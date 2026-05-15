@@ -25,6 +25,12 @@ pub struct PointRequestPlan {
     unique_index_by_key: HashMap<Key, usize, FastHashBuilder>,
 }
 
+struct BorrowedPointRequestPlan<'a> {
+    unique_keys: Vec<Key>,
+    requested_to_unique: Vec<usize>,
+    unique_index_by_key: HashMap<&'a Key, usize, FastHashBuilder>,
+}
+
 impl PointRequestPlan {
     pub fn new(keys: &[Key]) -> Self {
         let mut unique_index_by_key =
@@ -59,6 +65,35 @@ impl PointRequestPlan {
 
     pub fn is_empty(&self) -> bool {
         self.requested_to_unique.is_empty()
+    }
+}
+
+impl<'a> BorrowedPointRequestPlan<'a> {
+    fn new(keys: &'a [Key]) -> Self {
+        let mut unique_index_by_key =
+            HashMap::<&'a Key, usize, FastHashBuilder>::with_capacity_and_hasher(
+                keys.len(),
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+        let mut unique_keys = Vec::with_capacity(keys.len());
+        let mut requested_to_unique = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(&unique_index) = unique_index_by_key.get(key) {
+                requested_to_unique.push(unique_index);
+                continue;
+            }
+
+            let unique_index = unique_keys.len();
+            unique_index_by_key.insert(key, unique_index);
+            unique_keys.push(key.clone());
+            requested_to_unique.push(unique_index);
+        }
+
+        Self {
+            unique_keys,
+            requested_to_unique,
+            unique_index_by_key,
+        }
     }
 }
 
@@ -168,8 +203,8 @@ pub(crate) fn get_many_indexed_values_caller_order_with_stats<R>(
 where
     R: BackendRead,
 {
-    let plan = PointRequestPlan::new(keys);
-    get_many_indexed_values_for_plan_with_stats(read, space, &plan, opts)
+    let plan = BorrowedPointRequestPlan::new(keys);
+    get_many_indexed_values_for_borrowed_plan_with_stats(read, space, &plan, opts)
 }
 
 pub(crate) fn get_many_indexed_values_for_plan<R>(
@@ -182,6 +217,39 @@ where
     R: BackendRead,
 {
     Ok(get_many_indexed_values_for_plan_with_stats(read, space, plan, opts)?.value)
+}
+
+fn get_many_indexed_values_for_borrowed_plan_with_stats<R>(
+    read: &R,
+    space: SpaceId,
+    plan: &BorrowedPointRequestPlan<'_>,
+    opts: GetOptions<'_>,
+) -> Result<StorageReadResult<IndexedPointValues>, BackendError>
+where
+    R: BackendRead,
+{
+    let result = read.get_many(space, &plan.unique_keys, opts)?;
+
+    let mut unique_values = Vec::with_capacity(plan.unique_keys.len());
+    unique_values.resize_with(plan.unique_keys.len(), || None);
+    for entry in result.entries.entries {
+        if let Some(&unique_index) = plan.unique_index_by_key.get(&entry.key) {
+            unique_values[unique_index] = Some(entry.value);
+        }
+    }
+
+    Ok(StorageReadResult::new(
+        IndexedPointValues {
+            unique_values,
+            requested_to_unique: plan.requested_to_unique.clone(),
+        },
+        StorageReadStats {
+            requested_keys: plan.requested_to_unique.len() as u64,
+            unique_backend_keys: plan.unique_keys.len() as u64,
+            backend_calls: 1,
+            prefix_lowered: 0,
+        },
+    ))
 }
 
 pub(crate) fn get_many_indexed_values_for_plan_with_stats<R>(

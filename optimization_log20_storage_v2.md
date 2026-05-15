@@ -1273,3 +1273,64 @@ Next likely fix:
   add an internal BorrowedPointRequestPlan<'a> for one-shot reads and keep the
   owned PointRequestPlan for reusable reads.
 ```
+
+### 2026-05-14: Borrowed One-Shot Point Request Plan
+
+Change:
+
+```text
+Added an internal one-shot borrowed request plan:
+
+  BorrowedPointRequestPlan<'a>
+
+One-shot point-read helpers now use borrowed key references in their temporary
+key -> unique-index map. The owned PointRequestPlan remains the reusable API
+for repeated read shapes.
+```
+
+Why:
+
+```text
+PointRequestPlan gave the intended repeated-read win, but the first
+implementation made one-shot helpers build the owned reusable plan internally.
+That regressed small and unique-heavy one-shot reads because the temporary path
+paid for owned map keys it did not need to keep.
+
+The borrowed one-shot plan restores the cheaper temporary shape while keeping
+the reusable owned plan for repeated reads.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_indexed_adapter/m1000_u1000
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_indexed_lean_backend/m10000_u100
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_planned_lean_backend/m10000_u100
+```
+
+Focused scorecard:
+
+| Case                                      |      Mean |
+| ----------------------------------------- | --------: |
+| `indexed_adapter/m1000_u1000`             | 32.295 us |
+| `indexed_lean_backend/m10000_u100`        | 59.226 us |
+| `planned_lean_backend/m10000_u100`        |  3.101 us |
+
+Interpretation:
+
+```text
+The polluted parallel run made the first focused numbers look much worse than
+they were. Sequential reruns show the intended shape:
+
+  one-shot unique-heavy reads are back near the pre-owned-plan band
+  one-shot duplicate-heavy reads are back in the ~50-60us band
+  planned duplicate-heavy reads remain around ~3us
+
+So the storage_v2 point-read API now has both:
+
+  cheap one-shot borrowed planning
+  reusable owned planning for repeated read shapes
+```
