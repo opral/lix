@@ -627,6 +627,8 @@ point batch:
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations
+  backend_v2 exposes visitor-first range scans; storage_v2 owns materializing
+  ScanPage-shaped results when callers need owned entries
 
 storage cursor resume:
   O(1) cursor validation/construction plus backend range resume cost

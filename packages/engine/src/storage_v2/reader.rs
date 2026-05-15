@@ -8,9 +8,9 @@ use crate::storage_v2::{
     get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
     get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
-    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats,
-    BorrowedIndexedPointValues, IndexedPointValues, PointRequestPlan, PointSlot, StorageReadResult,
-    StorageReadScope, StorageReadStats, StorageSpace,
+    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats, scan_range,
+    scan_range_with_stats, BorrowedIndexedPointValues, IndexedPointValues, PointRequestPlan,
+    PointSlot, StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -218,7 +218,7 @@ where
         range: KeyRange,
         opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError> {
-        self.backend_read().scan_range(space.id, range, opts)
+        scan_range(self.backend_read(), space.id, range, opts)
     }
 
     fn scan_prefix(
@@ -236,16 +236,7 @@ where
         range: KeyRange,
         opts: ScanOptions<'_>,
     ) -> Result<StorageReadResult<ScanPage>, BackendError> {
-        let page = self.backend_read().scan_range(space.id, range, opts)?;
-        Ok(StorageReadResult::new(
-            page,
-            StorageReadStats {
-                requested_keys: 0,
-                unique_backend_keys: 0,
-                backend_calls: 1,
-                prefix_lowered: 0,
-            },
-        ))
+        scan_range_with_stats(self.backend_read(), space.id, range, opts)
     }
 
     fn scan_prefix_with_stats(
@@ -267,8 +258,8 @@ mod tests {
 
     use crate::backend_v2::{
         BackendError, BackendRead, ConformanceBackend, CoreProjection, GetManyResult, GetOptions,
-        Key, KeyRange, Prefix, ProjectedValue, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
-        ScanPage, SpaceId, StoredValue, WriteOptions,
+        Key, KeyRange, Prefix, ProjectedValue, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+        SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{PointRequestPlan, StorageContext, StorageReader, StorageSpace};
 
@@ -320,18 +311,16 @@ mod tests {
             ))
         }
 
-        fn scan_range(
+        fn visit_range(
             &self,
             _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<ScanPage, BackendError> {
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<ScanResult, BackendError> {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
-            Ok(ScanPage {
-                entries: ReadBatch::default(),
-                has_more: false,
-            })
+            Ok(ScanResult::default())
         }
     }
 
@@ -361,12 +350,13 @@ mod tests {
             ))
         }
 
-        fn scan_range(
+        fn visit_range(
             &self,
             _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<ScanPage, BackendError> {
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<ScanResult, BackendError> {
             unreachable!("requested-order point-read test does not scan")
         }
     }

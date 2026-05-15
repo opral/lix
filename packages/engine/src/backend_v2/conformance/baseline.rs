@@ -9,7 +9,8 @@ use crate::backend_v2::conformance::{
 };
 use crate::backend_v2::{
     Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, ProjectedValue,
-    ReadEntry, ReadOptions, ScanOptions, SpaceId, WriteOptions,
+    ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
+    WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -216,32 +217,32 @@ where
         upper: Bound::Excluded(key("e")),
     };
 
-    let first = read
-        .scan_range(
-            test_space,
-            range.clone(),
-            ScanOptions {
-                limit_rows: 2,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("first scan_range failed: {error}"))?;
+    let first = scan_range(
+        &read,
+        test_space,
+        range.clone(),
+        ScanOptions {
+            limit_rows: 2,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("first scan_range failed: {error}"))?;
     assert_read_entries(&first.entries.entries, &[("b", "B"), ("c", "C")])?;
     if !first.has_more {
         return Err("first scan page did not report has_more".to_string());
     }
 
-    let second = read
-        .scan_range(
-            test_space,
-            range,
-            ScanOptions {
-                limit_rows: 2,
-                resume_after: Some(&key("c")),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("second scan_range failed: {error}"))?;
+    let second = scan_range(
+        &read,
+        test_space,
+        range,
+        ScanOptions {
+            limit_rows: 2,
+            resume_after: Some(&key("c")),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("second scan_range failed: {error}"))?;
     assert_read_entries(&second.entries.entries, &[("d", "D")])?;
     if second.has_more {
         return Err("last scan page unexpectedly reported has_more".to_string());
@@ -264,28 +265,28 @@ where
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
-    let included = read
-        .scan_range(
-            test_space,
-            KeyRange {
-                lower: Bound::Included(key("b")),
-                upper: Bound::Included(key("c")),
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("included range scan failed: {error}"))?;
+    let included = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Included(key("b")),
+            upper: Bound::Included(key("c")),
+        },
+        ScanOptions::default(),
+    )
+    .map_err(|error| format!("included range scan failed: {error}"))?;
     assert_read_entries(&included.entries.entries, &[("b", "B"), ("c", "C")])?;
 
-    let excluded = read
-        .scan_range(
-            test_space,
-            KeyRange {
-                lower: Bound::Excluded(key("b")),
-                upper: Bound::Excluded(key("d")),
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("excluded range scan failed: {error}"))?;
+    let excluded = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Excluded(key("b")),
+            upper: Bound::Excluded(key("d")),
+        },
+        ScanOptions::default(),
+    )
+    .map_err(|error| format!("excluded range scan failed: {error}"))?;
     assert_read_entries(&excluded.entries.entries, &[("c", "C")])
 }
 
@@ -320,18 +321,19 @@ where
         ],
     )?;
 
-    let page = backend
+    let read = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read failed: {error}"))?
-        .scan_range(
-            test_space,
-            KeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("scan_range failed: {error}"))?;
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let page = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+        ScanOptions::default(),
+    )
+    .map_err(|error| format!("scan_range failed: {error}"))?;
 
     assert_read_entries_bytes(
         &page.entries.entries,
@@ -398,17 +400,17 @@ where
         let mut resume_after = None;
         let mut actual = Vec::new();
         loop {
-            let page = read
-                .scan_range(
-                    test_space,
-                    range.clone(),
-                    ScanOptions {
-                        limit_rows: limit,
-                        resume_after: resume_after.as_ref(),
-                        ..Default::default()
-                    },
-                )
-                .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
+            let page = scan_range(
+                &read,
+                test_space,
+                range.clone(),
+                ScanOptions {
+                    limit_rows: limit,
+                    resume_after: resume_after.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
             actual.extend(entries_to_key_values(&page.entries.entries));
             resume_after = page.entries.entries.last().map(|entry| entry.key.clone());
             if !page.has_more {
@@ -434,18 +436,19 @@ where
     let backend = open_backend(factory);
     let test_space = space(1);
     seed_full_values(&backend, test_space, [("a", "A"), ("b", "B")])?;
-    let page = backend
+    let read = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read failed: {error}"))?
-        .scan_range(
-            test_space,
-            KeyRange {
-                lower: Bound::Included(key("b")),
-                upper: Bound::Excluded(key("b")),
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("scan_range failed: {error}"))?;
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let page = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Included(key("b")),
+            upper: Bound::Excluded(key("b")),
+        },
+        ScanOptions::default(),
+    )
+    .map_err(|error| format!("scan_range failed: {error}"))?;
     if page.entries.entries.is_empty() {
         Ok(())
     } else {
@@ -561,16 +564,16 @@ where
         &[("a", "A")],
     )?;
 
-    let old_scan = old_read
-        .scan_range(
-            test_space,
-            KeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("old read scan_range failed: {error}"))?;
+    let old_scan = scan_range(
+        &old_read,
+        test_space,
+        KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+        ScanOptions::default(),
+    )
+    .map_err(|error| format!("old read scan_range failed: {error}"))?;
     assert_read_entries(&old_scan.entries.entries, &[("a", "A")])?;
 
     assert_get_entries(&backend, test_space, &[("a", Some("C"))])
@@ -639,19 +642,19 @@ where
         &[key("a")],
     )?;
 
-    let key_only_scan = read
-        .scan_range(
-            test_space,
-            KeyRange {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            ScanOptions {
-                projection: CoreProjection::KeyOnly,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?;
+    let key_only_scan = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+        ScanOptions {
+            projection: CoreProjection::KeyOnly,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?;
     assert_key_only_entries(&key_only_scan.entries.entries, &[key("a")])
 }
 
@@ -747,6 +750,32 @@ where
         .commit()
         .map_err(|error| format!("seed commit failed: {error}"))?;
     Ok(())
+}
+
+fn scan_range<R>(
+    read: &R,
+    test_space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Result<ScanPage, crate::backend_v2::BackendError>
+where
+    R: BackendRead,
+{
+    let mut entries = Vec::with_capacity(opts.limit_rows);
+    let result = read.visit_range(test_space, range, opts, &mut |key: &Key,
+                                                                  value: ProjectedValueRef<
+        '_,
+    >| {
+        entries.push(ReadEntry {
+            key: key.clone(),
+            value: value.to_owned(),
+        });
+        Ok(())
+    })?;
+    Ok(ScanPage {
+        entries: ReadBatch { entries },
+        has_more: result.has_more,
+    })
 }
 
 fn assert_get_entries<B>(

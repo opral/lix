@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadBatch,
-    ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
+    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rusqlite::types::Value as SqlValue;
@@ -135,13 +135,14 @@ impl BackendRead for SqliteRead {
         get_many(&self.conn, space, keys, opts)
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
-        scan_range(&self.conn, space, range, opts)
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
+        visit_range(&self.conn, space, range, opts, visitor)
     }
 
     fn close(self) -> Result<(), BackendError> {
@@ -286,18 +287,16 @@ fn get_many(
     ))
 }
 
-fn scan_range(
+fn visit_range(
     conn: &Connection,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, BackendError> {
+    visitor: &mut dyn ScanVisitor,
+) -> Result<ScanResult, BackendError> {
     let limit = opts.limit_rows;
     if limit == 0 {
-        return Ok(ScanPage {
-            entries: ReadBatch::default(),
-            has_more: false,
-        });
+        return Ok(ScanResult::default());
     }
 
     let mut sql = String::from("SELECT key, value FROM entries WHERE space_id = ?1");
@@ -316,25 +315,27 @@ fn scan_range(
     let mut rows = stmt
         .query(rusqlite::params_from_iter(values))
         .map_err(sqlite_error)?;
-    let mut entries = Vec::new();
+    let mut emitted = 0;
 
     while let Some(row) = rows.next().map_err(sqlite_error)? {
         let key_bytes: Vec<u8> = row.get(0).map_err(sqlite_error)?;
         let value_bytes: Vec<u8> = row.get(1).map_err(sqlite_error)?;
-        if entries.len() == limit {
-            return Ok(ScanPage {
-                entries: ReadBatch { entries },
+        if emitted == limit {
+            return Ok(ScanResult {
+                emitted,
                 has_more: true,
             });
         }
-        entries.push(ReadEntry {
-            key: Key(Bytes::from(key_bytes)),
-            value: project_value(Bytes::from(value_bytes), opts.projection),
-        });
+        let value = Bytes::from(value_bytes);
+        visitor.visit(
+            &Key(Bytes::from(key_bytes)),
+            project_value_ref(&value, opts.projection),
+        )?;
+        emitted += 1;
     }
 
-    Ok(ScanPage {
-        entries: ReadBatch { entries },
+    Ok(ScanResult {
+        emitted,
         has_more: false,
     })
 }
@@ -372,6 +373,13 @@ fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
         CoreProjection::FullValue => ProjectedValue::FullValue(value),
+    }
+}
+
+fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
+    match projection {
+        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
     }
 }
 

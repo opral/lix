@@ -1,6 +1,6 @@
 use crate::backend_v2::{
     BackendCapabilities, BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange,
-    PutBatch, ReadOptions, ScanOptions, ScanPage, SpaceId, WriteOptions,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId, WriteOptions,
 };
 
 pub trait Backend {
@@ -27,18 +27,32 @@ pub trait BackendRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError>;
 
-    fn scan_range(
+    fn visit_range(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError>;
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
         Self: Sized,
     {
         Ok(())
+    }
+}
+
+pub trait ScanVisitor {
+    fn visit(&mut self, key: &Key, value: ProjectedValueRef<'_>) -> Result<(), BackendError>;
+}
+
+impl<F> ScanVisitor for F
+where
+    F: for<'a> FnMut(&Key, ProjectedValueRef<'a>) -> Result<(), BackendError>,
+{
+    fn visit(&mut self, key: &Key, value: ProjectedValueRef<'_>) -> Result<(), BackendError> {
+        self(key, value)
     }
 }
 

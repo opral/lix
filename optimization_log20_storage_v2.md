@@ -1591,3 +1591,863 @@ Arbitrary PointRequestPlan::new(keys) remains O(M + U) expected because it must
 detect duplicates and build explicit indexes when requested slots are not an
 identity mapping.
 ```
+
+### 2026-05-14: New Baseline After Identity Point Plans
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Focused profiles:
+
+```text
+target/storage_v2_profiles/new_baseline/planned_m10000_u100.json
+target/storage_v2_profiles/new_baseline/planned_m10000_u10000.json
+target/storage_v2_profiles/new_baseline/indexed_m10000_u100.json
+target/storage_v2_profiles/new_baseline/write_k8192_g16.json
+target/storage_v2_profiles/new_baseline/conformance_get_many.json
+```
+
+Note:
+
+```text
+Criterion filters are substring filters. The planned_m10000_u100 profile also
+captured planned_m10000_u10000. The exact u10000 case was profiled separately.
+```
+
+#### Scorecard
+
+Write set lowering:
+
+| Case                       |      Mean |
+| -------------------------- | --------: |
+| `puts_k128_g1_v32`         |  1.103 us |
+| `puts_k1024_g1_v32`        |  9.381 us |
+| `puts_k1024_g16_v32`       | 14.332 us |
+| `puts_k8192_g16_v32`       | 68.675 us |
+| `puts_k1024_g64_v32`       | 13.396 us |
+| `puts_k4096_g256_v32`      | 42.674 us |
+| `deletes_k1024_g16`        |  7.130 us |
+| `mixed80_20_k1024_g16_v32` |  9.165 us |
+| `puts_k1024_g16_v1024`     |  8.925 us |
+| `puts_k1024_g16_v65536`    |  8.924 us |
+
+Point request plans:
+
+| Case                         |       Mean |
+| ---------------------------- | ---------: |
+| `dedupe/m100_u100`           |   1.348 us |
+| `known_unique/m100_u100`     |   0.156 us |
+| `dedupe/m1000_u1000`         |  15.219 us |
+| `known_unique/m1000_u1000`   |   1.424 us |
+| `dedupe/m10000_u10000`       | 158.038 us |
+| `known_unique/m10000_u10000` |  16.123 us |
+
+Point reads:
+
+| Group / Case                        |       Mean |
+| ----------------------------------- | ---------: |
+| `materialized/m10000_u100`          | 109.702 us |
+| `materialized/m10000_u10000`        |  66.191 ms |
+| `indexed/m10000_u100`               |  60.019 us |
+| `indexed/m10000_u10000`             |  70.853 ms |
+| `indexed_lean/m10000_u100`          |  45.151 us |
+| `indexed_lean/m10000_u10000`        | 157.273 us |
+| `planned_lean/m10000_u100`          |   0.433 us |
+| `planned_lean/m10000_u10000`        |  42.294 us |
+| `planned_lean/m1000_u100_missing90` |   0.095 us |
+
+Prefix and conformance backend:
+
+| Group / Case                        |      Mean |
+| ----------------------------------- | --------: |
+| `prefix/q0`                         |   62.7 ns |
+| `prefix/q1000`                      |  4.820 us |
+| `prefix/q10000`                     | 47.365 us |
+| `conformance/commit_puts_k1024_g16` | 57.224 us |
+| `conformance/get_many_m1000_u100`   | 13.356 us |
+| `conformance/scan_range_q1000`      |  8.604 us |
+
+#### Profile Ranking
+
+1. One-shot indexed reads still spend most of their time building temporary
+   point plans:
+
+```text
+indexed_m10000_u100:
+  ~24% ahash hash_one
+  ~19% HashMap/HashSet allocation
+  ~16% HashMap insert inclusive
+  ~8%  Bytes drop
+  ~5%  Bytes clone
+```
+
+This confirms the earlier first-principles conclusion: arbitrary one-shot point
+reads have an O(M) planning lower bound. The correct API answer is to avoid this
+path in repeated domain-store loops by using `PointRequestPlan`, and to use
+`from_unique_keys` when the domain store already guarantees uniqueness.
+
+2. Planned duplicate-heavy reads are now tiny:
+
+```text
+planned_lean/m10000_u100:
+  ~0.4 us
+```
+
+There is no obvious storage_v2 algorithmic win left in that case. It is mostly
+backend-slot fill and benchmark overhead.
+
+3. Planned unique-heavy reads are proportional to U:
+
+```text
+planned_lean/m10000_u10000:
+  ~42 us
+
+profile:
+  ~31% allocation
+  ~25% Vec collect/from_iter
+  ~22% Bytes clone
+  ~19% Bytes drop
+```
+
+That is expected for the current fake backend/result shape: U unique requested
+keys means U backend slots and U returned values. The next win would have to be
+backend/result ownership layout, not storage-side dedupe.
+
+4. Write-set lowering is no longer validation-bound:
+
+```text
+write_k8192_g16:
+  ~26% StorageWriteSet::stage_put
+  ~24% HashMap insert inclusive
+  ~11% ahash hash_one
+  ~9%  Bytes drop
+  ~6%  CountingWrite::put_many
+```
+
+The remaining write-side cost is staging and validation/hash work, plus Bytes
+clone/drop. There is no longer a tree-factor validation hotspot.
+
+5. Conformance get_many is allocation-heavy:
+
+```text
+conformance_get_many:
+  ~37% allocation
+  ~15% key clone path inclusive
+  ~8%  Bytes clone
+  ~6%  hash_one
+  ~6%  HashMap/HashSet allocation
+```
+
+This reinforces that `ConformanceBackend` is a correctness backend. The next
+in-memory performance work should be a separate optimized in-memory backend,
+not contorting the conformance backend.
+
+#### Interpretation
+
+```text
+storage_v2 now has three distinct point-read lanes:
+
+1. arbitrary one-shot:
+   O(M + U), still pays planning/hash cost
+
+2. known-unique one-shot plan:
+   O(U), skips dedupe hash map and explicit identity index allocation
+
+3. reusable planned reads:
+   O(M + U) once, then O(U) per read
+
+The new baseline says the API shape is sound for repeated reads. The remaining
+large storage-side concern is that the public materialized/indexed one-shot
+helpers route through a general plan path and are not the right hot path for
+unique-heavy loops. Domain stores should either use reusable plans or structured
+range scans.
+```
+
+#### Ranked Next Optimizations
+
+1. Build a production-oriented in-memory backend candidate.
+
+```text
+Do not optimize ConformanceBackend as if it were production.
+Add a separate in-memory backend with cheap snapshots and BTreeMap::range scans,
+then run backend conformance plus the storage_v2 scorecard against it.
+```
+
+2. Add a storage/domain-store API guideline:
+
+```text
+Repeated point reads must use PointRequestPlan.
+Known-unique point reads should use PointRequestPlan::from_unique_keys.
+Large structured key families should use range/prefix scans.
+```
+
+3. Consider restoring a cheaper one-shot unique helper only if domain usage
+shows it matters.
+
+```text
+The current one-shot unique-heavy materialized/indexed helper is slow compared
+with planned/lean paths. Before adding more API, wait for real domain callsites
+or the optimized in-memory backend to prove this matters.
+```
+
+### 2026-05-14: InMemoryBackend Profile Lane
+
+Change:
+
+```text
+Added storage_v2 bench coverage for the production-oriented backend_v2
+InMemoryBackend:
+
+  storage_v2/in_memory_backend/commit_puts_k1024_g16_v32
+  storage_v2/in_memory_backend/get_many_m1000_u100
+  storage_v2/in_memory_backend/scan_range_q1000
+```
+
+Validation:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo test -p lix_engine storage_v2 --no-fail-fast
+```
+
+Focused bench results:
+
+| Case                        |      Mean |
+| --------------------------- | --------: |
+| `commit_puts_k1024_g16_v32` | 57.483 us |
+| `get_many_m1000_u100`       | 14.393 us |
+| `scan_range_q1000`          |  7.974 us |
+
+Profiles:
+
+```text
+target/storage_v2_profiles/in_memory_backend/commit_puts_k1024_g16.json
+target/storage_v2_profiles/in_memory_backend/get_many_m1000_u100.json
+target/storage_v2_profiles/in_memory_backend/scan_range_q1000.json
+```
+
+Profile ranking:
+
+```text
+commit_puts_k1024_g16:
+  ~36% BTreeMap::insert exclusive
+  ~64% InMemoryWrite::put_many inclusive
+  ~14% StorageWriteSet::stage_put inclusive
+  ~9%  old map drop / Arc publication cleanup inclusive
+
+get_many_m1000_u100:
+  ~41% allocation inclusive
+  ~38% HashMap/HashSet allocation inclusive
+  ~20% Vec collect/from_iter inclusive
+  ~13% hash_one exclusive
+  ~6%  Bytes drop
+  ~6%  Bytes clone
+
+scan_range_q1000:
+  ~43% Key/Bytes clone in upper_bound exclusive
+  ~20% Vec growth inclusive
+  ~18% ReadEntry drop inclusive
+  BTreeMap::range itself is not the visible bottleneck
+```
+
+Interpretation:
+
+```text
+The InMemoryBackend lane validates the intended split:
+
+  ConformanceBackend = correctness reference
+  InMemoryBackend    = performance candidate
+
+For scans, using BTreeMap::range worked: range lookup is not hot. The visible
+cost is result materialization and avoidable bound/key cloning.
+
+For commits, BTreeMap insertion is now the honest backend cost. That is useful:
+storage_v2 write-set overhead is no longer hiding the backend write path.
+
+For get_many, the storage adapter still dominates this M=1000/U=100
+materialized caller-order path. Reusable planned reads remain the right
+domain-store API for hot repeated point shapes.
+```
+
+Ranked next optimizations:
+
+```text
+1. Fix InMemoryBackend scan bound construction:
+   avoid cloning the upper/lower bound keys on every scan when possible, or
+   store keys in a shape that can use borrowed range bounds.
+
+2. Add an InMemoryBackend planned-point bench:
+   measure get_many with PointRequestPlan so backend costs are not obscured by
+   one-shot storage planning.
+
+3. Consider a backend map layout keyed by SpaceId -> BTreeMap<Key, Bytes>:
+   this could avoid synthetic (next SpaceId, empty key) upper bounds and reduce
+   tuple-key cloning/comparison work.
+```
+
+### 2026-05-14: InMemoryBackend Planned Point Bench
+
+Change:
+
+```text
+Added:
+
+  storage_v2/in_memory_backend/planned_get_many_m1000_u100
+
+This uses PointRequestPlan and the borrowed indexed result shape so the
+benchmark isolates backend get_many plus planned storage result handling,
+instead of one-shot point planning.
+```
+
+Focused result:
+
+| Case                          |     Mean |
+| ----------------------------- | -------: |
+| `planned_get_many_m1000_u100` | 2.915 us |
+
+Comparison:
+
+```text
+in_memory get_many_m1000_u100 one-shot materialized:
+  ~14.4 us
+
+in_memory planned_get_many_m1000_u100:
+  ~2.9 us
+```
+
+Profile:
+
+```text
+target/storage_v2_profiles/in_memory_backend/planned_get_many_m1000_u100.json
+```
+
+Profile readout:
+
+```text
+~94% Vec collect/allocation inclusive
+~90% iterator fold inclusive
+~4%  Bytes drop
+~2%  Bytes clone
+
+The backend lookup itself is not visibly hot in this case. The remaining cost
+is mostly allocating/filling the U-slot result vector.
+```
+
+Interpretation:
+
+```text
+The planned point path removes the one-shot storage planning cost, as intended.
+For M=1000/U=100 it is roughly 5x faster than the materialized one-shot path.
+
+The next point-read optimization, if needed, is not another dedupe tweak. It is
+result ownership/layout: avoid allocating a fresh Vec<Option<ProjectedValue>>
+per read, or let hot domain-store paths consume backend slots in a reusable
+buffer.
+```
+
+### 2026-05-14: InMemoryBackend Per-Space Map Layout
+
+Change:
+
+```text
+Changed InMemoryBackend storage from:
+
+  BTreeMap<(SpaceId, Key), Bytes>
+
+to:
+
+  BTreeMap<SpaceId, BTreeMap<Key, Bytes>>
+
+Scan bounds now operate over the per-space key map, and a follow-up patch uses
+borrowed bounds for BTreeMap::range so scan setup does not clone range keys.
+```
+
+Why:
+
+```text
+The previous scan profile showed BTreeMap::range itself was not hot. The
+visible cost was synthetic tuple-bound construction and key/value/result
+materialization. Since backend spaces are separate ordered key domains, the
+in-memory physical layout should model that directly.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/in_memory_backend
+```
+
+Focused in-memory scorecard:
+
+| Case                          | Before Mean | After Mean | Criterion Change |
+| ----------------------------- | ----------: | ---------: | ---------------: |
+| `commit_puts_k1024_g16_v32`   |   57.483 us |  52.620 us |    7.822% faster |
+| `get_many_m1000_u100`         |   14.393 us |  13.620 us |    4.999% faster |
+| `planned_get_many_m1000_u100` |    2.915 us |   2.680 us |    8.122% faster |
+| `scan_range_q1000`            |    7.974 us |   7.628 us |    8.506% faster |
+
+Profile:
+
+```text
+target/storage_v2_profiles/in_memory_backend_space_map/scan_range_q1000_borrowed_bounds.json
+```
+
+Profile readout:
+
+```text
+The old upper_bound key clone hotspot disappeared after borrowed bounds.
+
+The remaining scan profile is mostly:
+  bounds/range setup symbol attribution
+  ReadEntry Vec allocation/growth
+  Key/Bytes clone/drop for emitted rows
+
+BTreeMap::range lookup remains tiny.
+```
+
+Interpretation:
+
+```text
+The per-space layout is a modest but consistent improvement across commit,
+point, planned point, and scan paths. More importantly, it better matches the
+backend abstraction: each SpaceId is its own ordered byte-key domain.
+
+The next scan win is result materialization, not range lookup. KeyOnly scans
+still emit owned ReadEntry keys, so Q=1000 implies Q key clones and a growing
+Vec<ReadEntry>.
+```
+
+### 2026-05-14: InMemoryBackend Next Hotspot Profile
+
+Command:
+
+```sh
+samply record --save-only --unstable-presymbolicate ...
+```
+
+Profiles:
+
+```text
+target/storage_v2_profiles/in_memory_backend_next/commit_puts_k1024_g16.json
+target/storage_v2_profiles/in_memory_backend_next/planned_get_many_m1000_u100.json
+target/storage_v2_profiles/in_memory_backend_next/scan_range_q1000.json
+```
+
+Focused results:
+
+| Case                          |      Mean |
+| ----------------------------- | --------: |
+| `commit_puts_k1024_g16_v32`   | 51.587 us |
+| `planned_get_many_m1000_u100` |  2.590 us |
+| `scan_range_q1000`            |  7.704 us |
+
+Profile ranking:
+
+```text
+commit_puts_k1024_g16:
+  ~46% BTreeMap::insert inclusive
+  ~58% InMemoryWrite::put_many inclusive
+  ~16% StorageWriteSet::stage_put inclusive
+  ~11% old map drop / Arc cleanup inclusive
+
+planned_get_many_m1000_u100:
+  ~94% BTreeMap::get path inclusive
+  ~92% Vec collect/from_iter inclusive
+  ~89% BTreeMap search_tree inclusive
+
+scan_range_q1000:
+  BTreeMap::range remains tiny
+  ~19% Vec growth inclusive
+  ~18% ReadEntry Vec drop inclusive
+  ~11% Bytes clone
+  ~10% Bytes drop
+```
+
+Interpretation:
+
+```text
+The per-space map layout did its job. The remaining backend costs are now
+honest:
+
+  writes: BTreeMap insert
+  planned points: BTreeMap get into a freshly allocated result vector
+  scans: result materialization, not range lookup
+```
+
+Ranked next optimizations:
+
+```text
+1. Preallocate scan result Vec capacity.
+   InMemoryBackend::scan_range currently starts with Vec::new(). For bounded
+   scans, use Vec::with_capacity(min(limit_rows, space_entries.len())).
+   This directly targets the visible Vec growth hotspot.
+
+2. Add an in-memory planned unique-heavy bench.
+   Current planned get_many is M=1000/U=100. Add m10000/u10000 so we can see
+   whether BTreeMap get remains acceptable for unique-heavy point reads.
+
+3. Consider result-buffer reuse only after real domain callsites exist.
+   planned_get_many is now mostly fresh Vec<Option<ProjectedValue>> allocation
+   plus BTreeMap lookup. A reusable buffer could help, but it widens API.
+
+4. Leave commit path alone for now.
+   BTreeMap insertion is the expected backend write cost. Optimizing it would
+   mean changing the physical data structure, not polishing storage_v2.
+```
+
+### 2026-05-14: Preallocate InMemory Scan Results
+
+Change:
+
+```text
+InMemoryBackend::scan_range now creates its ReadEntry vector with:
+
+  Vec::with_capacity(min(limit_rows, space_entries.len()))
+
+instead of starting with Vec::new().
+```
+
+Why:
+
+```text
+The post-space-map scan profile showed Vec growth as the next concrete hotspot:
+
+  ~19% Vec growth inclusive
+  ~18% ReadEntry Vec drop inclusive
+
+The backend already knows the page limit and per-space map length, so the
+bounded page can reserve its maximum possible emitted row count.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/in_memory_backend/scan_range_q1000
+```
+
+Focused result:
+
+| Case               | Before Mean | After Mean | Criterion Change |
+| ------------------ | ----------: | ---------: | ---------------: |
+| `scan_range_q1000` |    7.704 us |   6.601 us |   14.967% faster |
+
+Interpretation:
+
+```text
+This is a clean backend-local win. Range lookup was already cheap; the scan
+path now spends less time growing the output vector. Remaining scan cost is
+mostly unavoidable owned result materialization: cloning emitted keys and
+dropping ReadEntry values after the benchmark consumes the page.
+```
+
+### 2026-05-14: Borrowed Scan Visitor Experiment
+
+Change:
+
+```text
+Added an experimental InMemoryRead::visit_scan_range API that visits borrowed
+keys and borrowed values instead of materializing an owned ScanPage.
+
+For KeyOnly scans, the visitor receives:
+
+  (&Key, None)
+
+so the backend does not clone keys, clone Bytes, allocate ReadEntry rows, or
+drop an owned result batch after the scan.
+```
+
+Why:
+
+```text
+The scan profile after preallocation showed the next dominant cost was owned
+result materialization, not range lookup. This experiment tests the harder API
+cut directly while leaving the v0 BackendRead trait unchanged.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/in_memory_backend/scan_range
+```
+
+Focused result:
+
+| Case                              |      Mean |     Throughput |
+| --------------------------------- | --------: | -------------: |
+| `scan_range_q1000`                |  6.328 us | 158.04 Melem/s |
+| `scan_range_visit_key_only_q1000` | 768.59 ns | 1.3011 Gelem/s |
+
+Interpretation:
+
+```text
+The visitor path is about 8.2x faster for the key-only scan microbench.
+
+That is a first-principles signal: when a caller only needs to walk ordered
+keys, the owned ScanPage API forces avoidable work. The visitor shape should
+remain experimental until domain callsites prove they can use it ergonomically,
+but it is now the strongest evidence for a future scan extension.
+```
+
+### 2026-05-15: Pre-API-Change Scan Visitor Baseline Matrix
+
+Goal:
+
+```text
+Before changing backend_v2 core from owned ScanPage scans to visitor-first
+range scans, run a focused baseline matrix on the current API plus the
+experimental InMemoryRead::visit_scan_range path.
+```
+
+Bench harness:
+
+```text
+Group:
+  storage_v2/scan_visitor_baseline
+
+Backend:
+  InMemoryBackend
+
+Measurement:
+  sample_size = 10
+  warm_up_time = 500ms
+  measurement_time = 1s
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/scan_visitor_baseline
+```
+
+Key-only range scans:
+
+| Case   | Owned ScanPage | Borrowed Visitor | Visitor Speedup |
+| ------ | -------------: | ---------------: | --------------: |
+| q0     |      42.433 ns |        31.619 ns |           1.34x |
+| q1     |      80.406 ns |        48.167 ns |           1.67x |
+| q10    |      134.81 ns |        83.350 ns |           1.62x |
+| q100   |      789.49 ns |        187.71 ns |           4.21x |
+| q1000  |      6.8907 us |        919.73 ns |           7.49x |
+| q10000 |      69.444 us |        17.661 us |           3.93x |
+
+Full-value range scans:
+
+| Case         | Owned ScanPage | Borrowed Visitor | Visitor Speedup |
+| ------------ | -------------: | ---------------: | --------------: |
+| q1000 v32    |      9.1617 us |        1.1463 us |           7.99x |
+| q1000 v1024  |      10.271 us |        1.2618 us |           8.14x |
+| q1000 v65536 |      10.377 us |        1.2535 us |           8.28x |
+
+Storage materialization from visitor:
+
+| Case                 | Current Comparable Owned | Visitor Collects ScanPage |       Result |
+| -------------------- | -----------------------: | ------------------------: | -----------: |
+| key-only q1000       |                6.8907 us |                 6.8789 us |       parity |
+| full-value q1000 v32 |                9.1617 us |                 14.732 us | slower/noisy |
+
+Limit/page-size scans:
+
+| Case            | Owned ScanPage | Borrowed Visitor | Visitor Speedup |
+| --------------- | -------------: | ---------------: | --------------: |
+| q1000 limit10   |      371.05 ns |        262.66 ns |           1.41x |
+| q1000 limit100  |      1.1977 us |        404.42 ns |           2.96x |
+| q1000 limit1000 |      12.051 us |        1.6803 us |           7.17x |
+
+Pagination drain:
+
+| Case          | Owned Drain | Visitor Drain | Visitor Speedup |
+| ------------- | ----------: | ------------: | --------------: |
+| q1000 page10  |   36.017 us |     31.369 us |           1.15x |
+| q1000 page100 |   11.536 us |     7.3646 us |           1.57x |
+
+Interpretation:
+
+```text
+The visitor-first scan primitive is strongly justified for streaming/key-walk
+callers:
+
+  key-only q1000:       ~7.5x faster
+  full-value q1000:     ~8x faster
+  limit1000 key-only:   ~7.2x faster
+
+The Big-O remains O(log_B N + Q), but the visitor path removes forced O(Q)
+owned ReadEntry allocation/cloning/drop work when callers do not need a
+materialized page.
+
+The important regression guard is storage materialization. Visitor -> owned
+ScanPage is at parity for key-only q1000, which means storage can preserve the
+old ergonomic API without losing much. Full-value materialization was slower
+and noisy in this short matrix; before replacing backend_v2::scan_range
+entirely, rerun that case with a longer measurement window and inspect whether
+the slowdown is closure overhead, allocation behavior, or benchmark noise.
+```
+
+Decision pressure:
+
+```text
+Change backend_v2 core only if we accept this split:
+
+  backend_v2:
+    visit_range as the physical primitive
+
+  storage_v2:
+    scan_range / scan_prefix owned-page helpers
+    cursor and residual-filter loops
+    streaming key/value visitor helpers for domain hot paths
+
+This aligns with the reference systems: physical layers iterate/stream/fill
+caller-provided output; higher layers materialize pages or result batches when
+needed.
+```
+
+### 2026-05-15: Post-API-Change Visitor-First Backend Baseline
+
+Goal:
+
+```text
+After changing backend_v2 core from owned scan_range -> ScanPage to
+visitor-first visit_range -> ScanResult, establish the new storage_v2 scorecard
+baseline.
+```
+
+Validation:
+
+```sh
+cargo check -p lix_engine --features storage-benches
+cargo fmt -p lix_engine
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo test -p lix_engine --test backend --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Note:
+
+```text
+Criterion's change column compared against pre-cut history and showed noisy
+point-read/write changes unrelated to the scan API. Treat the absolute values
+below as the new baseline for future optimization comparisons.
+```
+
+Write-set lowering:
+
+| Case                     | New Median |
+| ------------------------ | ---------: |
+| puts_k128_g1_v32         |  1.0326 us |
+| puts_k1024_g1_v32        |  8.7081 us |
+| puts_k1024_g16_v32       |  8.6996 us |
+| puts_k8192_g16_v32       |  69.651 us |
+| puts_k1024_g64_v32       |  10.415 us |
+| puts_k4096_g256_v32      |  41.357 us |
+| deletes_k1024_g16        |  6.9476 us |
+| mixed80_20_k1024_g16_v32 |  8.8084 us |
+| puts_k1024_g16_v1024     |  9.0055 us |
+| puts_k1024_g16_v65536    |  10.753 us |
+
+Point request planning:
+
+| Case                       | New Median |
+| -------------------------- | ---------: |
+| dedupe m100_u100           |  1.6450 us |
+| known_unique m100_u100     |  193.10 ns |
+| dedupe m1000_u1000         |  36.817 us |
+| known_unique m1000_u1000   |  2.6042 us |
+| dedupe m10000_u10000       |  313.53 us |
+| known_unique m10000_u10000 |  28.588 us |
+
+Point read adapters:
+
+| Case                 | Materialized |   Indexed | Indexed Lean | Planned Lean |
+| -------------------- | -----------: | --------: | -----------: | -----------: |
+| m100_u100            |    21.865 us | 12.260 us |    1.3140 us |    331.68 ns |
+| m1000_u1000          |    1.2958 ms | 741.35 us |    13.408 us |    3.8872 us |
+| m1000_u100           |    44.120 us | 16.462 us |    5.5666 us |    324.45 ns |
+| m10000_u100          |    200.86 us | 55.660 us |    44.587 us |    332.99 ns |
+| m10000_u10000        |    69.557 ms | 68.433 ms |    136.79 us |    41.951 us |
+| m1000_u100_missing10 |    20.671 us | 16.242 us |    5.7966 us |    303.68 ns |
+| m1000_u100_missing90 |    10.605 us | 7.5242 us |    5.2110 us |    91.368 ns |
+
+Prefix scan adapter:
+
+| Case   | New Median |
+| ------ | ---------: |
+| q0     |  76.760 ns |
+| q100   |  642.48 ns |
+| q1000  |  6.4085 us |
+| q10000 |  69.978 us |
+
+Backend scorecard:
+
+| Case                                      | New Median |
+| ----------------------------------------- | ---------: |
+| conformance commit_puts_k1024_g16_v32     |  67.628 us |
+| conformance get_many_m1000_u100           |  30.016 us |
+| conformance scan_range_q1000              |  27.554 us |
+| in_memory commit_puts_k1024_g16_v32       |  120.20 us |
+| in_memory get_many_m1000_u100             |  32.614 us |
+| in_memory planned_get_many_m1000_u100     |  4.4627 us |
+| in_memory scan_range_q1000                |  15.110 us |
+| in_memory scan_range_visit_key_only_q1000 |  3.2952 us |
+
+Visitor-first scan matrix:
+
+| Case                         | Materialized/Owned Median | Visitor Median | Visitor Speedup |
+| ---------------------------- | ------------------------: | -------------: | --------------: |
+| key-only q0                  |                 57.244 ns |      36.197 ns |           1.58x |
+| key-only q1                  |                 81.119 ns |      52.080 ns |           1.56x |
+| key-only q10                 |                 149.34 ns |      87.172 ns |           1.71x |
+| key-only q100                |                 735.77 ns |      290.05 ns |           2.54x |
+| key-only q1000               |                 7.0825 us |      1.9936 us |           3.55x |
+| key-only q10000              |                 65.907 us |      18.804 us |           3.50x |
+| full-value q1000 v32         |                 8.6376 us |      2.2986 us |           3.76x |
+| full-value q1000 v1024       |                 9.8225 us |      2.4124 us |           4.07x |
+| full-value q1000 v65536      |                 8.2023 us |      2.2731 us |           3.61x |
+| key-only q1000 limit10       |                 191.37 ns |      179.90 ns |           1.06x |
+| key-only q1000 limit100      |                 689.93 ns |      276.56 ns |           2.49x |
+| key-only q1000 limit1000     |                 6.7208 us |      1.9792 us |           3.40x |
+| drain key-only q1000 page10  |                 21.974 us |      18.655 us |           1.18x |
+| drain key-only q1000 page100 |                 7.5217 us |      5.8824 us |           1.28x |
+
+Storage materialization from visitor:
+
+| Case                                   | New Median |
+| -------------------------------------- | ---------: |
+| visit_materialize_key_only_q1000       |  9.6111 us |
+| visit_materialize_full_value_q1000_v32 |  8.7213 us |
+
+Hash reference benches were unchanged by this API cut; see the earlier
+hash-selection entry.
+
+Interpretation:
+
+```text
+The hard cut preserved the Big-O shape and made visitor scans the physical
+backend primitive.
+
+Streaming/key-walk scan callers now have a clear win:
+  key-only q1000:     7.0825 us -> 1.9936 us
+  full-value q1000:   8.6376 us -> 2.2986 us
+  key-only q10000:    65.907 us -> 18.804 us
+
+Storage-owned materialization remains available, but key-only materialization
+from visitor is now slower than the pre-cut owned page baseline. That is the
+next scan-specific optimization target if materialized scans remain hot.
+
+The point-read numbers should not be interpreted as caused by the scan API
+change. They are included so this run can serve as the new baseline for later
+point-plan/read tuning.
+```

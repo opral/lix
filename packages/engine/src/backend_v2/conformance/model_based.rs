@@ -9,8 +9,9 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, ProjectedValue, ReadOptions,
-    ScanOptions, SpaceId, WriteOptions,
+    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, ProjectedValue,
+    ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
+    WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -155,16 +156,16 @@ where
         lower: Bound::Included(lower),
         upper: Bound::Included(upper),
     };
-    let page = read
-        .scan_range(
-            target_space,
-            range.clone(),
-            ScanOptions {
-                limit_rows: 3,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("{label}: scan_range failed: {error}"))?;
+    let page = scan_range(
+        read,
+        target_space,
+        range.clone(),
+        ScanOptions {
+            limit_rows: 3,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("{label}: scan_range failed: {error}"))?;
     let actual_scan = page_entries(&page.entries.entries);
     let expected_scan = model_scan(model, target_space, &range, Some(3));
     if actual_scan != expected_scan {
@@ -174,6 +175,34 @@ where
     }
 
     Ok(())
+}
+
+fn scan_range<R>(
+    read: &R,
+    target_space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Result<ScanPage, crate::backend_v2::BackendError>
+where
+    R: BackendRead,
+{
+    let mut entries = Vec::with_capacity(opts.limit_rows);
+    let result = read.visit_range(
+        target_space,
+        range,
+        opts,
+        &mut |key: &Key, value: ProjectedValueRef<'_>| {
+            entries.push(ReadEntry {
+                key: key.clone(),
+                value: value.to_owned(),
+            });
+            Ok(())
+        },
+    )?;
+    Ok(ScanPage {
+        entries: ReadBatch { entries },
+        has_more: result.has_more,
+    })
 }
 
 fn model_scan(

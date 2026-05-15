@@ -6,9 +6,9 @@ use bytes::Bytes;
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadBatch,
-    ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
+    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type ConformanceMap = BTreeMap<(SpaceId, Key), Bytes>;
@@ -107,13 +107,14 @@ impl BackendRead for ConformanceRead {
         get_many_from_map(&self.entries, space, keys, opts)
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
-        scan_range_from_map(&self.entries, space, range, opts)
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
+        visit_range_from_map(&self.entries, space, range, opts, visitor)
     }
 }
 
@@ -176,20 +177,18 @@ fn get_many_from_map(
     ))
 }
 
-fn scan_range_from_map(
+fn visit_range_from_map(
     entries: &ConformanceMap,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, BackendError> {
-    let mut read_entries = Vec::new();
+    visitor: &mut dyn ScanVisitor,
+) -> Result<ScanResult, BackendError> {
+    let mut emitted = 0;
     let mut has_more = false;
 
     if opts.limit_rows == 0 {
-        return Ok(ScanPage {
-            entries: ReadBatch::default(),
-            has_more: false,
-        });
+        return Ok(ScanResult::default());
     }
 
     for ((entry_space, key), value) in entries {
@@ -202,22 +201,15 @@ fn scan_range_from_map(
         {
             continue;
         }
-        if read_entries.len() == opts.limit_rows {
+        if emitted == opts.limit_rows {
             has_more = true;
             break;
         }
-        read_entries.push(ReadEntry {
-            key: key.clone(),
-            value: project_value(value, opts.projection),
-        });
+        visitor.visit(key, project_value_ref(value, opts.projection))?;
+        emitted += 1;
     }
 
-    Ok(ScanPage {
-        entries: ReadBatch {
-            entries: read_entries,
-        },
-        has_more,
-    })
+    Ok(ScanResult { emitted, has_more })
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {
@@ -238,6 +230,13 @@ fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
         CoreProjection::FullValue => ProjectedValue::FullValue(value.clone()),
+    }
+}
+
+fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
+    match projection {
+        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
     }
 }
 

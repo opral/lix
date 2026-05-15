@@ -4,7 +4,7 @@ The stable core is:
 
 ```text
 An ordered byte-key entry backend with coherent read views, batched point
-access, forward paged range scans, and atomic batched writes.
+access, forward row-bounded range visits, and atomic batched writes.
 ```
 
 Everything else is either `storage_v2` adapter behavior or an additive backend
@@ -38,7 +38,7 @@ Backend:
   ordered byte keys
   opaque byte values
   get_many
-  scan_range
+  visit_range
   put_many / delete_many
   begin_read / begin_write
   capabilities
@@ -94,7 +94,7 @@ Every v0 backend must support:
 begin_read
 begin_write
 get_many
-scan_range
+visit_range
 put_many
 delete_many
 commit
@@ -189,21 +189,21 @@ Backend author mapping:
 ```text
 FoundationDB:
   get_many     -> transaction get calls
-  scan_range   -> transaction get_range
+  visit_range  -> transaction get_range
   put_many     -> set
   delete_many  -> clear
   commit       -> commit
 
 RocksDB:
   get_many     -> MultiGet
-  scan_range   -> iterator seek + next
+  visit_range  -> iterator seek + next
   put_many     -> WriteBatch
   delete_many  -> WriteBatch delete
   commit       -> DB::write / Transaction::Commit
 
 SQLite:
   get_many     -> SELECT ... WHERE key IN (...)
-  scan_range   -> WHERE space = ? AND key >= ? AND key < ? ORDER BY key LIMIT ?
+  visit_range  -> WHERE space = ? AND key >= ? AND key < ? ORDER BY key LIMIT ?
   put_many     -> transaction + batched INSERT/UPDATE
   delete_many  -> transaction + batched DELETE
 ```
@@ -315,12 +315,13 @@ pub trait BackendRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError>;
 
-    fn scan_range(
+    fn visit_range(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError>;
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -328,6 +329,14 @@ pub trait BackendRead {
     {
         Ok(())
     }
+}
+
+pub trait ScanVisitor {
+    fn visit(
+        &mut self,
+        key: &Key,
+        value: ProjectedValueRef<'_>,
+    ) -> Result<(), BackendError>;
 }
 ```
 
@@ -387,16 +396,19 @@ impl Default for ScanOptions<'_> {
 }
 ```
 
-Scans must be paged:
+Backend scans are visitor-first and row-bounded:
 
 ```rust
-#[derive(Clone, Debug)]
-pub struct ScanPage {
-    pub entries: ReadBatch,
-    /// True means callers should continue by resuming after the last emitted
-    /// key. False means this backend page reached the end of the requested
-    /// range in this read view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanResult {
+    pub emitted: usize,
     pub has_more: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectedValueRef<'a> {
+    KeyOnly,
+    FullValue(&'a Bytes),
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +424,15 @@ opaque cursors are extension paths. Storage-level helpers may normalize
 `limit_rows = 0`, wrap public cursor tokens, validate cursor scope, and perform
 lookahead/buffering when they want an exact public "no cursor means no more
 eligible rows" promise.
+
+Materialized scan pages are a storage adapter convenience:
+
+```rust
+pub struct ScanPage {
+    pub entries: ReadBatch,
+    pub has_more: bool,
+}
+```
 
 ## Projection / Envelope Extensions
 
@@ -894,7 +915,7 @@ payload_ref = P
 ### Pushdown Support Result
 
 The support structures below belong to pushdown/envelope extension results.
-Core v0 `get_many` and `scan_range` do not return support metadata.
+Core v0 `get_many` and `visit_range` do not return support metadata.
 
 ```rust
 #[derive(Clone, Debug)]
@@ -1143,7 +1164,7 @@ Make the core look like native backend calls:
 
 ```text
 get_many
-scan_range
+visit_range
 put_many
 delete_many
 ```
@@ -1245,13 +1266,18 @@ let deleted_false = BackendPredicate {
 };
 
 let range = Prefix { bytes: schema_file_prefix }.to_range()?;
-let page = read.scan_range(
+let mut page_entries = Vec::new();
+let result = read.visit_range(
     TRACKED_BY_FILE_SPACE,
     range,
     ScanOptions {
         projection: CoreProjection::FullValue,
         limit_rows: 2048,
         resume_after: storage_cursor.last_key(),
+    },
+    &mut |key, value| {
+        page_entries.push((key.clone(), value.to_owned()));
+        Ok(())
     },
 )?;
 ```
@@ -1403,7 +1429,7 @@ higher engine layer, not in backend_v2.
 begin_read
 begin_write
 get_many
-scan_range
+visit_range
 put_many
 delete_many
 commit
@@ -1637,12 +1663,13 @@ pub trait BackendRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError>;
 
-    fn scan_range(
+    fn visit_range(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError>;
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError>;
 }
 
 pub trait BackendWrite {
