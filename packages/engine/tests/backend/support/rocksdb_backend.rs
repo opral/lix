@@ -189,8 +189,13 @@ impl BackendRead for RocksDbRead<'_> {
             }
 
             let key = decode_entry_key(encoded_key)?;
-            let value = Bytes::copy_from_slice(value.as_ref());
-            visitor.visit(&key, project_value_ref(&value, opts.projection))?;
+            match opts.projection {
+                CoreProjection::KeyOnly => visitor.visit(&key, ProjectedValueRef::KeyOnly)?,
+                CoreProjection::FullValue => {
+                    let value = Bytes::copy_from_slice(value.as_ref());
+                    visitor.visit(&key, ProjectedValueRef::FullValue(&value))?;
+                }
+            }
             emitted += 1;
         }
 
@@ -334,13 +339,6 @@ fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
         CoreProjection::FullValue => ProjectedValue::FullValue(value),
-    }
-}
-
-fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
     }
 }
 
