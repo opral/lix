@@ -3403,16 +3403,16 @@ STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
 
 Smoke baseline:
 
-| Case                                      | Smoke range |
-| ----------------------------------------- | ----------: |
-| commit puts k1024/g16                     | 114-354 us  |
-| mixed 80/20 k1024/g16                     |  87-116 us  |
-| commit touched existing k128/g16          | 8.9-10.9 us |
-| planned visit unique m1000/u100           | 4.6-4.8 us  |
-| planned get many m1000/u100               | 3.7-4.3 us  |
-| scan range visit key-only q1000           | 2.0-3.9 us  |
-| scan range materialized q1000             | 21-24 us    |
-| prefix scan materialized q1000            | 12-20 us    |
+| Case                             | Smoke range |
+| -------------------------------- | ----------: |
+| commit puts k1024/g16            |  114-354 us |
+| mixed 80/20 k1024/g16            |   87-116 us |
+| commit touched existing k128/g16 | 8.9-10.9 us |
+| planned visit unique m1000/u100  |  4.6-4.8 us |
+| planned get many m1000/u100      |  3.7-4.3 us |
+| scan range visit key-only q1000  |  2.0-3.9 us |
+| scan range materialized q1000    |    21-24 us |
+| prefix scan materialized q1000   |    12-20 us |
 
 Interpretation:
 
@@ -3460,16 +3460,16 @@ STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
 
 Smoke baseline:
 
-| Case                                      | Smoke range |
-| ----------------------------------------- | ----------: |
-| commit puts k1024/g16                     | 2.7-10.0 ms |
-| mixed 80/20 k1024/g16                     | 2.6-5.4 ms  |
-| commit touched existing k128/g16          | 2.8-7.3 ms  |
-| planned visit unique m1000/u100           | 286-658 us  |
-| planned get many m1000/u100               | 275-505 us  |
-| scan range visit key-only q1000           | 220-385 us  |
-| scan range materialized q1000             | 216-642 us  |
-| prefix scan materialized q1000            | 222-800 us  |
+| Case                             | Smoke range |
+| -------------------------------- | ----------: |
+| commit puts k1024/g16            | 2.7-10.0 ms |
+| mixed 80/20 k1024/g16            |  2.6-5.4 ms |
+| commit touched existing k128/g16 |  2.8-7.3 ms |
+| planned visit unique m1000/u100  |  286-658 us |
+| planned get many m1000/u100      |  275-505 us |
+| scan range visit key-only q1000  |  220-385 us |
+| scan range materialized q1000    |  216-642 us |
+| prefix scan materialized q1000   |  222-800 us |
 
 Interpretation:
 
@@ -3526,16 +3526,16 @@ STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
 
 Smoke baseline:
 
-| Case                                      | Smoke range |
-| ----------------------------------------- | ----------: |
-| commit puts k1024/g16                     | 20-27 ms    |
-| mixed 80/20 k1024/g16                     | 23-26 ms    |
-| commit touched existing k128/g16          | 20-27 ms    |
-| planned visit unique m1000/u100           | 38-134 us   |
-| planned get many m1000/u100               | 48-72 us    |
-| scan range visit key-only q1000           | 141-302 us  |
-| scan range materialized q1000             | 313-518 us  |
-| prefix scan materialized q1000            | 223-429 us  |
+| Case                             | Smoke range |
+| -------------------------------- | ----------: |
+| commit puts k1024/g16            |    20-27 ms |
+| mixed 80/20 k1024/g16            |    23-26 ms |
+| commit touched existing k128/g16 |    20-27 ms |
+| planned visit unique m1000/u100  |   38-134 us |
+| planned get many m1000/u100      |    48-72 us |
+| scan range visit key-only q1000  |  141-302 us |
+| scan range materialized q1000    |  313-518 us |
+| prefix scan materialized q1000   |  223-429 us |
 
 Interpretation:
 
@@ -3587,16 +3587,16 @@ STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
 
 Smoke baseline:
 
-| Case                                      | Smoke range |
-| ----------------------------------------- | ----------: |
-| commit puts k1024/g16                     | 596-920 us  |
-| mixed 80/20 k1024/g16                     | 683-965 us  |
-| commit touched existing k128/g16          | 601-1063 us |
-| planned visit unique m1000/u100           | 100-160 us  |
-| planned get many m1000/u100               | 143-246 us  |
-| scan range visit key-only q1000           | 463-701 us  |
-| scan range materialized q1000             | 439-972 us  |
-| prefix scan materialized q1000            | 359-679 us  |
+| Case                             | Smoke range |
+| -------------------------------- | ----------: |
+| commit puts k1024/g16            |  596-920 us |
+| mixed 80/20 k1024/g16            |  683-965 us |
+| commit touched existing k128/g16 | 601-1063 us |
+| planned visit unique m1000/u100  |  100-160 us |
+| planned get many m1000/u100      |  143-246 us |
+| scan range visit key-only q1000  |  463-701 us |
+| scan range materialized q1000    |  439-972 us |
+| prefix scan materialized q1000   |  359-679 us |
 
 Interpretation:
 
@@ -3609,4 +3609,72 @@ The first smoke numbers are directionally different from both SQLite and redb:
   - scans are slower than redb/SQLite in this simple key-only q1000 case.
 
 Now the real-backend matrix is complete enough to rank optimization work.
+```
+
+## 2026-05-15: full real-backend smoke matrix
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
+  --bench storage_v2 \
+  '^storage_v2/backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)$'
+```
+
+Smoke comparison:
+
+| Case                             |  in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | ---------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16            |  166-255us |  3.2-28.0ms |   20-29ms |    0.6-2.4ms |
+| mixed 80/20 k1024/g16            |   89-286us |   2.9-5.7ms |   20-31ms |    0.5-1.3ms |
+| commit touched existing k128/g16 |    10-25us |  4.8-12.2ms |   17-29ms |    0.5-2.1ms |
+| planned visit unique m1000/u100  | 4.7-12.7us |   465-811us |   13-15us |      63-66us |
+| planned get many m1000/u100      | 6.3-13.3us |   157-216us |   14-22us |      70-96us |
+| scan visit key-only q1000        |  2.8-4.5us |   261-890us | 115-153us |    206-225us |
+| scan materialized q1000          |    12-25us |   173-328us | 184-390us |    306-425us |
+| prefix materialized q1000        |    21-42us |   186-264us | 180-255us |    286-395us |
+
+Ranking read:
+
+```text
+Writes:
+  in_memory is the storage/backend overhead floor.
+  rocksdb_temp is the fastest durable real backend in this fixture.
+  sqlite_temp is much slower than RocksDB on writes but much faster than redb.
+  redb_temp write cost is the biggest outlier.
+
+Point reads:
+  redb_temp is surprisingly close to in_memory for m1000/u100.
+  rocksdb_temp is next.
+  sqlite_temp is slowest for visitor point reads but less bad for materialized
+  planned get_many in this run.
+
+Scans:
+  in_memory is the floor.
+  redb_temp and sqlite_temp are close for materialized prefix/range scans.
+  rocksdb_temp is slower on q1000 scan materialization in this fixture, though
+  its visitor scan improved substantially after snapshot/range fixes.
+```
+
+Next optimization candidates:
+
+```text
+1. Profile redb_temp writes:
+     commit_puts_k1024_g16_v32
+     commit_puts_k128_g16_existing10k_touched_v32
+
+   Goal: decide whether cost is redb commit/durability, per-row table insert,
+   or fixture file-copy setup.
+
+2. Profile sqlite_temp planned_visit_unique_m1000_u100 and get_many:
+   Goal: compare VALUES-list point lookup versus one prepared statement per key
+   or a temp requested-key table.
+
+3. Profile rocksdb_temp scan_range_visit_key_only_q1000:
+   Goal: determine whether scan cost is iterator creation, snapshot, key decode,
+   value materialization despite KeyOnly, or storage visitor overhead.
+
+Do not change the backend_v2 API based on this smoke pass alone. The matrix now
+shows backend-specific implementation costs more strongly than generic storage
+shape costs.
 ```
