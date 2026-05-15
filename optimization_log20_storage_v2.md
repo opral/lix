@@ -3054,13 +3054,13 @@ STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine \
 
 Smoke scorecard:
 
-| Case                                      | Smoke median |
-| ----------------------------------------- | -----------: |
-| commit puts k1024/g16 into empty backend  |    262.42 us |
-| commit puts k128/g16 into existing 10k    |      2.55 ms |
-| planned visit unique m1000/u100           |      4.19 us |
-| materialized key-only scan q1000          |     15.80 us |
-| borrowed key-only scan q1000              |      2.01 us |
+| Case                                     | Smoke median |
+| ---------------------------------------- | -----------: |
+| commit puts k1024/g16 into empty backend |    262.42 us |
+| commit puts k128/g16 into existing 10k   |      2.55 ms |
+| planned visit unique m1000/u100          |      4.19 us |
+| materialized key-only scan q1000         |     15.80 us |
+| borrowed key-only scan q1000             |      2.01 us |
 
 Interpretation:
 
@@ -3112,14 +3112,14 @@ timed loop.
 
 Post-change smoke scorecard:
 
-| Case                                         | Smoke median |
-| -------------------------------------------- | -----------: |
-| commit puts k1024/g16 into empty backend     |    127.12 us |
-| commit puts k128/g16 with existing 10k untouched | 11.56 us |
-| commit puts k128/g16 with existing 10k touched   | 346.97 us |
-| planned visit unique m1000/u100              |      8.43 us |
-| materialized key-only scan q1000             |     23.17 us |
-| borrowed key-only scan q1000                 |      3.19 us |
+| Case                                             | Smoke median |
+| ------------------------------------------------ | -----------: |
+| commit puts k1024/g16 into empty backend         |    127.12 us |
+| commit puts k128/g16 with existing 10k untouched |     11.56 us |
+| commit puts k128/g16 with existing 10k touched   |    346.97 us |
+| planned visit unique m1000/u100                  |      8.43 us |
+| materialized key-only scan q1000                 |     23.17 us |
+| borrowed key-only scan q1000                     |      3.19 us |
 
 Interpretation:
 
@@ -3220,4 +3220,78 @@ layer. A later compaction policy may be useful:
 
 For now this is the right in-memory backend shape for small writes into large
 spaces without penalizing flat read snapshots.
+```
+
+## 2026-05-15: overlay-depth smoke benches and scan fast path
+
+Change:
+
+```text
+Added in-memory backend smoke benches for:
+  direct backend write commit, bypassing StorageWriteSet
+  overlay-depth point reads at d0/d1/d8/d32
+  overlay-depth scans at d0/d1/d8/d32
+
+These separate backend write mechanics from storage staging and make overlay
+depth visible before adding compaction policy.
+```
+
+Initial finding:
+
+```text
+Layered point reads degraded gradually with depth, as expected.
+
+Layered scans were bad immediately when depth >= 1, even when overlay keys were
+outside the scanned range:
+  d0 scan: ~3.44 us
+  d1 scan: ~237 us
+  d8 scan: ~298 us
+  d32 scan: ~273 us
+
+That exposed a first-principles bug in the overlay scan path: it merged the base
+space into a temporary BTreeMap even when no overlay row could affect the query
+range.
+```
+
+Change:
+
+```text
+Layered range scans now check whether the current layer has puts/deletes inside
+the requested range. If not, scan delegates directly to the base layer. Flat
+spaces still use the direct BTreeMap::range path.
+```
+
+Post-change smoke scorecard:
+
+| Case                         | Smoke median |
+| ---------------------------- | -----------: |
+| direct commit k1024/g16      |     78.96 us |
+| direct touched 10k k128/g16  |      6.94 us |
+| overlay point d0 m1000/u100  |      3.99 us |
+| overlay point d1 m1000/u100  |      5.19 us |
+| overlay point d8 m1000/u100  |      8.30 us |
+| overlay point d32 m1000/u100 |     23.31 us |
+| overlay scan d0 q1000        |      1.44 us |
+| overlay scan d1 q1000        |      2.18 us |
+| overlay scan d8 q1000        |      3.17 us |
+| overlay scan d32 q1000       |      2.60 us |
+
+Interpretation:
+
+```text
+The scan fast path removed the immediate layered-scan cliff without needing
+compaction. Overlay point reads still scale with depth because they walk each
+layer until they find the key or reach the base.
+
+Do not add compaction yet. The benchmark now tells us the actual threshold
+question:
+  if domain workloads stack many overlays on one hot point-read space, compact
+  after some depth;
+  otherwise keep the overlay design simple and move to real backends.
+
+The direct write bench gives a cleaner backend-only floor:
+  direct k1024/g16: ~79 us
+Compared with storage commit smoke, this says the remaining storage overhead is
+mostly write-set staging and grouped lowering, which is expected and already
+shape-guarded.
 ```

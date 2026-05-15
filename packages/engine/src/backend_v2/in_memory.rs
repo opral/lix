@@ -147,14 +147,23 @@ impl BackendRead for InMemoryRead {
         Ok(GetManyResult::new(
             self.entries
                 .get(&space)
-                .map(|space_entries| {
-                    keys.iter()
+                .map(|space_entries| match space_entries.as_ref() {
+                    SpaceState::Flat(entries) => keys
+                        .iter()
+                        .map(|key| {
+                            entries
+                                .get(key)
+                                .map(|value| project_value(value, opts.projection))
+                        })
+                        .collect(),
+                    _ => keys
+                        .iter()
                         .map(|key| {
                             space_entries
                                 .get(key)
                                 .map(|value| project_value(value, opts.projection))
                         })
-                        .collect()
+                        .collect(),
                 })
                 .unwrap_or_else(|| vec![None; keys.len()]),
         ))
@@ -171,11 +180,23 @@ impl BackendRead for InMemoryRead {
         V: PointVisitor + ?Sized,
     {
         if let Some(space_entries) = self.entries.get(&space) {
-            for (index, key) in keys.iter().enumerate() {
-                let value = space_entries
-                    .get(key)
-                    .map(|value| project_value_ref(value, opts.projection));
-                visitor.visit(index, key, value)?;
+            match space_entries.as_ref() {
+                SpaceState::Flat(entries) => {
+                    for (index, key) in keys.iter().enumerate() {
+                        let value = entries
+                            .get(key)
+                            .map(|value| project_value_ref(value, opts.projection));
+                        visitor.visit(index, key, value)?;
+                    }
+                }
+                _ => {
+                    for (index, key) in keys.iter().enumerate() {
+                        let value = space_entries
+                            .get(key)
+                            .map(|value| project_value_ref(value, opts.projection));
+                        visitor.visit(index, key, value)?;
+                    }
+                }
             }
         } else {
             for (index, key) in keys.iter().enumerate() {
@@ -230,7 +251,9 @@ impl BackendWrite for InMemoryWrite {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            overlay.deletes.remove(&entry.key);
+            if !overlay.deletes.is_empty() {
+                overlay.deletes.remove(&entry.key);
+            }
             overlay.puts.insert(entry.key, value);
         }
         self.stats.backend_calls += 1;
@@ -240,7 +263,9 @@ impl BackendWrite for InMemoryWrite {
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         let overlay = self.overlays.entry(space).or_default();
         for key in keys {
-            overlay.puts.remove(key);
+            if !overlay.puts.is_empty() {
+                overlay.puts.remove(key);
+            }
             overlay.deletes.insert(key.clone());
         }
         self.stats.deleted_entries += keys.len() as u64;
@@ -335,21 +360,55 @@ where
         return Ok(ScanResult::default());
     }
 
-    if let SpaceState::Flat(entries) = space_entries.as_ref() {
-        return visit_flat_range(entries, lower, upper, opts, visitor);
-    }
+    visit_space_range(space_entries, lower, upper, opts, visitor)
+}
 
-    let mut rows = BTreeMap::<&Key, Option<&Bytes>>::new();
-    collect_range(space_entries, &lower, &upper, &mut rows);
+fn visit_space_range<V>(
+    state: &SpaceState,
+    lower: Bound<&Key>,
+    upper: Bound<&Key>,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
+    match state {
+        SpaceState::Empty => Ok(ScanResult::default()),
+        SpaceState::Flat(entries) => visit_flat_range(entries, lower, upper, opts, visitor),
+        SpaceState::Layered {
+            base,
+            puts,
+            deletes,
+        } if !range_has_entries(puts, &lower, &upper)
+            && !range_has_keys(deletes, &lower, &upper) =>
+        {
+            visit_space_range(base, lower, upper, opts, visitor)
+        }
+        SpaceState::Layered { .. } => {
+            let mut rows = BTreeMap::<&Key, Option<&Bytes>>::new();
+            collect_range(state, &lower, &upper, &mut rows);
 
-    match opts.projection {
-        CoreProjection::KeyOnly => visit_rows(rows, opts.limit_rows, visitor, |_, _| {
-            ProjectedValueRef::KeyOnly
-        }),
-        CoreProjection::FullValue => visit_rows(rows, opts.limit_rows, visitor, |_, value| {
-            ProjectedValueRef::FullValue(value)
-        }),
+            match opts.projection {
+                CoreProjection::KeyOnly => visit_rows(rows, opts.limit_rows, visitor, |_, _| {
+                    ProjectedValueRef::KeyOnly
+                }),
+                CoreProjection::FullValue => {
+                    visit_rows(rows, opts.limit_rows, visitor, |_, value| {
+                        ProjectedValueRef::FullValue(value)
+                    })
+                }
+            }
+        }
     }
+}
+
+fn range_has_entries(entries: &SpaceEntries, lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
+    entries.range((*lower, *upper)).next().is_some()
+}
+
+fn range_has_keys(keys: &BTreeSet<Key>, lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
+    keys.range((*lower, *upper)).next().is_some()
 }
 
 fn visit_flat_range<V>(
