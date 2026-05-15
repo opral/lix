@@ -3,12 +3,14 @@ use crate::backend_v2::{
     ScanPage,
 };
 use crate::storage_v2::{
-    get_many_caller_order, get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
+    get_many_borrowed_indexed_values_for_plan,
+    get_many_borrowed_indexed_values_for_plan_with_stats, get_many_caller_order,
+    get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
     get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats,
-    IndexedPointValues, PointRequestPlan, PointSlot, StorageReadResult, StorageReadScope,
-    StorageReadStats, StorageSpace,
+    BorrowedIndexedPointValues, IndexedPointValues, PointRequestPlan, PointSlot, StorageReadResult,
+    StorageReadScope, StorageReadStats, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -67,6 +69,20 @@ pub trait StorageReader {
         plan: &PointRequestPlan,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>;
+
+    fn get_many_borrowed_indexed_values_for_plan<'a>(
+        &self,
+        space: StorageSpace,
+        plan: &'a PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<BorrowedIndexedPointValues<'a>, BackendError>;
+
+    fn get_many_borrowed_indexed_values_for_plan_with_stats<'a>(
+        &self,
+        space: StorageSpace,
+        plan: &'a PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError>;
 
     fn scan_range(
         &self,
@@ -171,6 +187,29 @@ where
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<IndexedPointValues>, BackendError> {
         get_many_indexed_values_for_plan_with_stats(self.backend_read(), space.id, plan, opts)
+    }
+
+    fn get_many_borrowed_indexed_values_for_plan<'a>(
+        &self,
+        space: StorageSpace,
+        plan: &'a PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<BorrowedIndexedPointValues<'a>, BackendError> {
+        get_many_borrowed_indexed_values_for_plan(self.backend_read(), space.id, plan, opts)
+    }
+
+    fn get_many_borrowed_indexed_values_for_plan_with_stats<'a>(
+        &self,
+        space: StorageSpace,
+        plan: &'a PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError> {
+        get_many_borrowed_indexed_values_for_plan_with_stats(
+            self.backend_read(),
+            space.id,
+            plan,
+            opts,
+        )
     }
 
     fn scan_range(
@@ -474,6 +513,22 @@ mod tests {
             result.value.value_at(2),
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"A")))
         );
+
+        let borrowed = read
+            .get_many_borrowed_indexed_values_for_plan_with_stats(
+                space(1),
+                &plan,
+                GetOptions::default(),
+            )
+            .expect("borrowed planned indexed read");
+
+        assert_eq!(borrowed.stats.requested_keys, 4);
+        assert_eq!(borrowed.value.requested_to_unique, plan.requested_to_unique);
+        assert_eq!(
+            borrowed.value.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
+        );
+        assert_eq!(borrowed.value.value_at(1), None);
     }
 
     #[test]
