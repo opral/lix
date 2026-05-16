@@ -123,6 +123,15 @@ async fn execute_write_logical_plan_with_mode_inner(
     };
     validate_write_parameter_count(&write_plan.plan, params.len())?;
 
+    if mode != WriteExecutorModeInner::ForceDataFusion
+        && super::bound_public_write::supports_bound_public_write(&write_plan.plan)
+    {
+        let rows_affected =
+            super::bound_public_write::execute_bound_public_write(ctx, &write_plan.plan, params)
+                .await?;
+        return Ok((rows_affected, WriteExecutorPath::Fast));
+    }
+
     if mode != WriteExecutorModeInner::ForceDataFusion {
         super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan.plan, params)
             .await?;

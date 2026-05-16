@@ -38,26 +38,6 @@ manual/diagnostic/stress tests.
   - Reason: public SQL integration harness was disabled for Phase 1 writes.
   - Unblock: all public write targets used by the SQL harness have bound executors.
 
-- `packages/engine/tests/transaction.rs:18`
-  - `read_sql_rolls_back_read_transaction_when_pre_plan_setup_fails`
-  - Reason: uses public `UPDATE lix_key_value`.
-  - Unblock: entity-surface `UPDATE` runs through the bound executor.
-
-- `packages/engine/tests/transaction.rs:60`
-  - `write_transaction_open_rolls_back_when_active_version_resolution_fails`
-  - Reason: uses public `UPDATE` and `INSERT INTO lix_key_value`.
-  - Unblock: entity-surface `UPDATE` and `INSERT` run through the bound executor.
-
-- `packages/engine/tests/transaction.rs:140`
-  - `active_transaction_blocks_session_read_and_allows_transaction_read`
-  - Reason: uses public `INSERT INTO lix_key_value`.
-  - Unblock: entity-surface `INSERT` runs through the bound executor.
-
-- `packages/engine/tests/transaction.rs:195`
-  - `begin_transaction_cannot_race_with_opening_session_write`
-  - Reason: uses public `INSERT INTO lix_key_value`.
-  - Unblock: entity-surface `INSERT` runs through the bound executor.
-
 ### Delete Or Replace
 
 - `packages/engine/src/sql2/providers/lix_state.rs:2122`
@@ -136,12 +116,25 @@ same public behavior.
 - `packages/engine/tests/storage_accounting.rs:318`
   - Prints deterministic untracked_state storage accounting table.
 
+## Reactivated In Bound Entity Phase
+
+- `packages/engine/tests/transaction.rs`
+  - `read_sql_rolls_back_read_transaction_when_pre_plan_setup_fails`
+  - `write_transaction_open_rolls_back_when_active_version_resolution_fails`
+  - `active_transaction_blocks_session_read_and_allows_transaction_read`
+  - `begin_transaction_cannot_race_with_opening_session_write`
+  - Verified with `cargo test -p lix_engine --test transaction -- --nocapture`.
+
+The bound entity write executor now handles public entity `INSERT`, `UPDATE`,
+and `DELETE` for the functional targets exercised by branching, transaction,
+engine, and the targeted ignored SQL cases. Raw DataFusion provider DML remains
+in the delete-or-replace bucket until those provider paths are removed or
+guarded by code-structure tests.
+
 ## Current Behavioral Blocker
 
-`cargo test -p lix_engine --test branching` fails because public SQL entity
-surface writes are bound successfully but execution still routes non-`lix_state`
-targets through the DataFusion reference writer, which rejects them with
-`LIX_UNSUPPORTED_SQL`.
-
-The next implementation step should add a bound executor path for public entity
-surface writes while keeping raw `TableProvider` DML fail-closed.
+The remaining broad blocker is the disabled SQL integration harness at
+`packages/engine/tests/sql.rs:26`. Reactivation should proceed in target-driven
+batches after running the full `cargo test -p lix_engine --test sql` gate and
+triaging any residual public target gaps separately from obsolete raw provider
+DML coverage.
