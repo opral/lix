@@ -74,17 +74,7 @@ pub(crate) async fn create_logical_plan_from_parsed(
     sql: &str,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
-    validate_public_read_sql_surface(sql)?;
-    if crate::sql2::classify_datafusion_statement(&statement)
-        == crate::sql2::SqlStatementKind::Write
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "SQL writes must use the bound write planning path",
-        ));
-    }
-    crate::sql2::validate_supported_datafusion_statement_ast(&statement)?;
-    crate::sql2::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
+    crate::sql2::bind_read_statement(sql, &statement)?;
     let session = build_read_session(ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
@@ -107,17 +97,7 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     sql: &str,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
-    validate_public_read_sql_surface(sql)?;
-    if crate::sql2::classify_datafusion_statement(&statement)
-        == crate::sql2::SqlStatementKind::Write
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "SQL writes must use the bound write planning path",
-        ));
-    }
-    crate::sql2::validate_supported_datafusion_statement_ast(&statement)?;
-    crate::sql2::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
+    crate::sql2::bind_read_statement(sql, &statement)?;
     let session = build_write_session(ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
@@ -132,25 +112,6 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
         notices,
         strict_binary_params: BTreeSet::new(),
     }))
-}
-
-fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
-    let normalized = sql.to_ascii_lowercase();
-    if normalized.contains("lower(path)") {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "public column 'path' must be compared directly to a literal or parameter",
-        ));
-    }
-    if normalized.contains("lixcol_version_id")
-        && (normalized.contains("= lower(") || normalized.contains(" in (lower("))
-    {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "public column 'lixcol_version_id' must be compared directly to a literal or parameter",
-        ));
-    }
-    Ok(())
 }
 
 async fn create_logical_plan_from_statement(
@@ -241,9 +202,6 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         .table_provider(table_name)
         .await
         .map_err(datafusion_error_to_lix_error)?;
-    if plan.bound.version_scope == VersionScope::Empty {
-        return Ok(0);
-    }
     let table_schema = table.schema();
     let state = session.state();
 
@@ -252,16 +210,25 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
             let input =
                 insert_input_plan(&session, std::sync::Arc::clone(&table_schema), plan, params)
                     .await?;
+            if plan.bound.version_scope == VersionScope::Empty {
+                return Ok(0);
+            }
             table.insert_into(&state, input, InsertOp::Append).await
         }
         BoundWriteOp::Update => {
             let assignments =
                 datafusion_assignments(&session, table_schema.as_ref(), plan, params)?;
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
+            if plan.bound.version_scope == VersionScope::Empty {
+                return Ok(0);
+            }
             table.update(&state, assignments, filters).await
         }
         BoundWriteOp::Delete => {
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
+            if plan.bound.version_scope == VersionScope::Empty {
+                return Ok(0);
+            }
             table.delete_from(&state, filters).await
         }
     }
@@ -274,6 +241,49 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         query_result_from_batches(&[Field::new("count", DataType::UInt64, false)], &batches)?;
 
     affected_rows_from_query_result(result)
+}
+
+pub(crate) async fn validate_datafusion_write_logical_plan(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+) -> Result<(), LixError> {
+    let session = build_write_session(ctx).await?;
+    let table_name = write_target_table_name(plan)?;
+    let table = session
+        .table_provider(table_name)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    let table_schema = table.schema();
+    let state = session.state();
+
+    match plan.bound.op {
+        BoundWriteOp::Insert => {
+            let input = insert_input_plan(&session, table_schema, plan, params).await?;
+            let _ = table
+                .insert_into(&state, input, InsertOp::Append)
+                .await
+                .map_err(datafusion_error_to_lix_error)?;
+        }
+        BoundWriteOp::Update => {
+            let assignments =
+                datafusion_assignments(&session, table_schema.as_ref(), plan, params)?;
+            let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
+            let _ = table
+                .update(&state, assignments, filters)
+                .await
+                .map_err(datafusion_error_to_lix_error)?;
+        }
+        BoundWriteOp::Delete => {
+            let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
+            let _ = table
+                .delete_from(&state, filters)
+                .await
+                .map_err(datafusion_error_to_lix_error)?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn insert_input_plan(
@@ -397,6 +407,10 @@ fn datafusion_write_filters(
                 None,
             )),
         )));
+    }
+    let df_schema = DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
+    for filter in &filters {
+        validate_json_predicate_expr_with_dfschema(&df_schema, filter)?;
     }
     Ok(filters)
 }
@@ -3815,6 +3829,67 @@ mod tests {
         )
         .await
         .expect_err("column contradiction should not bypass JSON predicate validation");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error
+            .message
+            .contains("JSON columns can only be compared with JSON expressions"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_false_predicate_still_validates_json_predicates() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state \
+             SET metadata = lix_json('{}') \
+             WHERE false \
+               AND metadata = 'not-json-typed'",
+            &[],
+        )
+        .await
+        .expect_err("false predicate should not bypass JSON predicate validation");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error
+            .message
+            .contains("JSON columns can only be compared with JSON expressions"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_by_version_empty_scope_still_validates_json_predicates() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state_by_version \
+             SET metadata = lix_json('{}') \
+             WHERE version_id = 'version-a' \
+               AND version_id = 'version-b' \
+               AND metadata = 'not-json-typed'",
+            &[],
+        )
+        .await
+        .expect_err("empty version scope should not bypass JSON predicate validation");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert!(error

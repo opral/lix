@@ -1,6 +1,5 @@
 mod bind;
 mod catalog;
-mod classify;
 mod context;
 mod dml;
 mod error;
@@ -27,9 +26,9 @@ mod udfs;
 mod version_scope;
 mod write_normalization;
 
-pub(crate) use bind::{bind_statement, BoundStatement};
-pub(crate) use classify::{
-    classify_datafusion_statement, validate_supported_datafusion_statement_ast, SqlStatementKind,
+pub(crate) use bind::{
+    bind_read_statement, bind_statement, bind_statement_route, BoundStatement, BoundStatementRoute,
+    SqlStatementKind,
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
@@ -49,4 +48,4 @@ pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath,
 };
 pub(crate) use parse::parse_statement;
-pub(crate) use plan::{plan_write, LogicalReadPlan, LogicalWritePlan};
+pub(crate) use plan::plan_write;

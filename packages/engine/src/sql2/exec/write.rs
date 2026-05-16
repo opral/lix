@@ -124,6 +124,8 @@ async fn execute_write_logical_plan_with_mode_inner(
     validate_write_parameter_count(&write_plan.plan, params.len())?;
 
     if mode != WriteExecutorModeInner::ForceDataFusion {
+        super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan.plan, params)
+            .await?;
         if let Some(fast_plan) =
             crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan.plan)?
         {

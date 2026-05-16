@@ -6,15 +6,15 @@ The implementation strategy is intentionally a hard cut: create the ideal Rust t
 
 ## Invariants
 
-- [ ] Raw sqlparser/DataFusion AST is only interpreted in `parse/` and `bind/`.
-- [ ] Table names, column names, hidden/public columns, aliases, duplicate targets, qualified names, params, and assignment validity are resolved exactly once in `bind/`.
-- [ ] Fast write execution never validates SQL and never inspects raw `ObjectName`, `Ident`, or unbound AST.
-- [ ] Fast write execution only accepts a validated `BoundWrite` or canonical `LogicalWritePlan`.
-- [ ] Normal DataFusion execution and fast execution consume the same bound/plan representation.
-- [ ] Live-state visibility, transaction overlays, global-row projection, tombstone handling, and dedupe live behind one storage visibility API.
-- [ ] Empty filter, no-match filter, and all-values filter are distinct Rust states, never overloaded as empty `Vec`.
-- [ ] `_by_version` and base entity surfaces are distinct bound targets with different public columns and version-scope rules.
-- [ ] Fast path can only decline; it cannot silently change semantics.
+- [x] Write semantics from raw sqlparser/DataFusion AST are interpreted in `parse/` and `bind/`; read statements may still be handed to DataFusion after bind-owned public-surface validation.
+- [x] Public write table names, column names, hidden/public columns, aliases, duplicate targets, qualified names, params, and assignment validity are resolved exactly once in `bind/`.
+- [x] Fast write execution never validates SQL and never inspects raw `ObjectName`, `Ident`, or unbound AST.
+- [x] Fast write execution only accepts a validated `BoundWrite` or canonical `LogicalWritePlan`.
+- [x] Normal DataFusion write execution and fast write execution consume the same bound/plan representation.
+- [x] Live-state visibility, transaction overlays, global-row projection, tombstone handling, and dedupe live behind one storage visibility API.
+- [x] Row-level all/no-match filter state is explicit (`LiveStateRowFilter::{All,None}`); empty version id vectors remain the storage all-version scan convention.
+- [x] `_by_version` and base entity surfaces are distinct bound targets with different public columns and version-scope rules.
+- [x] Fast path can only decline; it cannot silently change semantics.
 
 ## Target File Layout
 
@@ -65,9 +65,10 @@ packages/engine/src/sql2/
 
   storage/
     mod.rs
-    live_state.rs
-    visibility.rs
     constraints.rs
+
+    # Implemented under the non-SQL owner:
+    # packages/engine/src/live_state/visibility.rs
 
   providers/
     mod.rs
@@ -253,15 +254,15 @@ Phase 2 implementation result:
 ## Phase 3: Binding Writes
 
 - [x] Implement `bind::bind_statement`.
-- [ ] Implement `bind::write::bind_insert`.
-- [ ] Implement `bind::write::bind_update`.
-- [ ] Implement `bind::write::bind_delete`.
+- [x] Implement `bind::write::bind_insert`.
+- [x] Implement `bind::write::bind_update`.
+- [x] Implement `bind::write::bind_delete`.
 - [x] Bind assignment targets into resolved column IDs, not strings.
 - [x] Reject duplicate insert target columns during binding.
 - [x] Reject duplicate update assignment targets during binding.
 - [x] Bind params in source-order once into `BoundParamMap`.
 - [x] Bind predicates into `BoundPredicate`.
-- [ ] Convert repeated identity predicates into `FilterSet` intersections during planning, not in execution.
+- [x] Convert repeated identity predicates into `FilterSet` intersections during planning, not in execution.
 - [x] Remove `ParamDecoder` from fast execution.
 - [x] Delete statement-level DML validation once binding covers the same rules.
 
@@ -272,7 +273,7 @@ Phase 3 implementation result:
 - Public catalog columns now carry stable column IDs and insert/update write capabilities. Dynamic entity primary-key root columns are insert-only, preventing bound updates that would desynchronize projected primary keys from entity identity.
 - Write version scope is bound before planning: base writes bind to active scope, `lix_version` and global `lix_state` rows bind to global scope, `_by_version` writes require concrete explicit version selectors, and no-match predicates bind to `VersionScope::Empty`.
 - Parameterized scope selectors fail closed until a later planning phase resolves bound params into concrete scopes; `VersionScope` intentionally has no dynamic variant that can leak into storage visibility.
-- Current gate: `cargo test -p lix_engine sql2::bind --lib -- --nocapture`, `cargo check -p lix_engine`, and `cargo fmt -p lix_engine --check` pass. The three `bind::write::{bind_insert,bind_update,bind_delete}` extraction items remain open because the Phase 3 implementation currently lives in `bind::statement`; extracting those helpers is a follow-up layout cleanup, not a semantic blocker.
+- Current gate: `cargo test -p lix_engine sql2::bind --lib -- --nocapture`, `cargo check -p lix_engine`, and `cargo fmt -p lix_engine --check` pass. The `bind::write::{bind_insert,bind_update,bind_delete}` entrypoints now exist and delegate to the bound implementation.
 
 ## Phase 4: Logical Write Plans
 
@@ -284,8 +285,8 @@ Phase 3 implementation result:
   - [x] `_by_version` update/delete use `VersionScope::ExplicitRequired`.
   - [x] `lix_state` can use global/active/explicit scopes where public semantics allow it.
 - [x] Represent logical no-match with `FilterSet::None` via the write-plan row sentinel.
-- [ ] Replace storage-facing `LiveStateFilter.no_match` with `FilterSet::None` or equivalent in Phase 7.
-- [ ] Convert logical write filters to storage filters only at the storage boundary.
+- [x] Replace storage-facing `LiveStateFilter.no_match` with `FilterSet::None` or equivalent in Phase 7.
+- [x] Convert logical write filters to storage filters only at the storage boundary.
 - [x] Add tests for contradictory predicates:
   - [x] repeated equality with different values returns zero matches.
   - [x] repeated `IN` intersections work.
@@ -461,7 +462,7 @@ Phase 9 progress:
 - [x] Delete duplicate assignment validation helpers.
 - [x] Delete duplicate version-filter booleans.
 - [x] Delete `LiveStateFilter.no_match` if superseded by typed filters.
-- [ ] Run `rg` for banned patterns:
+- [x] Run `rg` for banned patterns:
   - [x] `object_name_leaf`
   - [x] `statement.clone()` in fast-path selection
   - [x] `require_version_filter`
@@ -476,6 +477,8 @@ Phase 10 progress:
 - Replaced provider-local `limit = Some(0)` no-match sentinels with `LiveStateRowFilter::None`, so contradictory entity/lix_state pushdowns no longer overload limit or empty version filters.
 - Review hardening: moved the DataFusion reference-writer `VersionScope::Empty` no-op behind target resolution so unsupported no-match writes, such as `DELETE FROM lix_file WHERE false`, still fail with `LIX_UNSUPPORTED_SQL` instead of silently succeeding.
 - Review hardening: removed provider-side `lix_state` assignment validation and `_by_version` version-filter validation helpers. The provider still performs physical expression conversion and row materialization, but public assignment/version semantics are owned by bind/plan.
+- Final hardening: session read/write routing now goes through `bind_statement_route`, public UDF AST validation lives under `bind`, and fast-write validation invokes DataFusion provider DML planning hooks before fast execution can return a no-op.
+- Remaining provider-side DataFusion `Expr` analysis is read pushdown for scan pruning; it is not a write semantic path.
 - Current gate: banned-pattern `rg`, `cargo check -p lix_engine`, `cargo test -p lix_engine live_state::visibility --lib -- --nocapture`, `cargo test -p lix_engine sql2::test_support::differential --lib -- --nocapture`, `cargo test -p lix_engine sql2::exec::datafusion::tests --lib -- --nocapture`, `cargo test -p lix_engine --test code_structure -- --nocapture`, and `cargo fmt -p lix_engine --check` pass.
 
 ## Verification Gates
@@ -502,12 +505,12 @@ Phase 10 progress:
 - Start with Rust types and module boundaries, not with small behavioral patches.
 - Prefer compiler errors over compatibility adapters. Add temporary adapters only when needed to keep tests runnable between phases.
 - Keep commits phase-sized:
-  - [ ] layout/types compile cut.
-  - [ ] catalog/bind migration.
-  - [ ] logical write plan migration.
-  - [ ] fast executor migration.
-  - [ ] storage visibility migration.
-  - [ ] differential harness.
-  - [ ] legacy deletion.
+  - [x] layout/types compile cut.
+  - [x] catalog/bind migration.
+  - [x] logical write plan migration.
+  - [x] fast executor migration.
+  - [x] storage visibility migration.
+  - [x] differential harness.
+  - [x] legacy deletion.
 - Do not preserve old internal APIs for callers inside `sql2`; update them to the new pipeline.
 - Preserve public SQL behavior only where it is intentional and covered by the new binder tests.
