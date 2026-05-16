@@ -214,7 +214,7 @@ Phase 1 compiler result:
 - Review hardening: read planning entrypoints now reject write ASTs before DataFusion planning, live-state point loads and transaction schema point loads route through scan/overlay visibility, empty-version overlay dedupe happens before tombstone filtering, and stale raw-DataFusion write tests are explicitly ignored until the bound write pipeline is implemented.
 - Current gate: `cargo check -p lix_engine` passes with warnings from intentionally-unused Phase 1 target types. Write execution intentionally stops at the new binder/planner boundary until Phase 2/3 implement catalog, write binding, and bound write execution; this is the hard cut that prevents falling back to raw-AST DML semantics.
 - Current gate: `cargo test -p lix_engine sql2::exec::datafusion::tests --lib -- --nocapture` passes with active SQL2 read coverage restored through non-SQL fixtures; only write/history-write-dependent tests are ignored until the bound write pipeline is implemented.
-- Current gate: `cargo test -p lix_engine sql2::lix_state_provider::tests --lib -- --nocapture`, `cargo test -p lix_engine live_state::visibility::tests --lib -- --nocapture`, and `cargo test -p lix_engine overlay_ --lib -- --nocapture` pass. Raw provider DML hooks now fail closed, and shared live-state visibility owns overlay tombstone/dedupe/global projection semantics for both transaction and sql2 callers.
+- Current gate: `cargo test -p lix_engine sql2::providers::lix_state::tests --lib -- --nocapture`, `cargo test -p lix_engine live_state::visibility::tests --lib -- --nocapture`, and `cargo test -p lix_engine overlay_ --lib -- --nocapture` pass. Raw provider DML hooks now fail closed, and shared live-state visibility owns overlay tombstone/dedupe/global projection semantics for both transaction and sql2 callers.
 - Review hardening: overlay merge precedence is explicit now: version-specific rows beat projected global rows, staged rows beat base rows inside the same scope tier, and tracked/untracked only breaks ties within the same tier. Regression coverage includes staged tracked rows beating base untracked rows and tracked version tombstones beating staged untracked global rows.
 - Current gate: `cargo test -p lix_engine create_version_from_main --test branching -- --nocapture`, `cargo test -p lix_engine --test transaction -- --nocapture`, `cargo test -p lix_engine --test code_structure -- --nocapture`, `cargo test -p lix_engine --test sql -- --nocapture`, and `cargo fmt -p lix_engine --check` pass. The global `simulation_test!` macro is not ignored; only the public SQL integration harness is explicitly ignored for Phase 1 because it depends on disabled public SQL writes. The deterministic-mode SQL-write seed is skipped on the expected `LIX_UNSUPPORTED_SQL` hard-cut error.
 
@@ -386,11 +386,23 @@ Phase 7 progress:
 
 ## Phase 8: Providers Cleanup
 
-- [ ] Move provider files under `providers/` without changing behavior first.
-- [ ] Replace provider-local surface/column knowledge with `catalog/` contracts.
-- [ ] Ensure read providers and write providers use the same surface definitions.
-- [ ] Remove any provider-side special casing duplicated in `bind/`.
-- [ ] Keep DataFusion provider registration in one `providers::register_read` / `providers::register_write` API.
+- [x] Move provider files under `providers/` without changing behavior first.
+- [x] Replace provider-local surface/column knowledge with `catalog/` contracts.
+- [x] Ensure read providers and write providers use the same surface definitions.
+- [x] Remove any provider-side special casing duplicated in `bind/`.
+- [x] Keep DataFusion provider registration in one `providers::register_read` / `providers::register_write` API.
+
+Phase 8 progress:
+
+- Real provider implementations now live under `packages/engine/src/sql2/providers/`; the old root-level provider modules are deleted.
+- `session.rs` no longer knows the individual provider registration sequence. Read and write session construction calls only `providers::register_read` and `providers::register_write`.
+- Entity SQL surface derivation moved from the entity provider into `catalog/entity_surface.rs`, so catalog owns the schema-to-surface contract used by bind and providers.
+- Provider child modules are private behind the `providers` facade, and entity provider registration now iterates `PublicCatalog` surfaces/specs instead of independently deriving table existence from raw schemas.
+- System provider registration now dispatches from `PublicCatalog::surfaces()` by `PublicSurfaceKind`, so the catalog is the single source for every public SQL surface name wired into DataFusion.
+- Write-backed SQL sessions install read-only catalog surfaces only when the write context exposes transaction-owned committed-read capabilities, so minimal write contexts can still plan simple writes.
+- Transaction read-only providers now read through the transaction-owned SQL storage adapter instead of opening separate read transactions during provider registration.
+- Provider/catalog schema contract tests compare full Arrow field contracts for every system/entity surface, including type, nullability, and JSON metadata, instead of only names/order.
+- Code-structure coverage now asserts that session construction uses the providers facade, provider modules remain private, and entity provider registration stays catalog-driven.
 
 ## Phase 9: Differential Test Harness
 

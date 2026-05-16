@@ -984,7 +984,7 @@ mod tests {
         bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
         plan_write, BoundStatement,
     };
-    use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
+    use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlReadStore};
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
         KvValuePage, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
@@ -1160,7 +1160,7 @@ mod tests {
             let base_scope = test_read_scope(StorageContext::new(Arc::new(
                 crate::backend::testing::UnitTestBackend::new(),
             )));
-            let read_scope = StorageReadScope::new(base_scope.store());
+            let read_scope = StorageReadScope::new(SqlReadStore::scoped(base_scope.store()));
             CommitStoreQuerySource {
                 commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -3861,7 +3861,7 @@ mod tests {
 
         fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
             let base_scope = test_read_scope(self.storage.clone());
-            let read_scope = StorageReadScope::new(base_scope.store());
+            let read_scope = StorageReadScope::new(SqlReadStore::scoped(base_scope.store()));
             CommitStoreQuerySource {
                 commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),

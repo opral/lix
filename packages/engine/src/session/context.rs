@@ -13,7 +13,9 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
-use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
+use crate::sql2::{
+    CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlReadStore,
+};
 use crate::storage::{
     ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
 };
@@ -375,7 +377,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
-        let read_scope = StorageReadScope::new(self.read_store.clone());
+        let read_scope = StorageReadScope::new(SqlReadStore::scoped(self.read_store.clone()));
         CommitStoreQuerySource {
             commit_store_reader: Arc::new(self.commit_store.reader(read_scope.store())),
             json_reader: JsonStoreContext::new().reader(read_scope.store()),
