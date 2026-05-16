@@ -30,7 +30,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
 use crate::sql2::catalog::{
     entity_surface_schema, EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog,
@@ -385,7 +385,7 @@ fn apply_exact_entity_id_filters(
 ) -> Result<()> {
     if let Some(entity_ids) = entity_ids_from_primary_key_filters(spec, filters)? {
         if entity_ids.is_empty() {
-            request.limit = Some(0);
+            request.filter.rows = LiveStateRowFilter::None;
         }
         request.filter.entity_ids = entity_ids;
     }
@@ -413,7 +413,7 @@ fn apply_exact_version_id_filter(
 ) {
     if let Some(version_ids) = version_ids {
         if version_ids.is_empty() {
-            request.limit = Some(0);
+            request.filter.rows = LiveStateRowFilter::None;
         }
         request.filter.version_ids = version_ids;
     }
@@ -950,14 +950,10 @@ impl ExecutionPlan for EntityDeleteExec {
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = if request.limit == Some(0) {
-                Vec::new()
-            } else {
-                write_ctx
-                    .scan_live_state(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
+            let rows = write_ctx
+                .scan_live_state(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let source_batch = entity_record_batch(&spec, Arc::clone(&table_schema), &rows)?;
             let matched_batch = filter_entity_batch(source_batch, &filters)?;
             let mut write_rows = entity_existing_lix_state_write_rows_from_batch(
@@ -1114,14 +1110,10 @@ impl ExecutionPlan for EntityUpdateExec {
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = if request.limit == Some(0) {
-                Vec::new()
-            } else {
-                write_ctx
-                    .scan_live_state(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
+            let rows = write_ctx
+                .scan_live_state(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let source_batch = entity_record_batch(&spec, Arc::clone(&table_schema), &rows)?;
             let matched_batch = filter_entity_batch(source_batch, &filters)?;
             let write_rows = entity_update_write_rows_from_batch(
@@ -1814,14 +1806,10 @@ impl ExecutionPlan for EntityScanExec {
         let request = self.request.clone();
         let stream_schema = Arc::clone(&schema);
         let stream = stream::once(async move {
-            let rows = if request.limit == Some(0) {
-                Vec::new()
-            } else {
-                live_state
-                    .scan_rows(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
+            let rows = live_state
+                .scan_rows(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let batch = entity_record_batch(&spec, Arc::clone(&stream_schema), &rows)?;
             Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
                 batch,

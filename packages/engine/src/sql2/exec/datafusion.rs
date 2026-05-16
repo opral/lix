@@ -235,16 +235,15 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<u64, LixError> {
-    if plan.bound.version_scope == VersionScope::Empty {
-        return Ok(0);
-    }
-
     let session = build_write_session(ctx).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
         .table_provider(table_name)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    if plan.bound.version_scope == VersionScope::Empty {
+        return Ok(0);
+    }
     let table_schema = table.schema();
     let state = session.state();
 
@@ -1358,7 +1357,10 @@ mod tests {
             &self,
             request: &LiveStateScanRequest,
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            if request.filter.no_match {
+            if matches!(
+                request.filter.rows,
+                crate::live_state::LiveStateRowFilter::None
+            ) {
                 return Ok(Vec::new());
             }
             let mut rows = self
@@ -3757,6 +3759,30 @@ mod tests {
         )
         .await
         .expect_err("unsupported reference writer target should not become a fast no-op");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(
+            error.message,
+            "sql2 DataFusion reference writer currently supports only lix_state writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_unsupported_target_false_predicate_still_errors() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(&mut ctx, "DELETE FROM lix_file WHERE false", &[])
+            .await
+            .expect_err("unsupported target with empty scope should not become a no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert_eq!(

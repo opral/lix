@@ -616,7 +616,10 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<StagedScanParts, LixError> {
-        if request.filter.no_match {
+        if matches!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::None
+        ) {
             return Ok(StagedScanParts { rows: Vec::new() });
         }
 
