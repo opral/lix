@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    overlay_scan_rows, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
-use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::staging::PreparedStateRowOverlay;
 use crate::LixError;
 
