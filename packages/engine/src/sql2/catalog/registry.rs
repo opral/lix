@@ -1,23 +1,33 @@
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::Arc;
 
+#[cfg(test)]
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
 
 use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapabilities};
-use crate::sql2::entity_provider::{
-    derive_entity_surface_spec_from_schema, schema_exposed_as_entity_history_surface,
-    schema_exposed_as_entity_surface, EntityProviderVariant,
+#[cfg(test)]
+use crate::sql2::catalog::entity_surface_schema;
+use crate::sql2::catalog::{
+    derive_entity_surface_spec_from_schema, entity_system_fields,
+    schema_exposed_as_entity_history_surface, schema_exposed_as_entity_surface, EntitySurfaceShape,
+    EntitySurfaceSpec,
 };
 use crate::sql2::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
+#[cfg(test)]
+use crate::sql2::result_metadata::json_field;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
     surfaces: BTreeMap<String, PublicSurfaceContract>,
+    entity_specs: BTreeMap<String, EntitySurfaceSpec>,
 }
 
 impl PublicCatalog {
@@ -48,6 +58,65 @@ impl PublicCatalog {
 
     pub(crate) fn surface(&self, table_name: &str) -> Option<&PublicSurfaceContract> {
         self.surfaces.get(table_name)
+    }
+
+    pub(crate) fn surfaces(&self) -> impl Iterator<Item = &PublicSurfaceContract> {
+        self.surfaces.values()
+    }
+
+    pub(crate) fn entity_spec(&self, schema_key: &str) -> Option<&EntitySurfaceSpec> {
+        self.entity_specs.get(schema_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
+        let surface = self.surface(table_name)?;
+        Some(match &surface.kind {
+            PublicSurfaceKind::LixState => lix_state_schema(false),
+            PublicSurfaceKind::LixStateByVersion => lix_state_schema(true),
+            PublicSurfaceKind::File => filesystem_schema(false, true),
+            PublicSurfaceKind::FileByVersion => filesystem_schema(true, true),
+            PublicSurfaceKind::Directory => filesystem_schema(false, false),
+            PublicSurfaceKind::DirectoryByVersion => filesystem_schema(true, false),
+            PublicSurfaceKind::Version => Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("hidden", DataType::Boolean, false),
+                Field::new("commit_id", DataType::Utf8, false),
+            ])),
+            PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                json_field("entity_id", false),
+                Field::new("schema_key", DataType::Utf8, false),
+                Field::new("file_id", DataType::Utf8, true),
+                json_field("metadata", true),
+                Field::new("created_at", DataType::Utf8, false),
+                json_field("snapshot_content", true),
+            ])),
+            PublicSurfaceKind::History => Arc::new(Schema::new(vec![
+                json_field("entity_id", false),
+                Field::new("schema_key", DataType::Utf8, false),
+                Field::new("file_id", DataType::Utf8, true),
+                json_field("snapshot_content", true),
+                json_field("metadata", true),
+                Field::new("change_id", DataType::Utf8, false),
+                Field::new("observed_commit_id", DataType::Utf8, false),
+                Field::new("commit_created_at", DataType::Utf8, false),
+                Field::new("start_commit_id", DataType::Utf8, false),
+                Field::new("depth", DataType::Int64, false),
+            ])),
+            PublicSurfaceKind::FileHistory => history_filesystem_schema(true),
+            PublicSurfaceKind::DirectoryHistory => history_filesystem_schema(false),
+            PublicSurfaceKind::EntityBase { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::Active)
+            }
+            PublicSurfaceKind::EntityByVersion { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::ByVersion)
+            }
+            PublicSurfaceKind::EntityHistory { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::History)
+            }
+        })
     }
 
     pub(crate) fn require_surface(
@@ -185,20 +254,115 @@ impl PublicCatalog {
                 .iter()
                 .map(|column| PublicColumn::public(column.name.as_str()))
                 .collect::<Vec<_>>();
-            history_columns.extend(entity_system_columns(EntityProviderVariant::History));
+            history_columns.extend(entity_system_columns(EntitySurfaceShape::History));
 
             self.insert(surface(
                 format!("{}_history", spec.schema_key),
                 PublicSurfaceKind::EntityHistory {
-                    schema_key: spec.schema_key,
+                    schema_key: spec.schema_key.clone(),
                 },
                 history_columns,
                 SurfaceCapabilities::read_only(),
             ))?;
         }
 
+        self.entity_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn lix_state_schema(by_version: bool) -> SchemaRef {
+    let mut fields = vec![
+        json_field("entity_id", false),
+        Field::new("schema_key", DataType::Utf8, false),
+        Field::new("file_id", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
+        Field::new("created_at", DataType::Utf8, true),
+        Field::new("updated_at", DataType::Utf8, true),
+        Field::new("global", DataType::Boolean, true),
+        Field::new("change_id", DataType::Utf8, true),
+        Field::new("commit_id", DataType::Utf8, true),
+        Field::new("untracked", DataType::Boolean, true),
+    ];
+    if by_version {
+        fields.push(Field::new("version_id", DataType::Utf8, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+fn filesystem_schema(by_version: bool, include_data: bool) -> SchemaRef {
+    let mut fields = if include_data {
+        vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("path", DataType::Utf8, false),
+            Field::new("directory_id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("hidden", DataType::Boolean, true),
+            Field::new("data", DataType::Binary, true),
+        ]
+    } else {
+        vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("path", DataType::Utf8, true),
+            Field::new("parent_id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("hidden", DataType::Boolean, true),
+        ]
+    };
+    fields.extend([
+        json_field("lixcol_entity_id", false),
+        Field::new("lixcol_schema_key", DataType::Utf8, false),
+        Field::new("lixcol_file_id", DataType::Utf8, true),
+        Field::new("lixcol_global", DataType::Boolean, true),
+        Field::new("lixcol_change_id", DataType::Utf8, true),
+        Field::new("lixcol_created_at", DataType::Utf8, true),
+        Field::new("lixcol_updated_at", DataType::Utf8, true),
+        Field::new("lixcol_commit_id", DataType::Utf8, true),
+        Field::new("lixcol_untracked", DataType::Boolean, true),
+        json_field("lixcol_metadata", true),
+    ]);
+    if by_version {
+        fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+fn history_filesystem_schema(include_data: bool) -> SchemaRef {
+    let mut fields = if include_data {
+        vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("path", DataType::Utf8, true),
+            Field::new("directory_id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("hidden", DataType::Boolean, true),
+            Field::new("data", DataType::Binary, true),
+        ]
+    } else {
+        vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("path", DataType::Utf8, true),
+            Field::new("parent_id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("hidden", DataType::Boolean, true),
+        ]
+    };
+    fields.extend([
+        json_field(HISTORY_COL_ENTITY_ID, false),
+        Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
+        Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
+        json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
+        Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+        json_field(HISTORY_COL_METADATA, true),
+        Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
+        Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
+    ]);
+    Arc::new(Schema::new(fields))
 }
 
 fn surface(
@@ -224,7 +388,7 @@ fn public_columns<const N: usize>(names: [&str; N]) -> Vec<PublicColumn> {
     names.into_iter().map(PublicColumn::public).collect()
 }
 
-fn entity_columns(spec: &crate::sql2::entity_provider::EntitySurfaceSpec) -> Vec<PublicColumn> {
+fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
     let primary_key_roots = spec
         .primary_key_paths
         .iter()
@@ -288,15 +452,11 @@ fn directory_columns(by_version: bool) -> Vec<PublicColumn> {
 }
 
 fn entity_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
-    let mut columns = entity_system_columns(if by_version {
-        EntityProviderVariant::ByVersion
+    entity_system_columns(if by_version {
+        EntitySurfaceShape::ByVersion
     } else {
-        EntityProviderVariant::Active
-    });
-    if by_version {
-        columns.push(PublicColumn::public_insert_only("lixcol_version_id"));
-    }
-    columns
+        EntitySurfaceShape::Active
+    })
 }
 
 fn filesystem_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
@@ -318,35 +478,24 @@ fn filesystem_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
     columns
 }
 
-fn entity_system_columns(variant: EntityProviderVariant) -> Vec<PublicColumn> {
-    if variant == EntityProviderVariant::History {
-        return public_columns([
-            HISTORY_COL_ENTITY_ID,
-            HISTORY_COL_SCHEMA_KEY,
-            HISTORY_COL_FILE_ID,
-            HISTORY_COL_SNAPSHOT_CONTENT,
-            HISTORY_COL_METADATA,
-            HISTORY_COL_CHANGE_ID,
-            HISTORY_COL_OBSERVED_COMMIT_ID,
-            HISTORY_COL_COMMIT_CREATED_AT,
-            HISTORY_COL_START_COMMIT_ID,
-            HISTORY_COL_DEPTH,
-        ]);
+fn entity_system_columns(variant: EntitySurfaceShape) -> Vec<PublicColumn> {
+    if variant == EntitySurfaceShape::History {
+        return entity_system_fields(variant)
+            .into_iter()
+            .map(|field| PublicColumn::public(field.name().as_str()))
+            .collect();
     }
 
-    vec![
-        PublicColumn::hidden("lixcol_entity_id"),
-        PublicColumn::hidden("lixcol_schema_key"),
-        PublicColumn::hidden("lixcol_file_id"),
-        PublicColumn::hidden("lixcol_snapshot_content"),
-        PublicColumn::hidden("lixcol_global"),
-        PublicColumn::hidden("lixcol_change_id"),
-        PublicColumn::hidden("lixcol_created_at"),
-        PublicColumn::hidden("lixcol_updated_at"),
-        PublicColumn::hidden("lixcol_commit_id"),
-        PublicColumn::hidden("lixcol_untracked"),
-        PublicColumn::hidden("lixcol_metadata"),
-    ]
+    entity_system_fields(variant)
+        .into_iter()
+        .map(|field| {
+            if variant == EntitySurfaceShape::ByVersion && field.name() == "lixcol_version_id" {
+                PublicColumn::public_insert_only(field.name().as_str())
+            } else {
+                PublicColumn::hidden(field.name().as_str())
+            }
+        })
+        .collect()
 }
 
 fn state_history_columns() -> Vec<PublicColumn> {
@@ -376,8 +525,8 @@ fn file_history_columns() -> Vec<PublicColumn> {
         HISTORY_COL_SCHEMA_KEY,
         HISTORY_COL_FILE_ID,
         HISTORY_COL_SNAPSHOT_CONTENT,
-        HISTORY_COL_METADATA,
         HISTORY_COL_CHANGE_ID,
+        HISTORY_COL_METADATA,
         HISTORY_COL_OBSERVED_COMMIT_ID,
         HISTORY_COL_COMMIT_CREATED_AT,
         HISTORY_COL_START_COMMIT_ID,
@@ -396,8 +545,8 @@ fn directory_history_columns() -> Vec<PublicColumn> {
         HISTORY_COL_SCHEMA_KEY,
         HISTORY_COL_FILE_ID,
         HISTORY_COL_SNAPSHOT_CONTENT,
-        HISTORY_COL_METADATA,
         HISTORY_COL_CHANGE_ID,
+        HISTORY_COL_METADATA,
         HISTORY_COL_OBSERVED_COMMIT_ID,
         HISTORY_COL_COMMIT_CREATED_AT,
         HISTORY_COL_START_COMMIT_ID,
