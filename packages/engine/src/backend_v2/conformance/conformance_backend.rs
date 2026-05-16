@@ -7,11 +7,11 @@ use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTest
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 
-type ConformanceMap = BTreeMap<(SpaceId, Key), Bytes>;
+type ConformanceMap = BTreeMap<Key, Bytes>;
 
 #[derive(Clone, Debug, Default)]
 pub struct ConformanceBackend {
@@ -100,7 +100,6 @@ impl Backend for ConformanceBackend {
 impl BackendRead for ConformanceRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -108,12 +107,11 @@ impl BackendRead for ConformanceRead {
     where
         V: PointVisitor + ?Sized,
     {
-        visit_many_from_map(&self.entries, space, keys, opts, visitor)
+        visit_many_from_map(&self.entries, keys, opts, visitor)
     }
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -121,22 +119,22 @@ impl BackendRead for ConformanceRead {
     where
         V: ScanVisitor + ?Sized,
     {
-        visit_range_from_map(&self.entries, space, range, opts, visitor)
+        visit_range_from_map(&self.entries, range, opts, visitor)
     }
 }
 
 impl BackendWrite for ConformanceWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
             self.entries
-                .insert((space, entry.key), stored_value_bytes(entry.value));
+                .insert(entry.key, stored_value_bytes(entry.value));
         }
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
-            self.entries.remove(&(space, key.clone()));
+            self.entries.remove(key);
         }
         Ok(())
     }
@@ -169,7 +167,6 @@ impl ConformanceBackend {
 
 fn visit_many_from_map<V>(
     entries: &ConformanceMap,
-    space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
     visitor: &mut V,
@@ -179,7 +176,7 @@ where
 {
     for (index, key) in keys.iter().enumerate() {
         let value = entries
-            .get(&(space, key.clone()))
+            .get(key)
             .map(|value| project_value_ref(value, opts.projection));
         visitor.visit(index, key, value)?;
     }
@@ -188,7 +185,6 @@ where
 
 fn visit_range_from_map<V>(
     entries: &ConformanceMap,
-    space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
     visitor: &mut V,
@@ -203,8 +199,8 @@ where
         return Ok(ScanResult::default());
     }
 
-    for ((entry_space, key), value) in entries {
-        if *entry_space != space || !range_contains(&range, key) {
+    for (key, value) in entries {
+        if !range_contains(&range, key) {
             continue;
         }
         if opts

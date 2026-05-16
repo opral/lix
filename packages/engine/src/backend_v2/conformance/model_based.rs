@@ -4,14 +4,14 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::backend_v2::conformance::{
-    fixtures::{full_put, key, put_batch, space},
+    fixtures::{full_put, key, put_batch},
     model::ReferenceModel,
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
     get_many as backend_get_many, Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange,
     KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
-    ScanPage, SpaceId, WriteOptions,
+    ScanPage, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -31,7 +31,6 @@ where
     let backend = open_backend(factory);
     let mut model = ReferenceModel::default();
     let mut rng = TinyRng::new(0x51cedeed);
-    let spaces = [space(1), space(2)];
     let keys = [
         key("a"),
         key("b"),
@@ -54,22 +53,18 @@ where
 
         let mutation_count = 1 + rng.usize(4);
         for mutation_index in 0..mutation_count {
-            let target_space = spaces[rng.usize(spaces.len())];
             let target_key = keys[rng.usize(keys.len())].clone();
             if rng.bool() {
                 let value = Bytes::from(format!("v{step}-{mutation_index}"));
                 write
-                    .put_many(
-                        target_space,
-                        put_batch([full_put(target_key.clone(), value.clone())]),
-                    )
+                    .put_many(put_batch([full_put(target_key.clone(), value.clone())]))
                     .map_err(|error| format!("step {step}: put_many failed: {error}"))?;
-                staged.put(target_space, target_key, value);
+                staged.put(target_key, value);
             } else {
                 write
-                    .delete_many(target_space, &[target_key.clone()])
+                    .delete_many(&[target_key.clone()])
                     .map_err(|error| format!("step {step}: delete_many failed: {error}"))?;
-                staged.delete(target_space, &target_key);
+                staged.delete(&target_key);
             }
         }
 
@@ -87,7 +82,6 @@ where
         compare_read_to_model(
             &old_read,
             &old_model,
-            spaces,
             &keys,
             &mut rng,
             &format!("step {step} old snapshot"),
@@ -99,7 +93,6 @@ where
         compare_read_to_model(
             &new_read,
             &model,
-            spaces,
             &keys,
             &mut rng,
             &format!("step {step} new snapshot"),
@@ -112,7 +105,6 @@ where
 fn compare_read_to_model<R>(
     read: &R,
     model: &ReferenceModel,
-    spaces: [SpaceId; 2],
     keys: &[Key],
     rng: &mut TinyRng,
     label: &str,
@@ -120,23 +112,18 @@ fn compare_read_to_model<R>(
 where
     R: BackendRead,
 {
-    let target_space = spaces[rng.usize(spaces.len())];
     let point_keys = [
         keys[rng.usize(keys.len())].clone(),
         keys[rng.usize(keys.len())].clone(),
         key("missing"),
         keys[rng.usize(keys.len())].clone(),
     ];
-    let result = backend_get_many(read, target_space, &point_keys, GetOptions::default())
+    let result = backend_get_many(read, &point_keys, GetOptions::default())
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
     let actual = entries_to_map(&result.entries_for_requested_keys(&point_keys));
     let expected = point_keys
         .iter()
-        .filter_map(|key| {
-            model
-                .get(target_space, key)
-                .map(|value| (key.clone(), value.clone()))
-        })
+        .filter_map(|key| model.get(key).map(|value| (key.clone(), value.clone())))
         .collect::<BTreeMap<_, _>>();
     if actual != expected {
         return Err(format!(
@@ -157,7 +144,6 @@ where
     };
     let page = scan_range(
         read,
-        target_space,
         range.clone(),
         ScanOptions {
             limit_rows: 3,
@@ -166,7 +152,7 @@ where
     )
     .map_err(|error| format!("{label}: scan_range failed: {error}"))?;
     let actual_scan = page_entries(&page.entries.entries);
-    let expected_scan = model_scan(model, target_space, &range, Some(3));
+    let expected_scan = model_scan(model, &range, Some(3));
     if actual_scan != expected_scan {
         return Err(format!(
             "{label}: scan_range mismatch: expected {expected_scan:?}, got {actual_scan:?}"
@@ -178,7 +164,6 @@ where
 
 fn scan_range<R>(
     read: &R,
-    target_space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
 ) -> Result<ScanPage, crate::backend_v2::BackendError>
@@ -187,7 +172,6 @@ where
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
     let result = read.visit_range(
-        target_space,
         range,
         opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
@@ -204,14 +188,9 @@ where
     })
 }
 
-fn model_scan(
-    model: &ReferenceModel,
-    target_space: SpaceId,
-    range: &KeyRange,
-    limit: Option<usize>,
-) -> Vec<(Key, Bytes)> {
+fn model_scan(model: &ReferenceModel, range: &KeyRange, limit: Option<usize>) -> Vec<(Key, Bytes)> {
     model
-        .iter_space(target_space)
+        .iter()
         .filter(|(key, _)| range_contains(range, key))
         .take(limit.unwrap_or(usize::MAX))
         .map(|(key, value)| (key.clone(), value.clone()))

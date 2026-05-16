@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::backend_v2::{
     BackendError, BackendRead, GetOptions, Key, PointVisitor, ProjectedValue, SpaceId,
 };
+use crate::storage_v2::StorageSpace;
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
 use ahash::RandomState;
 
@@ -547,6 +548,12 @@ fn collect_unique_values<R>(
 where
     R: BackendRead,
 {
+    let storage_space = StorageSpace::new(space, "storage_v2.point");
+    let physical_keys = unique_keys
+        .iter()
+        .map(|key| storage_space.encode_key(key))
+        .collect::<Vec<_>>();
+
     struct Collector<'a> {
         values: &'a mut [Option<ProjectedValue>],
     }
@@ -567,8 +574,7 @@ where
 
     let mut values = vec![None; unique_keys.len()];
     read.visit_many(
-        space,
-        unique_keys,
+        &physical_keys,
         opts,
         &mut Collector {
             values: values.as_mut_slice(),
@@ -587,6 +593,12 @@ fn collect_unique_values_into<R>(
 where
     R: BackendRead,
 {
+    let storage_space = StorageSpace::new(space, "storage_v2.point");
+    let physical_keys = unique_keys
+        .iter()
+        .map(|key| storage_space.encode_key(key))
+        .collect::<Vec<_>>();
+
     struct Collector<'a> {
         values: &'a mut [Option<ProjectedValue>],
     }
@@ -607,8 +619,7 @@ where
 
     buffer.reset_for_len(unique_keys.len());
     read.visit_many(
-        space,
-        unique_keys,
+        &physical_keys,
         opts,
         &mut Collector {
             values: buffer.unique_values.as_mut_slice(),
@@ -627,7 +638,43 @@ where
     R: BackendRead,
     V: PointVisitor + ?Sized,
 {
-    read.visit_many(space, &plan.unique_keys, opts, visitor)?;
+    let storage_space = StorageSpace::new(space, "storage_v2.point");
+    let physical_keys = plan
+        .unique_keys
+        .iter()
+        .map(|key| storage_space.encode_key(key))
+        .collect::<Vec<_>>();
+
+    struct LogicalPointVisitor<'a, V: ?Sized> {
+        logical_keys: &'a [Key],
+        inner: &'a mut V,
+    }
+
+    impl<V> PointVisitor for LogicalPointVisitor<'_, V>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        fn visit(
+            &mut self,
+            index: usize,
+            _key: &Key,
+            value: Option<crate::backend_v2::ProjectedValueRef<'_>>,
+        ) -> Result<(), BackendError> {
+            let Some(logical_key) = self.logical_keys.get(index) else {
+                return Ok(());
+            };
+            self.inner.visit(index, logical_key, value)
+        }
+    }
+
+    read.visit_many(
+        &physical_keys,
+        opts,
+        &mut LogicalPointVisitor {
+            logical_keys: &plan.unique_keys,
+            inner: visitor,
+        },
+    )?;
     Ok(StorageReadStats {
         requested_keys: plan.requested_to_unique.len() as u64,
         unique_backend_keys: plan.unique_keys.len() as u64,

@@ -1062,15 +1062,12 @@ fn bench_conformance_backend(c: &mut Criterion) {
     let scan_read = scan_backend
         .begin_read(ReadOptions::default())
         .expect("begin read");
+    let scan_range = physical_point_scan_range(1);
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
             let page = materialize_backend_scan(
                 &scan_read,
-                SpaceId(1),
-                KeyRange {
-                    lower: Bound::Included(key("point-0000")),
-                    upper: Bound::Excluded(key("point-9999")),
-                },
+                scan_range.clone(),
                 ScanOptions {
                     limit_rows: 1_001,
                     projection: CoreProjection::KeyOnly,
@@ -1389,6 +1386,36 @@ where
         });
     }
 
+    let clean_direct_put_case = WriteCase {
+        name: "direct_commit_puts_reused_backend_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    if should_run(clean_direct_put_case.name) {
+        let clean_direct_put_mutations = write_mutations(&clean_direct_put_case);
+        let clean_direct_put_batches =
+            direct_write_batches_from_mutations(&clean_direct_put_mutations);
+        let backend = backend_family.open_empty();
+        commit_direct_write_batches(&backend, clean_direct_put_batches.clone())
+            .expect("warm reused direct put backend");
+        group.throughput(Throughput::Elements(clean_direct_put_case.writes as u64));
+        group.bench_function(clean_direct_put_case.name, |b| {
+            b.iter(|| {
+                let commit = commit_direct_write_batches(
+                    &backend,
+                    black_box(clean_direct_put_batches.clone()),
+                )
+                .expect("direct reused backend put commit");
+                assert_eq!(commit.stats.put_entries, 1_024);
+                assert_eq!(commit.stats.deleted_entries, 0);
+                assert_eq!(commit.stats.backend_calls, 16);
+                black_box(commit);
+            });
+        });
+    }
+
     let mixed_case = WriteCase {
         name: "direct_mixed80_20_k1024_g16_v32",
         writes: 1_024,
@@ -1457,7 +1484,7 @@ where
 
     if should_run("direct_get_many_m1000_u100") || should_run("direct_visit_many_m1000_u100") {
         let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
-        let point_keys = point_request_keys(1_000, 100);
+        let point_keys = physical_point_request_keys(1, 1_000, 100);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_get_many_m1000_u100") {
             group.bench_function("direct_get_many_m1000_u100", |b| {
@@ -1465,13 +1492,9 @@ where
                     let read = point_backend
                         .begin_read(ReadOptions::default())
                         .expect("begin direct point read");
-                    let result = backend_get_many(
-                        &read,
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                    )
-                    .expect("direct get_many");
+                    let result =
+                        backend_get_many(&read, black_box(&point_keys), GetOptions::default())
+                            .expect("direct get_many");
                     assert_eq!(result.values.len(), 1_000);
                     assert_eq!(
                         result.values.iter().filter(|value| value.is_some()).count(),
@@ -1490,13 +1513,8 @@ where
                         .begin_read(ReadOptions::default())
                         .expect("begin direct point visitor read");
                     let mut visitor = CountingPointVisitor::default();
-                    read.visit_many(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                        &mut visitor,
-                    )
-                    .expect("direct visit_many");
+                    read.visit_many(black_box(&point_keys), GetOptions::default(), &mut visitor)
+                        .expect("direct visit_many");
                     assert_eq!(visitor.visited, 1_000);
                     read.close().expect("close direct point visitor read");
                     black_box(visitor.visited);
@@ -1509,6 +1527,7 @@ where
         || should_run("direct_scan_materialized_q1000")
     {
         let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+        let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
         if should_run("direct_scan_visit_key_only_q1000") {
             group.bench_function("direct_scan_visit_key_only_q1000", |b| {
@@ -1519,8 +1538,7 @@ where
                     let mut visited = 0usize;
                     let result = read
                         .visit_range(
-                            SpaceId(1),
-                            point_scan_range(),
+                            scan_range.clone(),
                             ScanOptions {
                                 limit_rows: 1_001,
                                 projection: CoreProjection::KeyOnly,
@@ -1551,8 +1569,7 @@ where
                         .expect("begin direct materialized scan read");
                     let page = materialize_backend_scan(
                         &read,
-                        SpaceId(1),
-                        point_scan_range(),
+                        scan_range.clone(),
                         ScanOptions {
                             limit_rows: 1_001,
                             projection: CoreProjection::KeyOnly,
@@ -1622,8 +1639,8 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 let mut write = backend
                     .begin_write(WriteOptions::default())
                     .expect("begin direct in-memory write");
-                for (space, batch) in batches {
-                    write.put_many(space.id, batch).expect("put direct batch");
+                for (_space, batch) in batches {
+                    write.put_many(batch).expect("put direct batch");
                 }
                 let commit = write.commit().expect("commit direct write");
                 assert_eq!(commit.stats.put_entries, 1_024);
@@ -1733,10 +1750,8 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 let mut write = backend
                     .begin_write(WriteOptions::default())
                     .expect("begin direct touched write");
-                for (space, batch) in batches {
-                    write
-                        .put_many(space.id, batch)
-                        .expect("put direct touched batch");
+                for (_space, batch) in batches {
+                    write.put_many(batch).expect("put direct touched batch");
                 }
                 let commit = write.commit().expect("commit direct touched write");
                 assert_eq!(commit.stats.put_entries, 128);
@@ -1903,15 +1918,12 @@ fn bench_in_memory_backend(c: &mut Criterion) {
     let scan_read = scan_backend
         .begin_read(ReadOptions::default())
         .expect("begin read");
+    let scan_range = physical_point_scan_range(1);
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
             let page = materialize_backend_scan(
                 &scan_read,
-                SpaceId(1),
-                KeyRange {
-                    lower: Bound::Included(key("point-0000")),
-                    upper: Bound::Excluded(key("point-9999")),
-                },
+                scan_range.clone(),
                 ScanOptions {
                     limit_rows: 1_001,
                     projection: CoreProjection::KeyOnly,
@@ -1929,16 +1941,13 @@ fn bench_in_memory_backend(c: &mut Criterion) {
     let scan_visit_read = scan_visit_backend
         .begin_read(ReadOptions::default())
         .expect("begin read");
+    let scan_visit_range = physical_point_scan_range(1);
     group.bench_function("scan_range_visit_key_only_q1000", |b| {
         b.iter(|| {
             let mut visited = 0usize;
             let result = scan_visit_read
                 .visit_scan_range(
-                    SpaceId(1),
-                    KeyRange {
-                        lower: Bound::Included(key("point-0000")),
-                        upper: Bound::Excluded(key("point-9999")),
-                    },
+                    scan_visit_range.clone(),
                     ScanOptions {
                         limit_rows: 1_001,
                         projection: CoreProjection::KeyOnly,
@@ -1973,13 +1982,13 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
+        let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(rows as u64));
         group.bench_function(format!("owned_key_only_q{rows}"), |b| {
             b.iter(|| {
                 let page = materialize_backend_scan(
                     &read,
-                    SpaceId(1),
-                    point_scan_range(),
+                    scan_range.clone(),
                     ScanOptions {
                         limit_rows: rows + 1,
                         projection: CoreProjection::KeyOnly,
@@ -1997,8 +2006,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                 let mut visited = 0usize;
                 let result = read
                     .visit_scan_range(
-                        SpaceId(1),
-                        point_scan_range(),
+                        scan_range.clone(),
                         ScanOptions {
                             limit_rows: rows + 1,
                             projection: CoreProjection::KeyOnly,
@@ -2024,13 +2032,13 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
+        let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
         group.bench_function(format!("owned_full_value_q1000_v{value_size}"), |b| {
             b.iter(|| {
                 let page = materialize_backend_scan(
                     &read,
-                    SpaceId(1),
-                    point_scan_range(),
+                    scan_range.clone(),
                     ScanOptions {
                         limit_rows: 1_001,
                         projection: CoreProjection::FullValue,
@@ -2049,8 +2057,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                 let mut bytes_seen = 0usize;
                 let result = read
                     .visit_scan_range(
-                        SpaceId(1),
-                        point_scan_range(),
+                        scan_range.clone(),
                         ScanOptions {
                             limit_rows: 1_001,
                             projection: CoreProjection::FullValue,
@@ -2207,13 +2214,13 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
+        let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(limit_rows as u64));
         group.bench_function(format!("owned_key_only_q1000_limit{limit_rows}"), |b| {
             b.iter(|| {
                 let page = materialize_backend_scan(
                     &read,
-                    SpaceId(1),
-                    point_scan_range(),
+                    scan_range.clone(),
                     ScanOptions {
                         limit_rows,
                         projection: CoreProjection::KeyOnly,
@@ -2232,8 +2239,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                 let mut visited = 0usize;
                 let result = read
                     .visit_scan_range(
-                        SpaceId(1),
-                        point_scan_range(),
+                        scan_range.clone(),
                         ScanOptions {
                             limit_rows,
                             projection: CoreProjection::KeyOnly,
@@ -2259,6 +2265,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
+        let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
         group.bench_function(format!("owned_drain_key_only_q1000_page{page_size}"), |b| {
             b.iter(|| {
@@ -2267,8 +2274,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                 loop {
                     let page = materialize_backend_scan(
                         &read,
-                        SpaceId(1),
-                        point_scan_range(),
+                        scan_range.clone(),
                         ScanOptions {
                             limit_rows: page_size,
                             projection: CoreProjection::KeyOnly,
@@ -2295,8 +2301,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     let mut page_last_key = None;
                     let result = read
                         .visit_scan_range(
-                            SpaceId(1),
-                            point_scan_range(),
+                            scan_range.clone(),
                             ScanOptions {
                                 limit_rows: page_size,
                                 projection: CoreProjection::KeyOnly,
@@ -2367,14 +2372,14 @@ impl Backend for CountingBackend {
 }
 
 impl BackendWrite for CountingWrite {
-    fn put_many(&mut self, _space: SpaceId, _entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, _entries: PutBatch) -> Result<(), BackendError> {
         self.state
             .put_many_calls
             .set(self.state.put_many_calls.get() + 1);
         Ok(())
     }
 
-    fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, _keys: &[Key]) -> Result<(), BackendError> {
         self.state
             .delete_many_calls
             .set(self.state.delete_many_calls.get() + 1);
@@ -2423,7 +2428,6 @@ impl PointReadBackend {
 impl BackendRead for PointReadBackend {
     fn visit_many<V>(
         &self,
-        _space: SpaceId,
         keys: &[Key],
         _opts: GetOptions<'_>,
         visitor: &mut V,
@@ -2445,7 +2449,6 @@ impl BackendRead for PointReadBackend {
 
     fn visit_range<V>(
         &self,
-        _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
         _visitor: &mut V,
@@ -2482,7 +2485,6 @@ impl LeanPointReadBackend {
 impl BackendRead for LeanPointReadBackend {
     fn visit_many<V>(
         &self,
-        _space: SpaceId,
         keys: &[Key],
         _opts: GetOptions<'_>,
         visitor: &mut V,
@@ -2503,7 +2505,6 @@ impl BackendRead for LeanPointReadBackend {
 
     fn visit_range<V>(
         &self,
-        _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
         _visitor: &mut V,
@@ -2540,7 +2541,6 @@ impl PrefixReadBackend {
 impl BackendRead for PrefixReadBackend {
     fn visit_many<V>(
         &self,
-        _space: SpaceId,
         _keys: &[Key],
         _opts: GetOptions<'_>,
         _visitor: &mut V,
@@ -2553,7 +2553,6 @@ impl BackendRead for PrefixReadBackend {
 
     fn visit_range<V>(
         &self,
-        _space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -2581,7 +2580,6 @@ struct EmptyRead;
 impl BackendRead for EmptyRead {
     fn visit_many<V>(
         &self,
-        _space: SpaceId,
         _keys: &[Key],
         _opts: GetOptions<'_>,
         _visitor: &mut V,
@@ -2594,7 +2592,6 @@ impl BackendRead for EmptyRead {
 
     fn visit_range<V>(
         &self,
-        _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
         _visitor: &mut V,
@@ -2702,7 +2699,7 @@ fn layered_in_memory_backend(
     for layer in 0..overlay_depth {
         let entries = (0..rows_per_layer)
             .map(|index| PutEntry {
-                key: key(format!("zz-layer-{layer:04}-{index:04}")),
+                key: space(space_id).encode_key(&key(format!("zz-layer-{layer:04}-{index:04}"))),
                 value: value(layer * rows_per_layer + index, 32),
             })
             .collect();
@@ -2710,7 +2707,7 @@ fn layered_in_memory_backend(
             .begin_write(WriteOptions::default())
             .expect("begin overlay layer write");
         write
-            .put_many(SpaceId(space_id), PutBatch { entries })
+            .put_many(PutBatch { entries })
             .expect("write overlay layer");
         let commit = write.commit().expect("commit overlay layer");
         assert_eq!(commit.stats.put_entries, rows_per_layer as u64);
@@ -2723,7 +2720,7 @@ fn put_batches_by_space(mutations: &[WriteMutation]) -> Vec<(StorageSpace, PutBa
     for mutation in mutations {
         if let WriteMutation::Put(space, key, value) = mutation {
             batches.entry(*space).or_default().push(PutEntry {
-                key: key.clone(),
+                key: space.encode_key(key),
                 value: value.clone(),
             });
         }
@@ -2741,12 +2738,15 @@ fn direct_write_batches_from_mutations(mutations: &[WriteMutation]) -> DirectWri
         match mutation {
             WriteMutation::Put(space, key, value) => {
                 puts.entry(*space).or_default().push(PutEntry {
-                    key: key.clone(),
+                    key: space.encode_key(key),
                     value: value.clone(),
                 });
             }
             WriteMutation::Delete(space, key) => {
-                deletes.entry(*space).or_default().push(key.clone());
+                deletes
+                    .entry(*space)
+                    .or_default()
+                    .push(space.encode_key(key));
             }
         }
     }
@@ -2767,11 +2767,11 @@ where
     B: Backend,
 {
     let mut write = backend.begin_write(WriteOptions::default())?;
-    for (space, batch) in batches.puts {
-        write.put_many(space.id, batch)?;
+    for (_space, batch) in batches.puts {
+        write.put_many(batch)?;
     }
-    for (space, keys) in batches.deletes {
-        write.delete_many(space.id, &keys)?;
+    for (_space, keys) in batches.deletes {
+        write.delete_many(&keys)?;
     }
     write.commit()
 }
@@ -2801,7 +2801,6 @@ fn point_scan_range() -> KeyRange {
 
 fn materialize_backend_scan<R>(
     read: &R,
-    space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
 ) -> Result<ScanPage, BackendError>
@@ -2810,7 +2809,6 @@ where
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
     let result = read.visit_range(
-        space,
         range,
         opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
@@ -2835,8 +2833,7 @@ fn materialize_scan_visit(
 ) -> Result<ScanPage, BackendError> {
     let mut entries = Vec::with_capacity(limit_rows);
     let result = read.visit_scan_range(
-        SpaceId(1),
-        point_scan_range(),
+        physical_point_scan_range(1),
         ScanOptions {
             projection,
             limit_rows,
@@ -2920,6 +2917,23 @@ fn point_request_keys(requested_keys: usize, unique_keys: usize) -> Vec<Key> {
     (0..requested_keys)
         .map(|index| key(format!("point-{:04}", index % unique_keys)))
         .collect()
+}
+
+fn physical_point_request_keys(
+    space_id: u32,
+    requested_keys: usize,
+    unique_keys: usize,
+) -> Vec<Key> {
+    let storage_space = space(space_id);
+    point_request_keys(requested_keys, unique_keys)
+        .into_iter()
+        .map(|key| storage_space.encode_key(&key))
+        .collect()
+}
+
+fn physical_point_scan_range(space_id: u32) -> KeyRange {
+    let storage_space = space(space_id);
+    storage_space.encode_range(point_scan_range(), None)
 }
 
 fn point_key_index(key: &Key) -> usize {

@@ -8,8 +8,8 @@ use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
@@ -154,7 +154,6 @@ impl Backend for SqliteBackend {
 impl BackendRead for SqliteRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -162,12 +161,11 @@ impl BackendRead for SqliteRead {
     where
         V: PointVisitor + ?Sized,
     {
-        visit_many(self.conn(), space, keys, opts, visitor)
+        visit_many(self.conn(), keys, opts, visitor)
     }
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -175,7 +173,7 @@ impl BackendRead for SqliteRead {
     where
         V: ScanVisitor + ?Sized,
     {
-        visit_range(self.conn(), space, range, opts, visitor)
+        visit_range(self.conn(), range, opts, visitor)
     }
 
     fn close(mut self) -> Result<(), BackendError> {
@@ -211,13 +209,13 @@ impl Drop for SqliteRead {
 }
 
 impl BackendWrite for SqliteWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
         let mut stmt = self
             .conn
             .prepare(
-                "INSERT INTO entries(space_id, key, value)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(space_id, key) DO UPDATE SET value = excluded.value",
+                "INSERT INTO entries(key, value)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             )
             .map_err(sqlite_error)?;
 
@@ -225,25 +223,21 @@ impl BackendWrite for SqliteWrite {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            stmt.execute(params![
-                space.0 as i64,
-                entry.key.0.as_ref(),
-                value.as_ref()
-            ])
-            .map_err(sqlite_error)?;
+            stmt.execute(params![entry.key.0.as_ref(), value.as_ref()])
+                .map_err(sqlite_error)?;
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
         let mut stmt = self
             .conn
-            .prepare("DELETE FROM entries WHERE space_id = ?1 AND key = ?2")
+            .prepare("DELETE FROM entries WHERE key = ?1")
             .map_err(sqlite_error)?;
 
         for key in keys {
-            stmt.execute(params![space.0 as i64, key.0.as_ref()])
+            stmt.execute(params![key.0.as_ref()])
                 .map_err(sqlite_error)?;
         }
         self.stats.deleted_entries += keys.len() as u64;
@@ -270,10 +264,9 @@ fn initialize_database(path: &Path) -> Result<(), BackendError> {
         .map_err(sqlite_error)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS entries (
-            space_id INTEGER NOT NULL,
             key BLOB NOT NULL,
             value BLOB NOT NULL,
-            PRIMARY KEY (space_id, key)
+            PRIMARY KEY (key)
         ) WITHOUT ROWID;",
     )
     .map_err(sqlite_error)
@@ -302,7 +295,6 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
 
 fn visit_many<V>(
     conn: &Connection,
-    space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
     visitor: &mut V,
@@ -326,14 +318,13 @@ where
         "WITH requested(key) AS (VALUES {placeholders})
          SELECT e.key, e.value
          FROM requested r
-         JOIN entries e ON e.space_id = ? AND e.key = r.key
+         JOIN entries e ON e.key = r.key
          ORDER BY e.key ASC"
     );
-    let mut values = unique_keys
+    let values = unique_keys
         .into_iter()
         .map(|key| SqlValue::Blob(key.0.to_vec()))
         .collect::<Vec<_>>();
-    values.push(SqlValue::Integer(space.0 as i64));
 
     let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
     let mut rows = stmt
@@ -359,7 +350,6 @@ where
 
 fn visit_range<V>(
     conn: &Connection,
-    space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
     visitor: &mut V,
@@ -372,8 +362,8 @@ where
         return Ok(ScanResult::default());
     }
 
-    let mut sql = String::from("SELECT key, value FROM entries WHERE space_id = ?1");
-    let mut values = vec![SqlValue::Integer(space.0 as i64)];
+    let mut sql = String::from("SELECT key, value FROM entries WHERE 1 = 1");
+    let mut values = Vec::new();
 
     append_bound_sql(&mut sql, &mut values, "key", ">=", ">", &range.lower);
     append_bound_sql(&mut sql, &mut values, "key", "<=", "<", &range.upper);

@@ -2,31 +2,27 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{Key, SpaceId};
+use crate::backend_v2::Key;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceModel {
-    entries: BTreeMap<(SpaceId, Key), Bytes>,
+    entries: BTreeMap<Key, Bytes>,
 }
 
 impl ReferenceModel {
-    pub fn get(&self, space: SpaceId, key: &Key) -> Option<&Bytes> {
-        self.entries.get(&(space, key.clone()))
+    pub fn get(&self, key: &Key) -> Option<&Bytes> {
+        self.entries.get(key)
     }
 
-    pub fn put(&mut self, space: SpaceId, key: Key, value: Bytes) {
-        self.entries.insert((space, key), value);
+    pub fn put(&mut self, key: Key, value: Bytes) {
+        self.entries.insert(key, value);
     }
 
-    pub fn delete(&mut self, space: SpaceId, key: &Key) {
-        self.entries.remove(&(space, key.clone()));
+    pub fn delete(&mut self, key: &Key) {
+        self.entries.remove(key);
     }
 
-    pub fn iter_space(&self, space: SpaceId) -> impl Iterator<Item = (&Key, &Bytes)> {
-        self.entries
-            .iter()
-            .filter_map(move |((entry_space, key), value)| {
-                (*entry_space == space).then_some((key, value))
-            })
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, &Bytes)> {
+        self.entries.iter()
     }
 }

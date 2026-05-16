@@ -172,20 +172,28 @@ impl StorageWriteSet {
             if !group.puts.is_empty() {
                 stats.put_batches += 1;
                 stats.backend_calls += 1;
+                let entries = group
+                    .puts
+                    .into_iter()
+                    .map(|entry| PutEntry {
+                        key: group.space.encode_key(&entry.key),
+                        value: entry.value,
+                    })
+                    .collect();
                 write
-                    .put_many(
-                        group.space.id,
-                        PutBatch {
-                            entries: group.puts,
-                        },
-                    )
+                    .put_many(PutBatch { entries })
                     .map_err(StorageWriteSetError::Backend)?;
             }
             if !group.deletes.is_empty() {
                 stats.delete_batches += 1;
                 stats.backend_calls += 1;
+                let deletes = group
+                    .deletes
+                    .iter()
+                    .map(|key| group.space.encode_key(key))
+                    .collect::<Vec<_>>();
                 write
-                    .delete_many(group.space.id, &group.deletes)
+                    .delete_many(&deletes)
                     .map_err(StorageWriteSetError::Backend)?;
             }
         }
@@ -751,7 +759,6 @@ mod tests {
     impl BackendRead for CountingRead {
         fn visit_many<V>(
             &self,
-            _space: SpaceId,
             _keys: &[Key],
             _opts: GetOptions<'_>,
             _visitor: &mut V,
@@ -764,7 +771,6 @@ mod tests {
 
         fn visit_range<V>(
             &self,
-            _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
             _visitor: &mut V,
@@ -777,22 +783,32 @@ mod tests {
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
             if self.state.fail_point.get() == Some(FailPoint::PutMany) {
                 return Err(BackendError::Io("put_many failed".to_string()));
             }
-            let keys = entries.entries.into_iter().map(|entry| entry.key).collect();
+            let space = entries
+                .entries
+                .first()
+                .map(|entry| physical_space(&entry.key))
+                .unwrap_or(SpaceId(0));
+            let keys = entries
+                .entries
+                .into_iter()
+                .map(|entry| logical_key(entry.key))
+                .collect();
             self.put_batches.borrow_mut().push((space, keys));
             Ok(())
         }
 
-        fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+        fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
             if self.state.fail_point.get() == Some(FailPoint::DeleteMany) {
                 return Err(BackendError::Io("delete_many failed".to_string()));
             }
+            let space = keys.first().map(physical_space).unwrap_or(SpaceId(0));
             self.delete_batches
                 .borrow_mut()
-                .push((space, keys.to_vec()));
+                .push((space, keys.iter().cloned().map(logical_key).collect()));
             Ok(())
         }
 
@@ -823,5 +839,15 @@ mod tests {
                 .set(self.state.rollback_calls.get() + 1);
             Ok(())
         }
+    }
+
+    fn physical_space(key: &Key) -> SpaceId {
+        SpaceId(u32::from_be_bytes(
+            key.0[..4].try_into().expect("space prefix"),
+        ))
+    }
+
+    fn logical_key(key: Key) -> Key {
+        Key(key.0.slice(4..))
     }
 }

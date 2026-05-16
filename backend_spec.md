@@ -203,7 +203,7 @@ RocksDB:
 
 SQLite:
   visit_many   -> SELECT ... WHERE key IN (...)
-  visit_range  -> WHERE space = ? AND key >= ? AND key < ? ORDER BY key LIMIT ?
+  visit_range  -> WHERE key >= ? AND key < ? ORDER BY key LIMIT ?
   put_many     -> transaction + batched INSERT/UPDATE
   delete_many  -> transaction + batched DELETE
 ```
@@ -292,7 +292,15 @@ impl Prefix {
 V0 writes store opaque values only. Envelope-aware storage and native envelope
 projection are extension paths above this opaque byte value.
 
-`SpaceId` is a physical namespace. It is not a Lix table name. Storage can map:
+`SpaceId` is a storage-level logical namespace marker. It is not passed to the
+backend v0 API. `storage_v2` maps each `StorageSpace` to a physical byte prefix,
+currently:
+
+```text
+physical_key = big_endian_u32(SpaceId) || logical_key
+```
+
+Storage/domain code can map:
 
 ```text
 tracked_state.root    -> SpaceId(1)
@@ -302,7 +310,8 @@ json_payloads         -> SpaceId(4)
 blob_payloads         -> SpaceId(5)
 ```
 
-The backend does not know what these mean.
+The backend does not know what these mean. It sees one ordered physical byte-key
+space.
 
 ## Read API
 
@@ -310,7 +319,6 @@ The backend does not know what these mean.
 pub trait BackendRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -320,7 +328,6 @@ pub trait BackendRead {
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -377,16 +384,16 @@ impl Default for GetOptions<'_> {
 `visit_many` is required because point batching is a core backend primitive, not
 a looping convenience.
 
-V0 `visit_many` calls the visitor once per requested key, in the exact order of
-the key slice passed to the backend. Duplicate requested keys must produce
-duplicate visitor calls. Missing keys are passed as `None`.
+V0 `visit_many` calls the visitor once per physical key in the slice passed to
+the backend, in that exact order. Missing keys are passed as `None`.
 
 The visitor-shaped contract keeps backend values borrowed and avoids forcing
 every backend to allocate a materialized point result. Callers already know the
-requested keys, and `storage_v2` can dedupe to unique keys before calling the
-backend when that is useful. Backends must still implement `visit_many` as a
-batched point operation over the requested key set, not as a required loop of
-independent physical reads.
+requested logical keys, and `storage_v2` owns duplicate preservation,
+caller-order reconstruction, and missing-key slots. Storage normally dedupes to
+unique physical keys before calling the backend. Backends must still implement
+`visit_many` as a batched point operation over the requested physical key set,
+not as a required loop of independent physical reads.
 
 ### Scan Options
 
@@ -554,17 +561,9 @@ or reject the operation.
 
 ```rust
 pub trait BackendWrite {
-    fn put_many(
-        &mut self,
-        space: SpaceId,
-        entries: PutBatch,
-    ) -> Result<(), BackendError>;
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
 
-    fn delete_many(
-        &mut self,
-        space: SpaceId,
-        keys: &[Key],
-    ) -> Result<(), BackendError>;
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where
@@ -609,7 +608,6 @@ traits are part of the extension design, not the v0 core trait surface:
 pub trait BackendDeleteRangeExt: BackendWrite {
     fn delete_range(
         &mut self,
-        space: SpaceId,
         range: KeyRange,
     ) -> Result<(), BackendError>;
 }
@@ -635,20 +633,16 @@ distributed/remote/concurrent backends.
 #[derive(Clone, Debug)]
 pub enum Precondition {
     KeyAbsent {
-        space: SpaceId,
         key: Key,
     },
     KeyPresent {
-        space: SpaceId,
         key: Key,
     },
     KeyValueHashEquals {
-        space: SpaceId,
         key: Key,
         hash: [u8; 32],
     },
     RangeEmpty {
-        space: SpaceId,
         range: KeyRange,
     },
     VersionEquals {
@@ -835,7 +829,6 @@ types and support reporting:
 pub trait BackendPushdownExt {
     fn visit_many_pushdown<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: PushdownGetOptions<'_>,
         visitor: &mut V,
@@ -845,7 +838,6 @@ pub trait BackendPushdownExt {
 
     fn scan_range_pushdown(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: PushdownScanOptions<'_>,
     ) -> Result<PushdownScanPage, BackendError>;
@@ -1269,8 +1261,7 @@ let read = backend.begin_read(ReadOptions {
 
 let result = backend_v2::get_many(
     &read,
-    TRACKED_ROOT_SPACE,
-    &[state_row_key],
+    &[TRACKED_ROOT_SPACE.encode_key(&state_row_key)],
     GetOptions::default(),
 )?;
 
@@ -1298,14 +1289,14 @@ let deleted_false = BackendPredicate {
 };
 
 let range = Prefix { bytes: schema_file_prefix }.to_range()?;
+let physical_range = TRACKED_BY_FILE_SPACE.encode_range(range, storage_cursor.last_key());
 let mut page_entries = Vec::new();
 let result = read.visit_range(
-    TRACKED_BY_FILE_SPACE,
-    range,
+    physical_range,
     ScanOptions {
         projection: CoreProjection::FullValue,
         limit_rows: 2048,
-        resume_after: storage_cursor.last_key(),
+        resume_after: None,
     },
     &mut |key, value| {
         page_entries.push((key.to_owned_key(), value.to_owned()));
@@ -1330,15 +1321,16 @@ The Lix storage/domain-store layer owns logical publication order:
 4. atomically commit
 ```
 
-Backend sees only ordered byte mutations:
+Storage prefixes logical-space keys before lowering. Backend sees only ordered
+byte mutations:
 
 ```rust
 let mut write = backend.begin_write(WriteOptions::default())?;
 
-write.put_many(PAYLOAD_SPACE, payload_entries)?;
-write.put_many(INDEX_SPACE, index_entries)?;
-write.put_many(TRACKED_ROOT_SPACE, root_entries)?;
-write.put_many(VISIBILITY_SPACE, visibility_entries)?;
+write.put_many(PutBatch { entries: payload_entries })?;
+write.put_many(PutBatch { entries: index_entries })?;
+write.put_many(PutBatch { entries: root_entries })?;
+write.put_many(PutBatch { entries: visibility_entries })?;
 
 write.commit()?;
 ```
@@ -1551,7 +1543,7 @@ capabilities matter. It validates the v0 invariants: raw lexicographic byte-key
 ordering, opaque byte value preservation, coherent reads pinned across later
 commits, batched `visit_many`, forward row-bounded scans, multi-page key-resume
 draining without repeats/skips, atomic writes, rollback for
-new/overwrite/delete mutations, space isolation, and `FullValue`/`KeyOnly`.
+new/overwrite/delete mutations, and `FullValue`/`KeyOnly`.
 
 The other conformance modules are capability-gated or profile-gated:
 
@@ -1690,7 +1682,6 @@ pub trait Backend {
 pub trait BackendRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -1700,7 +1691,6 @@ pub trait BackendRead {
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -1710,17 +1700,9 @@ pub trait BackendRead {
 }
 
 pub trait BackendWrite {
-    fn put_many(
-        &mut self,
-        space: SpaceId,
-        entries: PutBatch,
-    ) -> Result<(), BackendError>;
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
 
-    fn delete_many(
-        &mut self,
-        space: SpaceId,
-        keys: &[Key],
-    ) -> Result<(), BackendError>;
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where

@@ -62,7 +62,6 @@ mod tests {
                 "baseline::rollback_discards_staged_mutations",
                 "baseline::rollback_discards_overwrite_and_delete",
                 "baseline::begin_read_pins_coherent_view",
-                "baseline::spaces_are_isolated",
                 "baseline::full_value_and_key_only_are_core",
                 "baseline::full_value_preserves_opaque_bytes",
                 "model::deterministic_history_matches_reference_model",

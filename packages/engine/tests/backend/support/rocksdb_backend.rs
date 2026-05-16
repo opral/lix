@@ -7,8 +7,8 @@ use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rocksdb::Snapshot;
@@ -132,7 +132,6 @@ impl Backend for RocksDbBackend {
 impl BackendRead for RocksDbRead<'_> {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -140,13 +139,13 @@ impl BackendRead for RocksDbRead<'_> {
     where
         V: PointVisitor + ?Sized,
     {
-        let encoded_keys = keys
-            .iter()
-            .map(|key| encode_entry_key(space, key))
-            .collect::<Vec<_>>();
         for (index, (key, value)) in keys
             .iter()
-            .zip(self.snapshot.multi_get(encoded_keys.iter()).into_iter())
+            .zip(
+                self.snapshot
+                    .multi_get(keys.iter().map(|key| key.0.as_ref()))
+                    .into_iter(),
+            )
             .enumerate()
         {
             let value = value.map_err(rocksdb_error)?;
@@ -163,7 +162,6 @@ impl BackendRead for RocksDbRead<'_> {
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -175,7 +173,7 @@ impl BackendRead for RocksDbRead<'_> {
             return Ok(ScanResult::default());
         }
 
-        let bounds = EncodedBounds::new(space, range, opts.resume_after);
+        let bounds = EncodedBounds::new(range, opts.resume_after);
         let mut emitted = 0;
         for item in self
             .snapshot
@@ -196,11 +194,15 @@ impl BackendRead for RocksDbRead<'_> {
                 });
             }
 
-            let key = decode_entry_key_ref(encoded_key)?;
             match opts.projection {
-                CoreProjection::KeyOnly => visitor.visit(key, ProjectedValueRef::KeyOnly)?,
+                CoreProjection::KeyOnly => {
+                    visitor.visit(KeyRef(encoded_key), ProjectedValueRef::KeyOnly)?
+                }
                 CoreProjection::FullValue => {
-                    visitor.visit(key, ProjectedValueRef::FullValue(value.as_ref()))?;
+                    visitor.visit(
+                        KeyRef(encoded_key),
+                        ProjectedValueRef::FullValue(value.as_ref()),
+                    )?;
                 }
             }
             emitted += 1;
@@ -214,21 +216,20 @@ impl BackendRead for RocksDbRead<'_> {
 }
 
 impl BackendWrite for RocksDbWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
-            let key = encode_entry_key(space, &entry.key);
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            self.batch.put(key, value.as_ref());
+            self.batch.put(entry.key.0.as_ref(), value.as_ref());
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
-            self.batch.delete(encode_entry_key(space, key));
+            self.batch.delete(key.0.as_ref());
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
@@ -255,23 +256,23 @@ struct EncodedBounds {
 }
 
 impl EncodedBounds {
-    fn new(space: SpaceId, range: KeyRange, resume_after: Option<&Key>) -> Self {
+    fn new(range: KeyRange, resume_after: Option<&Key>) -> Self {
         let lower = match (range.lower, resume_after) {
-            (_, Some(resume_after)) => Bound::Excluded(encode_entry_key(space, resume_after)),
-            (Bound::Included(key), None) => Bound::Included(encode_entry_key(space, &key)),
-            (Bound::Excluded(key), None) => Bound::Excluded(encode_entry_key(space, &key)),
-            (Bound::Unbounded, None) => Bound::Included(space.0.to_be_bytes().to_vec()),
+            (_, Some(resume_after)) => Bound::Excluded(resume_after.0.to_vec()),
+            (Bound::Included(key), None) => Bound::Included(key.0.to_vec()),
+            (Bound::Excluded(key), None) => Bound::Excluded(key.0.to_vec()),
+            (Bound::Unbounded, None) => Bound::Unbounded,
         };
 
         let upper = match range.upper {
-            Bound::Included(key) => Bound::Included(encode_entry_key(space, &key)),
-            Bound::Excluded(key) => Bound::Excluded(encode_entry_key(space, &key)),
-            Bound::Unbounded => Bound::Excluded(space_upper_bound(space)),
+            Bound::Included(key) => Bound::Included(key.0.to_vec()),
+            Bound::Excluded(key) => Bound::Excluded(key.0.to_vec()),
+            Bound::Unbounded => Bound::Unbounded,
         };
 
         let lower_seek = match &lower {
             Bound::Included(key) | Bound::Excluded(key) => key.clone(),
-            Bound::Unbounded => space.0.to_be_bytes().to_vec(),
+            Bound::Unbounded => Vec::new(),
         };
 
         Self {
@@ -316,30 +317,6 @@ fn open_rocksdb(path: &Path) -> Result<DB, BackendError> {
     options.set_use_fsync(false);
     options.set_write_buffer_size(64 * 1024 * 1024);
     DB::open(&options, path).map_err(rocksdb_error)
-}
-
-fn encode_entry_key(space: SpaceId, key: &Key) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(4 + key.0.len());
-    encoded.extend_from_slice(&space.0.to_be_bytes());
-    encoded.extend_from_slice(key.0.as_ref());
-    encoded
-}
-
-fn decode_entry_key_ref(encoded: &[u8]) -> Result<KeyRef<'_>, BackendError> {
-    if encoded.len() < 4 {
-        return Err(BackendError::Corruption(
-            "rocksdb entry key shorter than space prefix".into(),
-        ));
-    }
-    Ok(KeyRef(&encoded[4..]))
-}
-
-fn space_upper_bound(space: SpaceId) -> Vec<u8> {
-    if space.0 == u32::MAX {
-        vec![0xff, 0xff, 0xff, 0xff, 0xff]
-    } else {
-        (space.0 + 1).to_be_bytes().to_vec()
-    }
 }
 
 fn stored_value_bytes(value: StoredValue) -> Bytes {

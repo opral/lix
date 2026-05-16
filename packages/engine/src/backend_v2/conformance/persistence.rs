@@ -39,13 +39,10 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(
-                test_space,
-                put_batch([
-                    full_put(alpha.clone(), "persisted-alpha"),
-                    full_put(beta.clone(), "persisted-beta"),
-                ]),
-            )
+            .put_many(put_batch([
+                full_put(alpha.clone(), "persisted-alpha"),
+                full_put(beta.clone(), "persisted-beta"),
+            ]))
             .map_err(|error| format!("put_many failed: {error}"))?;
         write
             .commit()
@@ -77,10 +74,10 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(
-                test_space,
-                put_batch([full_put(rolled_back.clone(), "should-not-persist")]),
-            )
+            .put_many(put_batch([full_put(
+                rolled_back.clone(),
+                "should-not-persist",
+            )]))
             .map_err(|error| format!("put_many failed: {error}"))?;
         write
             .rollback()
@@ -106,13 +103,10 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(
-                test_space,
-                put_batch([
-                    full_put(overwritten.clone(), "old"),
-                    full_put(deleted.clone(), "delete-me"),
-                ]),
-            )
+            .put_many(put_batch([
+                full_put(overwritten.clone(), "old"),
+                full_put(deleted.clone(), "delete-me"),
+            ]))
             .map_err(|error| format!("initial put_many failed: {error}"))?;
         write
             .commit()
@@ -125,13 +119,10 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(
-                test_space,
-                put_batch([full_put(overwritten.clone(), "new")]),
-            )
+            .put_many(put_batch([full_put(overwritten.clone(), "new")]))
             .map_err(|error| format!("overwrite put_many failed: {error}"))?;
         write
-            .delete_many(test_space, &[deleted.clone()])
+            .delete_many(&[deleted.clone()])
             .map_err(|error| format!("delete_many failed: {error}"))?;
         write
             .commit()
@@ -148,7 +139,7 @@ where
 
 fn assert_full_values<B>(
     backend: &B,
-    test_space: crate::backend_v2::SpaceId,
+    _test_space: crate::backend_v2::SpaceId,
     expected: &[(crate::backend_v2::Key, Option<&str>)],
 ) -> ConformanceResult
 where
@@ -161,7 +152,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, test_space, &keys, GetOptions::default())
+    let result = backend_get_many(&read, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     for (index, (key, expected_value)) in expected.iter().enumerate() {

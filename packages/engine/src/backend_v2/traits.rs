@@ -1,7 +1,7 @@
 use crate::backend_v2::{
     BackendCapabilities, BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange,
     KeyRef, ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
-    SpaceId, WriteOptions,
+    WriteOptions,
 };
 
 pub trait Backend {
@@ -23,7 +23,6 @@ pub trait Backend {
 pub trait BackendRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -33,7 +32,6 @@ pub trait BackendRead {
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -64,7 +62,6 @@ pub trait PointVisitor {
 
 pub fn get_many<R>(
     read: &R,
-    space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
 ) -> Result<GetManyResult, BackendError>
@@ -91,7 +88,6 @@ where
 
     let mut values = vec![None::<ProjectedValue>; keys.len()];
     read.visit_many(
-        space,
         keys,
         opts,
         &mut MaterializingPointVisitor {
@@ -125,9 +121,9 @@ where
 }
 
 pub trait BackendWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError>;
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError>;
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where
