@@ -3,17 +3,23 @@ use crate::backend_v2::{
     ProjectedValueRef, ScanOptions, ScanPage, ScanResult, ScanVisitor,
 };
 use crate::storage_v2::{
+    get_many_borrowed_indexed_values_for_physical_plan,
+    get_many_borrowed_indexed_values_for_physical_plan_with_stats,
     get_many_borrowed_indexed_values_for_plan,
     get_many_borrowed_indexed_values_for_plan_with_stats, get_many_caller_order,
     get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
-    get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
+    get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_physical_plan,
+    get_many_indexed_values_for_physical_plan_into,
+    get_many_indexed_values_for_physical_plan_into_with_stats,
+    get_many_indexed_values_for_physical_plan_with_stats, get_many_indexed_values_for_plan,
     get_many_indexed_values_for_plan_into, get_many_indexed_values_for_plan_into_with_stats,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_into, scan_prefix_with_stats,
     scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix, visit_scan_range,
-    visit_unique_point_values_for_plan, BorrowedIndexedPointValues, BorrowedScanPage,
-    BufferedIndexedPointValues, IndexedPointValues, PointRequestPlan, PointSlot, PointValueBuffer,
-    StorageReadResult, StorageReadScope, StorageReadStats, StorageScanBuffer, StorageSpace,
+    visit_unique_point_values_for_physical_plan, visit_unique_point_values_for_plan,
+    BorrowedIndexedPointValues, BorrowedScanPage, BufferedIndexedPointValues, IndexedPointValues,
+    PhysicalPointRequestPlan, PointRequestPlan, PointSlot, PointValueBuffer, StorageReadResult,
+    StorageReadScope, StorageReadStats, StorageScanBuffer, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -73,6 +79,18 @@ pub trait StorageReader {
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>;
 
+    fn get_many_indexed_values_for_physical_plan(
+        &self,
+        plan: &PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<IndexedPointValues, BackendError>;
+
+    fn get_many_indexed_values_for_physical_plan_with_stats(
+        &self,
+        plan: &PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>;
+
     fn get_many_borrowed_indexed_values_for_plan<'a>(
         &self,
         space: StorageSpace,
@@ -84,6 +102,18 @@ pub trait StorageReader {
         &self,
         space: StorageSpace,
         plan: &'a PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError>;
+
+    fn get_many_borrowed_indexed_values_for_physical_plan<'a>(
+        &self,
+        plan: &'a PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<BorrowedIndexedPointValues<'a>, BackendError>;
+
+    fn get_many_borrowed_indexed_values_for_physical_plan_with_stats<'a>(
+        &self,
+        plan: &'a PhysicalPointRequestPlan,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError>;
 
@@ -103,10 +133,33 @@ pub trait StorageReader {
         buffer: &'buf mut PointValueBuffer,
     ) -> Result<StorageReadResult<BufferedIndexedPointValues<'plan, 'buf>>, BackendError>;
 
+    fn get_many_indexed_values_for_physical_plan_into<'plan, 'buf>(
+        &self,
+        plan: &'plan PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<BufferedIndexedPointValues<'plan, 'buf>, BackendError>;
+
+    fn get_many_indexed_values_for_physical_plan_into_with_stats<'plan, 'buf>(
+        &self,
+        plan: &'plan PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<StorageReadResult<BufferedIndexedPointValues<'plan, 'buf>>, BackendError>;
+
     fn visit_unique_point_values_for_plan<V>(
         &self,
         space: StorageSpace,
         plan: &PointRequestPlan,
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadStats, BackendError>
+    where
+        V: PointVisitor + ?Sized;
+
+    fn visit_unique_point_values_for_physical_plan<V>(
+        &self,
+        plan: &PhysicalPointRequestPlan,
         opts: GetOptions<'_>,
         visitor: &mut V,
     ) -> Result<StorageReadStats, BackendError>
@@ -254,6 +307,22 @@ where
         get_many_indexed_values_for_plan_with_stats(self.backend_read(), space.id, plan, opts)
     }
 
+    fn get_many_indexed_values_for_physical_plan(
+        &self,
+        plan: &PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<IndexedPointValues, BackendError> {
+        get_many_indexed_values_for_physical_plan(self.backend_read(), plan, opts)
+    }
+
+    fn get_many_indexed_values_for_physical_plan_with_stats(
+        &self,
+        plan: &PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<IndexedPointValues>, BackendError> {
+        get_many_indexed_values_for_physical_plan_with_stats(self.backend_read(), plan, opts)
+    }
+
     fn get_many_borrowed_indexed_values_for_plan<'a>(
         &self,
         space: StorageSpace,
@@ -272,6 +341,26 @@ where
         get_many_borrowed_indexed_values_for_plan_with_stats(
             self.backend_read(),
             space.id,
+            plan,
+            opts,
+        )
+    }
+
+    fn get_many_borrowed_indexed_values_for_physical_plan<'a>(
+        &self,
+        plan: &'a PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<BorrowedIndexedPointValues<'a>, BackendError> {
+        get_many_borrowed_indexed_values_for_physical_plan(self.backend_read(), plan, opts)
+    }
+
+    fn get_many_borrowed_indexed_values_for_physical_plan_with_stats<'a>(
+        &self,
+        plan: &'a PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError> {
+        get_many_borrowed_indexed_values_for_physical_plan_with_stats(
+            self.backend_read(),
             plan,
             opts,
         )
@@ -303,6 +392,29 @@ where
         )
     }
 
+    fn get_many_indexed_values_for_physical_plan_into<'plan, 'buf>(
+        &self,
+        plan: &'plan PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<BufferedIndexedPointValues<'plan, 'buf>, BackendError> {
+        get_many_indexed_values_for_physical_plan_into(self.backend_read(), plan, opts, buffer)
+    }
+
+    fn get_many_indexed_values_for_physical_plan_into_with_stats<'plan, 'buf>(
+        &self,
+        plan: &'plan PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<StorageReadResult<BufferedIndexedPointValues<'plan, 'buf>>, BackendError> {
+        get_many_indexed_values_for_physical_plan_into_with_stats(
+            self.backend_read(),
+            plan,
+            opts,
+            buffer,
+        )
+    }
+
     fn visit_unique_point_values_for_plan<V>(
         &self,
         space: StorageSpace,
@@ -314,6 +426,18 @@ where
         V: PointVisitor + ?Sized,
     {
         visit_unique_point_values_for_plan(self.backend_read(), space.id, plan, opts, visitor)
+    }
+
+    fn visit_unique_point_values_for_physical_plan<V>(
+        &self,
+        plan: &PhysicalPointRequestPlan,
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadStats, BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        visit_unique_point_values_for_physical_plan(self.backend_read(), plan, opts, visitor)
     }
 
     fn scan_range(
@@ -412,8 +536,8 @@ mod tests {
         ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{
-        PointRequestPlan, PointValueBuffer, StorageContext, StorageReader, StorageScanBuffer,
-        StorageSpace,
+        PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext,
+        StorageReader, StorageScanBuffer, StorageSpace,
     };
 
     fn key(bytes: &'static str) -> Key {
@@ -825,6 +949,50 @@ mod tests {
                 b"\0\0\0\x01a"
             )))
         );
+    }
+
+    #[test]
+    fn physical_point_request_plan_reuses_encoded_backend_keys() {
+        let read = crate::storage_v2::StorageReadScope::new(RequestedOrderRead::default());
+        let plan = PhysicalPointRequestPlan::new(
+            space(1),
+            &[key("b"), key("missing"), key("a"), key("b")],
+        );
+
+        assert_eq!(
+            plan.logical_unique_keys,
+            vec![key("b"), key("missing"), key("a")]
+        );
+        assert_eq!(
+            plan.physical_unique_keys,
+            vec![
+                space(1).encode_key(&key("b")),
+                space(1).encode_key(&key("missing")),
+                space(1).encode_key(&key("a")),
+            ]
+        );
+
+        let result = read
+            .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
+                &plan,
+                GetOptions::default(),
+            )
+            .expect("borrowed physical planned indexed read");
+
+        assert_eq!(
+            read.backend_read().get_many_keys.borrow().as_slice(),
+            plan.physical_unique_keys.as_slice()
+        );
+        assert_eq!(result.stats.requested_keys, 4);
+        assert_eq!(result.stats.unique_backend_keys, 3);
+        assert_eq!(result.stats.backend_calls, 1);
+        assert_eq!(
+            result.value.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(
+                b"\0\0\0\x01b"
+            )))
+        );
+        assert_eq!(result.value.value_at(1), None);
     }
 
     #[test]

@@ -21,8 +21,8 @@ use lix_engine::backend_v2::{
     SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
-    PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope, StorageReader,
-    StorageScanBuffer, StorageSpace, StorageWriteSet,
+    PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
+    StorageReader, StorageScanBuffer, StorageSpace, StorageWriteSet,
 };
 use redb_backend_v2::RedbBackend;
 use rocksdb_backend_v2::RocksDbBackend;
@@ -864,15 +864,14 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
 
     for case in POINT_CASES {
         let keys = point_request_keys(case.requested_keys, case.unique_keys);
-        let plan = PointRequestPlan::new(&keys);
+        let plan = PhysicalPointRequestPlan::new(space(1), &keys);
         let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
         let read = StorageReadScope::new(LeanPointReadBackend::new(case.existing_unique_keys));
         group.throughput(Throughput::Elements(case.requested_keys as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
                 let result = read
-                    .get_many_borrowed_indexed_values_for_plan_with_stats(
-                        space(1),
+                    .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
                         black_box(&plan),
                         GetOptions::default(),
                     )
@@ -899,8 +898,7 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("buffered", case.name), case, |b, case| {
             b.iter(|| {
                 let result = read
-                    .get_many_indexed_values_for_plan_into_with_stats(
-                        space(1),
+                    .get_many_indexed_values_for_physical_plan_into_with_stats(
                         black_box(&plan),
                         GetOptions::default(),
                         &mut buffer,
@@ -932,8 +930,7 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
                     let mut visited = 0usize;
                     let mut missing = 0usize;
                     let stats = read
-                        .visit_unique_point_values_for_plan(
-                            space(1),
+                        .visit_unique_point_values_for_physical_plan(
                             black_box(&plan),
                             GetOptions::default(),
                             &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
@@ -1191,15 +1188,14 @@ where
         .expect("begin backend matrix point read");
     let point_scope = StorageReadScope::new(point_read);
     let point_keys = point_request_keys(1_000, 100);
-    let point_plan = PointRequestPlan::new(&point_keys);
+    let point_plan = PhysicalPointRequestPlan::new(space(1), &point_keys);
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("planned_visit_unique_m1000_u100", |b| {
         b.iter(|| {
             let mut visited = 0usize;
             let mut bytes_seen = 0usize;
             let stats = point_scope
-                .visit_unique_point_values_for_plan(
-                    space(1),
+                .visit_unique_point_values_for_physical_plan(
                     black_box(&point_plan),
                     GetOptions::default(),
                     &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
@@ -1224,8 +1220,7 @@ where
     group.bench_function("planned_get_many_m1000_u100", |b| {
         b.iter(|| {
             let result = point_scope
-                .get_many_borrowed_indexed_values_for_plan_with_stats(
-                    space(1),
+                .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
                     black_box(&point_plan),
                     GetOptions::default(),
                 )
@@ -1242,8 +1237,7 @@ where
     group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
         b.iter(|| {
             let result = point_scope
-                .get_many_indexed_values_for_plan_into_with_stats(
-                    space(1),
+                .get_many_indexed_values_for_physical_plan_into_with_stats(
                     black_box(&point_plan),
                     GetOptions::default(),
                     &mut point_buffer,
@@ -1769,15 +1763,14 @@ fn bench_in_memory_backend(c: &mut Criterion) {
             .expect("begin layered read");
         let layered_scope = StorageReadScope::new(layered_read);
         let layered_keys = point_request_keys(1_000, 100);
-        let layered_plan = PointRequestPlan::new(&layered_keys);
+        let layered_plan = PhysicalPointRequestPlan::new(space(1), &layered_keys);
         group.bench_function(
             format!("overlay_depth_visit_base_d{depth}_m1000_u100"),
             |b| {
                 b.iter(|| {
                     let mut visitor = CountingPointVisitor::default();
                     let stats = layered_scope
-                        .visit_unique_point_values_for_plan(
-                            space(1),
+                        .visit_unique_point_values_for_physical_plan(
                             black_box(&layered_plan),
                             GetOptions::default(),
                             &mut visitor,
@@ -1846,12 +1839,11 @@ fn bench_in_memory_backend(c: &mut Criterion) {
         .expect("begin read");
     let planned_get_many_read = StorageReadScope::new(planned_get_many_read);
     let planned_get_many_keys = point_request_keys(1_000, 100);
-    let planned_get_many_plan = PointRequestPlan::new(&planned_get_many_keys);
+    let planned_get_many_plan = PhysicalPointRequestPlan::new(space(1), &planned_get_many_keys);
     group.bench_function("planned_get_many_m1000_u100", |b| {
         b.iter(|| {
             let result = planned_get_many_read
-                .get_many_borrowed_indexed_values_for_plan_with_stats(
-                    space(1),
+                .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
                     black_box(&planned_get_many_plan),
                     GetOptions::default(),
                 )
@@ -1869,8 +1861,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
     group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
         b.iter(|| {
             let result = planned_get_many_read
-                .get_many_indexed_values_for_plan_into_with_stats(
-                    space(1),
+                .get_many_indexed_values_for_physical_plan_into_with_stats(
                     black_box(&planned_get_many_plan),
                     GetOptions::default(),
                     &mut planned_get_many_buffer,
@@ -1890,8 +1881,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
             let mut visited = 0usize;
             let mut bytes_seen = 0usize;
             let stats = planned_get_many_read
-                .visit_unique_point_values_for_plan(
-                    space(1),
+                .visit_unique_point_values_for_physical_plan(
                     black_box(&planned_get_many_plan),
                     GetOptions::default(),
                     &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {

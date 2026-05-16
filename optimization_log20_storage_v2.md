@@ -4635,3 +4635,65 @@ Next candidate optimization:
   cache physical keys/ranges in PointRequestPlan and prefix/range plans so
   repeated reads do not rebuild big_endian_u32(SpaceId) || logical_key every time.
 ```
+
+## 2026-05-16 - Physical point request plan
+
+Change:
+
+```text
+Added PhysicalPointRequestPlan:
+  logical_unique_keys
+  physical_unique_keys = big_endian_u32(SpaceId) || logical_key
+  requested_to_unique
+
+Storage planned point reads can now reuse pre-encoded backend keys instead of
+rebuilding physical keys on each call. The storage visitor still receives
+logical keys; only the backend request vector is physical.
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/(point_read_planned_lean_backend|backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100))'
+```
+
+Focused before/after smoke means:
+
+| Case | Before | After | Delta |
+| ---- | -----: | ----: | ----: |
+| lean planned get m1000/u100 | 3.999 us | 2.166 us | 46% faster |
+| lean planned buffered m1000/u100 | 3.891 us | 2.109 us | 46% faster |
+| lean planned visit m1000/u100 | 2.193 us | 0.131 us | 94% faster |
+| lean planned get m10000/u10000 | 383.03 us | 214.54 us | 44% faster |
+| lean planned buffered m10000/u10000 | 391.49 us | 244.94 us | 37% faster |
+| lean planned visit m10000/u10000 | 230.09 us | 11.85 us | 95% faster |
+| in_memory planned visit m1000/u100 | 4.344 us | 2.618 us | 40% faster |
+| in_memory planned get m1000/u100 | 6.669 us | 5.665 us | 15% faster |
+| in_memory planned buffered m1000/u100 | 6.567 us | 5.337 us | 19% faster |
+| sqlite planned visit m1000/u100 | 35.14 us | 38.60 us | 10% slower |
+| sqlite planned get m1000/u100 | 43.14 us | 40.41 us | 6% faster |
+| sqlite planned buffered m1000/u100 | 39.01 us | 40.40 us | flat/noise |
+| redb planned visit m1000/u100 | 6.440 us | 5.220 us | 19% faster |
+| redb planned get m1000/u100 | 9.775 us | 9.321 us | 5% faster |
+| redb planned buffered m1000/u100 | 10.52 us | 9.136 us | 13% faster |
+| rocksdb planned visit m1000/u100 | 43.53 us | 44.24 us | flat/noise |
+| rocksdb planned get m1000/u100 | 44.74 us | 48.25 us | 8% slower |
+| rocksdb planned buffered m1000/u100 | 46.71 us | 46.94 us | flat/noise |
+
+Interpretation:
+
+```text
+Confirmed for the storage adapter and the in-memory/redb paths:
+  repeated planned reads should cache physical backend keys.
+
+The improvement is largest where backend work is cheap:
+  the lean backend and InMemoryBackend expose the storage adapter cost directly.
+
+SQLite and RocksDB are dominated by backend engine work in these lanes:
+  SQLite materialized reads are essentially flat/slightly better.
+  RocksDB point reads are noisy and one materialized lane regressed; this does
+  not invalidate the storage cut, but it says the next RocksDB-specific cut
+  should be based on direct backend profiling, not storage key encoding.
+```
