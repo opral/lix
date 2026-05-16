@@ -455,19 +455,28 @@ Phase 9 progress:
 
 ## Phase 10: Deletion of Legacy Code
 
-- [ ] Delete old `simple_dml.rs`.
-- [ ] Delete old `public_bind/` once all logic is represented in `catalog/` and `bind/`.
-- [ ] Delete duplicate table-name helpers.
-- [ ] Delete duplicate assignment validation helpers.
-- [ ] Delete duplicate version-filter booleans.
-- [ ] Delete `LiveStateFilter.no_match` if superseded by typed filters.
+- [x] Delete old `simple_dml.rs`.
+- [x] Delete old `public_bind/` once all logic is represented in `catalog/` and `bind/`.
+- [x] Delete duplicate table-name helpers.
+- [x] Delete duplicate assignment validation helpers.
+- [x] Delete duplicate version-filter booleans.
+- [x] Delete `LiveStateFilter.no_match` if superseded by typed filters.
 - [ ] Run `rg` for banned patterns:
-  - [ ] `object_name_leaf`
-  - [ ] `statement.clone()` in fast-path selection
-  - [ ] `require_version_filter`
-  - [ ] `allow_version_filter`
-  - [ ] `active_version_id.is_none()`
-  - [ ] empty `version_ids` meaning both all and none
+  - [x] `object_name_leaf`
+  - [x] `statement.clone()` in fast-path selection
+  - [x] `require_version_filter`
+  - [x] `allow_version_filter`
+  - [x] `active_version_id.is_none()`
+  - [x] empty `version_ids` meaning both all and none
+
+Phase 10 progress:
+
+- Confirmed the old raw-AST fast path and public DML validation modules are absent: no `simple_dml`, `public_bind`, `ParamDecoder`, `object_name_leaf`, or `validate_public_dml_statement` references remain under `sql2`.
+- Removed the last storage no-match side channel by replacing `LiveStateFilter.no_match` with `LiveStateRowFilter::{All,None}`. Empty `version_ids` now stays an all-visible storage scan convention, while zero-row predicates use the typed row filter.
+- Replaced provider-local `limit = Some(0)` no-match sentinels with `LiveStateRowFilter::None`, so contradictory entity/lix_state pushdowns no longer overload limit or empty version filters.
+- Review hardening: moved the DataFusion reference-writer `VersionScope::Empty` no-op behind target resolution so unsupported no-match writes, such as `DELETE FROM lix_file WHERE false`, still fail with `LIX_UNSUPPORTED_SQL` instead of silently succeeding.
+- Review hardening: removed provider-side `lix_state` assignment validation and `_by_version` version-filter validation helpers. The provider still performs physical expression conversion and row materialization, but public assignment/version semantics are owned by bind/plan.
+- Current gate: banned-pattern `rg`, `cargo check -p lix_engine`, `cargo test -p lix_engine live_state::visibility --lib -- --nocapture`, `cargo test -p lix_engine sql2::test_support::differential --lib -- --nocapture`, `cargo test -p lix_engine sql2::exec::datafusion::tests --lib -- --nocapture`, `cargo test -p lix_engine --test code_structure -- --nocapture`, and `cargo fmt -p lix_engine --check` pass.
 
 ## Verification Gates
 

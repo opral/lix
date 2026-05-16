@@ -28,7 +28,7 @@ use serde_json::Value as JsonValue;
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::read_only::reject_read_only_stage_rows;
@@ -278,7 +278,6 @@ impl TableProvider for LixStateProvider {
             .collect::<Result<Vec<_>>>()?;
 
         let route = LixStateByVersionRoute::from_filters(&filters);
-        require_explicit_lix_state_version_filter(&self.version_binding, &route, "DELETE")?;
         let version_binding = self.version_binding.active_version_id().map(str::to_owned);
         let request =
             lix_state_scan_request(&self.schema, version_binding.as_deref(), None, &route, None);
@@ -300,8 +299,6 @@ impl TableProvider for LixStateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let write_ctx = self.write_access.require_write("UPDATE lix_state")?;
 
-        validate_lix_state_update_assignments(&self.schema, &assignments)?;
-
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_assignments = assignments
@@ -319,7 +316,6 @@ impl TableProvider for LixStateProvider {
             .collect::<Result<Vec<_>>>()?;
 
         let route = LixStateByVersionRoute::from_filters(&filters);
-        require_explicit_lix_state_version_filter(&self.version_binding, &route, "UPDATE")?;
         let version_binding = self.version_binding.active_version_id().map(str::to_owned);
         let request =
             lix_state_scan_request(&self.schema, version_binding.as_deref(), None, &route, None);
@@ -504,14 +500,10 @@ impl ExecutionPlan for LixStateDeleteExec {
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = if request.limit == Some(0) {
-                Vec::new()
-            } else {
-                write_ctx
-                    .scan_live_state(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
+            let rows = write_ctx
+                .scan_live_state(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_state_record_batch(Arc::clone(&table_schema), &rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
@@ -657,14 +649,10 @@ impl ExecutionPlan for LixStateUpdateExec {
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = if request.limit == Some(0) {
-                Vec::new()
-            } else {
-                write_ctx
-                    .scan_live_state(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
+            let rows = write_ctx
+                .scan_live_state(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_state_record_batch(Arc::clone(&table_schema), &rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
@@ -697,41 +685,6 @@ impl ExecutionPlan for LixStateUpdateExec {
             stream,
         )))
     }
-}
-
-fn validate_lix_state_update_assignments(
-    schema: &SchemaRef,
-    assignments: &[(String, Expr)],
-) -> Result<()> {
-    for (column_name, _) in assignments {
-        schema.field_with_name(column_name).map_err(|_| {
-            DataFusionError::Plan(format!(
-                "UPDATE lix_state failed: column '{column_name}' does not exist"
-            ))
-        })?;
-        if !matches!(column_name.as_str(), "snapshot_content" | "metadata") {
-            return Err(DataFusionError::Execution(format!(
-                "UPDATE lix_state cannot stage read-only column '{column_name}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn require_explicit_lix_state_version_filter(
-    version_binding: &VersionBinding,
-    route: &LixStateByVersionRoute,
-    action: &str,
-) -> Result<()> {
-    if matches!(version_binding, VersionBinding::Explicit)
-        && route.version_ids.as_ref().is_none_or(BTreeSet::is_empty)
-        && !route.contradictory
-    {
-        return Err(DataFusionError::Execution(format!(
-            "{action} lix_state_by_version requires version_id"
-        )));
-    }
-    Ok(())
 }
 
 fn filter_lix_state_batch(
@@ -1179,14 +1132,10 @@ impl ExecutionPlan for LixStateScanExec {
         let request = self.request.clone();
         let stream_schema = Arc::clone(&schema);
         let stream = stream::once(async move {
-            let rows = if request.limit == Some(0) {
-                Vec::new()
-            } else {
-                live_state
-                    .scan_rows(&request)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?
-            };
+            let rows = live_state
+                .scan_rows(&request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let batch = lix_state_record_batch(Arc::clone(&stream_schema), &rows)
                 .map_err(lix_error_to_datafusion_error)?;
             Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
@@ -1333,10 +1282,14 @@ fn lix_state_scan_request(
         filter.file_ids.push(file_id);
     }
 
+    if route.contradictory {
+        filter.rows = LiveStateRowFilter::None;
+    }
+
     LiveStateScanRequest {
         filter,
         projection,
-        limit: route.contradictory.then_some(0).or(limit),
+        limit,
     }
 }
 
@@ -2108,7 +2061,11 @@ mod tests {
 
         let request = lix_state_scan_request(&schema, None, None, &route, None);
 
-        assert_eq!(request.limit, Some(0));
+        assert_eq!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::None
+        );
+        assert_eq!(request.limit, None);
         assert!(request.filter.schema_keys.is_empty());
     }
 

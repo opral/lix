@@ -4,8 +4,9 @@ use tokio::sync::Mutex;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::{
-    expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest, VisibilityVersionScope,
+    expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowFilter,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest,
+    VisibilityVersionScope,
 };
 use crate::storage::StorageReader;
 use crate::tracked_state::{
@@ -77,7 +78,7 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        if request.filter.no_match {
+        if matches!(request.filter.rows, LiveStateRowFilter::None) {
             return Ok(Vec::new());
         }
         let mut store = self.store.lock().await;
