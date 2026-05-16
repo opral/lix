@@ -364,8 +364,8 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, ConformanceBackend, CoreProjection, GetManyResult, GetOptions,
-        Key, KeyRange, KeyRef, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
+        BackendError, BackendRead, ConformanceBackend, CoreProjection, GetOptions, Key, KeyRange,
+        KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
         ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{
@@ -401,23 +401,25 @@ mod tests {
     }
 
     impl BackendRead for SpyRead {
-        fn get_many(
+        fn visit_many<V>(
             &self,
             _space: SpaceId,
             keys: &[Key],
             opts: GetOptions<'_>,
-        ) -> Result<GetManyResult, BackendError> {
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
             self.get_many_keys.replace(keys.to_vec());
-            Ok(GetManyResult::new(
-                keys.iter()
-                    .map(|key| {
-                        Some(match opts.projection {
-                            CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-                            CoreProjection::FullValue => ProjectedValue::FullValue(key.0.clone()),
-                        })
-                    })
-                    .collect(),
-            ))
+            for (index, key) in keys.iter().enumerate() {
+                let value = match opts.projection {
+                    CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+                    CoreProjection::FullValue => ProjectedValueRef::FullValue(key.0.as_ref()),
+                };
+                visitor.visit(index, key, Some(value))?;
+            }
+            Ok(())
         }
 
         fn visit_range<V>(
@@ -442,24 +444,23 @@ mod tests {
     }
 
     impl BackendRead for RequestedOrderRead {
-        fn get_many(
+        fn visit_many<V>(
             &self,
             _space: SpaceId,
             keys: &[Key],
             _opts: GetOptions<'_>,
-        ) -> Result<GetManyResult, BackendError> {
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
             self.get_many_keys.replace(keys.to_vec());
-            Ok(GetManyResult::new(
-                keys.iter()
-                    .map(|key| {
-                        if key.0.as_ref() == b"missing" {
-                            None
-                        } else {
-                            Some(ProjectedValue::FullValue(key.0.clone()))
-                        }
-                    })
-                    .collect(),
-            ))
+            for (index, key) in keys.iter().enumerate() {
+                let value = (key.0.as_ref() != b"missing")
+                    .then_some(ProjectedValueRef::FullValue(key.0.as_ref()));
+                visitor.visit(index, key, value)?;
+            }
+            Ok(())
         }
 
         fn visit_range<V>(

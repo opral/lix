@@ -6,9 +6,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use redb::{
@@ -127,28 +127,29 @@ impl Backend for RedbBackend {
 }
 
 impl BackendRead for RedbRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
         let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
-        let values = keys
-            .iter()
-            .map(|key| {
-                let encoded = encode_entry_key(space, key);
-                table
-                    .get(encoded.as_slice())
-                    .map_err(redb_error)
-                    .map(|value| {
-                        value.map(|value| {
-                            project_value(Bytes::copy_from_slice(value.value()), opts.projection)
-                        })
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(GetManyResult::new(values))
+        for (index, key) in keys.iter().enumerate() {
+            let encoded = encode_entry_key(space, key);
+            let value = table.get(encoded.as_slice()).map_err(redb_error)?;
+            visitor.visit(
+                index,
+                key,
+                value
+                    .as_ref()
+                    .map(|value| project_value_ref(value.value(), opts.projection)),
+            )?;
+        }
+        Ok(())
     }
 
     fn visit_range<V>(
@@ -288,13 +289,6 @@ fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
         Bound::Included(bytes) => Bound::Included(bytes.as_slice()),
         Bound::Excluded(bytes) => Bound::Excluded(bytes.as_slice()),
         Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
-fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(value),
     }
 }
 

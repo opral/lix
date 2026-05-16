@@ -9,7 +9,7 @@ use super::{
 };
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
+    CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef,
     ProjectionCapabilities, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
     StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
@@ -292,12 +292,16 @@ impl Backend for BrokenBackend {
 }
 
 impl BackendRead for BrokenRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
         let live_entries;
         let current_commit_count = *self
             .commit_count
@@ -316,7 +320,7 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        get_many_from_map(entries, self.mode, space, keys, opts)
+        visit_many_from_map(entries, self.mode, space, keys, opts, visitor)
     }
 
     fn visit_range<V>(
@@ -347,8 +351,17 @@ impl BackendRead for BrokenRead {
 impl BackendWrite for BrokenWrite {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
-            self.staged
-                .insert((space, entry.key), stored_value_bytes(entry.value));
+            let mut bytes = stored_value_bytes(entry.value);
+            if matches!(self.mode, BrokenMode::CorruptOpaqueBytes) {
+                bytes = Bytes::from(
+                    bytes
+                        .iter()
+                        .copied()
+                        .filter(|byte| *byte != 0)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            self.staged.insert((space, entry.key), bytes);
         }
         Ok(())
     }
@@ -405,37 +418,37 @@ impl BrokenBackend {
     }
 }
 
-fn get_many_from_map(
+fn visit_many_from_map<V>(
     entries: &BrokenMap,
     mode: BrokenMode,
     space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
-) -> Result<GetManyResult, BackendError> {
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
     let mut seen = BTreeSet::new();
-    let mut values = Vec::new();
-    for key in keys {
+    for (index, key) in keys.iter().enumerate() {
         if matches!(mode, BrokenMode::GetManyMissesExistingKey)
             && key == &Key(Bytes::from_static(b"a"))
         {
-            values.push(None);
+            visitor.visit(index, key, None)?;
             continue;
         }
-        if !seen.insert(key.clone()) {
-            if let Some(value) = entries.get(&(space, key.clone())) {
-                values.push(Some(project_value(value, mode, opts.projection, false)));
-            } else {
-                values.push(None);
-            }
-            continue;
-        }
-        values.push(
+        let value = if !seen.insert(key.clone()) {
             entries
                 .get(&(space, key.clone()))
-                .map(|value| project_value(value, mode, opts.projection, false)),
-        );
+                .map(|value| project_value_ref(value, mode, opts.projection, false))
+        } else {
+            entries
+                .get(&(space, key.clone()))
+                .map(|value| project_value_ref(value, mode, opts.projection, false))
+        };
+        visitor.visit(index, key, value)?;
     }
-    Ok(GetManyResult::new(values))
+    Ok(())
 }
 
 fn visit_range_from_map<V>(
@@ -502,34 +515,6 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
         Bound::Unbounded => true,
     };
     lower_matches && upper_matches
-}
-
-fn project_value(
-    value: &Bytes,
-    mode: BrokenMode,
-    projection: CoreProjection,
-    break_key_only: bool,
-) -> ProjectedValue {
-    let value = if matches!(mode, BrokenMode::CorruptOpaqueBytes) {
-        Bytes::from(
-            value
-                .iter()
-                .copied()
-                .filter(|byte| byte.is_ascii_graphic() || *byte == b' ')
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        value.clone()
-    };
-    match projection {
-        CoreProjection::KeyOnly
-            if break_key_only && matches!(mode, BrokenMode::KeyOnlyScanReturnsFullValues) =>
-        {
-            ProjectedValue::FullValue(value)
-        }
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(value),
-    }
 }
 
 fn project_value_ref(

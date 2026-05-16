@@ -50,8 +50,8 @@ Planned storage_v2 optimization extensions:
 Backend: backend_v2
   ordered byte keys
   opaque byte values
-  get_many
-  scan_range
+  visit_many
+  visit_range
   put_many / delete_many
   begin_read / begin_write
   atomic commit
@@ -399,7 +399,7 @@ Point reads:
 ```text
 domain store requests M keys, possibly with duplicates
 storage_v2 may dedupe to U unique keys
-backend_v2 get_many returns one slot per unique/requested backend key
+backend_v2 visit_many visits one borrowed value slot per unique/requested backend key
 storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
 storage_v2 can return either materialized caller-order values or an indexed
   shape with one value slot per unique key plus requested-slot indexes
@@ -621,15 +621,16 @@ point batch:
   reconstruction for M requested keys. Indexed point results avoid cloning
   duplicate value slots; materialized point results clone into M caller-order
   slots. A reusable point request plan moves dedupe/index construction out of
-  repeated reads with the same key shape. Backend get_many already returns
+  repeated reads with the same key shape. Backend visit_many already visits
   requested-order slots for the deduped key batch, so planned reads do not need
-  a returned-entry hash-map step.
+  a returned-entry hash-map step. Storage materializes only when the caller asks
+  for owned point values.
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations
-  backend_v2 exposes visitor-first range scans with borrowed KeyRef and
-  ProjectedValueRef row data; storage_v2 owns materializing ScanPage-shaped
-  results when callers need owned entries
+  backend_v2 exposes visitor-first point and range reads with borrowed KeyRef
+  and ProjectedValueRef row data; storage_v2 owns materializing point/ScanPage
+  shapes when callers need owned entries
 
 storage cursor resume:
   O(1) cursor validation/construction plus backend range resume cost

@@ -7,9 +7,9 @@ use bytes::Bytes;
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValue,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 
 type SpaceEntries = BTreeMap<Key, Bytes>;
@@ -138,37 +138,6 @@ impl Backend for InMemoryBackend {
 }
 
 impl BackendRead for InMemoryRead {
-    fn get_many(
-        &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
-        Ok(GetManyResult::new(
-            self.entries
-                .get(&space)
-                .map(|space_entries| match space_entries.as_ref() {
-                    SpaceState::Flat(entries) => keys
-                        .iter()
-                        .map(|key| {
-                            entries
-                                .get(key)
-                                .map(|value| project_value(value, opts.projection))
-                        })
-                        .collect(),
-                    _ => keys
-                        .iter()
-                        .map(|key| {
-                            space_entries
-                                .get(key)
-                                .map(|value| project_value(value, opts.projection))
-                        })
-                        .collect(),
-                })
-                .unwrap_or_else(|| vec![None; keys.len()]),
-        ))
-    }
-
     fn visit_many<V>(
         &self,
         space: SpaceId,
@@ -544,13 +513,6 @@ fn bounds_are_empty(lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
         (Bound::Included(lower), Bound::Excluded(upper))
         | (Bound::Excluded(lower), Bound::Included(upper))
         | (Bound::Excluded(lower), Bound::Excluded(upper)) => lower >= upper,
-    }
-}
-
-fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(value.clone()),
     }
 }
 
