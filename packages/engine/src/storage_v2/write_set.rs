@@ -325,7 +325,7 @@ mod tests {
 
     use crate::backend_v2::{
         Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-        ConformanceBackend, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ReadOptions,
+        ConformanceBackend, GetOptions, Key, KeyRange, PointVisitor, PutBatch, ReadOptions,
         ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
         WriteStats,
     };
@@ -749,12 +749,16 @@ mod tests {
     }
 
     impl BackendRead for CountingRead {
-        fn get_many(
+        fn visit_many<V>(
             &self,
             _space: SpaceId,
             _keys: &[Key],
             _opts: GetOptions<'_>,
-        ) -> Result<GetManyResult, BackendError> {
+            _visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
             unimplemented!("not used by write-set tests")
         }
 

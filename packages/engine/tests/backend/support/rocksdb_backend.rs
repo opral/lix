@@ -6,9 +6,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rocksdb::Snapshot;
@@ -130,27 +130,35 @@ impl Backend for RocksDbBackend {
 }
 
 impl BackendRead for RocksDbRead<'_> {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
         let encoded_keys = keys
             .iter()
             .map(|key| encode_entry_key(space, key))
             .collect::<Vec<_>>();
-        let values = self
-            .snapshot
-            .multi_get(encoded_keys.iter())
-            .into_iter()
-            .map(|value| {
-                value.map_err(rocksdb_error).map(|value| {
-                    value.map(|value| project_value(Bytes::from(value), opts.projection))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(GetManyResult::new(values))
+        for (index, (key, value)) in keys
+            .iter()
+            .zip(self.snapshot.multi_get(encoded_keys.iter()).into_iter())
+            .enumerate()
+        {
+            let value = value.map_err(rocksdb_error)?;
+            visitor.visit(
+                index,
+                key,
+                value
+                    .as_ref()
+                    .map(|value| project_value_ref(value.as_ref(), opts.projection)),
+            )?;
+        }
+        Ok(())
     }
 
     fn visit_range<V>(
@@ -334,15 +342,15 @@ fn space_upper_bound(space: SpaceId) -> Vec<u8> {
     }
 }
 
-fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(value),
-    }
-}
-
 fn stored_value_bytes(value: StoredValue) -> Bytes {
     value.bytes
+}
+
+fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
+    match projection {
+        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+    }
 }
 
 fn rocksdb_error(error: rocksdb::Error) -> BackendError {

@@ -3,7 +3,8 @@ use crate::backend_v2::conformance::{
     BackendFactory, BackendFixture, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, GetOptions, ProjectedValue, ReadOptions, WriteOptions,
+    get_many as backend_get_many, Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions,
+    WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -160,8 +161,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = read
-        .get_many(test_space, &keys, GetOptions::default())
+    let result = backend_get_many(&read, test_space, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     for (index, (key, expected_value)) in expected.iter().enumerate() {

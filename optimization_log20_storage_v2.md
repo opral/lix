@@ -4107,13 +4107,125 @@ Completed without stack overflow.
 
 Direct in-memory profile after harness fix:
 
-| Case | Time |
-| ---- | ---: |
-| direct_commit_puts_k1024_g16_v32 | 40.13 us |
-| direct_mixed80_20_k1024_g16_v32 | 35.96 us |
-| direct_commit_puts_k128_g16_existing10k_touched_v32 | 4.03 us |
-| direct_get_many_m1000_u100 | 27.36 us |
-| direct_visit_many_m1000_u100 | 23.63 us |
-| direct_scan_visit_key_only_q1000 | 1.055 us |
-| direct_scan_materialized_q1000 | 20.87 us |
+| Case                                                |     Time |
+| --------------------------------------------------- | -------: |
+| direct_commit_puts_k1024_g16_v32                    | 40.13 us |
+| direct_mixed80_20_k1024_g16_v32                     | 35.96 us |
+| direct_commit_puts_k128_g16_existing10k_touched_v32 |  4.03 us |
+| direct_get_many_m1000_u100                          | 27.36 us |
+| direct_visit_many_m1000_u100                        | 23.63 us |
+| direct_scan_visit_key_only_q1000                    | 1.055 us |
+| direct_scan_materialized_q1000                      | 20.87 us |
+```
+
+## 2026-05-16: Point reads hard-cut to visitor-first backend API
+
+Change under test:
+
+```text
+BackendRead::get_many(...) -> removed from the required backend trait
+BackendRead::visit_many(...) -> required core point-read API
+backend_v2::get_many(...) -> materializing helper layered above visit_many
+```
+
+This makes point reads match the scan-side cut: backend authors implement the
+borrowed visitor path; storage_v2 owns materialization when callers ask for
+owned values.
+
+Validation:
+
+```sh
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+All tests passed, and the full bench completed.
+
+Backend matrix scorecard:
+
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16            |  40.38 us |   897.20 us |  21.72 ms |    218.86 us |
+| mixed 80/20 k1024/g16            |  36.79 us |   984.64 us |  20.76 ms |    223.14 us |
+| commit touched existing k128/g16 |   4.17 us |     1.01 ms |  16.42 ms |    199.69 us |
+| planned visit unique m1000/u100  |   2.29 us |    34.19 us |   7.08 us |     40.53 us |
+| planned get many m1000/u100      |   4.77 us |    37.00 us |   9.24 us |     43.68 us |
+| scan visit key-only q1000        |   1.02 us |    44.65 us |  29.79 us |     91.17 us |
+| scan materialized q1000          |  19.67 us |    62.62 us |  39.10 us |    108.86 us |
+| prefix materialized q1000        |  19.51 us |    62.66 us |  39.19 us |    109.74 us |
+
+Direct backend profile:
+
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| direct get_many m1000/u100       |  50.05 us |   107.95 us |  91.79 us |    423.60 us |
+| direct visit_many m1000/u100     |  23.59 us |    80.21 us |  66.90 us |    400.86 us |
+| direct scan visit key-only q1000 |   1.39 us |    45.39 us |  23.59 us |     92.82 us |
+| direct scan materialized q1000   |  20.06 us |    64.40 us |  39.50 us |    109.16 us |
+
+Focused point-read adapter scorecard:
+
+| Case                                                     |      Time |      Criterion-reported change |
+| -------------------------------------------------------- | --------: | -----------------------------: |
+| point_read_adapter m1000/u100                            |  45.43 us |                  130.5% slower |
+| point_read_indexed_adapter m1000/u100                    |  35.37 us |                   78.7% slower |
+| point_read_planned_lean_backend m10000/u100              |   6.29 us |                 1750.9% slower |
+| point_read_planned_lean_backend visit_unique m10000/u100 | 291.71 ns |                  217.8% slower |
+| conformance_backend get_many m1000/u100                  |  16.71 us |                   24.0% slower |
+| in_memory_backend planned_get_many m1000/u100            |   4.95 us | 65.4% faster vs old noisy lane |
+| in_memory_backend planned_visit_unique m1000/u100        |   2.33 us | 74.8% faster vs old noisy lane |
+
+Interpretation:
+
+```text
+The hard cut is directionally clean but not a free point-read win.
+
+Direct visitor point reads are faster than materialized helper reads for every
+real backend in the direct profile:
+
+  in_memory:   50.05 us -> 23.59 us
+  sqlite_temp: 107.95 us -> 80.21 us
+  redb_temp:   91.79 us -> 66.90 us
+  rocksdb:    423.60 us -> 400.86 us
+
+But the storage-only and lean synthetic materialized point-read lanes regressed
+badly. The old backend trait allowed custom owned get_many implementations to
+fill Vec<Option<ProjectedValue>> directly. The new hard cut routes owned point
+results through per-slot PointVisitor calls and then materializes above the
+backend boundary.
+```
+
+So the current result is:
+
+```text
+Good:
+  backend API is simpler and borrowed-first
+  direct visitor point reads are cheaper than materialized helper reads
+  real backend planned visitor lanes improved or stayed competitive
+  scan visitor gains remain intact
+
+Bad:
+  materialized point reads now pay a visible helper/visitor/materialization tax
+  synthetic lean lanes expose that tax brutally
+```
+
+Next first-principles question:
+
+```text
+Can storage_v2 keep the visitor-first backend core while adding a monomorphic
+storage-owned point collector path that avoids the generic PointVisitor tax for
+materialized point results?
+
+Possible shape:
+  backend.visit_many_collect(space, keys, opts, &mut PointValueCollector)
+
+or:
+  BackendRead::visit_many receives a concrete enum/collector instead of a
+  generic PointVisitor for the materialized fast path.
+
+Do not re-add required BackendRead::get_many yet. The direct profile says the
+borrowed visitor API is valuable. The missing piece is an efficient
+materializing adapter above it.
 ```

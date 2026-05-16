@@ -37,7 +37,7 @@ The important cut:
 Backend:
   ordered byte keys
   opaque byte values
-  get_many
+  visit_many
   visit_range
   put_many / delete_many
   begin_read / begin_write
@@ -93,7 +93,7 @@ Every v0 backend must support:
 ```text
 begin_read
 begin_write
-get_many
+visit_many
 visit_range
 put_many
 delete_many
@@ -188,21 +188,21 @@ Backend author mapping:
 
 ```text
 FoundationDB:
-  get_many     -> transaction get calls
+  visit_many   -> transaction get calls
   visit_range  -> transaction get_range
   put_many     -> set
   delete_many  -> clear
   commit       -> commit
 
 RocksDB:
-  get_many     -> MultiGet
+  visit_many   -> MultiGet
   visit_range  -> iterator seek + next
   put_many     -> WriteBatch
   delete_many  -> WriteBatch delete
   commit       -> DB::write / Transaction::Commit
 
 SQLite:
-  get_many     -> SELECT ... WHERE key IN (...)
+  visit_many   -> SELECT ... WHERE key IN (...)
   visit_range  -> WHERE space = ? AND key >= ? AND key < ? ORDER BY key LIMIT ?
   put_many     -> transaction + batched INSERT/UPDATE
   delete_many  -> transaction + batched DELETE
@@ -308,12 +308,15 @@ The backend does not know what these mean.
 
 ```rust
 pub trait BackendRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized;
 
     fn visit_range<V>(
         &self,
@@ -331,6 +334,15 @@ pub trait BackendRead {
     {
         Ok(())
     }
+}
+
+pub trait PointVisitor {
+    fn visit(
+        &mut self,
+        index: usize,
+        key: &Key,
+        value: Option<ProjectedValueRef<'_>>,
+    ) -> Result<(), BackendError>;
 }
 
 pub trait ScanVisitor {
@@ -362,17 +374,17 @@ impl Default for GetOptions<'_> {
 }
 ```
 
-`get_many` is required because point batching is a core backend primitive, not a
-looping convenience.
+`visit_many` is required because point batching is a core backend primitive, not
+a looping convenience.
 
-V0 `get_many` returns one output slot per requested key, in the exact order of
+V0 `visit_many` calls the visitor once per requested key, in the exact order of
 the key slice passed to the backend. Duplicate requested keys must produce
-duplicate output slots. Missing keys are represented as `None`.
+duplicate visitor calls. Missing keys are passed as `None`.
 
-This slot-shaped contract is part of the core API because it is both simpler and
-faster than a backend-native found-entry result: callers already know the
+The visitor-shaped contract keeps backend values borrowed and avoids forcing
+every backend to allocate a materialized point result. Callers already know the
 requested keys, and `storage_v2` can dedupe to unique keys before calling the
-backend when that is useful. Backends must still implement `get_many` as a
+backend when that is useful. Backends must still implement `visit_many` as a
 batched point operation over the requested key set, not as a required loop of
 independent physical reads.
 
@@ -418,11 +430,16 @@ pub enum ProjectedValueRef<'a> {
 
 #[derive(Clone, Debug)]
 pub struct GetManyResult {
-    /// One value slot per key passed to get_many, in caller order.
+    /// One value slot per key passed to a materializing get_many helper,
+    /// in caller order.
     /// None means the requested key was missing.
     pub values: Vec<Option<ProjectedValue>>,
 }
 ```
+
+`GetManyResult` is a materialized helper result above the backend core. It is
+useful for conformance tests and simple callers, but backend authors implement
+`visit_many`, not owned `get_many`.
 
 V0 scans are forward only. Reverse scans, byte limits, predicates, and native
 opaque cursors are extension paths. Storage-level helpers may normalize
@@ -698,7 +715,7 @@ pub struct BackendCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendProfile {
     /// Ordered byte keys, coherent read views, paged forward scans,
-    /// batched get_many, and atomic write commit.
+    /// batched visit_many, and atomic write commit.
     V0 {
         write_concurrency: WriteConcurrency,
     },
@@ -816,12 +833,15 @@ types and support reporting:
 
 ```rust
 pub trait BackendPushdownExt {
-    fn get_many_pushdown(
+    fn visit_many_pushdown<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: PushdownGetOptions<'_>,
-    ) -> Result<PushdownGetResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<PushdownPointResult, BackendError>
+    where
+        V: PointVisitor + ?Sized;
 
     fn scan_range_pushdown(
         &self,
@@ -926,7 +946,7 @@ payload_ref = P
 ### Pushdown Support Result
 
 The support structures below belong to pushdown/envelope extension results.
-Core v0 `get_many` and `visit_range` do not return support metadata.
+Core v0 `visit_many` and `visit_range` do not return support metadata.
 
 ```rust
 #[derive(Clone, Debug)]
@@ -1174,7 +1194,7 @@ read(ReadPlan) -> ReadPage
 Make the core look like native backend calls:
 
 ```text
-get_many
+visit_many
 visit_range
 put_many
 delete_many
@@ -1247,7 +1267,8 @@ let read = backend.begin_read(ReadOptions {
     ..Default::default()
 })?;
 
-let result = read.get_many(
+let result = backend_v2::get_many(
+    &read,
     TRACKED_ROOT_SPACE,
     &[state_row_key],
     GetOptions::default(),
@@ -1439,7 +1460,7 @@ higher engine layer, not in backend_v2.
 ```text
 begin_read
 begin_write
-get_many
+visit_many
 visit_range
 put_many
 delete_many
@@ -1452,7 +1473,7 @@ Required guarantees:
 ```text
 ordered keys
 coherent read view
-batched get_many over requested keys
+batched visit_many over requested keys
 forward row-bounded paged scans
 key-resume continuation within the same read view
 atomic write commit
@@ -1528,7 +1549,7 @@ packages/engine/src/backend_v2/conformance/
 `baseline.rs` contains the required tests every backend must pass before
 capabilities matter. It validates the v0 invariants: raw lexicographic byte-key
 ordering, opaque byte value preservation, coherent reads pinned across later
-commits, batched `get_many`, forward row-bounded scans, multi-page key-resume
+commits, batched `visit_many`, forward row-bounded scans, multi-page key-resume
 draining without repeats/skips, atomic writes, rollback for
 new/overwrite/delete mutations, space isolation, and `FullValue`/`KeyOnly`.
 
@@ -1667,12 +1688,15 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized;
 
     fn visit_range<V>(
         &self,

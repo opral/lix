@@ -8,9 +8,9 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
-    ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage,
-    SpaceId, WriteOptions,
+    get_many as backend_get_many, Backend, BackendRead, BackendWrite, CoreProjection, GetOptions,
+    Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions,
+    ScanOptions, ScanPage, SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -79,10 +79,10 @@ where
     seed_full_values(&backend, test_space, [("a", "A"), ("b", "B")])?;
 
     let requested = [key("b"), key("missing"), key("a"), key("b")];
-    let result = backend
+    let read = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read failed: {error}"))?
-        .get_many(test_space, &requested, GetOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let result = backend_get_many(&read, test_space, &requested, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     if result.values.len() != requested.len() {
@@ -120,10 +120,10 @@ where
     F: BackendFactory,
 {
     let backend = open_backend(factory);
-    let result = backend
+    let read = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read failed: {error}"))?
-        .get_many(space(1), &[], GetOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let result = backend_get_many(&read, space(1), &[], GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
     if result.entries_for_requested_keys(&[]).is_empty() {
         Ok(())
@@ -475,15 +475,16 @@ where
         )
         .map_err(|error| format!("put_many failed: {error}"))?;
 
-    let before_commit = backend
+    let read_before_commit = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read before commit failed: {error}"))?
-        .get_many(
-            test_space,
-            &[key_a.clone(), key_b.clone()],
-            GetOptions::default(),
-        )
-        .map_err(|error| format!("get_many before commit failed: {error}"))?;
+        .map_err(|error| format!("begin_read before commit failed: {error}"))?;
+    let before_commit = backend_get_many(
+        &read_before_commit,
+        test_space,
+        &[key_a.clone(), key_b.clone()],
+        GetOptions::default(),
+    )
+    .map_err(|error| format!("get_many before commit failed: {error}"))?;
     if !before_commit
         .entries_for_requested_keys(&[key_a.clone(), key_b.clone()])
         .is_empty()
@@ -556,8 +557,7 @@ where
     seed_full_values(&backend, test_space, [("a", "C")])?;
 
     let old_keys = [key("a")];
-    let old_result = old_read
-        .get_many(test_space, &old_keys, GetOptions::default())
+    let old_result = backend_get_many(&old_read, test_space, &old_keys, GetOptions::default())
         .map_err(|error| format!("old read get_many failed: {error}"))?;
     assert_read_entries(
         &old_result.entries_for_requested_keys(&old_keys),
@@ -614,29 +614,29 @@ where
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
     let full_keys = [key("a")];
-    let full = read
-        .get_many(
-            test_space,
-            &full_keys,
-            GetOptions {
-                projection: CoreProjection::FullValue,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("FullValue get_many failed: {error}"))?;
+    let full = backend_get_many(
+        &read,
+        test_space,
+        &full_keys,
+        GetOptions {
+            projection: CoreProjection::FullValue,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("FullValue get_many failed: {error}"))?;
     assert_read_entries(&full.entries_for_requested_keys(&full_keys), &[("a", "A")])?;
 
     let key_only_keys = [key("a")];
-    let key_only = read
-        .get_many(
-            test_space,
-            &key_only_keys,
-            GetOptions {
-                projection: CoreProjection::KeyOnly,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("KeyOnly get_many failed: {error}"))?;
+    let key_only = backend_get_many(
+        &read,
+        test_space,
+        &key_only_keys,
+        GetOptions {
+            projection: CoreProjection::KeyOnly,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("KeyOnly get_many failed: {error}"))?;
     assert_key_only_entries(
         &key_only.entries_for_requested_keys(&key_only_keys),
         &[key("a")],
@@ -695,10 +695,10 @@ where
         [(opaque_key.0.clone(), opaque_value.clone())],
     )?;
     let requested = [opaque_key.clone()];
-    let result = backend
+    let read = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read failed: {error}"))?
-        .get_many(test_space, &requested, GetOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let result = backend_get_many(&read, test_space, &requested, GetOptions::default())
         .map_err(|error| format!("opaque get_many failed: {error}"))?;
     assert_read_entries_bytes(
         &result.entries_for_requested_keys(&requested),
@@ -790,10 +790,10 @@ where
         .iter()
         .map(|(key_bytes, _)| key(*key_bytes))
         .collect::<Vec<_>>();
-    let result = backend
+    let read = backend
         .begin_read(ReadOptions::default())
-        .map_err(|error| format!("begin_read failed: {error}"))?
-        .get_many(test_space, &keys, GetOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let result = backend_get_many(&read, test_space, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
     assert_optional_entry_map(&result.entries_for_requested_keys(&keys), expected)
 }

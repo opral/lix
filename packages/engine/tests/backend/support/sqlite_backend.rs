@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
@@ -152,13 +152,17 @@ impl Backend for SqliteBackend {
 }
 
 impl BackendRead for SqliteRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
-        get_many(self.conn(), space, keys, opts)
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        visit_many(self.conn(), space, keys, opts, visitor)
     }
 
     fn visit_range<V>(
@@ -296,18 +300,22 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-fn get_many(
+fn visit_many<V>(
     conn: &Connection,
     space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
-) -> Result<GetManyResult, BackendError> {
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
     let unique_keys = keys
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     if unique_keys.is_empty() {
-        return Ok(GetManyResult::new(Vec::new()));
+        return Ok(());
     }
 
     let placeholders = std::iter::repeat("(?)")
@@ -335,16 +343,18 @@ fn get_many(
     while let Some(row) = rows.next().map_err(sqlite_error)? {
         let key_bytes: Vec<u8> = row.get(0).map_err(sqlite_error)?;
         let value_bytes: Vec<u8> = row.get(1).map_err(sqlite_error)?;
-        found.insert(
-            Key(Bytes::from(key_bytes)),
-            project_value(Bytes::from(value_bytes), opts.projection),
-        );
+        found.insert(Key(Bytes::from(key_bytes)), Bytes::from(value_bytes));
     }
-    Ok(GetManyResult::new(
-        keys.iter()
-            .map(|key| found.get(key).cloned())
-            .collect::<Vec<_>>(),
-    ))
+    for (index, key) in keys.iter().enumerate() {
+        visitor.visit(
+            index,
+            key,
+            found
+                .get(key)
+                .map(|value| project_value_ref(value.as_ref(), opts.projection)),
+        )?;
+    }
+    Ok(())
 }
 
 fn visit_range<V>(
@@ -425,13 +435,6 @@ fn append_bound_sql(
             values.push(SqlValue::Blob(key.0.to_vec()));
         }
         Bound::Unbounded => {}
-    }
-}
-
-fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(value),
     }
 }
 

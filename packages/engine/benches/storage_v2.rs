@@ -14,11 +14,11 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    ConformanceBackend, CoreProjection, GetManyResult, GetOptions, InMemoryBackend, Key, KeyRange,
-    KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
-    ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    get_many as backend_get_many, Backend, BackendCapabilities, BackendError, BackendRead,
+    BackendWrite, CommitResult, ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend,
+    Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch,
+    PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor,
+    SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageScanBuffer,
@@ -1417,9 +1417,13 @@ where
                     let read = point_backend
                         .begin_read(ReadOptions::default())
                         .expect("begin direct point read");
-                    let result = read
-                        .get_many(SpaceId(1), black_box(&point_keys), GetOptions::default())
-                        .expect("direct get_many");
+                    let result = backend_get_many(
+                        &read,
+                        SpaceId(1),
+                        black_box(&point_keys),
+                        GetOptions::default(),
+                    )
+                    .expect("direct get_many");
                     assert_eq!(result.values.len(), 1_000);
                     assert_eq!(
                         result.values.iter().filter(|value| value.is_some()).count(),
@@ -2349,23 +2353,26 @@ impl PointReadBackend {
 }
 
 impl BackendRead for PointReadBackend {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         _space: SpaceId,
         keys: &[Key],
         _opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
         self.requested_keys.replace(keys.to_vec());
-        Ok(GetManyResult::new(
-            keys.iter()
-                .map(|key| {
-                    self.values
-                        .iter()
-                        .find(|entry| entry.key == *key)
-                        .map(|entry| entry.value.clone())
-                })
-                .collect(),
-        ))
+        for (index, key) in keys.iter().enumerate() {
+            let value = self
+                .values
+                .iter()
+                .find(|entry| entry.key == *key)
+                .map(|entry| entry.value.as_ref());
+            visitor.visit(index, key, value)?;
+        }
+        Ok(())
     }
 
     fn visit_range<V>(
@@ -2405,23 +2412,6 @@ impl LeanPointReadBackend {
 }
 
 impl BackendRead for LeanPointReadBackend {
-    fn get_many(
-        &self,
-        _space: SpaceId,
-        keys: &[Key],
-        _opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
-        let found = keys.len().min(self.values.len());
-        let values = self
-            .values
-            .iter()
-            .take(found)
-            .map(|entry| Some(entry.value.clone()))
-            .chain(std::iter::repeat_with(|| None).take(keys.len().saturating_sub(found)))
-            .collect();
-        Ok(GetManyResult::new(values))
-    }
-
     fn visit_many<V>(
         &self,
         _space: SpaceId,
@@ -2480,12 +2470,16 @@ impl PrefixReadBackend {
 }
 
 impl BackendRead for PrefixReadBackend {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         _space: SpaceId,
         _keys: &[Key],
         _opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
+        _visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
         unreachable!("prefix-scan benchmark does not point-read")
     }
 
@@ -2517,12 +2511,16 @@ impl BackendRead for PrefixReadBackend {
 struct EmptyRead;
 
 impl BackendRead for EmptyRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         _space: SpaceId,
         _keys: &[Key],
         _opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
+        _visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
         unreachable!("write-set benchmark does not point-read")
     }
 

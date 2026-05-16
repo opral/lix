@@ -245,7 +245,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, ConformanceBackend, GetManyResult, GetOptions, Key, KeyRange,
+        BackendError, BackendRead, ConformanceBackend, GetOptions, Key, KeyRange, PointVisitor,
         Prefix, ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
         StoredValue, WriteOptions,
     };
@@ -385,12 +385,16 @@ mod tests {
     }
 
     impl BackendRead for CapturingRead {
-        fn get_many(
+        fn visit_many<V>(
             &self,
             _space: SpaceId,
             _keys: &[Key],
             _opts: GetOptions<'_>,
-        ) -> Result<GetManyResult, BackendError> {
+            _visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
             unimplemented!("not used by prefix lowering tests")
         }
 

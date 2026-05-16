@@ -9,9 +9,9 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
-    WriteOptions,
+    get_many as backend_get_many, Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange,
+    KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
+    ScanPage, SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -127,8 +127,7 @@ where
         key("missing"),
         keys[rng.usize(keys.len())].clone(),
     ];
-    let result = read
-        .get_many(target_space, &point_keys, GetOptions::default())
+    let result = backend_get_many(read, target_space, &point_keys, GetOptions::default())
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
     let actual = entries_to_map(&result.entries_for_requested_keys(&point_keys));
     let expected = point_keys

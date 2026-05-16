@@ -1,7 +1,7 @@
 use crate::backend_v2::{
     BackendCapabilities, BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange,
-    KeyRef, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId,
-    WriteOptions,
+    KeyRef, ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
+    SpaceId, WriteOptions,
 };
 
 pub trait Backend {
@@ -21,13 +21,6 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    fn get_many(
-        &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError>;
-
     fn visit_many<V>(
         &self,
         space: SpaceId,
@@ -36,14 +29,7 @@ pub trait BackendRead {
         visitor: &mut V,
     ) -> Result<(), BackendError>
     where
-        V: PointVisitor + ?Sized,
-    {
-        let result = self.get_many(space, keys, opts)?;
-        for (index, (key, value)) in keys.iter().zip(result.values.iter()).enumerate() {
-            visitor.visit(index, key, value.as_ref().map(|value| value.as_ref()))?;
-        }
-        Ok(())
-    }
+        V: PointVisitor + ?Sized;
 
     fn visit_range<V>(
         &self,
@@ -74,6 +60,45 @@ pub trait PointVisitor {
         key: &Key,
         value: Option<ProjectedValueRef<'_>>,
     ) -> Result<(), BackendError>;
+}
+
+pub fn get_many<R>(
+    read: &R,
+    space: SpaceId,
+    keys: &[Key],
+    opts: GetOptions<'_>,
+) -> Result<GetManyResult, BackendError>
+where
+    R: BackendRead + ?Sized,
+{
+    struct MaterializingPointVisitor<'a> {
+        values: &'a mut [Option<ProjectedValue>],
+    }
+
+    impl PointVisitor for MaterializingPointVisitor<'_> {
+        fn visit(
+            &mut self,
+            index: usize,
+            _key: &Key,
+            value: Option<ProjectedValueRef<'_>>,
+        ) -> Result<(), BackendError> {
+            if let Some(slot) = self.values.get_mut(index) {
+                *slot = value.map(|value| value.to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    let mut values = vec![None::<ProjectedValue>; keys.len()];
+    read.visit_many(
+        space,
+        keys,
+        opts,
+        &mut MaterializingPointVisitor {
+            values: values.as_mut_slice(),
+        },
+    )?;
+    Ok(GetManyResult::new(values))
 }
 
 impl<F> ScanVisitor for F

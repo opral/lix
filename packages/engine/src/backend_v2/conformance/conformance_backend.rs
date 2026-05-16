@@ -6,9 +6,9 @@ use bytes::Bytes;
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
-    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 
 type ConformanceMap = BTreeMap<(SpaceId, Key), Bytes>;
@@ -98,13 +98,17 @@ impl Backend for ConformanceBackend {
 }
 
 impl BackendRead for ConformanceRead {
-    fn get_many(
+    fn visit_many<V>(
         &self,
         space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
-        get_many_from_map(&self.entries, space, keys, opts)
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        visit_many_from_map(&self.entries, space, keys, opts, visitor)
     }
 
     fn visit_range<V>(
@@ -163,21 +167,23 @@ impl ConformanceBackend {
     }
 }
 
-fn get_many_from_map(
+fn visit_many_from_map<V>(
     entries: &ConformanceMap,
     space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
-) -> Result<GetManyResult, BackendError> {
-    Ok(GetManyResult::new(
-        keys.iter()
-            .map(|key| {
-                entries
-                    .get(&(space, key.clone()))
-                    .map(|value| project_value(value, opts.projection))
-            })
-            .collect(),
-    ))
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    for (index, key) in keys.iter().enumerate() {
+        let value = entries
+            .get(&(space, key.clone()))
+            .map(|value| project_value_ref(value, opts.projection));
+        visitor.visit(index, key, value)?;
+    }
+    Ok(())
 }
 
 fn visit_range_from_map<V>(
@@ -230,13 +236,6 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
         std::ops::Bound::Unbounded => true,
     };
     lower_matches && upper_matches
-}
-
-fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue => ProjectedValue::FullValue(value.clone()),
-    }
 }
 
 fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {

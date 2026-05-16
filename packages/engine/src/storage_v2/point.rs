@@ -385,11 +385,11 @@ fn get_many_indexed_values_for_borrowed_plan_with_stats<R>(
 where
     R: BackendRead,
 {
-    let result = read.get_many(space, &plan.unique_keys, opts)?;
+    let unique_values = collect_unique_values(read, space, &plan.unique_keys, opts)?;
 
     Ok(StorageReadResult::new(
         IndexedPointValues {
-            unique_values: result.values,
+            unique_values,
             requested_to_unique: plan.requested_to_unique.clone(),
         },
         StorageReadStats {
@@ -438,11 +438,11 @@ pub(crate) fn get_many_borrowed_indexed_values_for_plan_with_stats<'a, R>(
 where
     R: BackendRead,
 {
-    let result = read.get_many(space, &plan.unique_keys, opts)?;
+    let unique_values = collect_unique_values(read, space, &plan.unique_keys, opts)?;
 
     Ok(StorageReadResult::new(
         BorrowedIndexedPointValues {
-            unique_values: result.values,
+            unique_values,
             requested_to_unique: plan.requested_to_unique.as_ref(),
         },
         StorageReadStats {
@@ -452,6 +452,45 @@ where
             prefix_lowered: 0,
         },
     ))
+}
+
+fn collect_unique_values<R>(
+    read: &R,
+    space: SpaceId,
+    unique_keys: &[Key],
+    opts: GetOptions<'_>,
+) -> Result<Vec<Option<ProjectedValue>>, BackendError>
+where
+    R: BackendRead,
+{
+    struct Collector<'a> {
+        values: &'a mut [Option<ProjectedValue>],
+    }
+
+    impl PointVisitor for Collector<'_> {
+        fn visit(
+            &mut self,
+            index: usize,
+            _key: &Key,
+            value: Option<crate::backend_v2::ProjectedValueRef<'_>>,
+        ) -> Result<(), BackendError> {
+            if let Some(slot) = self.values.get_mut(index) {
+                *slot = value.map(|value| value.to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    let mut values = vec![None; unique_keys.len()];
+    read.visit_many(
+        space,
+        unique_keys,
+        opts,
+        &mut Collector {
+            values: values.as_mut_slice(),
+        },
+    )?;
+    Ok(values)
 }
 
 pub(crate) fn visit_unique_point_values_for_plan<R, V>(
