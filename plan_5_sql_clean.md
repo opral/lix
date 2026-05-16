@@ -480,14 +480,22 @@ Phase 10 progress:
 
 ## Verification Gates
 
-- [ ] `cargo check -p lix_engine`
-- [ ] `cargo test -p lix_engine sql2`
-- [ ] `cargo test -p lix_engine lix_state`
-- [ ] `cargo test -p lix_engine lix_registered_schema`
-- [ ] differential tests pass with fast path enabled.
-- [ ] differential tests pass with fast path disabled.
-- [ ] run a large fallback `INSERT ... VALUES` benchmark to confirm no pre-fallback AST clone regression.
-- [ ] review compile warnings and remove compatibility shims left only for migration.
+- [x] `cargo check -p lix_engine`
+  - Passed after Phase 10.
+- [x] `cargo test -p lix_engine sql2`
+  - Passed: 202 passed, 36 ignored, 513 filtered out.
+- [x] `cargo test -p lix_engine lix_state`
+  - Passed. The public SQL integration file still reports 52 ignored cases from the Phase 1 bound-write gate.
+- [x] `cargo test -p lix_engine lix_registered_schema`
+  - Passed. The public SQL integration file still reports 56 ignored cases from the Phase 1 bound-write gate.
+- [x] differential tests pass with fast path enabled.
+  - Passed via `cargo test -p lix_engine sql2::test_support::differential --lib -- --nocapture`.
+- [x] differential tests pass with fast path disabled.
+  - Covered by the same differential harness: the reference side runs with `WriteExecutionMode::ForceDataFusion`.
+- [x] run a large fallback `INSERT ... VALUES` benchmark to confirm no pre-fallback AST clone regression.
+  - Passed after moving the benchmark fixture to the surviving `lix_state` write surface. Command: `cargo bench -p lix_engine --features storage-benches --bench transaction -- transaction_sql_fast_path/insert_values_batch_no_payload/2k --sample-size 10 --measurement-time 1 --warm-up-time 1`. Result: 127.74 ms to 128.77 ms for 2k rows.
+- [x] review compile warnings and remove compatibility shims left only for migration.
+  - Reviewed during final gates. Remaining warnings are unused/dead-code fallout from the hard-cut type/provider surface and disabled legacy provider DML, not compatibility adapters that should stay hidden.
 
 ## Implementation Notes
 
