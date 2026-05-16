@@ -82,24 +82,30 @@ where
             return Ok(Vec::new());
         }
         let mut store = self.store.lock().await;
-        let scope = scan_scope(&mut *store, &self.untracked_state, request).await?;
+        self.scan_rows_with_store(&mut *store, request).await
+    }
+
+    async fn scan_rows_with_store(
+        &self,
+        store: &mut dyn StorageReader,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let scope = scan_scope(store, &self.untracked_state, request).await?;
         let derived_rows =
-            scan_commit_derived_rows(&mut *store, &self.commit_graph, request, &scope).await?;
+            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut tracked_rows = Vec::new();
         if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
             for version_id in &scope.storage_version_ids {
                 let Some(commit_id) =
-                    load_version_ref_commit_id(&mut *store, &self.untracked_state, version_id)
-                        .await?
+                    load_version_ref_commit_id(store, &self.untracked_state, version_id).await?
                 else {
                     continue;
                 };
                 let tracked_request = tracked_scan_request_from_live(request);
                 let source = tracked_source_from_version_id(version_id);
-                let store: &mut dyn StorageReader = &mut *store;
                 tracked_rows.extend(
                     self.tracked_state
-                        .reader(store)
+                        .reader(&mut *store)
                         .scan_rows_at_commit(&commit_id, &tracked_request)
                         .await?
                         .into_iter()
@@ -109,9 +115,8 @@ where
         }
 
         let untracked_rows = if request.filter.untracked != Some(false) {
-            let store: &mut dyn StorageReader = &mut *store;
             self.untracked_state
-                .reader(store)
+                .reader(&mut *store)
                 .scan_rows(&untracked_scan_request_from_live(
                     request,
                     &scope.storage_version_ids,
@@ -154,19 +159,26 @@ where
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+        let mut store = self.store.lock().await;
+        if !version_ref_exists(&mut *store, &self.untracked_state, &request.version_id).await? {
+            return Ok(None);
+        }
         let rows = self
-            .scan_rows(&LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
-                    schema_keys: vec![request.schema_key.clone()],
-                    entity_ids: vec![request.entity_id.clone()],
-                    version_ids: vec![request.version_id.clone()],
-                    file_ids: vec![request.file_id.clone()],
-                    include_tombstones: false,
+            .scan_rows_with_store(
+                &mut *store,
+                &LiveStateScanRequest {
+                    filter: crate::live_state::LiveStateFilter {
+                        schema_keys: vec![request.schema_key.clone()],
+                        entity_ids: vec![request.entity_id.clone()],
+                        version_ids: vec![request.version_id.clone()],
+                        file_ids: vec![request.file_id.clone()],
+                        include_tombstones: false,
+                        ..Default::default()
+                    },
+                    limit: Some(1),
                     ..Default::default()
                 },
-                limit: Some(1),
-                ..Default::default()
-            })
+            )
             .await?;
         Ok(rows.into_iter().next())
     }
@@ -964,6 +976,35 @@ mod tests {
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"global-tracked\"}")
         );
+    }
+
+    #[tokio::test]
+    async fn load_row_returns_none_for_missing_version_even_when_identity_exists_elsewhere() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
+        let live_state = live_state_context();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
+                version_ref_row("global", "commit-global"),
+                version_ref_row("version-a", "commit-version-a"),
+                untracked_row_at("version-a", "untracked-version-a"),
+                untracked_row("untracked-global"),
+            ],
+        )
+        .await;
+        transaction.commit().await.expect("commit should persist");
+
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "missing-version")
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded, None);
     }
 
     #[tokio::test]
