@@ -10,6 +10,20 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::{LixError, Value};
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteExecutorMode {
+    Auto,
+    ForceDataFusion,
+    ForceFast,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteExecutorPath {
+    Fast,
+    DataFusion,
+}
+
 #[allow(dead_code)]
 pub(crate) struct WriteLogicalPlan {
     pub(super) plan: LogicalWritePlan,
@@ -48,6 +62,59 @@ pub(crate) async fn execute_write_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<u64, LixError> {
+    execute_write_logical_plan_auto(ctx, plan, params).await
+}
+
+async fn execute_write_logical_plan_auto(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+) -> Result<u64, LixError> {
+    execute_write_logical_plan_with_mode_inner(ctx, plan, params, WriteExecutorModeInner::Auto)
+        .await
+        .map(|(rows_affected, _path)| rows_affected)
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_write_logical_plan_with_mode(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    mode: WriteExecutorMode,
+) -> Result<u64, LixError> {
+    execute_write_logical_plan_with_mode_and_trace(ctx, plan, params, mode)
+        .await
+        .map(|(rows_affected, _path)| rows_affected)
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_write_logical_plan_with_mode_and_trace(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    mode: WriteExecutorMode,
+) -> Result<(u64, WriteExecutorPath), LixError> {
+    let mode = match mode {
+        WriteExecutorMode::Auto => WriteExecutorModeInner::Auto,
+        WriteExecutorMode::ForceDataFusion => WriteExecutorModeInner::ForceDataFusion,
+        WriteExecutorMode::ForceFast => WriteExecutorModeInner::ForceFast,
+    };
+    execute_write_logical_plan_with_mode_inner(ctx, plan, params, mode).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteExecutorModeInner {
+    Auto,
+    ForceDataFusion,
+    ForceFast,
+}
+
+async fn execute_write_logical_plan_with_mode_inner(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+    mode: WriteExecutorModeInner,
+) -> Result<(u64, WriteExecutorPath), LixError> {
     let SqlLogicalPlan::Write(write_plan) = plan else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -56,14 +123,27 @@ pub(crate) async fn execute_write_logical_plan(
     };
     validate_write_parameter_count(&write_plan.plan, params.len())?;
 
-    if let Some(fast_plan) =
-        crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan.plan)?
-    {
-        return crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
-            .await;
+    if mode != WriteExecutorModeInner::ForceDataFusion {
+        if let Some(fast_plan) =
+            crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan.plan)?
+        {
+            let rows_affected =
+                crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
+                    .await?;
+            return Ok((rows_affected, WriteExecutorPath::Fast));
+        }
+        if mode == WriteExecutorModeInner::ForceFast {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "SQL write plan is not eligible for fast execution",
+            ));
+        }
     }
 
-    super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan.plan, params).await
+    let rows_affected =
+        super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan.plan, params)
+            .await?;
+    Ok((rows_affected, WriteExecutorPath::DataFusion))
 }
 
 fn validate_write_parameter_count(
