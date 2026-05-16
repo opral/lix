@@ -16,7 +16,7 @@ use criterion::{
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     ConformanceBackend, CoreProjection, GetManyResult, GetOptions, InMemoryBackend, Key, KeyRange,
-    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
+    KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
     ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
 };
@@ -1230,7 +1230,7 @@ where
                         projection: CoreProjection::KeyOnly,
                         ..ScanOptions::default()
                     },
-                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                         visited += 1;
                         assert!(matches!(value, ProjectedValueRef::KeyOnly));
                         black_box(key);
@@ -1321,15 +1321,15 @@ where
     if should_run(direct_put_case.name) {
         let direct_put_mutations = write_mutations(&direct_put_case);
         let direct_put_batches = direct_write_batches_from_mutations(&direct_put_mutations);
-        let direct_put_backend = backend_family.open_empty();
-        commit_direct_write_batches(&direct_put_backend, direct_put_batches.clone())
+        let warm_backend = backend_family.open_empty();
+        commit_direct_write_batches(&warm_backend, direct_put_batches.clone())
             .expect("warm direct put backend");
         group.throughput(Throughput::Elements(direct_put_case.writes as u64));
         group.bench_function(direct_put_case.name, |b| {
             b.iter_batched(
-                || direct_put_batches.clone(),
-                |batches| {
-                    let commit = commit_direct_write_batches(&direct_put_backend, batches)
+                || (backend_family.open_empty(), direct_put_batches.clone()),
+                |(backend, batches)| {
+                    let commit = commit_direct_write_batches(&backend, batches)
                         .expect("direct backend put commit");
                     assert_eq!(commit.stats.put_entries, 1_024);
                     assert_eq!(commit.stats.deleted_entries, 0);
@@ -1351,15 +1351,15 @@ where
     if should_run(mixed_case.name) {
         let mixed_mutations = write_mutations(&mixed_case);
         let mixed_batches = direct_write_batches_from_mutations(&mixed_mutations);
-        let mixed_backend = backend_family.open_empty();
-        commit_direct_write_batches(&mixed_backend, mixed_batches.clone())
+        let warm_backend = backend_family.open_empty();
+        commit_direct_write_batches(&warm_backend, mixed_batches.clone())
             .expect("warm direct mixed backend");
         group.throughput(Throughput::Elements(mixed_case.writes as u64));
         group.bench_function(mixed_case.name, |b| {
             b.iter_batched(
-                || mixed_batches.clone(),
-                |batches| {
-                    let commit = commit_direct_write_batches(&mixed_backend, batches)
+                || (backend_family.open_empty(), mixed_batches.clone()),
+                |(backend, batches)| {
+                    let commit = commit_direct_write_batches(&backend, batches)
                         .expect("direct backend mixed commit");
                     assert_eq!(commit.stats.put_entries, 816);
                     assert_eq!(commit.stats.deleted_entries, 208);
@@ -1381,15 +1381,21 @@ where
     if should_run(touched_case.name) {
         let touched_mutations = write_mutations(&touched_case);
         let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
-        let touched_backend = backend_family.seed_points(SpaceId(1), 10_000, 32);
-        commit_direct_write_batches(&touched_backend, touched_batches.clone())
+        let touched_seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
+        let warm_backend = backend_family.fork_for_write(&touched_seed);
+        commit_direct_write_batches(&warm_backend, touched_batches.clone())
             .expect("warm direct touched backend");
         group.throughput(Throughput::Elements(touched_case.writes as u64));
         group.bench_function(touched_case.name, |b| {
             b.iter_batched(
-                || touched_batches.clone(),
-                |batches| {
-                    let commit = commit_direct_write_batches(&touched_backend, batches)
+                || {
+                    (
+                        backend_family.fork_for_write(&touched_seed),
+                        touched_batches.clone(),
+                    )
+                },
+                |(backend, batches)| {
+                    let commit = commit_direct_write_batches(&backend, batches)
                         .expect("direct backend touched commit");
                     assert_eq!(commit.stats.put_entries, 128);
                     assert_eq!(commit.stats.deleted_entries, 0);
@@ -1468,7 +1474,7 @@ where
                                 projection: CoreProjection::KeyOnly,
                                 ..ScanOptions::default()
                             },
-                            &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                                 visited += 1;
                                 assert!(matches!(value, ProjectedValueRef::KeyOnly));
                                 black_box(key);
@@ -1719,7 +1725,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
 
         group.bench_function(format!("overlay_depth_scan_base_q1000_d{depth}"), |b| {
             b.iter(|| {
-                let mut visitor = |key: &Key, value: ProjectedValueRef<'_>| {
+                let mut visitor = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                     assert!(matches!(value, ProjectedValueRef::KeyOnly));
                     black_box(key);
                     Ok(())
@@ -2048,7 +2054,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                         limit_rows: 1_001,
                         ..ScanOptions::default()
                     },
-                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                         visited += 1;
                         assert_eq!(value, ProjectedValueRef::KeyOnly);
                         black_box(key);
@@ -2085,7 +2091,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                         limit_rows: 1_001,
                         ..ScanOptions::default()
                     },
-                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                         visited += 1;
                         let ProjectedValueRef::FullValue(value) = value else {
                             panic!("expected full value");
@@ -2226,7 +2232,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                             },
                             |key, value| {
                                 assert!(value.is_none());
-                                page_last_key = Some(key.clone());
+                                page_last_key = Some(key.to_owned_key());
                                 black_box(key);
                             },
                         )
@@ -2497,7 +2503,7 @@ impl BackendRead for PrefixReadBackend {
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
         let mut emitted = 0;
         for entry in self.entries.iter().take(opts.limit_rows) {
-            visitor.visit(&entry.key, ProjectedValueRef::KeyOnly)?;
+            visitor.visit(entry.key.as_ref(), ProjectedValueRef::KeyOnly)?;
             emitted += 1;
         }
         Ok(ScanResult {
@@ -2741,9 +2747,9 @@ where
         space,
         range,
         opts,
-        &mut |key: &Key, value: ProjectedValueRef<'_>| {
+        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
             entries.push(ReadEntry {
-                key: key.clone(),
+                key: key.to_owned_key(),
                 value: value.to_owned(),
             });
             Ok(())
@@ -2773,10 +2779,10 @@ fn materialize_scan_visit(
         |key, value| {
             let value = match value {
                 None => ProjectedValue::KeyOnly,
-                Some(value) => ProjectedValue::FullValue(value.clone()),
+                Some(value) => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
             };
             entries.push(ReadEntry {
-                key: key.clone(),
+                key: key.to_owned_key(),
                 value,
             });
         },

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValue,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
     StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
@@ -229,9 +229,9 @@ impl InMemoryRead {
         mut visitor: F,
     ) -> Result<InMemoryScanVisitResult, BackendError>
     where
-        F: FnMut(&Key, Option<&Bytes>),
+        F: FnMut(KeyRef<'_>, Option<&[u8]>),
     {
-        let mut visitor = |key: &Key, value: ProjectedValueRef<'_>| {
+        let mut visitor = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
             let value = match value {
                 ProjectedValueRef::KeyOnly => None,
                 ProjectedValueRef::FullValue(value) => Some(value),
@@ -395,7 +395,7 @@ where
                 }),
                 CoreProjection::FullValue => {
                     visit_rows(rows, opts.limit_rows, visitor, |_, value| {
-                        ProjectedValueRef::FullValue(value)
+                        ProjectedValueRef::FullValue(value.as_ref())
                     })
                 }
             }
@@ -431,7 +431,7 @@ where
                     has_more = true;
                     break;
                 }
-                visitor.visit(key, ProjectedValueRef::KeyOnly)?;
+                visitor.visit(key.as_ref(), ProjectedValueRef::KeyOnly)?;
                 emitted += 1;
             }
         }
@@ -441,7 +441,7 @@ where
                     has_more = true;
                     break;
                 }
-                visitor.visit(key, ProjectedValueRef::FullValue(value))?;
+                visitor.visit(key.as_ref(), ProjectedValueRef::FullValue(value.as_ref()))?;
                 emitted += 1;
             }
         }
@@ -499,7 +499,7 @@ where
             has_more = true;
             break;
         }
-        visitor.visit(key, project(key, value))?;
+        visitor.visit(key.as_ref(), project(key, value))?;
         emitted += 1;
     }
     Ok(ScanResult { emitted, has_more })
@@ -557,7 +557,7 @@ fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
 fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
     match projection {
         CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value.as_ref()),
     }
 }
 

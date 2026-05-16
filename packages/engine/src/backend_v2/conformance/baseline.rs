@@ -8,9 +8,9 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, ProjectedValue,
-    ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
-    WriteOptions,
+    Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
+    ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage,
+    SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -762,12 +762,12 @@ where
     R: BackendRead,
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = read.visit_range(test_space, range, opts, &mut |key: &Key,
+    let result = read.visit_range(test_space, range, opts, &mut |key: KeyRef<'_>,
                                                                   value: ProjectedValueRef<
         '_,
     >| {
         entries.push(ReadEntry {
-            key: key.clone(),
+            key: key.to_owned_key(),
             value: value.to_owned(),
         });
         Ok(())

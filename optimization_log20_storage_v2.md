@@ -3856,10 +3856,10 @@ sqlite_backend_passes_backend_v2_conformance ... ok
 
 Focused bench deltas:
 
-| Case | Before focused profile | After read pool | After prepare_cached |
-| ---- | ---------------------: | --------------: | -------------------: |
-| sqlite direct get_many m1000/u100 | 2.439 ms | 528 us | 298 us |
-| sqlite direct scan visit q1000 | 2.571 ms | 347 us | 305 us |
+| Case                              | Before focused profile | After read pool | After prepare_cached |
+| --------------------------------- | ---------------------: | --------------: | -------------------: |
+| sqlite direct get_many m1000/u100 |               2.439 ms |          528 us |               298 us |
+| sqlite direct scan visit q1000    |               2.571 ms |          347 us |               305 us |
 
 Interpretation:
 
@@ -3912,8 +3912,8 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Delta:
 
-| Case | Before | After |
-| ---- | -----: | ----: |
+| Case                                    | Before |  After |
+| --------------------------------------- | -----: | -----: |
 | rocksdb direct scan visit q1000 KeyOnly | 477 us | 279 us |
 
 Interpretation:
@@ -3932,4 +3932,188 @@ mostly RocksDB iterator traversal and key-side allocation/copying:
 Next RocksDB scan cut, if needed:
   avoid key Bytes allocation by adding a borrowed-key scan visitor path or by
   changing backend_v2 visitor semantics to allow borrowed backend keys.
+```
+
+## 2026-05-15: Borrowed scan API hard cut, partial full-matrix run
+
+Change:
+
+```text
+backend_v2 scan visitors now receive borrowed row data:
+  KeyRef<'_>
+  ProjectedValueRef::FullValue(&[u8])
+
+The hard cut removes owned Key/Bytes materialization from the backend scan
+visitor path. storage_v2 materializes owned ReadEntry rows only for APIs that
+return ScanPage-shaped results.
+```
+
+Validation before bench:
+
+```sh
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+```
+
+Result:
+
+```text
+backend_v2 conformance passed for:
+  in-memory
+  conformance backend
+  sqlite_temp
+  redb_temp
+  rocksdb_temp
+
+storage_v2 bench target compiled.
+```
+
+Full bench command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Run status:
+
+```text
+Partial run only. Criterion completed storage-only, conformance backend,
+in_memory, sqlite_temp, redb_temp, rocksdb_temp, and part of direct in-memory
+profiling. The process then aborted with stack overflow during
+backend_direct_profile/in_memory, after direct write cases and before the full
+direct-profile block completed.
+```
+
+Important post-cut measurements from the completed portion:
+
+| Case                                   |      Time |
+| -------------------------------------- | --------: |
+| in_memory scan visit key-only q1000    |  1.519 us |
+| in_memory materialized scan q1000      |  20.03 us |
+| sqlite_temp scan visit key-only q1000  |  43.02 us |
+| sqlite_temp materialized scan q1000    |  64.83 us |
+| sqlite_temp prefix materialized q1000  |  61.86 us |
+| redb_temp scan visit key-only q1000    |  29.71 us |
+| redb_temp materialized scan q1000      |  39.06 us |
+| redb_temp prefix materialized q1000    |  41.84 us |
+| rocksdb_temp scan visit key-only q1000 |  90.42 us |
+| rocksdb_temp materialized scan q1000   | 120.43 us |
+| rocksdb_temp prefix materialized q1000 | 109.93 us |
+
+Write/read reference points from the same run:
+
+| Case                                     |      Time |
+| ---------------------------------------- | --------: |
+| in_memory commit puts k1024/g16          |  43.57 us |
+| sqlite_temp commit puts k1024/g16        | 909.93 us |
+| redb_temp commit puts k1024/g16          |  16.77 ms |
+| rocksdb_temp commit puts k1024/g16       | 201.76 us |
+| sqlite_temp planned get_many m1000/u100  |  37.26 us |
+| redb_temp planned get_many m1000/u100    |   9.93 us |
+| rocksdb_temp planned get_many m1000/u100 |  41.38 us |
+
+Criterion-reported scan deltas versus the previous saved baseline:
+
+| Case                                   | Reported change |
+| -------------------------------------- | --------------: |
+| sqlite_temp scan visit key-only q1000  |    92.8% faster |
+| sqlite_temp materialized scan q1000    |    70.3% faster |
+| redb_temp scan visit key-only q1000    |    81.6% faster |
+| redb_temp materialized scan q1000      |    83.2% faster |
+| rocksdb_temp scan visit key-only q1000 |    81.7% faster |
+| rocksdb_temp materialized scan q1000   |    77.1% faster |
+
+Interpretation:
+
+```text
+The borrowed scan API is a real first-principles win for real backends.
+
+The biggest confirmed gains are exactly where expected:
+  SQLite scan no longer copies row key/value blobs before visitor use.
+  redb scan can pass table key/value slices directly.
+  RocksDB scan avoids both value and key Bytes construction on the visitor path.
+
+Materialized scans also improved because storage_v2 now owns the only required
+copy, instead of layering backend materialization plus storage materialization.
+```
+
+Follow-up before treating this as the new official full baseline:
+
+```text
+Fix or isolate the backend_direct_profile/in_memory stack overflow.
+Then rerun either:
+  full storage_v2 matrix
+or:
+  STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY focused direct-profile matrix
+```
+
+## 2026-05-15: Direct-profile stack overflow investigation
+
+Finding:
+
+```text
+The stack overflow was caused by the benchmark harness, not by the borrowed
+scan API.
+
+backend_direct_profile write cases reused the same in-memory backend for all
+Criterion iterations. InMemoryBackend represents commits as per-space overlay
+layers:
+
+  SpaceState::Layered { base, puts, deletes }
+
+Repeated direct commits into the same backend created a very deep recursive
+overlay chain. When the benchmark moved on and dropped that backend, recursive
+drop of the SpaceState chain overflowed the stack.
+```
+
+Why this mattered:
+
+```text
+The direct-profile write benchmarks were not measuring a stable
+begin_write -> put_many/delete_many -> commit cost. They were also measuring
+the side effects of ever-growing benchmark state.
+```
+
+Harness fix:
+
+```text
+Each direct-write benchmark iteration now receives a fresh/forked backend from
+Criterion setup:
+
+  empty write cases:
+    setup opens a fresh empty backend
+
+  touched-existing case:
+    setup forks the seeded backend
+
+The measured routine still contains only:
+  begin_write -> put_many/delete_many -> commit
+```
+
+Validation:
+
+```sh
+STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY=1 \
+STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND=in_memory \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  backend_direct_profile/in_memory
+```
+
+Result:
+
+```text
+Completed without stack overflow.
+```
+
+Direct in-memory profile after harness fix:
+
+| Case | Time |
+| ---- | ---: |
+| direct_commit_puts_k1024_g16_v32 | 40.13 us |
+| direct_mixed80_20_k1024_g16_v32 | 35.96 us |
+| direct_commit_puts_k128_g16_existing10k_touched_v32 | 4.03 us |
+| direct_get_many_m1000_u100 | 27.36 us |
+| direct_visit_many_m1000_u100 | 23.63 us |
+| direct_scan_visit_key_only_q1000 | 1.055 us |
+| direct_scan_materialized_q1000 | 20.87 us |
 ```

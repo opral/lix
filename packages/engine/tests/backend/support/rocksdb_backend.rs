@@ -6,9 +6,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
-    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rocksdb::Snapshot;
@@ -188,12 +188,11 @@ impl BackendRead for RocksDbRead<'_> {
                 });
             }
 
-            let key = decode_entry_key(encoded_key)?;
+            let key = decode_entry_key_ref(encoded_key)?;
             match opts.projection {
-                CoreProjection::KeyOnly => visitor.visit(&key, ProjectedValueRef::KeyOnly)?,
+                CoreProjection::KeyOnly => visitor.visit(key, ProjectedValueRef::KeyOnly)?,
                 CoreProjection::FullValue => {
-                    let value = Bytes::copy_from_slice(value.as_ref());
-                    visitor.visit(&key, ProjectedValueRef::FullValue(&value))?;
+                    visitor.visit(key, ProjectedValueRef::FullValue(value.as_ref()))?;
                 }
             }
             emitted += 1;
@@ -318,13 +317,13 @@ fn encode_entry_key(space: SpaceId, key: &Key) -> Vec<u8> {
     encoded
 }
 
-fn decode_entry_key(encoded: &[u8]) -> Result<Key, BackendError> {
+fn decode_entry_key_ref(encoded: &[u8]) -> Result<KeyRef<'_>, BackendError> {
     if encoded.len() < 4 {
         return Err(BackendError::Corruption(
             "rocksdb entry key shorter than space prefix".into(),
         ));
     }
-    Ok(Key(Bytes::copy_from_slice(&encoded[4..])))
+    Ok(KeyRef(&encoded[4..]))
 }
 
 fn space_upper_bound(space: SpaceId) -> Vec<u8> {

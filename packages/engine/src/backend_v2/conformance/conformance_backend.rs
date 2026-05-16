@@ -211,7 +211,7 @@ where
             has_more = true;
             break;
         }
-        visitor.visit(key, project_value_ref(value, opts.projection))?;
+        visitor.visit(key.as_ref(), project_value_ref(value, opts.projection))?;
         emitted += 1;
     }
 
@@ -242,7 +242,7 @@ fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
 fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
     match projection {
         CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value.as_ref()),
     }
 }
 
