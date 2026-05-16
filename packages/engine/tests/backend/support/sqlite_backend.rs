@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,48 +301,53 @@ fn visit_many<V>(
 where
     V: PointVisitor + ?Sized,
 {
-    let unique_keys = keys
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    if unique_keys.is_empty() {
+    if keys.is_empty() {
         return Ok(());
     }
 
-    let placeholders = std::iter::repeat("(?)")
-        .take(unique_keys.len())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let mut placeholders = String::with_capacity(keys.len() * 8);
+    let mut values = Vec::with_capacity(keys.len() * 2);
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push_str("(?, ?)");
+        values.push(SqlValue::Integer(index as i64));
+        values.push(SqlValue::Blob(key.0.to_vec()));
+    }
     let sql = format!(
-        "WITH requested(key) AS (VALUES {placeholders})
-         SELECT e.key, e.value
+        "WITH requested(ord, key) AS (VALUES {placeholders})
+         SELECT r.ord, e.value
          FROM requested r
-         JOIN entries e ON e.key = r.key
-         ORDER BY e.key ASC"
+         LEFT JOIN entries e ON e.key = r.key
+         ORDER BY r.ord ASC"
     );
-    let values = unique_keys
-        .into_iter()
-        .map(|key| SqlValue::Blob(key.0.to_vec()))
-        .collect::<Vec<_>>();
 
     let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(values))
         .map_err(sqlite_error)?;
-    let mut found = BTreeMap::new();
     while let Some(row) = rows.next().map_err(sqlite_error)? {
-        let key_bytes: Vec<u8> = row.get(0).map_err(sqlite_error)?;
-        let value_bytes: Vec<u8> = row.get(1).map_err(sqlite_error)?;
-        found.insert(Key(Bytes::from(key_bytes)), Bytes::from(value_bytes));
-    }
-    for (index, key) in keys.iter().enumerate() {
-        visitor.visit(
-            index,
-            key,
-            found
-                .get(key)
-                .map(|value| project_value_ref(value.as_ref(), opts.projection)),
-        )?;
+        let index: i64 = row.get(0).map_err(sqlite_error)?;
+        let index = usize::try_from(index).map_err(|_| {
+            BackendError::Corruption(format!("sqlite requested ordinal was negative: {index}"))
+        })?;
+        let Some(key) = keys.get(index) else {
+            return Err(BackendError::Corruption(format!(
+                "sqlite requested ordinal out of bounds: {index}"
+            )));
+        };
+        let value_ref = row.get_ref(1).map_err(sqlite_error)?;
+        let value = match value_ref {
+            SqlValueRef::Null => None,
+            SqlValueRef::Blob(value) => Some(project_value_ref(value, opts.projection)),
+            other => {
+                return Err(BackendError::Corruption(format!(
+                    "sqlite value column was not a blob: {other:?}"
+                )));
+            }
+        };
+        visitor.visit(index, key, value)?;
     }
     Ok(())
 }
