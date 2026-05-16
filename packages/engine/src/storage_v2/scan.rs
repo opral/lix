@@ -1,6 +1,6 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, Key, KeyRange, Prefix, ProjectedValueRef, ReadBatch, ReadEntry,
-    ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId,
+    BackendError, BackendRead, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef, ReadBatch,
+    ReadEntry, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId,
 };
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
 
@@ -120,9 +120,9 @@ where
         space,
         range,
         opts,
-        &mut |key: &Key, value: ProjectedValueRef<'_>| {
+        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
             buffer.entries.push(ReadEntry {
-                key: key.clone(),
+                key: key.to_owned_key(),
                 value: value.to_owned(),
             });
             Ok(())

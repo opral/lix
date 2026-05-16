@@ -9,7 +9,7 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, ProjectedValue,
+    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
     ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
     WriteOptions,
 };
@@ -191,9 +191,9 @@ where
         target_space,
         range,
         opts,
-        &mut |key: &Key, value: ProjectedValueRef<'_>| {
+        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
             entries.push(ReadEntry {
-                key: key.clone(),
+                key: key.to_owned_key(),
                 value: value.to_owned(),
             });
             Ok(())

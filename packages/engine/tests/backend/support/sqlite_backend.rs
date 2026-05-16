@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
-    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
-use rusqlite::types::Value as SqlValue;
+use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
@@ -381,19 +381,15 @@ where
     let mut emitted = 0;
 
     while let Some(row) = rows.next().map_err(sqlite_error)? {
-        let key_bytes: Vec<u8> = row.get(0).map_err(sqlite_error)?;
-        let value_bytes: Vec<u8> = row.get(1).map_err(sqlite_error)?;
         if emitted == limit {
             return Ok(ScanResult {
                 emitted,
                 has_more: true,
             });
         }
-        let value = Bytes::from(value_bytes);
-        visitor.visit(
-            &Key(Bytes::from(key_bytes)),
-            project_value_ref(&value, opts.projection),
-        )?;
+        let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
+        let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
+        visitor.visit(KeyRef(key), project_value_ref(value, opts.projection))?;
         emitted += 1;
     }
 
@@ -439,7 +435,16 @@ fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
     }
 }
 
-fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
+fn blob_ref<'a>(value: SqlValueRef<'a>, column: &str) -> Result<&'a [u8], BackendError> {
+    match value {
+        SqlValueRef::Blob(bytes) => Ok(bytes),
+        other => Err(BackendError::Corruption(format!(
+            "sqlite {column} column was not a blob: {other:?}"
+        ))),
+    }
+}
+
+fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
     match projection {
         CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
         CoreProjection::FullValue => ProjectedValueRef::FullValue(value),

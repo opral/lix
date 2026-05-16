@@ -6,9 +6,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
-    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use redb::{
@@ -181,9 +181,8 @@ impl BackendRead for RedbRead {
                 });
             }
 
-            let key = decode_entry_key(key.value())?;
-            let value = Bytes::copy_from_slice(value.value());
-            visitor.visit(&key, project_value_ref(&value, opts.projection))?;
+            let key = decode_entry_key_ref(key.value())?;
+            visitor.visit(key, project_value_ref(value.value(), opts.projection))?;
             emitted += 1;
         }
 
@@ -249,13 +248,13 @@ fn encode_entry_key(space: SpaceId, key: &Key) -> Vec<u8> {
     encoded
 }
 
-fn decode_entry_key(encoded: &[u8]) -> Result<Key, BackendError> {
+fn decode_entry_key_ref(encoded: &[u8]) -> Result<KeyRef<'_>, BackendError> {
     if encoded.len() < 4 {
         return Err(BackendError::Corruption(
             "redb entry key shorter than space prefix".into(),
         ));
     }
-    Ok(Key(Bytes::copy_from_slice(&encoded[4..])))
+    Ok(KeyRef(&encoded[4..]))
 }
 
 fn encoded_bounds(
@@ -299,7 +298,7 @@ fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
     }
 }
 
-fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
+fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
     match projection {
         CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
         CoreProjection::FullValue => ProjectedValueRef::FullValue(value),

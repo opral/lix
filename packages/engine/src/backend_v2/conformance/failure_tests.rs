@@ -480,7 +480,10 @@ where
             has_more = true;
             break;
         }
-        visitor.visit(key, project_value_ref(value, mode, opts.projection, true))?;
+        visitor.visit(
+            key.as_ref(),
+            project_value_ref(value, mode, opts.projection, true),
+        )?;
         emitted += 1;
     }
 
@@ -539,10 +542,10 @@ fn project_value_ref(
         CoreProjection::KeyOnly
             if break_key_only && matches!(mode, BrokenMode::KeyOnlyScanReturnsFullValues) =>
         {
-            ProjectedValueRef::FullValue(value)
+            ProjectedValueRef::FullValue(value.as_ref())
         }
         CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value.as_ref()),
     }
 }
 

@@ -336,7 +336,7 @@ pub trait BackendRead {
 pub trait ScanVisitor {
     fn visit(
         &mut self,
-        key: &Key,
+        key: KeyRef<'_>,
         value: ProjectedValueRef<'_>,
     ) -> Result<(), BackendError>;
 }
@@ -401,6 +401,9 @@ impl Default for ScanOptions<'_> {
 Backend scans are visitor-first and row-bounded:
 
 ```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyRef<'a>(pub &'a [u8]);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanResult {
     pub emitted: usize,
@@ -410,7 +413,7 @@ pub struct ScanResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectedValueRef<'a> {
     KeyOnly,
-    FullValue(&'a Bytes),
+    FullValue(&'a [u8]),
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +429,12 @@ opaque cursors are extension paths. Storage-level helpers may normalize
 `limit_rows = 0`, wrap public cursor tokens, validate cursor scope, and perform
 lookahead/buffering when they want an exact public "no cursor means no more
 eligible rows" promise.
+
+`KeyRef` and `ProjectedValueRef` are borrowed, ephemeral row references. They
+are valid only during the visitor call. A backend may point them at an iterator
+buffer, SQLite row value, RocksDB slice, redb table value, or in-memory map
+entry. Callers that need to retain rows must materialize them above the backend
+boundary.
 
 Materialized scan pages are a storage adapter convenience:
 
@@ -1278,7 +1287,7 @@ let result = read.visit_range(
         resume_after: storage_cursor.last_key(),
     },
     &mut |key, value| {
-        page_entries.push((key.clone(), value.to_owned()));
+        page_entries.push((key.to_owned_key(), value.to_owned()));
         Ok(())
     },
 )?;

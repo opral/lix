@@ -10,6 +10,9 @@ pub struct SpaceId(pub u32);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key(pub Bytes);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyRef<'a>(pub &'a [u8]);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value(pub Bytes);
 
@@ -99,15 +102,33 @@ pub enum ProjectedValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectedValueRef<'a> {
     KeyOnly,
-    FullValue(&'a Bytes),
+    FullValue(&'a [u8]),
 }
 
 impl ProjectedValueRef<'_> {
     pub fn to_owned(self) -> ProjectedValue {
         match self {
             ProjectedValueRef::KeyOnly => ProjectedValue::KeyOnly,
-            ProjectedValueRef::FullValue(value) => ProjectedValue::FullValue(value.clone()),
+            ProjectedValueRef::FullValue(value) => {
+                ProjectedValue::FullValue(Bytes::copy_from_slice(value))
+            }
         }
+    }
+}
+
+impl<'a> KeyRef<'a> {
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+
+    pub fn to_owned_key(self) -> Key {
+        Key(Bytes::copy_from_slice(self.0))
+    }
+}
+
+impl Key {
+    pub fn as_ref(&self) -> KeyRef<'_> {
+        KeyRef(self.0.as_ref())
     }
 }
 
@@ -115,7 +136,7 @@ impl ProjectedValue {
     pub fn as_ref(&self) -> ProjectedValueRef<'_> {
         match self {
             ProjectedValue::KeyOnly => ProjectedValueRef::KeyOnly,
-            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value),
+            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
         }
     }
 }

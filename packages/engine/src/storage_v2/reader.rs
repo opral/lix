@@ -365,7 +365,7 @@ mod tests {
 
     use crate::backend_v2::{
         BackendError, BackendRead, ConformanceBackend, CoreProjection, GetManyResult, GetOptions,
-        Key, KeyRange, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
+        Key, KeyRange, KeyRef, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
         ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{
@@ -934,8 +934,8 @@ mod tests {
                     limit_rows: 10,
                     resume_after: None,
                 },
-                &mut |key: &Key, value: ProjectedValueRef<'_>| {
-                    visited.push((key.clone(), value.to_owned()));
+                &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                    visited.push((key.to_owned_key(), value.to_owned()));
                     Ok(())
                 },
             )
