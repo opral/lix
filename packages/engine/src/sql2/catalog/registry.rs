@@ -397,7 +397,9 @@ fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
     spec.columns
         .iter()
         .map(|column| {
-            if primary_key_roots.contains(&column.name) {
+            if spec.schema_key == "lix_registered_schema" && column.name == "value" {
+                PublicColumn::public(column.name.as_str())
+            } else if primary_key_roots.contains(&column.name) {
                 PublicColumn::public_insert_only(column.name.as_str())
             } else {
                 PublicColumn::public(column.name.as_str())
@@ -488,12 +490,16 @@ fn entity_system_columns(variant: EntitySurfaceShape) -> Vec<PublicColumn> {
 
     entity_system_fields(variant)
         .into_iter()
-        .map(|field| {
-            if variant == EntitySurfaceShape::ByVersion && field.name() == "lixcol_version_id" {
-                PublicColumn::public_insert_only(field.name().as_str())
-            } else {
-                PublicColumn::hidden(field.name().as_str())
+        .map(|field| match field.name().as_str() {
+            "lixcol_schema_key" | "lixcol_change_id" | "lixcol_created_at"
+            | "lixcol_updated_at" | "lixcol_commit_id" => {
+                PublicColumn::public_read_only(field.name().as_str())
             }
+            "lixcol_entity_id" | "lixcol_global" | "lixcol_untracked" | "lixcol_version_id" => {
+                PublicColumn::public_insert_only(field.name().as_str())
+            }
+            "lixcol_metadata" => PublicColumn::public(field.name().as_str()),
+            _ => PublicColumn::hidden(field.name().as_str()),
         })
         .collect()
 }

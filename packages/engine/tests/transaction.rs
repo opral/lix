@@ -15,7 +15,6 @@ type KvKey = (String, Vec<u8>);
 type KvMap = BTreeMap<KvKey, Vec<u8>>;
 
 #[tokio::test]
-#[ignore = "Phase 1 disables SQL writes; re-enable through the bound write pipeline"]
 async fn read_sql_rolls_back_read_transaction_when_pre_plan_setup_fails() {
     let backend = RecordingBackend::new();
     let _receipt = Engine::initialize(Box::new(backend.clone()))
@@ -57,7 +56,6 @@ async fn read_sql_rolls_back_read_transaction_when_pre_plan_setup_fails() {
 }
 
 #[tokio::test]
-#[ignore = "Phase 1 disables SQL writes; re-enable through the bound write pipeline"]
 async fn write_transaction_open_rolls_back_when_active_version_resolution_fails() {
     let backend = RecordingBackend::new();
     let _receipt = Engine::initialize(Box::new(backend.clone()))
@@ -137,7 +135,6 @@ async fn rebuild_tracked_state_rolls_back_read_and_write_transactions_on_failure
 }
 
 #[tokio::test]
-#[ignore = "Phase 1 disables SQL writes; re-enable through the bound write pipeline"]
 async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
     let backend = RecordingBackend::new();
     let _receipt = Engine::initialize(Box::new(backend.clone()))
@@ -192,7 +189,6 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
 }
 
 #[tokio::test]
-#[ignore = "Phase 1 disables SQL writes; re-enable through the bound write pipeline"]
 async fn begin_transaction_cannot_race_with_opening_session_write() {
     let backend = BlockingBeginWriteBackend::new();
     let gate = backend.gate();
