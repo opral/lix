@@ -7,8 +7,8 @@ use bytes::Bytes;
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use redb::{
@@ -129,7 +129,6 @@ impl Backend for RedbBackend {
 impl BackendRead for RedbRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -139,8 +138,7 @@ impl BackendRead for RedbRead {
     {
         let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
         for (index, key) in keys.iter().enumerate() {
-            let encoded = encode_entry_key(space, key);
-            let value = table.get(encoded.as_slice()).map_err(redb_error)?;
+            let value = table.get(key.0.as_ref()).map_err(redb_error)?;
             visitor.visit(
                 index,
                 key,
@@ -154,7 +152,6 @@ impl BackendRead for RedbRead {
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -167,7 +164,7 @@ impl BackendRead for RedbRead {
         }
 
         let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
-        let (lower, upper) = encoded_bounds(space, range, opts.resume_after);
+        let (lower, upper) = encoded_bounds(range, opts.resume_after);
         let lower = bound_as_slice(&lower);
         let upper = bound_as_slice(&upper);
         let mut emitted = 0;
@@ -182,8 +179,10 @@ impl BackendRead for RedbRead {
                 });
             }
 
-            let key = decode_entry_key_ref(key.value())?;
-            visitor.visit(key, project_value_ref(value.value(), opts.projection))?;
+            visitor.visit(
+                KeyRef(key.value()),
+                project_value_ref(value.value(), opts.projection),
+            )?;
             emitted += 1;
         }
 
@@ -195,26 +194,24 @@ impl BackendRead for RedbRead {
 }
 
 impl BackendWrite for RedbWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
         let mut table = self.write.open_table(ENTRIES).map_err(redb_error)?;
         for entry in entries.entries {
-            let key = encode_entry_key(space, &entry.key);
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
             table
-                .insert(key.as_slice(), value.as_ref())
+                .insert(entry.key.0.as_ref(), value.as_ref())
                 .map_err(redb_error)?;
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
         let mut table = self.write.open_table(ENTRIES).map_err(redb_error)?;
         for key in keys {
-            let encoded = encode_entry_key(space, key);
-            table.remove(encoded.as_slice()).map_err(redb_error)?;
+            table.remove(key.0.as_ref()).map_err(redb_error)?;
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
@@ -242,43 +239,18 @@ fn initialize_database(db: &Database) -> Result<(), BackendError> {
     write.commit().map_err(redb_error)
 }
 
-fn encode_entry_key(space: SpaceId, key: &Key) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(4 + key.0.len());
-    encoded.extend_from_slice(&space.0.to_be_bytes());
-    encoded.extend_from_slice(key.0.as_ref());
-    encoded
-}
-
-fn decode_entry_key_ref(encoded: &[u8]) -> Result<KeyRef<'_>, BackendError> {
-    if encoded.len() < 4 {
-        return Err(BackendError::Corruption(
-            "redb entry key shorter than space prefix".into(),
-        ));
-    }
-    Ok(KeyRef(&encoded[4..]))
-}
-
-fn encoded_bounds(
-    space: SpaceId,
-    range: KeyRange,
-    resume_after: Option<&Key>,
-) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
-    let space_prefix = space.0.to_be_bytes();
+fn encoded_bounds(range: KeyRange, resume_after: Option<&Key>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let lower = match (range.lower, resume_after) {
-        (_, Some(resume_after)) => Bound::Excluded(encode_entry_key(space, resume_after)),
-        (Bound::Included(key), None) => Bound::Included(encode_entry_key(space, &key)),
-        (Bound::Excluded(key), None) => Bound::Excluded(encode_entry_key(space, &key)),
-        (Bound::Unbounded, None) => Bound::Included(space_prefix.to_vec()),
+        (_, Some(resume_after)) => Bound::Excluded(resume_after.0.to_vec()),
+        (Bound::Included(key), None) => Bound::Included(key.0.to_vec()),
+        (Bound::Excluded(key), None) => Bound::Excluded(key.0.to_vec()),
+        (Bound::Unbounded, None) => Bound::Unbounded,
     };
 
-    let mut next_space = (space.0 + 1).to_be_bytes().to_vec();
-    if space.0 == u32::MAX {
-        next_space = vec![0xff, 0xff, 0xff, 0xff, 0xff];
-    }
     let upper = match range.upper {
-        Bound::Included(key) => Bound::Included(encode_entry_key(space, &key)),
-        Bound::Excluded(key) => Bound::Excluded(encode_entry_key(space, &key)),
-        Bound::Unbounded => Bound::Excluded(next_space),
+        Bound::Included(key) => Bound::Included(key.0.to_vec()),
+        Bound::Excluded(key) => Bound::Excluded(key.0.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
     };
 
     (lower, upper)

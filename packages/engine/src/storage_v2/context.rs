@@ -193,6 +193,9 @@ mod shape_tests {
         assert_eq!(
             read.get_many_keys.borrow().clone(),
             vec![key("b"), key("a"), key("missing")]
+                .into_iter()
+                .map(|key| space(1).encode_key(&key))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             slots
@@ -222,8 +225,8 @@ mod shape_tests {
         assert_eq!(
             read.scan_range.borrow().clone(),
             Some(KeyRange {
-                lower: Bound::Included(key("a")),
-                upper: Bound::Excluded(key("b")),
+                lower: Bound::Included(space(1).encode_key(&key("a"))),
+                upper: Bound::Excluded(space(1).encode_key(&key("b"))),
             })
         );
     }
@@ -276,15 +279,24 @@ mod shape_tests {
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+            let space = entries
+                .entries
+                .first()
+                .map(|entry| physical_space(&entry.key))
+                .unwrap_or(SpaceId(0));
             self.put_batches.push((
                 space,
-                entries.entries.into_iter().map(|entry| entry.key).collect(),
+                entries
+                    .entries
+                    .into_iter()
+                    .map(|entry| logical_key(entry.key))
+                    .collect(),
             ));
             Ok(())
         }
 
-        fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
+        fn delete_many(&mut self, _keys: &[Key]) -> Result<(), BackendError> {
             Ok(())
         }
 
@@ -314,7 +326,6 @@ mod shape_tests {
     impl BackendRead for SpyRead {
         fn visit_many<V>(
             &self,
-            _space: SpaceId,
             keys: &[Key],
             _opts: GetOptions<'_>,
             visitor: &mut V,
@@ -333,7 +344,6 @@ mod shape_tests {
 
         fn visit_range<V>(
             &self,
-            _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
             _visitor: &mut V,
@@ -349,6 +359,16 @@ mod shape_tests {
 
     fn space(id: u32) -> StorageSpace {
         StorageSpace::new(SpaceId(id), "shape.test.space")
+    }
+
+    fn physical_space(key: &Key) -> SpaceId {
+        SpaceId(u32::from_be_bytes(
+            key.0[..4].try_into().expect("space prefix"),
+        ))
+    }
+
+    fn logical_key(key: Key) -> Key {
+        Key(key.0.slice(4..))
     }
 
     fn key(bytes: &'static str) -> Key {

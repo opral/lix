@@ -59,9 +59,6 @@ where
     report.run("baseline::begin_read_pins_coherent_view", || {
         begin_read_pins_coherent_view(factory)
     });
-    report.run("baseline::spaces_are_isolated", || {
-        spaces_are_isolated(factory)
-    });
     report.run("baseline::full_value_and_key_only_are_core", || {
         full_value_and_key_only_are_core(factory)
     });
@@ -82,7 +79,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, test_space, &requested, GetOptions::default())
+    let result = backend_get_many(&read, &requested, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     if result.values.len() != requested.len() {
@@ -123,7 +120,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, space(1), &[], GetOptions::default())
+    let result = backend_get_many(&read, &[], GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
     if result.entries_for_requested_keys(&[]).is_empty() {
         Ok(())
@@ -147,7 +144,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .delete_many(test_space, &[key("missing")])
+        .delete_many(&[key("missing")])
         .map_err(|error| format!("delete_many missing failed: {error}"))?;
     write
         .commit()
@@ -168,7 +165,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .delete_many(test_space, &[key("a")])
+        .delete_many(&[key("a")])
         .map_err(|error| format!("delete_many existing failed: {error}"))?;
     write
         .commit()
@@ -189,7 +186,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(test_space, put_batch([full_put(key("a"), "B")]))
+        .put_many(put_batch([full_put(key("a"), "B")]))
         .map_err(|error| format!("put_many overwrite failed: {error}"))?;
     write
         .commit()
@@ -469,10 +466,10 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(
-            test_space,
-            put_batch([full_put(key_a.clone(), "A"), full_put(key_b.clone(), "B")]),
-        )
+        .put_many(put_batch([
+            full_put(key_a.clone(), "A"),
+            full_put(key_b.clone(), "B"),
+        ]))
         .map_err(|error| format!("put_many failed: {error}"))?;
 
     let read_before_commit = backend
@@ -480,7 +477,6 @@ where
         .map_err(|error| format!("begin_read before commit failed: {error}"))?;
     let before_commit = backend_get_many(
         &read_before_commit,
-        test_space,
         &[key_a.clone(), key_b.clone()],
         GetOptions::default(),
     )
@@ -509,7 +505,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(test_space, put_batch([full_put(key("a"), "A")]))
+        .put_many(put_batch([full_put(key("a"), "A")]))
         .map_err(|error| format!("put_many failed: {error}"))?;
     write
         .rollback()
@@ -530,10 +526,10 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(test_space, put_batch([full_put(key("a"), "A2")]))
+        .put_many(put_batch([full_put(key("a"), "A2")]))
         .map_err(|error| format!("put_many overwrite failed: {error}"))?;
     write
-        .delete_many(test_space, &[key("b")])
+        .delete_many(&[key("b")])
         .map_err(|error| format!("delete_many failed: {error}"))?;
     write
         .rollback()
@@ -557,7 +553,7 @@ where
     seed_full_values(&backend, test_space, [("a", "C")])?;
 
     let old_keys = [key("a")];
-    let old_result = backend_get_many(&old_read, test_space, &old_keys, GetOptions::default())
+    let old_result = backend_get_many(&old_read, &old_keys, GetOptions::default())
         .map_err(|error| format!("old read get_many failed: {error}"))?;
     assert_read_entries(
         &old_result.entries_for_requested_keys(&old_keys),
@@ -579,29 +575,6 @@ where
     assert_get_entries(&backend, test_space, &[("a", Some("C"))])
 }
 
-fn spaces_are_isolated<F>(factory: &F) -> ConformanceResult
-where
-    F: BackendFactory,
-{
-    let backend = open_backend(factory);
-    let shared_key = key("same");
-    let mut write = backend
-        .begin_write(WriteOptions::default())
-        .map_err(|error| format!("begin_write failed: {error}"))?;
-    write
-        .put_many(space(1), put_batch([full_put(shared_key.clone(), "one")]))
-        .map_err(|error| format!("first put_many failed: {error}"))?;
-    write
-        .put_many(space(2), put_batch([full_put(shared_key, "two")]))
-        .map_err(|error| format!("second put_many failed: {error}"))?;
-    write
-        .commit()
-        .map_err(|error| format!("commit failed: {error}"))?;
-
-    assert_get_entries(&backend, space(1), &[("same", Some("one"))])?;
-    assert_get_entries(&backend, space(2), &[("same", Some("two"))])
-}
-
 fn full_value_and_key_only_are_core<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
@@ -616,7 +589,6 @@ where
     let full_keys = [key("a")];
     let full = backend_get_many(
         &read,
-        test_space,
         &full_keys,
         GetOptions {
             projection: CoreProjection::FullValue,
@@ -629,7 +601,6 @@ where
     let key_only_keys = [key("a")];
     let key_only = backend_get_many(
         &read,
-        test_space,
         &key_only_keys,
         GetOptions {
             projection: CoreProjection::KeyOnly,
@@ -698,7 +669,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, test_space, &requested, GetOptions::default())
+    let result = backend_get_many(&read, &requested, GetOptions::default())
         .map_err(|error| format!("opaque get_many failed: {error}"))?;
     assert_read_entries_bytes(
         &result.entries_for_requested_keys(&requested),
@@ -706,7 +677,7 @@ where
     )
 }
 
-fn seed_full_values<B, I>(backend: &B, test_space: SpaceId, rows: I) -> ConformanceResult
+fn seed_full_values<B, I>(backend: &B, _test_space: SpaceId, rows: I) -> ConformanceResult
 where
     B: Backend,
     I: IntoIterator<Item = (&'static str, &'static str)>,
@@ -715,13 +686,9 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("seed begin_write failed: {error}"))?;
     write
-        .put_many(
-            test_space,
-            put_batch(
-                rows.into_iter()
-                    .map(|(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes)),
-            ),
-        )
+        .put_many(put_batch(rows.into_iter().map(
+            |(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes),
+        )))
         .map_err(|error| format!("seed put_many failed: {error}"))?;
     write
         .commit()
@@ -729,7 +696,7 @@ where
     Ok(())
 }
 
-fn seed_full_byte_values<B, I>(backend: &B, test_space: SpaceId, rows: I) -> ConformanceResult
+fn seed_full_byte_values<B, I>(backend: &B, _test_space: SpaceId, rows: I) -> ConformanceResult
 where
     B: Backend,
     I: IntoIterator<Item = (Bytes, Bytes)>,
@@ -738,13 +705,9 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("seed begin_write failed: {error}"))?;
     write
-        .put_many(
-            test_space,
-            put_batch(
-                rows.into_iter()
-                    .map(|(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes)),
-            ),
-        )
+        .put_many(put_batch(rows.into_iter().map(
+            |(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes),
+        )))
         .map_err(|error| format!("seed put_many failed: {error}"))?;
     write
         .commit()
@@ -754,7 +717,7 @@ where
 
 fn scan_range<R>(
     read: &R,
-    test_space: SpaceId,
+    _test_space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
 ) -> Result<ScanPage, crate::backend_v2::BackendError>
@@ -762,16 +725,17 @@ where
     R: BackendRead,
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = read.visit_range(test_space, range, opts, &mut |key: KeyRef<'_>,
-                                                                  value: ProjectedValueRef<
-        '_,
-    >| {
-        entries.push(ReadEntry {
-            key: key.to_owned_key(),
-            value: value.to_owned(),
-        });
-        Ok(())
-    })?;
+    let result = read.visit_range(
+        range,
+        opts,
+        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            entries.push(ReadEntry {
+                key: key.to_owned_key(),
+                value: value.to_owned(),
+            });
+            Ok(())
+        },
+    )?;
     Ok(ScanPage {
         entries: ReadBatch { entries },
         has_more: result.has_more,
@@ -780,7 +744,7 @@ where
 
 fn assert_get_entries<B>(
     backend: &B,
-    test_space: SpaceId,
+    _test_space: SpaceId,
     expected: &[(&str, Option<&str>)],
 ) -> ConformanceResult
 where
@@ -793,7 +757,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, test_space, &keys, GetOptions::default())
+    let result = backend_get_many(&read, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
     assert_optional_entry_map(&result.entries_for_requested_keys(&keys), expected)
 }

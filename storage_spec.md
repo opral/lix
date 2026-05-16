@@ -179,13 +179,18 @@ schema.
 
 ## Storage Spaces
 
-`backend_v2` uses numeric `SpaceId`.
+`backend_v2` exposes one ordered physical byte-key space. `storage_v2` owns
+logical spaces and encodes them into backend keys.
 
 Domain stores should not hand-roll numeric `SpaceId` values. `storage_v2` should
 provide declaration helpers so spaces are stable and easy to audit. The current
 implementation has named `StorageSpace` declarations and validates conflicting
 same-id/different-name declarations inside a `StorageWriteSet`; it does not have
-a global runtime registry yet.
+a global runtime registry yet. The current physical encoding is:
+
+```text
+physical_key = big_endian_u32(SpaceId) || logical_key
+```
 
 Example shape:
 
@@ -201,7 +206,9 @@ pub const TRACKED_STATE_CHUNK_SPACE: StorageSpace = StorageSpace {
 };
 ```
 
-Space names are for diagnostics and validation. Backends see only `SpaceId`.
+Space names are for diagnostics and validation. Backends see only encoded
+physical byte keys. Space isolation is a storage invariant, not a backend API
+parameter.
 
 Open question: whether space definitions live centrally in `storage_v2/spaces.rs`
 or next to each domain store and are registered centrally. Prefer the second if
@@ -229,7 +236,8 @@ And it preserves the write-side Big-O shape:
 ```text
 domain stores emit K logical mutations
 storage_v2 stages them in memory
-storage_v2 groups by SpaceId and operation
+storage_v2 groups by StorageSpace and operation
+storage_v2 encodes StorageSpace + logical key into physical keys
 storage_v2 lowers to put_many/delete_many batches
 backend_v2 commits once
 ```
@@ -256,19 +264,19 @@ pub struct StorageWriteSet {
 }
 
 pub struct StorageWriteGroup {
-    pub space: SpaceId,
+    pub space: StorageSpace,
     pub puts: Vec<PutEntry>,
     pub deletes: Vec<Key>,
 }
 
 pub struct StoragePut {
-    pub space: SpaceId,
+    pub space: StorageSpace,
     pub key: Key,
     pub value: StoredValue,
 }
 
 pub struct StorageDelete {
-    pub space: SpaceId,
+    pub space: StorageSpace,
     pub key: Key,
 }
 ```
@@ -279,8 +287,8 @@ It must preserve enough grouping information to lower
 efficiently to:
 
 ```text
-put_many(space, PutBatch)
-delete_many(space, &[Key])
+put_many(PutBatch) where every PutEntry.key is physical
+delete_many(&[Key]) where every key is physical
 ```
 
 The write set should not encode domain semantics such as "publish commit
@@ -309,10 +317,23 @@ impl StorageWriteSet {
     ) -> Result<StorageWriteSetStats, BackendError> {
         for group in self.groups {
             if !group.puts.is_empty() {
-                write.put_many(group.space, PutBatch { entries: group.puts })?;
+                let entries = group
+                    .puts
+                    .into_iter()
+                    .map(|put| PutEntry {
+                        key: group.space.encode_key(&put.key),
+                        value: put.value,
+                    })
+                    .collect();
+                write.put_many(PutBatch { entries })?;
             }
             if !group.deletes.is_empty() {
-                write.delete_many(group.space, &group.deletes)?;
+                let deletes = group
+                    .deletes
+                    .iter()
+                    .map(|key| group.space.encode_key(key))
+                    .collect::<Vec<_>>();
+                write.delete_many(&deletes)?;
             }
         }
         Ok(StorageWriteSetStats::default())
@@ -346,7 +367,7 @@ For v0:
 
 ```text
 A sealed StorageWriteSet must contain at most one final mutation for a given
-(SpaceId, Key).
+(StorageSpace.id, Key).
 
 Conflicting duplicate keys are invalid at the storage_v2 boundary.
 
@@ -558,7 +579,7 @@ Notation:
 
 ```text
 K = total staged mutations
-G = touched backend groups, usually distinct (SpaceId, operation)
+G = touched storage groups, usually distinct (StorageSpace, operation)
 M = point keys requested
 Q = rows emitted by a scan or touched by a scan/delete fallback
 P = payload bytes read/written
@@ -590,7 +611,7 @@ O(K + G)
 
 backend write calls:
   O(G), not O(K)
-  at most one put_many and one delete_many per touched space
+  at most one put_many and one delete_many per touched storage space
 
 atomic commit:
   one BackendWrite commit boundary
@@ -617,14 +638,14 @@ Read-side targets:
 
 ```text
 point batch:
-  O(U) backend batch for U unique keys plus O(M + U) caller-order
+  O(U) backend batch for U unique physical keys plus O(M + U) caller-order
   reconstruction for M requested keys. Indexed point results avoid cloning
   duplicate value slots; materialized point results clone into M caller-order
   slots. A reusable point request plan moves dedupe/index construction out of
-  repeated reads with the same key shape. Backend visit_many already visits
-  requested-order slots for the deduped key batch, so planned reads do not need
-  a returned-entry hash-map step. Storage materializes only when the caller asks
-  for owned point values.
+  repeated reads with the same key shape. Storage encodes logical keys once per
+  backend request and calls backend visit_many with unique physical keys, so
+  planned reads do not need a returned-entry hash-map step. Storage materializes
+  only when the caller asks for owned point values.
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations

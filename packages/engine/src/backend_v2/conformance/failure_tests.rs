@@ -10,11 +10,11 @@ use super::{
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef,
-    ProjectionCapabilities, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    ProjectionCapabilities, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
     StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
-type BrokenMap = BTreeMap<(SpaceId, Key), Bytes>;
+type BrokenMap = BTreeMap<Key, Bytes>;
 
 #[derive(Clone, Copy, Debug)]
 enum BrokenMode {
@@ -294,7 +294,6 @@ impl Backend for BrokenBackend {
 impl BackendRead for BrokenRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -320,12 +319,11 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        visit_many_from_map(entries, self.mode, space, keys, opts, visitor)
+        visit_many_from_map(entries, self.mode, keys, opts, visitor)
     }
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -344,12 +342,12 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        visit_range_from_map(entries, self.mode, space, range, opts, visitor)
+        visit_range_from_map(entries, self.mode, range, opts, visitor)
     }
 }
 
 impl BackendWrite for BrokenWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
             let mut bytes = stored_value_bytes(entry.value);
             if matches!(self.mode, BrokenMode::CorruptOpaqueBytes) {
@@ -361,19 +359,19 @@ impl BackendWrite for BrokenWrite {
                         .collect::<Vec<_>>(),
                 );
             }
-            self.staged.insert((space, entry.key), bytes);
+            self.staged.insert(entry.key, bytes);
         }
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
             if matches!(self.mode, BrokenMode::DeleteManyIgnoresExistingKeys)
-                && self.staged.contains_key(&(space, key.clone()))
+                && self.staged.contains_key(key)
             {
                 continue;
             }
-            self.staged.remove(&(space, key.clone()));
+            self.staged.remove(key);
         }
         Ok(())
     }
@@ -421,7 +419,6 @@ impl BrokenBackend {
 fn visit_many_from_map<V>(
     entries: &BrokenMap,
     mode: BrokenMode,
-    space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
     visitor: &mut V,
@@ -439,11 +436,11 @@ where
         }
         let value = if !seen.insert(key.clone()) {
             entries
-                .get(&(space, key.clone()))
+                .get(key)
                 .map(|value| project_value_ref(value, mode, opts.projection, false))
         } else {
             entries
-                .get(&(space, key.clone()))
+                .get(key)
                 .map(|value| project_value_ref(value, mode, opts.projection, false))
         };
         visitor.visit(index, key, value)?;
@@ -454,7 +451,6 @@ where
 fn visit_range_from_map<V>(
     entries: &BrokenMap,
     mode: BrokenMode,
-    space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
     visitor: &mut V,
@@ -466,20 +462,19 @@ where
     let mut has_more = false;
     let mut candidates = entries
         .iter()
-        .filter(|((entry_space, key), _)| *entry_space == space && range_contains(&range, key))
+        .filter(|(key, _)| range_contains(&range, key))
         .collect::<Vec<_>>();
     if matches!(mode, BrokenMode::BadByteOrdering) {
         candidates.sort_by(|left, right| {
             left.0
-                 .1
                  .0
                 .len()
-                .cmp(&right.0 .1 .0.len())
-                .then(left.0 .1.cmp(&right.0 .1))
+                .cmp(&right.0 .0.len())
+                .then(left.0.cmp(right.0))
         });
     }
 
-    for ((_, key), value) in candidates {
+    for (key, value) in candidates {
         if opts.resume_after.is_some_and(|resume_after| {
             if matches!(mode, BrokenMode::KeyResumeRepeatsLastKey) {
                 key < resume_after

@@ -2,7 +2,9 @@ use crate::backend_v2::{
     BackendError, BackendRead, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef, ReadBatch,
     ReadEntry, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId,
 };
-use crate::storage_v2::{StorageReadResult, StorageReadStats};
+use crate::storage_v2::{
+    decode_logical_key_ref, StorageReadResult, StorageReadStats, StorageSpace,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StorageScanBuffer {
@@ -116,11 +118,19 @@ where
             .reserve(opts.limit_rows - buffer.entries.capacity());
     }
 
+    let storage_space = StorageSpace::new(space, "storage_v2.scan");
+    let resume_after = opts.resume_after;
+    let physical_range = storage_space.encode_range(range, resume_after);
+    let physical_opts = ScanOptions {
+        resume_after: None,
+        ..opts
+    };
+
     let result = read.visit_range(
-        space,
-        range,
-        opts,
+        physical_range,
+        physical_opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            let key = decode_logical_key_ref(key)?;
             buffer.entries.push(ReadEntry {
                 key: key.to_owned_key(),
                 value: value.to_owned(),
@@ -150,7 +160,36 @@ where
         return Ok(ScanResult::default());
     }
 
-    read.visit_range(space, range, opts, visitor)
+    let storage_space = StorageSpace::new(space, "storage_v2.scan");
+    let resume_after = opts.resume_after;
+    let physical_range = storage_space.encode_range(range, resume_after);
+    let physical_opts = ScanOptions {
+        resume_after: None,
+        ..opts
+    };
+
+    struct LogicalScanVisitor<'a, V: ?Sized> {
+        inner: &'a mut V,
+    }
+
+    impl<V> ScanVisitor for LogicalScanVisitor<'_, V>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        fn visit(
+            &mut self,
+            key: KeyRef<'_>,
+            value: ProjectedValueRef<'_>,
+        ) -> Result<(), BackendError> {
+            self.inner.visit(decode_logical_key_ref(key)?, value)
+        }
+    }
+
+    read.visit_range(
+        physical_range,
+        physical_opts,
+        &mut LogicalScanVisitor { inner: visitor },
+    )
 }
 
 pub(crate) fn scan_range_with_stats<R>(
@@ -318,8 +357,8 @@ mod tests {
         assert_eq!(
             read.take_range(),
             KeyRange {
-                lower: Bound::Included(Key(Bytes::new())),
-                upper: Bound::Unbounded,
+                lower: Bound::Included(space(1).encode_key(&Key(Bytes::new()))),
+                upper: Bound::Excluded(space(2).encode_key(&Key(Bytes::new()))),
             }
         );
     }
@@ -341,8 +380,8 @@ mod tests {
         assert_eq!(
             read.take_range(),
             KeyRange {
-                lower: Bound::Included(key_bytes(&[0xff])),
-                upper: Bound::Unbounded,
+                lower: Bound::Included(space(1).encode_key(&key_bytes(&[0xff]))),
+                upper: Bound::Excluded(space(2).encode_key(&Key(Bytes::new()))),
             }
         );
     }
@@ -364,8 +403,8 @@ mod tests {
         assert_eq!(
             read.take_range(),
             KeyRange {
-                lower: Bound::Included(key_bytes(&[0x00, 0xff])),
-                upper: Bound::Excluded(key_bytes(&[0x01])),
+                lower: Bound::Included(space(1).encode_key(&key_bytes(&[0x00, 0xff]))),
+                upper: Bound::Excluded(space(1).encode_key(&key_bytes(&[0x01]))),
             }
         );
     }
@@ -387,7 +426,6 @@ mod tests {
     impl BackendRead for CapturingRead {
         fn visit_many<V>(
             &self,
-            _space: SpaceId,
             _keys: &[Key],
             _opts: GetOptions<'_>,
             _visitor: &mut V,
@@ -400,7 +438,6 @@ mod tests {
 
         fn visit_range<V>(
             &self,
-            _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
             _visitor: &mut V,

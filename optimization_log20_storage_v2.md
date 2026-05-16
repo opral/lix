@@ -4320,3 +4320,318 @@ The next possible cut is not another buffer tweak. It is either:
   - add a non-required backend/storage collector extension only if profiling
     still shows the PointVisitor shim itself dominating.
 ```
+
+## 2026-05-16: Real-backend profiles after visitor-first point API
+
+Command shape:
+
+```sh
+STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY=1 \
+STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND=<sqlite_temp|redb_temp|rocksdb_temp> \
+STORAGE_V2_BENCH_DIRECT_PROFILE_CASE=<case> \
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/real_backend_next/<profile>.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2
+
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/real_backend_next/<profile>.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/<backend>/planned_visit_unique_m1000_u100'
+```
+
+Focused timings:
+
+| Backend      | direct visit_many m1000/u100 | planned visit_unique m1000/u100 | scan visit key-only q1000 | direct commit puts k1024/g16 |
+| ------------ | ---------------------------: | ------------------------------: | ------------------------: | ---------------------------: |
+| sqlite_temp  |                     82.52 us |                        37.42 us |                  48.56 us |                    966.94 us |
+| redb_temp    |                     70.37 us |                         7.89 us |                  25.86 us |                     16.78 ms |
+| rocksdb_temp |                    413.52 us |                        44.07 us |                  96.14 us |                    295.84 us |
+
+Profile notes:
+
+```text
+sqlite planned point:
+  SqliteRead::visit_many -> rusqlite row advance / sqlite3_step
+  backend-side key collection is still visible
+
+redb planned point:
+  RedbRead::visit_many -> encode key Vec allocation -> redb Btree::get_helper
+
+rocksdb planned point:
+  RocksDbRead::visit_many -> rocksdb multi_get -> DBImpl/TableCache/Version::Get
+
+scan key-only:
+  redb is mostly BtreeRangeIter
+  sqlite is sqlite3_step / rusqlite row advance
+  rocksdb is DBIterator::next / DBIter::Next
+
+write profiles:
+  still not clean enough for API conclusions.
+  The direct write lanes include real-backend setup/open/copy cost:
+    redb shows File::sync_all/open_empty
+    rocksdb shows DB::Open/open_empty
+    sqlite shows open_empty plus sqlite3_step
+```
+
+Interpretation:
+
+```text
+The visitor-first backend core is no longer the obvious cross-backend
+bottleneck. Planned storage point reads are now mostly backend engine work:
+  redb ~8 us
+  sqlite ~37 us
+  rocksdb ~44 us
+
+The remaining first-principles API smell is that backend_v2 still owns two
+concepts storage_v2 is better positioned to own:
+
+  1. logical spaces
+     every backend encodes (SpaceId, Key) into a physical key
+
+  2. duplicate/caller-order point semantics
+     storage already builds PointRequestPlan and can provide unique keys
+
+That shows up as repeated encode_entry_key Vec construction in redb/rocksdb and
+backend-local de-dupe/reconstruction work in sqlite.
+```
+
+Proposed next hard cut:
+
+```text
+Make backend_v2 a single ordered physical byte-key space.
+
+storage_v2:
+  maps StorageSpace -> physical key prefix
+  encodes logical keys into physical keys
+  owns caller-order slots, duplicate keys, and missing-key reconstruction
+
+backend_v2:
+  sees only physical byte keys
+  visit_many receives unique physical keys
+  visit_range scans physical byte-key ranges
+  put_many/delete_many write physical byte-key batches
+```
+
+Expected Big-O impact:
+
+```text
+No asymptotic change:
+  point reads: O(U)
+  range scans: O(log N + Q)
+  write lowering: O(K + G)
+
+Constant-factor improvements:
+  remove per-backend SpaceId/key encoding
+  remove backend-local duplicate handling
+  make SQLite schema a single BLOB primary key instead of (space_id, key)
+  let storage cache/reuse physical point plans directly
+```
+
+This follows the same first-principles direction as the previous cuts: backend
+becomes a boring ordered byte-key engine; storage owns Lix keyspaces and
+adapter semantics.
+
+## 2026-05-16: Cleaner real-backend write profile lane
+
+Added:
+
+```text
+storage_v2/backend_direct_profile/<backend>/
+  direct_commit_puts_reused_backend_k1024_g16_v32
+```
+
+This lane keeps one backend open and repeatedly commits the same 1024 put rows
+across 16 spaces. It measures overwrite commits rather than empty-database
+insert commits, but it removes the previous temp-file setup/copy/open noise from
+the sampled profile.
+
+Validation/profile commands:
+
+```sh
+STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY=1 \
+STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND=<backend> \
+STORAGE_V2_BENCH_DIRECT_PROFILE_CASE=direct_commit_puts_reused_backend_k1024_g16_v32 \
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/real_backend_next/<backend>_commit_puts_reused_backend.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Focused timings:
+
+| Backend      | reused backend commit puts k1024/g16 |
+| ------------ | -----------------------------------: |
+| sqlite_temp  |                            799.28 us |
+| redb_temp    |                              4.06 ms |
+| rocksdb_temp |                            520.25 us |
+
+Profile notes:
+
+```text
+sqlite_temp:
+  sqlite3_step / rusqlite Statement::execute dominate.
+  No open/copy/checkpoint stack remains in the hot lane.
+
+redb_temp:
+  redb WriteTransaction::commit -> File::sync_all dominates.
+  This is durability policy / backend behavior, not storage write-set shape.
+
+rocksdb_temp:
+  rocksdb DBImpl::Write -> WriteBatchInternal::InsertInto -> MemTable::Add dominates.
+  This is backend engine write path.
+
+all three:
+  DirectWriteBatches::clone remains visible because backend_v2::put_many consumes
+  owned PutBatch. That clone is benchmark repetition overhead, not the normal
+  storage_v2 write-set lowering path where the write set is consumed once.
+```
+
+Interpretation:
+
+```text
+The write profile is now clean enough to rank backend-engine costs:
+  rocksdb overwrite commit is fastest among real file backends here
+  sqlite is ~1.5x rocksdb
+  redb is much slower because commit sync dominates
+
+It is still not clean enough for a required write API cut, because the benchmark
+must clone owned PutBatch values to repeat the same commit. If we want to study
+write API constants next, the right harness is either:
+
+  1. storage-owned reusable write buffers that can be refilled without cloning
+  2. an optional borrowed write path experiment:
+       put_many_ref(space, &[PutEntryRef])
+
+Do not make that a v0 backend requirement yet. The read-side physical-key cut is
+the higher-confidence API simplification.
+```
+
+## 2026-05-16: Implemented physical-key-only backend v2 core
+
+Implemented the hard API cut proposed above:
+
+```text
+backend_v2:
+  one ordered physical byte-key space
+  visit_many(keys, opts, visitor)
+  visit_range(range, opts, visitor)
+  put_many(PutBatch)
+  delete_many(&[Key])
+
+storage_v2:
+  StorageSpace owns the logical space id/name
+  physical_key = big_endian_u32(SpaceId) || logical_key
+  point plans encode unique backend keys
+  scan/prefix helpers lower logical ranges into physical ranges
+  write sets encode keys during lower_into()
+```
+
+Implementation notes:
+
+```text
+Removed SpaceId from the backend read/write trait surface.
+Moved space isolation into storage_v2 key encoding and tests.
+Updated ConformanceBackend, InMemoryBackend, SQLite, redb, and RocksDB test
+backends to store only physical keys.
+Removed backend-level space-isolation conformance; storage conformance now owns
+that invariant.
+Updated direct backend benchmarks to use physical keys/ranges so the scorecard
+continues to measure the intended layer.
+```
+
+Expected complexity impact:
+
+```text
+No asymptotic change:
+  point reads: O(U)
+  scans: O(log N + Q)
+  write-set lowering: O(K + G)
+
+Constant-factor target:
+  less per-backend key encoding
+  simpler backend schemas and range bounds
+  storage can cache/reuse physical point/range plans
+```
+
+## 2026-05-16: Physical-key-only API smoke delta
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(commit_puts_k1024_g16_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)'
+
+STORAGE_V2_BENCH_SMOKE=1 \
+STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_direct_profile/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(direct_visit_many_m1000_u100|direct_get_many_m1000_u100|direct_scan_visit_key_only_q1000|direct_scan_materialized_q1000|direct_commit_puts_reused_backend_k1024_g16_v32)'
+```
+
+This is a smoke delta, not a final long-run scorecard. It compares against the
+most recent pre-physical-key entries in this log.
+
+Backend matrix, current smoke means:
+
+| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ---------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16        |  92.87 us |    884.7 us |  17.47 ms |    208.25 us |
+| planned visit unique m1000/u100 | 4.48 us |     39.59 us |   6.54 us |     41.06 us |
+| planned get many m1000/u100  |   6.86 us |     40.86 us |  10.18 us |     44.36 us |
+| planned get many buffered m1000/u100 | 7.14 us | 45.75 us | 10.86 us | 43.80 us |
+| scan visit key-only q1000    |   1.53 us |     40.45 us |  30.06 us |     90.17 us |
+| scan materialized q1000      |  21.44 us |     63.67 us |  58.25 us |    110.48 us |
+| prefix materialized q1000    |  19.96 us |     61.93 us |  68.53 us |    113.81 us |
+
+Approximate delta vs previous backend-matrix/focused entries:
+
+| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ---------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16        | 130% slower | 1% faster | 20% faster | 5% faster |
+| planned visit unique m1000/u100 | 96% slower | 16% slower | 8% faster | 1% slower |
+| planned get many m1000/u100  | 44% slower | 10% slower | 10% slower | 2% slower |
+| scan visit key-only q1000    | 50% slower | 9% faster | flat | 1% faster |
+| scan materialized q1000      | 9% slower | flat | 49% slower | 1% slower |
+| prefix materialized q1000    | 2% slower | flat | 75% slower | 4% slower |
+
+Direct backend profile, current smoke means:
+
+| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ---------------------------- | --------: | ----------: | --------: | -----------: |
+| direct reused commit k1024/g16 | 69.62 us | 805.92 us | 4.05 ms | 531.71 us |
+| direct get_many m1000/u100   |  46.74 us | 109.18 us | 75.42 us | 401.00 us |
+| direct visit_many m1000/u100 |  22.04 us |  78.65 us | 42.03 us | 389.65 us |
+| direct scan visit key-only q1000 | 1.43 us | 44.60 us | 29.38 us | 91.84 us |
+| direct scan materialized q1000 | 20.56 us | 64.88 us | 44.90 us | 115.31 us |
+
+Direct-profile interpretation:
+
+```text
+Physical-key-only helps or holds the raw backend point path:
+  in_memory direct visit_many: ~6.6% faster
+  sqlite direct visit_many: ~2% faster / noise
+  redb direct visit_many: ~37% faster
+  rocksdb direct visit_many: ~3% faster / noise
+
+The storage matrix now exposes storage-side key prefix encoding costs:
+  in_memory is the clearest regression because backend I/O is tiny
+  real backends mostly hide the prefix cost behind engine work
+
+Scan results are mixed:
+  SQLite scan visitor improved a little
+  RocksDB scan visitor is effectively flat
+  redb materialized/prefix scans regressed in this smoke run and need a focused
+  profile before drawing a first-principles conclusion
+```
+
+Conclusion:
+
+```text
+The hard API cut did simplify backend implementations and improved the direct
+backend point path, especially redb. It did not automatically improve
+storage-level in-memory performance because physical-key construction moved into
+storage_v2 and is now paid visibly in the fastest backend.
+
+Next candidate optimization:
+  cache physical keys/ranges in PointRequestPlan and prefix/range plans so
+  repeated reads do not rebuild big_endian_u32(SpaceId) || logical_key every time.
+```

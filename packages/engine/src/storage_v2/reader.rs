@@ -447,7 +447,6 @@ mod tests {
     impl BackendRead for SpyRead {
         fn visit_many<V>(
             &self,
-            _space: SpaceId,
             keys: &[Key],
             opts: GetOptions<'_>,
             visitor: &mut V,
@@ -468,7 +467,6 @@ mod tests {
 
         fn visit_range<V>(
             &self,
-            _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
             _visitor: &mut V,
@@ -490,7 +488,6 @@ mod tests {
     impl BackendRead for RequestedOrderRead {
         fn visit_many<V>(
             &self,
-            _space: SpaceId,
             keys: &[Key],
             _opts: GetOptions<'_>,
             visitor: &mut V,
@@ -500,7 +497,7 @@ mod tests {
         {
             self.get_many_keys.replace(keys.to_vec());
             for (index, key) in keys.iter().enumerate() {
-                let value = (key.0.as_ref() != b"missing")
+                let value = (!key.0.ends_with(b"missing"))
                     .then_some(ProjectedValueRef::FullValue(key.0.as_ref()));
                 visitor.visit(index, key, value)?;
             }
@@ -509,7 +506,6 @@ mod tests {
 
         fn visit_range<V>(
             &self,
-            _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
             _visitor: &mut V,
@@ -574,7 +570,11 @@ mod tests {
 
         assert_eq!(
             read.backend_read().get_many_keys.borrow().as_slice(),
-            &[key("b"), key("a"), key("missing")]
+            [
+                space(1).encode_key(&key("b")),
+                space(1).encode_key(&key("a")),
+                space(1).encode_key(&key("missing"))
+            ]
         );
         assert_eq!(
             slots.into_iter().map(|slot| slot.key).collect::<Vec<_>>(),
@@ -803,19 +803,27 @@ mod tests {
 
         assert_eq!(
             read.backend_read().get_many_keys.borrow().as_slice(),
-            &[key("b"), key("missing"), key("a")]
+            [
+                space(1).encode_key(&key("b")),
+                space(1).encode_key(&key("missing")),
+                space(1).encode_key(&key("a"))
+            ]
         );
         assert_eq!(result.stats.requested_keys, 4);
         assert_eq!(result.stats.unique_backend_keys, 3);
         assert_eq!(result.stats.backend_calls, 1);
         assert_eq!(
             result.value.value_at(0),
-            Some(&ProjectedValue::FullValue(Bytes::from_static(b"b")))
+            Some(&ProjectedValue::FullValue(Bytes::from_static(
+                b"\0\0\0\x01b"
+            )))
         );
         assert_eq!(result.value.value_at(1), None);
         assert_eq!(
             result.value.value_at(2),
-            Some(&ProjectedValue::FullValue(Bytes::from_static(b"a")))
+            Some(&ProjectedValue::FullValue(Bytes::from_static(
+                b"\0\0\0\x01a"
+            )))
         );
     }
 
@@ -1086,8 +1094,11 @@ mod tests {
             .borrow()
             .clone()
             .expect("range captured");
-        assert_eq!(range.lower, Bound::Included(key_bytes(b"a\xff")));
-        assert_eq!(range.upper, Bound::Excluded(key("b")));
+        assert_eq!(
+            range.lower,
+            Bound::Included(space(1).encode_key(&key_bytes(b"a\xff")))
+        );
+        assert_eq!(range.upper, Bound::Excluded(space(1).encode_key(&key("b"))));
     }
 
     #[test]

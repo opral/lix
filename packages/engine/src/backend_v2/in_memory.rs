@@ -8,28 +8,27 @@ use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTest
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 
-type SpaceEntries = BTreeMap<Key, Bytes>;
-type InMemoryMap = BTreeMap<SpaceId, Arc<SpaceState>>;
+type InMemoryMap = BTreeMap<Key, Bytes>;
 
 #[derive(Clone, Debug, Default)]
-enum SpaceState {
+enum EntriesState {
     #[default]
     Empty,
-    Flat(SpaceEntries),
+    Flat(InMemoryMap),
     Layered {
-        base: Arc<SpaceState>,
-        puts: SpaceEntries,
+        base: Arc<EntriesState>,
+        puts: InMemoryMap,
         deletes: BTreeSet<Key>,
     },
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryBackend {
-    entries: Arc<Mutex<Arc<InMemoryMap>>>,
+    entries: Arc<Mutex<Arc<EntriesState>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -37,25 +36,25 @@ pub struct InMemoryBackendFactory;
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryBackendFixture {
-    entries: Arc<Mutex<Arc<InMemoryMap>>>,
+    entries: Arc<Mutex<Arc<EntriesState>>>,
 }
 
 pub struct InMemoryRead {
-    entries: Arc<InMemoryMap>,
+    entries: Arc<EntriesState>,
 }
 
 pub type InMemoryScanVisitResult = ScanResult;
 
 pub struct InMemoryWrite {
-    parent: Arc<Mutex<Arc<InMemoryMap>>>,
-    base: Arc<InMemoryMap>,
-    overlays: BTreeMap<SpaceId, SpaceOverlay>,
+    parent: Arc<Mutex<Arc<EntriesState>>>,
+    base: Arc<EntriesState>,
+    overlay: EntriesOverlay,
     stats: WriteStats,
 }
 
 #[derive(Debug, Default)]
-struct SpaceOverlay {
-    puts: SpaceEntries,
+struct EntriesOverlay {
+    puts: InMemoryMap,
     deletes: BTreeSet<Key>,
 }
 
@@ -71,7 +70,7 @@ impl InMemoryBackend {
         })
     }
 
-    fn snapshot(&self) -> Result<Arc<InMemoryMap>, BackendError> {
+    fn snapshot(&self) -> Result<Arc<EntriesState>, BackendError> {
         self.entries
             .lock()
             .map_err(|_| BackendError::Io("in-memory backend lock poisoned".to_string()))
@@ -131,7 +130,7 @@ impl Backend for InMemoryBackend {
         Ok(InMemoryWrite {
             parent: Arc::clone(&self.entries),
             base: self.snapshot()?,
-            overlays: BTreeMap::new(),
+            overlay: EntriesOverlay::default(),
             stats: WriteStats::default(),
         })
     }
@@ -140,7 +139,6 @@ impl Backend for InMemoryBackend {
 impl BackendRead for InMemoryRead {
     fn visit_many<V>(
         &self,
-        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -148,28 +146,22 @@ impl BackendRead for InMemoryRead {
     where
         V: PointVisitor + ?Sized,
     {
-        if let Some(space_entries) = self.entries.get(&space) {
-            match space_entries.as_ref() {
-                SpaceState::Flat(entries) => {
-                    for (index, key) in keys.iter().enumerate() {
-                        let value = entries
-                            .get(key)
-                            .map(|value| project_value_ref(value, opts.projection));
-                        visitor.visit(index, key, value)?;
-                    }
-                }
-                _ => {
-                    for (index, key) in keys.iter().enumerate() {
-                        let value = space_entries
-                            .get(key)
-                            .map(|value| project_value_ref(value, opts.projection));
-                        visitor.visit(index, key, value)?;
-                    }
+        match self.entries.as_ref() {
+            EntriesState::Flat(entries) => {
+                for (index, key) in keys.iter().enumerate() {
+                    let value = entries
+                        .get(key)
+                        .map(|value| project_value_ref(value, opts.projection));
+                    visitor.visit(index, key, value)?;
                 }
             }
-        } else {
-            for (index, key) in keys.iter().enumerate() {
-                visitor.visit(index, key, None)?;
+            entries => {
+                for (index, key) in keys.iter().enumerate() {
+                    let value = entries
+                        .get(key)
+                        .map(|value| project_value_ref(value, opts.projection));
+                    visitor.visit(index, key, value)?;
+                }
             }
         }
         Ok(())
@@ -177,7 +169,6 @@ impl BackendRead for InMemoryRead {
 
     fn visit_range<V>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         visitor: &mut V,
@@ -185,14 +176,13 @@ impl BackendRead for InMemoryRead {
     where
         V: ScanVisitor + ?Sized,
     {
-        visit_range(&self.entries, space, range, opts, visitor)
+        visit_range(&self.entries, range, opts, visitor)
     }
 }
 
 impl InMemoryRead {
     pub fn visit_scan_range<F>(
         &self,
-        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
         mut visitor: F,
@@ -208,34 +198,31 @@ impl InMemoryRead {
             visitor(key, value);
             Ok(())
         };
-        visit_range(&self.entries, space, range, opts, &mut visitor)
+        visit_range(&self.entries, range, opts, &mut visitor)
     }
 }
 
 impl BackendWrite for InMemoryWrite {
-    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        let overlay = self.overlays.entry(space).or_default();
-
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            if !overlay.deletes.is_empty() {
-                overlay.deletes.remove(&entry.key);
+            if !self.overlay.deletes.is_empty() {
+                self.overlay.deletes.remove(&entry.key);
             }
-            overlay.puts.insert(entry.key, value);
+            self.overlay.puts.insert(entry.key, value);
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        let overlay = self.overlays.entry(space).or_default();
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
-            if !overlay.puts.is_empty() {
-                overlay.puts.remove(key);
+            if !self.overlay.puts.is_empty() {
+                self.overlay.puts.remove(key);
             }
-            overlay.deletes.insert(key.clone());
+            self.overlay.deletes.insert(key.clone());
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
@@ -243,35 +230,25 @@ impl BackendWrite for InMemoryWrite {
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
-        let mut entries = self.base.as_ref().clone();
-        for (space, overlay) in self.overlays {
-            if overlay.puts.is_empty() && overlay.deletes.is_empty() {
-                continue;
-            }
-            let base = entries
-                .remove(&space)
-                .unwrap_or_else(|| Arc::new(SpaceState::Empty));
-            if matches!(base.as_ref(), SpaceState::Empty) {
-                if !overlay.puts.is_empty() {
-                    entries.insert(space, Arc::new(SpaceState::Flat(overlay.puts)));
-                }
-            } else {
-                entries.insert(
-                    space,
-                    Arc::new(SpaceState::Layered {
-                        base,
-                        puts: overlay.puts,
-                        deletes: overlay.deletes,
-                    }),
-                );
-            }
-        }
+        let entries = if self.overlay.puts.is_empty() && self.overlay.deletes.is_empty() {
+            self.base
+        } else if matches!(self.base.as_ref(), EntriesState::Empty)
+            && self.overlay.deletes.is_empty()
+        {
+            Arc::new(EntriesState::Flat(self.overlay.puts))
+        } else {
+            Arc::new(EntriesState::Layered {
+                base: self.base,
+                puts: self.overlay.puts,
+                deletes: self.overlay.deletes,
+            })
+        };
 
         *self
             .parent
             .lock()
             .map_err(|_| BackendError::Io("in-memory backend lock poisoned".to_string()))? =
-            Arc::new(entries);
+            entries;
         Ok(CommitResult {
             commit_id: None,
             stats: self.stats,
@@ -283,12 +260,12 @@ impl BackendWrite for InMemoryWrite {
     }
 }
 
-impl SpaceState {
+impl EntriesState {
     fn get(&self, key: &Key) -> Option<&Bytes> {
         match self {
-            SpaceState::Empty => None,
-            SpaceState::Flat(entries) => entries.get(key),
-            SpaceState::Layered {
+            EntriesState::Empty => None,
+            EntriesState::Flat(entries) => entries.get(key),
+            EntriesState::Layered {
                 base,
                 puts,
                 deletes,
@@ -306,8 +283,7 @@ impl SpaceState {
 }
 
 fn visit_range<V>(
-    entries: &InMemoryMap,
-    space: SpaceId,
+    entries: &EntriesState,
     range: KeyRange,
     opts: ScanOptions<'_>,
     visitor: &mut V,
@@ -319,21 +295,17 @@ where
         return Ok(ScanResult::default());
     }
 
-    let Some(space_entries) = entries.get(&space) else {
-        return Ok(ScanResult::default());
-    };
-
     let lower = lower_bound(&range, opts.resume_after);
     let upper = upper_bound(&range);
     if bounds_are_empty(&lower, &upper) {
         return Ok(ScanResult::default());
     }
 
-    visit_space_range(space_entries, lower, upper, opts, visitor)
+    visit_entries_range(entries, lower, upper, opts, visitor)
 }
 
-fn visit_space_range<V>(
-    state: &SpaceState,
+fn visit_entries_range<V>(
+    state: &EntriesState,
     lower: Bound<&Key>,
     upper: Bound<&Key>,
     opts: ScanOptions<'_>,
@@ -343,18 +315,18 @@ where
     V: ScanVisitor + ?Sized,
 {
     match state {
-        SpaceState::Empty => Ok(ScanResult::default()),
-        SpaceState::Flat(entries) => visit_flat_range(entries, lower, upper, opts, visitor),
-        SpaceState::Layered {
+        EntriesState::Empty => Ok(ScanResult::default()),
+        EntriesState::Flat(entries) => visit_flat_range(entries, lower, upper, opts, visitor),
+        EntriesState::Layered {
             base,
             puts,
             deletes,
         } if !range_has_entries(puts, &lower, &upper)
             && !range_has_keys(deletes, &lower, &upper) =>
         {
-            visit_space_range(base, lower, upper, opts, visitor)
+            visit_entries_range(base, lower, upper, opts, visitor)
         }
-        SpaceState::Layered { .. } => {
+        EntriesState::Layered { .. } => {
             let mut rows = BTreeMap::<&Key, Option<&Bytes>>::new();
             collect_range(state, &lower, &upper, &mut rows);
 
@@ -372,7 +344,7 @@ where
     }
 }
 
-fn range_has_entries(entries: &SpaceEntries, lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
+fn range_has_entries(entries: &InMemoryMap, lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
     entries.range((*lower, *upper)).next().is_some()
 }
 
@@ -381,7 +353,7 @@ fn range_has_keys(keys: &BTreeSet<Key>, lower: &Bound<&Key>, upper: &Bound<&Key>
 }
 
 fn visit_flat_range<V>(
-    entries: &SpaceEntries,
+    entries: &InMemoryMap,
     lower: Bound<&Key>,
     upper: Bound<&Key>,
     opts: ScanOptions<'_>,
@@ -420,19 +392,19 @@ where
 }
 
 fn collect_range<'a>(
-    state: &'a SpaceState,
+    state: &'a EntriesState,
     lower: &Bound<&'a Key>,
     upper: &Bound<&'a Key>,
     rows: &mut BTreeMap<&'a Key, Option<&'a Bytes>>,
 ) {
     match state {
-        SpaceState::Empty => {}
-        SpaceState::Flat(entries) => {
+        EntriesState::Empty => {}
+        EntriesState::Flat(entries) => {
             for (key, value) in entries.range((*lower, *upper)) {
                 rows.entry(key).or_insert(Some(value));
             }
         }
-        SpaceState::Layered {
+        EntriesState::Layered {
             base,
             puts,
             deletes,
