@@ -14,4 +14,7 @@ pub(crate) use types::{
     LiveStateScanRequest, MaterializedLiveStateRow, ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
-pub(crate) use visibility::{resolve_overlay_rows, resolve_scan_rows};
+pub(crate) use visibility::{
+    expanded_version_ids, overlay_scan_rows, resolve_visible_rows, StagedLiveStateRows,
+    VisibilityRequest, VisibilityVersionScope,
+};

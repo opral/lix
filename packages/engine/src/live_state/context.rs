@@ -3,9 +3,9 @@ use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::visibility;
 use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest, VisibilityVersionScope,
 };
 use crate::storage::StorageReader;
 use crate::tracked_state::{
@@ -135,14 +135,17 @@ where
                 .chain(derived_rows)
                 .collect()
         };
-        rows = visibility::resolve_scan_rows(
+        rows = resolve_visible_rows(
             rows,
-            &scope.projection_version_ids,
-            request.filter.include_tombstones,
+            Vec::new(),
+            &VisibilityRequest {
+                version_scope: VisibilityVersionScope::VersionIds {
+                    version_ids: scope.projection_version_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            },
         );
-        if let Some(limit) = request.limit {
-            rows.truncate(limit);
-        }
         Ok(rows)
     }
 
@@ -388,7 +391,7 @@ async fn scan_scope(
         }
     }
 
-    let storage_version_ids = visibility::expanded_version_ids(&projection_version_ids);
+    let storage_version_ids = expanded_version_ids(&projection_version_ids);
     Ok(LiveStateScanScope {
         storage_version_ids,
         projection_version_ids,

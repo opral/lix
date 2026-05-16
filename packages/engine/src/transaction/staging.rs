@@ -595,10 +595,16 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(crate::live_state::resolve_scan_rows(
+        Ok(crate::live_state::resolve_visible_rows(
             self.scan_parts(request)?.rows,
-            &request.filter.version_ids,
-            request.filter.include_tombstones,
+            Vec::new(),
+            &crate::live_state::VisibilityRequest {
+                version_scope: crate::live_state::VisibilityVersionScope::VersionIds {
+                    version_ids: request.filter.version_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: None,
+            },
         ))
     }
 
@@ -711,6 +717,15 @@ impl PreparedStateRowOverlay {
             return None;
         };
         adopted_guard.get(index)?.as_ref().cloned()
+    }
+}
+
+impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
+    fn staged_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        Ok(self.scan_parts(request)?.rows)
     }
 }
 
@@ -1543,7 +1558,7 @@ mod tests {
             })
             .expect("overlay scan should succeed");
 
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.entity_id
@@ -1552,11 +1567,11 @@ mod tests {
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
                 .count(),
-            2
+            1
         );
         assert!(rows.iter().any(|row| {
             row.snapshot_content.as_deref()
-                == Some("{\"key\":\"shared-entity\",\"value\":\"tracked\"}")
+                == Some("{\"key\":\"shared-entity\",\"value\":\"base\"}")
         }));
     }
 

@@ -209,7 +209,7 @@ Phase 1 compiler result:
 
 - First compiler-error class: canonical bound types incorrectly derived `Eq` for fields containing `Value`, and the new parser used a non-existent error-code constant.
 - Resolution: removed `Eq` derives from value-bearing bound types and delegated DataFusion parser errors to the existing sql2 error classifier.
-- Review hardening: removed the pre-bind fast-write hook from session execution, changed fast execution to consume `FastWritePlan`, put `bind_statement` on the write planning path, removed old `simple_dml` and `public_bind`, made `VersionScope` the sole entity version authority, made write values bound expressions instead of runtime `Value`s, added planned `FilterSet`s to `LogicalWritePlan`, and routed transaction overlay visibility through the `live_state` visibility owner with `sql2::storage::visibility` as a wrapper.
+- Review hardening: removed the pre-bind fast-write hook from session execution, changed fast execution to consume `FastWritePlan`, put `bind_statement` on the write planning path, removed old `simple_dml` and `public_bind`, made `VersionScope` the sole entity version authority, made write values bound expressions instead of runtime `Value`s, added planned `FilterSet`s to `LogicalWritePlan`, and routed transaction overlay visibility through the `live_state` visibility owner facade.
 - Review hardening: transaction overlay candidate scans now remove pre-visibility `limit` and force `include_tombstones = true`, then apply caller limit/tombstone filtering only after shared visibility resolution.
 - Review hardening: read planning entrypoints now reject write ASTs before DataFusion planning, live-state point loads and transaction schema point loads route through scan/overlay visibility, empty-version overlay dedupe happens before tombstone filtering, and stale raw-DataFusion write tests are explicitly ignored until the bound write pipeline is implemented.
 - Current gate: `cargo check -p lix_engine` passes with warnings from intentionally-unused Phase 1 target types. Write execution intentionally stops at the new binder/planner boundary until Phase 2/3 implement catalog, write binding, and bound write execution; this is the hard cut that prevents falling back to raw-AST DML semantics.
@@ -340,19 +340,23 @@ Phase 6 progress:
 
 ## Phase 7: Storage Visibility Cut
 
-- [ ] Move live-state scan/write adaptation into `storage/live_state.rs`.
-- [ ] Move `packages/engine/src/live_state/visibility.rs` semantics behind `sql2/storage/visibility.rs` or a shared non-SQL module with one public API.
-- [ ] Define one visibility request type:
+- [x] Move live-state scan/write adaptation behind the `live_state` owner facade.
+- [x] Keep `packages/engine/src/live_state/visibility.rs` semantics in the shared non-SQL owner module with one public API.
+- [x] Define one visibility request type:
 
 ```rust
 pub(crate) struct VisibilityRequest {
-    pub(crate) version_scope: VersionScope,
+    pub(crate) version_scope: VisibilityVersionScope,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
 }
 ```
 
-- [ ] Define one resolver:
+`VisibilityVersionScope` intentionally has no empty-result variant. Empty live-state
+version filters are represented as `VersionIds { version_ids: vec![] }` so they mean
+all stored versions with normal dedupe, not no rows.
+
+- [x] Define one resolver:
 
 ```rust
 pub(crate) fn resolve_visible_rows(
@@ -362,16 +366,23 @@ pub(crate) fn resolve_visible_rows(
 ) -> Vec<MaterializedLiveStateRow>;
 ```
 
-- [ ] Make dedupe unconditional after base+staged merge.
-- [ ] Make global-row projection part of the same resolver.
-- [ ] Make tombstones participate in winner selection before tombstone filtering.
-- [ ] Remove caller-specific overlay/dedupe logic from transaction code.
-- [ ] Add tests for:
-  - [ ] committed/base live-state scans.
-  - [ ] staged-overlay scans inside `begin_transaction()`.
-  - [ ] empty version filter with duplicate base/staged identity.
-  - [ ] global rows projected into requested versions.
-  - [ ] tombstone winning over older visible rows.
+- [x] Make dedupe unconditional after base+staged merge.
+- [x] Make global-row projection part of the same resolver.
+- [x] Make tombstones participate in winner selection before tombstone filtering.
+- [x] Remove caller-specific overlay/dedupe logic from transaction code.
+- [x] Add tests for:
+  - [x] committed/base live-state scans.
+  - [x] staged-overlay scans inside `begin_transaction()`.
+  - [x] empty version filter with duplicate base/staged identity.
+  - [x] global rows projected into requested versions.
+  - [x] tombstone winning over older visible rows.
+
+Phase 7 progress:
+
+- `live_state/visibility.rs` now owns the shared non-SQL visibility API and resolver, avoiding a `live_state -> sql2 -> live_state` owner cycle. It projects global candidates into requested version scopes, keeps tombstones in candidate selection until after winners are chosen, and dedupes rows for empty and non-empty version scopes.
+- The `live_state` root facade now owns the transaction overlay scan adapter behind a narrow staged-row trait. Transaction context and schema resolution call that facade instead of carrying local overlay/dedupe code, without exposing `transaction::staging` crate-wide.
+- The old `transaction/live_state_overlay.rs` module and SQL-shaped storage wrappers are removed. Existing committed/base live-state reads and transaction overlay scans now route through the same visibility resolver.
+- Tests cover committed/base projection, staged transaction reads through `begin_transaction()`, duplicate base/staged identity handling with empty version filters, global row projection, committed global fallback for transaction-only version scopes, and tombstone winner semantics.
 
 ## Phase 8: Providers Cleanup
 

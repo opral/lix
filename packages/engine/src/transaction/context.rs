@@ -12,14 +12,14 @@ use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    overlay_scan_rows, LiveStateContext, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
-use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
