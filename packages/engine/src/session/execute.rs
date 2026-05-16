@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::functions::FunctionContext;
-use crate::sql2::{self, BoundStatement};
+use crate::sql2;
 use crate::storage::{StorageReadScope, StorageWriteSet};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
@@ -299,8 +299,7 @@ impl SessionContext {
         self.ensure_open()?;
         let _transaction_guard = self.reserve_session_transaction()?;
         let statement = sql2::parse_statement(sql)?;
-        let write_bind = self.bind_write_statement(&statement).await?;
-        if write_bind.is_some() {
+        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
             return self
@@ -319,13 +318,6 @@ impl SessionContext {
                 })
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
-        }
-        let kind = sql2::classify_datafusion_statement(&statement);
-        if kind == sql2::SqlStatementKind::Other {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "SQL statement is not supported by Lix SQL",
-            ));
         }
 
         let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
@@ -381,8 +373,7 @@ impl SessionContext {
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
-        let write_bind = self.bind_write_statement(&statement).await?;
-        if write_bind.is_some() {
+        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
             let _transaction_guard = self.reserve_session_transaction()?;
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
@@ -406,27 +397,6 @@ impl SessionContext {
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
         self.execute(sql, params).await
-    }
-
-    async fn bind_write_statement(
-        &self,
-        statement: &datafusion::sql::parser::Statement,
-    ) -> Result<Option<BoundStatement>, LixError> {
-        let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
-        let result = async {
-            let mut read_store = read_scope.store();
-            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
-            let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
-            let visible_schemas = self
-                .catalog_context
-                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_version_id)
-                .await?;
-            bind_write_statement_from_parts(statement, &visible_schemas, &active_version_id)
-        }
-        .await;
-        read_scope.rollback().await?;
-        result
     }
 
     /// Persists execution-scoped runtime function state after a successful read.
@@ -464,32 +434,26 @@ impl SessionTransaction {
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
         let statement = sql2::parse_statement(sql)?;
-        let write_bind = self.bind_write_statement(&statement)?;
         let transaction = self.transaction_mut()?;
-        match write_bind {
-            Some(_) => execute_transaction_write(transaction, statement, params)
+        match sql2::bind_statement_route(&statement)? {
+            sql2::BoundStatementRoute::Write => {
+                execute_transaction_write(transaction, statement, params)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            sql2::BoundStatementRoute::Read => {
+                let plan = sql2::create_transaction_read_logical_plan_from_parsed(
+                    transaction,
+                    sql,
+                    statement,
+                )
                 .await
-                .map_err(|error| normalize_sql_surface_error(error, sql)),
-            None => match sql2::classify_datafusion_statement(&statement) {
-                sql2::SqlStatementKind::Read => {
-                    let plan = sql2::create_transaction_read_logical_plan_from_parsed(
-                        transaction,
-                        sql,
-                        statement,
-                    )
+                .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                let result = sql2::execute_logical_plan(plan, params)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                    let result = sql2::execute_logical_plan(plan, params)
-                        .await
-                        .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                    Ok(ExecuteResult::from_sql_query_result(result))
-                }
-                sql2::SqlStatementKind::Other => Err(LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "SQL statement is not supported by Lix SQL",
-                )),
-                sql2::SqlStatementKind::Write => unreachable!("write binding checked first"),
-            },
+                Ok(ExecuteResult::from_sql_query_result(result))
+            }
         }
     }
 
@@ -501,13 +465,14 @@ impl SessionTransaction {
         mode: sql2::WriteExecutorMode,
     ) -> Result<ExecuteResult, LixError> {
         let statement = sql2::parse_statement(sql)?;
-        let write_bind = self.bind_write_statement(&statement)?;
         let transaction = self.transaction_mut()?;
-        match write_bind {
-            Some(_) => execute_transaction_write_with_mode(transaction, statement, params, mode)
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, sql)),
-            None => self.execute(sql, params).await,
+        match sql2::bind_statement_route(&statement)? {
+            sql2::BoundStatementRoute::Write => {
+                execute_transaction_write_with_mode(transaction, statement, params, mode)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            sql2::BoundStatementRoute::Read => self.execute(sql, params).await,
         }
     }
 
@@ -519,15 +484,16 @@ impl SessionTransaction {
         mode: sql2::WriteExecutorMode,
     ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
         let statement = sql2::parse_statement(sql)?;
-        let write_bind = self.bind_write_statement(&statement)?;
         let transaction = self.transaction_mut()?;
-        match write_bind {
-            Some(_) => {
+        match sql2::bind_statement_route(&statement)? {
+            sql2::BoundStatementRoute::Write => {
                 execute_transaction_write_with_mode_and_trace(transaction, statement, params, mode)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
-            None => self.execute(sql, params).await.map(|result| (result, None)),
+            sql2::BoundStatementRoute::Read => {
+                self.execute(sql, params).await.map(|result| (result, None))
+            }
         }
     }
 
@@ -542,41 +508,6 @@ impl SessionTransaction {
             request,
         )
         .await
-    }
-
-    fn bind_write_statement(
-        &self,
-        statement: &datafusion::sql::parser::Statement,
-    ) -> Result<Option<BoundStatement>, LixError> {
-        let transaction = self.transaction.as_ref().ok_or_else(|| {
-            super::transaction::transaction_state_error("Lix transaction is closed")
-        })?;
-        let visible_schemas =
-            <crate::transaction::Transaction as sql2::SqlWriteExecutionContext>::list_visible_schemas(
-                transaction,
-            )?;
-        let active_version_id =
-            <crate::transaction::Transaction as sql2::SqlWriteExecutionContext>::active_version_id(
-                transaction,
-            );
-        bind_write_statement_from_parts(statement, &visible_schemas, active_version_id)
-    }
-}
-
-fn bind_write_statement_from_parts(
-    statement: &datafusion::sql::parser::Statement,
-    visible_schemas: &[serde_json::Value],
-    active_version_id: &str,
-) -> Result<Option<BoundStatement>, LixError> {
-    match sql2::bind_statement(statement, visible_schemas, active_version_id) {
-        Ok(bound @ BoundStatement::Write(_)) => Ok(Some(bound)),
-        Ok(BoundStatement::Read(_)) => Ok(None),
-        Err(error)
-            if sql2::classify_datafusion_statement(statement) == sql2::SqlStatementKind::Write =>
-        {
-            Err(error)
-        }
-        Err(_) => Ok(None),
     }
 }
 

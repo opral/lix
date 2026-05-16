@@ -57,101 +57,13 @@ fn bind_sql_statement(
 ) -> Result<BoundStatement, LixError> {
     match statement {
         SqlStatement::Insert(insert) => {
-            let mut params = ParamBinder::default();
-            reject_unsupported_insert_clauses(insert)?;
-            let TableObject::TableName(name) = &insert.table else {
-                return Err(super::error::unsupported("unsupported INSERT target"));
-            };
-            let table = bind_public_table(catalog, name)?;
-            require_write_capability(&table.surface, BoundWriteOp::Insert)?;
-            if insert.columns.is_empty() {
-                return Err(super::error::unsupported(
-                    "INSERT requires an explicit public column list",
-                ));
-            }
-            let mut target_columns = BTreeSet::new();
-            let mut columns = Vec::new();
-            for column in &insert.columns {
-                let column_name = normalize_identifier(column);
-                reject_duplicate_target_column(&mut target_columns, &column_name)?;
-                columns.push(require_writable_column(
-                    &table,
-                    &column_name,
-                    BoundWriteOp::Insert,
-                )?);
-            }
-            let input = bind_insert_input(&columns, insert.source.as_deref(), &mut params)?;
-            let version_scope = bind_write_version_scope(
-                &table.surface.kind,
-                &input,
-                &BoundPredicate::True,
-                active_version_id,
-            )?;
-            Ok(BoundStatement::Write(BoundWrite {
-                target: bound_write_target(&table.surface.kind),
-                op: BoundWriteOp::Insert,
-                input,
-                predicate: BoundPredicate::True,
-                assignments: Vec::new(),
-                params: params.into_map(),
-                version_scope,
-            }))
+            super::write::bind_insert(insert, catalog, active_version_id).map(BoundStatement::Write)
         }
         SqlStatement::Update(update) => {
-            let mut params = ParamBinder::default();
-            reject_unsupported_update_clauses(update)?;
-            let table = bind_table_with_joins(catalog, &update.table)?;
-            require_write_capability(&table.surface, BoundWriteOp::Update)?;
-            let mut target_columns = BTreeSet::new();
-            let mut assignments = Vec::new();
-            for assignment in &update.assignments {
-                let column = bind_assignment_target(&table, &assignment.target)?;
-                reject_duplicate_target_column(&mut target_columns, &column.name)?;
-                assignments.push(BoundAssignment {
-                    column,
-                    value: bind_expr(&table, &assignment.value, &mut params)?,
-                });
-            }
-            let predicate =
-                bind_optional_predicate(&table, update.selection.as_ref(), &mut params)?;
-            let version_scope = bind_write_version_scope(
-                &table.surface.kind,
-                &BoundWriteInput::None,
-                &predicate,
-                active_version_id,
-            )?;
-            Ok(BoundStatement::Write(BoundWrite {
-                target: bound_write_target(&table.surface.kind),
-                op: BoundWriteOp::Update,
-                input: BoundWriteInput::None,
-                predicate,
-                assignments,
-                params: params.into_map(),
-                version_scope,
-            }))
+            super::write::bind_update(update, catalog, active_version_id).map(BoundStatement::Write)
         }
         SqlStatement::Delete(delete) => {
-            let mut params = ParamBinder::default();
-            reject_unsupported_delete_clauses(delete)?;
-            let table = bind_delete_target(catalog, &delete.from)?;
-            require_write_capability(&table.surface, BoundWriteOp::Delete)?;
-            let predicate =
-                bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
-            let version_scope = bind_write_version_scope(
-                &table.surface.kind,
-                &BoundWriteInput::None,
-                &predicate,
-                active_version_id,
-            )?;
-            Ok(BoundStatement::Write(BoundWrite {
-                target: bound_write_target(&table.surface.kind),
-                op: BoundWriteOp::Delete,
-                input: BoundWriteInput::None,
-                predicate,
-                assignments: Vec::new(),
-                params: params.into_map(),
-                version_scope,
-            }))
+            super::write::bind_delete(delete, catalog, active_version_id).map(BoundStatement::Write)
         }
         SqlStatement::Explain { .. } => Err(super::error::unsupported(
             "EXPLAIN statements are not supported by SQL write binding",
@@ -160,6 +72,116 @@ fn bind_sql_statement(
             "sql2 bound statement pipeline is not wired yet",
         )),
     }
+}
+
+pub(super) fn bind_insert_bound(
+    insert: &Insert,
+    catalog: &PublicCatalog,
+    active_version_id: &str,
+) -> Result<BoundWrite, LixError> {
+    let mut params = ParamBinder::default();
+    reject_unsupported_insert_clauses(insert)?;
+    let TableObject::TableName(name) = &insert.table else {
+        return Err(super::error::unsupported("unsupported INSERT target"));
+    };
+    let table = bind_public_table(catalog, name)?;
+    require_write_capability(&table.surface, BoundWriteOp::Insert)?;
+    if insert.columns.is_empty() {
+        return Err(super::error::unsupported(
+            "INSERT requires an explicit public column list",
+        ));
+    }
+    let mut target_columns = BTreeSet::new();
+    let mut columns = Vec::new();
+    for column in &insert.columns {
+        let column_name = normalize_identifier(column);
+        reject_duplicate_target_column(&mut target_columns, &column_name)?;
+        columns.push(require_writable_column(
+            &table,
+            &column_name,
+            BoundWriteOp::Insert,
+        )?);
+    }
+    let input = bind_insert_input(&columns, insert.source.as_deref(), &mut params)?;
+    let version_scope = bind_write_version_scope(
+        &table.surface.kind,
+        &input,
+        &BoundPredicate::True,
+        active_version_id,
+    )?;
+    Ok(BoundWrite {
+        target: bound_write_target(&table.surface.kind),
+        op: BoundWriteOp::Insert,
+        input,
+        predicate: BoundPredicate::True,
+        assignments: Vec::new(),
+        params: params.into_map(),
+        version_scope,
+    })
+}
+
+pub(super) fn bind_update_bound(
+    update: &Update,
+    catalog: &PublicCatalog,
+    active_version_id: &str,
+) -> Result<BoundWrite, LixError> {
+    let mut params = ParamBinder::default();
+    reject_unsupported_update_clauses(update)?;
+    let table = bind_table_with_joins(catalog, &update.table)?;
+    require_write_capability(&table.surface, BoundWriteOp::Update)?;
+    let mut target_columns = BTreeSet::new();
+    let mut assignments = Vec::new();
+    for assignment in &update.assignments {
+        let column = bind_assignment_target(&table, &assignment.target)?;
+        reject_duplicate_target_column(&mut target_columns, &column.name)?;
+        assignments.push(BoundAssignment {
+            column,
+            value: bind_expr(&table, &assignment.value, &mut params)?,
+        });
+    }
+    let predicate = bind_optional_predicate(&table, update.selection.as_ref(), &mut params)?;
+    let version_scope = bind_write_version_scope(
+        &table.surface.kind,
+        &BoundWriteInput::None,
+        &predicate,
+        active_version_id,
+    )?;
+    Ok(BoundWrite {
+        target: bound_write_target(&table.surface.kind),
+        op: BoundWriteOp::Update,
+        input: BoundWriteInput::None,
+        predicate,
+        assignments,
+        params: params.into_map(),
+        version_scope,
+    })
+}
+
+pub(super) fn bind_delete_bound(
+    delete: &Delete,
+    catalog: &PublicCatalog,
+    active_version_id: &str,
+) -> Result<BoundWrite, LixError> {
+    let mut params = ParamBinder::default();
+    reject_unsupported_delete_clauses(delete)?;
+    let table = bind_delete_target(catalog, &delete.from)?;
+    require_write_capability(&table.surface, BoundWriteOp::Delete)?;
+    let predicate = bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
+    let version_scope = bind_write_version_scope(
+        &table.surface.kind,
+        &BoundWriteInput::None,
+        &predicate,
+        active_version_id,
+    )?;
+    Ok(BoundWrite {
+        target: bound_write_target(&table.surface.kind),
+        op: BoundWriteOp::Delete,
+        input: BoundWriteInput::None,
+        predicate,
+        assignments: Vec::new(),
+        params: params.into_map(),
+        version_scope,
+    })
 }
 
 fn reject_unsupported_insert_clauses(insert: &Insert) -> Result<(), LixError> {

@@ -177,47 +177,12 @@ pub(crate) async fn register_write(
                 )
                 .await?;
             }
-            PublicSurfaceKind::Version => {
-                version::register_lix_version_write_surface(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::File => {
-                file::register_lix_file_active_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileByVersion => {
-                file::register_lix_file_by_version_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::Directory => {
-                directory::register_lix_directory_active_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryByVersion => {
-                directory::register_lix_directory_by_version_write_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::Change
+            PublicSurfaceKind::Version
+            | PublicSurfaceKind::File
+            | PublicSurfaceKind::FileByVersion
+            | PublicSurfaceKind::Directory
+            | PublicSurfaceKind::DirectoryByVersion
+            | PublicSurfaceKind::Change
             | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
