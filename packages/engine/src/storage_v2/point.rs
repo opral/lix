@@ -26,6 +26,17 @@ pub struct BorrowedIndexedPointValues<'a> {
     pub requested_to_unique: RequestedToUniqueRef<'a>,
 }
 
+#[derive(Debug, Default)]
+pub struct PointValueBuffer {
+    unique_values: Vec<Option<ProjectedValue>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct BufferedIndexedPointValues<'plan, 'buf> {
+    pub unique_values: &'buf [Option<ProjectedValue>],
+    pub requested_to_unique: RequestedToUniqueRef<'plan>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PointRequestPlan {
     pub unique_keys: Vec<Key>,
@@ -273,6 +284,40 @@ impl<'a> BorrowedIndexedPointValues<'a> {
     }
 }
 
+impl PointValueBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.unique_values.capacity()
+    }
+
+    pub fn clear(&mut self) {
+        self.unique_values.clear();
+    }
+
+    fn reset_for_len(&mut self, len: usize) {
+        self.unique_values.clear();
+        self.unique_values.resize_with(len, || None);
+    }
+}
+
+impl<'plan, 'buf> BufferedIndexedPointValues<'plan, 'buf> {
+    pub fn len(&self) -> usize {
+        self.requested_to_unique.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requested_to_unique.is_empty()
+    }
+
+    pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
+        let unique_index = self.requested_to_unique.unique_index(requested_index)?;
+        self.unique_values.get(unique_index)?.as_ref()
+    }
+}
+
 pub(crate) fn get_many_caller_order<R>(
     read: &R,
     space: SpaceId,
@@ -454,6 +499,45 @@ where
     ))
 }
 
+pub(crate) fn get_many_indexed_values_for_plan_into<'plan, 'buf, R>(
+    read: &R,
+    space: SpaceId,
+    plan: &'plan PointRequestPlan,
+    opts: GetOptions<'_>,
+    buffer: &'buf mut PointValueBuffer,
+) -> Result<BufferedIndexedPointValues<'plan, 'buf>, BackendError>
+where
+    R: BackendRead,
+{
+    Ok(get_many_indexed_values_for_plan_into_with_stats(read, space, plan, opts, buffer)?.value)
+}
+
+pub(crate) fn get_many_indexed_values_for_plan_into_with_stats<'plan, 'buf, R>(
+    read: &R,
+    space: SpaceId,
+    plan: &'plan PointRequestPlan,
+    opts: GetOptions<'_>,
+    buffer: &'buf mut PointValueBuffer,
+) -> Result<StorageReadResult<BufferedIndexedPointValues<'plan, 'buf>>, BackendError>
+where
+    R: BackendRead,
+{
+    collect_unique_values_into(read, space, &plan.unique_keys, opts, buffer)?;
+
+    Ok(StorageReadResult::new(
+        BufferedIndexedPointValues {
+            unique_values: buffer.unique_values.as_slice(),
+            requested_to_unique: plan.requested_to_unique.as_ref(),
+        },
+        StorageReadStats {
+            requested_keys: plan.requested_to_unique.len() as u64,
+            unique_backend_keys: plan.unique_keys.len() as u64,
+            backend_calls: 1,
+            prefix_lowered: 0,
+        },
+    ))
+}
+
 fn collect_unique_values<R>(
     read: &R,
     space: SpaceId,
@@ -491,6 +575,45 @@ where
         },
     )?;
     Ok(values)
+}
+
+fn collect_unique_values_into<R>(
+    read: &R,
+    space: SpaceId,
+    unique_keys: &[Key],
+    opts: GetOptions<'_>,
+    buffer: &mut PointValueBuffer,
+) -> Result<(), BackendError>
+where
+    R: BackendRead,
+{
+    struct Collector<'a> {
+        values: &'a mut [Option<ProjectedValue>],
+    }
+
+    impl PointVisitor for Collector<'_> {
+        fn visit(
+            &mut self,
+            index: usize,
+            _key: &Key,
+            value: Option<crate::backend_v2::ProjectedValueRef<'_>>,
+        ) -> Result<(), BackendError> {
+            if let Some(slot) = self.values.get_mut(index) {
+                *slot = value.map(|value| value.to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    buffer.reset_for_len(unique_keys.len());
+    read.visit_many(
+        space,
+        unique_keys,
+        opts,
+        &mut Collector {
+            values: buffer.unique_values.as_mut_slice(),
+        },
+    )
 }
 
 pub(crate) fn visit_unique_point_values_for_plan<R, V>(

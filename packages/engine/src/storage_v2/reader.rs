@@ -7,12 +7,13 @@ use crate::storage_v2::{
     get_many_borrowed_indexed_values_for_plan_with_stats, get_many_caller_order,
     get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
     get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
+    get_many_indexed_values_for_plan_into, get_many_indexed_values_for_plan_into_with_stats,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_into, scan_prefix_with_stats,
     scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix, visit_scan_range,
     visit_unique_point_values_for_plan, BorrowedIndexedPointValues, BorrowedScanPage,
-    IndexedPointValues, PointRequestPlan, PointSlot, StorageReadResult, StorageReadScope,
-    StorageReadStats, StorageScanBuffer, StorageSpace,
+    BufferedIndexedPointValues, IndexedPointValues, PointRequestPlan, PointSlot, PointValueBuffer,
+    StorageReadResult, StorageReadScope, StorageReadStats, StorageScanBuffer, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -85,6 +86,22 @@ pub trait StorageReader {
         plan: &'a PointRequestPlan,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError>;
+
+    fn get_many_indexed_values_for_plan_into<'plan, 'buf>(
+        &self,
+        space: StorageSpace,
+        plan: &'plan PointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<BufferedIndexedPointValues<'plan, 'buf>, BackendError>;
+
+    fn get_many_indexed_values_for_plan_into_with_stats<'plan, 'buf>(
+        &self,
+        space: StorageSpace,
+        plan: &'plan PointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<StorageReadResult<BufferedIndexedPointValues<'plan, 'buf>>, BackendError>;
 
     fn visit_unique_point_values_for_plan<V>(
         &self,
@@ -260,6 +277,32 @@ where
         )
     }
 
+    fn get_many_indexed_values_for_plan_into<'plan, 'buf>(
+        &self,
+        space: StorageSpace,
+        plan: &'plan PointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<BufferedIndexedPointValues<'plan, 'buf>, BackendError> {
+        get_many_indexed_values_for_plan_into(self.backend_read(), space.id, plan, opts, buffer)
+    }
+
+    fn get_many_indexed_values_for_plan_into_with_stats<'plan, 'buf>(
+        &self,
+        space: StorageSpace,
+        plan: &'plan PointRequestPlan,
+        opts: GetOptions<'_>,
+        buffer: &'buf mut PointValueBuffer,
+    ) -> Result<StorageReadResult<BufferedIndexedPointValues<'plan, 'buf>>, BackendError> {
+        get_many_indexed_values_for_plan_into_with_stats(
+            self.backend_read(),
+            space.id,
+            plan,
+            opts,
+            buffer,
+        )
+    }
+
     fn visit_unique_point_values_for_plan<V>(
         &self,
         space: StorageSpace,
@@ -369,7 +412,8 @@ mod tests {
         ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{
-        PointRequestPlan, StorageContext, StorageReader, StorageScanBuffer, StorageSpace,
+        PointRequestPlan, PointValueBuffer, StorageContext, StorageReader, StorageScanBuffer,
+        StorageSpace,
     };
 
     fn key(bytes: &'static str) -> Key {
@@ -668,6 +712,71 @@ mod tests {
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
         );
         assert_eq!(borrowed.value.value_at(1), None);
+    }
+
+    #[test]
+    fn planned_point_reads_can_reuse_value_buffer() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("a"), value("A"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        writes.stage_put(space(1), key("c"), value("C"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let first_plan = PointRequestPlan::new(&[key("b"), key("missing"), key("a"), key("b")]);
+        let second_plan = PointRequestPlan::new(&[key("c")]);
+        let mut buffer = PointValueBuffer::new();
+
+        let first = read
+            .get_many_indexed_values_for_plan_into_with_stats(
+                space(1),
+                &first_plan,
+                GetOptions::default(),
+                &mut buffer,
+            )
+            .expect("first buffered planned indexed read");
+
+        assert_eq!(first.stats.requested_keys, 4);
+        assert_eq!(first.stats.unique_backend_keys, 3);
+        assert_eq!(first.value.len(), 4);
+        assert_eq!(first.value.unique_values.len(), 3);
+        assert_eq!(
+            first.value.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
+        );
+        assert_eq!(first.value.value_at(1), None);
+        assert_eq!(
+            first.value.value_at(2),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"A")))
+        );
+        drop(first);
+
+        let capacity_after_first = buffer.capacity();
+        let second = read
+            .get_many_indexed_values_for_plan_into_with_stats(
+                space(1),
+                &second_plan,
+                GetOptions::default(),
+                &mut buffer,
+            )
+            .expect("second buffered planned indexed read");
+
+        assert_eq!(second.stats.requested_keys, 1);
+        assert_eq!(second.stats.unique_backend_keys, 1);
+        assert_eq!(second.value.unique_values.len(), 1);
+        assert_eq!(
+            second.value.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"C")))
+        );
+        drop(second);
+        assert!(
+            buffer.capacity() >= capacity_after_first,
+            "buffer allocation should be retained for reuse"
+        );
     }
 
     #[test]

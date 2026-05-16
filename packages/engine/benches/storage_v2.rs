@@ -21,8 +21,8 @@ use lix_engine::backend_v2::{
     SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
-    PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageScanBuffer,
-    StorageSpace, StorageWriteSet,
+    PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope, StorageReader,
+    StorageScanBuffer, StorageSpace, StorageWriteSet,
 };
 use redb_backend_v2::RedbBackend;
 use rocksdb_backend_v2::RocksDbBackend;
@@ -895,6 +895,35 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
             });
         });
 
+        let mut buffer = PointValueBuffer::new();
+        group.bench_with_input(BenchmarkId::new("buffered", case.name), case, |b, case| {
+            b.iter(|| {
+                let result = read
+                    .get_many_indexed_values_for_plan_into_with_stats(
+                        space(1),
+                        black_box(&plan),
+                        GetOptions::default(),
+                        &mut buffer,
+                    )
+                    .expect("buffered planned indexed point read");
+                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
+                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
+                assert_eq!(result.stats.backend_calls, 1);
+                assert_eq!(result.value.len(), case.requested_keys);
+                assert_eq!(result.value.unique_values.len(), case.unique_keys);
+                assert_eq!(
+                    result
+                        .value
+                        .unique_values
+                        .iter()
+                        .filter(|value| value.is_none())
+                        .count(),
+                    expected_unique_missing
+                );
+                black_box(result.value);
+            });
+        });
+
         group.bench_with_input(
             BenchmarkId::new("visit_unique", case.name),
             case,
@@ -1204,6 +1233,25 @@ where
                     GetOptions::default(),
                 )
                 .expect("backend matrix planned point read");
+            assert_eq!(result.stats.requested_keys, 1_000);
+            assert_eq!(result.stats.unique_backend_keys, 100);
+            assert_eq!(result.stats.backend_calls, 1);
+            assert_eq!(result.value.unique_values.len(), 100);
+            black_box(result.value);
+        });
+    });
+
+    let mut point_buffer = PointValueBuffer::new();
+    group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
+        b.iter(|| {
+            let result = point_scope
+                .get_many_indexed_values_for_plan_into_with_stats(
+                    space(1),
+                    black_box(&point_plan),
+                    GetOptions::default(),
+                    &mut point_buffer,
+                )
+                .expect("backend matrix buffered planned point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
             assert_eq!(result.stats.backend_calls, 1);
@@ -1793,6 +1841,26 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                     GetOptions::default(),
                 )
                 .expect("planned point read");
+            assert_eq!(result.stats.requested_keys, 1_000);
+            assert_eq!(result.stats.unique_backend_keys, 100);
+            assert_eq!(result.stats.backend_calls, 1);
+            assert_eq!(result.value.len(), 1_000);
+            assert_eq!(result.value.unique_values.len(), 100);
+            black_box(result.value);
+        });
+    });
+
+    let mut planned_get_many_buffer = PointValueBuffer::new();
+    group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
+        b.iter(|| {
+            let result = planned_get_many_read
+                .get_many_indexed_values_for_plan_into_with_stats(
+                    space(1),
+                    black_box(&planned_get_many_plan),
+                    GetOptions::default(),
+                    &mut planned_get_many_buffer,
+                )
+                .expect("buffered planned point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
             assert_eq!(result.stats.backend_calls, 1);

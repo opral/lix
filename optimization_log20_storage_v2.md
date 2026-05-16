@@ -4229,3 +4229,94 @@ Do not re-add required BackendRead::get_many yet. The direct profile says the
 borrowed visitor API is valuable. The missing piece is an efficient
 materializing adapter above it.
 ```
+
+## 2026-05-16: Reusable point value buffer
+
+Change under test:
+
+```text
+Added storage_v2::PointValueBuffer.
+Added get_many_indexed_values_for_plan_into(..., &mut PointValueBuffer).
+Added get_many_indexed_values_for_plan_into_with_stats(...).
+
+BackendRead remains visitor-first. This is a storage-owned materialization
+buffer, not a required backend get_many revival.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/(point_read_planned_lean_backend|in_memory_backend/(planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100|planned_visit_unique_m1000_u100)|backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100))'
+```
+
+Focused lean scorecard:
+
+| Case                 | fresh materialized | buffered materialized | visit_unique |
+| -------------------- | -----------------: | --------------------: | -----------: |
+| m100/u100            |            1.87 us |               1.78 us |     88.30 ns |
+| m1000/u1000          |           18.71 us |              18.04 us |    859.98 ns |
+| m1000/u100           |            1.87 us |               1.80 us |     87.96 ns |
+| m10000/u100          |            1.89 us |               1.79 us |     87.45 ns |
+| m10000/u10000        |          185.68 us |             181.94 us |      9.19 us |
+| m1000/u100 missing10 |            1.74 us |               1.64 us |     86.01 ns |
+| m1000/u100 missing90 |          408.25 ns |             349.51 ns |     71.00 ns |
+
+Focused real-backend scorecard:
+
+| Backend      | planned visit_unique | fresh materialized | buffered materialized |
+| ------------ | -------------------: | -----------------: | --------------------: |
+| in_memory    |              2.37 us |            4.86 us |               4.75 us |
+| sqlite_temp  |             34.17 us |           37.11 us |              36.69 us |
+| redb_temp    |              6.93 us |            9.15 us |               9.29 us |
+| rocksdb_temp |             40.42 us |           42.33 us |              42.53 us |
+
+In-memory-specific scorecard:
+
+| Case                                 |    Time |
+| ------------------------------------ | ------: |
+| planned_get_many_m1000_u100          | 4.98 us |
+| planned_get_many_buffered_m1000_u100 | 4.80 us |
+| planned_visit_unique_m1000_u100      | 2.35 us |
+
+Interpretation:
+
+```text
+The reusable buffer has the desired limited impact:
+
+  - It removes repeated Vec allocation/capacity churn.
+  - It gives small but consistent wins in lean materialized lanes.
+  - It does not and cannot remove owned value clones.
+  - On real backends the result is mostly noise to small win, because backend
+    lookup dominates more than allocation.
+
+The first-principles ranking remains:
+
+  1. visit_unique_point_values_for_plan
+     fastest; no owned point result and no storage materialization clones
+
+  2. get_many_indexed_values_for_plan_into
+     middle lane; reusable allocation but still owns/clones values
+
+  3. get_many_borrowed_indexed_values_for_plan / caller-order helpers
+     convenience lanes; allocate owned result per call
+```
+
+Conclusion:
+
+```text
+PointValueBuffer is worth keeping because it gives a clean storage-owned
+materialization lane with no backend API cost. But it does not solve the whole
+materialized point-read tax. The actual hot path should remain the visitor API,
+and domain stores should prefer decoding/accumulating inside
+visit_unique_point_values_for_plan whenever possible.
+
+The next possible cut is not another buffer tweak. It is either:
+  - move domain hot reads to the visitor lane, or
+  - add a non-required backend/storage collector extension only if profiling
+    still shows the PointVisitor shim itself dominating.
+```
