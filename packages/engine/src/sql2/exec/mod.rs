@@ -15,6 +15,11 @@ pub(crate) use write::{
     create_write_logical_plan, create_write_logical_plan_from_parsed, execute_write_logical_plan,
     WriteLogicalPlan as SqlWriteLogicalPlan,
 };
+#[cfg(test)]
+pub(crate) use write::{
+    execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
+    WriteExecutorMode, WriteExecutorPath,
+};
 
 #[allow(dead_code)]
 pub(crate) enum SqlLogicalPlan {

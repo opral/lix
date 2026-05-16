@@ -372,6 +372,42 @@ impl SessionContext {
         Ok(ExecuteResult::from_sql_query_result(result))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn execute_with_write_executor_mode(
+        &self,
+        sql: &str,
+        params: &[Value],
+        mode: sql2::WriteExecutorMode,
+    ) -> Result<ExecuteResult, LixError> {
+        self.ensure_open()?;
+        let statement = sql2::parse_statement(sql)?;
+        let write_bind = self.bind_write_statement(&statement).await?;
+        if write_bind.is_some() {
+            let _transaction_guard = self.reserve_session_transaction()?;
+            let sql_for_error = sql.to_string();
+            let params = params.to_vec();
+            return self
+                .with_write_transaction_reserved(|transaction| {
+                    Box::pin(async move {
+                        let tx_plan =
+                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
+                                .await?;
+                        let affected_rows = sql2::execute_write_logical_plan_with_mode(
+                            transaction,
+                            tx_plan,
+                            &params,
+                            mode,
+                        )
+                        .await?;
+                        Ok(ExecuteResult::from_rows_affected(affected_rows))
+                    })
+                })
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+        }
+        self.execute(sql, params).await
+    }
+
     async fn bind_write_statement(
         &self,
         statement: &datafusion::sql::parser::Statement,
@@ -457,6 +493,57 @@ impl SessionTransaction {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn execute_with_write_executor_mode(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        mode: sql2::WriteExecutorMode,
+    ) -> Result<ExecuteResult, LixError> {
+        let statement = sql2::parse_statement(sql)?;
+        let write_bind = self.bind_write_statement(&statement)?;
+        let transaction = self.transaction_mut()?;
+        match write_bind {
+            Some(_) => execute_transaction_write_with_mode(transaction, statement, params, mode)
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, sql)),
+            None => self.execute(sql, params).await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_with_write_executor_mode_and_trace(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        mode: sql2::WriteExecutorMode,
+    ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
+        let statement = sql2::parse_statement(sql)?;
+        let write_bind = self.bind_write_statement(&statement)?;
+        let transaction = self.transaction_mut()?;
+        match write_bind {
+            Some(_) => {
+                execute_transaction_write_with_mode_and_trace(transaction, statement, params, mode)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            None => self.execute(sql, params).await.map(|result| (result, None)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn scan_live_state_for_test(
+        &mut self,
+        request: &crate::live_state::LiveStateScanRequest,
+    ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+        let transaction = self.transaction_mut()?;
+        <crate::transaction::Transaction as sql2::SqlWriteExecutionContext>::scan_live_state(
+            transaction,
+            request,
+        )
+        .await
+    }
+
     fn bind_write_statement(
         &self,
         statement: &datafusion::sql::parser::Statement,
@@ -498,9 +585,44 @@ async fn execute_transaction_write(
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
 ) -> Result<ExecuteResult, LixError> {
+    execute_transaction_write_auto(transaction, statement, params).await
+}
+
+async fn execute_transaction_write_auto(
+    transaction: &mut crate::transaction::Transaction,
+    statement: datafusion::sql::parser::Statement,
+    params: &[Value],
+) -> Result<ExecuteResult, LixError> {
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
     Ok(ExecuteResult::from_rows_affected(affected_rows))
+}
+
+#[cfg(test)]
+async fn execute_transaction_write_with_mode(
+    transaction: &mut crate::transaction::Transaction,
+    statement: datafusion::sql::parser::Statement,
+    params: &[Value],
+    mode: sql2::WriteExecutorMode,
+) -> Result<ExecuteResult, LixError> {
+    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let affected_rows =
+        sql2::execute_write_logical_plan_with_mode(transaction, tx_plan, params, mode).await?;
+    Ok(ExecuteResult::from_rows_affected(affected_rows))
+}
+
+#[cfg(test)]
+async fn execute_transaction_write_with_mode_and_trace(
+    transaction: &mut crate::transaction::Transaction,
+    statement: datafusion::sql::parser::Statement,
+    params: &[Value],
+    mode: sql2::WriteExecutorMode,
+) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
+    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let (affected_rows, path) =
+        sql2::execute_write_logical_plan_with_mode_and_trace(transaction, tx_plan, params, mode)
+            .await?;
+    Ok((ExecuteResult::from_rows_affected(affected_rows), Some(path)))
 }
 
 fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {

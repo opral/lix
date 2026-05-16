@@ -406,7 +406,7 @@ Phase 8 progress:
 
 ## Phase 9: Differential Test Harness
 
-- [ ] Add a test-only fast-path disable knob:
+- [x] Add a test-only fast-path disable knob:
 
 ```rust
 pub(crate) enum WriteExecutorMode {
@@ -416,28 +416,42 @@ pub(crate) enum WriteExecutorMode {
 }
 ```
 
-- [ ] Implement `test_support/differential.rs`:
-  - [ ] initialize identical databases.
-  - [ ] execute with `ForceDataFusion`.
-  - [ ] execute with `Auto` or `ForceFast`.
-  - [ ] compare error code/message class.
-  - [ ] compare rows affected.
-  - [ ] compare final live-state rows.
-  - [ ] compare transaction staged reads before commit.
-- [ ] Add deterministic repro fixtures for all known bugs:
-  - [ ] unresolvable assignment target.
-  - [ ] base entity version override.
-  - [ ] base entity insert with hidden version column.
-  - [ ] unknown typed entity insert column.
-  - [ ] `_by_version` update/delete without version predicate.
-  - [ ] repeated contradictory predicates.
-  - [ ] duplicate insert target columns.
-  - [ ] duplicate update assignments.
-  - [ ] qualified target table names.
-  - [ ] staged overlay global-row reads.
-  - [ ] empty version filter base/staged dedupe.
-- [ ] Add generated cases for entity/base/_by_version/lix_state DML.
-- [ ] Store failing generated seeds as regression tests.
+- [x] Implement `test_support/differential.rs`:
+  - [x] initialize identical databases.
+  - [x] execute with `ForceDataFusion`.
+  - [x] execute with `Auto` or `ForceFast`.
+  - [x] compare error code/message class.
+  - [x] compare rows affected.
+  - [x] compare final live-state rows.
+  - [x] compare transaction staged reads before commit.
+- [x] Add deterministic repro fixtures for all known bugs:
+  - [x] unresolvable assignment target.
+  - [x] base entity version override.
+  - [x] base entity insert with hidden version column.
+  - [x] unknown typed entity insert column.
+  - [x] `_by_version` update/delete without version predicate.
+  - [x] repeated contradictory predicates.
+  - [x] duplicate insert target columns.
+  - [x] duplicate update assignments.
+  - [x] qualified target table names.
+  - [x] staged overlay global-row reads.
+  - [x] empty version filter base/staged dedupe.
+- [x] Add generated cases for entity/base/_by_version/lix_state DML.
+- [x] Store failing generated seeds as regression tests.
+
+Phase 9 progress:
+
+- Added `WriteExecutorMode::{Auto, ForceDataFusion, ForceFast}` behind `#[cfg(test)]` at the write executor boundary. Production write execution still uses `Auto`; tests can force the DataFusion reference writer or require a fast plan from the same bound `LogicalWritePlan`.
+- Added test-only session/transaction entrypoints that re-use normal parse/bind/plan code and only vary the physical write executor mode. The knob does not introduce a public API or a second semantic path.
+- Implemented `sql2::test_support::differential` over real initialized in-memory engines. Each case runs setup through the `ForceDataFusion` reference writer, executes one side with `ForceDataFusion` and the other with `SemanticParityMayFallback`/`Auto` or `FastRequiredParity`/`ForceFast`, then compares exact error code/message, rows affected, declared transaction-local staged probes before commit, and declared final visible probes after commit/rollback.
+- Added deterministic regression seeds for the known Bugbot classes: unresolvable assignments, hidden/base-version columns, unknown entity columns, missing `_by_version` version predicates, repeated contradictions, duplicate insert/update targets, qualified target names, staged global-row reads, and base/staged dedupe.
+- Added deterministic generated cases covering `lix_state`, `lix_state_by_version`, entity base, and entity `_by_version` DML shapes. Generated seeds are built from stable table/operation specs, not hand-written fixture rows; the seed names remain stable regression identifiers in `test_support/generators.rs`, and cases can carry bound parameters to cover placeholder/parameter-decoder regressions.
+- Differential cases now declare explicit observation probes, including active `lix_state` identities, staged/final `lix_state_by_version` rows for `global`/`version-a`/`version-b`, `lix_registered_schema`, and staged/final `lix_registered_schema_by_version` rows for `global`/`version-a`/`version-b`, so entity/base/_by_version failures are observed instead of relying on one hard-coded `lix_state` slice.
+- Fast-path coverage is explicit: `FastRequiredParity` cases force the fast writer, fail when optimization declines, and assert the test-only executor trace reports `WriteExecutorPath::Fast`. `SemanticParityMayFallback` cases intentionally cover semantic parity through the normal auto path even when the current optimizer falls back.
+- Known repro cases carry explicit expected success/error outcomes, so differential equality cannot hide a shared reference/candidate bug that accepts invalid SQL. The harness also supports transaction-local setup statements, with coverage for an update that must see a row staged earlier in the same transaction.
+- Versioned probes include the initialized session's real active version id plus real `version-a`/`version-b` refs and canonicalize only version-id columns to a stable active sentinel before comparing independent engines.
+- `FastRequiredParity` no-op cases, semantic zero-row successes, and expected-error cases compare against an independent baseline snapshot, so a shared empty-scope shortcut or partial mutation before error cannot be the only proof of correctness.
+- Transaction-local `_by_version` staged probes use the transaction live-state scan API directly, with requested active/global/explicit version ids preserved, so staged overlay reads are covered before commit as well as after commit.
 
 ## Phase 10: Deletion of Legacy Code
 
