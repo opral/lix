@@ -1000,13 +1000,14 @@ async fn prepare_sql_fast_path_fixture(rows: usize) -> Result<SqlFastPathFixture
     Engine::initialize(Box::new(backend.clone())).await?;
     let engine = Engine::new(Box::new(backend)).await?;
     let session = engine.open_workspace_session().await?;
-    register_sql_fast_path_schema(&session).await?;
     let batch_sql = sql_fast_path_batch_insert_sql(rows);
     let row_params = (0..rows)
         .map(|index| {
             [
-                Value::Text(format!("entity-{index:06}")),
-                Value::Text(format!("value-{index:06}")),
+                Value::Text(format!(r#"["entity-{index:06}"]"#)),
+                Value::Text(format!(
+                    r#"{{"key":"entity-{index:06}","value":"value-{index:06}"}}"#
+                )),
             ]
         })
         .collect();
@@ -1015,27 +1016,6 @@ async fn prepare_sql_fast_path_fixture(rows: usize) -> Result<SqlFastPathFixture
         batch_sql,
         row_params,
     })
-}
-
-async fn register_sql_fast_path_schema(session: &SessionContext) -> Result<(), LixError> {
-    let schema = r#"{
-        "x-lix-key": "bench_fast_path",
-        "x-lix-primary-key": ["/id"],
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "value": { "type": "string" }
-        },
-        "required": ["id", "value"],
-        "additionalProperties": false
-    }"#;
-    let sql = format!(
-        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json('{}'), false, false)",
-        schema.replace('\'', "''")
-    );
-    let affected = session.execute(&sql, &[]).await?.rows_affected();
-    assert_eq!(affected, 1);
-    Ok(())
 }
 
 async fn sql_fast_path_insert_batch(fixture: SqlFastPathFixture) -> Result<usize, LixError> {
@@ -1047,7 +1027,7 @@ async fn sql_fast_path_insert_batch(fixture: SqlFastPathFixture) -> Result<usize
 
 async fn sql_fast_path_insert_individual(fixture: SqlFastPathFixture) -> Result<usize, LixError> {
     let mut tx = fixture.session.begin_transaction().await?;
-    let sql = "INSERT INTO bench_fast_path (id, value) VALUES (?, ?)";
+    let sql = "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) VALUES (lix_json(?), 'lix_key_value', lix_json(?))";
     let mut affected = 0usize;
     for params in &fixture.row_params {
         affected += tx.execute(sql, params.as_slice()).await?.rows_affected() as usize;
@@ -1057,12 +1037,15 @@ async fn sql_fast_path_insert_individual(fixture: SqlFastPathFixture) -> Result<
 }
 
 fn sql_fast_path_batch_insert_sql(rows: usize) -> String {
-    let mut sql = String::from("INSERT INTO bench_fast_path (id, value) VALUES ");
+    let mut sql =
+        String::from("INSERT INTO lix_state (entity_id, schema_key, snapshot_content) VALUES ");
     for index in 0..rows {
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!("('entity-{index:06}', 'value-{index:06}')"));
+        sql.push_str(&format!(
+            "(lix_json('[\"entity-{index:06}\"]'), 'lix_key_value', lix_json('{{\"key\":\"entity-{index:06}\",\"value\":\"value-{index:06}\"}}'))"
+        ));
     }
     sql
 }
