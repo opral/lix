@@ -4693,7 +4693,58 @@ The improvement is largest where backend work is cheap:
 
 SQLite and RocksDB are dominated by backend engine work in these lanes:
   SQLite materialized reads are essentially flat/slightly better.
-  RocksDB point reads are noisy and one materialized lane regressed; this does
-  not invalidate the storage cut, but it says the next RocksDB-specific cut
-  should be based on direct backend profiling, not storage key encoding.
+RocksDB point reads are noisy and one materialized lane regressed; this does
+not invalidate the storage cut, but it says the next RocksDB-specific cut
+should be based on direct backend profiling, not storage key encoding.
+```
+
+## 2026-05-16 - SQLite requested-order point reads
+
+Change:
+
+```text
+SQLite visit_many now uses:
+  WITH requested(ord, key) AS (VALUES (?, ?), ...)
+  SELECT r.ord, e.value
+  FROM requested r
+  LEFT JOIN entries e ON e.key = r.key
+  ORDER BY r.ord
+
+This removes the Rust-side BTreeSet/BTreeMap reconstruction from the SQLite
+adapter and avoids SQLite row_number() overhead. Storage already sends planned
+unique physical keys, so the backend can return requested-order slots directly.
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/sqlite_temp/(planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100)'
+```
+
+Focused before/after smoke means:
+
+| Case | Before | After | Delta |
+| ---- | -----: | ----: | ----: |
+| sqlite planned visit m1000/u100 | 33.69 us | 22.71 us | 33% faster |
+| sqlite planned get m1000/u100 | 39.94 us | 23.11 us | 42% faster |
+| sqlite planned buffered m1000/u100 | 38.83 us | 21.26 us | 45% faster |
+
+Interpretation:
+
+```text
+The first attempted requested-order SQL shape used row_number() over VALUES and
+was flat/slower. Explicit ordinals in VALUES are the right SQLite shape here.
+
+The API/layout lesson holds:
+  once storage_v2 owns duplicate removal and physical plans, concrete backends
+  should consume the provided key order directly instead of rebuilding their own
+  sorted/request map.
+
+Next related cuts:
+  - check RocksDB direct materialized point cost separately; storage planned
+    lanes are now fast enough that backend engine behavior dominates.
+  - add physical scan/range plans if repeated scan workloads show bound
+    encoding in profiles.
 ```
