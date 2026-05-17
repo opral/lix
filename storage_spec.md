@@ -796,6 +796,15 @@ pub struct StorageReadStats {
     pub unique_backend_keys: u64,
     pub backend_calls: u64,
     pub prefix_lowered: u64,
+    pub range_scan_chunks: u64,
+    pub prefix_scan_chunks: u64,
+    pub scan_key_only_chunks: u64,
+    pub scan_full_value_chunks: u64,
+    pub scan_rows: u64,
+    pub scan_has_more: u64,
+    pub scan_resume_after: u64,
+    pub scan_limit_rows_total: u64,
+    pub scan_limit_rows_max: u64,
 }
 
 pub struct StorageReadResult<T> {
@@ -807,6 +816,13 @@ pub struct StorageReadResult<T> {
 The no-stats read helpers remain available. The `_with_stats` variants expose
 the same operation result together with shape counters for tests, benchmarks,
 and future workload accounting.
+
+Scan trace counters are intentionally shape-level, not profiler-level. They
+answer whether real workloads are doing range or prefix scans, whether they use
+`KeyOnly` or `FullValue`, how many rows each scan chunk emits, how often
+`has_more` is returned, whether `resume_after` is used, and which `limit_rows`
+values are common. These counters are the evidence gate for adding a
+cursorized scan extension.
 
 Implemented write-set stats:
 
@@ -865,7 +881,8 @@ caller_order_reconstruction:
 
 read_shape_stats:
   point reads report requested keys, unique backend keys, and backend calls;
-  range/prefix scans report backend calls and prefix lowering
+  range/prefix scans report backend calls, prefix lowering, projection shape,
+  emitted rows, has_more, resume_after use, and limit_rows totals/maxima
 
 prefix_lowering:
   empty prefix, normal prefix, and all-0xff prefix lower to correct ranges

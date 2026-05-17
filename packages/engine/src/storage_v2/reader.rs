@@ -15,7 +15,8 @@ use crate::storage_v2::{
     get_many_indexed_values_for_plan_into, get_many_indexed_values_for_plan_into_with_stats,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_into, scan_prefix_with_stats,
-    scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix, visit_scan_range,
+    scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix,
+    visit_scan_prefix_with_stats, visit_scan_range, visit_scan_range_with_stats,
     visit_unique_point_values_for_physical_plan, visit_unique_point_values_for_plan,
     BorrowedIndexedPointValues, BorrowedScanChunk, BufferedIndexedPointValues, IndexedPointValues,
     PhysicalPointRequestPlan, PointRequestPlan, PointSlot, PointValueBuffer, StorageReadResult,
@@ -213,6 +214,26 @@ pub trait StorageReader {
         opts: ScanOptions<'_>,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
+
+    fn visit_scan_range_with_stats<V>(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadResult<ScanResult>, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
+
+    fn visit_scan_prefix_with_stats<V>(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadResult<ScanResult>, BackendError>
     where
         V: ScanVisitor + ?Sized;
 
@@ -502,6 +523,32 @@ where
         V: ScanVisitor + ?Sized,
     {
         visit_scan_prefix(self.backend_read(), space.id, prefix, opts, visitor)
+    }
+
+    fn visit_scan_range_with_stats<V>(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadResult<ScanResult>, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        visit_scan_range_with_stats(self.backend_read(), space.id, range, opts, visitor)
+    }
+
+    fn visit_scan_prefix_with_stats<V>(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadResult<ScanResult>, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        visit_scan_prefix_with_stats(self.backend_read(), space.id, prefix, opts, visitor)
     }
 
     fn scan_range_with_stats(
@@ -1063,6 +1110,15 @@ mod tests {
         assert_eq!(result.stats.unique_backend_keys, 3);
         assert_eq!(result.stats.backend_calls, 1);
         assert_eq!(result.stats.prefix_lowered, 0);
+        assert_eq!(result.stats.range_scan_chunks, 0);
+        assert_eq!(result.stats.prefix_scan_chunks, 0);
+        assert_eq!(result.stats.scan_key_only_chunks, 0);
+        assert_eq!(result.stats.scan_full_value_chunks, 0);
+        assert_eq!(result.stats.scan_rows, 0);
+        assert_eq!(result.stats.scan_has_more, 0);
+        assert_eq!(result.stats.scan_resume_after, 0);
+        assert_eq!(result.stats.scan_limit_rows_total, 0);
+        assert_eq!(result.stats.scan_limit_rows_max, 0);
     }
 
     #[test]
@@ -1290,6 +1346,15 @@ mod tests {
         assert_eq!(result.stats.unique_backend_keys, 0);
         assert_eq!(result.stats.backend_calls, 1);
         assert_eq!(result.stats.prefix_lowered, 0);
+        assert_eq!(result.stats.range_scan_chunks, 1);
+        assert_eq!(result.stats.prefix_scan_chunks, 0);
+        assert_eq!(result.stats.scan_key_only_chunks, 0);
+        assert_eq!(result.stats.scan_full_value_chunks, 1);
+        assert_eq!(result.stats.scan_rows, 0);
+        assert_eq!(result.stats.scan_has_more, 0);
+        assert_eq!(result.stats.scan_resume_after, 0);
+        assert_eq!(result.stats.scan_limit_rows_total, 1024);
+        assert_eq!(result.stats.scan_limit_rows_max, 1024);
     }
 
     #[test]
@@ -1309,7 +1374,57 @@ mod tests {
         assert_eq!(result.stats.unique_backend_keys, 0);
         assert_eq!(result.stats.backend_calls, 1);
         assert_eq!(result.stats.prefix_lowered, 1);
+        assert_eq!(result.stats.range_scan_chunks, 0);
+        assert_eq!(result.stats.prefix_scan_chunks, 1);
+        assert_eq!(result.stats.scan_full_value_chunks, 1);
         assert_eq!(*read.backend_read().scan_range_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn visit_scan_reports_trace_stats() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("aa"), value("AA"));
+        writes.stage_put(space(1), key("ab"), value("AB"));
+        writes.stage_put(space(1), key("ac"), value("AC"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+
+        let result = read
+            .visit_scan_prefix_with_stats(
+                space(1),
+                Prefix {
+                    bytes: Bytes::from_static(b"a"),
+                },
+                ScanOptions {
+                    projection: CoreProjection::KeyOnly,
+                    limit_rows: 2,
+                    resume_after: Some(&key("aa")),
+                },
+                &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                    Ok(())
+                },
+            )
+            .expect("visit scan prefix with stats");
+
+        assert_eq!(result.value.emitted, 2);
+        assert!(!result.value.has_more);
+        assert_eq!(result.stats.backend_calls, 1);
+        assert_eq!(result.stats.prefix_lowered, 1);
+        assert_eq!(result.stats.range_scan_chunks, 0);
+        assert_eq!(result.stats.prefix_scan_chunks, 1);
+        assert_eq!(result.stats.scan_key_only_chunks, 1);
+        assert_eq!(result.stats.scan_full_value_chunks, 0);
+        assert_eq!(result.stats.scan_rows, 2);
+        assert_eq!(result.stats.scan_has_more, 0);
+        assert_eq!(result.stats.scan_resume_after, 1);
+        assert_eq!(result.stats.scan_limit_rows_total, 2);
+        assert_eq!(result.stats.scan_limit_rows_max, 2);
     }
 
     #[test]

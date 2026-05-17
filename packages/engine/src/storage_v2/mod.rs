@@ -41,7 +41,8 @@ pub use read_scope::StorageReadScope;
 pub use reader::StorageReader;
 pub(crate) use scan::{
     scan_prefix, scan_prefix_into, scan_prefix_with_stats, scan_range, scan_range_into,
-    scan_range_with_stats, visit_scan_prefix, visit_scan_range,
+    scan_range_with_stats, visit_scan_prefix, visit_scan_prefix_with_stats, visit_scan_range,
+    visit_scan_range_with_stats,
 };
 pub use scan::{BorrowedScanChunk, StorageScanBuffer};
 pub(crate) use spaces::decode_logical_key_ref;

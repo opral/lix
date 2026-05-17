@@ -4,6 +4,15 @@ pub struct StorageReadStats {
     pub unique_backend_keys: u64,
     pub backend_calls: u64,
     pub prefix_lowered: u64,
+    pub range_scan_chunks: u64,
+    pub prefix_scan_chunks: u64,
+    pub scan_key_only_chunks: u64,
+    pub scan_full_value_chunks: u64,
+    pub scan_rows: u64,
+    pub scan_has_more: u64,
+    pub scan_resume_after: u64,
+    pub scan_limit_rows_total: u64,
+    pub scan_limit_rows_max: u64,
 }
 
 impl StorageReadStats {
@@ -12,6 +21,15 @@ impl StorageReadStats {
         self.unique_backend_keys += other.unique_backend_keys;
         self.backend_calls += other.backend_calls;
         self.prefix_lowered += other.prefix_lowered;
+        self.range_scan_chunks += other.range_scan_chunks;
+        self.prefix_scan_chunks += other.prefix_scan_chunks;
+        self.scan_key_only_chunks += other.scan_key_only_chunks;
+        self.scan_full_value_chunks += other.scan_full_value_chunks;
+        self.scan_rows += other.scan_rows;
+        self.scan_has_more += other.scan_has_more;
+        self.scan_resume_after += other.scan_resume_after;
+        self.scan_limit_rows_total += other.scan_limit_rows_total;
+        self.scan_limit_rows_max = self.scan_limit_rows_max.max(other.scan_limit_rows_max);
     }
 }
 
