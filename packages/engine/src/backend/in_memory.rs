@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
-use crate::backend_v2::{
+use crate::backend::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
+use crate::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     BufferedRangeScan, CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
     PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
@@ -41,6 +41,7 @@ pub struct InMemoryBackendFixture {
     entries: Arc<Mutex<Arc<EntriesState>>>,
 }
 
+#[derive(Clone)]
 pub struct InMemoryRead {
     entries: Arc<EntriesState>,
 }
@@ -218,7 +219,7 @@ impl BackendRead for InMemoryRead {
                         ..opts
                     },
                     &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                        rows.push(crate::backend_v2::ReadEntry {
+                        rows.push(crate::backend::ReadEntry {
                             key: key.to_owned_key(),
                             value: value.to_owned(),
                         });
@@ -533,13 +534,13 @@ fn collect_range<'a>(
             puts,
             deletes,
         } => {
+            collect_range(base, lower, upper, rows);
             for delete in deletes.range((*lower, *upper)) {
                 rows.insert(delete, None);
             }
             for (key, value) in puts.range((*lower, *upper)) {
                 rows.insert(key, Some(value));
             }
-            collect_range(base, lower, upper, rows);
         }
     }
 }
@@ -639,12 +640,11 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend_v2::conformance::{run_backend_conformance, ConformanceStatus};
-    use crate::backend_v2::InMemoryBackendFactory;
+    use crate::backend::conformance::{run_backend_conformance, ConformanceStatus};
 
     #[test]
-    fn in_memory_backend_passes_backend_v2_conformance() {
-        let report = run_backend_conformance(&InMemoryBackendFactory);
+    fn in_memory_backend_passes_backend_conformance() {
+        let report = run_backend_conformance(&crate::backend::InMemoryBackendFactory);
 
         report.assert_no_failures();
 

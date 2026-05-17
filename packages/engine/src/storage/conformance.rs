@@ -2,11 +2,11 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{
+use crate::backend::{
     CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, Prefix, ProjectedValue,
     ProjectedValueRef, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
 };
-use crate::storage_v2::{
+use crate::storage::{
     PointReadPlan, ScanPlan, StorageContext, StorageReadStatsCollector, StorageSpace,
     StorageWriteSetError,
 };
@@ -48,7 +48,7 @@ impl StorageConformanceReport {
 
         assert!(
             failures.is_empty(),
-            "storage_v2 conformance failures: {failures:?}"
+            "storage conformance failures: {failures:?}"
         );
     }
 }
@@ -239,7 +239,7 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
             },
             &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                 if !matches!(value, ProjectedValueRef::KeyOnly) {
-                    return Err(crate::backend_v2::BackendError::Corruption(
+                    return Err(crate::backend::BackendError::Corruption(
                         "expected key-only scan value".to_string(),
                     ));
                 }
@@ -373,7 +373,7 @@ mod tests {
     use super::{run_storage_conformance, StorageConformanceStatus};
 
     #[test]
-    fn in_memory_backend_passes_storage_v2_conformance() {
+    fn in_memory_backend_passes_storage_conformance() {
         let report = run_storage_conformance();
 
         report.assert_no_failures();

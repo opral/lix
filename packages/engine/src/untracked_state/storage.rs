@@ -1,5 +1,10 @@
-use crate::storage::KvScanRange;
-use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
+use bytes::Bytes;
+
+use crate::storage::{
+    PointReadPlan, ScanPlan, StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix,
+    StorageProjectedValue, StorageRead, StorageScanOptions, StorageSpace, StorageSpaceId,
+    StorageValue, StorageWriteSet,
+};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedMaterializationProjection, UntrackedStateIdentity,
     UntrackedStateIdentityRef, UntrackedStateRow, UntrackedStateRowRef, UntrackedStateRowRequest,
@@ -8,9 +13,11 @@ use crate::untracked_state::{
 use crate::{LixError, NullableKeyFilter};
 
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
+const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0001_0001), UNTRACKED_STATE_ROW_NAMESPACE);
 
 pub(crate) async fn scan_rows(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
     let mut rows = scan_all_canonical_rows(store).await?;
@@ -27,24 +34,25 @@ pub(crate) async fn scan_rows(
 }
 
 pub(crate) async fn load_row(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     request: &UntrackedStateRowRequest,
 ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
     let Some(identity) = identity_from_request(request) else {
         return Ok(None);
     };
-    let bytes = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                keys: vec![encode_untracked_state_row_key(&identity)],
-            }],
-        })
-        .await?
-        .groups
+    let result = PointReadPlan::new(
+        UNTRACKED_STATE_ROW_SPACE,
+        &[StorageKey(Bytes::from(encode_untracked_state_row_key(
+            &identity,
+        )))],
+    )
+    .materialize(store, StorageGetOptions::default())?;
+    let bytes = result
+        .value
         .into_iter()
         .next()
-        .and_then(|group| group.single_value_owned());
+        .flatten()
+        .and_then(full_value);
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -54,7 +62,7 @@ pub(crate) async fn load_row(
 }
 
 pub(super) async fn existing_identities<'a>(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 ) -> Result<Vec<UntrackedStateIdentity>, LixError> {
     let mut candidates = identities
@@ -77,29 +85,27 @@ pub(super) async fn existing_identities<'a>(
     }
     let keys = candidates
         .iter()
-        .map(|(key, _)| key.clone())
+        .map(|(key, _)| StorageKey(Bytes::from(key.clone())))
         .collect::<Vec<_>>();
 
-    let result = store
-        .exists_many(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                keys,
-            }],
-        })
-        .await?;
-    let group = result.groups.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "untracked identity existence probe returned no result group",
-        )
-    })?;
-    if group.exists.len() != candidates.len() {
+    let result = PointReadPlan::from_unique_keys(UNTRACKED_STATE_ROW_SPACE, keys).materialize(
+        store,
+        StorageGetOptions {
+            projection: StorageCoreProjection::KeyOnly,
+            ..StorageGetOptions::default()
+        },
+    )?;
+    let exists = result
+        .value
+        .into_iter()
+        .map(|value| value.is_some())
+        .collect::<Vec<_>>();
+    if exists.len() != candidates.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "untracked identity existence probe returned {} results for {} requested keys",
-                group.exists.len(),
+                exists.len(),
                 candidates.len()
             ),
         ));
@@ -107,7 +113,7 @@ pub(super) async fn existing_identities<'a>(
 
     Ok(candidates
         .into_iter()
-        .zip(group.exists)
+        .zip(exists)
         .filter_map(|((_, identity), exists)| exists.then_some(identity))
         .collect())
 }
@@ -119,14 +125,16 @@ where
     for row in rows {
         if row.snapshot_content.is_none() {
             writes.delete(
-                UNTRACKED_STATE_ROW_NAMESPACE,
-                encode_untracked_state_row_key_ref(row.into()),
+                UNTRACKED_STATE_ROW_SPACE,
+                StorageKey(Bytes::from(encode_untracked_state_row_key_ref(row.into()))),
             );
         } else {
             writes.put(
-                UNTRACKED_STATE_ROW_NAMESPACE,
-                encode_untracked_state_row_key_ref(row.into()),
-                crate::untracked_state::codec::encode_row_ref(row)?,
+                UNTRACKED_STATE_ROW_SPACE,
+                StorageKey(Bytes::from(encode_untracked_state_row_key_ref(row.into()))),
+                StorageValue {
+                    bytes: Bytes::from(crate::untracked_state::codec::encode_row_ref(row)?),
+                },
             );
         }
     }
@@ -139,27 +147,35 @@ where
 {
     for identity in identities {
         writes.delete(
-            UNTRACKED_STATE_ROW_NAMESPACE,
-            encode_untracked_state_row_key_ref(identity),
+            UNTRACKED_STATE_ROW_SPACE,
+            StorageKey(Bytes::from(encode_untracked_state_row_key_ref(identity))),
         );
     }
 }
 
 async fn scan_all_canonical_rows(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let page = store
-        .scan_values(KvScanRequest {
-            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-            range: KvScanRange::prefix(Vec::new()),
-            after: None,
-            limit: usize::MAX,
-        })
-        .await?;
-    page.values
-        .iter()
-        .map(crate::untracked_state::codec::decode_row)
+    let page = ScanPlan::prefix(
+        UNTRACKED_STATE_ROW_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    )
+    .collect(store, StorageScanOptions::default())?;
+    page.value
+        .entries
+        .into_iter()
+        .filter_map(|entry| full_value(entry.value))
+        .map(|bytes| crate::untracked_state::codec::decode_row(bytes.as_ref()))
         .collect()
+}
+
+fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
+    match value {
+        StorageProjectedValue::FullValue(bytes) => Some(bytes),
+        StorageProjectedValue::KeyOnly => None,
+    }
 }
 
 fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest) -> bool {
@@ -227,19 +243,17 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::untracked_state::UntrackedStateContext;
 
     async fn write_materialized_rows_to_store(
         context: &UntrackedStateContext,
-        store: &mut (impl StorageWriteTransaction + ?Sized),
+        storage: &StorageContext,
         rows: &[MaterializedUntrackedStateRow],
     ) {
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         let canonical_rows = rows
             .iter()
             .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
@@ -249,30 +263,24 @@ mod tests {
             .writer(&mut writes)
             .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
             .expect("rows should write");
-        writes.apply(store).await.expect("rows should apply");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("rows should commit");
     }
 
     #[tokio::test]
     async fn write_and_load_roundtrips() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        write_materialized_rows_to_store(
-            &context,
-            transaction.as_mut(),
-            std::slice::from_ref(&row),
-        )
-        .await;
-        transaction.commit().await.expect("commit should succeed");
+        write_materialized_rows_to_store(&context, &storage, std::slice::from_ref(&row)).await;
 
         let loaded = {
-            let mut reader = context.reader(storage.clone());
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let mut reader = context.reader(read);
             reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
@@ -288,16 +296,11 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_by_schema_and_version() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let context = UntrackedStateContext::new();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_materialized_rows_to_store(
             &context,
-            transaction.as_mut(),
+            &storage,
             &[
                 untracked_row("global", "lix_key_value", "global-ui"),
                 untracked_row("version-a", "lix_key_value", "version-ui"),
@@ -305,10 +308,12 @@ mod tests {
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should succeed");
 
         let rows = {
-            let mut reader = context.reader(storage.clone());
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let mut reader = context.reader(read);
             reader
                 .scan_rows(&UntrackedStateScanRequest {
                     filter: crate::untracked_state::UntrackedStateFilter {
@@ -331,8 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_row() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
         let identity = UntrackedStateIdentity {
@@ -341,27 +345,20 @@ mod tests {
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
         };
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let canonical_row =
-            crate::test_support::untracked_state_row_from_materialized(&mut writes, &row)
-                .expect("row should canonicalize");
+        write_materialized_rows_to_store(&context, &storage, std::slice::from_ref(&row)).await;
+
+        let mut writes = storage.new_write_set();
         let mut writer = context.writer(&mut writes);
-        writer
-            .stage_rows(std::iter::once(canonical_row.as_ref()))
-            .expect("write should succeed");
         writer.stage_delete_rows(std::iter::once(identity.as_ref()));
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("writes should apply");
-        transaction.commit().await.expect("commit should succeed");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
         let loaded = {
-            let mut reader = context.reader(storage.clone());
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let mut reader = context.reader(read);
             reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),

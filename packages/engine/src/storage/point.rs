@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use ahash::RandomState;
 
-use crate::backend_v2::{
+use crate::backend::{
     BackendError, BackendRead, GetOptions, Key, PointVisitor, ProjectedValue, ProjectedValueRef,
 };
-use crate::storage_v2::{StorageRead, StorageReadResult, StorageReadStats, StorageSpace};
+use crate::storage::{StorageRead, StorageReadResult, StorageReadStats, StorageSpace};
 
 type FastHashBuilder = RandomState;
 

@@ -36,14 +36,18 @@ use super::history_route::{
 use super::result_metadata::json_field;
 use super::SqlCommitStoreQuerySource;
 use crate::commit_store::MaterializedChange;
+use crate::storage::StorageRead;
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-pub(crate) async fn register_lix_directory_history_provider(
+pub(crate) async fn register_lix_directory_history_provider<S>(
     session: &datafusion::prelude::SessionContext,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlCommitStoreQuerySource,
-) -> Result<(), LixError> {
+    query_source: SqlCommitStoreQuerySource<S>,
+) -> Result<(), LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     session
         .register_table(
             "lix_directory_history",
@@ -56,22 +60,22 @@ pub(crate) async fn register_lix_directory_history_provider(
     Ok(())
 }
 
-struct LixDirectoryHistoryProvider {
+struct LixDirectoryHistoryProvider<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
 }
 
-impl std::fmt::Debug for LixDirectoryHistoryProvider {
+impl<S> std::fmt::Debug for LixDirectoryHistoryProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixDirectoryHistoryProvider").finish()
     }
 }
 
-impl LixDirectoryHistoryProvider {
+impl<S> LixDirectoryHistoryProvider<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
     ) -> Self {
         Self {
             schema: lix_directory_history_schema(),
@@ -82,7 +86,10 @@ impl LixDirectoryHistoryProvider {
 }
 
 #[async_trait]
-impl TableProvider for LixDirectoryHistoryProvider {
+impl<S> TableProvider for LixDirectoryHistoryProvider<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -128,16 +135,16 @@ impl TableProvider for LixDirectoryHistoryProvider {
     }
 }
 
-struct LixDirectoryHistoryScanExec {
+struct LixDirectoryHistoryScanExec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     schema: SchemaRef,
     route: HistoryRoute,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
 
-impl std::fmt::Debug for LixDirectoryHistoryScanExec {
+impl<S> std::fmt::Debug for LixDirectoryHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixDirectoryHistoryScanExec")
             .field("route", &self.route)
@@ -146,10 +153,10 @@ impl std::fmt::Debug for LixDirectoryHistoryScanExec {
     }
 }
 
-impl LixDirectoryHistoryScanExec {
+impl<S> LixDirectoryHistoryScanExec<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
         schema: SchemaRef,
         route: HistoryRoute,
         limit: Option<usize>,
@@ -171,7 +178,7 @@ impl LixDirectoryHistoryScanExec {
     }
 }
 
-impl DisplayAs for LixDirectoryHistoryScanExec {
+impl<S> DisplayAs for LixDirectoryHistoryScanExec<S> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
@@ -184,7 +191,10 @@ impl DisplayAs for LixDirectoryHistoryScanExec {
     }
 }
 
-impl ExecutionPlan for LixDirectoryHistoryScanExec {
+impl<S> ExecutionPlan for LixDirectoryHistoryScanExec<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn name(&self) -> &str {
         "LixDirectoryHistoryScanExec"
     }
@@ -287,11 +297,14 @@ struct DirectoryDescriptorSnapshot {
     hidden: Option<bool>,
 }
 
-async fn load_directory_history_rows(
+async fn load_directory_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     route: &HistoryRoute,
-) -> Result<Vec<DirectoryHistoryOutputRow>, LixError> {
+) -> Result<Vec<DirectoryHistoryOutputRow>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     let event_route = route.traversal_only();
     let event_entries = load_history_entries(
         HistoryViewDescriptor {

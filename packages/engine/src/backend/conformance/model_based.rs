@@ -3,12 +3,12 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::backend_v2::conformance::{
+use crate::backend::conformance::{
     fixtures::{full_put, key, put_batch},
     model::ReferenceModel,
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
-use crate::backend_v2::{
+use crate::backend::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendRead,
     BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadEntry,
     ReadOptions, ScanChunk, ScanOptions, WriteOptions,
@@ -166,7 +166,7 @@ fn scan_range<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanChunk, crate::backend_v2::BackendError>
+) -> Result<ScanChunk, crate::backend::BackendError>
 where
     R: BackendRead,
 {
@@ -212,14 +212,14 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
     lower_matches && upper_matches
 }
 
-fn chunk_entries(entries: &[crate::backend_v2::ReadEntry]) -> Vec<(Key, Bytes)> {
+fn chunk_entries(entries: &[crate::backend::ReadEntry]) -> Vec<(Key, Bytes)> {
     entries
         .iter()
         .map(|entry| (entry.key.clone(), projected_value_bytes(&entry.value)))
         .collect()
 }
 
-fn entries_to_map(entries: &[crate::backend_v2::ReadEntry]) -> BTreeMap<Key, Bytes> {
+fn entries_to_map(entries: &[crate::backend::ReadEntry]) -> BTreeMap<Key, Bytes> {
     chunk_entries(entries).into_iter().collect()
 }
 

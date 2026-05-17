@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::binary_cas::{
     BlobBytesBatch, BlobExistsBatch, BlobHash, BlobMetadataBatch, BlobWrite, BlobWriteReceipt,
 };
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::LixError;
 use std::collections::HashSet;
 
@@ -30,7 +30,7 @@ impl BinaryCasContext {
     /// when reads must participate in transaction-local visibility.
     pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead,
     {
         BinaryCasStoreReader { store }
     }
@@ -43,7 +43,7 @@ impl BinaryCasContext {
 #[async_trait]
 impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
-    S: StorageReader + Clone + Send + Sync,
+    S: StorageRead + Clone + Send + Sync,
 {
     async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         let mut reader = BinaryCasStoreReader {
@@ -60,14 +60,14 @@ pub(crate) struct BinaryCasStoreReader<S> {
 
 impl<S> BinaryCasStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     #[allow(dead_code)]
     pub(crate) async fn exists_many(
         &mut self,
         hashes: &[BlobHash],
     ) -> Result<BlobExistsBatch, LixError> {
-        crate::binary_cas::kv::exists_many(&mut self.store, hashes).await
+        crate::binary_cas::kv::exists_many(&self.store, hashes).await
     }
 
     #[allow(dead_code)]
@@ -75,19 +75,19 @@ where
         &mut self,
         hashes: &[BlobHash],
     ) -> Result<BlobMetadataBatch, LixError> {
-        crate::binary_cas::kv::load_metadata_many(&mut self.store, hashes).await
+        crate::binary_cas::kv::load_metadata_many(&self.store, hashes).await
     }
 
     pub(crate) async fn load_bytes_many(
         &mut self,
         hashes: &[BlobHash],
     ) -> Result<BlobBytesBatch, LixError> {
-        crate::binary_cas::kv::load_bytes_many(&mut self.store, hashes).await
+        crate::binary_cas::kv::load_bytes_many(&self.store, hashes).await
     }
 
     #[cfg(feature = "storage-benches")]
     pub(crate) async fn count_blob_manifests(&mut self) -> Result<usize, LixError> {
-        crate::binary_cas::kv::count_manifests(&mut self.store).await
+        crate::binary_cas::kv::count_manifests(&self.store).await
     }
 }
 

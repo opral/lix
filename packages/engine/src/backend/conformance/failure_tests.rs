@@ -7,7 +7,7 @@ use bytes::Bytes;
 use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
-use crate::backend_v2::{
+use crate::backend::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
@@ -53,6 +53,7 @@ struct BrokenBackend {
     commit_count: Arc<Mutex<u64>>,
 }
 
+#[derive(Clone)]
 struct BrokenRead {
     mode: BrokenMode,
     parent: Arc<Mutex<BrokenMap>>,

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::backend_v2::{
+use crate::backend::{
     Backend, BackendError, BackendWrite, CommitResult, Key, PutBatch, PutEntry, SpaceId,
     StoredValue, WriteOptions,
 };
-use crate::storage_v2::{StorageSpace, StorageWriteSetStats};
+use crate::storage::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
 
 type FastHashBuilder = RandomState;
@@ -317,13 +317,13 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    use crate::backend_v2::{
+    use crate::backend::{
         Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
         BufferedRangeScan, CommitResult, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor,
         PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
         WriteConcurrency, WriteOptions, WriteStats,
     };
-    use crate::storage_v2::{StorageSpace, StorageWriteSet, StorageWriteSetError};
+    use crate::storage::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -697,7 +697,7 @@ mod tests {
         fail_point: Cell<Option<FailPoint>>,
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct CountingRead;
 
     struct CountingWrite {

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit_graph::{CommitGraphCommit, CommitGraphStoreReader, ReachableCommitGraphCommit};
-use crate::storage::StorageReader;
+use crate::storage::StorageRead;
 use crate::LixError;
 
 /// Walks parent links from `head_commit_id` and returns reachable commits
@@ -15,7 +15,7 @@ pub(crate) async fn walk_reachable_commits<S>(
     head_commit_id: &str,
 ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     let mut loader = CommitTraversalLoader::new(reader);
     let mut visiting = BTreeSet::new();
@@ -67,7 +67,7 @@ pub(crate) async fn best_common_ancestors<S>(
     right_commit_id: &str,
 ) -> Result<Vec<CommitGraphCommit>, LixError>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     let left_reachable = walk_reachable_commits(reader, left_commit_id).await?;
     let right_reachable = walk_reachable_commits(reader, right_commit_id).await?;
@@ -104,7 +104,7 @@ async fn has_descendant_in_set<S>(
     candidate_descendant_ids: &BTreeSet<String>,
 ) -> Result<bool, LixError>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     for candidate_descendant_id in candidate_descendant_ids {
         if candidate_descendant_id == commit_id {
@@ -123,7 +123,7 @@ where
 
 struct CommitTraversalLoader<'a, S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     reader: &'a mut CommitGraphStoreReader<S>,
     loaded: BTreeMap<String, CommitGraphCommit>,
@@ -131,7 +131,7 @@ where
 
 impl<'a, S> CommitTraversalLoader<'a, S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     fn new(reader: &'a mut CommitGraphStoreReader<S>) -> Self {
         Self {
@@ -218,22 +218,19 @@ struct TraversalFrame {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use serde_json::json;
 
-    use crate::backend::testing::UnitTestBackend;
     use crate::commit_graph::CommitGraphContext;
     use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
-    use crate::storage::{StorageContext, StorageWriteSet};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::LixError;
 
     #[tokio::test]
     async fn reachable_commits_returns_commits_nearest_first() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change(
@@ -248,7 +245,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let commits = reader
             .reachable_commits("commit-head")
             .await
@@ -265,10 +265,9 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_errors_on_missing_parent_commit() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[commit_change(
                 "commit-head-change",
                 "commit-head",
@@ -279,7 +278,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let error = reader
             .reachable_commits("commit-head")
             .await
@@ -290,10 +292,9 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_errors_on_cycle() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &["commit-b"]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -302,7 +303,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let error = reader
             .reachable_commits("commit-a")
             .await
@@ -313,10 +317,9 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_dedupes_shared_ancestors_in_diamond() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -332,7 +335,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let commits = reader
             .reachable_commits("commit-head")
             .await
@@ -354,10 +360,9 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_keeps_nearest_depth_for_multiple_paths() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change(
@@ -377,7 +382,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let commits = reader
             .reachable_commits("commit-head")
             .await
@@ -394,10 +402,9 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_orders_same_depth_commits_by_id() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-z-change", "commit-z", &[], &[]),
                 commit_change("commit-a-change", "commit-a", &[], &[]),
@@ -412,7 +419,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let commits = reader
             .reachable_commits("commit-head")
             .await
@@ -429,10 +439,12 @@ mod tests {
 
     #[tokio::test]
     async fn reachable_commits_errors_on_missing_head_commit() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
 
         let error = reader
             .reachable_commits("missing-head")
@@ -444,10 +456,9 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_nearest_common_commit_in_simple_graph() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &[]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -458,7 +469,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let ancestors = reader
             .best_common_ancestors("commit-c", "commit-d")
             .await
@@ -475,10 +489,9 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_shared_fork_in_diamond_graph() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -500,7 +513,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let ancestors = reader
             .best_common_ancestors("commit-left-head", "commit-right-head")
             .await
@@ -517,10 +533,9 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_parent_when_one_side_is_ancestor() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &[]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -530,7 +545,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let ancestors = reader
             .best_common_ancestors("commit-b", "commit-c")
             .await
@@ -547,10 +565,9 @@ mod tests {
 
     #[tokio::test]
     async fn best_common_ancestors_returns_multiple_bases_for_criss_cross_graph() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -572,7 +589,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let ancestors = reader
             .best_common_ancestors("commit-head-left", "commit-head-right")
             .await
@@ -589,10 +609,9 @@ mod tests {
 
     #[tokio::test]
     async fn merge_base_returns_single_best_common_ancestor() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &[]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -603,7 +622,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let base = reader
             .merge_base("commit-c", "commit-d")
             .await
@@ -614,10 +636,9 @@ mod tests {
 
     #[tokio::test]
     async fn merge_base_errors_when_histories_have_no_common_commit() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-left-change", "commit-left", &[], &[]),
                 commit_change("commit-right-change", "commit-right", &[], &[]),
@@ -626,7 +647,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let error = reader
             .merge_base("commit-left", "commit-right")
             .await
@@ -637,10 +661,9 @@ mod tests {
 
     #[tokio::test]
     async fn merge_base_errors_when_best_common_ancestor_is_ambiguous() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -662,7 +685,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let error = reader
             .merge_base("commit-head-left", "commit-head-right")
             .await
@@ -698,12 +724,11 @@ mod tests {
         parent_commit_ids: Vec<String>,
     }
 
-    async fn append_changes(storage: StorageContext, changes: &[TestCommitChange]) {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+    async fn append_changes(storage: &StorageContext, changes: &[TestCommitChange]) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         let commit_store = CommitStoreContext::new();
         for change in changes {
             let commit_id = change
@@ -721,16 +746,14 @@ mod tests {
                 created_at: &change.change.created_at,
             };
             commit_store
-                .writer(tx.as_mut(), &mut writes)
+                .writer(&read, &mut writes)
                 .stage_commit_draft(commit, Vec::new(), Vec::new())
                 .await
                 .expect("commit-store fixture should append");
         }
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("writes should apply");
-        tx.commit().await.expect("commit should succeed");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("commit should succeed");
     }
 
     fn commit_change(

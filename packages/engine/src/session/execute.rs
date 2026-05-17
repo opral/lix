@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::functions::FunctionContext;
 use crate::sql2;
-use crate::storage::{StorageReadScope, StorageWriteSet};
+use crate::storage::StorageBackend;
+use crate::storage::StorageWriteSet;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
@@ -287,7 +288,12 @@ impl RowRef<'_> {
     }
 }
 
-impl SessionContext {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
@@ -325,14 +331,16 @@ impl SessionContext {
             ));
         }
 
-        let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
+        let read_scope = self
+            .storage
+            .begin_read(crate::storage::StorageReadOptions::default())?;
         let read_result = async {
-            let mut read_store = read_scope.store();
+            let read_store = read_scope.store();
             let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                 Arc::new(self.live_state.reader(read_store.clone()));
             let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
             let functions = runtime_functions.provider();
-            let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
+            let active_version_id = self.active_version_id_from_reader(&read_store).await?;
             let visible_schemas = self
                 .catalog_context
                 .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_version_id)
@@ -355,12 +363,8 @@ impl SessionContext {
             Ok::<_, LixError>((runtime_functions, result))
         };
         let (runtime_functions, result) = match read_result.await {
-            Ok(result) => {
-                read_scope.rollback().await?;
-                result
-            }
+            Ok(result) => result,
             Err(error) => {
-                let _ = read_scope.rollback().await;
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
@@ -386,13 +390,19 @@ impl SessionContext {
         if writes.is_empty() {
             return Ok(());
         }
-        let mut transaction = self.storage.begin_write_transaction().await?;
-        writes.apply(&mut transaction.as_mut()).await?;
-        transaction.commit().await
+        self.storage
+            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
 
-impl SessionTransaction {
+impl<B> SessionTransaction<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Executes one SQL statement inside this transaction.
     ///
     /// Write statements are staged until `commit()`. Read statements use the
@@ -426,11 +436,16 @@ impl SessionTransaction {
     }
 }
 
-async fn execute_transaction_write(
-    transaction: &mut crate::transaction::Transaction,
+async fn execute_transaction_write<B>(
+    transaction: &mut crate::transaction::Transaction<B>,
     sql: &str,
     params: &[Value],
-) -> Result<ExecuteResult, LixError> {
+) -> Result<ExecuteResult, LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     let tx_plan = sql2::create_write_logical_plan(transaction, sql).await?;
     let result = sql2::execute_logical_plan(tx_plan, params).await?;
     let affected_rows = affected_rows_from_query_result(result)?;

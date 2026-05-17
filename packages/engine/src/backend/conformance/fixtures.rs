@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::backend_v2::{Key, PutBatch, PutEntry, SpaceId, StoredValue};
+use crate::backend::{Key, PutBatch, PutEntry, SpaceId, StoredValue};
 
 pub fn space(id: u32) -> SpaceId {
     SpaceId(id)

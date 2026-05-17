@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
-use crate::backend_v2::Key;
+use crate::backend::Key;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceModel {

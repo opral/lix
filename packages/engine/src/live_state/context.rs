@@ -7,7 +7,7 @@ use crate::live_state::visibility;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::storage::StorageReader;
+use crate::storage::StorageRead;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRowRequest, TrackedStateScanRequest,
@@ -50,7 +50,7 @@ impl LiveStateContext {
     /// Creates a visible live-state reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> LiveStateStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead + Send + Sync,
     {
         LiveStateStoreReader {
             store: Mutex::new(store),
@@ -71,28 +71,27 @@ pub(crate) struct LiveStateStoreReader<S> {
 
 impl<S> LiveStateStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let mut store = self.store.lock().await;
-        let scope = scan_scope(&mut *store, &self.untracked_state, request).await?;
+        let store = self.store.lock().await;
+        let scope = scan_scope(&*store, &self.untracked_state, request).await?;
         let derived_rows =
-            scan_commit_derived_rows(&mut *store, &self.commit_graph, request, &scope).await?;
+            scan_commit_derived_rows(&*store, &self.commit_graph, request, &scope).await?;
         let mut tracked_rows = Vec::new();
         if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
             for version_id in &scope.storage_version_ids {
                 let Some(commit_id) =
-                    load_version_ref_commit_id(&mut *store, &self.untracked_state, version_id)
-                        .await?
+                    load_version_ref_commit_id(&*store, &self.untracked_state, version_id).await?
                 else {
                     continue;
                 };
                 let tracked_request = tracked_scan_request_from_live(request);
                 let source = tracked_source_from_version_id(version_id);
-                let store: &mut dyn StorageReader = &mut *store;
+                let store = &*store;
                 tracked_rows.extend(
                     self.tracked_state
                         .reader(store)
@@ -105,7 +104,7 @@ where
         }
 
         let untracked_rows = if request.filter.untracked != Some(false) {
-            let store: &mut dyn StorageReader = &mut *store;
+            let store = &*store;
             self.untracked_state
                 .reader(store)
                 .scan_rows(&untracked_scan_request_from_live(
@@ -147,8 +146,8 @@ where
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        let mut store = self.store.lock().await;
-        if !version_ref_exists(&mut *store, &self.untracked_state, &request.version_id).await? {
+        let store = self.store.lock().await;
+        if !version_ref_exists(&*store, &self.untracked_state, &request.version_id).await? {
             return Ok(None);
         }
         if is_commit_derived_schema(&request.schema_key)
@@ -159,7 +158,7 @@ where
                 projection_version_ids: vec![request.version_id.clone()],
             };
             let rows = scan_commit_derived_rows(
-                &mut *store,
+                &*store,
                 &self.commit_graph,
                 &LiveStateScanRequest {
                     filter: crate::live_state::LiveStateFilter {
@@ -184,7 +183,7 @@ where
         for candidate in load_row_candidates(request) {
             match candidate.source {
                 LiveStateLookupSource::Untracked => {
-                    let store: &mut dyn StorageReader = &mut *store;
+                    let store = &*store;
                     if let Some(row) = self
                         .untracked_state
                         .reader(store)
@@ -203,7 +202,7 @@ where
                 }
                 LiveStateLookupSource::Tracked => {
                     let Some(commit_id) = load_version_ref_commit_id(
-                        &mut *store,
+                        &*store,
                         &self.untracked_state,
                         &candidate.version_id,
                     )
@@ -211,7 +210,7 @@ where
                     else {
                         continue;
                     };
-                    let store: &mut dyn StorageReader = &mut *store;
+                    let store = &*store;
                     let tracked_request = tracked_row_request_from_live(request);
                     let mut rows = self
                         .tracked_state
@@ -235,7 +234,7 @@ where
 #[async_trait]
 impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
-    S: StorageReader + Sync,
+    S: StorageRead + Send + Sync,
 {
     async fn scan_rows(
         &self,
@@ -253,7 +252,7 @@ where
 }
 
 async fn scan_commit_derived_rows(
-    store: &mut dyn StorageReader,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
     commit_graph: &CommitGraphContext,
     request: &LiveStateScanRequest,
     scope: &LiveStateScanScope,
@@ -434,7 +433,7 @@ struct LiveStateScanScope {
 }
 
 async fn scan_scope(
-    store: &mut dyn StorageReader,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
@@ -460,7 +459,7 @@ async fn scan_scope(
 }
 
 async fn all_version_ref_ids(
-    store: &mut dyn StorageReader,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
 ) -> Result<Vec<String>, LixError> {
     let rows = untracked_state
@@ -480,7 +479,7 @@ async fn all_version_ref_ids(
 }
 
 async fn load_version_ref_commit_id(
-    store: &mut dyn StorageReader,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
@@ -513,7 +512,7 @@ async fn load_version_ref_commit_id(
 }
 
 async fn version_ref_exists(
-    store: &mut dyn StorageReader,
+    store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
     version_id: &str,
 ) -> Result<bool, LixError> {
@@ -625,14 +624,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::commit_store::{CommitDraftRef, CommitStoreContext};
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::{
         JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
     };
     use crate::live_state::LiveStateFilter;
-    use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage::{StorageContext, StorageWriteSet};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
     use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
     use crate::NullableKeyFilter;
@@ -649,10 +648,11 @@ mod tests {
     }
 
     async fn write_untracked_rows_to_store(
-        store: &mut (impl StorageWriteTransaction + ?Sized),
+        storage: &StorageContext,
+        _read: &(impl crate::storage::StorageRead + Send + Sync + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         let canonical_rows = rows
             .iter()
             .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
@@ -662,21 +662,21 @@ mod tests {
             .writer(&mut writes)
             .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
             .expect("untracked rows should write");
-        writes
-            .apply(store)
-            .await
-            .expect("untracked rows should apply");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("untracked rows should commit");
     }
 
     async fn write_empty_commits_to_store(
-        store: &mut (impl StorageWriteTransaction + ?Sized),
+        storage: &StorageContext,
+        read: &(impl crate::storage::StorageRead + Send + Sync + ?Sized),
         commit_ids: &[&str],
     ) {
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         for commit_id in commit_ids {
             let commit_change_id = format!("{commit_id}:commit");
             CommitStoreContext::new()
-                .writer(&mut *store, &mut writes)
+                .writer(read, &mut writes)
                 .stage_commit_draft(
                     CommitDraftRef {
                         id: commit_id,
@@ -691,14 +691,13 @@ mod tests {
                 .await
                 .expect("empty commit should stage");
         }
-        writes
-            .apply(store)
-            .await
-            .expect("empty commits should apply");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("empty commits should commit");
     }
 
     async fn stage_materialized_live_rows(
-        store: &mut (impl StorageReader + ?Sized),
+        store: &(impl StorageRead + Send + Sync + ?Sized),
         writes: &mut StorageWriteSet,
         _json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
@@ -762,7 +761,7 @@ mod tests {
                     .unwrap_or("1970-01-01T00:00:00.000Z"),
             };
             let staged = CommitStoreContext::new()
-                .writer(&mut *store, writes)
+                .writer(&*store, writes)
                 .stage_tracked_commit_draft(
                     commit,
                     rows.iter().map(|(change, _, _)| change.as_ref()).collect(),
@@ -782,7 +781,7 @@ mod tests {
                 )
                 .collect::<Vec<_>>();
             TrackedStateContext::new()
-                .writer(&mut *store, writes)
+                .writer(&*store, writes)
                 .stage_delta(&commit_id, parent_commit_id.as_deref(), &deltas)
                 .await?;
         }
@@ -838,20 +837,18 @@ mod tests {
 
     #[tokio::test]
     async fn live_state_overlays_untracked_rows() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 stage_materialized_live_rows(
-                    transaction.as_mut(),
+                    &read,
                     &mut writes,
                     &mut json_writer,
                     &[tracked_row_with_commit(
@@ -863,22 +860,21 @@ mod tests {
                 .await
                 .expect("tracked row should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked row should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-tracked"),
                 untracked_row("untracked-value"),
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let rows = scan_selected_tab_at(&live_state, storage.clone(), "global", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "global", false)
             .await
             .expect("scan should succeed");
         assert_eq!(rows.len(), 1);
@@ -890,7 +886,11 @@ mod tests {
         assert_eq!(rows[0].change_id, None);
 
         let loaded = live_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
@@ -909,20 +909,18 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_row_is_visible_without_untracked_overlay() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 stage_materialized_live_rows(
-                    transaction.as_mut(),
+                    &read,
                     &mut writes,
                     &mut json_writer,
                     &[tracked_row_with_commit(
@@ -934,19 +932,18 @@ mod tests {
                 .await
                 .expect("tracked row should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked row should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[version_ref_row("global", "commit-tracked")],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab(&live_state, storage.clone())
+        let loaded = load_selected_tab(&live_state, &storage)
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible");
@@ -960,20 +957,18 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_untracked_row_reveals_tracked_row() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 stage_materialized_live_rows(
-                    transaction.as_mut(),
+                    &read,
                     &mut writes,
                     &mut json_writer,
                     &[tracked_row_with_commit(
@@ -985,13 +980,13 @@ mod tests {
                 .await
                 .expect("tracked row should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked row should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-tracked"),
                 untracked_row("untracked-value"),
@@ -1009,14 +1004,12 @@ mod tests {
             UntrackedStateContext::new()
                 .writer(&mut writes)
                 .stage_delete_rows(std::iter::once(identity.as_ref()));
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("untracked row should delete");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
-        transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab(&live_state, storage.clone())
+        let loaded = load_selected_tab(&live_state, &storage)
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible again");
@@ -1030,14 +1023,12 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_version() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
                 "global-tracked",
@@ -1047,32 +1038,26 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked row should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked row should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked row should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version-a"),
             ],
         )
         .await;
-        write_empty_commits_to_store(transaction.as_mut(), &["commit-version-a"]).await;
-        transaction.commit().await.expect("commit should persist");
+        write_empty_commits_to_store(&storage, &read, &["commit-version-a"]).await;
 
-        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
             .await
             .expect("load should succeed")
             .expect("global row should be visible for requested version");
@@ -1088,8 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_sees_global_row_by_reading_global_root_separately() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
@@ -1097,10 +1081,9 @@ mod tests {
             crate::commit_graph::CommitGraphContext::new(),
         );
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
                 "global-tracked",
@@ -1110,32 +1093,26 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("global tracked row should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("global tracked row should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("global tracked row should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("main", "commit-main"),
             ],
         )
         .await;
-        write_empty_commits_to_store(transaction.as_mut(), &["commit-main"]).await;
-        transaction.commit().await.expect("commit should persist");
+        write_empty_commits_to_store(&storage, &read, &["commit-main"]).await;
 
-        let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
+        let loaded = load_selected_tab_at(&live_state, &storage, "main")
             .await
             .expect("load should succeed")
             .expect("global row should be projected into main");
@@ -1146,8 +1123,7 @@ mod tests {
             Some("{\"value\":\"global-tracked\"}")
         );
 
-        let main_root_rows =
-            scan_tracked_root(&tracked_state, storage.clone(), "commit-main").await;
+        let main_root_rows = scan_tracked_root(&tracked_state, &storage, "commit-main").await;
         assert_eq!(
             main_root_rows.len(),
             0,
@@ -1157,14 +1133,12 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_prefers_requested_version_over_global() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
@@ -1178,31 +1152,25 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
             .await
             .expect("load should succeed")
             .expect("version row should be visible");
@@ -1217,14 +1185,12 @@ mod tests {
 
     #[tokio::test]
     async fn main_override_hides_global_row() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
@@ -1238,31 +1204,25 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("main", "commit-main"),
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
+        let loaded = load_selected_tab_at(&live_state, &storage, "main")
             .await
             .expect("load should succeed")
             .expect("main row should be visible");
@@ -1277,14 +1237,12 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_prefers_requested_untracked_over_requested_tracked_and_global_rows() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
@@ -1298,22 +1256,17 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
@@ -1322,9 +1275,8 @@ mod tests {
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
             .await
             .expect("load should succeed")
             .expect("version untracked row should be visible");
@@ -1339,14 +1291,12 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_overlays_requested_version_over_global() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
@@ -1360,31 +1310,25 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "version-a", false)
             .await
             .expect("scan should succeed");
 
@@ -1398,14 +1342,12 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_projects_global_row_into_requested_version() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
                 "global-tracked",
@@ -1415,32 +1357,26 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version-a"),
             ],
         )
         .await;
-        write_empty_commits_to_store(transaction.as_mut(), &["commit-version-a"]).await;
-        transaction.commit().await.expect("commit should persist");
+        write_empty_commits_to_store(&storage, &read, &["commit-version-a"]).await;
 
-        let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "version-a", false)
             .await
             .expect("scan should succeed");
 
@@ -1455,14 +1391,12 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_does_not_project_global_rows_into_missing_version() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [tracked_row_with_commit(
                 "global-tracked",
@@ -1472,28 +1406,22 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked row should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked row should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked row should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[version_ref_row("global", "commit-global")],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let rows = scan_selected_tab_at(&live_state, storage.clone(), "missing-version", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "missing-version", false)
             .await
             .expect("scan should succeed");
 
@@ -1506,14 +1434,12 @@ mod tests {
 
     #[tokio::test]
     async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
@@ -1526,36 +1452,30 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let hidden = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
+        let hidden = scan_selected_tab_at(&live_state, &storage, "version-a", false)
             .await
             .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let with_tombstone = scan_selected_tab_at(&live_state, storage.clone(), "version-a", true)
+        let with_tombstone = scan_selected_tab_at(&live_state, &storage, "version-a", true)
             .await
             .expect("scan should succeed");
         assert_eq!(with_tombstone.len(), 1);
@@ -1565,14 +1485,12 @@ mod tests {
 
     #[tokio::test]
     async fn main_tombstone_hides_global_row() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
@@ -1585,36 +1503,30 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("main", "commit-main"),
             ],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let hidden = scan_selected_tab_at(&live_state, storage.clone(), "main", false)
+        let hidden = scan_selected_tab_at(&live_state, &storage, "main", false)
             .await
             .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let tombstones = scan_selected_tab_at(&live_state, storage.clone(), "main", true)
+        let tombstones = scan_selected_tab_at(&live_state, &storage, "main", true)
             .await
             .expect("scan should succeed");
         assert_eq!(tombstones.len(), 1);
@@ -1625,13 +1537,11 @@ mod tests {
 
     #[tokio::test]
     async fn writer_allows_commit_fact_to_share_the_touched_version_commit_id() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         {
             let rows = [
@@ -1646,28 +1556,22 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("commit facts are changelog projections, not root-local rows");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("commit facts are changelog projections, not root-local rows");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("commit fact rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
         write_untracked_rows_to_store(
-            transaction.as_mut(),
+            &storage,
+            &read,
             &[version_ref_row("version-a", "commit-version")],
         )
         .await;
-        transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
             .await
             .expect("load should succeed")
             .expect("version row should be visible");
@@ -1679,16 +1583,14 @@ mod tests {
 
     #[tokio::test]
     async fn writer_uses_first_parent_as_merge_root_base() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
-        let mut seed_transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("seed transaction should open");
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let mut writes = StorageWriteSet::new();
         {
             CommitStoreContext::new()
-                .writer(&mut seed_transaction.as_mut(), &mut writes)
+                .writer(&read, &mut writes)
                 .stage_commit_draft(
                     CommitDraftRef {
                         id: "parent-left",
@@ -1703,24 +1605,18 @@ mod tests {
                 .await
                 .expect("first parent commit should stage");
             TrackedStateContext::new()
-                .writer(&mut seed_transaction.as_mut(), &mut writes)
+                .writer(&read, &mut writes)
                 .stage_delta("parent-left", None, &[])
                 .await
                 .expect("first parent root should exist");
         }
-        writes
-            .apply(&mut seed_transaction.as_mut())
-            .await
-            .expect("first parent root should apply");
-        seed_transaction
-            .commit()
-            .await
-            .expect("seed transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         {
             let rows = [
@@ -1738,31 +1634,23 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("merge commit should use first parent as tracked-root base");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("merge commit should use first parent as tracked-root base");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("merge commit rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
     }
 
     #[tokio::test]
     async fn non_global_root_does_not_store_global_rows() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         {
             let rows = [
@@ -1777,32 +1665,23 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             {
-                stage_materialized_live_rows(
-                    transaction.as_mut(),
-                    &mut writes,
-                    &mut json_writer,
-                    &rows,
-                )
-                .await
-                .expect("tracked rows should stage");
+                stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
             }
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("tracked rows should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("writes should commit");
         }
-        transaction.commit().await.expect("commit should persist");
 
-        let global_root_rows =
-            scan_tracked_root(&tracked_state, storage.clone(), "commit-global").await;
+        let global_root_rows = scan_tracked_root(&tracked_state, &storage, "commit-global").await;
         assert_eq!(global_root_rows.len(), 1);
         assert_eq!(
             global_root_rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"global-tracked\"}")
         );
 
-        let main_root_rows =
-            scan_tracked_root(&tracked_state, storage.clone(), "commit-main").await;
+        let main_root_rows = scan_tracked_root(&tracked_state, &storage, "commit-main").await;
         assert_eq!(main_root_rows.len(), 1);
         assert_eq!(
             main_root_rows[0].snapshot_content.as_deref(),
@@ -1812,10 +1691,14 @@ mod tests {
 
     async fn load_selected_tab(
         live_state: &LiveStateContext,
-        storage: StorageContext,
+        storage: &StorageContext,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
-            .reader(storage)
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
@@ -1827,11 +1710,15 @@ mod tests {
 
     async fn load_selected_tab_at(
         live_state: &LiveStateContext,
-        storage: StorageContext,
+        storage: &StorageContext,
         version_id: &str,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
-            .reader(storage)
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: version_id.to_string(),
@@ -1843,12 +1730,16 @@ mod tests {
 
     async fn scan_selected_tab_at(
         live_state: &LiveStateContext,
-        storage: StorageContext,
+        storage: &StorageContext,
         version_id: &str,
         include_tombstones: bool,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         live_state
-            .reader(storage)
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
@@ -1867,11 +1758,15 @@ mod tests {
 
     async fn scan_tracked_root(
         tracked_state: &TrackedStateContext,
-        storage: StorageContext,
+        storage: &StorageContext,
         commit_id: &str,
     ) -> Vec<MaterializedTrackedStateRow> {
         tracked_state
-            .reader(storage)
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 commit_id,
                 &TrackedStateScanRequest {

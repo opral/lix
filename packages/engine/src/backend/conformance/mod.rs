@@ -1,6 +1,6 @@
-//! Conformance harness for backend_v2 implementations.
+//! Conformance harness for backend implementations.
 //!
-//! The harness is colocated with the experimental API for now. Once backend_v2
+//! The harness is colocated with the experimental API for now. Once backend
 //! is stable, rs-sdk can re-export this as the public backend author test kit.
 
 mod baseline;
@@ -29,7 +29,7 @@ pub use runner::{
 #[cfg(test)]
 mod tests {
     use super::{run_backend_conformance, ConformanceStatus};
-    use crate::backend_v2::InMemoryBackendFactory;
+    use crate::backend::InMemoryBackendFactory;
 
     #[test]
     fn in_memory_backend_passes_baseline_conformance() {
@@ -54,6 +54,7 @@ mod tests {
                 "baseline::delete_range_applies_after_staged_puts",
                 "baseline::put_many_applies_after_delete_range",
                 "baseline::put_many_overwrites_existing_value",
+                "baseline::scan_range_sees_overwritten_existing_value",
                 "baseline::scan_range_returns_forward_row_bounded_chunks",
                 "baseline::scan_range_honors_bound_variants",
                 "baseline::scan_range_orders_raw_byte_keys",

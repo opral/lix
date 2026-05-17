@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lix_engine::backend_v2::{
+use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
 };
-use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
+use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use redb::{
     Database, Range as RedbRange, ReadTransaction, ReadableDatabase, ReadableTable,
     TableDefinition, WriteTransaction as RedbWriteTxn,
@@ -66,7 +66,7 @@ impl RedbBackendFactory {
     }
 }
 
-impl BackendV2Factory for RedbBackendFactory {
+impl BackendFactory for RedbBackendFactory {
     type Backend = RedbBackend;
     type Fixture = RedbBackendFixture;
 
@@ -79,16 +79,16 @@ impl BackendV2Factory for RedbBackendFactory {
         RedbBackendFixture { path }
     }
 
-    fn config(&self) -> BackendV2TestConfig {
-        BackendV2TestConfig {
+    fn config(&self) -> BackendTestConfig {
+        BackendTestConfig {
             ephemeral: false,
             supports_concurrent_writers: false,
-            ..BackendV2TestConfig::default()
+            ..BackendTestConfig::default()
         }
     }
 }
 
-impl BackendV2Fixture for RedbBackendFixture {
+impl BackendFixture for RedbBackendFixture {
     type Backend = RedbBackend;
 
     fn open(&self) -> Self::Backend {

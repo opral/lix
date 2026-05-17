@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::backend_v2::{BackendError, Key, KeyRange, KeyRef, SpaceId};
+use crate::backend::{BackendError, Key, KeyRange, KeyRef, SpaceId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageSpace {
@@ -90,8 +90,8 @@ fn space_upper_bound(space: SpaceId) -> Key {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend_v2::{Key, SpaceId};
-    use crate::storage_v2::StorageSpace;
+    use crate::backend::{Key, SpaceId};
+    use crate::storage::StorageSpace;
 
     #[test]
     fn storage_space_preserves_id_and_name() {

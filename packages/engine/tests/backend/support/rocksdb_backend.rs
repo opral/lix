@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lix_engine::backend_v2::{
+use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
 };
-use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
+use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rocksdb::{DBIteratorWithThreadMode, Snapshot};
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
@@ -60,7 +60,7 @@ impl RocksDbBackendFactory {
     }
 }
 
-impl BackendV2Factory for RocksDbBackendFactory {
+impl BackendFactory for RocksDbBackendFactory {
     type Backend = RocksDbBackend;
     type Fixture = RocksDbBackendFixture;
 
@@ -73,16 +73,16 @@ impl BackendV2Factory for RocksDbBackendFactory {
         RocksDbBackendFixture { path }
     }
 
-    fn config(&self) -> BackendV2TestConfig {
-        BackendV2TestConfig {
+    fn config(&self) -> BackendTestConfig {
+        BackendTestConfig {
             ephemeral: false,
             supports_concurrent_writers: false,
-            ..BackendV2TestConfig::default()
+            ..BackendTestConfig::default()
         }
     }
 }
 
-impl BackendV2Fixture for RocksDbBackendFixture {
+impl BackendFixture for RocksDbBackendFixture {
     type Backend = RocksDbBackend;
 
     fn open(&self) -> Self::Backend {
