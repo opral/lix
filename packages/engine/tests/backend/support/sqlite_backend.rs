@@ -244,6 +244,21 @@ impl BackendWrite for SqliteWrite {
         Ok(())
     }
 
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        let mut sql = String::from("DELETE FROM entries WHERE 1 = 1");
+        let mut values = Vec::new();
+        append_bound_sql(&mut sql, &mut values, "key", ">=", ">", &range.lower);
+        append_bound_sql(&mut sql, &mut values, "key", "<=", "<", &range.upper);
+        let deleted = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(values))
+            .map_err(sqlite_error)?;
+        self.stats.deleted_entries += deleted as u64;
+        self.stats.deleted_ranges += 1;
+        self.stats.backend_calls += 1;
+        Ok(())
+    }
+
     fn commit(self) -> Result<CommitResult, BackendError> {
         self.conn.execute_batch("COMMIT").map_err(sqlite_error)?;
         Ok(CommitResult {

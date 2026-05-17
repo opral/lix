@@ -529,6 +529,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_delete_range_fallback(c, SqliteTempBenchBackend::new());
     bench_delete_range_fallback(c, RedbTempBenchBackend::new());
     bench_delete_range_fallback(c, RocksDbTempBenchBackend::new());
+    bench_delete_range_native(c, InMemoryBenchBackend);
+    bench_delete_range_native(c, SqliteTempBenchBackend::new());
+    bench_delete_range_native(c, RedbTempBenchBackend::new());
+    bench_delete_range_native(c, RocksDbTempBenchBackend::new());
     bench_scan_pagination_matrix(c, InMemoryBenchBackend);
     bench_scan_pagination_matrix(c, SqliteTempBenchBackend::new());
     bench_scan_pagination_matrix(c, RedbTempBenchBackend::new());
@@ -969,6 +973,44 @@ where
                     assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
                     assert_eq!(stats.write_stats.staged_deletes, case.rows as u64);
                     black_box(stats);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_delete_range_native<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!("storage_v2/delete_range_native/{}", backend_family.name());
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    for case in DELETE_RANGE_CASES {
+        let seed = backend_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        group.throughput(Throughput::Elements(case.rows as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
+            b.iter_batched(
+                || backend_family.fork_for_write(&seed),
+                |backend| {
+                    let mut write = backend
+                        .begin_write(WriteOptions::default())
+                        .expect("begin native delete_range write");
+                    write
+                        .delete_range(physical_point_scan_range(1))
+                        .expect("native delete_range");
+                    let commit = write.commit().expect("commit native delete_range");
+                    assert_eq!(commit.stats.deleted_ranges, 1);
+                    assert_eq!(commit.stats.backend_calls, 1);
+                    black_box((case.rows, commit));
                 },
                 BatchSize::LargeInput,
             );
@@ -2879,6 +2921,13 @@ impl BackendWrite for CountingWrite {
     }
 
     fn delete_many(&mut self, _keys: &[Key]) -> Result<(), BackendError> {
+        self.state
+            .delete_many_calls
+            .set(self.state.delete_many_calls.get() + 1);
+        Ok(())
+    }
+
+    fn delete_range(&mut self, _range: KeyRange) -> Result<(), BackendError> {
         self.state
             .delete_many_calls
             .set(self.state.delete_many_calls.get() + 1);

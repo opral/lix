@@ -229,6 +229,38 @@ impl BackendWrite for InMemoryWrite {
         Ok(())
     }
 
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        let mut base_keys = Vec::new();
+        visit_range(
+            &self.base,
+            range.clone(),
+            ScanOptions {
+                limit_rows: usize::MAX,
+                projection: CoreProjection::KeyOnly,
+                resume_after: None,
+            },
+            &mut |key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                base_keys.push(key.to_owned_key());
+                Ok(())
+            },
+        )?;
+
+        let overlay_puts_before = self.overlay.puts.len();
+        self.overlay
+            .puts
+            .retain(|key, _value| !range_contains(&range, key));
+        let removed_overlay_puts = overlay_puts_before - self.overlay.puts.len();
+
+        for key in &base_keys {
+            self.overlay.deletes.insert(key.clone());
+        }
+
+        self.stats.deleted_entries += (base_keys.len() + removed_overlay_puts) as u64;
+        self.stats.deleted_ranges += 1;
+        self.stats.backend_calls += 1;
+        Ok(())
+    }
+
     fn commit(self) -> Result<CommitResult, BackendError> {
         let entries = if self.overlay.puts.is_empty() && self.overlay.deletes.is_empty() {
             self.base
@@ -486,6 +518,20 @@ fn bounds_are_empty(lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
         | (Bound::Excluded(lower), Bound::Included(upper))
         | (Bound::Excluded(lower), Bound::Excluded(upper)) => lower >= upper,
     }
+}
+
+fn range_contains(range: &KeyRange, key: &Key) -> bool {
+    let lower_matches = match &range.lower {
+        Bound::Included(lower) => key >= lower,
+        Bound::Excluded(lower) => key > lower,
+        Bound::Unbounded => true,
+    };
+    let upper_matches = match &range.upper {
+        Bound::Included(upper) => key <= upper,
+        Bound::Excluded(upper) => key < upper,
+        Bound::Unbounded => true,
+    };
+    lower_matches && upper_matches
 }
 
 fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {

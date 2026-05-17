@@ -23,6 +23,7 @@ enum BrokenMode {
     ReadSeesSecondLaterCommit,
     ScanReadSeesLaterCommits,
     DeleteManyIgnoresExistingKeys,
+    DeleteRangeIgnoresUpperBound,
     KeyOnlyScanReturnsFullValues,
     AdvertisesPendingCapability,
     RollbackCommits,
@@ -104,6 +105,14 @@ fn detects_delete_many_ignores_existing_keys() {
     assert_failed(
         BrokenMode::DeleteManyIgnoresExistingKeys,
         "baseline::delete_many_removes_existing_keys",
+    );
+}
+
+#[test]
+fn detects_delete_range_ignores_upper_bound() {
+    assert_failed(
+        BrokenMode::DeleteRangeIgnoresUpperBound,
+        "baseline::delete_range_removes_exact_range",
     );
 }
 
@@ -372,6 +381,20 @@ impl BackendWrite for BrokenWrite {
                 continue;
             }
             self.staged.remove(key);
+        }
+        Ok(())
+    }
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        if matches!(self.mode, BrokenMode::DeleteRangeIgnoresUpperBound) {
+            self.staged.retain(|key, _value| match &range.lower {
+                Bound::Included(lower) => key < lower,
+                Bound::Excluded(lower) => key <= lower,
+                Bound::Unbounded => false,
+            });
+        } else {
+            self.staged
+                .retain(|key, _value| !range_contains(&range, key));
         }
         Ok(())
     }

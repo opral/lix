@@ -896,6 +896,10 @@ mod tests {
             Ok(())
         }
 
+        fn delete_range(&mut self, _range: KeyRange) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         fn commit(self) -> Result<CommitResult, BackendError> {
             self.state
                 .commit_calls

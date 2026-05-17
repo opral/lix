@@ -12,7 +12,8 @@ use lix_engine::backend_v2::{
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use redb::{
-    Database, ReadTransaction, ReadableDatabase, TableDefinition, WriteTransaction as RedbWriteTxn,
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+    WriteTransaction as RedbWriteTxn,
 };
 use tempfile::TempDir;
 
@@ -214,6 +215,28 @@ impl BackendWrite for RedbWrite {
             table.remove(key.0.as_ref()).map_err(redb_error)?;
         }
         self.stats.deleted_entries += keys.len() as u64;
+        self.stats.backend_calls += 1;
+        Ok(())
+    }
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        let (lower, upper) = encoded_bounds(range, None);
+        let lower = bound_as_slice(&lower);
+        let upper = bound_as_slice(&upper);
+        let mut table = self.write.open_table(ENTRIES).map_err(redb_error)?;
+        let keys = table
+            .range::<&[u8]>((lower, upper))
+            .map_err(redb_error)?
+            .map(|row| {
+                let (key, _value) = row.map_err(redb_error)?;
+                Ok::<_, BackendError>(key.value().to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in &keys {
+            table.remove(key.as_slice()).map_err(redb_error)?;
+        }
+        self.stats.deleted_entries += keys.len() as u64;
+        self.stats.deleted_ranges += 1;
         self.stats.backend_calls += 1;
         Ok(())
     }

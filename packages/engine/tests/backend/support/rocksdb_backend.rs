@@ -39,6 +39,7 @@ pub struct RocksDbRead<'a> {
 pub struct RocksDbWrite {
     db: Arc<DB>,
     batch: WriteBatch,
+    staged_put_keys: Vec<Key>,
     stats: WriteStats,
 }
 
@@ -124,6 +125,7 @@ impl Backend for RocksDbBackend {
         Ok(RocksDbWrite {
             db: Arc::clone(&self.db),
             batch: WriteBatch::default(),
+            staged_put_keys: Vec::new(),
             stats: WriteStats::default(),
         })
     }
@@ -221,6 +223,7 @@ impl BackendWrite for RocksDbWrite {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
+            self.staged_put_keys.push(entry.key.clone());
             self.batch.put(entry.key.0.as_ref(), value.as_ref());
         }
         self.stats.backend_calls += 1;
@@ -232,6 +235,38 @@ impl BackendWrite for RocksDbWrite {
             self.batch.delete(key.0.as_ref());
         }
         self.stats.deleted_entries += keys.len() as u64;
+        self.stats.backend_calls += 1;
+        Ok(())
+    }
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
+            self.batch.delete_range(lower.as_slice(), upper.as_slice());
+        } else {
+            let bounds = EncodedBounds::new(range, None);
+            for item in self
+                .db
+                .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
+            {
+                let (encoded_key, _value) = item.map_err(rocksdb_error)?;
+                let encoded_key = encoded_key.as_ref();
+                if !bounds.after_lower(encoded_key) {
+                    continue;
+                }
+                if !bounds.before_upper(encoded_key) {
+                    break;
+                }
+                self.batch.delete(encoded_key);
+            }
+
+            for key in &self.staged_put_keys {
+                if bounds.contains(key.0.as_ref()) {
+                    self.batch.delete(key.0.as_ref());
+                }
+            }
+        }
+
+        self.stats.deleted_ranges += 1;
         self.stats.backend_calls += 1;
         Ok(())
     }
@@ -309,6 +344,31 @@ impl EncodedBounds {
             Bound::Unbounded => true,
         }
     }
+}
+
+fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
+    let lower = match &range.lower {
+        Bound::Included(key) => key.0.to_vec(),
+        Bound::Excluded(key) => next_lexicographic_key(key)?,
+        Bound::Unbounded => Vec::new(),
+    };
+    let upper = match &range.upper {
+        Bound::Included(key) => next_lexicographic_key(key)?,
+        Bound::Excluded(key) => key.0.to_vec(),
+        Bound::Unbounded => return None,
+    };
+
+    if lower >= upper {
+        None
+    } else {
+        Some((lower, upper))
+    }
+}
+
+fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
+    let mut bytes = key.0.to_vec();
+    bytes.push(0);
+    Some(bytes)
 }
 
 fn open_rocksdb(path: &Path) -> Result<DB, BackendError> {

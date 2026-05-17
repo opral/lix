@@ -125,6 +125,8 @@ pub trait BackendWrite {
 
     fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
 
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError>;
+
     fn commit(self) -> Result<CommitResult, BackendError>
     where
         Self: Sized;
