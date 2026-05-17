@@ -5,7 +5,7 @@ use ahash::RandomState;
 use crate::backend_v2::{
     BackendError, BackendRead, GetOptions, Key, PointVisitor, ProjectedValue, ProjectedValueRef,
 };
-use crate::storage_v2::{StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace};
+use crate::storage_v2::{StorageRead, StorageReadResult, StorageReadStats, StorageSpace};
 
 type FastHashBuilder = RandomState;
 
@@ -96,11 +96,11 @@ impl PointReadPlan {
 
     pub fn collect<R>(
         &self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<PointValues<'_>>, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
     {
         let unique_values =
             collect_physical_unique_values(read.backend_read(), &self.physical_unique_keys, opts)?;
@@ -115,11 +115,11 @@ impl PointReadPlan {
 
     pub fn materialize<R>(
         &self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
     {
         let result = self.collect(read, opts)?;
         Ok(StorageReadResult::new(
@@ -130,12 +130,12 @@ impl PointReadPlan {
 
     pub fn collect_into<'plan, 'buf, R>(
         &'plan self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: GetOptions<'_>,
         buffer: &'buf mut PointReadBuffer,
     ) -> Result<StorageReadResult<PointValuesRef<'plan, 'buf>>, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
     {
         collect_physical_unique_values_into(
             read.backend_read(),
@@ -155,12 +155,12 @@ impl PointReadPlan {
 
     pub fn visit<R, V>(
         &self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: GetOptions<'_>,
         visitor: &mut V,
     ) -> Result<StorageReadStats, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
         V: PointVisitor + ?Sized,
     {
         struct LogicalPointVisitor<'a, V: ?Sized> {

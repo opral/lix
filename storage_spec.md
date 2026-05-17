@@ -437,13 +437,31 @@ v2 should provide read scopes over a backend read transaction.
 Sketch:
 
 ```rust
+pub trait StorageRead {
+    type BackendRead: BackendRead;
+
+    fn backend_read(&self) -> &Self::BackendRead;
+}
+
 pub struct StorageReadScope<R> {
     read: R,
+}
+
+impl<R: BackendRead> StorageRead for StorageReadScope<R> {
+    type BackendRead = R;
+
+    fn backend_read(&self) -> &R;
 }
 ```
 
 A read scope is useful when one high-level operation needs tracked_state,
 commit_store, and payload_store reads to agree on one backend snapshot.
+
+`StorageRead` exists for transaction/scope polymorphism, following the useful
+part of storage v1's `StorageReader`: domain code can accept "anything that
+provides a coherent backend read view" without caring whether it is a read
+transaction, scoped clone, test fixture, or future read wrapper. It deliberately
+does not expose operation methods.
 
 For reads, storage_v2 can stay lighter than the write path. Domain-store hot
 paths may use storage_v2 helpers without routing every operation through a heavy
@@ -544,8 +562,9 @@ chunked cursor drain:
   ScanPlan::{range,prefix}(...).cursor(read, opts, |scan| ...)
 ```
 
-There is no separate `StorageReader` trait. Point and scan plans are the read
-API; the `StorageReadScope` only owns the coherent backend read view.
+There is no separate operation-bearing `StorageReader` trait. Point and scan
+plans are the read APIs; `StorageRead` only provides the coherent backend read
+view to those plans.
 
 Backend scan cursors:
 
