@@ -1517,6 +1517,90 @@ where
         }
     }
 
+    if should_run("direct_get_many_unique_u100") || should_run("direct_visit_many_unique_u100") {
+        let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
+        let point_keys = physical_point_request_keys(1, 100, 100);
+        group.throughput(Throughput::Elements(100));
+        if should_run("direct_get_many_unique_u100") {
+            group.bench_function("direct_get_many_unique_u100", |b| {
+                b.iter(|| {
+                    let read = point_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct unique point read");
+                    let result =
+                        backend_get_many(&read, black_box(&point_keys), GetOptions::default())
+                            .expect("direct unique get_many");
+                    assert_eq!(result.values.len(), 100);
+                    assert_eq!(
+                        result.values.iter().filter(|value| value.is_some()).count(),
+                        100
+                    );
+                    read.close().expect("close direct unique point read");
+                    black_box(result);
+                });
+            });
+        }
+
+        if should_run("direct_visit_many_unique_u100") {
+            group.bench_function("direct_visit_many_unique_u100", |b| {
+                b.iter(|| {
+                    let read = point_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct unique point visitor read");
+                    let mut visitor = CountingPointVisitor::default();
+                    read.visit_many(black_box(&point_keys), GetOptions::default(), &mut visitor)
+                        .expect("direct unique visit_many");
+                    assert_eq!(visitor.visited, 100);
+                    read.close()
+                        .expect("close direct unique point visitor read");
+                    black_box(visitor.visited);
+                });
+            });
+        }
+    }
+
+    if should_run("direct_get_many_unique_u1000") || should_run("direct_visit_many_unique_u1000") {
+        let point_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+        let point_keys = physical_point_request_keys(1, 1_000, 1_000);
+        group.throughput(Throughput::Elements(1_000));
+        if should_run("direct_get_many_unique_u1000") {
+            group.bench_function("direct_get_many_unique_u1000", |b| {
+                b.iter(|| {
+                    let read = point_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct unique point read");
+                    let result =
+                        backend_get_many(&read, black_box(&point_keys), GetOptions::default())
+                            .expect("direct unique get_many");
+                    assert_eq!(result.values.len(), 1_000);
+                    assert_eq!(
+                        result.values.iter().filter(|value| value.is_some()).count(),
+                        1_000
+                    );
+                    read.close().expect("close direct unique point read");
+                    black_box(result);
+                });
+            });
+        }
+
+        if should_run("direct_visit_many_unique_u1000") {
+            group.bench_function("direct_visit_many_unique_u1000", |b| {
+                b.iter(|| {
+                    let read = point_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct unique point visitor read");
+                    let mut visitor = CountingPointVisitor::default();
+                    read.visit_many(black_box(&point_keys), GetOptions::default(), &mut visitor)
+                        .expect("direct unique visit_many");
+                    assert_eq!(visitor.visited, 1_000);
+                    read.close()
+                        .expect("close direct unique point visitor read");
+                    black_box(visitor.visited);
+                });
+            });
+        }
+    }
+
     if should_run("direct_scan_visit_key_only_q1000")
         || should_run("direct_scan_materialized_q1000")
     {
