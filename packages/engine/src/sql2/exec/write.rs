@@ -6,6 +6,7 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::SqlLogicalPlan;
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::{LixError, Value};
@@ -106,23 +107,23 @@ async fn execute_write_logical_plan_with_mode_inner(
             "expected SQL write logical plan",
         ));
     };
-    validate_write_parameter_count(&write_plan.plan, params.len())?;
+    let write_plan = resolve_parameterized_version_scope(write_plan.plan, params)?;
+    validate_write_parameter_count(&write_plan, params.len())?;
 
     if mode != WriteExecutorModeInner::ForceDataFusion
-        && super::bound_public_write::supports_bound_public_write(&write_plan.plan)
+        && super::bound_public_write::supports_bound_public_write(&write_plan)
     {
         let rows_affected =
-            super::bound_public_write::execute_bound_public_write(ctx, &write_plan.plan, params)
+            super::bound_public_write::execute_bound_public_write(ctx, &write_plan, params)
                 .await
                 .map_err(normalize_bound_public_write_error)?;
         return Ok((rows_affected, WriteExecutorPath::Fast));
     }
 
     if mode != WriteExecutorModeInner::ForceDataFusion {
-        super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan.plan, params)
-            .await?;
+        super::datafusion::validate_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
         if let Some(fast_plan) =
-            crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan.plan)?
+            crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan)?
         {
             let rows_affected =
                 crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
@@ -138,9 +139,67 @@ async fn execute_write_logical_plan_with_mode_inner(
     }
 
     let rows_affected =
-        super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan.plan, params)
-            .await?;
+        super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan, params).await?;
     Ok((rows_affected, WriteExecutorPath::DataFusion))
+}
+
+fn resolve_parameterized_version_scope(
+    mut plan: LogicalWritePlan,
+    params: &[Value],
+) -> Result<LogicalWritePlan, LixError> {
+    plan.bound.version_scope = match plan.bound.version_scope {
+        VersionScope::ExplicitDynamic {
+            mut version_ids,
+            param_indexes,
+        } => {
+            insert_version_param_values(&mut version_ids, &param_indexes, params)?;
+            if version_ids.is_empty() {
+                VersionScope::Empty
+            } else {
+                VersionScope::Explicit { version_ids }
+            }
+        }
+        VersionScope::ExplicitRequiredDynamic {
+            mut version_ids,
+            param_indexes,
+        } => {
+            insert_version_param_values(&mut version_ids, &param_indexes, params)?;
+            if version_ids.is_empty() {
+                VersionScope::Empty
+            } else {
+                VersionScope::ExplicitRequired { version_ids }
+            }
+        }
+        scope => scope,
+    };
+    Ok(plan)
+}
+
+fn insert_version_param_values(
+    version_ids: &mut std::collections::BTreeSet<String>,
+    param_indexes: &std::collections::BTreeSet<usize>,
+    params: &[Value],
+) -> Result<(), LixError> {
+    for index in param_indexes {
+        match params.get(index.saturating_sub(1)) {
+            Some(Value::Text(version_id)) => {
+                version_ids.insert(version_id.clone());
+            }
+            Some(_) => {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "by-version SQL write selectors require text version-id parameters",
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("SQL version selector parameter ${index} was not provided"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_bound_public_write_error(error: LixError) -> LixError {
