@@ -15,14 +15,15 @@ use criterion::{
 };
 use lix_engine::backend_v2::{
     get_many as backend_get_many, Backend, BackendCapabilities, BackendError, BackendRead,
-    BackendWrite, CommitResult, ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend,
-    Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch,
-    PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor,
-    SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    BackendWrite, CommitResult, ConformanceBackend, CoreProjection, Durability, GetOptions,
+    InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
+    ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
+    ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 use lix_engine::storage_v2::{
     PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
-    StorageReader, StorageScanBuffer, StorageSpace, StorageWriteSet,
+    StorageReader, StorageScanBuffer, StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
 use redb_backend_v2::RedbBackend;
 use rocksdb_backend_v2::RocksDbBackend;
@@ -114,6 +115,35 @@ struct PointCase {
 struct PrefixCase {
     name: &'static str,
     rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DeleteRangeCase {
+    name: &'static str,
+    rows: usize,
+    page_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PaginationCase {
+    name: &'static str,
+    rows: usize,
+    page_size: usize,
+}
+
+#[derive(Clone, Debug)]
+struct DeleteRangeFallbackStats {
+    scanned: usize,
+    deleted: usize,
+    pages: usize,
+    write_stats: StorageWriteSetStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScanDrainStats {
+    scanned: usize,
+    pages: usize,
+    backend_calls: u64,
 }
 
 trait StorageBenchBackend {
@@ -435,6 +465,42 @@ const PREFIX_CASES: &[PrefixCase] = &[
     },
 ];
 
+const DELETE_RANGE_CASES: &[DeleteRangeCase] = &[
+    DeleteRangeCase {
+        name: "delete_prefix_q100",
+        rows: 100,
+        page_size: 256,
+    },
+    DeleteRangeCase {
+        name: "delete_prefix_q1000",
+        rows: 1_000,
+        page_size: 512,
+    },
+    DeleteRangeCase {
+        name: "delete_prefix_q10000",
+        rows: 10_000,
+        page_size: 1_024,
+    },
+];
+
+const PAGINATION_CASES: &[PaginationCase] = &[
+    PaginationCase {
+        name: "drain_range_q10000_page1",
+        rows: 10_000,
+        page_size: 1,
+    },
+    PaginationCase {
+        name: "drain_range_q10000_page10",
+        rows: 10_000,
+        page_size: 10,
+    },
+    PaginationCase {
+        name: "drain_range_q10000_page100",
+        rows: 10_000,
+        page_size: 100,
+    },
+];
+
 fn storage_v2_benches(c: &mut Criterion) {
     if std::env::var_os("STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY").is_some() {
         match std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND").as_deref() {
@@ -459,6 +525,18 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_write_set_build_and_commit(c, SqliteTempBenchBackend::new());
     bench_write_set_build_and_commit(c, RedbTempBenchBackend::new());
     bench_write_set_build_and_commit(c, RocksDbTempBenchBackend::new());
+    bench_delete_range_fallback(c, InMemoryBenchBackend);
+    bench_delete_range_fallback(c, SqliteTempBenchBackend::new());
+    bench_delete_range_fallback(c, RedbTempBenchBackend::new());
+    bench_delete_range_fallback(c, RocksDbTempBenchBackend::new());
+    bench_scan_pagination_matrix(c, InMemoryBenchBackend);
+    bench_scan_pagination_matrix(c, SqliteTempBenchBackend::new());
+    bench_scan_pagination_matrix(c, RedbTempBenchBackend::new());
+    bench_scan_pagination_matrix(c, RocksDbTempBenchBackend::new());
+    bench_durability_matrix(c, InMemoryBenchBackend);
+    bench_durability_matrix(c, SqliteTempBenchBackend::new());
+    bench_durability_matrix(c, RedbTempBenchBackend::new());
+    bench_durability_matrix(c, RocksDbTempBenchBackend::new());
     bench_point_request_plan(c);
     bench_point_read_adapter(c);
     bench_point_read_indexed_adapter(c);
@@ -847,6 +925,167 @@ where
                         (case.writes - case.expected_deletes()) as u64
                     );
                     assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
+                    black_box(stats);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_delete_range_fallback<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!("storage_v2/delete_range_fallback/{}", backend_family.name());
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    for case in DELETE_RANGE_CASES {
+        let seed = backend_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        group.throughput(Throughput::Elements(case.rows as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
+            b.iter_batched(
+                || {
+                    let backend = backend_family.fork_for_write(&seed);
+                    StorageContext::new(backend)
+                },
+                |storage| {
+                    let stats = fallback_delete_range(
+                        &storage,
+                        space(1),
+                        point_scan_range(),
+                        case.page_size,
+                    )
+                    .expect("delete range fallback");
+                    assert_eq!(stats.scanned, case.rows);
+                    assert_eq!(stats.deleted, case.rows);
+                    assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
+                    assert_eq!(stats.write_stats.staged_deletes, case.rows as u64);
+                    black_box(stats);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_scan_pagination_matrix<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!("storage_v2/scan_pagination/{}", backend_family.name());
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    let seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
+    let read = seed
+        .begin_read(ReadOptions::default())
+        .expect("begin pagination read");
+    let scope = StorageReadScope::new(read);
+
+    for case in PAGINATION_CASES {
+        group.throughput(Throughput::Elements(case.rows as u64));
+        group.bench_with_input(
+            BenchmarkId::new("materialized", case.name),
+            case,
+            |b, case| {
+                b.iter(|| {
+                    let stats = drain_scan_materialized(
+                        &scope,
+                        space(1),
+                        point_scan_range(),
+                        case.rows,
+                        case.page_size,
+                    )
+                    .expect("drain paginated materialized scan");
+                    assert_eq!(stats.scanned, case.rows);
+                    assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
+                    black_box(stats);
+                });
+            },
+        );
+
+        group.bench_with_input(BenchmarkId::new("visit", case.name), case, |b, case| {
+            b.iter(|| {
+                let stats = drain_scan_visit(
+                    &scope,
+                    space(1),
+                    point_scan_range(),
+                    case.rows,
+                    case.page_size,
+                )
+                .expect("drain paginated visitor scan");
+                assert_eq!(stats.scanned, case.rows);
+                assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
+                black_box(stats);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_durability_matrix<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!("storage_v2/durability_matrix/{}", backend_family.name());
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    let case = WriteCase {
+        name: "puts_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let mutations = write_mutations(&case);
+    let durability_cases = [
+        ("default", Durability::Default),
+        ("durable", Durability::Durable),
+        ("relaxed", Durability::Relaxed),
+    ];
+
+    for (durability_name, durability) in durability_cases {
+        group.throughput(Throughput::Elements(case.writes as u64));
+        group.bench_function(BenchmarkId::new(durability_name, case.name), |b| {
+            b.iter_batched(
+                || {
+                    let backend = backend_family.open_empty();
+                    let storage = StorageContext::new(backend);
+                    let writes = canonical_write_set_from_mutations(&mutations);
+                    (storage, writes)
+                },
+                |(storage, writes)| {
+                    let (_commit, stats) = storage
+                        .commit_write_set(
+                            writes,
+                            WriteOptions {
+                                durability,
+                                ..WriteOptions::default()
+                            },
+                        )
+                        .expect("durability matrix commit");
+                    assert_eq!(stats.staged_puts, case.writes as u64);
+                    assert_eq!(stats.put_batches, case.spaces as u64);
                     black_box(stats);
                 },
                 BatchSize::LargeInput,
@@ -3034,6 +3273,159 @@ where
         write.delete_many(&keys)?;
     }
     write.commit()
+}
+
+fn fallback_delete_range<B>(
+    storage: &StorageContext<B>,
+    storage_space: StorageSpace,
+    range: KeyRange,
+    page_size: usize,
+) -> Result<DeleteRangeFallbackStats, String>
+where
+    B: Backend,
+{
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .map_err(|error| error.to_string())?;
+    let mut keys = Vec::new();
+    let mut resume_after = None::<Key>;
+    let mut scanned = 0usize;
+    let mut pages = 0usize;
+
+    loop {
+        let mut page_last_key = None::<Key>;
+        let result = read
+            .visit_scan_range(
+                storage_space,
+                range.clone(),
+                ScanOptions {
+                    limit_rows: page_size,
+                    projection: CoreProjection::KeyOnly,
+                    resume_after: resume_after.as_ref(),
+                },
+                &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                    let key = key.to_owned_key();
+                    page_last_key = Some(key.clone());
+                    keys.push(key);
+                    Ok(())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        scanned += result.emitted;
+        pages += usize::from(result.emitted > 0 || result.has_more);
+        resume_after = page_last_key;
+
+        if !result.has_more {
+            break;
+        }
+    }
+
+    let mut writes = StorageWriteSet::canonical_with_capacity(keys.len(), 1);
+    writes.reserve_space(storage_space, 0, keys.len());
+    for key in keys {
+        writes.stage_canonical_delete(storage_space, key);
+    }
+
+    let (_commit, write_stats) = storage
+        .commit_write_set(writes, WriteOptions::default())
+        .map_err(|error| error.to_string())?;
+    Ok(DeleteRangeFallbackStats {
+        scanned,
+        deleted: write_stats.staged_deletes as usize,
+        pages,
+        write_stats,
+    })
+}
+
+fn drain_scan_materialized<R>(
+    read: &R,
+    storage_space: StorageSpace,
+    range: KeyRange,
+    expected_rows: usize,
+    page_size: usize,
+) -> Result<ScanDrainStats, BackendError>
+where
+    R: StorageReader,
+{
+    let mut resume_after = None::<Key>;
+    let mut stats = ScanDrainStats::default();
+
+    loop {
+        let page = read.scan_range_with_stats(
+            storage_space,
+            range.clone(),
+            ScanOptions {
+                limit_rows: page_size,
+                projection: CoreProjection::KeyOnly,
+                resume_after: resume_after.as_ref(),
+            },
+        )?;
+
+        let entries = &page.value.entries.entries;
+        stats.scanned += entries.len();
+        stats.backend_calls += page.stats.backend_calls;
+        stats.pages += usize::from(!entries.is_empty() || page.value.has_more);
+        resume_after = entries.last().map(|entry| entry.key.clone());
+
+        if !page.value.has_more {
+            break;
+        }
+    }
+
+    assert_eq!(
+        stats.backend_calls,
+        expected_rows.div_ceil(page_size) as u64
+    );
+    Ok(stats)
+}
+
+fn drain_scan_visit<R>(
+    read: &R,
+    storage_space: StorageSpace,
+    range: KeyRange,
+    expected_rows: usize,
+    page_size: usize,
+) -> Result<ScanDrainStats, BackendError>
+where
+    R: StorageReader,
+{
+    let mut resume_after = None::<Key>;
+    let mut stats = ScanDrainStats::default();
+
+    loop {
+        let mut page_last_key = None::<Key>;
+        let result = read.visit_scan_range(
+            storage_space,
+            range.clone(),
+            ScanOptions {
+                limit_rows: page_size,
+                projection: CoreProjection::KeyOnly,
+                resume_after: resume_after.as_ref(),
+            },
+            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                page_last_key = Some(key.to_owned_key());
+                Ok(())
+            },
+        )?;
+
+        stats.scanned += result.emitted;
+        stats.backend_calls += 1;
+        stats.pages += usize::from(result.emitted > 0 || result.has_more);
+        resume_after = page_last_key;
+
+        if !result.has_more {
+            break;
+        }
+    }
+
+    assert_eq!(
+        stats.backend_calls,
+        expected_rows.div_ceil(page_size) as u64
+    );
+    Ok(stats)
 }
 
 fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {

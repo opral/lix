@@ -5104,23 +5104,23 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Construction-only smoke means:
 
-| Case                     | Checked | Canonical | Delta |
-| ------------------------ | ------: | --------: | ----: |
-| puts_k1024_g16_v32       | 31.51 us | 18.54 us | 41% faster |
-| mixed80_20_k1024_g16_v32 | 33.78 us | 19.06 us | 44% faster |
+| Case                     |  Checked | Canonical |      Delta |
+| ------------------------ | -------: | --------: | ---------: |
+| puts_k1024_g16_v32       | 31.51 us |  18.54 us | 41% faster |
+| mixed80_20_k1024_g16_v32 | 33.78 us |  19.06 us | 44% faster |
 
 Build+commit smoke means:
 
-| Backend      | Case                     | Checked | Canonical | Delta |
-| ------------ | ------------------------ | ------: | --------: | ----: |
-| in_memory    | puts_k1024_g16_v32       | 118.33 us | 107.38 us | 9% faster |
-| in_memory    | mixed80_20_k1024_g16_v32 | 136.36 us | 122.27 us | 10% faster |
-| sqlite_temp  | puts_k1024_g16_v32       | 1.01 ms | 1.36 ms | noisy/slower |
-| sqlite_temp  | mixed80_20_k1024_g16_v32 | 939.37 us | 919.37 us | 2% faster |
-| redb_temp    | puts_k1024_g16_v32       | 15.73 ms | 17.18 ms | noisy/slower |
-| redb_temp    | mixed80_20_k1024_g16_v32 | 15.34 ms | 15.25 ms | flat |
-| rocksdb_temp | puts_k1024_g16_v32       | 242.54 us | 223.17 us | 8% faster |
-| rocksdb_temp | mixed80_20_k1024_g16_v32 | 258.44 us | 223.18 us | 14% faster |
+| Backend      | Case                     |   Checked | Canonical |        Delta |
+| ------------ | ------------------------ | --------: | --------: | -----------: |
+| in_memory    | puts_k1024_g16_v32       | 118.33 us | 107.38 us |    9% faster |
+| in_memory    | mixed80_20_k1024_g16_v32 | 136.36 us | 122.27 us |   10% faster |
+| sqlite_temp  | puts_k1024_g16_v32       |   1.01 ms |   1.36 ms | noisy/slower |
+| sqlite_temp  | mixed80_20_k1024_g16_v32 | 939.37 us | 919.37 us |    2% faster |
+| redb_temp    | puts_k1024_g16_v32       |  15.73 ms |  17.18 ms | noisy/slower |
+| redb_temp    | mixed80_20_k1024_g16_v32 |  15.34 ms |  15.25 ms |         flat |
+| rocksdb_temp | puts_k1024_g16_v32       | 242.54 us | 223.17 us |    8% faster |
+| rocksdb_temp | mixed80_20_k1024_g16_v32 | 258.44 us | 223.18 us |   14% faster |
 
 Interpretation:
 
@@ -5159,4 +5159,74 @@ The next likely Big-O/backend-family cuts are:
   2. SQLite prepared statement caching inside backend write/read txns
   3. domain-shaped write workloads to prove canonical builders map to real Lix
      stores rather than only synthetic mutation vectors
+```
+
+## 2026-05-16 - Missing primitive benchmark lanes
+
+Added benchmark groups for the next suspected API cuts:
+
+```text
+storage_v2/delete_range_fallback/<backend>/delete_prefix_q{100,1000,10000}
+storage_v2/scan_pagination/<backend>/{materialized,visit}/drain_range_q10000_page{1,10,100}
+storage_v2/durability_matrix/<backend>/{default,durable,relaxed}/puts_k1024_g16_v32
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/(delete_range_fallback|scan_pagination|durability_matrix)/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)'
+```
+
+Smoke baseline, selected means:
+
+| Group                        | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ---------------------------- | --------: | ----------: | --------: | -----------: |
+| delete prefix q100           |  13.45 us |   815.16 us |  16.71 ms |    160.13 us |
+| delete prefix q1000          | 155.17 us |     1.39 ms |  18.93 ms |    637.65 us |
+| delete prefix q10000         |   1.65 ms |     6.18 ms |  20.66 ms |      2.91 ms |
+| drain page1 materialized     |   3.08 ms |     6.57 ms |   6.98 ms |     12.17 ms |
+| drain page1 visit            |   2.31 ms |     5.89 ms |   6.59 ms |     12.34 ms |
+| drain page10 materialized    | 521.04 us |     1.32 ms |   1.12 ms |      2.32 ms |
+| drain page10 visit           | 432.15 us |     1.16 ms |   1.12 ms |      2.22 ms |
+| drain page100 materialized   | 273.27 us |   766.02 us | 523.79 us |      1.31 ms |
+| drain page100 visit          | 236.74 us |   692.17 us | 455.18 us |      1.45 ms |
+| durability default k1024/g16 |  89.22 us |   956.24 us |  16.65 ms |    251.74 us |
+| durability durable k1024/g16 |  90.92 us |   971.93 us |  16.43 ms |    248.72 us |
+| durability relaxed k1024/g16 |  91.61 us |   999.03 us |  17.62 ms |    225.68 us |
+
+Interpretation:
+
+```text
+delete_range:
+  The fallback path is now visible and scales roughly with deleted rows for
+  in_memory/sqlite/rocksdb. redb is dominated by transaction/commit cost in
+  this smoke shape. This is enough evidence to benchmark a native
+  delete_range/clear_prefix extension next, especially for SQLite and RocksDB.
+
+scan pagination:
+  Tiny page sizes are expensive across all real backends because storage
+  resumes by issuing many range scans. page1 is the stress case. page10/page100
+  are much healthier. This creates the evidence lane needed before considering
+  an optional cursorized scan extension.
+
+durability:
+  WriteOptions::durability is either currently unmapped or within smoke noise
+  for these backends. Before drawing conclusions about redb/sqlite write cost,
+  wire durability policy explicitly and rerun this group.
+```
+
+API conclusion:
+
+```text
+Do not change the read core yet.
+
+The next backend/storage API experiment with clear evidence is:
+  optional delete_range(range) on BackendWrite
+  storage_v2 delete_prefix/delete_range/clear_space helpers
+  fallback = scan key-only pages + delete_many + one commit
+
+Cursorized scans remain a second candidate, but only if domain workloads
+actually drain large ranges with very small page sizes.
 ```
