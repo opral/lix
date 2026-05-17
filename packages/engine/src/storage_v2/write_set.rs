@@ -319,9 +319,9 @@ mod tests {
 
     use crate::backend_v2::{
         Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, ConformanceBackend, GetOptions, Key, KeyRange,
-        PointVisitor, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-        StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+        BufferedRangeScan, CommitResult, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor,
+        PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
+        WriteConcurrency, WriteOptions, WriteStats,
     };
     use crate::storage_v2::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn write_set_rejects_duplicate_final_mutations() {
-        let backend = ConformanceBackend::new();
+        let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
         writes.put(space(1), key("a"), value("A"));
         writes.delete(space(1), key("a"));
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn duplicate_puts_are_rejected() {
-        let backend = ConformanceBackend::new();
+        let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("a"), value("B"));
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn duplicate_deletes_are_rejected() {
-        let backend = ConformanceBackend::new();
+        let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
         writes.delete(space(1), key("a"));
         writes.delete(space(1), key("a"));
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn conflicting_space_declarations_are_rejected() {
-        let backend = ConformanceBackend::new();
+        let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
         writes.put(
             StorageSpace::new(SpaceId(1), "test.space.one"),
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn conflicting_space_declaration_across_extend_is_rejected() {
-        let backend = ConformanceBackend::new();
+        let backend = InMemoryBackend::new();
         let mut left = StorageWriteSet::new();
         left.put(
             StorageSpace::new(SpaceId(1), "test.space.one"),
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn same_key_in_different_spaces_is_allowed() {
-        let backend = ConformanceBackend::new();
+        let backend = InMemoryBackend::new();
         let mut writes = StorageWriteSet::new();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(2), key("a"), value("B"));

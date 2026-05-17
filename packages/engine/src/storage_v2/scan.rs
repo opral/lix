@@ -611,8 +611,8 @@ mod tests {
 
     use super::scan_prefix;
     use crate::backend_v2::{
-        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, ConformanceBackend,
-        GetOptions, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
+        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, GetOptions,
+        InMemoryBackend, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
         ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{ScanPlan, StorageContext, StorageSpace};
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn prefix_scan_limit_zero_returns_empty_page() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("aa"), value("AA"));
         storage

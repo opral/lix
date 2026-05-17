@@ -920,7 +920,7 @@ Backend conformance proves backend correctness. Storage adapter tests should
 prove storage_v2 preserves batching and complexity boundaries.
 
 The current code has an internal storage conformance runner over
-`ConformanceBackend`, plus focused counting-backend unit tests for write-set
+`InMemoryBackend`, plus focused counting-backend unit tests for write-set
 batching, read-shape stats, and failure behavior.
 
 Implemented storage_v2 test themes:

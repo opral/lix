@@ -16,10 +16,9 @@ use criterion::{
 use lix_engine::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
     BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
-    ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef,
-    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix,
+    ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
@@ -580,7 +579,6 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_point_read_indexed_lean_backend(c);
     bench_point_read_planned_lean_backend(c);
     bench_prefix_scan_adapter(c);
-    bench_conformance_backend(c);
     bench_storage_backend_matrix(c, InMemoryBenchBackend);
     bench_storage_backend_matrix(c, SqliteTempBenchBackend::new());
     bench_storage_backend_matrix(c, RedbTempBenchBackend::new());
@@ -1490,94 +1488,6 @@ fn bench_prefix_scan_adapter(c: &mut Criterion) {
             });
         });
     }
-
-    group.finish();
-}
-
-fn bench_conformance_backend(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/conformance_backend");
-
-    group.throughput(Throughput::Elements(1_024));
-    let commit_case = WriteCase {
-        name: "commit_puts_k1024_g16_v32",
-        writes: 1_024,
-        spaces: 16,
-        value_size: 32,
-        mix: WriteMix::PutsOnly,
-    };
-    let commit_mutations = write_mutations(&commit_case);
-    group.bench_function("commit_puts_k1024_g16_v32", |b| {
-        b.iter_batched(
-            || {
-                let backend = ConformanceBackend::new();
-                let storage = StorageContext::new(backend);
-                let mut writes = storage.new_write_set();
-                for mutation in &commit_mutations {
-                    match mutation {
-                        WriteMutation::Put(space, key, value) => {
-                            writes.put(*space, key.clone(), value.clone());
-                        }
-                        WriteMutation::Delete(space, key) => {
-                            writes.delete(*space, key.clone());
-                        }
-                    }
-                }
-                (storage, writes)
-            },
-            |(storage, writes)| {
-                let (_commit, stats) = storage
-                    .commit_write_set(writes, WriteOptions::default())
-                    .expect("commit write set");
-                assert_eq!(stats.staged_puts, 1_024);
-                assert_eq!(stats.put_batches, 16);
-                black_box(stats);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.throughput(Throughput::Elements(1_000));
-    let get_many_backend = seeded_conformance_backend(1, 100);
-    let get_many_read = get_many_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let get_many_read = StorageReadScope::new(get_many_read);
-    let get_many_keys = point_request_keys(1_000, 100);
-    group.bench_function("get_many_m1000_u100", |b| {
-        b.iter(|| {
-            let result = PointReadPlan::new(space(1), black_box(&get_many_keys))
-                .materialize(&get_many_read, GetOptions::default())
-                .expect("point read");
-            assert_eq!(result.stats.requested_keys, 1_000);
-            assert_eq!(result.stats.unique_backend_keys, 100);
-            assert_eq!(result.stats.backend_calls, 1);
-            assert_eq!(result.value.len(), 1_000);
-            black_box(result.value);
-        });
-    });
-
-    group.throughput(Throughput::Elements(1_000));
-    let scan_backend = seeded_conformance_backend(1, 1_000);
-    let scan_read = scan_backend
-        .begin_read(ReadOptions::default())
-        .expect("begin read");
-    let scan_range = physical_point_scan_range(1);
-    group.bench_function("scan_range_q1000", |b| {
-        b.iter(|| {
-            let chunk = materialize_backend_scan(
-                &scan_read,
-                scan_range.clone(),
-                ScanOptions {
-                    limit_rows: 1_001,
-                    projection: CoreProjection::KeyOnly,
-                    ..ScanOptions::default()
-                },
-            )
-            .expect("scan range");
-            assert_eq!(chunk.entries.len(), 1_000);
-            black_box(chunk);
-        });
-    });
 
     group.finish();
 }
@@ -3285,12 +3195,6 @@ impl PointCase {
             .filter(|key| point_key_index(key) >= self.existing_unique_keys)
             .count()
     }
-}
-
-fn seeded_conformance_backend(space_id: u32, rows: u32) -> ConformanceBackend {
-    let backend = ConformanceBackend::new();
-    seed_backend_points(&backend, SpaceId(space_id), rows, 32, "conformance backend");
-    backend
 }
 
 fn seeded_in_memory_backend(space_id: u32, rows: u32) -> InMemoryBackend {

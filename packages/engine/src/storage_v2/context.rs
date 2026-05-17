@@ -84,7 +84,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        ConformanceBackend, GetOptions, Key, ProjectedValue, ReadOptions, SpaceId, StoredValue,
+        GetOptions, InMemoryBackend, Key, ProjectedValue, ReadOptions, SpaceId, StoredValue,
         WriteOptions,
     };
     use crate::storage_v2::{PointReadPlan, StorageContext, StorageSpace};
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn context_commits_write_set_and_reads_through_storage_contract() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn context_read_scope_pins_snapshot_across_later_commits() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         storage
