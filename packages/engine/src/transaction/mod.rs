@@ -1,6 +1,5 @@
 mod commit;
 mod context;
-mod live_state_overlay;
 mod normalization;
 mod prep;
 mod schema_resolver;

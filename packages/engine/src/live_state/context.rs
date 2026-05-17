@@ -3,14 +3,15 @@ use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::visibility;
 use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowFilter,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest,
+    VisibilityVersionScope,
 };
 use crate::storage::StorageReader;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateProjection,
-    TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateScanRequest,
 };
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
@@ -77,25 +78,37 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        if matches!(request.filter.rows, LiveStateRowFilter::None) {
+            return Ok(Vec::new());
+        }
         let mut store = self.store.lock().await;
-        let scope = scan_scope(&mut *store, &self.untracked_state, request).await?;
+        self.scan_rows_with_store(&mut *store, request).await
+    }
+
+    async fn scan_rows_with_store(
+        &self,
+        store: &mut dyn StorageReader,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let scope = scan_scope(store, &self.untracked_state, request).await?;
+        if !request.filter.version_ids.is_empty() && scope.projection_version_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let derived_rows =
-            scan_commit_derived_rows(&mut *store, &self.commit_graph, request, &scope).await?;
+            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut tracked_rows = Vec::new();
         if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
             for version_id in &scope.storage_version_ids {
                 let Some(commit_id) =
-                    load_version_ref_commit_id(&mut *store, &self.untracked_state, version_id)
-                        .await?
+                    load_version_ref_commit_id(store, &self.untracked_state, version_id).await?
                 else {
                     continue;
                 };
                 let tracked_request = tracked_scan_request_from_live(request);
                 let source = tracked_source_from_version_id(version_id);
-                let store: &mut dyn StorageReader = &mut *store;
                 tracked_rows.extend(
                     self.tracked_state
-                        .reader(store)
+                        .reader(&mut *store)
                         .scan_rows_at_commit(&commit_id, &tracked_request)
                         .await?
                         .into_iter()
@@ -105,9 +118,8 @@ where
         }
 
         let untracked_rows = if request.filter.untracked != Some(false) {
-            let store: &mut dyn StorageReader = &mut *store;
             self.untracked_state
-                .reader(store)
+                .reader(&mut *store)
                 .scan_rows(&untracked_scan_request_from_live(
                     request,
                     &scope.storage_version_ids,
@@ -132,14 +144,17 @@ where
                 .chain(derived_rows)
                 .collect()
         };
-        rows = visibility::resolve_scan_rows(
+        rows = resolve_visible_rows(
             rows,
-            &scope.projection_version_ids,
-            request.filter.include_tombstones,
+            Vec::new(),
+            &VisibilityRequest {
+                version_scope: VisibilityVersionScope::VersionIds {
+                    version_ids: scope.projection_version_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            },
         );
-        if let Some(limit) = request.limit {
-            rows.truncate(limit);
-        }
         Ok(rows)
     }
 
@@ -151,84 +166,24 @@ where
         if !version_ref_exists(&mut *store, &self.untracked_state, &request.version_id).await? {
             return Ok(None);
         }
-        if is_commit_derived_schema(&request.schema_key)
-            && request.file_id == NullableKeyFilter::Null
-        {
-            let scope = LiveStateScanScope {
-                storage_version_ids: vec![request.version_id.clone()],
-                projection_version_ids: vec![request.version_id.clone()],
-            };
-            let rows = scan_commit_derived_rows(
+        let rows = self
+            .scan_rows_with_store(
                 &mut *store,
-                &self.commit_graph,
                 &LiveStateScanRequest {
                     filter: crate::live_state::LiveStateFilter {
                         schema_keys: vec![request.schema_key.clone()],
                         entity_ids: vec![request.entity_id.clone()],
                         version_ids: vec![request.version_id.clone()],
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(false),
+                        file_ids: vec![request.file_id.clone()],
                         include_tombstones: false,
                         ..Default::default()
                     },
                     limit: Some(1),
                     ..Default::default()
                 },
-                &scope,
             )
             .await?;
-            if let Some(row) = rows.into_iter().next() {
-                return Ok(Some(row));
-            }
-        }
-        for candidate in load_row_candidates(request) {
-            match candidate.source {
-                LiveStateLookupSource::Untracked => {
-                    let store: &mut dyn StorageReader = &mut *store;
-                    if let Some(row) = self
-                        .untracked_state
-                        .reader(store)
-                        .load_row(&untracked_row_request_from_live(
-                            request,
-                            &candidate.version_id,
-                        ))
-                        .await?
-                    {
-                        return Ok(Some(visibility::project_loaded_row(
-                            MaterializedLiveStateRow::from(row),
-                            &request.version_id,
-                            &candidate.version_id,
-                        )));
-                    }
-                }
-                LiveStateLookupSource::Tracked => {
-                    let Some(commit_id) = load_version_ref_commit_id(
-                        &mut *store,
-                        &self.untracked_state,
-                        &candidate.version_id,
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    let store: &mut dyn StorageReader = &mut *store;
-                    let tracked_request = tracked_row_request_from_live(request);
-                    let mut rows = self
-                        .tracked_state
-                        .reader(store)
-                        .load_rows_at_commit(&commit_id, &[tracked_request])
-                        .await?;
-                    if let Some(row) = rows.pop().flatten() {
-                        return Ok(Some(project_tracked_row(
-                            row,
-                            &request.version_id,
-                            tracked_source_from_version_id(&candidate.version_id),
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(None)
+        Ok(rows.into_iter().next())
     }
 }
 
@@ -452,7 +407,7 @@ async fn scan_scope(
         }
     }
 
-    let storage_version_ids = visibility::expanded_version_ids(&projection_version_ids);
+    let storage_version_ids = expanded_version_ids(&projection_version_ids);
     Ok(LiveStateScanScope {
         storage_version_ids,
         projection_version_ids,
@@ -557,66 +512,6 @@ fn project_tracked_row(
         commit_id: Some(row.commit_id),
         untracked: false,
         version_id: view_version_id.to_string(),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveStateLookupSource {
-    Untracked,
-    Tracked,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveStateLookupCandidate {
-    source: LiveStateLookupSource,
-    version_id: String,
-}
-
-fn load_row_candidates(request: &LiveStateRowRequest) -> Vec<LiveStateLookupCandidate> {
-    let mut candidates = vec![
-        LiveStateLookupCandidate {
-            source: LiveStateLookupSource::Untracked,
-            version_id: request.version_id.clone(),
-        },
-        LiveStateLookupCandidate {
-            source: LiveStateLookupSource::Tracked,
-            version_id: request.version_id.clone(),
-        },
-    ];
-
-    if request.version_id != GLOBAL_VERSION_ID {
-        candidates.extend([
-            LiveStateLookupCandidate {
-                source: LiveStateLookupSource::Untracked,
-                version_id: GLOBAL_VERSION_ID.to_string(),
-            },
-            LiveStateLookupCandidate {
-                source: LiveStateLookupSource::Tracked,
-                version_id: GLOBAL_VERSION_ID.to_string(),
-            },
-        ]);
-    }
-
-    candidates
-}
-
-fn untracked_row_request_from_live(
-    request: &LiveStateRowRequest,
-    version_id: &str,
-) -> crate::untracked_state::UntrackedStateRowRequest {
-    crate::untracked_state::UntrackedStateRowRequest {
-        schema_key: request.schema_key.clone(),
-        version_id: version_id.to_string(),
-        entity_id: request.entity_id.clone(),
-        file_id: request.file_id.clone(),
-    }
-}
-
-fn tracked_row_request_from_live(request: &LiveStateRowRequest) -> TrackedStateRowRequest {
-    TrackedStateRowRequest {
-        schema_key: request.schema_key.clone(),
-        entity_id: request.entity_id.clone(),
-        file_id: request.file_id.clone(),
     }
 }
 
@@ -1087,6 +982,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_row_returns_none_for_missing_version_even_when_identity_exists_elsewhere() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
+        let live_state = live_state_context();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
+                version_ref_row("global", "commit-global"),
+                version_ref_row("version-a", "commit-version-a"),
+                untracked_row_at("version-a", "untracked-version-a"),
+                untracked_row("untracked-global"),
+            ],
+        )
+        .await;
+        transaction.commit().await.expect("commit should persist");
+
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "missing-version")
+            .await
+            .expect("load should succeed");
+
+        assert_eq!(loaded, None);
+    }
+
+    #[tokio::test]
     async fn main_sees_global_row_by_reading_global_root_separately() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
@@ -1501,6 +1425,38 @@ mod tests {
             rows.len(),
             0,
             "global rows must not be projected into a missing version scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_rows_does_not_leak_untracked_rows_into_missing_version() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
+        let live_state = live_state_context();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
+                version_ref_row("global", "commit-global"),
+                version_ref_row("version-a", "commit-version-a"),
+                untracked_row_at("version-a", "untracked-version-a"),
+            ],
+        )
+        .await;
+        transaction.commit().await.expect("commit should persist");
+
+        let rows = scan_selected_tab_at(&live_state, storage.clone(), "missing-version", false)
+            .await
+            .expect("scan should succeed");
+
+        assert_eq!(
+            rows.len(),
+            0,
+            "missing explicit version scope must not become an all-version untracked scan"
         );
     }
 

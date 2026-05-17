@@ -11,6 +11,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 
+use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 use crate::LixError;
 
 #[derive(Debug, Clone)]
@@ -47,24 +48,32 @@ pub(crate) struct InsertColumnIntents {
 }
 
 impl InsertColumnIntents {
-    pub(crate) fn all_explicit() -> Self {
-        Self {
-            explicit_columns: None,
-        }
-    }
-
     pub(crate) fn from_input(input: &Arc<dyn ExecutionPlan>) -> Self {
+        if let Some(explicit_columns) = Self::explicit_columns_from_schema(input) {
+            return Self {
+                explicit_columns: Some(explicit_columns),
+            };
+        }
+
         let Some(projection) = input.as_any().downcast_ref::<ProjectionExec>() else {
             return Self {
                 explicit_columns: None,
             };
         };
 
+        let child_schema = projection.children().first().map(|child| child.schema());
         let explicit_columns = projection
             .expr()
             .iter()
-            .filter(|expr| !is_generated_null_default(expr.expr.as_ref()))
-            .map(|expr| expr.alias.clone())
+            .enumerate()
+            .filter(|(index, expr)| {
+                !is_generated_null_default(expr.expr.as_ref())
+                    && !child_schema
+                        .as_ref()
+                        .and_then(|schema| schema.fields().get(*index))
+                        .is_some_and(|field| field_is_omitted_insert_default(field.as_ref()))
+            })
+            .map(|(_, expr)| expr.alias.clone())
             .collect();
 
         Self {
@@ -72,27 +81,41 @@ impl InsertColumnIntents {
         }
     }
 
+    fn explicit_columns_from_schema(input: &Arc<dyn ExecutionPlan>) -> Option<BTreeSet<String>> {
+        let omitted_columns = input
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| field_is_omitted_insert_default(field.as_ref()))
+            .map(|field| field.name().clone())
+            .collect::<BTreeSet<_>>();
+        if omitted_columns.is_empty() {
+            return None;
+        }
+
+        Some(
+            input
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| !omitted_columns.contains(field.name().as_str()))
+                .map(|field| field.name().clone())
+                .collect(),
+        )
+    }
+
     pub(crate) fn includes_column(&self, column_name: &str) -> bool {
         self.explicit_columns
             .as_ref()
             .is_none_or(|columns| columns.contains(column_name))
     }
+}
 
-    pub(crate) fn cell(
-        &self,
-        batch: &RecordBatch,
-        row_index: usize,
-        column_name: &str,
-    ) -> Result<InsertCell> {
-        if !self.includes_column(column_name) {
-            return Ok(InsertCell::Omitted);
-        }
-
-        optional_scalar_value(batch, row_index, column_name).map(|value| match value {
-            None => InsertCell::Omitted,
-            Some(value) => InsertCell::Provided(SqlCell::from_scalar(value)),
-        })
-    }
+fn field_is_omitted_insert_default(field: &datafusion::arrow::datatypes::Field) -> bool {
+    field
+        .metadata()
+        .get(LIX_INSERT_COLUMN_OMITTED_METADATA_KEY)
+        .is_some_and(|value| value == "true")
 }
 
 pub(crate) fn reject_non_binary_casts_for_insert_column(

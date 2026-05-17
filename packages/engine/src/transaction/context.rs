@@ -12,14 +12,17 @@ use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    overlay_scan_rows, LiveStateContext, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
-use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
+use crate::storage::{
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
+    StorageContext, StorageWriteSet, StorageWriteTransaction,
+};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
-use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
@@ -53,6 +56,7 @@ pub(crate) struct TransactionCommitOutcome;
 /// helpers.
 pub(crate) struct Transaction {
     active_version_id: String,
+    storage: StorageContext,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -133,6 +137,7 @@ impl Transaction {
         Ok(OpenTransaction {
             transaction: Self {
                 active_version_id,
+                storage,
                 live_state,
                 tracked_state,
                 binary_cas,
@@ -702,10 +707,41 @@ impl SqlWriteExecutionContext for Transaction {
         Ok(self.visible_schemas.clone())
     }
 
+    fn storage_context(&self) -> Option<StorageContext> {
+        Some(self.storage.clone())
+    }
+
+    fn commit_store_context(&self) -> Option<Arc<CommitStoreContext>> {
+        Some(Arc::clone(&self.commit_store))
+    }
+
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         self.binary_cas
             .reader(self.storage_transaction.as_mut())
             .load_bytes_many(hashes)
+            .await
+    }
+
+    async fn read_get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
+        self.storage_transaction.as_mut().get_values(request).await
+    }
+
+    async fn read_exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
+        self.storage_transaction.as_mut().exists_many(request).await
+    }
+
+    async fn read_scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+        self.storage_transaction.as_mut().scan_keys(request).await
+    }
+
+    async fn read_scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+        self.storage_transaction.as_mut().scan_values(request).await
+    }
+
+    async fn read_scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+        self.storage_transaction
+            .as_mut()
+            .scan_entries(request)
             .await
     }
 
