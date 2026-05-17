@@ -13,7 +13,9 @@ import readmeMarkdown from "../../../../README.md?raw";
 
 async function loadReadmeContent() {
   const parsed = await parse(readmeMarkdown);
-  return { html: parsed.html };
+  return {
+    html: parsed.html.replaceAll('src="./assets/', 'src="/assets/'),
+  };
 }
 
 export const Route = createFileRoute("/v3")({

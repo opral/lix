@@ -7,6 +7,7 @@
   ],
   "Concepts": [
     { "path": "./schemas.md", "label": "Schemas" },
+    { "path": "./semantic-changes.md", "label": "Semantic Changes" },
     { "path": "./versions.md", "label": "Versions & Merging" },
     { "path": "./history.md", "label": "Change History" },
     { "path": "./surfaces.md", "label": "SQL Surfaces" }

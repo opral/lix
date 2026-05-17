@@ -19,8 +19,6 @@ Lix is an **embeddable version control system** you import as a library. Give ag
 - **SQL interface.** Agents can query history and changes without rereading whole files.
 - **Bring your own backend.** Start in memory, then plug into SQLite, Postgres, S3, Cloudflare, or your own adapter.
 
-<p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://cdn.worldvectorlogo.com/logos/amazon-s3-simple-storage-service.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
-
 ## Getting started
 
 <p>
@@ -55,75 +53,91 @@ const rows = await lix.execute(
 
 ## Why Lix?
 
-AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, branches, reviewable changes, and rollback.
-
 ### Git was not designed to be embedded
+
+AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, branches, reviewable changes, and rollback.
 
 Teams reach for Git, but wrapping it means managing repository directories, worktrees, locks, packfiles, garbage collection, LFS, process calls, protocol servers, and transaction coordination around a tool that expects to live outside the app.
 
-Lix is built the other way around: sessions, branches, history, blobs, and semantic changes live in an engine you embed.
+Lix is built the other way around: version control runs in-process inside your app.
 
 [How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
-### Semantic change (delta) tracking
+### What Lix provides
 
-Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
+#### Import as a library
 
-#### JSON file example
+Import Lix and open it inside your app. No daemon, no protocol.
 
-**Before:**
-```json
-{"theme":"light","notifications":true,"language":"en"}
+```ts
+import { openLix } from "@lix-js/sdk";
+import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+
+const lix = await openLix({
+  backend: createBetterSqlite3Backend({ path: "app.lix" }),
+});
 ```
 
-**After:**
-```json
-{"theme":"dark","notifications":true,"language":"en"}
+#### ACID transactions
+
+Write files, blobs, and history in one transaction.
+
+```ts
+await lix.transaction(async (tx) => {
+  await tx.file.write("/spec.docx", body);
+  await tx.file.write("/spec.png", image);
+});
 ```
 
-**Git sees:**
-```diff
--{"theme":"light","notifications":true,"language":"en"}
-+{"theme":"dark","notifications":true,"language":"en"}
+#### Parallel sessions. No worktrees.
+
+Give every agent its own isolated session without creating Git-style multi-checkout worktrees.
+
+```ts
+const agent1 = await lix.create_session("copy");
+const agent2 = await lix.create_session("pricing");
+const agent3 = await lix.create_session("qa");
+
+await agent1.file.write("/landing.md", copyDraft);
+await agent2.file.write("/plans.json", priceModel);
+await agent3.file.write("/checks/report.json", testRun);
+
+await agent1.commit();
+await agent2.commit();
+await agent3.commit();
 ```
 
-**Lix sees:**
+#### Semantic changes
 
-```diff
-property theme:
-- light
-+ dark
+Unlike Git's line-based diffs, Lix can track structured entities: XLSX rows, DOCX clauses, JSON properties, app records, and more.
+
+```ts
+const changes = await lix.diff({ from: "main", to: draft });
 ```
 
-#### Excel file example
+For example, an agent edits an orders spreadsheet:
 
-The same approach works for binary formats. With an XLSX plugin, Lix shows cell-level changes:
+```text
+Before:
+| order_id | product  | status  |
+| -------- | -------- | ------- |
+| 1001     | Widget A | shipped |
+| 1002     | Widget B | pending |
 
-> **v0.6 status:** entity-level change tracking and the physical storage layout are stable. The file plugin API for writing custom plugins (XLSX, DOCX, PDF, code) is being finalized; see [roadmap](#roadmap).
-
-**Before:**
-```diff
-  | order_id | product  | status  |
-  | -------- | -------- | ------- |
-  | 1001     | Widget A | shipped |
-  | 1002     | Widget B | pending |
+After:
+| order_id | product  | status  |
+| -------- | -------- | ------- |
+| 1001     | Widget A | shipped |
+| 1002     | Widget B | shipped |
 ```
 
-**After:**
-```diff
-  | order_id | product  | status  |
-  | -------- | -------- | ------- |
-  | 1001     | Widget A | shipped |
-  | 1002     | Widget B | shipped |
-```
-
-**Git sees:**
+Git can only tell you the file changed:
 
 ```diff
 -Binary files differ
 ```
 
-**Lix sees:**
+Lix can expose the row field that changed:
 
 ```diff
 order_id 1002 status:
@@ -132,13 +146,13 @@ order_id 1002 status:
 + shipped
 ```
 
-### SQL interface for agents
+[Read more about semantic changes →](https://lix.dev/docs/semantic-changes)
+
+#### SQL interface
 
 Agents burn fewer tokens and keep cleaner context when version-control questions are answered with SQL instead of whole-file rereads.
 
-Instead of loading files back into context, an agent can ask Lix what just changed:
-
-> What changed recently?
+<img src="./assets/claude-sql-question.svg" alt="Claude Code asks: Which orders changed status in this branch? Executing SQL" width="460" />
 
 ```ts
 const rows = await lix.execute(`
@@ -151,14 +165,19 @@ const rows = await lix.execute(`
 
 Every change, across every file and every branch, is a row in `lix_change`. Filter by branch, file, schema, or time without re-reading whole files.
 
-## What you can build with Lix
+#### Bring your own backend
 
-- **AI agent filesystems** - isolated workspaces, branchable explore steps, semantic change history, and rollback when a run goes sideways.
-- **Version control for Postgres & SQLite** - time-travel and branchable schemas on top of an existing database. Reviewable migrations. Diffable rows.
-- **Apps with version control** - add branches, review, rollback, and history to editors, CMSs, design tools, internal ops apps, and AI-native products.
-- **Review for AI-generated changes** - surface what an agent actually changed at the entity level. Approve, request edits, or revert by symbol instead of patch.
+Start in memory, then plug Lix into the infrastructure your app already runs.
 
-## How Lix Works
+<p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://api.iconify.design/logos:aws-s3.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
+
+```ts
+const lix = await openLix({
+  backend: createBackend({ url: env.LIX_BACKEND }),
+});
+```
+
+## How Lix works
 
 Lix runs in-process inside your app.
 
@@ -185,6 +204,13 @@ SQL is the query interface on top. Agents can ask what changed without rereading
 ```
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
+
+## What you can build with Lix
+
+- **AI agent filesystems** - isolated workspaces, branchable explore steps, semantic change history, and rollback when a run goes sideways.
+- **Version control for Postgres & SQLite** - time-travel and branchable schemas on top of an existing database. Reviewable migrations. Diffable rows.
+- **Apps with version control** - add branches, review, rollback, and history to editors, CMSs, design tools, internal ops apps, and AI-native products.
+- **Review for AI-generated changes** - surface what an agent actually changed at the entity level. Approve, request edits, or revert by symbol instead of patch.
 
 ## Roadmap
 
