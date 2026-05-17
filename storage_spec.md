@@ -52,9 +52,9 @@ Backend: backend_v2
   opaque byte values
   visit_many
   visit_range
-  put_many / delete_many
+  put_many / delete_many / delete_range
   begin_read / begin_write
-  atomic commit
+  atomic durable commit
 ```
 
 The clean rule:
@@ -677,11 +677,16 @@ backend write calls:
   at most one put_many and one delete_many per touched storage space
 
 atomic commit:
-  one BackendWrite commit boundary
+  one durable BackendWrite commit boundary
 
 overall write path:
   O(K + G + backend_commit_cost)
 ```
+
+For v0, `storage_v2` assumes the single backend durability policy:
+`Durability::Durable`. Policy choices such as relaxed or backend-default commit
+durability are not part of the MVP storage contract; if they are added later,
+storage-level tests and benches should make the tradeoff explicit.
 
 Domain-store writes:
 

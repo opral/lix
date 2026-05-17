@@ -168,9 +168,7 @@ pub struct SnapshotRef(pub Bytes);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Durability {
     #[default]
-    Default,
     Durable,
-    Relaxed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
