@@ -1,11 +1,8 @@
-use std::collections::BTreeSet;
-
 use crate::sql2::bind::expr::BoundExpr;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FilterSet<T> {
+pub(crate) enum FilterSet {
     All,
-    Some(BTreeSet<T>),
     None,
 }
 

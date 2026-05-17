@@ -40,11 +40,6 @@ impl PublicCatalog {
         Ok(catalog)
     }
 
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn insert(&mut self, surface: PublicSurfaceContract) -> Result<(), LixError> {
         if self.surfaces.contains_key(&surface.name) {
             return Err(LixError::new(

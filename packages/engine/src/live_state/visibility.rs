@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::live_state::{
     LiveStateReader, LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -15,10 +15,7 @@ pub(crate) struct VisibilityRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum VisibilityVersionScope {
-    Active { version_id: String },
-    Explicit { version_ids: BTreeSet<String> },
     VersionIds { version_ids: Vec<String> },
-    Global,
 }
 
 pub(crate) trait StagedLiveStateRows {
@@ -160,27 +157,9 @@ fn resolve_live_state_rows(
     rows
 }
 
-/// Resolves a row loaded through a concrete storage version into the row visible
-/// to the requested version scope.
-fn project_loaded_row(
-    mut row: MaterializedLiveStateRow,
-    requested_version_id: &str,
-    matched_version_id: &str,
-) -> MaterializedLiveStateRow {
-    if row.global && requested_version_id != GLOBAL_VERSION_ID {
-        row.version_id = requested_version_id.to_string();
-    } else if matched_version_id == GLOBAL_VERSION_ID && requested_version_id != GLOBAL_VERSION_ID {
-        row.version_id = requested_version_id.to_string();
-    }
-    row
-}
-
 fn requested_version_ids(version_scope: &VisibilityVersionScope) -> Vec<String> {
     match version_scope {
-        VisibilityVersionScope::Active { version_id } => vec![version_id.clone()],
-        VisibilityVersionScope::Explicit { version_ids } => set_to_vec(version_ids),
         VisibilityVersionScope::VersionIds { version_ids } => version_ids.clone(),
-        VisibilityVersionScope::Global => vec![GLOBAL_VERSION_ID.to_string()],
     }
 }
 
@@ -250,10 +229,6 @@ fn insert_row_preferring_untracked(
             rows_by_identity.insert(identity, row);
         }
     }
-}
-
-fn set_to_vec(values: &BTreeSet<String>) -> Vec<String> {
-    values.iter().cloned().collect()
 }
 
 #[cfg(test)]
@@ -567,28 +542,10 @@ mod tests {
     }
 
     #[test]
-    fn loaded_global_row_is_projected_into_requested_version() {
-        let row = project_loaded_row(
-            row_at(
-                "global",
-                "entity",
-                "global-value",
-                true,
-                Some("change-global"),
-            ),
-            "version-a",
-            "global",
-        );
-
-        assert_eq!(row.version_id, "version-a");
-        assert!(row.global);
-    }
-
-    #[test]
     fn resolve_visible_rows_maps_version_scope_and_applies_limit() {
         let request = VisibilityRequest {
-            version_scope: VisibilityVersionScope::Active {
-                version_id: "version-a".to_string(),
+            version_scope: VisibilityVersionScope::VersionIds {
+                version_ids: vec!["version-a".to_string()],
             },
             include_tombstones: false,
             limit: Some(1),

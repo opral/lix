@@ -24,7 +24,6 @@ pub(crate) enum WriteExecutorPath {
     DataFusion,
 }
 
-#[allow(dead_code)]
 pub(crate) struct WriteLogicalPlan {
     pub(super) plan: LogicalWritePlan,
 }
@@ -43,14 +42,8 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     let visible_schemas = ctx.list_visible_schemas()?;
-    let bound_statement =
+    let bound_write =
         crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;
-    let crate::sql2::BoundStatement::Write(bound_write) = bound_statement else {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "expected SQL write statement after binding",
-        ));
-    };
     let logical_write = crate::sql2::plan_write(bound_write)?;
     Ok(SqlLogicalPlan::Write(WriteLogicalPlan {
         plan: logical_write,
@@ -58,14 +51,6 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
 }
 
 pub(crate) async fn execute_write_logical_plan(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    plan: SqlLogicalPlan,
-    params: &[Value],
-) -> Result<u64, LixError> {
-    execute_write_logical_plan_auto(ctx, plan, params).await
-}
-
-async fn execute_write_logical_plan_auto(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],

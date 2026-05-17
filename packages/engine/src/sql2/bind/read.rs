@@ -5,13 +5,7 @@ use crate::LixError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundRead {
-    pub(crate) source: BoundReadSource,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BoundReadSource {
-    DataFusion,
-    Query(Box<Query>),
+    pub(crate) query: Box<Query>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +30,7 @@ pub(crate) fn bind_statement_route(
 pub(crate) fn bind_read_statement(
     sql: &str,
     statement: &DataFusionStatement,
-) -> Result<BoundRead, LixError> {
+) -> Result<(), LixError> {
     validate_public_read_sql_surface(sql)?;
     if super::classify::classify_datafusion_statement(statement)
         == super::classify::SqlStatementKind::Write
@@ -48,9 +42,7 @@ pub(crate) fn bind_read_statement(
     }
     super::classify::validate_supported_datafusion_statement_ast(statement)?;
     super::public_udf::validate_public_udf_calls_in_datafusion_statement(statement)?;
-    Ok(BoundRead {
-        source: BoundReadSource::DataFusion,
-    })
+    Ok(())
 }
 
 fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {

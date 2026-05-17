@@ -27,8 +27,7 @@ mod version_scope;
 mod write_normalization;
 
 pub(crate) use bind::{
-    bind_read_statement, bind_statement, bind_statement_route, BoundStatement, BoundStatementRoute,
-    SqlStatementKind,
+    bind_read_statement, bind_statement, bind_statement_route, BoundStatementRoute,
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,

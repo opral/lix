@@ -346,7 +346,6 @@ impl TableProvider for LixFileProvider {
             reject_non_binary_casts_for_insert_column(&input, "data", "INSERT into lix_file")?;
         }
         let sink = LixFileInsertSink::new(
-            Arc::clone(&self.schema),
             write_ctx,
             self.functions.clone(),
             self.version_binding.clone(),
@@ -458,7 +457,6 @@ impl std::fmt::Debug for LixFileInsertSink {
 
 impl LixFileInsertSink {
     fn new(
-        _schema: SchemaRef,
         write_ctx: SqlWriteContext,
         functions: FunctionProviderHandle,
         version_binding: VersionBinding,
@@ -3583,7 +3581,6 @@ mod tests {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink = LixFileInsertSink::new(
-            batch.schema(),
             write_ctx,
             test_functions(),
             VersionBinding::explicit(),
@@ -3620,7 +3617,6 @@ mod tests {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink = LixFileInsertSink::new(
-            batch.schema(),
             write_ctx,
             test_functions(),
             VersionBinding::explicit(),
@@ -3680,7 +3676,6 @@ mod tests {
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink = LixFileInsertSink::new(
-            batch.schema(),
             write_ctx,
             test_functions(),
             VersionBinding::explicit(),

@@ -1247,7 +1247,7 @@ mod tests {
             spec.visible_column("meta").map(|column| column.column_type),
             Some(EntityColumnType::Json)
         );
-        assert!(!spec.is_visible_column("lixcol_entity_id"));
+        assert!(spec.visible_column("lixcol_entity_id").is_none());
     }
 
     #[test]

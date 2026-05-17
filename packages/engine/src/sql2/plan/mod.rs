@@ -1,5 +1,4 @@
 pub(crate) mod predicate;
-pub(crate) mod read;
 pub(crate) mod version_scope;
 pub(crate) mod write;
 

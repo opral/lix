@@ -1,37 +1,9 @@
 use std::collections::BTreeMap;
 
-use datafusion::sql::sqlparser::ast::{Delete, Insert, Update};
-
 use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef};
 use super::read::BoundRead;
-use crate::sql2::catalog::PublicCatalog;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::sql2::plan::version_scope::VersionScope;
-use crate::LixError;
-
-pub(crate) fn bind_insert(
-    insert: &Insert,
-    catalog: &PublicCatalog,
-    active_version_id: &str,
-) -> Result<BoundWrite, LixError> {
-    super::statement::bind_insert_bound(insert, catalog, active_version_id)
-}
-
-pub(crate) fn bind_update(
-    update: &Update,
-    catalog: &PublicCatalog,
-    active_version_id: &str,
-) -> Result<BoundWrite, LixError> {
-    super::statement::bind_update_bound(update, catalog, active_version_id)
-}
-
-pub(crate) fn bind_delete(
-    delete: &Delete,
-    catalog: &PublicCatalog,
-    active_version_id: &str,
-) -> Result<BoundWrite, LixError> {
-    super::statement::bind_delete_bound(delete, catalog, active_version_id)
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundWrite {

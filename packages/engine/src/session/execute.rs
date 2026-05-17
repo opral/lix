@@ -437,7 +437,7 @@ impl SessionTransaction {
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
             sql2::BoundStatementRoute::Write => {
-                execute_transaction_write(transaction, statement, params)
+                execute_transaction_write_auto(transaction, statement, params)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
@@ -509,14 +509,6 @@ impl SessionTransaction {
         )
         .await
     }
-}
-
-async fn execute_transaction_write(
-    transaction: &mut crate::transaction::Transaction,
-    statement: datafusion::sql::parser::Statement,
-    params: &[Value],
-) -> Result<ExecuteResult, LixError> {
-    execute_transaction_write_auto(transaction, statement, params).await
 }
 
 async fn execute_transaction_write_auto(

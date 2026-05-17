@@ -24,9 +24,10 @@ pub(crate) use merge::{
     plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
 };
 pub(crate) use storage::{load_delta_pack, DeltaJsonPackIndexesRef};
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use types::TrackedStateRowRequest;
 #[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateProjection, TrackedStateRowRequest,
-    TrackedStateScanRequest,
+    TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateProjection, TrackedStateScanRequest,
 };

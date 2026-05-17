@@ -52,10 +52,6 @@ impl EntitySurfaceSpec {
             .iter()
             .find(|column| column.name == column_name)
     }
-
-    pub(crate) fn is_visible_column(&self, column_name: &str) -> bool {
-        self.visible_column(column_name).is_some()
-    }
 }
 
 pub(crate) fn derive_entity_surface_spec_from_schema(

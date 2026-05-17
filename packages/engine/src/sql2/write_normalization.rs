@@ -48,12 +48,6 @@ pub(crate) struct InsertColumnIntents {
 }
 
 impl InsertColumnIntents {
-    pub(crate) fn all_explicit() -> Self {
-        Self {
-            explicit_columns: None,
-        }
-    }
-
     pub(crate) fn from_input(input: &Arc<dyn ExecutionPlan>) -> Self {
         if let Some(explicit_columns) = Self::explicit_columns_from_schema(input) {
             return Self {
@@ -114,22 +108,6 @@ impl InsertColumnIntents {
         self.explicit_columns
             .as_ref()
             .is_none_or(|columns| columns.contains(column_name))
-    }
-
-    pub(crate) fn cell(
-        &self,
-        batch: &RecordBatch,
-        row_index: usize,
-        column_name: &str,
-    ) -> Result<InsertCell> {
-        if !self.includes_column(column_name) {
-            return Ok(InsertCell::Omitted);
-        }
-
-        optional_scalar_value(batch, row_index, column_name).map(|value| match value {
-            None => InsertCell::Omitted,
-            Some(value) => InsertCell::Provided(SqlCell::from_scalar(value)),
-        })
     }
 }
 

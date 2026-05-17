@@ -49,16 +49,6 @@ impl VersionBinding {
             Self::Explicit => None,
         }
     }
-
-    pub(crate) fn require_active_version_id(&self, action: &str) -> Result<String, LixError> {
-        match self {
-            Self::Active { version_id } => Ok(version_id.clone()),
-            Self::Explicit => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("{action} is only supported for active-version SQL surfaces"),
-            )),
-        }
-    }
 }
 
 pub(crate) fn resolve_write_version_scope(

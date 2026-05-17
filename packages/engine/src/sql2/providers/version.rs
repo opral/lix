@@ -156,7 +156,7 @@ impl TableProvider for LixVersionProvider {
         let write_ctx = self.write_access.require_write("INSERT into lix_version")?;
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
-        let sink = LixVersionInsertSink::new(Arc::clone(&self.schema), write_ctx);
+        let sink = LixVersionInsertSink::new(write_ctx);
         Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
@@ -224,7 +224,7 @@ impl std::fmt::Debug for LixVersionInsertSink {
 }
 
 impl LixVersionInsertSink {
-    fn new(_schema: SchemaRef, write_ctx: SqlWriteContext) -> Self {
+    fn new(write_ctx: SqlWriteContext) -> Self {
         Self { write_ctx }
     }
 }
