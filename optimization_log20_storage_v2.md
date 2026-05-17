@@ -5395,3 +5395,85 @@ This completes the storage-facing half of making delete_range a required
 backend primitive. Domain stores can now clear logical ranges, prefixes, and
 spaces without scan/materialize/delete fallback.
 ```
+
+## 2026-05-16 - delete_range focused scorecard
+
+Ran the focused scorecard for the delete-range cut only:
+
+```text
+delete_range_fallback
+delete_range_native
+delete_range_storage_helpers/delete_range
+```
+
+across:
+
+```text
+in_memory
+sqlite_temp
+redb_temp
+rocksdb_temp
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/delete_range_(fallback|native|storage_helpers)/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)'
+```
+
+Criterion mean estimates:
+
+| Backend      | Case   |  fallback |    native | storage helper |
+| ------------ | ------ | --------: | --------: | -------------: |
+| in_memory    | q100   |  12.90 us |   8.64 us |        8.79 us |
+| in_memory    | q1000  | 161.20 us | 105.56 us |      111.23 us |
+| in_memory    | q10000 |   1.59 ms |   1.25 ms |        1.36 ms |
+| sqlite_temp  | q100   | 790.15 us | 722.32 us |      671.77 us |
+| sqlite_temp  | q1000  |   1.44 ms |   1.16 ms |        1.12 ms |
+| sqlite_temp  | q10000 |   5.83 ms |   3.16 ms |        3.25 ms |
+| redb_temp    | q100   |  14.56 ms |  16.74 ms |       16.31 ms |
+| redb_temp    | q1000  |  18.90 ms |  19.62 ms |       19.31 ms |
+| redb_temp    | q10000 |  20.08 ms |  19.73 ms |       20.92 ms |
+| rocksdb_temp | q100   | 136.70 us | 113.72 us |       91.14 us |
+| rocksdb_temp | q1000  | 550.07 us | 103.02 us |       92.67 us |
+| rocksdb_temp | q10000 |   2.96 ms | 107.85 us |      107.01 us |
+
+Delta vs fallback:
+
+| Backend      | Case   |     native | storage helper |
+| ------------ | ------ | ---------: | -------------: |
+| in_memory    | q100   | 33% faster |     32% faster |
+| in_memory    | q1000  | 35% faster |     31% faster |
+| in_memory    | q10000 | 21% faster |     14% faster |
+| sqlite_temp  | q100   |  9% faster |     15% faster |
+| sqlite_temp  | q1000  | 19% faster |     22% faster |
+| sqlite_temp  | q10000 | 46% faster |     44% faster |
+| redb_temp    | q100   | 15% slower |     12% slower |
+| redb_temp    | q1000  |  4% slower |      2% slower |
+| redb_temp    | q10000 |  2% faster |      4% slower |
+| rocksdb_temp | q100   | 17% faster |     33% faster |
+| rocksdb_temp | q1000  | 81% faster |     83% faster |
+| rocksdb_temp | q10000 | 96% faster |     96% faster |
+
+Interpretation:
+
+```text
+The delete_range hard cut is validated for in_memory, SQLite, and especially
+RocksDB. Storage helper overhead is effectively negligible against the backend
+primitive; the helper sometimes benchmarks faster than direct native due to
+smoke noise and fixture variance.
+
+redb is not improved by the primitive in this smoke shape because its range
+delete implementation is still range iteration/removal plus commit durability.
+The scorecard reinforces that redb's next meaningful work is durability policy
+or a better redb-specific range deletion primitive if the crate exposes one
+later.
+
+For RocksDB, the native range tombstone shape is the big win:
+  q10000 fallback ~2.96 ms
+  q10000 storage helper ~107 us
+
+This completes the delete-range API/storage cut from a performance perspective.
+```

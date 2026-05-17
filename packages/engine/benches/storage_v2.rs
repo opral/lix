@@ -15,11 +15,10 @@ use criterion::{
 };
 use lix_engine::backend_v2::{
     get_many as backend_get_many, Backend, BackendCapabilities, BackendError, BackendRead,
-    BackendWrite, CommitResult, ConformanceBackend, CoreProjection, Durability, GetOptions,
-    InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
-    ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
-    ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    BackendWrite, CommitResult, ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend,
+    Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch,
+    PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor,
+    SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
@@ -541,10 +540,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_scan_pagination_matrix(c, SqliteTempBenchBackend::new());
     bench_scan_pagination_matrix(c, RedbTempBenchBackend::new());
     bench_scan_pagination_matrix(c, RocksDbTempBenchBackend::new());
-    bench_durability_matrix(c, InMemoryBenchBackend);
-    bench_durability_matrix(c, SqliteTempBenchBackend::new());
-    bench_durability_matrix(c, RedbTempBenchBackend::new());
-    bench_durability_matrix(c, RocksDbTempBenchBackend::new());
+    bench_durable_commit(c, InMemoryBenchBackend);
+    bench_durable_commit(c, SqliteTempBenchBackend::new());
+    bench_durable_commit(c, RedbTempBenchBackend::new());
+    bench_durable_commit(c, RocksDbTempBenchBackend::new());
     bench_point_request_plan(c);
     bench_point_read_adapter(c);
     bench_point_read_indexed_adapter(c);
@@ -1178,11 +1177,11 @@ where
     group.finish();
 }
 
-fn bench_durability_matrix<B>(c: &mut Criterion, backend_family: B)
+fn bench_durable_commit<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
 {
-    let group_name = format!("storage_v2/durability_matrix/{}", backend_family.name());
+    let group_name = format!("storage_v2/durable_commit/{}", backend_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -1198,40 +1197,26 @@ where
         mix: WriteMix::PutsOnly,
     };
     let mutations = write_mutations(&case);
-    let durability_cases = [
-        ("default", Durability::Default),
-        ("durable", Durability::Durable),
-        ("relaxed", Durability::Relaxed),
-    ];
-
-    for (durability_name, durability) in durability_cases {
-        group.throughput(Throughput::Elements(case.writes as u64));
-        group.bench_function(BenchmarkId::new(durability_name, case.name), |b| {
-            b.iter_batched(
-                || {
-                    let backend = backend_family.open_empty();
-                    let storage = StorageContext::new(backend);
-                    let writes = canonical_write_set_from_mutations(&mutations);
-                    (storage, writes)
-                },
-                |(storage, writes)| {
-                    let (_commit, stats) = storage
-                        .commit_write_set(
-                            writes,
-                            WriteOptions {
-                                durability,
-                                ..WriteOptions::default()
-                            },
-                        )
-                        .expect("durability matrix commit");
-                    assert_eq!(stats.staged_puts, case.writes as u64);
-                    assert_eq!(stats.put_batches, case.spaces as u64);
-                    black_box(stats);
-                },
-                BatchSize::LargeInput,
-            );
-        });
-    }
+    group.throughput(Throughput::Elements(case.writes as u64));
+    group.bench_function(BenchmarkId::new("durable", case.name), |b| {
+        b.iter_batched(
+            || {
+                let backend = backend_family.open_empty();
+                let storage = StorageContext::new(backend);
+                let writes = canonical_write_set_from_mutations(&mutations);
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("durable commit");
+                assert_eq!(stats.staged_puts, case.writes as u64);
+                assert_eq!(stats.put_batches, case.spaces as u64);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
 
     group.finish();
 }

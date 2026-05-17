@@ -381,7 +381,10 @@ where
         return Ok(ScanResult::default());
     }
 
-    let mut sql = String::from("SELECT key, value FROM entries WHERE 1 = 1");
+    let mut sql = match opts.projection {
+        CoreProjection::KeyOnly => String::from("SELECT key FROM entries WHERE 1 = 1"),
+        CoreProjection::FullValue => String::from("SELECT key, value FROM entries WHERE 1 = 1"),
+    };
     let mut values = Vec::new();
 
     append_bound_sql(&mut sql, &mut values, "key", ">=", ">", &range.lower);
@@ -407,8 +410,13 @@ where
             });
         }
         let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
-        let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
-        visitor.visit(KeyRef(key), project_value_ref(value, opts.projection))?;
+        match opts.projection {
+            CoreProjection::KeyOnly => visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?,
+            CoreProjection::FullValue => {
+                let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
+                visitor.visit(KeyRef(key), ProjectedValueRef::FullValue(value))?;
+            }
+        }
         emitted += 1;
     }
 

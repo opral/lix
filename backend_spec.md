@@ -1132,15 +1132,9 @@ pub struct SnapshotRef(pub Bytes);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Durability {
-    /// Let backend choose.
+    /// Durable before commit returns for non-ephemeral backends.
     #[default]
-    Default,
-
-    /// Durable before commit returns.
     Durable,
-
-    /// May be buffered; only legal for tests or explicit relaxed mode.
-    Relaxed,
 }
 ```
 
@@ -1157,16 +1151,18 @@ ReadOptions {
 
 WriteOptions {
     base_snapshot: None,
-    durability: Durability::Default,
+    durability: Durability::Durable,
     idempotency_key: None,
 }
 ```
 
 Non-default `SnapshotRef`, `ReadConsistency::StaleOk`, `ReadConsistency::Latest`,
-explicit durability modes, `base_snapshot`, and `idempotency_key` are reserved
-extension points until the API exposes a normative way to obtain snapshot refs
-and defines conflict/idempotency semantics. Backends may support them early, but
-the v0 conformance baseline does not require or test them.
+`base_snapshot`, and `idempotency_key` are reserved extension points until the
+API exposes a normative way to obtain snapshot refs and defines
+conflict/idempotency semantics. v0 has one durability policy: commits are
+durable for non-ephemeral backends before `commit` returns. Additional policies
+such as relaxed or backend-default durability may be added later only after they
+are specified and measured against real backends.
 
 ## Zero-Cost Abstraction Path
 
