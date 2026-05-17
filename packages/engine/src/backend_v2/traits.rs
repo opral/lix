@@ -21,9 +21,9 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    type ScanCursor<'cursor>: BackendScanCursor;
+    type RangeScan<'cursor>: BackendRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -32,14 +32,14 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>;
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -53,7 +53,7 @@ pub trait ScanVisitor {
     fn visit(&mut self, key: KeyRef<'_>, value: ProjectedValueRef<'_>) -> Result<(), BackendError>;
 }
 
-pub trait BackendScanCursor {
+pub trait BackendRangeScan {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -64,18 +64,18 @@ pub trait BackendScanCursor {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct BufferedScanCursor {
+pub struct BufferedRangeScan {
     rows: Vec<ReadEntry>,
     position: usize,
 }
 
-impl BufferedScanCursor {
+impl BufferedRangeScan {
     pub fn new(rows: Vec<ReadEntry>) -> Self {
         Self { rows, position: 0 }
     }
 }
 
-impl BackendScanCursor for BufferedScanCursor {
+impl BackendRangeScan for BufferedRangeScan {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -141,7 +141,7 @@ where
     }
 
     let mut values = vec![None::<ProjectedValue>; keys.len()];
-    read.visit_many(
+    read.visit_keys(
         keys,
         opts,
         &mut MaterializingPointVisitor {
@@ -161,7 +161,7 @@ where
     R: BackendRead,
 {
     let limit_rows = opts.limit_rows;
-    read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
+    read.with_range_scan(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 
 impl<F> ScanVisitor for F

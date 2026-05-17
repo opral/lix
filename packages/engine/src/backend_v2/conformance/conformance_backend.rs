@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef,
     PutBatch, ReadEntry, ReadOptions, ScanOptions, StoredValue, WriteConcurrency, WriteOptions,
     WriteStats,
@@ -98,9 +98,9 @@ impl Backend for ConformanceBackend {
 }
 
 impl BackendRead for ConformanceRead {
-    type ScanCursor<'a> = BufferedScanCursor;
+    type RangeScan<'a> = BufferedRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -109,19 +109,19 @@ impl BackendRead for ConformanceRead {
     where
         V: PointVisitor + ?Sized,
     {
-        visit_many_from_map(&self.entries, keys, opts, visitor)
+        visit_keys_from_map(&self.entries, keys, opts, visitor)
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
-        let mut cursor = BufferedScanCursor::new(scan_rows_from_map(&self.entries, range, opts));
+        let mut cursor = BufferedRangeScan::new(scan_rows_from_map(&self.entries, range, opts));
         f(&mut cursor)
     }
 }
@@ -174,7 +174,7 @@ impl ConformanceBackend {
     }
 }
 
-fn visit_many_from_map<V>(
+fn visit_keys_from_map<V>(
     entries: &ConformanceMap,
     keys: &[Key],
     opts: GetOptions<'_>,

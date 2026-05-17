@@ -15,7 +15,7 @@ use criterion::{
 };
 use lix_engine::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
-    BackendError, BackendRead, BackendScanCursor, BackendWrite, BufferedScanCursor, CommitResult,
+    BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
     ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef,
     PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
     ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency,
@@ -2075,7 +2075,7 @@ where
         });
     }
 
-    if should_run("direct_get_many_m1000_u100") || should_run("direct_visit_many_m1000_u100") {
+    if should_run("direct_get_many_m1000_u100") || should_run("direct_visit_keys_m1000_u100") {
         let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 100);
         group.throughput(Throughput::Elements(1_000));
@@ -2099,15 +2099,15 @@ where
             });
         }
 
-        if should_run("direct_visit_many_m1000_u100") {
-            group.bench_function("direct_visit_many_m1000_u100", |b| {
+        if should_run("direct_visit_keys_m1000_u100") {
+            group.bench_function("direct_visit_keys_m1000_u100", |b| {
                 b.iter(|| {
                     let read = point_backend
                         .begin_read(ReadOptions::default())
                         .expect("begin direct point visitor read");
                     let mut visitor = CountingPointVisitor::default();
-                    read.visit_many(black_box(&point_keys), GetOptions::default(), &mut visitor)
-                        .expect("direct visit_many");
+                    read.visit_keys(black_box(&point_keys), GetOptions::default(), &mut visitor)
+                        .expect("direct visit_keys");
                     assert_eq!(visitor.visited, 1_000);
                     read.close().expect("close direct point visitor read");
                     black_box(visitor.visited);
@@ -2116,7 +2116,7 @@ where
         }
     }
 
-    if should_run("direct_get_many_unique_u100") || should_run("direct_visit_many_unique_u100") {
+    if should_run("direct_get_many_unique_u100") || should_run("direct_visit_keys_unique_u100") {
         let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
         let point_keys = physical_point_request_keys(1, 100, 100);
         group.throughput(Throughput::Elements(100));
@@ -2140,15 +2140,15 @@ where
             });
         }
 
-        if should_run("direct_visit_many_unique_u100") {
-            group.bench_function("direct_visit_many_unique_u100", |b| {
+        if should_run("direct_visit_keys_unique_u100") {
+            group.bench_function("direct_visit_keys_unique_u100", |b| {
                 b.iter(|| {
                     let read = point_backend
                         .begin_read(ReadOptions::default())
                         .expect("begin direct unique point visitor read");
                     let mut visitor = CountingPointVisitor::default();
-                    read.visit_many(black_box(&point_keys), GetOptions::default(), &mut visitor)
-                        .expect("direct unique visit_many");
+                    read.visit_keys(black_box(&point_keys), GetOptions::default(), &mut visitor)
+                        .expect("direct unique visit_keys");
                     assert_eq!(visitor.visited, 100);
                     read.close()
                         .expect("close direct unique point visitor read");
@@ -2158,7 +2158,7 @@ where
         }
     }
 
-    if should_run("direct_get_many_unique_u1000") || should_run("direct_visit_many_unique_u1000") {
+    if should_run("direct_get_many_unique_u1000") || should_run("direct_visit_keys_unique_u1000") {
         let point_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
         let point_keys = physical_point_request_keys(1, 1_000, 1_000);
         group.throughput(Throughput::Elements(1_000));
@@ -2182,15 +2182,15 @@ where
             });
         }
 
-        if should_run("direct_visit_many_unique_u1000") {
-            group.bench_function("direct_visit_many_unique_u1000", |b| {
+        if should_run("direct_visit_keys_unique_u1000") {
+            group.bench_function("direct_visit_keys_unique_u1000", |b| {
                 b.iter(|| {
                     let read = point_backend
                         .begin_read(ReadOptions::default())
                         .expect("begin direct unique point visitor read");
                     let mut visitor = CountingPointVisitor::default();
-                    read.visit_many(black_box(&point_keys), GetOptions::default(), &mut visitor)
-                        .expect("direct unique visit_many");
+                    read.visit_keys(black_box(&point_keys), GetOptions::default(), &mut visitor)
+                        .expect("direct unique visit_keys");
                     assert_eq!(visitor.visited, 1_000);
                     read.close()
                         .expect("close direct unique point visitor read");
@@ -3112,9 +3112,9 @@ impl PointReadBackend {
 }
 
 impl BackendRead for PointReadBackend {
-    type ScanCursor<'a> = BufferedScanCursor;
+    type RangeScan<'a> = BufferedRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         _opts: GetOptions<'_>,
@@ -3135,14 +3135,14 @@ impl BackendRead for PointReadBackend {
         Ok(())
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
         _f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         unreachable!("point-read benchmark does not scan")
     }
@@ -3171,9 +3171,9 @@ impl LeanPointReadBackend {
 }
 
 impl BackendRead for LeanPointReadBackend {
-    type ScanCursor<'a> = BufferedScanCursor;
+    type RangeScan<'a> = BufferedRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         _opts: GetOptions<'_>,
@@ -3193,14 +3193,14 @@ impl BackendRead for LeanPointReadBackend {
         Ok(())
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
         _f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         unreachable!("lean point-read benchmark does not scan")
     }
@@ -3229,9 +3229,9 @@ impl PrefixReadBackend {
 }
 
 impl BackendRead for PrefixReadBackend {
-    type ScanCursor<'a> = BufferedScanCursor;
+    type RangeScan<'a> = BufferedRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         _keys: &[Key],
         _opts: GetOptions<'_>,
@@ -3243,22 +3243,22 @@ impl BackendRead for PrefixReadBackend {
         unreachable!("prefix-scan benchmark does not point-read")
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         assert_eq!(range.lower, Bound::Included(key("row-")));
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
         if opts.limit_rows == 0 {
-            let mut cursor = BufferedScanCursor::default();
+            let mut cursor = BufferedRangeScan::default();
             return f(&mut cursor);
         }
-        let mut cursor = BufferedScanCursor::new((*self.entries).clone());
+        let mut cursor = BufferedRangeScan::new((*self.entries).clone());
         f(&mut cursor)
     }
 }
@@ -3267,9 +3267,9 @@ impl BackendRead for PrefixReadBackend {
 struct EmptyRead;
 
 impl BackendRead for EmptyRead {
-    type ScanCursor<'a> = BufferedScanCursor;
+    type RangeScan<'a> = BufferedRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         _keys: &[Key],
         _opts: GetOptions<'_>,
@@ -3281,14 +3281,14 @@ impl BackendRead for EmptyRead {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
         _f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         unreachable!("write-set benchmark does not scan")
     }
@@ -3661,11 +3661,11 @@ where
 
     match scan {
         ScanChunkingMode::Range => {
-            read.with_scan_range_cursor(storage_space, point_scan_range(), opts, |cursor| {
+            read.with_range_scan(storage_space, point_scan_range(), opts, |cursor| {
                 drain_storage_cursor(cursor, chunk_size, &mut stats)
             })?
         }
-        ScanChunkingMode::Prefix => read.with_scan_prefix_cursor(
+        ScanChunkingMode::Prefix => read.with_prefix_scan(
             storage_space,
             Prefix {
                 bytes: Bytes::from_static(b"point-"),
@@ -3683,12 +3683,12 @@ where
 }
 
 fn drain_storage_cursor<C>(
-    cursor: &mut lix_engine::storage_v2::StorageScanCursor<'_, C>,
+    cursor: &mut lix_engine::storage_v2::StorageRangeScan<'_, C>,
     chunk_size: usize,
     stats: &mut ScanDrainStats,
 ) -> Result<(), BackendError>
 where
-    C: BackendScanCursor,
+    C: BackendRangeScan,
 {
     loop {
         let result = cursor.visit_next_with_stats(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
+    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
@@ -36,7 +36,7 @@ pub struct RocksDbRead<'a> {
     snapshot: Snapshot<'a>,
 }
 
-pub struct RocksDbScanCursor<'a> {
+pub struct RocksDbRangeScan<'a> {
     iter: DBIteratorWithThreadMode<'a, DB>,
     bounds: EncodedBounds,
     projection: CoreProjection,
@@ -140,9 +140,9 @@ impl Backend for RocksDbBackend {
 }
 
 impl<'db> BackendRead for RocksDbRead<'db> {
-    type ScanCursor<'cursor> = RocksDbScanCursor<'db>;
+    type RangeScan<'cursor> = RocksDbRangeScan<'db>;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -172,17 +172,17 @@ impl<'db> BackendRead for RocksDbRead<'db> {
         Ok(())
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         let bounds = EncodedBounds::new(range, opts.resume_after);
-        let mut cursor = RocksDbScanCursor {
+        let mut cursor = RocksDbRangeScan {
             iter: self
                 .snapshot
                 .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward)),
@@ -195,7 +195,7 @@ impl<'db> BackendRead for RocksDbRead<'db> {
     }
 }
 
-impl BackendScanCursor for RocksDbScanCursor<'_> {
+impl BackendRangeScan for RocksDbRangeScan<'_> {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -237,7 +237,7 @@ impl BackendScanCursor for RocksDbScanCursor<'_> {
     }
 }
 
-impl RocksDbScanCursor<'_> {
+impl RocksDbRangeScan<'_> {
     fn next_row(&mut self) -> Result<Option<(Box<[u8]>, Box<[u8]>)>, BackendError> {
         if let Some(pending) = self.pending.take() {
             return Ok(Some(pending));

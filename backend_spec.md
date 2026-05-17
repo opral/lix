@@ -37,8 +37,8 @@ The important cut:
 Backend:
   ordered byte keys
   opaque byte values
-visit_many
-with_scan_cursor / cursor.visit_next
+visit_keys
+with_range_scan / cursor.visit_next
 put_many / delete_many
 begin_read / begin_write
 capabilities
@@ -93,8 +93,8 @@ Every v0 backend must support:
 ```text
 begin_read
 begin_write
-visit_many
-with_scan_cursor
+visit_keys
+with_range_scan
 put_many
 delete_many
 delete_range
@@ -188,7 +188,7 @@ Backend author mapping:
 
 ```text
 FoundationDB:
-  visit_many   -> transaction get calls
+  visit_keys   -> transaction get calls
   scan cursor  -> transaction get_range stream
   put_many     -> set
   delete_many  -> clear
@@ -196,7 +196,7 @@ FoundationDB:
   commit       -> commit
 
 RocksDB:
-  visit_many   -> MultiGet
+  visit_keys   -> MultiGet
   scan cursor  -> iterator seek + next
   put_many     -> WriteBatch
   delete_many  -> WriteBatch delete
@@ -204,7 +204,7 @@ RocksDB:
   commit       -> DB::write / Transaction::Commit
 
 SQLite:
-  visit_many   -> SELECT ... WHERE key IN (...)
+  visit_keys   -> SELECT ... WHERE key IN (...)
   scan cursor  -> prepared SELECT ... WHERE key range ORDER BY key
   put_many     -> transaction + batched INSERT/UPDATE
   delete_many  -> transaction + batched DELETE
@@ -320,9 +320,9 @@ space.
 
 ```rust
 pub trait BackendRead {
-    type ScanCursor<'cursor>: BackendScanCursor;
+    type RangeScan<'cursor>: BackendRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -331,14 +331,14 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>;
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -365,7 +365,7 @@ pub trait ScanVisitor {
     ) -> Result<(), BackendError>;
 }
 
-pub trait BackendScanCursor {
+pub trait BackendRangeScan {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -386,7 +386,7 @@ where
     V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
-    read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
+    read.with_range_scan(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 ```
 
@@ -416,10 +416,10 @@ impl Default for GetOptions<'_> {
 }
 ```
 
-`visit_many` is required because point batching is a core backend primitive, not
+`visit_keys` is required because point batching is a core backend primitive, not
 a looping convenience.
 
-V0 `visit_many` calls the visitor once per physical key in the slice passed to
+V0 `visit_keys` calls the visitor once per physical key in the slice passed to
 the backend, in that exact order. Missing keys are passed as `None`.
 
 The visitor-shaped contract keeps backend values borrowed and avoids forcing
@@ -427,7 +427,7 @@ every backend to allocate a materialized point result. Callers already know the
 requested logical keys, and `storage_v2` owns duplicate preservation,
 caller-order reconstruction, and missing-key slots. Storage normally dedupes to
 unique physical keys before calling the backend. Backends must still implement
-`visit_many` as a batched point operation over the requested physical key set,
+`visit_keys` as a batched point operation over the requested physical key set,
 not as a required loop of independent physical reads.
 
 ### Scan Options
@@ -481,7 +481,7 @@ pub struct GetManyResult {
 
 `GetManyResult` is a materialized helper result above the backend core. It is
 useful for conformance tests and simple callers, but backend authors implement
-`visit_many`, not owned `get_many`.
+`visit_keys`, not owned `get_many`.
 
 V0 scans are forward only. Reverse scans, byte limits, predicates, and
 long-lived opaque cursors are extension paths. Storage-level helpers may normalize
@@ -514,7 +514,7 @@ outside the backend trait: it opens a callback-scoped cursor and calls
 The unit of continuation is a scan chunk: `cursor.visit_next(limit_rows,
 visitor)` returns at most `limit_rows` rows from the same opened scan. A backend
 cursor is bound to its read view, range, projection, and initial resume point,
-and it may only be used inside the `with_scan_cursor` callback. It is not a
+and it may only be used inside the `with_range_scan` callback. It is not a
 public, long-lived storage cursor token.
 
 ## Projection / Envelope Extensions
@@ -753,7 +753,7 @@ pub struct BackendCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendProfile {
     /// Ordered byte keys, coherent read views, chunked forward scans,
-    /// batched visit_many, and atomic write commit.
+    /// batched visit_keys, and atomic write commit.
     V0 {
         write_concurrency: WriteConcurrency,
     },
@@ -868,7 +868,7 @@ types and support reporting:
 
 ```rust
 pub trait BackendPushdownExt {
-    fn visit_many_pushdown<V>(
+    fn visit_keys_pushdown<V>(
         &self,
         keys: &[Key],
         opts: PushdownGetOptions<'_>,
@@ -979,7 +979,7 @@ payload_ref = P
 ### Pushdown Support Result
 
 The support structures below belong to pushdown/envelope extension results.
-Core v0 `visit_many` and `with_scan_cursor` / `cursor.visit_next` do not return
+Core v0 `visit_keys` and `with_range_scan` / `cursor.visit_next` do not return
 support metadata.
 
 ```rust
@@ -1223,8 +1223,8 @@ read(ReadPlan) -> ReadChunk
 Make the core look like native backend calls:
 
 ```text
-visit_many
-with_scan_cursor / cursor.visit_next
+visit_keys
+with_range_scan / cursor.visit_next
 put_many
 delete_many
 ```
@@ -1490,8 +1490,8 @@ higher engine layer, not in backend_v2.
 ```text
 begin_read
 begin_write
-visit_many
-with_scan_cursor / cursor.visit_next
+visit_keys
+with_range_scan / cursor.visit_next
 put_many
 delete_many
 commit
@@ -1503,7 +1503,7 @@ Required guarantees:
 ```text
 ordered keys
 coherent read view
-batched visit_many over requested keys
+batched visit_keys over requested keys
 forward row-bounded chunked scans
 key-resume continuation within the same read view
 atomic write commit
@@ -1578,7 +1578,7 @@ packages/engine/src/backend_v2/conformance/
 `baseline.rs` contains the required tests every backend must pass before
 capabilities matter. It validates the v0 invariants: raw lexicographic byte-key
 ordering, opaque byte value preservation, coherent reads pinned across later
-commits, batched `visit_many`, forward row-bounded scans, multi-chunk key-resume
+commits, batched `visit_keys`, forward row-bounded scans, multi-chunk key-resume
 draining without repeats/skips, atomic writes, rollback for
 new/overwrite/delete mutations, and `FullValue`/`KeyOnly`.
 
@@ -1717,9 +1717,9 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    type ScanCursor<'cursor>: BackendScanCursor;
+    type RangeScan<'cursor>: BackendRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -1728,17 +1728,17 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>;
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>;
 }
 
-pub trait BackendScanCursor {
+pub trait BackendRangeScan {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -1759,7 +1759,7 @@ where
     V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
-    read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
+    read.with_range_scan(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 
 pub trait BackendWrite {

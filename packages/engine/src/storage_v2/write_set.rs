@@ -391,8 +391,8 @@ mod tests {
     use std::rc::Rc;
 
     use crate::backend_v2::{
-        Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
-        BufferedScanCursor, CommitResult, ConformanceBackend, GetOptions, Key, KeyRange,
+        Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
+        BufferedRangeScan, CommitResult, ConformanceBackend, GetOptions, Key, KeyRange,
         PointVisitor, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
         StoredValue, WriteConcurrency, WriteOptions, WriteStats,
     };
@@ -841,9 +841,9 @@ mod tests {
     }
 
     impl BackendRead for CountingRead {
-        type ScanCursor<'a> = BufferedScanCursor;
+        type RangeScan<'a> = BufferedRangeScan;
 
-        fn visit_many<V>(
+        fn visit_keys<V>(
             &self,
             _keys: &[Key],
             _opts: GetOptions<'_>,
@@ -855,14 +855,14 @@ mod tests {
             unimplemented!("not used by write-set tests")
         }
 
-        fn with_scan_cursor<T, F>(
+        fn with_range_scan<T, F>(
             &self,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
             _f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
         {
             unimplemented!("not used by write-set tests")
         }

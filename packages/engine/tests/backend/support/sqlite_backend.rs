@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
+    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
@@ -37,7 +37,7 @@ pub struct SqliteRead {
     read_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
-pub struct SqliteScanCursor<'stmt> {
+pub struct SqliteRangeScan<'stmt> {
     rows: Rows<'stmt>,
     projection: CoreProjection,
     pending: Option<SqlitePendingRow>,
@@ -163,9 +163,9 @@ impl Backend for SqliteBackend {
 }
 
 impl BackendRead for SqliteRead {
-    type ScanCursor<'a> = SqliteScanCursor<'a>;
+    type RangeScan<'a> = SqliteRangeScan<'a>;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -174,24 +174,24 @@ impl BackendRead for SqliteRead {
     where
         V: PointVisitor + ?Sized,
     {
-        visit_many(self.conn(), keys, opts, visitor)
+        visit_keys(self.conn(), keys, opts, visitor)
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         let (sql, values) = scan_sql(range, opts)?;
         let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
         let rows = stmt
             .query(rusqlite::params_from_iter(values))
             .map_err(sqlite_error)?;
-        let mut cursor = SqliteScanCursor {
+        let mut cursor = SqliteRangeScan {
             rows,
             projection: opts.projection,
             pending: None,
@@ -205,7 +205,7 @@ impl BackendRead for SqliteRead {
     }
 }
 
-impl BackendScanCursor for SqliteScanCursor<'_> {
+impl BackendRangeScan for SqliteRangeScan<'_> {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -254,7 +254,7 @@ impl BackendScanCursor for SqliteScanCursor<'_> {
     }
 }
 
-impl SqliteScanCursor<'_> {
+impl SqliteRangeScan<'_> {
     fn ensure_pending(&mut self) -> Result<bool, BackendError> {
         if self.pending.is_some() {
             return Ok(true);
@@ -427,7 +427,7 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-fn visit_many<V>(
+fn visit_keys<V>(
     conn: &Connection,
     keys: &[Key],
     opts: GetOptions<'_>,

@@ -5816,3 +5816,60 @@ Given the API simplicity win, keep the single associated cursor unless a fuller
 scorecard shows a durable RocksDB regression large enough to justify more
 complexity.
 ```
+
+## 2026-05-17 - full scan chunking scorecard after unified cursor
+
+Ran the full scan-chunking smoke scorecard after consolidating the scan cursor API.
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'scan_chunking'
+```
+
+Representative Criterion mean estimates for `cursor_visit`:
+
+| Backend      | Case                  | Mean |
+| ------------ | --------------------- | ---: |
+| in_memory    | range single          | 18.75 us |
+| in_memory    | range chunk1          | 115.71 us |
+| in_memory    | range chunk10         | 22.77 us |
+| in_memory    | range chunk100        | 18.59 us |
+| in_memory    | prefix chunk10        | 23.40 us |
+| in_memory    | prefix single         | 18.35 us |
+| sqlite_temp  | range single          | 276.44 us |
+| sqlite_temp  | range chunk1          | 517.81 us |
+| sqlite_temp  | range chunk10         | 296.05 us |
+| sqlite_temp  | range chunk100        | 276.16 us |
+| sqlite_temp  | prefix chunk10        | 316.50 us |
+| sqlite_temp  | prefix single         | 276.95 us |
+| redb_temp    | range single          | 270.42 us |
+| redb_temp    | range chunk1          | 499.33 us |
+| redb_temp    | range chunk10         | 282.21 us |
+| redb_temp    | range chunk100        | 272.27 us |
+| redb_temp    | prefix chunk10        | 274.93 us |
+| redb_temp    | prefix single         | 263.49 us |
+| rocksdb_temp | range single          | 901.34 us |
+| rocksdb_temp | range chunk1          | 931.04 us |
+| rocksdb_temp | range chunk10         | 890.21 us |
+| rocksdb_temp | range chunk100        | 905.94 us |
+| rocksdb_temp | prefix chunk10        | 927.62 us |
+| rocksdb_temp | prefix single         | 877.56 us |
+
+Interpretation:
+
+```text
+The full scan scorecard vindicates the unified cursor API. Cursor drains are the
+winning shape for deep/chunked scans, especially compared with materialized or
+visit paths that re-open the range for every chunk.
+
+RocksDB did not show a durable regression in the full scorecard. Its cursor
+lanes improved versus the prior Criterion baseline across single, chunked, and
+prefix drains. Do not profile RocksDB scan cursor for a regression yet.
+
+The scan API is likely good enough to freeze for now: one callback-scoped cursor
+API, associated cursor type, generic visit_next visitor, storage-owned prefix
+lowering and stats.
+```

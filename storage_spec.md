@@ -52,8 +52,8 @@ Planned storage_v2 optimization extensions:
 Backend: backend_v2
   ordered byte keys
   opaque byte values
-  visit_many
-  with_scan_cursor / cursor.visit_next
+  visit_keys
+  with_range_scan / cursor.visit_next
   put_many / delete_many / delete_range
   begin_read / begin_write
   atomic durable commit
@@ -480,7 +480,7 @@ Point reads:
 ```text
 domain store requests M keys, possibly with duplicates
 storage_v2 may dedupe to U unique keys
-backend_v2 visit_many visits one borrowed value slot per unique/requested backend key
+backend_v2 visit_keys visits one borrowed value slot per unique/requested backend key
 storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
 storage_v2 can return either materialized caller-order values or an indexed
   shape with one value slot per unique key plus requested-slot indexes
@@ -545,7 +545,7 @@ cursor.visit_next(limit_rows, visitor)
 ```
 
 The cursor is backend/read-scope local and may only be used inside the
-`with_scan_cursor` callback. It is not a public resume token, and it does not
+`with_range_scan` callback. It is not a public resume token, and it does not
 relax storage cursor validation rules. Storage still owns logical space
 decoding, prefix-to-range lowering, and scan trace stats around each emitted
 chunk.
@@ -741,7 +741,7 @@ point batch:
   duplicate value slots; materialized point results clone into M caller-order
   slots. A reusable point request plan moves dedupe/index construction out of
   repeated reads with the same key shape. Storage encodes logical keys once per
-  backend request and calls backend visit_many with unique physical keys, so
+  backend request and calls backend visit_keys with unique physical keys, so
   planned reads do not need a returned-entry hash-map step. Storage materializes
   only when the caller asks for owned point values.
 

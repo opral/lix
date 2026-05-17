@@ -9,9 +9,9 @@ use crate::backend_v2::conformance::{
 };
 use crate::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
-    BackendRead, BackendScanCursor, BackendWrite, CoreProjection, GetOptions, Key, KeyRange,
-    KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, SpaceId, WriteOptions,
+    BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
+    ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -585,7 +585,7 @@ where
 
     for limit in [1usize, 2, 3] {
         let mut actual = Vec::new();
-        read.with_scan_cursor(
+        read.with_range_scan(
             range.clone(),
             ScanOptions {
                 limit_rows: limit,
@@ -617,7 +617,7 @@ where
                 Ok(())
             },
         )
-        .map_err(|error| format!("with_scan_cursor limit {limit} failed: {error}"))?;
+        .map_err(|error| format!("with_range_scan limit {limit} failed: {error}"))?;
         if actual != expected {
             return Err(format!(
                 "cursor drain mismatch for limit {limit}: expected {expected:?}, got {actual:?}"

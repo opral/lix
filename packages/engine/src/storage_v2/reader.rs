@@ -578,7 +578,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, BackendScanCursor, BufferedScanCursor, ConformanceBackend,
+        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, ConformanceBackend,
         CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
         ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
         WriteOptions,
@@ -617,9 +617,9 @@ mod tests {
     }
 
     impl BackendRead for SpyRead {
-        type ScanCursor<'a> = BufferedScanCursor;
+        type RangeScan<'a> = BufferedRangeScan;
 
-        fn visit_many<V>(
+        fn visit_keys<V>(
             &self,
             keys: &[Key],
             opts: GetOptions<'_>,
@@ -639,18 +639,18 @@ mod tests {
             Ok(())
         }
 
-        fn with_scan_cursor<T, F>(
+        fn with_range_scan<T, F>(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
             f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
         {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
-            let mut cursor = BufferedScanCursor::default();
+            let mut cursor = BufferedRangeScan::default();
             f(&mut cursor)
         }
     }
@@ -661,9 +661,9 @@ mod tests {
     }
 
     impl BackendRead for RequestedOrderRead {
-        type ScanCursor<'a> = BufferedScanCursor;
+        type RangeScan<'a> = BufferedRangeScan;
 
-        fn visit_many<V>(
+        fn visit_keys<V>(
             &self,
             keys: &[Key],
             _opts: GetOptions<'_>,
@@ -681,14 +681,14 @@ mod tests {
             Ok(())
         }
 
-        fn with_scan_cursor<T, F>(
+        fn with_range_scan<T, F>(
             &self,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
             _f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
         {
             unreachable!("requested-order point-read test does not scan")
         }

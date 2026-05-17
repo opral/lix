@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
+    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
@@ -40,7 +40,7 @@ pub struct RedbRead {
     read: ReadTransaction,
 }
 
-pub struct RedbScanCursor<'a> {
+pub struct RedbRangeScan<'a> {
     rows: RedbRange<'a, &'static [u8], &'static [u8]>,
     projection: CoreProjection,
     pending: Option<RedbPendingRow>,
@@ -140,9 +140,9 @@ impl Backend for RedbBackend {
 }
 
 impl BackendRead for RedbRead {
-    type ScanCursor<'a> = RedbScanCursor<'a>;
+    type RangeScan<'a> = RedbRangeScan<'a>;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -165,21 +165,21 @@ impl BackendRead for RedbRead {
         Ok(())
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
         let (lower, upper) = encoded_bounds(range, opts.resume_after);
         let lower = bound_as_slice(&lower);
         let upper = bound_as_slice(&upper);
         let rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
-        let mut cursor = RedbScanCursor {
+        let mut cursor = RedbRangeScan {
             rows,
             projection: opts.projection,
             pending: None,
@@ -189,7 +189,7 @@ impl BackendRead for RedbRead {
     }
 }
 
-impl BackendScanCursor for RedbScanCursor<'_> {
+impl BackendRangeScan for RedbRangeScan<'_> {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -233,7 +233,7 @@ impl BackendScanCursor for RedbScanCursor<'_> {
     }
 }
 
-impl RedbScanCursor<'_> {
+impl RedbRangeScan<'_> {
     fn ensure_pending(&mut self) -> Result<bool, BackendError> {
         if self.pending.is_some() {
             return Ok(true);

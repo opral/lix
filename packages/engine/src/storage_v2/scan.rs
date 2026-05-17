@@ -42,16 +42,16 @@ pub struct BorrowedScanChunk<'a> {
     pub has_more: bool,
 }
 
-pub struct StorageScanCursor<'a, C> {
+pub struct StorageRangeScan<'a, C> {
     inner: &'a mut C,
     kind: ScanKind,
     projection: CoreProjection,
     chunks_seen: u64,
 }
 
-impl<C> StorageScanCursor<'_, C>
+impl<C> StorageRangeScan<'_, C>
 where
-    C: crate::backend_v2::BackendScanCursor,
+    C: crate::backend_v2::BackendRangeScan,
 {
     pub fn visit_next(
         &mut self,
@@ -138,7 +138,7 @@ where
     Ok(scan_prefix_with_stats(read, space, prefix, opts)?.value)
 }
 
-pub(crate) fn with_scan_range_cursor<R, T, F>(
+pub(crate) fn with_range_scan<R, T, F>(
     read: &R,
     space: SpaceId,
     range: KeyRange,
@@ -147,7 +147,7 @@ pub(crate) fn with_scan_range_cursor<R, T, F>(
 ) -> Result<T, BackendError>
 where
     R: BackendRead,
-    F: FnOnce(&mut StorageScanCursor<'_, R::ScanCursor<'_>>) -> Result<T, BackendError>,
+    F: FnOnce(&mut StorageRangeScan<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
 {
     let storage_space = StorageSpace::new(space, "storage_v2.scan");
     let resume_after = opts.resume_after;
@@ -156,8 +156,8 @@ where
         resume_after: None,
         ..opts
     };
-    read.with_scan_cursor(physical_range, physical_opts, |backend_cursor| {
-        let mut cursor = StorageScanCursor {
+    read.with_range_scan(physical_range, physical_opts, |backend_cursor| {
+        let mut cursor = StorageRangeScan {
             inner: backend_cursor,
             kind: ScanKind::Range,
             projection: opts.projection,
@@ -167,7 +167,7 @@ where
     })
 }
 
-pub(crate) fn with_scan_prefix_cursor<R, T, F>(
+pub(crate) fn with_prefix_scan<R, T, F>(
     read: &R,
     space: SpaceId,
     prefix: Prefix,
@@ -176,9 +176,9 @@ pub(crate) fn with_scan_prefix_cursor<R, T, F>(
 ) -> Result<T, BackendError>
 where
     R: BackendRead,
-    F: FnOnce(&mut StorageScanCursor<'_, R::ScanCursor<'_>>) -> Result<T, BackendError>,
+    F: FnOnce(&mut StorageRangeScan<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
 {
-    with_scan_range_cursor(read, space, prefix.to_range()?, opts, |cursor| {
+    with_range_scan(read, space, prefix.to_range()?, opts, |cursor| {
         cursor.kind = ScanKind::Prefix;
         f(cursor)
     })
@@ -478,7 +478,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, BackendScanCursor, BufferedScanCursor, ConformanceBackend,
+        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, ConformanceBackend,
         GetOptions, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
         ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
@@ -618,9 +618,9 @@ mod tests {
     }
 
     impl BackendRead for CapturingRead {
-        type ScanCursor<'a> = BufferedScanCursor;
+        type RangeScan<'a> = BufferedRangeScan;
 
-        fn visit_many<V>(
+        fn visit_keys<V>(
             &self,
             _keys: &[Key],
             _opts: GetOptions<'_>,
@@ -632,17 +632,17 @@ mod tests {
             unimplemented!("not used by prefix lowering tests")
         }
 
-        fn with_scan_cursor<T, F>(
+        fn with_range_scan<T, F>(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
             f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
         {
             self.range.replace(Some(range));
-            let mut cursor = BufferedScanCursor::default();
+            let mut cursor = BufferedRangeScan::default();
             f(&mut cursor)
         }
     }
