@@ -53,7 +53,7 @@ Backend: backend_v2
   ordered byte keys
   opaque byte values
   visit_many
-  open_scan_cursor / cursor.visit_next
+  with_scan_cursor / cursor.visit_next
   put_many / delete_many / delete_range
   begin_read / begin_write
   atomic durable commit
@@ -538,15 +538,17 @@ Backend scan cursors:
 ```text
 implemented baseline behavior
 
-storage_v2 opens a backend scan cursor for chunked drains and repeatedly calls:
+storage_v2 opens a callback-scoped backend scan cursor for chunked drains and
+repeatedly calls:
 
 cursor.visit_next(limit_rows, visitor)
 ```
 
-The cursor is backend/read-scope local. It is not a public resume token, and it
-does not relax storage cursor validation rules. Storage still owns logical
-space decoding, prefix-to-range lowering, and scan trace stats around each
-emitted chunk.
+The cursor is backend/read-scope local and may only be used inside the
+`with_scan_cursor` callback. It is not a public resume token, and it does not
+relax storage cursor validation rules. Storage still owns logical space
+decoding, prefix-to-range lowering, and scan trace stats around each emitted
+chunk.
 
 Public storage cursors:
 

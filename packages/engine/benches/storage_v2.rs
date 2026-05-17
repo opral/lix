@@ -15,10 +15,11 @@ use criterion::{
 };
 use lix_engine::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
-    BackendError, BackendRead, BackendWrite, BufferedScanCursor, CommitResult, ConformanceBackend,
-    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix,
-    ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    BackendError, BackendRead, BackendScanCursor, BackendWrite, BufferedScanCursor, CommitResult,
+    ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef,
+    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
+    ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
@@ -3111,11 +3112,6 @@ impl PointReadBackend {
 }
 
 impl BackendRead for PointReadBackend {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -3137,11 +3133,15 @@ impl BackendRead for PointReadBackend {
         Ok(())
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        _f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         unreachable!("point-read benchmark does not scan")
     }
 }
@@ -3169,11 +3169,6 @@ impl LeanPointReadBackend {
 }
 
 impl BackendRead for LeanPointReadBackend {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -3194,11 +3189,15 @@ impl BackendRead for LeanPointReadBackend {
         Ok(())
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        _f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         unreachable!("lean point-read benchmark does not scan")
     }
 }
@@ -3226,11 +3225,6 @@ impl PrefixReadBackend {
 }
 
 impl BackendRead for PrefixReadBackend {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         _keys: &[Key],
@@ -3243,17 +3237,23 @@ impl BackendRead for PrefixReadBackend {
         unreachable!("prefix-scan benchmark does not point-read")
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         assert_eq!(range.lower, Bound::Included(key("row-")));
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
         if opts.limit_rows == 0 {
-            return Ok(BufferedScanCursor::default());
+            let mut cursor = BufferedScanCursor::default();
+            return f(&mut cursor);
         }
-        Ok(BufferedScanCursor::new((*self.entries).clone()))
+        let mut cursor = BufferedScanCursor::new((*self.entries).clone());
+        f(&mut cursor)
     }
 }
 
@@ -3261,11 +3261,6 @@ impl BackendRead for PrefixReadBackend {
 struct EmptyRead;
 
 impl BackendRead for EmptyRead {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         _keys: &[Key],
@@ -3278,11 +3273,15 @@ impl BackendRead for EmptyRead {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        _f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         unreachable!("write-set benchmark does not scan")
     }
 }
@@ -3650,37 +3649,41 @@ where
         projection: CoreProjection::KeyOnly,
         resume_after: None,
     };
-    let mut cursor = match scan {
-        ScanChunkingMode::Range => {
-            read.open_scan_range_cursor(storage_space, point_scan_range(), opts)?
+    let mut stats = ScanDrainStats::default();
+    let mut drain = |cursor: &mut lix_engine::storage_v2::StorageScanCursor<'_>| {
+        loop {
+            let result = cursor.visit_next_with_stats(
+                chunk_size,
+                &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                    Ok(())
+                },
+            )?;
+
+            stats.scanned += result.value.emitted;
+            stats.backend_calls += result.stats.backend_calls;
+            stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
+            stats.read_stats.add(result.stats);
+
+            if !result.value.has_more {
+                break;
+            }
         }
-        ScanChunkingMode::Prefix => read.open_scan_prefix_cursor(
+        Ok::<(), BackendError>(())
+    };
+
+    match scan {
+        ScanChunkingMode::Range => {
+            read.with_scan_range_cursor(storage_space, point_scan_range(), opts, &mut drain)?
+        }
+        ScanChunkingMode::Prefix => read.with_scan_prefix_cursor(
             storage_space,
             Prefix {
                 bytes: Bytes::from_static(b"point-"),
             },
             opts,
+            &mut drain,
         )?,
-    };
-    let mut stats = ScanDrainStats::default();
-
-    loop {
-        let result = cursor.visit_next_with_stats(
-            chunk_size,
-            &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                Ok(())
-            },
-        )?;
-
-        stats.scanned += result.value.emitted;
-        stats.backend_calls += result.stats.backend_calls;
-        stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
-        stats.read_stats.add(result.stats);
-
-        if !result.value.has_more {
-            break;
-        }
     }
 
     assert_eq!(

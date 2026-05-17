@@ -8,10 +8,10 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendRead,
-    BackendScanCursor, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
-    ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SpaceId, WriteOptions,
+    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
+    BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
+    ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
+    WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -584,40 +584,40 @@ where
     ];
 
     for limit in [1usize, 2, 3] {
-        let mut cursor = read
-            .open_scan_cursor(
-                range.clone(),
-                ScanOptions {
-                    limit_rows: limit,
-                    ..Default::default()
-                },
-            )
-            .map_err(|error| format!("open_scan_cursor limit {limit} failed: {error}"))?;
         let mut actual = Vec::new();
-        loop {
-            let mut entries = Vec::new();
-            let result = cursor
-                .visit_next(
-                    limit,
-                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+        read.with_scan_cursor(
+            range.clone(),
+            ScanOptions {
+                limit_rows: limit,
+                ..Default::default()
+            },
+            |cursor| {
+                loop {
+                    let mut entries = Vec::new();
+                    let result = cursor.visit_next(limit, &mut |key: KeyRef<'_>,
+                                                                 value: ProjectedValueRef<
+                        '_,
+                    >| {
                         entries.push(ReadEntry {
                             key: key.to_owned_key(),
                             value: value.to_owned(),
                         });
                         Ok(())
-                    },
-                )
-                .map_err(|error| format!("cursor visit_next limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&entries));
-            if !result.has_more {
-                break;
-            }
-            if actual.len() > expected.len() {
-                return Err(format!(
-                    "cursor limit {limit} emitted too many rows: {actual:?}"
-                ));
-            }
-        }
+                    })?;
+                    actual.extend(entries_to_key_values(&entries));
+                    if !result.has_more {
+                        break;
+                    }
+                    if actual.len() > expected.len() {
+                        return Err(BackendError::Io(format!(
+                            "cursor limit {limit} emitted too many rows: {actual:?}"
+                        )));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("with_scan_cursor limit {limit} failed: {error}"))?;
         if actual != expected {
             return Err(format!(
                 "cursor drain mismatch for limit {limit}: expected {expected:?}, got {actual:?}"
