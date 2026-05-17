@@ -1,12 +1,12 @@
-use lix_engine::{Backend, LixError, Value};
+use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt, Engine, ExecuteResult, InitReceipt,
     MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
     SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
 };
+use lix_engine::{LixError, Value};
 
 use super::expect_same::SimulationAssertions;
-use super::kv_backend::InMemoryKvBackend;
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 
@@ -15,7 +15,7 @@ use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 pub struct Simulation {
     mode: SimulationMode,
     #[allow(dead_code)]
-    backend: InMemoryKvBackend,
+    backend: InMemoryBackend,
     engine: Engine,
     receipt: InitReceipt,
     rebuild_tracked_state: RebuildTrackedStateSimulation,
@@ -27,12 +27,11 @@ impl Simulation {
     pub(super) async fn from_bootstrap(
         mode: SimulationMode,
         options: SimulationOptions,
-        snapshot: super::kv_backend::KvMap,
+        backend: InMemoryBackend,
         receipt: InitReceipt,
         assertions: SimulationAssertions,
     ) -> Result<Self, LixError> {
-        let backend = InMemoryKvBackend::from_snapshot(snapshot);
-        let engine = Engine::new(Box::new(backend.clone())).await?;
+        let engine = Engine::new(backend.clone()).await?;
         if options.deterministic {
             super::macro_runtime::enable_deterministic_mode(&engine, &receipt, mode).await?;
         }
@@ -58,10 +57,7 @@ impl Simulation {
     /// same repository. It lets tests distinguish persisted workspace state
     /// from in-memory session state.
     pub async fn reboot_engine_from_current_snapshot(&self) -> Result<Engine, LixError> {
-        Engine::new(Box::new(InMemoryKvBackend::from_snapshot(
-            self.backend.snapshot(),
-        )))
-        .await
+        Engine::new(self.backend.clone()).await
     }
 
     /// Wraps a normal engine session with simulation hooks.
@@ -74,8 +70,8 @@ impl Simulation {
     }
 
     /// Returns a fresh, empty backend for lifecycle tests.
-    pub fn uninitialized_backend(&self) -> Box<dyn Backend + Send + Sync> {
-        Box::new(InMemoryKvBackend::new())
+    pub fn uninitialized_backend(&self) -> InMemoryBackend {
+        InMemoryBackend::new()
     }
 
     /// Returns the initialized Lix id.

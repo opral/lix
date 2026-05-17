@@ -1,4 +1,4 @@
-use crate::backend_v2::{
+use crate::backend::{
     BackendCapabilities, BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange,
     KeyRef, ProjectedValue, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions,
     ScanResult, WriteOptions,

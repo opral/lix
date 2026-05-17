@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::storage::StorageBackend;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
@@ -23,7 +24,12 @@ pub struct SwitchVersionReceipt {
     pub version_id: String,
 }
 
-impl SessionContext {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Switches the session's active version selector.
     ///
     /// Pinned sessions switch in memory and return a new pinned session.
@@ -32,7 +38,7 @@ impl SessionContext {
     pub async fn switch_version(
         &self,
         options: SwitchVersionOptions,
-    ) -> Result<(SessionContext, SwitchVersionReceipt), LixError> {
+    ) -> Result<(SessionContext<B>, SwitchVersionReceipt), LixError> {
         let version_id = options.version_id;
         let receipt_version_id = version_id.clone();
         let current_mode = self.mode.clone();

@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{Key, KeyRange, Prefix};
+use crate::backend::{Key, KeyRange, Prefix};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendPredicate {

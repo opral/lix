@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit_store::CommitStoreContext;
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
@@ -41,7 +41,7 @@ impl TrackedStateContext {
     /// Creates a commit-id-addressed tracked-state reader.
     pub(crate) fn reader<S>(&self, store: S) -> TrackedStateStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead + Send + Sync,
     {
         TrackedStateStoreReader {
             store,
@@ -53,11 +53,11 @@ impl TrackedStateContext {
     /// Creates a tracked-state writer over a caller-owned transaction and write set.
     pub(crate) fn writer<'a, S>(
         &'a self,
-        store: &'a mut S,
+        store: &'a S,
         writes: &'a mut StorageWriteSet,
     ) -> TrackedStateWriter<'a, S>
     where
-        S: StorageReader + ?Sized,
+        S: StorageRead + Send + Sync + ?Sized,
     {
         TrackedStateWriter {
             tree: self.tree.clone(),
@@ -72,12 +72,12 @@ impl TrackedStateContext {
     /// projection root is a caller-chosen maintenance/read-acceleration step.
     pub(crate) fn materializer<'a, S>(
         &'a self,
-        store: &'a mut S,
+        store: &'a S,
         writes: &'a mut StorageWriteSet,
         commit_store: &'a CommitStoreContext,
     ) -> TrackedStateMaterializer<'a, S>
     where
-        S: StorageReader + ?Sized,
+        S: StorageRead + Send + Sync + ?Sized,
     {
         TrackedStateMaterializer {
             tracked_state: self,
@@ -97,7 +97,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
 
 impl<S> TrackedStateStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     pub(crate) async fn scan_rows_at_commit(
         &mut self,
@@ -706,21 +706,21 @@ where
 /// Writer for commit-store-backed tracked-state projection roots.
 pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     tree: TrackedStateTree,
-    store: &'a mut S,
+    store: &'a S,
     writes: &'a mut StorageWriteSet,
 }
 
 /// Explicit projection-root materializer created by `TrackedStateContext`.
 pub(crate) struct TrackedStateMaterializer<'a, S: ?Sized> {
     pub(super) tracked_state: &'a TrackedStateContext,
-    pub(super) store: &'a mut S,
+    pub(super) store: &'a S,
     pub(super) writes: &'a mut StorageWriteSet,
     pub(super) commit_store: &'a CommitStoreContext,
 }
 
 impl<S> TrackedStateMaterializer<'_, S>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + Send + Sync + ?Sized,
 {
     pub(crate) async fn materialize_root_at(
         &mut self,
@@ -732,7 +732,7 @@ where
 
 impl<S> TrackedStateWriter<'_, S>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + Send + Sync + ?Sized,
 {
     /// Stages one tracked-state projection delta for `commit_id`.
     pub(crate) async fn stage_delta(
@@ -945,25 +945,18 @@ fn tracked_key_from_request(request: &TrackedStateRowRequest) -> Result<TrackedS
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend};
-    use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::NullableKeyFilter;
 
     #[tokio::test]
     async fn stage_delta_does_not_require_parent_projection_root() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-child",
             Some("missing-parent"),
@@ -988,7 +981,11 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .plan_merge(
                 "base",
                 "target",
@@ -1012,7 +1009,11 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .plan_merge(
                 "base",
                 "target",
@@ -1046,7 +1047,11 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .plan_merge(
                 "base",
                 "target",
@@ -1070,7 +1075,11 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .plan_merge(
                 "base",
                 "target",
@@ -1087,20 +1096,14 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_by_file_uses_file_index_shape() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let mut file_a = row("entity-a", "change-a", "commit-1");
         file_a.file_id = Some("file-a.json".to_string());
         let mut file_b = row("entity-b", "change-b", "commit-1");
         file_b.file_id = Some("file-b.json".to_string());
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1108,13 +1111,13 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -1141,19 +1144,13 @@ mod tests {
 
     #[tokio::test]
     async fn by_file_header_index_fetches_primary_payload_only_when_requested() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let mut row = row("entity-a", "change-a", "commit-1");
         row.file_id = Some("file-a.json".to_string());
         let expected_snapshot = row.snapshot_content.clone();
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1161,12 +1158,12 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
-        let mut reader = tracked_state.reader(storage.clone());
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let header_rows = reader
             .scan_rows_at_commit(
                 "commit-1",
@@ -1203,17 +1200,11 @@ mod tests {
 
     #[tokio::test]
     async fn null_file_rows_do_not_stage_by_file_index() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let row = row("entity-a", "change-a", "commit-1");
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1221,18 +1212,23 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
-        let by_file_root = storage::load_by_file_root(&mut storage.clone(), "commit-1")
-            .await
-            .expect("by-file root lookup should load");
+        let by_file_root = storage::load_by_file_root(
+            &storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+            "commit-1",
+        )
+        .await
+        .expect("by-file root lookup should load");
         assert!(by_file_root.is_none());
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -1258,19 +1254,13 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_null_and_concrete_file_scan_uses_primary_tree() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let null_row = row("entity-null", "change-null", "commit-1");
         let mut file_row = row("entity-file", "change-file", "commit-2");
         file_row.file_id = Some("file-a.json".to_string());
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1279,7 +1269,7 @@ mod tests {
         .await
         .expect("parent root should write");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-2",
             Some("commit-1"),
@@ -1287,13 +1277,13 @@ mod tests {
         )
         .await
         .expect("child root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-2",
                 &TrackedStateScanRequest {
@@ -1320,34 +1310,22 @@ mod tests {
 
     #[tokio::test]
     async fn by_file_header_index_filters_tombstones_without_payload_sentinel() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let mut live = row("entity-live", "change-live", "commit-1");
         live.file_id = Some("file-a.json".to_string());
         let mut deleted = tombstone("entity-deleted", "change-delete", "commit-1");
         deleted.file_id = Some("file-a.json".to_string());
-
-        let mut transaction = storage
-            .begin_write_transaction()
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &[live, deleted])
             .await
-            .expect("transaction should open");
-        write_root_for_test(
-            transaction.as_mut(),
-            &tracked_state,
-            "commit-1",
-            None,
-            &[live, deleted],
-        )
-        .await
-        .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+            .expect("root should write");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -1376,18 +1354,12 @@ mod tests {
 
     #[tokio::test]
     async fn pending_tombstone_delta_hides_materialized_base_row() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let base = row("entity-a", "change-base", "base");
         let delete = tombstone("entity-a", "change-delete", "child");
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("base transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "base",
             None,
@@ -1395,37 +1367,20 @@ mod tests {
         )
         .await
         .expect("base delta should write");
-        transaction.commit().await.expect("base should commit");
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("materialize transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         tracked_state
-            .materializer(
-                transaction.as_mut(),
-                &mut writes,
-                &CommitStoreContext::new(),
-            )
+            .materializer(&read, &mut writes, &CommitStoreContext::new())
             .materialize_root_at("base")
             .await
             .expect("base projection root should materialize");
-        writes
-            .apply(transaction.as_mut())
-            .await
-            .expect("base root writes should apply");
-        transaction
-            .commit()
-            .await
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
             .expect("materialized base should commit");
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("child transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "child",
             Some("base"),
@@ -1433,10 +1388,13 @@ mod tests {
         )
         .await
         .expect("child tombstone delta should write");
-        transaction.commit().await.expect("child should commit");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit("child", &TrackedStateScanRequest::default())
             .await
             .expect("child scan should apply pending tombstone over base root");
@@ -1446,16 +1404,10 @@ mod tests {
 
     #[tokio::test]
     async fn single_delta_pack_scan_keeps_last_delta_for_duplicate_key() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1468,13 +1420,13 @@ mod tests {
         )
         .await
         .expect("delta pack should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit("commit-1", &TrackedStateScanRequest::default())
             .await
             .expect("single delta pack should scan");
@@ -1502,16 +1454,10 @@ mod tests {
 
     #[tokio::test]
     async fn scan_limit_applies_after_tombstone_visibility() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1522,13 +1468,13 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -1551,34 +1497,22 @@ mod tests {
 
     #[tokio::test]
     async fn by_file_scan_limit_applies_after_tombstone_visibility() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let mut deleted = tombstone("entity-a", "change-delete", "commit-1");
         deleted.file_id = Some("file-a.json".to_string());
         let mut live = row("entity-b", "change-live", "commit-1");
         live.file_id = Some("file-a.json".to_string());
-
-        let mut transaction = storage
-            .begin_write_transaction()
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &[deleted, live])
             .await
-            .expect("transaction should open");
-        write_root_for_test(
-            transaction.as_mut(),
-            &tracked_state,
-            "commit-1",
-            None,
-            &[deleted, live],
-        )
-        .await
-        .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+            .expect("root should write");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -1607,18 +1541,12 @@ mod tests {
 
     #[tokio::test]
     async fn reads_resolve_json_snapshot_refs() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1626,12 +1554,12 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
-        let mut reader = tracked_state.reader(storage.clone());
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let loaded = reader
             .load_rows_at_commit(
                 "commit-1",
@@ -1657,19 +1585,13 @@ mod tests {
 
     #[tokio::test]
     async fn projection_cache_uses_seen_updated_at_not_change_created_at() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let mut row = row("entity-a", "change-a", "commit-1");
         row.created_at = "2026-01-01T00:00:00Z".to_string();
         row.updated_at = "2026-01-02T00:00:00Z".to_string();
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1677,13 +1599,13 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
         let loaded = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_rows_at_commit(
                 "commit-1",
                 &[TrackedStateRowRequest {
@@ -1704,18 +1626,12 @@ mod tests {
 
     #[tokio::test]
     async fn projected_scans_do_not_materialize_snapshot_when_snapshot_content_is_omitted() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
-
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         write_root_for_test(
-            transaction.as_mut(),
+            &storage,
             &tracked_state,
             "commit-1",
             None,
@@ -1723,13 +1639,13 @@ mod tests {
         )
         .await
         .expect("root should write");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -1751,44 +1667,17 @@ mod tests {
         target_rows: &[MaterializedTrackedStateRow],
         source_rows: &[MaterializedTrackedStateRow],
     ) -> (StorageContext, TrackedStateContext) {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut transaction = storage
-            .begin_write_transaction()
+        write_root_for_test(&storage, &tracked_state, "base", None, base_rows)
             .await
-            .expect("transaction should open");
-        write_root_for_test(
-            transaction.as_mut(),
-            &tracked_state,
-            "base",
-            None,
-            base_rows,
-        )
-        .await
-        .expect("base root should write");
-        write_root_for_test(
-            transaction.as_mut(),
-            &tracked_state,
-            "target",
-            None,
-            target_rows,
-        )
-        .await
-        .expect("target root should write");
-        write_root_for_test(
-            transaction.as_mut(),
-            &tracked_state,
-            "source",
-            None,
-            source_rows,
-        )
-        .await
-        .expect("source root should write");
-        transaction
-            .commit()
+            .expect("base root should write");
+        write_root_for_test(&storage, &tracked_state, "target", None, target_rows)
             .await
-            .expect("transaction should commit");
+            .expect("target root should write");
+        write_root_for_test(&storage, &tracked_state, "source", None, source_rows)
+            .await
+            .expect("source root should write");
         (storage, tracked_state)
     }
 
@@ -1819,20 +1708,27 @@ mod tests {
     }
 
     async fn write_root_for_test(
-        transaction: &mut dyn StorageWriteTransaction,
+        storage: &StorageContext,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
         rows: &[MaterializedTrackedStateRow],
     ) -> Result<(), LixError> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         crate::test_support::stage_tracked_root_from_materialized(
-            transaction,
+            &read,
+            &mut writes,
             tracked_state,
             commit_id,
             parent_commit_id,
             rows,
         )
-        .await
+        .await?;
+        storage.commit_write_set(writes, StorageWriteOptions::default())?;
+        Ok(())
     }
 
     fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {

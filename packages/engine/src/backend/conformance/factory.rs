@@ -1,4 +1,4 @@
-use crate::backend_v2::{Backend, BackendCapabilities, BackendError, ReadOptions, WriteOptions};
+use crate::backend::{Backend, BackendCapabilities, BackendError, ReadOptions, WriteOptions};
 
 pub trait BackendFactory {
     type Backend: Backend;

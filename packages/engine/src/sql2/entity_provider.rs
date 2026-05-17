@@ -57,17 +57,21 @@ use crate::sql2::{
     SqlCommitStoreQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
     WriteContextVersionRefReader,
 };
+use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
-pub(crate) async fn register_entity_providers(
+pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     schema_definitions: &[JsonValue],
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     for schema in schema_definitions {
         let spec = match derive_entity_surface_spec_from_schema(schema) {
             Ok(spec) => Arc::new(spec),

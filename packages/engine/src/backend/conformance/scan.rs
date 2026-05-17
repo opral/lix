@@ -1,4 +1,4 @@
-use crate::backend_v2::conformance::{BackendFactory, ConformanceReport};
+use crate::backend::conformance::{BackendFactory, ConformanceReport};
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
 where

@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use lix_engine::backend_v2::{
+use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
 };
-use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
+use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
 use rusqlite::{params, Connection, Rows};
 use tempfile::TempDir;
@@ -63,7 +63,7 @@ impl SqliteBackendFactory {
     }
 }
 
-impl BackendV2Factory for SqliteBackendFactory {
+impl BackendFactory for SqliteBackendFactory {
     type Backend = SqliteBackend;
     type Fixture = SqliteBackendFixture;
 
@@ -76,16 +76,16 @@ impl BackendV2Factory for SqliteBackendFactory {
         SqliteBackendFixture { path }
     }
 
-    fn config(&self) -> BackendV2TestConfig {
-        BackendV2TestConfig {
+    fn config(&self) -> BackendTestConfig {
+        BackendTestConfig {
             ephemeral: false,
             supports_concurrent_writers: false,
-            ..BackendV2TestConfig::default()
+            ..BackendTestConfig::default()
         }
     }
 }
 
-impl BackendV2Fixture for SqliteBackendFixture {
+impl BackendFixture for SqliteBackendFixture {
     type Backend = SqliteBackend;
 
     fn open(&self) -> Self::Backend {

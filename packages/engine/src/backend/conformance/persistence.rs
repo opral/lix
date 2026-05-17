@@ -1,8 +1,8 @@
-use crate::backend_v2::conformance::{
+use crate::backend::conformance::{
     fixtures::{full_put, key, put_batch, space},
     BackendFactory, BackendFixture, ConformanceReport, ConformanceResult,
 };
-use crate::backend_v2::{
+use crate::backend::{
     get_many as backend_get_many, Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions,
     WriteOptions,
 };
@@ -139,8 +139,8 @@ where
 
 fn assert_full_values<B>(
     backend: &B,
-    _test_space: crate::backend_v2::SpaceId,
-    expected: &[(crate::backend_v2::Key, Option<&str>)],
+    _test_space: crate::backend::SpaceId,
+    expected: &[(crate::backend::Key, Option<&str>)],
 ) -> ConformanceResult
 where
     B: Backend,

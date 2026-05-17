@@ -1,7 +1,7 @@
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
-use crate::storage::StorageReader;
+use crate::storage::StorageRead;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::LixError;
@@ -14,12 +14,12 @@ use std::collections::BTreeMap;
 /// metadata bytes are hydrated from grouped json_store loads only when the
 /// requested projection needs them.
 pub(crate) async fn materialize_index_entries<S>(
-    store: &mut S,
+    store: &S,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     projection: &TrackedMaterializationProjection,
 ) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     if !projection.snapshot_content && !projection.metadata {
         return Ok(entries
@@ -127,13 +127,13 @@ struct JsonRefLocality {
 }
 
 async fn load_projection_json_values<S>(
-    store: &mut S,
+    store: &S,
     json_refs: &[JsonRef],
     json_ref_localities: &[JsonRefLocality],
     row_plans: &[MaterializedTrackedStateRowPlan],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     if json_refs.len() != json_ref_localities.len() {
         return Err(LixError::new(

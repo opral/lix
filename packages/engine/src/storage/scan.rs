@@ -1,9 +1,9 @@
-use crate::backend_v2::{
+use crate::backend::{
     visit_range as backend_visit_range, BackendError, BackendRead, CoreProjection, Key, KeyRange,
     KeyRef, Prefix, ProjectedValueRef, ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
     SpaceId,
 };
-use crate::storage_v2::{
+use crate::storage::{
     decode_logical_key_ref, StorageRead, StorageReadResult, StorageReadStats, StorageSpace,
 };
 
@@ -185,7 +185,7 @@ impl ScanPlan {
 
 impl<C> ScanCursor<'_, C>
 where
-    C: crate::backend_v2::BackendRangeScan,
+    C: crate::backend::BackendRangeScan,
 {
     pub fn visit_next(
         &mut self,
@@ -283,7 +283,7 @@ where
     R: BackendRead,
     F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
 {
-    let storage_space = StorageSpace::new(space, "storage_v2.scan");
+    let storage_space = StorageSpace::new(space, "storage.scan");
     let resume_after = opts.resume_after;
     let physical_range = storage_space.encode_range(range, resume_after);
     let physical_opts = ScanOptions {
@@ -364,7 +364,7 @@ where
             .reserve(opts.limit_rows - buffer.entries.capacity());
     }
 
-    let storage_space = StorageSpace::new(space, "storage_v2.scan");
+    let storage_space = StorageSpace::new(space, "storage.scan");
     let resume_after = opts.resume_after;
     let physical_range = storage_space.encode_range(range, resume_after);
     let physical_opts = ScanOptions {
@@ -424,7 +424,7 @@ where
         ));
     }
 
-    let storage_space = StorageSpace::new(space, "storage_v2.scan");
+    let storage_space = StorageSpace::new(space, "storage.scan");
     let resume_after = opts.resume_after;
     let physical_range = storage_space.encode_range(range, resume_after);
     let physical_opts = ScanOptions {
@@ -610,12 +610,12 @@ mod tests {
     use bytes::Bytes;
 
     use super::scan_prefix;
-    use crate::backend_v2::{
+    use crate::backend::{
         BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, GetOptions,
         InMemoryBackend, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
         ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
-    use crate::storage_v2::{ScanPlan, StorageContext, StorageSpace};
+    use crate::storage::{ScanPlan, StorageContext, StorageSpace};
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))

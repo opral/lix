@@ -18,9 +18,10 @@ use super::udfs::register_sql2_functions;
 use super::version_provider::{register_lix_version_provider, register_lix_version_write_provider};
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
-pub(crate) async fn build_read_session(
-    ctx: &dyn SqlExecutionContext,
-) -> Result<SessionContext, LixError> {
+pub(crate) async fn build_read_session<C>(ctx: &C) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let session = new_sql_session_context();
     let version_ref = ctx.version_ref();
     let active_version_commit_id = version_ref

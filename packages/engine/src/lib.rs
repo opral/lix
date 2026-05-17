@@ -1,5 +1,4 @@
-mod backend;
-pub mod backend_v2;
+pub mod backend;
 mod binary_cas;
 pub(crate) mod catalog;
 pub(crate) mod cel;
@@ -19,15 +18,9 @@ mod schema;
 pub mod session;
 pub(crate) mod sql2;
 #[allow(dead_code, unused_imports)]
-pub(crate) mod storage;
+pub mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
-#[allow(dead_code, unused_imports)]
-#[cfg(not(feature = "storage-benches"))]
-pub(crate) mod storage_v2;
-#[allow(dead_code, unused_imports)]
-#[cfg(feature = "storage-benches")]
-pub mod storage_v2;
 #[cfg_attr(feature = "storage-benches", allow(dead_code))]
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
@@ -42,19 +35,10 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
-pub use backend::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    BytePage, BytePageBuilder,
-};
-pub use backend_v2::conformance::{
-    run_backend_conformance, BackendFactory as BackendV2Factory,
-    BackendFixture as BackendV2Fixture, BackendTestConfig as BackendV2TestConfig,
-    ConformanceReport as BackendV2ConformanceReport,
-    ConformanceResult as BackendV2ConformanceResult,
-    ConformanceStatus as BackendV2ConformanceStatus, ConformanceTest as BackendV2ConformanceTest,
+pub use backend::conformance::{
+    run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig,
+    ConformanceReport as BackendConformanceReport, ConformanceResult as BackendConformanceResult,
+    ConformanceStatus as BackendConformanceStatus, ConformanceTest as BackendConformanceTest,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

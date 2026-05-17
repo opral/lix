@@ -1,5 +1,4 @@
 mod expect_same;
-mod kv_backend;
 mod macro_runtime;
 mod mode;
 mod rebuild_tracked_state;

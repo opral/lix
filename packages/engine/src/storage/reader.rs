@@ -5,13 +5,13 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::backend_v2::{
+    use crate::backend::{
         BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, CoreProjection, GetOptions,
         InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
         ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
         WriteOptions,
     };
-    use crate::storage_v2::{
+    use crate::storage::{
         PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageRead,
         StorageSpace,
     };
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn point_reads_dedupe_before_backend_call() {
-        let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
+        let read = crate::storage::StorageReadScope::new(SpyRead::default());
         let result = PointReadPlan::new(
             space(1),
             &[key("b"), key("a"), key("b"), key("missing"), key("missing")],
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn planned_point_reads_use_backend_requested_order_slots() {
-        let read = crate::storage_v2::StorageReadScope::new(RequestedOrderRead::default());
+        let read = crate::storage::StorageReadScope::new(RequestedOrderRead::default());
         let plan = PointReadPlan::new(space(1), &[key("b"), key("missing"), key("a"), key("b")]);
 
         let result = plan
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn physical_point_request_plan_reuses_encoded_backend_keys() {
-        let read = crate::storage_v2::StorageReadScope::new(RequestedOrderRead::default());
+        let read = crate::storage::StorageReadScope::new(RequestedOrderRead::default());
         let plan = PointReadPlan::new(space(1), &[key("b"), key("missing"), key("a"), key("b")]);
 
         assert_eq!(
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn point_reads_report_shape_stats() {
-        let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
+        let read = crate::storage::StorageReadScope::new(SpyRead::default());
         let result = PointReadPlan::new(space(1), &[key("b"), key("a"), key("b"), key("missing")])
             .materialize(&read, GetOptions::default())
             .expect("caller order");
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn prefix_scan_lowers_expected_range() {
-        let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
+        let read = crate::storage::StorageReadScope::new(SpyRead::default());
         ScanPlan::prefix(
             space(1),
             Prefix {
@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn scan_range_reports_shape_stats() {
-        let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
+        let read = crate::storage::StorageReadScope::new(SpyRead::default());
         let result = ScanPlan::range(
             space(1),
             KeyRange {
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn prefix_scan_reports_shape_stats() {
-        let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
+        let read = crate::storage::StorageReadScope::new(SpyRead::default());
         let result = ScanPlan::prefix(
             space(1),
             Prefix {
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn prefix_scan_limit_zero_reports_no_backend_call() {
-        let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
+        let read = crate::storage::StorageReadScope::new(SpyRead::default());
         let result = ScanPlan::prefix(
             space(1),
             Prefix {

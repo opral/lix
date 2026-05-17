@@ -1,4 +1,4 @@
-use crate::backend_v2::conformance::{
+use crate::backend::conformance::{
     baseline, model_based, persistence, projection, pushdown, scan, write, BackendFactory,
 };
 

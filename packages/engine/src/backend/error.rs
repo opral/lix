@@ -2,7 +2,7 @@ use std::fmt;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{Key, KeyRange, SpaceId, Support};
+use crate::backend::{Key, KeyRange, SpaceId, Support};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {

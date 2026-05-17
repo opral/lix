@@ -3,11 +3,11 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::backend_v2::conformance::{
+use crate::backend::conformance::{
     fixtures::{full_put, key, put_batch, space},
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
-use crate::backend_v2::{
+use crate::backend::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
     BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
     ProjectedValue, ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
@@ -42,6 +42,10 @@ where
     report.run("baseline::put_many_overwrites_existing_value", || {
         put_many_overwrites_existing_value(factory)
     });
+    report.run(
+        "baseline::scan_range_sees_overwritten_existing_value",
+        || scan_range_sees_overwritten_existing_value(factory),
+    );
     report.run(
         "baseline::scan_range_returns_forward_row_bounded_chunks",
         || scan_range_returns_forward_row_bounded_chunks(factory),
@@ -314,6 +318,41 @@ where
         .map_err(|error| format!("commit failed: {error}"))?;
 
     assert_get_entries(&backend, test_space, &[("a", Some("B"))])
+}
+
+fn scan_range_sees_overwritten_existing_value<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let test_space = space(1);
+    seed_full_values(&backend, test_space, [("a", "A")])?;
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin_write failed: {error}"))?;
+    write
+        .put_many(put_batch([full_put(key("a"), "B")]))
+        .map_err(|error| format!("put_many overwrite failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let chunk = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+        ScanOptions::default(),
+    )
+    .map_err(|error| format!("scan_range failed: {error}"))?;
+
+    assert_read_entries(&chunk.entries, &[("a", "B")])
 }
 
 fn scan_range_returns_forward_row_bounded_chunks<F>(factory: &F) -> ConformanceResult
@@ -921,7 +960,7 @@ fn scan_range<R>(
     _test_space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanChunk, crate::backend_v2::BackendError>
+) -> Result<ScanChunk, crate::backend::BackendError>
 where
     R: BackendRead,
 {

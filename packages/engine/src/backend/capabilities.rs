@@ -1,4 +1,4 @@
-use crate::backend_v2::PredicateSupportLevel;
+use crate::backend::PredicateSupportLevel;
 
 #[derive(Clone, Debug)]
 pub struct BackendCapabilities {
