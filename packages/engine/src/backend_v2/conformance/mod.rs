@@ -4,7 +4,6 @@
 //! is stable, rs-sdk can re-export this as the public backend author test kit.
 
 mod baseline;
-pub mod conformance_backend;
 mod factory;
 #[cfg(test)]
 mod failure_tests;
@@ -29,13 +28,12 @@ pub use runner::{
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        conformance_backend::ConformanceBackendFactory, run_backend_conformance, ConformanceStatus,
-    };
+    use super::{run_backend_conformance, ConformanceStatus};
+    use crate::backend_v2::InMemoryBackendFactory;
 
     #[test]
-    fn conformance_backend_passes_baseline_conformance() {
-        let report = run_backend_conformance(&ConformanceBackendFactory);
+    fn in_memory_backend_passes_baseline_conformance() {
+        let report = run_backend_conformance(&InMemoryBackendFactory);
 
         report.assert_no_failures();
 

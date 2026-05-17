@@ -3,7 +3,7 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::backend_v2::{
-    ConformanceBackend, CoreProjection, GetOptions, Key, KeyRange, KeyRef, Prefix, ProjectedValue,
+    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, Prefix, ProjectedValue,
     ProjectedValueRef, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
 };
 use crate::storage_v2::{
@@ -96,7 +96,7 @@ fn run_storage_conformance() -> StorageConformanceReport {
 }
 
 fn write_set_commits_and_reads_back() -> StorageConformanceResult {
-    let storage = StorageContext::new(ConformanceBackend::new());
+    let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
     writes.put(space_one(), key("b"), value("B"));
@@ -132,7 +132,7 @@ fn write_set_commits_and_reads_back() -> StorageConformanceResult {
 }
 
 fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConformanceResult {
-    let storage = StorageContext::new(ConformanceBackend::new());
+    let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
     writes.put(space_one(), key("b"), value("B"));
@@ -167,7 +167,7 @@ fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConforma
 }
 
 fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
-    let storage = StorageContext::new(ConformanceBackend::new());
+    let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("aa"), value("AA"));
     writes.put(space_one(), key("ab"), value("AB"));
@@ -202,7 +202,7 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
 }
 
 fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceResult {
-    let storage = StorageContext::new(ConformanceBackend::new());
+    let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     for suffix in ["0", "1", "2", "3", "4"] {
         writes.put(
@@ -281,7 +281,7 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
 }
 
 fn read_scope_pins_snapshot() -> StorageConformanceResult {
-    let storage = StorageContext::new(ConformanceBackend::new());
+    let storage = StorageContext::new(InMemoryBackend::new());
     let mut seed = storage.new_write_set();
     seed.put(space_one(), key("a"), value("A"));
     storage
@@ -322,7 +322,7 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
 }
 
 fn write_set_rejects_conflicting_space_declarations() -> StorageConformanceResult {
-    let storage = StorageContext::new(ConformanceBackend::new());
+    let storage = StorageContext::new(InMemoryBackend::new());
     let mut writes = storage.new_write_set();
     writes.put(space_one(), key("a"), value("A"));
     writes.put(
@@ -373,7 +373,7 @@ mod tests {
     use super::{run_storage_conformance, StorageConformanceStatus};
 
     #[test]
-    fn conformance_backend_passes_storage_v2_conformance() {
+    fn in_memory_backend_passes_storage_v2_conformance() {
         let report = run_storage_conformance();
 
         report.assert_no_failures();

@@ -6,8 +6,8 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, ConformanceBackend,
-        CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
+        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, CoreProjection, GetOptions,
+        InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
         ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
         WriteOptions,
     };
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn point_reads_reconstruct_caller_order_duplicates_and_missing() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn point_reads_can_return_values_without_echoing_keys() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn point_reads_can_return_indexed_values_without_duplicate_value_clones() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn point_request_plan_can_be_reused_for_indexed_reads() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn planned_point_reads_can_reuse_value_buffer() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn planned_point_reads_can_visit_unique_values_without_materializing_indexed_result() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("a"), value("A"));
         writes.put(space(1), key("b"), value("B"));
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn prefix_scan_lowers_to_range_and_respects_key_only_projection() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("aa"), value("AA"));
         writes.put(space(1), key("ab"), value("AB"));
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn scan_range_into_reuses_storage_buffer() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("aa"), value("AA"));
         writes.put(space(1), key("ab"), value("AB"));
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn visit_scan_prefix_lowers_without_materializing_entries() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("aa"), value("AA"));
         writes.put(space(1), key("ab"), value("AB"));
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn visit_scan_reports_trace_stats() {
-        let storage = StorageContext::new(ConformanceBackend::new());
+        let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
         writes.put(space(1), key("aa"), value("AA"));
         writes.put(space(1), key("ab"), value("AB"));
