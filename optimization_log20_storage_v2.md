@@ -5330,9 +5330,68 @@ RocksDB optimized smoke:
 
 RocksDB delta from the first exact implementation:
 
-| Case | Before | After | Delta |
-| ---- | -----: | ----: | ----: |
-| q100 | 130.37 us | 103.80 us | 20% faster |
-| q1000 | 625.16 us | 119.74 us | 81% faster |
-| q10000 | 3.52 ms | 147.97 us | 96% faster |
+| Case   |    Before |     After |      Delta |
+| ------ | --------: | --------: | ---------: |
+| q100   | 130.37 us | 103.80 us | 20% faster |
+| q1000  | 625.16 us | 119.74 us | 81% faster |
+| q10000 |   3.52 ms | 147.97 us | 96% faster |
+```
+
+## 2026-05-16 - storage_v2 delete range helpers
+
+Added storage-facing helpers on `StorageContext`:
+
+```rust
+delete_range(space, range, opts)
+delete_prefix(space, prefix, opts)
+clear_space(space, opts)
+```
+
+Each helper opens one backend write transaction, encodes the logical
+`StorageSpace` range into the physical byte-key space, calls exactly one
+backend `delete_range`, and commits.
+
+Shape tests now assert:
+
+```text
+delete_range  -> one backend delete_range, zero delete_many calls
+delete_prefix -> one backend delete_range, zero delete_many calls
+clear_space   -> one backend delete_range, zero delete_many calls
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/delete_range_storage_helpers/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)'
+```
+
+Smoke baseline, selected means:
+
+| Backend      | helper        |      q100 |     q1000 |        q10000 |
+| ------------ | ------------- | --------: | --------: | ------------: |
+| in_memory    | delete_range  |   9.07 us | 120.25 us |       1.29 ms |
+| in_memory    | delete_prefix |   9.64 us | 119.34 us |       1.27 ms |
+| in_memory    | clear_space   |   9.80 us | 124.35 us |       1.28 ms |
+| sqlite_temp  | delete_range  | 796.17 us |   1.16 ms |       3.29 ms |
+| sqlite_temp  | delete_prefix | 779.65 us |   1.10 ms |       3.26 ms |
+| sqlite_temp  | clear_space   | 669.59 us |   1.14 ms | 8.51 ms noisy |
+| redb_temp    | delete_range  |  17.81 ms |  21.81 ms |      19.49 ms |
+| redb_temp    | delete_prefix |  14.74 ms |  19.35 ms |      20.60 ms |
+| redb_temp    | clear_space   |  20.81 ms |  19.39 ms |      24.56 ms |
+| rocksdb_temp | delete_range  |  87.96 us | 152.54 us |     142.13 us |
+| rocksdb_temp | delete_prefix |  98.38 us | 110.40 us |     116.56 us |
+| rocksdb_temp | clear_space   | 131.86 us | 118.53 us |     113.00 us |
+
+Interpretation:
+
+```text
+The storage helper path is now close to the direct native delete_range path.
+The remaining cost is backend transaction/open/commit behavior plus a tiny
+amount of logical-to-physical range encoding.
+
+This completes the storage-facing half of making delete_range a required
+backend primitive. Domain stores can now clear logical ranges, prefixes, and
+spaces without scan/materialize/delete fallback.
 ```
