@@ -258,8 +258,7 @@ impl TableProvider for LixStateProvider {
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
 
-        let sink =
-            LixStateInsertSink::new(Arc::clone(&self.schema), write_ctx.clone(), version_binding);
+        let sink = LixStateInsertSink::new(write_ctx.clone(), version_binding);
         Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
@@ -346,11 +345,7 @@ impl std::fmt::Debug for LixStateInsertSink {
 }
 
 impl LixStateInsertSink {
-    fn new(
-        _schema: SchemaRef,
-        write_ctx: SqlWriteContext,
-        version_binding: Option<String>,
-    ) -> Self {
+    fn new(write_ctx: SqlWriteContext, version_binding: Option<String>) -> Self {
         Self {
             write_ctx,
             version_binding,
@@ -1629,10 +1624,6 @@ mod tests {
 
     struct EmptyLiveStateReader;
     struct EmptyVersionRefReader;
-    #[allow(dead_code)]
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-    }
     struct DummyBlobReader;
 
     #[derive(Default)]
@@ -1759,23 +1750,6 @@ mod tests {
 
     fn empty_version_ref() -> Arc<dyn VersionRefReader> {
         Arc::new(EmptyVersionRefReader)
-    }
-
-    #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
-        async fn scan_rows(
-            &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self.rows.clone())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     fn test_functions() -> FunctionProviderHandle {
@@ -2357,8 +2331,7 @@ mod tests {
     async fn insert_sink_stages_decoded_lix_state_rows() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let sink =
-            LixStateInsertSink::new(lix_state_schema(), write_ctx, Some("version-a".to_string()));
+        let sink = LixStateInsertSink::new(write_ctx, Some("version-a".to_string()));
         let batch = one_row_lix_state_batch(false);
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))

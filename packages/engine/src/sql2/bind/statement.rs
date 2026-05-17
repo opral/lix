@@ -17,7 +17,7 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::expr::{BoundExpr, BoundLiteral, BoundParamRef};
-use super::read::{BoundRead, BoundReadSource};
+use super::read::BoundRead;
 use super::table::{
     bind_public_column_ref, bind_public_table, require_writable_column, BoundTable,
 };
@@ -26,17 +26,11 @@ use super::write::{
     BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BoundStatement {
-    Read(BoundRead),
-    Write(BoundWrite),
-}
-
 pub(crate) fn bind_statement(
     statement: &DataFusionStatement,
     visible_schemas: &[JsonValue],
     active_version_id: &str,
-) -> Result<BoundStatement, LixError> {
+) -> Result<BoundWrite, LixError> {
     let catalog = PublicCatalog::from_visible_schemas(visible_schemas)?;
     match statement {
         DataFusionStatement::Statement(statement) => {
@@ -55,17 +49,11 @@ fn bind_sql_statement(
     statement: &SqlStatement,
     catalog: &PublicCatalog,
     active_version_id: &str,
-) -> Result<BoundStatement, LixError> {
+) -> Result<BoundWrite, LixError> {
     match statement {
-        SqlStatement::Insert(insert) => {
-            super::write::bind_insert(insert, catalog, active_version_id).map(BoundStatement::Write)
-        }
-        SqlStatement::Update(update) => {
-            super::write::bind_update(update, catalog, active_version_id).map(BoundStatement::Write)
-        }
-        SqlStatement::Delete(delete) => {
-            super::write::bind_delete(delete, catalog, active_version_id).map(BoundStatement::Write)
-        }
+        SqlStatement::Insert(insert) => bind_insert_bound(insert, catalog, active_version_id),
+        SqlStatement::Update(update) => bind_update_bound(update, catalog, active_version_id),
+        SqlStatement::Delete(delete) => bind_delete_bound(delete, catalog, active_version_id),
         SqlStatement::Explain { .. } => Err(super::error::unsupported(
             "EXPLAIN statements are not supported by SQL write binding",
         )),
@@ -415,7 +403,7 @@ fn bind_insert_input(
         bind_query_params(source, params)?;
         return Ok(BoundWriteInput::Query {
             query: Box::new(BoundRead {
-                source: BoundReadSource::Query(Box::new(source.clone())),
+                query: Box::new(source.clone()),
             }),
             columns: columns.to_vec(),
         });
@@ -1578,9 +1566,7 @@ mod tests {
         )
         .expect("write body should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert!(matches!(
             write.target,
             BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
@@ -1621,9 +1607,7 @@ mod tests {
         let statement = parse_statement("INSERT INTO lix_file (id, name) VALUES ($1, $2)");
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.op, BoundWriteOp::Insert);
         assert_eq!(
             write.params.params.keys().copied().collect::<Vec<_>>(),
@@ -1662,9 +1646,7 @@ mod tests {
             parse_statement("INSERT INTO lix_file (id, data) VALUES ('file1', X'4142')");
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         let BoundWriteInput::Values(rows) = write.input else {
             panic!("expected values input");
         };
@@ -1681,9 +1663,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         let BoundWriteInput::Values(rows) = write.input else {
             panic!("expected values input");
         };
@@ -1704,9 +1684,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         let BoundWriteInput::Values(rows) = write.input else {
             panic!("expected values input");
         };
@@ -1743,9 +1721,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert!(matches!(
             write.version_scope,
             VersionScope::Explicit { ref version_ids }
@@ -1774,9 +1750,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("delete should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.version_scope, VersionScope::Empty);
     }
 
@@ -1785,9 +1759,7 @@ mod tests {
         let statement = parse_statement("DELETE FROM lix_file_by_version WHERE false");
         let bound = bind_statement(&statement, &[], "version1").expect("no-match delete binds");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.version_scope, VersionScope::Empty);
     }
 
@@ -1800,9 +1772,7 @@ mod tests {
         ] {
             let bound = bind_statement(&parse_statement(sql), &[], "version1")
                 .expect("no-match write should bind");
-            let BoundStatement::Write(write) = bound else {
-                panic!("expected bound write");
-            };
+            let write = bound;
             assert_eq!(write.version_scope, VersionScope::Empty, "{sql}");
         }
     }
@@ -1814,9 +1784,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.version_scope, VersionScope::Global);
     }
 
@@ -1855,9 +1823,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("global row should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.version_scope, VersionScope::Global);
     }
 
@@ -1883,9 +1849,7 @@ mod tests {
         let bound =
             bind_statement(&statement, &[], "version1").expect("no-match scope should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.version_scope, VersionScope::Empty);
     }
 
@@ -1949,9 +1913,7 @@ mod tests {
             parse_statement("INSERT INTO lix_version (id, name) VALUES ('draft', 'Draft')");
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert_eq!(write.version_scope, VersionScope::Global);
     }
 
@@ -1962,9 +1924,7 @@ mod tests {
         );
         let bound = bind_statement(&statement, &[], "version1").expect("update should bind");
 
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected bound write");
-        };
+        let write = bound;
         assert!(matches!(
             write.assignments[0].value,
             BoundExpr::Literal(BoundLiteral::Integer(-1))

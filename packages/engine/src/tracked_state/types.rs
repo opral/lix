@@ -143,6 +143,7 @@ pub(crate) struct TrackedStateScanRequest {
 }
 
 /// Point lookup request for one tracked-state row.
+#[cfg(any(test, feature = "storage-benches"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateRowRequest {
     pub(crate) schema_key: String,

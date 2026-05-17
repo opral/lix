@@ -45,7 +45,7 @@ fn is_known_no_match(plan: &LogicalWritePlan) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql2::bind::{bind_statement, BoundStatement};
+    use crate::sql2::bind::bind_statement;
     use crate::sql2::parse_statement;
     use crate::sql2::plan::plan_write;
 
@@ -110,10 +110,7 @@ mod tests {
 
     fn plan_sql(sql: &str) -> LogicalWritePlan {
         let statement = parse_statement(sql).expect("SQL parses");
-        let bound = bind_statement(&statement, &[], "version1").expect("SQL binds");
-        let BoundStatement::Write(write) = bound else {
-            panic!("expected write statement");
-        };
+        let write = bind_statement(&statement, &[], "version1").expect("SQL binds");
         plan_write(write).expect("write plans")
     }
 }

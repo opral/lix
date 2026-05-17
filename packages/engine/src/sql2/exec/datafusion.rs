@@ -12,7 +12,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
-use crate::sql2::bind::read::BoundReadSource;
 use crate::sql2::bind::write::{BoundInsertRow, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
@@ -34,26 +33,17 @@ use crate::sql2::session::{
     SqlWriteSessionOptions,
 };
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
-use crate::sql2::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
+use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan};
 
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
 
-#[allow(dead_code)]
 pub(crate) struct DataFusionLogicalPlan {
     pub(super) session: SessionContext,
     pub(super) plan: LogicalPlan,
-    pub(super) kind: SqlStatementKind,
     pub(super) notices: Vec<LixNotice>,
-    pub(super) strict_binary_params: BTreeSet<usize>,
     pub(super) json_predicate_params: BTreeSet<usize>,
-}
-
-impl DataFusionLogicalPlan {
-    pub(crate) fn kind(&self) -> SqlStatementKind {
-        self.kind
-    }
 }
 
 /// Minimal top-level sql2 entrypoint.
@@ -91,20 +81,16 @@ pub(crate) async fn create_logical_plan_from_parsed(
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
-    let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session,
         plan,
-        kind,
         notices,
-        strict_binary_params: BTreeSet::new(),
         json_predicate_params,
     }))
 }
 
-#[allow(dead_code)]
 pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
@@ -116,15 +102,12 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
-    let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session,
         plan,
-        kind,
         notices,
-        strict_binary_params: BTreeSet::new(),
         json_predicate_params,
     }))
 }
@@ -208,13 +191,10 @@ pub(crate) async fn execute_logical_plan(
     let SqlDataFusionLogicalPlan {
         session,
         plan,
-        kind: _,
         notices,
-        strict_binary_params,
         json_predicate_params,
     } = plan;
     validate_parameter_count(&plan, params.len())?;
-    validate_strict_binary_params(&strict_binary_params, params)?;
     validate_json_predicate_params(&json_predicate_params, params)?;
 
     let mut dataframe = session
@@ -432,16 +412,10 @@ async fn insert_query_input_plan(
     columns: &[crate::sql2::bind::expr::BoundColumnRef],
     params: &[Value],
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
-    let BoundReadSource::Query(query) = &query.source else {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "INSERT query source is not available",
-        ));
-    };
     let input = session
         .state()
         .statement_to_plan(DataFusionStatement::Statement(Box::new(
-            datafusion::sql::sqlparser::ast::Statement::Query(query.clone()),
+            datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
         )))
         .await
         .map_err(datafusion_error_to_lix_error)?;
@@ -935,21 +909,6 @@ fn affected_rows_from_query_result(result: SqlQueryResult) -> Result<u64, LixErr
     }
 }
 
-fn validate_strict_binary_params(
-    strict_binary_params: &BTreeSet<usize>,
-    params: &[Value],
-) -> Result<(), LixError> {
-    for index in strict_binary_params {
-        let Some(value) = params.get(index - 1) else {
-            continue;
-        };
-        if !matches!(value, Value::Blob(_)) {
-            return Err(lix_file_data_type_lix_error());
-        }
-    }
-    Ok(())
-}
-
 fn validate_json_predicate_params(
     json_predicate_params: &BTreeSet<usize>,
     params: &[Value],
@@ -1031,16 +990,6 @@ fn sorted_parameter_names(parameter_names: &HashSet<String>) -> Vec<String> {
     let mut names = parameter_names.iter().cloned().collect::<Vec<_>>();
     names.sort();
     names
-}
-
-fn classify_logical_plan(plan: &LogicalPlan) -> SqlStatementKind {
-    match plan {
-        LogicalPlan::Dml(_) => SqlStatementKind::Write,
-        LogicalPlan::Ddl(_) | LogicalPlan::Statement(_) | LogicalPlan::Copy(_) => {
-            SqlStatementKind::Other
-        }
-        _ => SqlStatementKind::Read,
-    }
 }
 
 fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
@@ -1343,21 +1292,17 @@ mod tests {
     };
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
-        LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
-        MaterializedLiveStateRow,
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::{
         bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
-        plan_write, BoundStatement,
+        plan_write,
     };
     use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlReadStore};
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
         KvValuePage, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
-        StorageWriteSet,
     };
-    use crate::tracked_state::TrackedStateContext;
-    use crate::transaction::prepare_version_ref_row;
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
@@ -1374,7 +1319,6 @@ mod tests {
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
     }
-    struct BackendBlobReader(StorageContext);
     struct DummyCommitGraphReader;
     struct DummyVersionRefReader;
     struct TestReadTransaction(StorageContext);
@@ -1801,18 +1745,6 @@ mod tests {
                 );
                 hashes.len()
             ]))
-        }
-    }
-
-    #[async_trait]
-    impl BlobDataReader for BackendBlobReader {
-        async fn load_bytes_many(
-            &self,
-            hashes: &[crate::binary_cas::BlobHash],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            let binary_cas = crate::binary_cas::BinaryCasContext::new();
-            let reader = binary_cas.reader(self.0.clone());
-            reader.load_bytes_many(hashes).await
         }
     }
 
@@ -3903,11 +3835,7 @@ mod tests {
                  metadata = '{\"schema_key\":\"lix_key_value\"}' \
              WHERE metadata = lix_json('{ \"source\" : \"match\" }')";
         let statement = parse_statement(sql).expect("SQL parses");
-        let BoundStatement::Write(bound_write) =
-            bind_statement(&statement, &[], "version-a").expect("SQL binds")
-        else {
-            panic!("expected write statement");
-        };
+        let bound_write = bind_statement(&statement, &[], "version-a").expect("SQL binds");
         let plan = plan_write(bound_write).expect("write plans");
         assert_eq!(
             crate::sql2::optimize::simple_write::try_make_fast_write_plan(&plan)
@@ -4575,14 +4503,6 @@ mod tests {
             }),
             schema_definitions: vec![schema_definition],
         })
-    }
-
-    fn test_live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
-            TrackedStateContext::new(),
-            UntrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
-        )
     }
 
     fn run_async_test_with_large_stack(

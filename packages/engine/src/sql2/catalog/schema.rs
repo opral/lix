@@ -28,18 +28,6 @@ impl PublicColumn {
         }
     }
 
-    pub(crate) fn public_update_only(name: impl Into<String>) -> Self {
-        Self {
-            id: 0,
-            name: name.into(),
-            role: PublicColumnRole::Public,
-            write: PublicColumnWrite {
-                insert: false,
-                update: true,
-            },
-        }
-    }
-
     pub(crate) fn public_read_only(name: impl Into<String>) -> Self {
         Self {
             id: 0,
@@ -54,15 +42,6 @@ impl PublicColumn {
             id: 0,
             name: name.into(),
             role: PublicColumnRole::Hidden,
-            write: PublicColumnWrite::READ_ONLY,
-        }
-    }
-
-    pub(crate) fn internal(name: impl Into<String>) -> Self {
-        Self {
-            id: 0,
-            name: name.into(),
-            role: PublicColumnRole::Internal,
             write: PublicColumnWrite::READ_ONLY,
         }
     }
@@ -89,7 +68,6 @@ impl PublicColumn {
 pub(crate) enum PublicColumnRole {
     Public,
     Hidden,
-    Internal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

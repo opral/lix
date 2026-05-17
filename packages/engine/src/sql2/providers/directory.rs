@@ -289,7 +289,6 @@ impl TableProvider for LixDirectoryProvider {
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
         let sink = LixDirectoryInsertSink::new(
-            Arc::clone(&self.schema),
             write_ctx,
             self.functions.clone(),
             self.version_binding.clone(),
@@ -395,7 +394,6 @@ impl std::fmt::Debug for LixDirectoryInsertSink {
 
 impl LixDirectoryInsertSink {
     fn new(
-        _schema: SchemaRef,
         write_ctx: SqlWriteContext,
         functions: FunctionProviderHandle,
         version_binding: VersionBinding,
@@ -1882,9 +1880,7 @@ mod tests {
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::live_state::{
-        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    };
+    use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{
@@ -1976,29 +1972,6 @@ mod tests {
         ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
             Ok(TransactionWriteOutcome { count: 0 })
-        }
-    }
-
-    #[derive(Default)]
-    #[allow(dead_code)]
-    struct RowsLiveStateReader {
-        rows: Vec<MaterializedLiveStateRow>,
-    }
-
-    #[async_trait]
-    impl LiveStateReader for RowsLiveStateReader {
-        async fn scan_rows(
-            &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self.rows.clone())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 
@@ -2389,12 +2362,8 @@ mod tests {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_insert_batch(true, false);
-        let sink = LixDirectoryInsertSink::new(
-            batch.schema(),
-            write_ctx,
-            test_functions(),
-            VersionBinding::explicit(),
-        );
+        let sink =
+            LixDirectoryInsertSink::new(write_ctx, test_functions(), VersionBinding::explicit());
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
@@ -2443,12 +2412,8 @@ mod tests {
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_path_insert_batch("/docs/nested/");
-        let sink = LixDirectoryInsertSink::new(
-            batch.schema(),
-            write_ctx,
-            test_functions(),
-            VersionBinding::explicit(),
-        );
+        let sink =
+            LixDirectoryInsertSink::new(write_ctx, test_functions(), VersionBinding::explicit());
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
