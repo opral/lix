@@ -10,7 +10,7 @@ use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue, SchemaExt};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -34,7 +34,9 @@ use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::filesystem_predicates::{
     canonicalize_filesystem_path_filters, FilesystemPathKind,
 };
-use crate::sql2::predicate_typecheck::validate_json_predicate_filters;
+use crate::sql2::predicate_typecheck::{
+    canonicalize_json_identity_text_filters, validate_json_predicate_filters,
+};
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
     resolve_write_version_scope, VersionBinding,
@@ -104,7 +106,7 @@ pub(super) async fn register_lix_directory_by_version_provider(
     Ok(())
 }
 
-pub(super) async fn register_lix_directory_by_version_write_provider(
+pub(super) async fn register_by_version_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
@@ -118,7 +120,7 @@ pub(super) async fn register_lix_directory_by_version_write_provider(
     Ok(())
 }
 
-pub(super) async fn register_lix_directory_active_write_provider(
+pub(super) async fn register_active_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
@@ -275,27 +277,106 @@ impl TableProvider for LixDirectoryProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for lix_directory yet");
+        }
+        let write_ctx = self
+            .write_access
+            .require_write("INSERT into lix_directory")?;
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+        let sink = LixDirectoryInsertSink::new(
+            Arc::clone(&self.schema),
+            write_ctx,
+            self.functions.clone(),
+            self.version_binding.clone(),
+        );
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
         &self,
-        _state: &dyn Session,
-        _filters: Vec<Expr>,
+        state: &dyn Session,
+        filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
+        let write_ctx = self
+            .write_access
+            .require_write("DELETE FROM lix_directory")?;
+        let filters =
+            canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::Directory)?;
+        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut request =
+            lix_directory_scan_request(self.version_binding.active_version_id(), None, None);
+        request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
+        request.filter.version_ids = resolve_provider_version_ids(
+            self.version_ref.as_ref(),
+            &self.version_binding,
+            request.filter.version_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+        Ok(Arc::new(LixDirectoryDeleteExec::new(
+            write_ctx,
+            Arc::clone(&self.schema),
+            self.version_binding.clone(),
+            request,
+            physical_filters,
+        )))
     }
 
     async fn update(
         &self,
-        _state: &dyn Session,
-        _assignments: Vec<(String, Expr)>,
-        _filters: Vec<Expr>,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
+        let write_ctx = self.write_access.require_write("UPDATE lix_directory")?;
+        validate_lix_directory_update_assignments(&self.schema, &assignments)?;
+        let filters =
+            canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::Directory)?;
+        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut request =
+            lix_directory_scan_request(self.version_binding.active_version_id(), None, None);
+        request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
+        request.filter.version_ids = resolve_provider_version_ids(
+            self.version_ref.as_ref(),
+            &self.version_binding,
+            request.filter.version_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+        Ok(Arc::new(LixDirectoryUpdateExec::new(
+            write_ctx,
+            Arc::clone(&self.schema),
+            self.version_binding.clone(),
+            request,
+            physical_assignments,
+            physical_filters,
+        )))
     }
 }
 

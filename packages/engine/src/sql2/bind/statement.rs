@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, Insert, ObjectName, ObjectNamePart, Query, SetExpr,
     Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
-    Value,
+    Value, Visit, Visitor,
 };
 use serde_json::Value as JsonValue;
 
@@ -16,7 +17,7 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::expr::{BoundExpr, BoundLiteral, BoundParamRef};
-use super::read::BoundRead;
+use super::read::{BoundRead, BoundReadSource};
 use super::table::{
     bind_public_column_ref, bind_public_table, require_writable_column, BoundTable,
 };
@@ -102,7 +103,12 @@ pub(super) fn bind_insert_bound(
             BoundWriteOp::Insert,
         )?);
     }
-    let input = bind_insert_input(&columns, insert.source.as_deref(), &mut params)?;
+    let input = bind_insert_input(
+        &table.surface.kind,
+        &columns,
+        insert.source.as_deref(),
+        &mut params,
+    )?;
     let version_scope = bind_write_version_scope(
         &table.surface.kind,
         &input,
@@ -375,6 +381,7 @@ fn bind_assignment_target(
 }
 
 fn bind_insert_input(
+    surface_kind: &PublicSurfaceKind,
     columns: &[super::expr::BoundColumnRef],
     source: Option<&Query>,
     params: &mut ParamBinder,
@@ -384,9 +391,34 @@ fn bind_insert_input(
     };
     reject_unsupported_insert_query_clauses(source)?;
     let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(super::error::unsupported(
-            "INSERT ... SELECT is not supported by bound writes yet",
-        ));
+        if matches!(
+            surface_kind,
+            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByVersion { .. }
+        ) {
+            return Err(super::error::unsupported(
+                "INSERT ... SELECT is not supported for entity SQL surfaces yet",
+            ));
+        }
+        if columns
+            .iter()
+            .any(|column| column.table == "lix_file" && column.name == "data")
+        {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "lix_file.data expects binary data",
+            )
+            .with_hint("Use X'...' or a binary parameter for file contents."));
+        }
+        let statement =
+            DataFusionStatement::Statement(Box::new(SqlStatement::Query(Box::new(source.clone()))));
+        super::read::bind_read_statement(&source.to_string(), &statement)?;
+        bind_query_params(source, params)?;
+        return Ok(BoundWriteInput::Query {
+            query: Box::new(BoundRead {
+                source: BoundReadSource::Query(Box::new(source.clone())),
+            }),
+            columns: columns.to_vec(),
+        });
     };
     let mut rows = Vec::with_capacity(values.rows.len());
     for row in &values.rows {
@@ -406,6 +438,35 @@ fn bind_insert_input(
         });
     }
     Ok(BoundWriteInput::Values(rows))
+}
+
+fn bind_query_params(query: &Query, params: &mut ParamBinder) -> Result<(), LixError> {
+    let mut visitor = QueryParamVisitor { params };
+    match query.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(*error),
+    }
+}
+
+struct QueryParamVisitor<'a> {
+    params: &'a mut ParamBinder,
+}
+
+impl Visitor for QueryParamVisitor<'_> {
+    type Break = Box<LixError>;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Value(value) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let Value::Placeholder(name) = &value.value else {
+            return ControlFlow::Continue(());
+        };
+        match self.params.bind(name) {
+            Ok(_) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(Box::new(error)),
+        }
+    }
 }
 
 fn bind_insert_value_expr(expr: &Expr, params: &mut ParamBinder) -> Result<BoundExpr, LixError> {
@@ -464,6 +525,12 @@ fn bind_predicate(
             flatten_and_predicate(table, right, params, &mut predicates)?;
             Ok(BoundPredicate::And(predicates))
         }
+        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
+            let mut predicates = Vec::new();
+            flatten_or_predicate(table, left, params, &mut predicates)?;
+            flatten_or_predicate(table, right, params, &mut predicates)?;
+            Ok(BoundPredicate::Or(predicates))
+        }
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => Ok(BoundPredicate::Eq(
             bind_expr(table, left, params)?,
             bind_expr(table, right, params)?,
@@ -502,6 +569,19 @@ fn flatten_and_predicate(
 ) -> Result<(), LixError> {
     match bind_predicate(table, expr, params)? {
         BoundPredicate::And(items) => predicates.extend(items),
+        predicate => predicates.push(predicate),
+    }
+    Ok(())
+}
+
+fn flatten_or_predicate(
+    table: &BoundTable,
+    expr: &Expr,
+    params: &mut ParamBinder,
+    predicates: &mut Vec<BoundPredicate>,
+) -> Result<(), LixError> {
+    match bind_predicate(table, expr, params)? {
+        BoundPredicate::Or(items) => predicates.extend(items),
         predicate => predicates.push(predicate),
     }
     Ok(())
@@ -838,9 +918,10 @@ fn reject_duplicate_target_column(
     if target_columns.insert(column_name.to_string()) {
         Ok(())
     } else {
-        Err(super::error::unsupported(format!(
-            "duplicate write target column '{column_name}'"
-        )))
+        Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("duplicate write target column '{column_name}'"),
+        ))
     }
 }
 
@@ -856,10 +937,20 @@ fn require_write_capability(
     if allowed {
         Ok(())
     } else {
-        Err(LixError::new(
+        let mut error = LixError::new(
             LixError::CODE_READ_ONLY,
             format!("DML cannot write read-only SQL table '{}'", surface.name),
-        ))
+        );
+        if matches!(
+            surface.kind,
+            PublicSurfaceKind::EntityHistory { .. }
+                | PublicSurfaceKind::FileHistory
+                | PublicSurfaceKind::DirectoryHistory
+                | PublicSurfaceKind::History
+        ) {
+            error = error.with_hint("History views are query-only.");
+        }
+        Err(error)
     }
 }
 
@@ -918,7 +1009,7 @@ fn bind_write_version_scope(
             selector
         }
         BoundWriteInput::None => predicate_version_selector(predicate, version_column)?,
-        BoundWriteInput::Query(_) => Err(super::error::unsupported(
+        BoundWriteInput::Query { .. } => Err(super::error::unsupported(
             "INSERT ... SELECT by-version writes are not supported",
         ))?,
     };
@@ -932,7 +1023,7 @@ fn bind_write_version_scope(
                 selector
             }
             BoundWriteInput::None => predicate_global_selector(predicate)?,
-            BoundWriteInput::Query(_) => GlobalSelector::Missing,
+            BoundWriteInput::Query { .. } => GlobalSelector::Missing,
         };
         return lix_state_by_version_scope(
             input,
@@ -965,7 +1056,7 @@ fn by_version_scope(
         (BoundWriteInput::None, VersionSelector::Static(version_ids)) => {
             Ok(VersionScope::ExplicitRequired { version_ids })
         }
-        (BoundWriteInput::Query(_), _) => Err(super::error::unsupported(
+        (BoundWriteInput::Query { .. }, _) => Err(super::error::unsupported(
             "INSERT ... SELECT by-version writes are not supported",
         )),
     }
@@ -1065,7 +1156,7 @@ fn bind_base_write_version_scope(
                 "lix_state global predicates select mixed version scopes",
             )),
         },
-        BoundWriteInput::Query(_) => Ok(active_version_scope(active_version_id)),
+        BoundWriteInput::Query { .. } => Ok(active_version_scope(active_version_id)),
     }
 }
 
@@ -1091,8 +1182,9 @@ impl GlobalSelector {
     fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Mixed, Self::Missing) | (Self::Missing, Self::Mixed) => Self::Mixed,
             (Self::Mixed, selector) | (selector, Self::Mixed) => selector,
+            (Self::Missing, selector) | (selector, Self::Missing) => selector,
             (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
             (Self::Static(_), Self::Static(_)) => Self::Empty,
         }
@@ -1120,6 +1212,27 @@ fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelecto
                 result = result.intersect(predicate_global_selector(predicate)?);
             }
             Ok(result)
+        }
+        BoundPredicate::Or(predicates) => {
+            let mut result = GlobalSelector::Empty;
+            let mut has_missing_branch = false;
+            for predicate in predicates {
+                let selector = predicate_global_selector(predicate)?;
+                if selector == GlobalSelector::Missing {
+                    has_missing_branch = true;
+                    continue;
+                }
+                result = result.union(selector);
+            }
+            if has_missing_branch {
+                if result == GlobalSelector::Empty {
+                    Ok(GlobalSelector::Missing)
+                } else {
+                    Ok(GlobalSelector::Mixed)
+                }
+            } else {
+                Ok(result)
+            }
         }
         BoundPredicate::Eq(left, right) => global_value_from_binary_exprs(left, right)
             .or_else(|| global_value_from_binary_exprs(right, left))
@@ -1214,6 +1327,17 @@ fn predicate_version_selector(
             let mut result = VersionSelector::Missing;
             for predicate in predicates {
                 result = result.intersect(predicate_version_selector(predicate, version_column)?);
+            }
+            Ok(result)
+        }
+        BoundPredicate::Or(predicates) => {
+            let mut result = VersionSelector::Static(BTreeSet::new());
+            for predicate in predicates {
+                let selector = predicate_version_selector(predicate, version_column)?;
+                if selector == VersionSelector::Missing {
+                    return Ok(VersionSelector::Missing);
+                }
+                result = result.union(selector);
             }
             Ok(result)
         }
@@ -1366,7 +1490,7 @@ mod tests {
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("hidden columns should not bind through statement binder");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
         assert!(error.message.contains("not part of public SQL surface"));
     }
 
@@ -1383,12 +1507,35 @@ mod tests {
     }
 
     #[test]
+    fn bind_statement_rejects_entity_insert_select() {
+        let statement = parse_statement(
+            "INSERT INTO test_state_schema (lixcol_entity_id, value) SELECT lix_json('[\"a\"]'), 'A'",
+        );
+        let error = bind_statement(
+            &statement,
+            &[serde_json::json!({
+                "x-lix-key": "test_state_schema",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+            "version1",
+        )
+        .expect_err("entity INSERT SELECT should fail closed at binding");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("INSERT ... SELECT is not supported for entity SQL surfaces yet"));
+    }
+
+    #[test]
     fn bind_statement_rejects_duplicate_insert_columns() {
         let statement = parse_statement("INSERT INTO lix_file (id, id) VALUES ('file1', 'file2')");
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("duplicate insert columns should be rejected");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("duplicate write target column 'id'"));
     }
 
@@ -1398,7 +1545,7 @@ mod tests {
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("duplicate update columns should be rejected");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error
             .message
             .contains("duplicate write target column 'name'"));
@@ -1465,7 +1612,7 @@ mod tests {
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("hidden predicate columns should not bind");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
         assert!(error.message.contains("not part of public SQL surface"));
     }
 
@@ -1740,6 +1887,36 @@ mod tests {
             panic!("expected bound write");
         };
         assert_eq!(write.version_scope, VersionScope::Empty);
+    }
+
+    #[test]
+    fn bind_statement_rejects_mixed_or_lix_state_global_scope() {
+        let statement = parse_statement(
+            "UPDATE lix_state SET metadata = '{}' WHERE global = true OR schema_key = 'app.test'",
+        );
+        let error = bind_statement(&statement, &[], "version1")
+            .expect_err("mixed global OR scope should fail closed");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(
+            error
+                .message
+                .contains("lix_state global predicates select mixed version scopes"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn global_selector_mixed_intersect_missing_stays_mixed() {
+        assert_eq!(
+            GlobalSelector::Mixed.intersect(GlobalSelector::Missing),
+            GlobalSelector::Mixed
+        );
+        assert_eq!(
+            GlobalSelector::Missing.intersect(GlobalSelector::Mixed),
+            GlobalSelector::Mixed
+        );
     }
 
     #[test]

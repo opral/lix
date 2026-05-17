@@ -134,7 +134,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             probes: LIX_KEY_VALUE_AND_REGISTERED_SCHEMA_PROBES,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_COLUMN_NOT_FOUND",
             },
         },
         DifferentialSqlCase {
@@ -146,7 +146,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_COLUMN_NOT_FOUND",
             },
         },
         DifferentialSqlCase {
@@ -158,7 +158,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_COLUMN_NOT_FOUND",
             },
         },
         DifferentialSqlCase {
@@ -170,7 +170,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_COLUMN_NOT_FOUND",
             },
         },
         DifferentialSqlCase {
@@ -216,7 +216,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_INVALID_PARAM",
             },
         },
         DifferentialSqlCase {
@@ -228,7 +228,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_INVALID_PARAM",
             },
         },
         DifferentialSqlCase {
@@ -335,19 +335,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
-            },
-        },
-        DifferentialSqlCase {
-            seed: "generated/entity-by-version/delete-explicit-miss".into(),
-            setup_sql: &[],
-            transaction_setup_sql: &[],
-            sql: "DELETE FROM lix_registered_schema_by_version WHERE lixcol_version_id = 'version-b'".into(),
-            params: EMPTY_PARAMS,
-            probes: REGISTERED_SCHEMA_PROBE,
-            expectation: DifferentialExpectation::SemanticParityMayFallback,
-            expected_execution: ExpectedExecution::Err {
-                code: "LIX_UNSUPPORTED_SQL",
+                code: "LIX_COLUMN_NOT_FOUND",
             },
         },
         DifferentialSqlCase {

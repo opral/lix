@@ -141,6 +141,49 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_update_accepts_parseable_json_text_identity_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('state-json-text', 'before')",
+                &[],
+            )
+            .await
+            .expect("key value insert should succeed");
+
+        let update = session
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = lix_json('{\"key\":\"state-json-text\",\"value\":\"after\"}') \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = '[ \"state-json-text\" ]'",
+                &[],
+            )
+            .await
+            .expect("parseable JSON text identity predicate should update lix_state");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'state-json-text'",
+                &[],
+            )
+            .await
+            .expect("key value read should succeed");
+        assert_rows_eq(result, vec![vec![Value::Json(json!("after"))]]);
+    }
+);
+
+simulation_test!(
     lix_state_update_intersects_repeated_identity_predicates_in_transaction,
     |sim| async move {
         let engine = sim.boot_engine().await;

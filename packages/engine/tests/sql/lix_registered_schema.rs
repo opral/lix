@@ -1141,6 +1141,120 @@ simulation_test!(
 );
 
 simulation_test!(
+    typed_entity_update_accepts_parseable_json_text_identity_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_identity_literal_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity insert should succeed");
+
+        let update = session
+            .execute(
+                "UPDATE engine_identity_literal_schema \
+                 SET name = 'after' \
+                 WHERE lixcol_entity_id = '[\"row-1\"]'",
+                &[],
+            )
+            .await
+            .expect("parseable JSON text identity predicate should be accepted");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT name FROM engine_identity_literal_schema WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("updated typed entity should read");
+        assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
+    }
+);
+
+simulation_test!(
+    typed_entity_update_accepts_parseable_json_text_identity_in_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_identity_in_literal_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity insert should succeed");
+
+        let update = session
+            .execute(
+                "UPDATE engine_identity_in_literal_schema \
+                 SET name = 'after' \
+                 WHERE lixcol_entity_id IN ('[\"row-1\"]')",
+                &[],
+            )
+            .await
+            .expect("parseable JSON text identity IN predicate should be accepted");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT name FROM engine_identity_in_literal_schema WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("updated typed entity should read");
+        assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
+    }
+);
+
+simulation_test!(
     typed_entity_base_update_cannot_override_active_version_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;

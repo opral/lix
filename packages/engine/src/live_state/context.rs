@@ -91,6 +91,9 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let scope = scan_scope(store, &self.untracked_state, request).await?;
+        if !request.filter.version_ids.is_empty() && scope.projection_version_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let derived_rows =
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut tracked_rows = Vec::new();
@@ -1422,6 +1425,38 @@ mod tests {
             rows.len(),
             0,
             "global rows must not be projected into a missing version scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_rows_does_not_leak_untracked_rows_into_missing_version() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
+        let live_state = live_state_context();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
+                version_ref_row("global", "commit-global"),
+                version_ref_row("version-a", "commit-version-a"),
+                untracked_row_at("version-a", "untracked-version-a"),
+            ],
+        )
+        .await;
+        transaction.commit().await.expect("commit should persist");
+
+        let rows = scan_selected_tab_at(&live_state, storage.clone(), "missing-version", false)
+            .await
+            .expect("scan should succeed");
+
+        assert_eq!(
+            rows.len(),
+            0,
+            "missing explicit version scope must not become an all-version untracked scan"
         );
     }
 

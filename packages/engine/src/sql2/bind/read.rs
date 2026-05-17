@@ -1,4 +1,5 @@
 use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::sqlparser::ast::Query;
 
 use crate::LixError;
 
@@ -10,6 +11,7 @@ pub(crate) struct BoundRead {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundReadSource {
     DataFusion,
+    Query(Box<Query>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

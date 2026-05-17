@@ -60,15 +60,21 @@ async fn execute_entity_write(
 
     let spec = entity_spec(ctx, schema_key)?;
     validate_bound_write_supported(plan, &spec)?;
+    let active_version_commit_id = load_active_version_commit_id(ctx).await?;
     let no_op = matches!(plan.bound.version_scope, VersionScope::Empty)
         || matches!(plan.filters.rows, FilterSet::None);
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                entity_insert_rows(ctx, plan, &spec, params, None)?;
+                entity_insert_rows(
+                    ctx,
+                    plan,
+                    &spec,
+                    params,
+                    active_version_commit_id.as_deref(),
+                )?;
                 return Ok(0);
             }
-            let active_version_commit_id = load_active_version_commit_id(ctx).await?;
             entity_insert(
                 ctx,
                 plan,
@@ -82,7 +88,6 @@ async fn execute_entity_write(
             if no_op {
                 return Ok(0);
             }
-            let active_version_commit_id = load_active_version_commit_id(ctx).await?;
             entity_update(
                 ctx,
                 plan,
@@ -96,7 +101,6 @@ async fn execute_entity_write(
             if no_op {
                 return Ok(0);
             }
-            let active_version_commit_id = load_active_version_commit_id(ctx).await?;
             entity_delete(
                 ctx,
                 plan,
@@ -113,7 +117,16 @@ async fn load_active_version_commit_id(
     ctx: &mut dyn SqlWriteExecutionContext,
 ) -> Result<Option<String>, LixError> {
     let active_version_id = ctx.active_version_id().to_string();
-    ctx.load_version_head(&active_version_id).await
+    ctx.load_version_head(&active_version_id)
+        .await?
+        .map(Some)
+        .ok_or_else(|| {
+            LixError::version_not_found(
+                active_version_id,
+                "execute bound public write",
+                "active version",
+            )
+        })
 }
 
 async fn entity_insert(
@@ -147,6 +160,9 @@ fn entity_insert_rows(
             .values
             .iter()
             .map(|(column, expr)| {
+                if let Some(surface_column) = spec.visible_column(&column.name) {
+                    reject_direct_blob_json_value(expr, surface_column.column_type, params)?;
+                }
                 Ok((
                     column.name.as_str(),
                     eval_expr(
@@ -193,6 +209,7 @@ async fn entity_update(
         let mut visible_assignments = Vec::new();
         for assignment in &plan.bound.assignments {
             if let Some(column) = spec.visible_column(&assignment.column.name) {
+                reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
                 let value = eval_expr(
                     &assignment.value,
                     &original_context,
@@ -605,6 +622,21 @@ fn predicate_matches(
             }
             Ok(true)
         }
+        BoundPredicate::Or(predicates) => {
+            for predicate in predicates {
+                if predicate_matches(
+                    predicate,
+                    context,
+                    spec,
+                    ctx,
+                    params,
+                    active_version_commit_id,
+                )? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         BoundPredicate::Eq(left, right) => {
             let (left, right) = eval_comparison_operands(
                 left,
@@ -664,17 +696,34 @@ fn normalize_comparison_operands(
     let left_is_json = bound_expr_is_json(left_expr, spec);
     let right_is_json = bound_expr_is_json(right_expr, spec);
     Ok((
-        normalize_json_param_value(left_expr, left_value, right_is_json)?,
-        normalize_json_param_value(right_expr, right_value, left_is_json)?,
+        normalize_json_comparison_value(
+            left_expr,
+            left_value,
+            right_is_json,
+            is_identity_json_expr(right_expr),
+        )?,
+        normalize_json_comparison_value(
+            right_expr,
+            right_value,
+            left_is_json,
+            is_identity_json_expr(left_expr),
+        )?,
     ))
 }
 
-fn normalize_json_param_value(
+fn normalize_json_comparison_value(
     expr: &BoundExpr,
     value: JsonValue,
     other_side_is_json: bool,
+    other_side_is_identity_json: bool,
 ) -> Result<JsonValue, LixError> {
-    if !other_side_is_json || !matches!(expr, BoundExpr::Param(_)) {
+    if !other_side_is_json {
+        return Ok(value);
+    }
+    let should_parse = matches!(expr, BoundExpr::Param(_))
+        || (other_side_is_identity_json
+            && matches!(expr, BoundExpr::Literal(BoundLiteral::Text(_))));
+    if !should_parse {
         return Ok(value);
     }
     let JsonValue::String(raw) = value else {
@@ -702,7 +751,7 @@ fn validate_bound_write_supported(
                 }
             }
         }
-        BoundWriteInput::Query(_) | BoundWriteInput::None => {}
+        BoundWriteInput::Query { .. } | BoundWriteInput::None => {}
     }
     for assignment in &plan.bound.assignments {
         validate_expr_supported(&assignment.value)?;
@@ -717,6 +766,12 @@ fn validate_predicate_supported(
     match predicate {
         BoundPredicate::True | BoundPredicate::False => Ok(()),
         BoundPredicate::And(predicates) => {
+            for predicate in predicates {
+                validate_predicate_supported(predicate)?;
+            }
+            Ok(())
+        }
+        BoundPredicate::Or(predicates) => {
             for predicate in predicates {
                 validate_predicate_supported(predicate)?;
             }
@@ -749,15 +804,27 @@ fn validate_json_predicate_types(
             }
             Ok(())
         }
+        BoundPredicate::Or(predicates) => {
+            for predicate in predicates {
+                validate_json_predicate_types(predicate, spec)?;
+            }
+            Ok(())
+        }
         BoundPredicate::Eq(left, right) => validate_json_comparison_operands(left, right, spec),
         BoundPredicate::In { expr, values } => {
             if bound_expr_is_json(expr, spec) {
                 for value in values {
+                    if is_identity_json_expr(expr) && is_parseable_json_text_literal(value) {
+                        continue;
+                    }
                     require_json_comparison_operand(value, spec)?;
                 }
             }
             for value in values {
                 if bound_expr_is_json(value, spec) {
+                    if is_identity_json_expr(value) && is_parseable_json_text_literal(expr) {
+                        continue;
+                    }
                     require_json_comparison_operand(expr, spec)?;
                 }
             }
@@ -772,9 +839,15 @@ fn validate_json_comparison_operands(
     spec: &EntitySurfaceSpec,
 ) -> Result<(), LixError> {
     if bound_expr_is_json(left, spec) {
+        if is_identity_json_expr(left) && is_parseable_json_text_literal(right) {
+            return Ok(());
+        }
         require_json_comparison_operand(right, spec)?;
     }
     if bound_expr_is_json(right, spec) {
+        if is_identity_json_expr(right) && is_parseable_json_text_literal(left) {
+            return Ok(());
+        }
         require_json_comparison_operand(left, spec)?;
     }
     Ok(())
@@ -795,6 +868,23 @@ fn require_json_comparison_operand(
         "JSON columns can only be compared with JSON expressions",
     )
     .with_hint("Wrap JSON text with lix_json(...), use lix_json_get(...) for JSON values, or use IS NULL for null checks."))
+}
+
+fn is_identity_json_expr(expr: &BoundExpr) -> bool {
+    matches!(
+        expr,
+        BoundExpr::Column(column)
+            if matches!(column.name.as_str(), "entity_id" | "lixcol_entity_id")
+    )
+}
+
+fn is_parseable_json_text_literal(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Text(value)) => {
+            serde_json::from_str::<JsonValue>(value).is_ok()
+        }
+        _ => false,
+    }
 }
 
 fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
@@ -877,6 +967,30 @@ fn entity_json_value(
         (JsonValue::Null, _) => JsonValue::Null,
         (value, _) => value,
     })
+}
+
+fn reject_direct_blob_json_value(
+    expr: &BoundExpr,
+    column_type: EntityColumnType,
+    params: &[Value],
+) -> Result<(), LixError> {
+    if column_type != EntityColumnType::Json {
+        return Ok(());
+    }
+    let is_blob = match expr {
+        BoundExpr::Literal(BoundLiteral::Blob(_)) => true,
+        BoundExpr::Param(param) => params
+            .get(param.index.saturating_sub(1))
+            .is_some_and(|value| matches!(value, Value::Blob(_))),
+        _ => false,
+    };
+    if is_blob {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "cannot store blob values directly in JSON entity columns",
+        ));
+    }
+    Ok(())
 }
 
 fn literal_json(literal: &BoundLiteral) -> JsonValue {
