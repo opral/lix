@@ -4572,36 +4572,36 @@ most recent pre-physical-key entries in this log.
 
 Backend matrix, current smoke means:
 
-| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
-| ---------------------------- | --------: | ----------: | --------: | -----------: |
-| commit puts k1024/g16        |  92.87 us |    884.7 us |  17.47 ms |    208.25 us |
-| planned visit unique m1000/u100 | 4.48 us |     39.59 us |   6.54 us |     41.06 us |
-| planned get many m1000/u100  |   6.86 us |     40.86 us |  10.18 us |     44.36 us |
-| planned get many buffered m1000/u100 | 7.14 us | 45.75 us | 10.86 us | 43.80 us |
-| scan visit key-only q1000    |   1.53 us |     40.45 us |  30.06 us |     90.17 us |
-| scan materialized q1000      |  21.44 us |     63.67 us |  58.25 us |    110.48 us |
-| prefix materialized q1000    |  19.96 us |     61.93 us |  68.53 us |    113.81 us |
+| Case                                 | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ------------------------------------ | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16                |  92.87 us |    884.7 us |  17.47 ms |    208.25 us |
+| planned visit unique m1000/u100      |   4.48 us |    39.59 us |   6.54 us |     41.06 us |
+| planned get many m1000/u100          |   6.86 us |    40.86 us |  10.18 us |     44.36 us |
+| planned get many buffered m1000/u100 |   7.14 us |    45.75 us |  10.86 us |     43.80 us |
+| scan visit key-only q1000            |   1.53 us |    40.45 us |  30.06 us |     90.17 us |
+| scan materialized q1000              |  21.44 us |    63.67 us |  58.25 us |    110.48 us |
+| prefix materialized q1000            |  19.96 us |    61.93 us |  68.53 us |    113.81 us |
 
 Approximate delta vs previous backend-matrix/focused entries:
 
-| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
-| ---------------------------- | --------: | ----------: | --------: | -----------: |
-| commit puts k1024/g16        | 130% slower | 1% faster | 20% faster | 5% faster |
-| planned visit unique m1000/u100 | 96% slower | 16% slower | 8% faster | 1% slower |
-| planned get many m1000/u100  | 44% slower | 10% slower | 10% slower | 2% slower |
-| scan visit key-only q1000    | 50% slower | 9% faster | flat | 1% faster |
-| scan materialized q1000      | 9% slower | flat | 49% slower | 1% slower |
-| prefix materialized q1000    | 2% slower | flat | 75% slower | 4% slower |
+| Case                            |   in_memory | sqlite_temp |  redb_temp | rocksdb_temp |
+| ------------------------------- | ----------: | ----------: | ---------: | -----------: |
+| commit puts k1024/g16           | 130% slower |   1% faster | 20% faster |    5% faster |
+| planned visit unique m1000/u100 |  96% slower |  16% slower |  8% faster |    1% slower |
+| planned get many m1000/u100     |  44% slower |  10% slower | 10% slower |    2% slower |
+| scan visit key-only q1000       |  50% slower |   9% faster |       flat |    1% faster |
+| scan materialized q1000         |   9% slower |        flat | 49% slower |    1% slower |
+| prefix materialized q1000       |   2% slower |        flat | 75% slower |    4% slower |
 
 Direct backend profile, current smoke means:
 
-| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
-| ---------------------------- | --------: | ----------: | --------: | -----------: |
-| direct reused commit k1024/g16 | 69.62 us | 805.92 us | 4.05 ms | 531.71 us |
-| direct get_many m1000/u100   |  46.74 us | 109.18 us | 75.42 us | 401.00 us |
-| direct visit_many m1000/u100 |  22.04 us |  78.65 us | 42.03 us | 389.65 us |
-| direct scan visit key-only q1000 | 1.43 us | 44.60 us | 29.38 us | 91.84 us |
-| direct scan materialized q1000 | 20.56 us | 64.88 us | 44.90 us | 115.31 us |
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| direct reused commit k1024/g16   |  69.62 us |   805.92 us |   4.05 ms |    531.71 us |
+| direct get_many m1000/u100       |  46.74 us |   109.18 us |  75.42 us |    401.00 us |
+| direct visit_many m1000/u100     |  22.04 us |    78.65 us |  42.03 us |    389.65 us |
+| direct scan visit key-only q1000 |   1.43 us |    44.60 us |  29.38 us |     91.84 us |
+| direct scan materialized q1000   |  20.56 us |    64.88 us |  44.90 us |    115.31 us |
 
 Direct-profile interpretation:
 
@@ -4661,26 +4661,26 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Focused before/after smoke means:
 
-| Case | Before | After | Delta |
-| ---- | -----: | ----: | ----: |
-| lean planned get m1000/u100 | 3.999 us | 2.166 us | 46% faster |
-| lean planned buffered m1000/u100 | 3.891 us | 2.109 us | 46% faster |
-| lean planned visit m1000/u100 | 2.193 us | 0.131 us | 94% faster |
-| lean planned get m10000/u10000 | 383.03 us | 214.54 us | 44% faster |
-| lean planned buffered m10000/u10000 | 391.49 us | 244.94 us | 37% faster |
-| lean planned visit m10000/u10000 | 230.09 us | 11.85 us | 95% faster |
-| in_memory planned visit m1000/u100 | 4.344 us | 2.618 us | 40% faster |
-| in_memory planned get m1000/u100 | 6.669 us | 5.665 us | 15% faster |
-| in_memory planned buffered m1000/u100 | 6.567 us | 5.337 us | 19% faster |
-| sqlite planned visit m1000/u100 | 35.14 us | 38.60 us | 10% slower |
-| sqlite planned get m1000/u100 | 43.14 us | 40.41 us | 6% faster |
-| sqlite planned buffered m1000/u100 | 39.01 us | 40.40 us | flat/noise |
-| redb planned visit m1000/u100 | 6.440 us | 5.220 us | 19% faster |
-| redb planned get m1000/u100 | 9.775 us | 9.321 us | 5% faster |
-| redb planned buffered m1000/u100 | 10.52 us | 9.136 us | 13% faster |
-| rocksdb planned visit m1000/u100 | 43.53 us | 44.24 us | flat/noise |
-| rocksdb planned get m1000/u100 | 44.74 us | 48.25 us | 8% slower |
-| rocksdb planned buffered m1000/u100 | 46.71 us | 46.94 us | flat/noise |
+| Case                                  |    Before |     After |      Delta |
+| ------------------------------------- | --------: | --------: | ---------: |
+| lean planned get m1000/u100           |  3.999 us |  2.166 us | 46% faster |
+| lean planned buffered m1000/u100      |  3.891 us |  2.109 us | 46% faster |
+| lean planned visit m1000/u100         |  2.193 us |  0.131 us | 94% faster |
+| lean planned get m10000/u10000        | 383.03 us | 214.54 us | 44% faster |
+| lean planned buffered m10000/u10000   | 391.49 us | 244.94 us | 37% faster |
+| lean planned visit m10000/u10000      | 230.09 us |  11.85 us | 95% faster |
+| in_memory planned visit m1000/u100    |  4.344 us |  2.618 us | 40% faster |
+| in_memory planned get m1000/u100      |  6.669 us |  5.665 us | 15% faster |
+| in_memory planned buffered m1000/u100 |  6.567 us |  5.337 us | 19% faster |
+| sqlite planned visit m1000/u100       |  35.14 us |  38.60 us | 10% slower |
+| sqlite planned get m1000/u100         |  43.14 us |  40.41 us |  6% faster |
+| sqlite planned buffered m1000/u100    |  39.01 us |  40.40 us | flat/noise |
+| redb planned visit m1000/u100         |  6.440 us |  5.220 us | 19% faster |
+| redb planned get m1000/u100           |  9.775 us |  9.321 us |  5% faster |
+| redb planned buffered m1000/u100      |  10.52 us |  9.136 us | 13% faster |
+| rocksdb planned visit m1000/u100      |  43.53 us |  44.24 us | flat/noise |
+| rocksdb planned get m1000/u100        |  44.74 us |  48.25 us |  8% slower |
+| rocksdb planned buffered m1000/u100   |  46.71 us |  46.94 us | flat/noise |
 
 Interpretation:
 
@@ -4725,10 +4725,10 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Focused before/after smoke means:
 
-| Case | Before | After | Delta |
-| ---- | -----: | ----: | ----: |
-| sqlite planned visit m1000/u100 | 33.69 us | 22.71 us | 33% faster |
-| sqlite planned get m1000/u100 | 39.94 us | 23.11 us | 42% faster |
+| Case                               |   Before |    After |      Delta |
+| ---------------------------------- | -------: | -------: | ---------: |
+| sqlite planned visit m1000/u100    | 33.69 us | 22.71 us | 33% faster |
+| sqlite planned get m1000/u100      | 39.94 us | 23.11 us | 42% faster |
 | sqlite planned buffered m1000/u100 | 38.83 us | 21.26 us | 45% faster |
 
 Interpretation:
@@ -4747,4 +4747,416 @@ Next related cuts:
     lanes are now fast enough that backend engine behavior dominates.
   - add physical scan/range plans if repeated scan workloads show bound
     encoding in profiles.
+```
+
+## 2026-05-16 - Fresh backend matrix after point-plan and SQLite point cuts
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(commit_puts_k1024_g16_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)'
+```
+
+Fresh smoke means:
+
+| Case                                 | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ------------------------------------ | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16                |  92.76 us |   924.78 us |  15.96 ms |    223.50 us |
+| planned visit unique m1000/u100      |   2.42 us |    18.52 us |   4.34 us |     40.03 us |
+| planned get many m1000/u100          |   5.01 us |    21.73 us |   7.67 us |     42.68 us |
+| planned get many buffered m1000/u100 |   4.64 us |    20.33 us |   7.79 us |     41.15 us |
+| scan visit key-only q1000            |   1.54 us |    48.04 us |  31.19 us |     97.52 us |
+| scan materialized q1000              |  21.62 us |    63.20 us |  46.42 us |    120.54 us |
+| prefix materialized q1000            |  24.20 us |    70.86 us |  49.91 us |    116.63 us |
+
+Interpretation:
+
+```text
+Point-read path is now stable:
+  in_memory and redb expose low storage overhead.
+  sqlite point reads are now in the low 20us range after requested-order SQL.
+  rocksdb planned point reads sit around 40us, matching direct unique_u100
+  RocksDB point reads.
+
+The remaining larger numbers are not point-plan issues:
+  redb writes are commit/durability dominated.
+  sqlite writes are transaction/SQLite dominated.
+  rocksdb scans are iterator/materialization dominated and noisy.
+
+Next profiling target:
+  scan/prefix small-Q lanes. If q10/q100 show measurable adapter overhead, add
+  physical scan/prefix plans. If only q1000 differs, avoid a scan-plan API cut
+  and treat the difference as backend iterator/materialization noise.
+```
+
+## 2026-05-16 - Small-Q scan/prefix profile
+
+Change:
+
+```text
+Added backend matrix scan lanes for q10 and q100:
+  scan_range_visit_key_only_q{10,100}
+  scan_range_q{10,100}
+  prefix_scan_q{10,100}
+
+The existing q1000 lanes remain the large-scan comparison point.
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(scan_range_visit_key_only_q10|scan_range_q10|prefix_scan_q10|scan_range_visit_key_only_q100|scan_range_q100|prefix_scan_q100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)'
+```
+
+Fresh smoke means:
+
+| Backend      | range visit q10 | range q10 | prefix q10 | range visit q100 | range q100 | prefix q100 | range visit q1000 | range q1000 | prefix q1000 |
+| ------------ | --------------: | --------: | ---------: | ---------------: | ---------: | ----------: | ----------------: | ----------: | -----------: |
+| in_memory    |       137.79 ns | 338.32 ns |  325.67 ns |        317.06 ns |    2.24 us |     2.24 us |           1.63 us |    20.82 us |     20.51 us |
+| sqlite_temp  |       824.19 ns |   1.03 us |    1.08 us |          4.52 us |    6.49 us |     6.49 us |          40.77 us |    63.63 us |     60.76 us |
+| redb_temp    |       628.21 ns | 801.73 ns |  881.05 ns |          3.40 us |    5.05 us |     5.38 us |          30.01 us |    46.64 us |     48.94 us |
+| rocksdb_temp |         1.53 us |   1.87 us |    1.74 us |          9.33 us |   11.51 us |    11.66 us |          89.20 us |   110.98 us |    110.51 us |
+
+Interpretation:
+
+```text
+Do not add PhysicalScanPlan / PhysicalPrefixPlan yet.
+
+Range and prefix materialized scans are effectively the same once rows dominate:
+  q100 and q1000 are flat across in_memory/sqlite/rocksdb, with redb prefix only
+  slightly slower.
+
+Small q10 differences are sub-microsecond to low-microsecond and not a clear
+API/layout bottleneck. The current scan path is already shaped correctly:
+  one backend range call, storage-owned prefix lowering, and visitor-first scan.
+
+The larger remaining scan cost is row iteration/materialization, not repeated
+bound encoding.
+
+Next optimization target:
+  materialized scan allocation/reuse or backend-specific scan iterator tuning,
+  not a new scan-plan API.
+```
+
+## 2026-05-16 - Flatten StorageWriteSet lowering experiment
+
+Experiment:
+
+```text
+Tested lowering all staged puts into one physical backend put_many() call and
+all staged deletes into one physical backend delete_many() call.
+
+The candidate storage contract was:
+  put_batches <= 1
+  delete_batches <= 1
+  backend write calls <= 2 before commit
+
+This would replace the current per-logical-space lowering where write calls
+scale with G.
+```
+
+Before command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32)'
+```
+
+Before smoke means:
+
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16            |  83.32 us |   880.45 us |  16.50 ms |    189.44 us |
+| mixed 80/20 k1024/g16            | 106.96 us |   812.72 us |  16.65 ms |    217.72 us |
+| commit touched existing k128/g16 |   8.43 us |     1.16 ms |  15.41 ms |    155.32 us |
+
+After smoke means:
+
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16            | 109.62 us |   980.90 us |  15.96 ms |    239.99 us |
+| mixed 80/20 k1024/g16            |  96.96 us |   861.79 us |  16.51 ms |    252.59 us |
+| commit touched existing k128/g16 |   9.66 us |     1.23 ms |  16.22 ms |    235.06 us |
+
+Delta from the explicit before run:
+
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16            |    +31.6% |      +11.4% |     -3.2% |       +26.7% |
+| mixed 80/20 k1024/g16            |     -9.3% |       +6.0% |     -0.8% |       +16.0% |
+| commit touched existing k128/g16 |    +14.6% |       +5.4% |     +5.2% |       +51.3% |
+
+Interpretation:
+
+```text
+The API shape is cleaner, but this smoke run does not show a universal
+performance win.
+
+The intended Big-O contract improved:
+  old write lowering: O(G) backend write calls
+  new write lowering: O(1) backend write calls, at most put + delete
+
+The measured constants are mixed:
+  redb is effectively unchanged, likely commit/durability dominated.
+  in_memory improves for mixed writes but regresses for put-only lanes.
+  sqlite and rocksdb regress in this smoke matrix despite fewer backend calls.
+
+Likely cause:
+  flattening introduces one larger storage-side materialization buffer and moves
+  all encoded physical keys through it before the backend sees the batch. For
+  local embedded backends, reducing 16 cheap same-transaction calls to 1 call is
+  not enough to offset the changed materialization/cache behavior in this run.
+
+Next decision:
+  do not keep this implementation.
+
+  The code was reverted to grouped-by-space lowering after profiling showed the
+  storage-only write_set_lowering lane regressed from about 6us to about 31us
+  for puts_k1024_g16_v32. The architectural simplification may still be right,
+  but only with a borrowed/streamed write path or earlier physical-key staging.
+  Simply flattening into one owned PutBatch is not the right cut.
+```
+
+## 2026-05-16 - Borrowed write sink experiment
+
+Experiment:
+
+```text
+Tested an additive BackendWrite fast path:
+  put_many_with(|sink| sink.put(KeyRef, value_bytes))
+  delete_many_with(|sink| sink.delete(KeyRef))
+
+storage_v2 encoded physical keys into a reusable scratch buffer and handed the
+borrowed bytes to the backend sink immediately. The owned put_many/delete_many
+API stayed as the fallback.
+```
+
+Focused storage-only results:
+
+| Case                     | Flattened owned batch | Borrowed sink |
+| ------------------------ | --------------------: | ------------: |
+| puts_k1024_g16_v32       |              30.92 us |      11.91 us |
+| puts_k8192_g16_v32       |             160.32 us |      75.71 us |
+| mixed80_20_k1024_g16_v32 |              21.45 us |      12.24 us |
+
+Backend matrix smoke means with the borrowed sink:
+
+| Case                             | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| -------------------------------- | --------: | ----------: | --------: | -----------: |
+| commit puts k1024/g16            | 105.02 us |     1.08 ms |  17.18 ms |    200.54 us |
+| mixed 80/20 k1024/g16            | 137.21 us |     1.06 ms |  16.42 ms |    253.10 us |
+| commit touched existing k128/g16 |  16.12 us |     1.28 ms |  16.40 ms |    175.31 us |
+
+Interpretation:
+
+```text
+Do not keep this implementation.
+
+Borrowed sinks fix much of the owned-flattening storage-only regression, but
+they still do not beat the pre-flatten grouped baseline:
+  old grouped puts_k1024_g16_v32: about 8.70 us
+  borrowed sink puts_k1024_g16_v32: about 11.91 us
+
+The real backend matrix is mixed:
+  redb improves in the large put lane
+  rocksdb is mostly flat/noisy
+  in_memory and sqlite regress, likely from per-entry dyn sink dispatch and
+  backend-specific sink wrappers
+
+Conclusion:
+  a generic dyn write sink is not the right backend_v2 API cut. If we revisit
+  borrowed writes, it should be monomorphic or backend-specific, and it should
+  be justified by a domain-shaped workload where redb-style table insertion is
+  the limiting path. For now, keep grouped owned put_many/delete_many.
+```
+
+## 2026-05-16 - Canonical write-set staging experiment
+
+Experiment:
+
+```text
+Add a storage_v2 write-set construction path for callers that already emit
+canonical final mutations:
+
+  StorageWriteSet::canonicalized_with_capacity(...)
+  StorageWriteSet::reserve_space(...)
+  StorageWriteSet::stage_canonical_put(...)
+  StorageWriteSet::stage_canonical_delete(...)
+
+This path skips the per-mutation duplicate HashMap and preserves first-seen
+space order before lowering to the existing grouped put_many/delete_many calls.
+The checked stage_put/stage_delete path remains available for defensive callers
+and tests.
+```
+
+Before command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/(write_set_lowering/(puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|puts_k8192_g16_v32)|backend_matrix/(in_memory|rocksdb_temp)/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32))'
+```
+
+Before smoke means:
+
+| Case                                |    Before |
+| ----------------------------------- | --------: |
+| write_set puts k1024/g16            |  28.76 us |
+| write_set puts k8192/g16            | 221.58 us |
+| write_set mixed 80/20 k1024/g16     |  28.70 us |
+| in_memory commit puts k1024/g16     |  86.87 us |
+| in_memory mixed 80/20 k1024/g16     | 128.30 us |
+| in_memory touched existing k128/g16 |   8.58 us |
+| rocksdb commit puts k1024/g16       | 238.53 us |
+| rocksdb mixed 80/20 k1024/g16       | 202.92 us |
+| rocksdb touched existing k128/g16   | 146.07 us |
+
+After smoke means, after preserving first-seen space order:
+
+| Case                                |     After |
+| ----------------------------------- | --------: |
+| write_set puts k1024/g16            |  25.92 us |
+| write_set puts k8192/g16            | 226.66 us |
+| write_set mixed 80/20 k1024/g16     |  29.83 us |
+| in_memory commit puts k1024/g16     |  93.66 us |
+| in_memory mixed 80/20 k1024/g16     | 117.36 us |
+| in_memory touched existing k128/g16 |   9.87 us |
+| rocksdb commit puts k1024/g16       | 232.43 us |
+| rocksdb mixed 80/20 k1024/g16       | 219.85 us |
+| rocksdb touched existing k128/g16   | 168.15 us |
+
+Focused rerun for the most sensitive lanes:
+
+| Case                            | Focused after |
+| ------------------------------- | ------------: |
+| write_set puts k1024/g16        |      25.69 us |
+| in_memory commit puts k1024/g16 |      89.78 us |
+| rocksdb commit puts k1024/g16   |     239.96 us |
+
+Delta from the explicit before run:
+
+| Case                                |  Delta |
+| ----------------------------------- | -----: |
+| write_set puts k1024/g16            |  -9.9% |
+| write_set puts k8192/g16            |  +2.3% |
+| write_set mixed 80/20 k1024/g16     |  +3.9% |
+| in_memory commit puts k1024/g16     |  +7.8% |
+| in_memory mixed 80/20 k1024/g16     |  -8.5% |
+| in_memory touched existing k128/g16 | +15.0% |
+| rocksdb commit puts k1024/g16       |  -2.6% |
+| rocksdb mixed 80/20 k1024/g16       |  +8.3% |
+| rocksdb touched existing k128/g16   | +15.1% |
+
+Interpretation:
+
+```text
+This is not a clean cross-backend performance win.
+
+The API distinction is still useful:
+  checked write sets: defensive staging, duplicate validation
+  canonical write sets: final mutations from domain stores
+
+But the current smoke scorecard says canonical staging mostly moves small
+constants around. It improves the storage-only 1024-put lowering lane and one
+in-memory mixed lane, but does not improve the in-memory/rocksdb write matrix
+consistently.
+
+The likely reason is that these benches mostly measure lowering/commit after
+Criterion setup has already built the write set. The new path attacks
+construction, while the remaining measured cost is physical key encoding and
+backend insertion.
+
+Next benchmark hardening:
+  add explicit write-set construction benches:
+    checked_stage_put/delete
+    canonical_stage_put/delete
+    build_and_commit end-to-end
+
+Do not make a larger backend_v2 API cut from this result alone.
+```
+
+## 2026-05-16 - Write-set construction and build+commit benches
+
+Added benchmark groups to measure the thing the canonical write-set path was
+designed to improve:
+
+```text
+storage_v2/write_set_construction/{checked,canonical}/...
+storage_v2/write_set_build_and_commit/<backend>/{checked,canonical}/...
+```
+
+The construction group measures only write-set building from prebuilt
+mutations. The build+commit group measures write-set construction plus
+`StorageContext::commit_write_set` against real backend families.
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/write_set_(construction|build_and_commit/(in_memory|sqlite_temp|redb_temp|rocksdb_temp))/(checked|canonical)/(puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|puts_k128_g16_v32)'
+```
+
+Construction-only smoke means:
+
+| Case                     | Checked | Canonical | Delta |
+| ------------------------ | ------: | --------: | ----: |
+| puts_k1024_g16_v32       | 31.51 us | 18.54 us | 41% faster |
+| mixed80_20_k1024_g16_v32 | 33.78 us | 19.06 us | 44% faster |
+
+Build+commit smoke means:
+
+| Backend      | Case                     | Checked | Canonical | Delta |
+| ------------ | ------------------------ | ------: | --------: | ----: |
+| in_memory    | puts_k1024_g16_v32       | 118.33 us | 107.38 us | 9% faster |
+| in_memory    | mixed80_20_k1024_g16_v32 | 136.36 us | 122.27 us | 10% faster |
+| sqlite_temp  | puts_k1024_g16_v32       | 1.01 ms | 1.36 ms | noisy/slower |
+| sqlite_temp  | mixed80_20_k1024_g16_v32 | 939.37 us | 919.37 us | 2% faster |
+| redb_temp    | puts_k1024_g16_v32       | 15.73 ms | 17.18 ms | noisy/slower |
+| redb_temp    | mixed80_20_k1024_g16_v32 | 15.34 ms | 15.25 ms | flat |
+| rocksdb_temp | puts_k1024_g16_v32       | 242.54 us | 223.17 us | 8% faster |
+| rocksdb_temp | mixed80_20_k1024_g16_v32 | 258.44 us | 223.18 us | 14% faster |
+
+Interpretation:
+
+```text
+This confirms the split is real:
+
+Checked staging:
+  useful for defensive construction and tests
+  pays per-mutation duplicate HashMap cost
+
+Canonical staging:
+  useful for domain stores that already emit final mutations
+  construction is ~40-45% faster in these synthetic cases
+  improves in_memory and rocksdb build+commit by ~8-14%
+
+SQLite and redb remain dominated by backend transaction/commit behavior in this
+smoke shape. The storage construction win is too small relative to their
+backend floor to show up consistently.
+```
+
+API conclusion:
+
+```text
+Keep backend_v2 write API boring:
+  put_many
+  delete_many
+  commit
+  rollback
+
+Keep the storage_v2 split:
+  checked write-set construction for safety
+  canonical write-set construction for domain-store hot paths
+
+The next likely Big-O/backend-family cuts are:
+  1. delete_range extension and fallback safety matrix
+  2. SQLite prepared statement caching inside backend write/read txns
+  3. domain-shaped write workloads to prove canonical builders map to real Lix
+     stores rather than only synthetic mutation vectors
 ```

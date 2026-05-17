@@ -454,6 +454,11 @@ fn storage_v2_benches(c: &mut Criterion) {
     }
 
     bench_write_set_lowering(c);
+    bench_write_set_construction(c);
+    bench_write_set_build_and_commit(c, InMemoryBenchBackend);
+    bench_write_set_build_and_commit(c, SqliteTempBenchBackend::new());
+    bench_write_set_build_and_commit(c, RedbTempBenchBackend::new());
+    bench_write_set_build_and_commit(c, RocksDbTempBenchBackend::new());
     bench_point_request_plan(c);
     bench_point_read_adapter(c);
     bench_point_read_indexed_adapter(c);
@@ -705,17 +710,7 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                 || {
                     let backend = CountingBackend::default();
                     let storage = StorageContext::new(backend.clone());
-                    let mut writes = storage.new_write_set();
-                    for mutation in &mutations {
-                        match mutation {
-                            WriteMutation::Put(space, key, value) => {
-                                writes.stage_put(*space, key.clone(), value.clone());
-                            }
-                            WriteMutation::Delete(space, key) => {
-                                writes.stage_delete(*space, key.clone());
-                            }
-                        }
-                    }
+                    let writes = canonical_write_set_from_mutations(&mutations);
                     (storage, backend, writes)
                 },
                 |(storage, backend, writes)| {
@@ -738,6 +733,120 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                         case.expected_delete_batches() as u64
                     );
                     assert_eq!(backend.state.commit_calls.get(), 1);
+                    black_box(stats);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_write_set_construction(c: &mut Criterion) {
+    let mut group = storage_benchmark_group(c, "storage_v2/write_set_construction");
+
+    for case in WRITE_CASES {
+        assert_eq!(
+            case.writes % case.spaces,
+            0,
+            "write cases must divide cleanly across spaces"
+        );
+        let mutations = write_mutations(case);
+        group.throughput(Throughput::Elements(case.writes as u64));
+
+        group.bench_with_input(BenchmarkId::new("checked", case.name), case, |b, case| {
+            b.iter(|| {
+                let writes = checked_write_set_from_mutations(black_box(&mutations));
+                let stats = writes.stats();
+                assert_eq!(
+                    stats.staged_puts,
+                    (case.writes - case.expected_deletes()) as u64
+                );
+                assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
+                assert_eq!(stats.touched_spaces, case.spaces as u64);
+                black_box(writes);
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("canonical", case.name), case, |b, case| {
+            b.iter(|| {
+                let writes = canonical_write_set_from_mutations(black_box(&mutations));
+                let stats = writes.stats();
+                assert_eq!(
+                    stats.staged_puts,
+                    (case.writes - case.expected_deletes()) as u64
+                );
+                assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
+                assert_eq!(stats.touched_spaces, case.spaces as u64);
+                black_box(writes);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_write_set_build_and_commit<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!(
+        "storage_v2/write_set_build_and_commit/{}",
+        backend_family.name()
+    );
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    for case in WRITE_CASES
+        .iter()
+        .filter(|case| case.writes == 1_024 || case.writes == 128)
+    {
+        let mutations = write_mutations(case);
+        group.throughput(Throughput::Elements(case.writes as u64));
+
+        group.bench_with_input(BenchmarkId::new("checked", case.name), case, |b, case| {
+            b.iter_batched(
+                || {
+                    let backend = backend_family.open_empty();
+                    StorageContext::new(backend)
+                },
+                |storage| {
+                    let writes = checked_write_set_from_mutations(black_box(&mutations));
+                    let (_commit, stats) = storage
+                        .commit_write_set(writes, WriteOptions::default())
+                        .expect("checked build and commit");
+                    assert_eq!(
+                        stats.staged_puts,
+                        (case.writes - case.expected_deletes()) as u64
+                    );
+                    assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
+                    black_box(stats);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("canonical", case.name), case, |b, case| {
+            b.iter_batched(
+                || {
+                    let backend = backend_family.open_empty();
+                    StorageContext::new(backend)
+                },
+                |storage| {
+                    let writes = canonical_write_set_from_mutations(black_box(&mutations));
+                    let (_commit, stats) = storage
+                        .commit_write_set(writes, WriteOptions::default())
+                        .expect("canonical build and commit");
+                    assert_eq!(
+                        stats.staged_puts,
+                        (case.writes - case.expected_deletes()) as u64
+                    );
+                    assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
                     black_box(stats);
                 },
                 BatchSize::LargeInput,
@@ -1250,6 +1359,83 @@ where
             black_box(result.value);
         });
     });
+
+    for rows in [10usize, 100] {
+        let scan_backend = backend_family.seed_points(SpaceId(1), rows as u32, 32);
+        let scan_read = scan_backend
+            .begin_read(ReadOptions::default())
+            .expect("begin backend matrix small scan read");
+        let scan_scope = StorageReadScope::new(scan_read);
+        group.throughput(Throughput::Elements(rows as u64));
+
+        group.bench_function(format!("scan_range_visit_key_only_q{rows}"), |b| {
+            b.iter(|| {
+                let mut visited = 0usize;
+                let result = scan_scope
+                    .visit_scan_range(
+                        space(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: rows + 1,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                            visited += 1;
+                            assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                            black_box(key);
+                            Ok(())
+                        },
+                    )
+                    .expect("backend matrix small scan visitor");
+                assert_eq!(visited, rows);
+                assert_eq!(result.emitted, rows);
+                assert!(!result.has_more);
+                black_box(result);
+            });
+        });
+
+        group.bench_function(format!("scan_range_q{rows}"), |b| {
+            b.iter(|| {
+                let page = scan_scope
+                    .scan_range_with_stats(
+                        space(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: rows + 1,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                    )
+                    .expect("backend matrix small materialized scan");
+                assert_eq!(page.value.entries.entries.len(), rows);
+                assert_eq!(page.stats.backend_calls, 1);
+                black_box(page.value);
+            });
+        });
+
+        group.bench_function(format!("prefix_scan_q{rows}"), |b| {
+            b.iter(|| {
+                let page = scan_scope
+                    .scan_prefix_with_stats(
+                        space(1),
+                        Prefix {
+                            bytes: Bytes::from_static(b"point-"),
+                        },
+                        ScanOptions {
+                            limit_rows: rows + 1,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                    )
+                    .expect("backend matrix small prefix scan");
+                assert_eq!(page.value.entries.entries.len(), rows);
+                assert_eq!(page.stats.backend_calls, 1);
+                assert_eq!(page.stats.prefix_lowered, 1);
+                black_box(page.value);
+            });
+        });
+    }
 
     let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
     let scan_read = scan_backend
@@ -2749,7 +2935,7 @@ fn seed_backend_points<B>(
     B: Backend + Clone,
 {
     let storage = StorageContext::new(backend.clone());
-    let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
+    let mut writes = StorageWriteSet::checked_with_capacity(rows as usize, 1);
     for index in 0..rows {
         writes.stage_put(
             space(space_id.0),
@@ -2937,7 +3123,13 @@ fn write_set_from_mutations<B>(
 where
     B: Backend,
 {
-    let mut writes = storage.new_write_set();
+    let _ = storage;
+    canonical_write_set_from_mutations(mutations)
+}
+
+fn checked_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWriteSet {
+    let mut writes =
+        StorageWriteSet::checked_with_capacity(mutations.len(), unique_space_count(mutations));
     for mutation in mutations {
         match mutation {
             WriteMutation::Put(space, key, value) => {
@@ -2949,6 +3141,64 @@ where
         }
     }
     writes
+}
+
+fn canonical_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWriteSet {
+    let mut counts = HashMap::<SpaceId, (StorageSpace, usize, usize)>::new();
+    let mut space_order = Vec::<StorageSpace>::new();
+    for mutation in mutations {
+        match mutation {
+            WriteMutation::Put(space, _, _) => {
+                counts
+                    .entry(space.id)
+                    .and_modify(|(_, puts, _)| *puts += 1)
+                    .or_insert_with(|| {
+                        space_order.push(*space);
+                        (*space, 1, 0)
+                    });
+            }
+            WriteMutation::Delete(space, _) => {
+                counts
+                    .entry(space.id)
+                    .and_modify(|(_, _, deletes)| *deletes += 1)
+                    .or_insert_with(|| {
+                        space_order.push(*space);
+                        (*space, 0, 1)
+                    });
+            }
+        }
+    }
+
+    let mut writes = StorageWriteSet::canonical_with_capacity(mutations.len(), counts.len());
+    for space in space_order {
+        if let Some((_, puts, deletes)) = counts.get(&space.id).copied() {
+            writes.reserve_space(space, puts, deletes);
+        }
+    }
+
+    for mutation in mutations {
+        match mutation {
+            WriteMutation::Put(space, key, value) => {
+                writes.stage_canonical_put(*space, key.clone(), value.clone());
+            }
+            WriteMutation::Delete(space, key) => {
+                writes.stage_canonical_delete(*space, key.clone());
+            }
+        }
+    }
+    writes
+}
+
+fn unique_space_count(mutations: &[WriteMutation]) -> usize {
+    let mut spaces = HashSet::new();
+    for mutation in mutations {
+        match mutation {
+            WriteMutation::Put(space, _, _) | WriteMutation::Delete(space, _) => {
+                spaces.insert(space.id);
+            }
+        }
+    }
+    spaces.len()
 }
 
 fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {
