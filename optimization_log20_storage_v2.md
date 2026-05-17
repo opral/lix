@@ -5632,16 +5632,16 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Criterion mean estimates:
 
-| Backend      | Case     | Before buffered cursor | After native/local cursor | Delta |
-| ------------ | -------- | ---------------------: | ------------------------: | ----: |
-| in_memory    | chunk10  |              213.07 us |                  23.50 us | 9.1x faster |
-| in_memory    | chunk100 |              200.45 us |                  21.55 us | 9.3x faster |
+| Backend      | Case     | Before buffered cursor | After native/local cursor |            Delta |
+| ------------ | -------- | ---------------------: | ------------------------: | ---------------: |
+| in_memory    | chunk10  |              213.07 us |                  23.50 us |      9.1x faster |
+| in_memory    | chunk100 |              200.45 us |                  21.55 us |      9.3x faster |
 | sqlite_temp  | chunk10  |              499.13 us |                 546.75 us | 10% slower/noise |
-| sqlite_temp  | chunk100 |              500.05 us |                 542.61 us | 9% slower/noise |
+| sqlite_temp  | chunk100 |              500.05 us |                 542.61 us |  9% slower/noise |
 | redb_temp    | chunk10  |              392.52 us |                 436.34 us | 11% slower/noise |
 | redb_temp    | chunk100 |              397.06 us |                 446.99 us | 13% slower/noise |
-| rocksdb_temp | chunk10  |                1.12 ms |                   1.03 ms | 1.1x faster |
-| rocksdb_temp | chunk100 |                1.25 ms |                   1.00 ms | 1.2x faster |
+| rocksdb_temp | chunk10  |                1.12 ms |                   1.03 ms |      1.1x faster |
+| rocksdb_temp | chunk100 |                1.25 ms |                   1.00 ms |      1.2x faster |
 
 Interpretation:
 
@@ -5685,14 +5685,14 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Criterion mean estimates:
 
-| Backend      | Case     | Before returned cursor | After callback cursor | Delta |
-| ------------ | -------- | ---------------------: | --------------------: | ----: |
+| Backend      | Case     | Before returned cursor | After callback cursor |       Delta |
+| ------------ | -------- | ---------------------: | --------------------: | ----------: |
 | in_memory    | chunk10  |               21.93 us |              32.94 us | 1.5x slower |
 | in_memory    | chunk100 |               20.65 us |              28.81 us | 1.4x slower |
 | sqlite_temp  | chunk10  |              643.84 us |             344.86 us | 1.9x faster |
 | sqlite_temp  | chunk100 |              602.85 us |             321.16 us | 1.9x faster |
-| redb_temp    | chunk10  |              447.42 us |             413.05 us | ~neutral |
-| redb_temp    | chunk100 |              411.39 us |             424.51 us | ~neutral |
+| redb_temp    | chunk10  |              447.42 us |             413.05 us |    ~neutral |
+| redb_temp    | chunk100 |              411.39 us |             424.51 us |    ~neutral |
 | rocksdb_temp | chunk10  |              912.99 us |               1.00 ms | 1.1x slower |
 | rocksdb_temp | chunk100 |              904.24 us |               1.03 ms | 1.1x slower |
 
@@ -5745,10 +5745,10 @@ Criterion mean estimates:
 
 | Backend      | Case     | Required cursor before | Required cursor after | Fast cursor after | Fast vs before |
 | ------------ | -------- | ---------------------: | --------------------: | ----------------: | -------------: |
-| in_memory    | chunk10  |               31.50 us |              33.11 us |          25.93 us |     1.2x faster |
-| in_memory    | chunk100 |               24.39 us |              28.61 us |          19.61 us |     1.2x faster |
-| rocksdb_temp | chunk10  |              874.37 us |             934.78 us |         925.39 us |         neutral |
-| rocksdb_temp | chunk100 |              877.87 us |             986.05 us |         891.12 us |         neutral |
+| in_memory    | chunk10  |               31.50 us |              33.11 us |          25.93 us |    1.2x faster |
+| in_memory    | chunk100 |               24.39 us |              28.61 us |          19.61 us |    1.2x faster |
+| rocksdb_temp | chunk10  |              874.37 us |             934.78 us |         925.39 us |        neutral |
+| rocksdb_temp | chunk100 |              877.87 us |             986.05 us |         891.12 us |        neutral |
 
 Interpretation:
 
@@ -5792,16 +5792,16 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Criterion mean estimates:
 
-| Backend      | Case     | Callback dyn cursor | Unified cursor | Delta |
-| ------------ | -------- | ------------------: | -------------: | ----: |
+| Backend      | Case     | Callback dyn cursor | Unified cursor |       Delta |
+| ------------ | -------- | ------------------: | -------------: | ----------: |
 | in_memory    | chunk10  |            33.11 us |       24.35 us | 1.4x faster |
 | in_memory    | chunk100 |            28.61 us |       21.04 us | 1.4x faster |
-| sqlite_temp  | chunk10  |           304.84 us |      336.69 us | 10% slower |
-| sqlite_temp  | chunk100 |           292.72 us |      307.16 us | 5% slower |
+| sqlite_temp  | chunk10  |           304.84 us |      336.69 us |  10% slower |
+| sqlite_temp  | chunk100 |           292.72 us |      307.16 us |   5% slower |
 | redb_temp    | chunk10  |           368.27 us |      307.28 us | 1.2x faster |
 | redb_temp    | chunk100 |           343.36 us |      304.08 us | 1.1x faster |
-| rocksdb_temp | chunk10  |           934.78 us |        1.04 ms | 11% slower |
-| rocksdb_temp | chunk100 |           986.05 us |        1.04 ms | 6% slower |
+| rocksdb_temp | chunk10  |           934.78 us |        1.04 ms |  11% slower |
+| rocksdb_temp | chunk100 |           986.05 us |        1.04 ms |   6% slower |
 
 Interpretation:
 
@@ -5831,32 +5831,32 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 
 Representative Criterion mean estimates for `cursor_visit`:
 
-| Backend      | Case                  | Mean |
-| ------------ | --------------------- | ---: |
-| in_memory    | range single          | 18.75 us |
-| in_memory    | range chunk1          | 115.71 us |
-| in_memory    | range chunk10         | 22.77 us |
-| in_memory    | range chunk100        | 18.59 us |
-| in_memory    | prefix chunk10        | 23.40 us |
-| in_memory    | prefix single         | 18.35 us |
-| sqlite_temp  | range single          | 276.44 us |
-| sqlite_temp  | range chunk1          | 517.81 us |
-| sqlite_temp  | range chunk10         | 296.05 us |
-| sqlite_temp  | range chunk100        | 276.16 us |
-| sqlite_temp  | prefix chunk10        | 316.50 us |
-| sqlite_temp  | prefix single         | 276.95 us |
-| redb_temp    | range single          | 270.42 us |
-| redb_temp    | range chunk1          | 499.33 us |
-| redb_temp    | range chunk10         | 282.21 us |
-| redb_temp    | range chunk100        | 272.27 us |
-| redb_temp    | prefix chunk10        | 274.93 us |
-| redb_temp    | prefix single         | 263.49 us |
-| rocksdb_temp | range single          | 901.34 us |
-| rocksdb_temp | range chunk1          | 931.04 us |
-| rocksdb_temp | range chunk10         | 890.21 us |
-| rocksdb_temp | range chunk100        | 905.94 us |
-| rocksdb_temp | prefix chunk10        | 927.62 us |
-| rocksdb_temp | prefix single         | 877.56 us |
+| Backend      | Case           |      Mean |
+| ------------ | -------------- | --------: |
+| in_memory    | range single   |  18.75 us |
+| in_memory    | range chunk1   | 115.71 us |
+| in_memory    | range chunk10  |  22.77 us |
+| in_memory    | range chunk100 |  18.59 us |
+| in_memory    | prefix chunk10 |  23.40 us |
+| in_memory    | prefix single  |  18.35 us |
+| sqlite_temp  | range single   | 276.44 us |
+| sqlite_temp  | range chunk1   | 517.81 us |
+| sqlite_temp  | range chunk10  | 296.05 us |
+| sqlite_temp  | range chunk100 | 276.16 us |
+| sqlite_temp  | prefix chunk10 | 316.50 us |
+| sqlite_temp  | prefix single  | 276.95 us |
+| redb_temp    | range single   | 270.42 us |
+| redb_temp    | range chunk1   | 499.33 us |
+| redb_temp    | range chunk10  | 282.21 us |
+| redb_temp    | range chunk100 | 272.27 us |
+| redb_temp    | prefix chunk10 | 274.93 us |
+| redb_temp    | prefix single  | 263.49 us |
+| rocksdb_temp | range single   | 901.34 us |
+| rocksdb_temp | range chunk1   | 931.04 us |
+| rocksdb_temp | range chunk10  | 890.21 us |
+| rocksdb_temp | range chunk100 | 905.94 us |
+| rocksdb_temp | prefix chunk10 | 927.62 us |
+| rocksdb_temp | prefix single  | 877.56 us |
 
 Interpretation:
 
@@ -5872,4 +5872,80 @@ prefix drains. Do not profile RocksDB scan cursor for a regression yet.
 The scan API is likely good enough to freeze for now: one callback-scoped cursor
 API, associated cursor type, generic visit_next visitor, storage-owned prefix
 lowering and stats.
+```
+
+## 2026-05-17 - storage_v2 API cleanup regression scorecard
+
+Ran the backend-matrix smoke scorecard after the storage_v2 API cleanup:
+
+```text
+StorageReader removed.
+Point reads now go through PointReadPlan only.
+StorageScanPlan renamed to ScanPlan.
+StorageScan renamed to ScanCursor.
+PointValuesOwned removed.
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/backend_matrix/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)/(commit_puts_k1024_g16_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|planned_get_many_buffered_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)'
+```
+
+Criterion mean estimates:
+
+| Backend      | Case                                 |      Mean | Criterion change vs local baseline |
+| ------------ | ------------------------------------ | --------: | ---------------------------------: |
+| in_memory    | commit puts k1024/g16                |  87.70 us |                          no change |
+| in_memory    | planned visit unique m1000/u100      |  2.651 us |                      +11.8% slower |
+| in_memory    | planned get many m1000/u100          |  5.444 us |                       +9.2% slower |
+| in_memory    | planned get many buffered m1000/u100 |  5.576 us |                      +27.9% slower |
+| in_memory    | scan visit key-only q1000            |  3.258 us |                      +98.6% slower |
+| in_memory    | scan materialized q1000              |  24.60 us |                      +20.4% slower |
+| in_memory    | prefix materialized q1000            |  24.54 us |                      +25.7% slower |
+| sqlite_temp  | commit puts k1024/g16                |  1.026 ms |                       40.1% faster |
+| sqlite_temp  | planned visit unique m1000/u100      |  20.29 us |                      +12.1% slower |
+| sqlite_temp  | planned get many m1000/u100          |  24.25 us |                      +10.0% slower |
+| sqlite_temp  | planned get many buffered m1000/u100 |  23.59 us |                      +19.3% slower |
+| sqlite_temp  | scan visit key-only q1000            |  33.98 us |                       15.0% faster |
+| sqlite_temp  | scan materialized q1000              |  57.41 us |                          no change |
+| sqlite_temp  | prefix materialized q1000            |  55.42 us |                        8.2% faster |
+| redb_temp    | commit puts k1024/g16                |  17.22 ms |                       +7.4% slower |
+| redb_temp    | planned visit unique m1000/u100      |  4.776 us |                      +15.7% slower |
+| redb_temp    | planned get many m1000/u100          |  8.761 us |                      +15.6% slower |
+| redb_temp    | planned get many buffered m1000/u100 |  8.792 us |                      +15.0% slower |
+| redb_temp    | scan visit key-only q1000            |  30.79 us |                          no change |
+| redb_temp    | scan materialized q1000              |  48.97 us |                       +4.1% slower |
+| redb_temp    | prefix materialized q1000            |  49.17 us |                          no change |
+| rocksdb_temp | commit puts k1024/g16                | 251.35 us |                          no change |
+| rocksdb_temp | planned visit unique m1000/u100      |  47.73 us |                      +21.3% slower |
+| rocksdb_temp | planned get many m1000/u100          |  49.56 us |                      +15.7% slower |
+| rocksdb_temp | planned get many buffered m1000/u100 |  48.60 us |                      +19.2% slower |
+| rocksdb_temp | scan visit key-only q1000            | 110.10 us |                      +25.5% slower |
+| rocksdb_temp | scan materialized q1000              | 131.65 us |                      +22.5% slower |
+| rocksdb_temp | prefix materialized q1000            | 139.37 us |                      +19.5% slower |
+
+Interpretation:
+
+```text
+The API cleanup should mostly be a rename/removal cut, so the broad Criterion
+regressions are suspicious. Some lanes improved materially, especially SQLite
+write and scan lanes, which suggests the local Criterion baseline is not purely
+comparing this cleanup in isolation.
+
+Still, the signal is strong enough not to hand-wave away:
+
+- planned point-read lanes are slower across all backend families
+- in-memory scan visitor is much slower versus the local baseline
+- RocksDB scan lanes are slower across visitor/materialized/prefix
+
+Next step before further API cleanup: profile focused lanes rather than doing
+another broad refactor. Start with in_memory scan_range_visit_key_only_q1000 and
+planned_get_many_buffered_m1000_u100, because those are cheap enough that Rust
+adapter shape should dominate. If the profile points at renamed wrapper layers or
+extra result construction, fix that. If it points at Criterion baseline drift,
+rerun the scorecard after clearing old baselines or compare against the previous
+commit directly.
 ```

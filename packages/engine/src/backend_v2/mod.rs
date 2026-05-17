@@ -37,7 +37,7 @@ pub use traits::{
 };
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,
-    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadConsistency,
-    ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, SnapshotRef, SpaceId, StoredValue,
-    Value, WriteOptions, WriteStats,
+    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, ScanResult, SnapshotRef, SpaceId, StoredValue, Value,
+    WriteOptions, WriteStats,
 };

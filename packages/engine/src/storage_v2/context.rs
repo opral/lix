@@ -87,7 +87,7 @@ mod tests {
         ConformanceBackend, GetOptions, Key, ProjectedValue, ReadOptions, SpaceId, StoredValue,
         WriteOptions,
     };
-    use crate::storage_v2::{StorageContext, StorageReader, StorageSpace};
+    use crate::storage_v2::{PointReadPlan, StorageContext, StorageSpace};
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -111,10 +111,10 @@ mod tests {
     fn context_commits_write_set_and_reads_through_storage_contract() {
         let storage = StorageContext::new(ConformanceBackend::new());
         let mut writes = storage.new_write_set();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_put(space(1), key("b"), value("B"));
-        writes.stage_put(space(2), key("a"), value("other"));
-        writes.stage_delete(space(2), key("missing"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("b"), value("B"));
+        writes.put(space(2), key("a"), value("other"));
+        writes.delete(space(2), key("missing"));
 
         let (_commit, stats) = storage
             .commit_write_set(writes, WriteOptions::default())
@@ -130,11 +130,11 @@ mod tests {
         let read = storage
             .begin_read(ReadOptions::default())
             .expect("begin read");
-        let slots = read
-            .get_many_caller_order(space(1), &[key("a"), key("b")], GetOptions::default())
+        let result = PointReadPlan::new(space(1), &[key("a"), key("b")])
+            .materialize(&read, GetOptions::default())
             .expect("read back values");
         assert_eq!(
-            slots.into_iter().map(|slot| slot.value).collect::<Vec<_>>(),
+            result.value,
             vec![
                 Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
                 Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
@@ -146,7 +146,7 @@ mod tests {
     fn context_read_scope_pins_snapshot_across_later_commits() {
         let storage = StorageContext::new(ConformanceBackend::new());
         let mut writes = storage.new_write_set();
-        writes.stage_put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("a"), value("A"));
         storage
             .commit_write_set(writes, WriteOptions::default())
             .expect("seed");
@@ -156,17 +156,17 @@ mod tests {
             .expect("begin read");
 
         let mut later = storage.new_write_set();
-        later.stage_put(space(1), key("a"), value("B"));
+        later.put(space(1), key("a"), value("B"));
         storage
             .commit_write_set(later, WriteOptions::default())
             .expect("later commit");
 
-        let slots = read
-            .get_many_caller_order(space(1), &[key("a")], GetOptions::default())
+        let result = PointReadPlan::new(space(1), &[key("a")])
+            .materialize(&read, GetOptions::default())
             .expect("read old scope");
 
         assert_eq!(
-            slots[0].value,
+            result.value[0],
             Some(ProjectedValue::FullValue(Bytes::from_static(b"A")))
         );
     }
@@ -182,20 +182,22 @@ mod shape_tests {
 
     use crate::backend_v2::{
         Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, GetOptions, Key, KeyRange, PointVisitor,
+        BufferedRangeScan, CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
         ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
         StoredValue, WriteConcurrency, WriteOptions, WriteStats,
     };
-    use crate::storage_v2::{StorageContext, StorageReadScope, StorageReader, StorageSpace};
+    use crate::storage_v2::{
+        PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace,
+    };
 
     #[test]
     fn write_set_across_g_spaces_lowers_to_g_put_many_calls_and_one_commit() {
         let backend = CountingBackend::default();
         let storage = StorageContext::new(backend.clone());
         let mut writes = storage.new_write_set();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_put(space(2), key("a"), value("B"));
-        writes.stage_put(space(3), key("a"), value("C"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(2), key("a"), value("B"));
+        writes.put(space(3), key("a"), value("C"));
 
         storage
             .commit_write_set(writes, WriteOptions::default())
@@ -225,13 +227,12 @@ mod shape_tests {
         let read = SpyRead::default();
         let scope = StorageReadScope::new(read.clone());
 
-        let slots = scope
-            .get_many_caller_order(
-                space(1),
-                &[key("b"), key("a"), key("b"), key("missing"), key("a")],
-                GetOptions::default(),
-            )
-            .expect("point read");
+        let result = PointReadPlan::new(
+            space(1),
+            &[key("b"), key("a"), key("b"), key("missing"), key("a")],
+        )
+        .materialize(&scope, GetOptions::default())
+        .expect("point read");
 
         assert_eq!(
             read.get_many_keys.borrow().clone(),
@@ -241,11 +242,16 @@ mod shape_tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            slots
-                .iter()
-                .map(|slot| slot.key.clone())
-                .collect::<Vec<_>>(),
-            vec![key("b"), key("a"), key("b"), key("missing"), key("a")]
+            result.value,
+            vec![
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
+                Some(ProjectedValue::FullValue(
+                    space(1).encode_key(&key("missing")).0
+                )),
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
+            ]
         );
     }
 
@@ -254,15 +260,14 @@ mod shape_tests {
         let read = SpyRead::default();
         let scope = StorageReadScope::new(read.clone());
 
-        scope
-            .scan_prefix(
-                space(1),
-                crate::backend_v2::Prefix {
-                    bytes: Bytes::from_static(b"a"),
-                },
-                ScanOptions::default(),
-            )
-            .expect("prefix scan");
+        ScanPlan::prefix(
+            space(1),
+            crate::backend_v2::Prefix {
+                bytes: Bytes::from_static(b"a"),
+            },
+        )
+        .collect(&scope, ScanOptions::default())
+        .expect("prefix scan");
 
         assert_eq!(read.scan_range_calls.get(), 1);
         assert_eq!(

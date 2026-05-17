@@ -17,14 +17,13 @@ use lix_engine::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
     BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
     ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef,
-    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
-    ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
+    WriteStats,
 };
 use lix_engine::storage_v2::{
-    PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
-    StorageReadStats, StorageReader, StorageScanBuffer, StorageSpace, StorageWriteSet,
-    StorageWriteSetStats,
+    PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
+    StorageReadStats, StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
 use redb_backend_v2::RedbBackend;
 use rocksdb_backend_v2::RocksDbBackend;
@@ -606,7 +605,7 @@ fn bench_point_request_plan(c: &mut Criterion) {
         group.throughput(Throughput::Elements(case.requested_keys as u64));
         group.bench_with_input(BenchmarkId::new("dedupe", case.name), case, |b, _case| {
             b.iter(|| {
-                black_box(PointRequestPlan::new(black_box(&keys)));
+                black_box(PointReadPlan::new(space(1), black_box(&keys)));
             });
         });
         group.bench_with_input(
@@ -616,7 +615,7 @@ fn bench_point_request_plan(c: &mut Criterion) {
                 b.iter_batched(
                     || keys.clone(),
                     |keys| {
-                        black_box(PointRequestPlan::from_unique_keys(black_box(keys)));
+                        black_box(PointReadPlan::from_unique_keys(space(1), black_box(keys)));
                     },
                     BatchSize::SmallInput,
                 );
@@ -1280,12 +1279,8 @@ fn bench_point_read_adapter(c: &mut Criterion) {
         group.throughput(Throughput::Elements(case.requested_keys as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
-                let result = read
-                    .get_many_values_caller_order_with_stats(
-                        space(1),
-                        black_box(&keys),
-                        GetOptions::default(),
-                    )
+                let result = PointReadPlan::new(space(1), black_box(&keys))
+                    .materialize(&read, GetOptions::default())
                     .expect("point read");
                 assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
                 assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
@@ -1313,12 +1308,9 @@ fn bench_point_read_indexed_adapter(c: &mut Criterion) {
         group.throughput(Throughput::Elements(case.requested_keys as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
-                let result = read
-                    .get_many_indexed_values_caller_order_with_stats(
-                        space(1),
-                        black_box(&keys),
-                        GetOptions::default(),
-                    )
+                let plan = PointReadPlan::new(space(1), black_box(&keys));
+                let result = plan
+                    .collect(&read, GetOptions::default())
                     .expect("indexed point read");
                 assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
                 assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
@@ -1352,12 +1344,9 @@ fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
         group.throughput(Throughput::Elements(case.requested_keys as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
-                let result = read
-                    .get_many_indexed_values_caller_order_with_stats(
-                        space(1),
-                        black_box(&keys),
-                        GetOptions::default(),
-                    )
+                let plan = PointReadPlan::new(space(1), black_box(&keys));
+                let result = plan
+                    .collect(&read, GetOptions::default())
                     .expect("indexed point read");
                 assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
                 assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
@@ -1386,17 +1375,14 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
 
     for case in POINT_CASES {
         let keys = point_request_keys(case.requested_keys, case.unique_keys);
-        let plan = PhysicalPointRequestPlan::new(space(1), &keys);
+        let plan = PointReadPlan::new(space(1), &keys);
         let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
         let read = StorageReadScope::new(LeanPointReadBackend::new(case.existing_unique_keys));
         group.throughput(Throughput::Elements(case.requested_keys as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
-                let result = read
-                    .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
-                        black_box(&plan),
-                        GetOptions::default(),
-                    )
+                let result = black_box(&plan)
+                    .collect(&read, GetOptions::default())
                     .expect("planned indexed point read");
                 assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
                 assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
@@ -1416,15 +1402,11 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
             });
         });
 
-        let mut buffer = PointValueBuffer::new();
+        let mut buffer = PointReadBuffer::new();
         group.bench_with_input(BenchmarkId::new("buffered", case.name), case, |b, case| {
             b.iter(|| {
-                let result = read
-                    .get_many_indexed_values_for_physical_plan_into_with_stats(
-                        black_box(&plan),
-                        GetOptions::default(),
-                        &mut buffer,
-                    )
+                let result = black_box(&plan)
+                    .collect_into(&read, GetOptions::default(), &mut buffer)
                     .expect("buffered planned indexed point read");
                 assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
                 assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
@@ -1451,9 +1433,9 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
                 b.iter(|| {
                     let mut visited = 0usize;
                     let mut missing = 0usize;
-                    let stats = read
-                        .visit_unique_point_values_for_physical_plan(
-                            black_box(&plan),
+                    let stats = black_box(&plan)
+                        .visit(
+                            &read,
                             GetOptions::default(),
                             &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
                                 visited += 1;
@@ -1487,21 +1469,23 @@ fn bench_prefix_scan_adapter(c: &mut Criterion) {
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
-                let result = read
-                    .scan_prefix_with_stats(
-                        space(1),
-                        Prefix {
-                            bytes: Bytes::from_static(b"row-"),
-                        },
-                        ScanOptions {
-                            limit_rows: case.rows + 1,
-                            ..ScanOptions::default()
-                        },
-                    )
-                    .expect("prefix scan");
+                let result = ScanPlan::prefix(
+                    space(1),
+                    Prefix {
+                        bytes: Bytes::from_static(b"row-"),
+                    },
+                )
+                .collect(
+                    &read,
+                    ScanOptions {
+                        limit_rows: case.rows + 1,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("prefix scan");
                 assert_eq!(result.stats.prefix_lowered, 1);
                 assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.entries.entries.len(), case.rows);
+                assert_eq!(result.value.entries.len(), case.rows);
                 black_box(result.value);
             });
         });
@@ -1531,10 +1515,10 @@ fn bench_conformance_backend(c: &mut Criterion) {
                 for mutation in &commit_mutations {
                     match mutation {
                         WriteMutation::Put(space, key, value) => {
-                            writes.stage_put(*space, key.clone(), value.clone());
+                            writes.put(*space, key.clone(), value.clone());
                         }
                         WriteMutation::Delete(space, key) => {
-                            writes.stage_delete(*space, key.clone());
+                            writes.delete(*space, key.clone());
                         }
                     }
                 }
@@ -1561,12 +1545,8 @@ fn bench_conformance_backend(c: &mut Criterion) {
     let get_many_keys = point_request_keys(1_000, 100);
     group.bench_function("get_many_m1000_u100", |b| {
         b.iter(|| {
-            let result = get_many_read
-                .get_many_values_caller_order_with_stats(
-                    space(1),
-                    black_box(&get_many_keys),
-                    GetOptions::default(),
-                )
+            let result = PointReadPlan::new(space(1), black_box(&get_many_keys))
+                .materialize(&get_many_read, GetOptions::default())
                 .expect("point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
@@ -1594,7 +1574,7 @@ fn bench_conformance_backend(c: &mut Criterion) {
                 },
             )
             .expect("scan range");
-            assert_eq!(chunk.entries.entries.len(), 1_000);
+            assert_eq!(chunk.entries.len(), 1_000);
             black_box(chunk);
         });
     });
@@ -1710,15 +1690,15 @@ where
         .expect("begin backend matrix point read");
     let point_scope = StorageReadScope::new(point_read);
     let point_keys = point_request_keys(1_000, 100);
-    let point_plan = PhysicalPointRequestPlan::new(space(1), &point_keys);
+    let point_plan = PointReadPlan::new(space(1), &point_keys);
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("planned_visit_unique_m1000_u100", |b| {
         b.iter(|| {
             let mut visited = 0usize;
             let mut bytes_seen = 0usize;
-            let stats = point_scope
-                .visit_unique_point_values_for_physical_plan(
-                    black_box(&point_plan),
+            let stats = black_box(&point_plan)
+                .visit(
+                    &point_scope,
                     GetOptions::default(),
                     &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
                         visited += 1;
@@ -1741,11 +1721,8 @@ where
 
     group.bench_function("planned_get_many_m1000_u100", |b| {
         b.iter(|| {
-            let result = point_scope
-                .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
-                    black_box(&point_plan),
-                    GetOptions::default(),
-                )
+            let result = black_box(&point_plan)
+                .collect(&point_scope, GetOptions::default())
                 .expect("backend matrix planned point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
@@ -1755,15 +1732,11 @@ where
         });
     });
 
-    let mut point_buffer = PointValueBuffer::new();
+    let mut point_buffer = PointReadBuffer::new();
     group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
         b.iter(|| {
-            let result = point_scope
-                .get_many_indexed_values_for_physical_plan_into_with_stats(
-                    black_box(&point_plan),
-                    GetOptions::default(),
-                    &mut point_buffer,
-                )
+            let result = black_box(&point_plan)
+                .collect_into(&point_scope, GetOptions::default(), &mut point_buffer)
                 .expect("backend matrix buffered planned point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
@@ -1784,10 +1757,9 @@ where
         group.bench_function(format!("scan_range_visit_key_only_q{rows}"), |b| {
             b.iter(|| {
                 let mut visited = 0usize;
-                let result = scan_scope
-                    .visit_scan_range(
-                        space(1),
-                        point_scan_range(),
+                let result = ScanPlan::range(space(1), point_scan_range())
+                    .visit(
+                        &scan_scope,
                         ScanOptions {
                             limit_rows: rows + 1,
                             projection: CoreProjection::KeyOnly,
@@ -1802,18 +1774,17 @@ where
                     )
                     .expect("backend matrix small scan visitor");
                 assert_eq!(visited, rows);
-                assert_eq!(result.emitted, rows);
-                assert!(!result.has_more);
+                assert_eq!(result.value.emitted, rows);
+                assert!(!result.value.has_more);
                 black_box(result);
             });
         });
 
         group.bench_function(format!("scan_range_q{rows}"), |b| {
             b.iter(|| {
-                let chunk = scan_scope
-                    .scan_range_with_stats(
-                        space(1),
-                        point_scan_range(),
+                let chunk = ScanPlan::range(space(1), point_scan_range())
+                    .collect(
+                        &scan_scope,
                         ScanOptions {
                             limit_rows: rows + 1,
                             projection: CoreProjection::KeyOnly,
@@ -1821,7 +1792,7 @@ where
                         },
                     )
                     .expect("backend matrix small materialized scan");
-                assert_eq!(chunk.value.entries.entries.len(), rows);
+                assert_eq!(chunk.value.entries.len(), rows);
                 assert_eq!(chunk.stats.backend_calls, 1);
                 black_box(chunk.value);
             });
@@ -1829,20 +1800,22 @@ where
 
         group.bench_function(format!("prefix_scan_q{rows}"), |b| {
             b.iter(|| {
-                let chunk = scan_scope
-                    .scan_prefix_with_stats(
-                        space(1),
-                        Prefix {
-                            bytes: Bytes::from_static(b"point-"),
-                        },
-                        ScanOptions {
-                            limit_rows: rows + 1,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                    )
-                    .expect("backend matrix small prefix scan");
-                assert_eq!(chunk.value.entries.entries.len(), rows);
+                let chunk = ScanPlan::prefix(
+                    space(1),
+                    Prefix {
+                        bytes: Bytes::from_static(b"point-"),
+                    },
+                )
+                .collect(
+                    &scan_scope,
+                    ScanOptions {
+                        limit_rows: rows + 1,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("backend matrix small prefix scan");
+                assert_eq!(chunk.value.entries.len(), rows);
                 assert_eq!(chunk.stats.backend_calls, 1);
                 assert_eq!(chunk.stats.prefix_lowered, 1);
                 black_box(chunk.value);
@@ -1859,10 +1832,9 @@ where
     group.bench_function("scan_range_visit_key_only_q1000", |b| {
         b.iter(|| {
             let mut visited = 0usize;
-            let result = scan_scope
-                .visit_scan_range(
-                    space(1),
-                    point_scan_range(),
+            let result = ScanPlan::range(space(1), point_scan_range())
+                .visit(
+                    &scan_scope,
                     ScanOptions {
                         limit_rows: 1_001,
                         projection: CoreProjection::KeyOnly,
@@ -1877,18 +1849,17 @@ where
                 )
                 .expect("backend matrix scan visitor");
             assert_eq!(visited, 1_000);
-            assert_eq!(result.emitted, 1_000);
-            assert!(!result.has_more);
+            assert_eq!(result.value.emitted, 1_000);
+            assert!(!result.value.has_more);
             black_box(result);
         });
     });
 
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
-            let chunk = scan_scope
-                .scan_range_with_stats(
-                    space(1),
-                    point_scan_range(),
+            let chunk = ScanPlan::range(space(1), point_scan_range())
+                .collect(
+                    &scan_scope,
                     ScanOptions {
                         limit_rows: 1_001,
                         projection: CoreProjection::KeyOnly,
@@ -1896,7 +1867,7 @@ where
                     },
                 )
                 .expect("backend matrix materialized scan");
-            assert_eq!(chunk.value.entries.entries.len(), 1_000);
+            assert_eq!(chunk.value.entries.len(), 1_000);
             assert_eq!(chunk.stats.backend_calls, 1);
             black_box(chunk.value);
         });
@@ -1904,20 +1875,22 @@ where
 
     group.bench_function("prefix_scan_q1000", |b| {
         b.iter(|| {
-            let chunk = scan_scope
-                .scan_prefix_with_stats(
-                    space(1),
-                    Prefix {
-                        bytes: Bytes::from_static(b"point-"),
-                    },
-                    ScanOptions {
-                        limit_rows: 1_001,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("backend matrix prefix scan");
-            assert_eq!(chunk.value.entries.entries.len(), 1_000);
+            let chunk = ScanPlan::prefix(
+                space(1),
+                Prefix {
+                    bytes: Bytes::from_static(b"point-"),
+                },
+            )
+            .collect(
+                &scan_scope,
+                ScanOptions {
+                    limit_rows: 1_001,
+                    projection: CoreProjection::KeyOnly,
+                    ..ScanOptions::default()
+                },
+            )
+            .expect("backend matrix prefix scan");
+            assert_eq!(chunk.value.entries.len(), 1_000);
             assert_eq!(chunk.stats.backend_calls, 1);
             assert_eq!(chunk.stats.prefix_lowered, 1);
             black_box(chunk.value);
@@ -2254,7 +2227,7 @@ where
                         },
                     )
                     .expect("direct materialized scan");
-                    assert_eq!(chunk.entries.entries.len(), 1_000);
+                    assert_eq!(chunk.entries.len(), 1_000);
                     assert!(!chunk.has_more);
                     read.close().expect("close direct materialized scan read");
                     black_box(chunk);
@@ -2287,10 +2260,10 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 for mutation in &commit_mutations {
                     match mutation {
                         WriteMutation::Put(space, key, value) => {
-                            writes.stage_put(*space, key.clone(), value.clone());
+                            writes.put(*space, key.clone(), value.clone());
                         }
                         WriteMutation::Delete(space, key) => {
-                            writes.stage_delete(*space, key.clone());
+                            writes.delete(*space, key.clone());
                         }
                     }
                 }
@@ -2350,10 +2323,10 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 for mutation in &untouched_existing_commit_mutations {
                     match mutation {
                         WriteMutation::Put(space, key, value) => {
-                            writes.stage_put(*space, key.clone(), value.clone());
+                            writes.put(*space, key.clone(), value.clone());
                         }
                         WriteMutation::Delete(space, key) => {
-                            writes.stage_delete(*space, key.clone());
+                            writes.delete(*space, key.clone());
                         }
                     }
                 }
@@ -2391,10 +2364,10 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 for mutation in &touched_existing_commit_mutations {
                     match mutation {
                         WriteMutation::Put(space, key, value) => {
-                            writes.stage_put(*space, key.clone(), value.clone());
+                            writes.put(*space, key.clone(), value.clone());
                         }
                         WriteMutation::Delete(space, key) => {
-                            writes.stage_delete(*space, key.clone());
+                            writes.delete(*space, key.clone());
                         }
                     }
                 }
@@ -2446,18 +2419,14 @@ fn bench_in_memory_backend(c: &mut Criterion) {
             .expect("begin layered read");
         let layered_scope = StorageReadScope::new(layered_read);
         let layered_keys = point_request_keys(1_000, 100);
-        let layered_plan = PhysicalPointRequestPlan::new(space(1), &layered_keys);
+        let layered_plan = PointReadPlan::new(space(1), &layered_keys);
         group.bench_function(
             format!("overlay_depth_visit_base_d{depth}_m1000_u100"),
             |b| {
                 b.iter(|| {
                     let mut visitor = CountingPointVisitor::default();
-                    let stats = layered_scope
-                        .visit_unique_point_values_for_physical_plan(
-                            black_box(&layered_plan),
-                            GetOptions::default(),
-                            &mut visitor,
-                        )
+                    let stats = black_box(&layered_plan)
+                        .visit(&layered_scope, GetOptions::default(), &mut visitor)
                         .expect("visit layered point values");
                     assert_eq!(stats.unique_backend_keys, 100);
                     assert_eq!(visitor.visited, 100);
@@ -2473,10 +2442,9 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                     black_box(key);
                     Ok(())
                 };
-                let result = layered_scope
-                    .visit_scan_range(
-                        space(1),
-                        point_scan_range(),
+                let result = ScanPlan::range(space(1), point_scan_range())
+                    .visit(
+                        &layered_scope,
                         ScanOptions {
                             limit_rows: 1_001,
                             projection: CoreProjection::KeyOnly,
@@ -2485,7 +2453,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                         &mut visitor,
                     )
                     .expect("scan layered base range");
-                assert_eq!(result.emitted, 1_000);
+                assert_eq!(result.value.emitted, 1_000);
                 black_box(result);
             });
         });
@@ -2500,12 +2468,8 @@ fn bench_in_memory_backend(c: &mut Criterion) {
     let get_many_keys = point_request_keys(1_000, 100);
     group.bench_function("get_many_m1000_u100", |b| {
         b.iter(|| {
-            let result = get_many_read
-                .get_many_values_caller_order_with_stats(
-                    space(1),
-                    black_box(&get_many_keys),
-                    GetOptions::default(),
-                )
+            let result = PointReadPlan::new(space(1), black_box(&get_many_keys))
+                .materialize(&get_many_read, GetOptions::default())
                 .expect("point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
@@ -2522,14 +2486,11 @@ fn bench_in_memory_backend(c: &mut Criterion) {
         .expect("begin read");
     let planned_get_many_read = StorageReadScope::new(planned_get_many_read);
     let planned_get_many_keys = point_request_keys(1_000, 100);
-    let planned_get_many_plan = PhysicalPointRequestPlan::new(space(1), &planned_get_many_keys);
+    let planned_get_many_plan = PointReadPlan::new(space(1), &planned_get_many_keys);
     group.bench_function("planned_get_many_m1000_u100", |b| {
         b.iter(|| {
-            let result = planned_get_many_read
-                .get_many_borrowed_indexed_values_for_physical_plan_with_stats(
-                    black_box(&planned_get_many_plan),
-                    GetOptions::default(),
-                )
+            let result = black_box(&planned_get_many_plan)
+                .collect(&planned_get_many_read, GetOptions::default())
                 .expect("planned point read");
             assert_eq!(result.stats.requested_keys, 1_000);
             assert_eq!(result.stats.unique_backend_keys, 100);
@@ -2540,12 +2501,12 @@ fn bench_in_memory_backend(c: &mut Criterion) {
         });
     });
 
-    let mut planned_get_many_buffer = PointValueBuffer::new();
+    let mut planned_get_many_buffer = PointReadBuffer::new();
     group.bench_function("planned_get_many_buffered_m1000_u100", |b| {
         b.iter(|| {
-            let result = planned_get_many_read
-                .get_many_indexed_values_for_physical_plan_into_with_stats(
-                    black_box(&planned_get_many_plan),
+            let result = black_box(&planned_get_many_plan)
+                .collect_into(
+                    &planned_get_many_read,
                     GetOptions::default(),
                     &mut planned_get_many_buffer,
                 )
@@ -2563,9 +2524,9 @@ fn bench_in_memory_backend(c: &mut Criterion) {
         b.iter(|| {
             let mut visited = 0usize;
             let mut bytes_seen = 0usize;
-            let stats = planned_get_many_read
-                .visit_unique_point_values_for_physical_plan(
-                    black_box(&planned_get_many_plan),
+            let stats = black_box(&planned_get_many_plan)
+                .visit(
+                    &planned_get_many_read,
                     GetOptions::default(),
                     &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
                         visited += 1;
@@ -2604,7 +2565,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 },
             )
             .expect("scan range");
-            assert_eq!(chunk.entries.entries.len(), 1_000);
+            assert_eq!(chunk.entries.len(), 1_000);
             black_box(chunk);
         });
     });
@@ -2669,7 +2630,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     },
                 )
                 .expect("scan range");
-                assert_eq!(chunk.entries.entries.len(), rows);
+                assert_eq!(chunk.entries.len(), rows);
                 black_box(chunk);
             });
         });
@@ -2719,7 +2680,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     },
                 )
                 .expect("scan range");
-                assert_eq!(chunk.entries.entries.len(), 1_000);
+                assert_eq!(chunk.entries.len(), 1_000);
                 black_box(chunk);
             });
         });
@@ -2768,18 +2729,17 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
             let chunk =
                 materialize_scan_visit(&materialize_read, CoreProjection::KeyOnly, 1_001, None)
                     .expect("materialize visitor scan");
-            assert_eq!(chunk.entries.entries.len(), 1_000);
+            assert_eq!(chunk.entries.len(), 1_000);
             black_box(chunk);
         });
     });
 
     group.bench_function("storage_buffer_key_only_q1000", |b| {
-        let mut buffer = StorageScanBuffer::with_capacity(1_001);
+        let mut buffer = ScanBuffer::with_capacity(1_001);
         b.iter(|| {
-            let chunk = storage_materialize_read
-                .scan_range_into(
-                    space(1),
-                    point_scan_range(),
+            let chunk = ScanPlan::range(space(1), point_scan_range())
+                .collect_into(
+                    &storage_materialize_read,
                     ScanOptions {
                         projection: CoreProjection::KeyOnly,
                         limit_rows: 1_001,
@@ -2788,19 +2748,18 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     &mut buffer,
                 )
                 .expect("storage scan buffer");
-            assert_eq!(chunk.entries.len(), 1_000);
-            black_box(chunk.entries);
-            black_box(chunk.has_more);
+            assert_eq!(chunk.value.entries.len(), 1_000);
+            black_box(chunk.value.entries);
+            black_box(chunk.value.has_more);
         });
     });
 
     group.bench_function("storage_visit_key_only_q1000", |b| {
         b.iter(|| {
             let mut visited = 0usize;
-            let result = storage_materialize_read
-                .visit_scan_range(
-                    space(1),
-                    point_scan_range(),
+            let result = ScanPlan::range(space(1), point_scan_range())
+                .visit(
+                    &storage_materialize_read,
                     ScanOptions {
                         projection: CoreProjection::KeyOnly,
                         limit_rows: 1_001,
@@ -2815,7 +2774,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                 )
                 .expect("storage visit scan");
             assert_eq!(visited, 1_000);
-            assert_eq!(result.emitted, 1_000);
+            assert_eq!(result.value.emitted, 1_000);
             black_box(result);
         });
     });
@@ -2825,7 +2784,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
             let chunk =
                 materialize_scan_visit(&materialize_read, CoreProjection::FullValue, 1_001, None)
                     .expect("materialize visitor scan");
-            assert_eq!(chunk.entries.entries.len(), 1_000);
+            assert_eq!(chunk.entries.len(), 1_000);
             black_box(chunk);
         });
     });
@@ -2834,10 +2793,9 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         b.iter(|| {
             let mut visited = 0usize;
             let mut bytes_seen = 0usize;
-            let result = storage_materialize_read
-                .visit_scan_range(
-                    space(1),
-                    point_scan_range(),
+            let result = ScanPlan::range(space(1), point_scan_range())
+                .visit(
+                    &storage_materialize_read,
                     ScanOptions {
                         projection: CoreProjection::FullValue,
                         limit_rows: 1_001,
@@ -2856,18 +2814,17 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                 .expect("storage visit scan");
             assert_eq!(visited, 1_000);
             assert_eq!(bytes_seen, 32_000);
-            assert_eq!(result.emitted, 1_000);
+            assert_eq!(result.value.emitted, 1_000);
             black_box(result);
         });
     });
 
     group.bench_function("storage_buffer_full_value_q1000_v32", |b| {
-        let mut buffer = StorageScanBuffer::with_capacity(1_001);
+        let mut buffer = ScanBuffer::with_capacity(1_001);
         b.iter(|| {
-            let chunk = storage_materialize_read
-                .scan_range_into(
-                    space(1),
-                    point_scan_range(),
+            let chunk = ScanPlan::range(space(1), point_scan_range())
+                .collect_into(
+                    &storage_materialize_read,
                     ScanOptions {
                         projection: CoreProjection::FullValue,
                         limit_rows: 1_001,
@@ -2876,9 +2833,9 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     &mut buffer,
                 )
                 .expect("storage scan buffer");
-            assert_eq!(chunk.entries.len(), 1_000);
-            black_box(chunk.entries);
-            black_box(chunk.has_more);
+            assert_eq!(chunk.value.entries.len(), 1_000);
+            black_box(chunk.value.entries);
+            black_box(chunk.value.has_more);
         });
     });
 
@@ -2901,7 +2858,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     },
                 )
                 .expect("scan range");
-                assert_eq!(chunk.entries.entries.len(), limit_rows);
+                assert_eq!(chunk.entries.len(), limit_rows);
                 assert_eq!(chunk.has_more, limit_rows < 1_000);
                 black_box(chunk);
             });
@@ -2957,8 +2914,8 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                             },
                         )
                         .expect("scan range");
-                        emitted += chunk.entries.entries.len();
-                        resume_after = chunk.entries.entries.last().map(|entry| entry.key.clone());
+                        emitted += chunk.entries.len();
+                        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
                         if !chunk.has_more {
                             break;
                         }
@@ -3366,9 +3323,9 @@ fn seed_backend_points<B>(
     B: Backend + Clone,
 {
     let storage = StorageContext::new(backend.clone());
-    let mut writes = StorageWriteSet::checked_with_capacity(rows as usize, 1);
+    let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
     for index in 0..rows {
-        writes.stage_put(
+        writes.put(
             space(space_id.0),
             key(format!("point-{index:04}")),
             value(index, value_size),
@@ -3486,10 +3443,9 @@ where
 
     loop {
         let mut chunk_last_key = None::<Key>;
-        let result = read
-            .visit_scan_range(
-                storage_space,
-                range.clone(),
+        let result = ScanPlan::range(storage_space, range.clone())
+            .visit(
+                &read,
                 ScanOptions {
                     limit_rows: chunk_size,
                     projection: CoreProjection::KeyOnly,
@@ -3505,19 +3461,19 @@ where
             )
             .map_err(|error| error.to_string())?;
 
-        scanned += result.emitted;
-        chunks += usize::from(result.emitted > 0 || result.has_more);
+        scanned += result.value.emitted;
+        chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
         resume_after = chunk_last_key;
 
-        if !result.has_more {
+        if !result.value.has_more {
             break;
         }
     }
 
-    let mut writes = StorageWriteSet::canonical_with_capacity(keys.len(), 1);
+    let mut writes = StorageWriteSet::with_capacity(keys.len(), 1);
     writes.reserve_space(storage_space, 0, keys.len());
     for key in keys {
-        writes.stage_canonical_delete(storage_space, key);
+        writes.delete(storage_space, key);
     }
 
     let (_commit, write_stats) = storage
@@ -3532,14 +3488,14 @@ where
 }
 
 fn drain_scan_materialized<R>(
-    read: &R,
+    read: &StorageReadScope<R>,
     storage_space: StorageSpace,
     scan: ScanChunkingMode,
     expected_rows: usize,
     chunk_size: usize,
 ) -> Result<ScanDrainStats, BackendError>
 where
-    R: StorageReader,
+    R: BackendRead,
 {
     let mut resume_after = None::<Key>;
     let mut stats = ScanDrainStats::default();
@@ -3550,20 +3506,18 @@ where
             projection: CoreProjection::KeyOnly,
             resume_after: resume_after.as_ref(),
         };
-        let chunk = match scan {
-            ScanChunkingMode::Range => {
-                read.scan_range_with_stats(storage_space, point_scan_range(), opts)?
-            }
-            ScanChunkingMode::Prefix => read.scan_prefix_with_stats(
+        let plan = match scan {
+            ScanChunkingMode::Range => ScanPlan::range(storage_space, point_scan_range()),
+            ScanChunkingMode::Prefix => ScanPlan::prefix(
                 storage_space,
                 Prefix {
                     bytes: Bytes::from_static(b"point-"),
                 },
-                opts,
-            )?,
+            ),
         };
+        let chunk = plan.collect(read, opts)?;
 
-        let entries = &chunk.value.entries.entries;
+        let entries = &chunk.value.entries;
         stats.scanned += entries.len();
         stats.backend_calls += chunk.stats.backend_calls;
         stats.chunks += usize::from(!entries.is_empty() || chunk.value.has_more);
@@ -3583,14 +3537,14 @@ where
 }
 
 fn drain_scan_visit<R>(
-    read: &R,
+    read: &StorageReadScope<R>,
     storage_space: StorageSpace,
     scan: ScanChunkingMode,
     expected_rows: usize,
     chunk_size: usize,
 ) -> Result<ScanDrainStats, BackendError>
 where
-    R: StorageReader,
+    R: BackendRead,
 {
     let mut resume_after = None::<Key>;
     let mut stats = ScanDrainStats::default();
@@ -3607,22 +3561,16 @@ where
             chunk_last_key = Some(key.to_owned_key());
             Ok(())
         };
-        let result = match scan {
-            ScanChunkingMode::Range => read.visit_scan_range_with_stats(
-                storage_space,
-                point_scan_range(),
-                opts,
-                &mut visitor,
-            )?,
-            ScanChunkingMode::Prefix => read.visit_scan_prefix_with_stats(
+        let plan = match scan {
+            ScanChunkingMode::Range => ScanPlan::range(storage_space, point_scan_range()),
+            ScanChunkingMode::Prefix => ScanPlan::prefix(
                 storage_space,
                 Prefix {
                     bytes: Bytes::from_static(b"point-"),
                 },
-                opts,
-                &mut visitor,
-            )?,
+            ),
         };
+        let result = plan.visit(read, opts, &mut visitor)?;
 
         stats.scanned += result.value.emitted;
         stats.backend_calls += result.stats.backend_calls;
@@ -3661,18 +3609,19 @@ where
 
     match scan {
         ScanChunkingMode::Range => {
-            read.with_range_scan(storage_space, point_scan_range(), opts, |cursor| {
+            ScanPlan::range(storage_space, point_scan_range()).cursor(read, opts, |cursor| {
                 drain_storage_cursor(cursor, chunk_size, &mut stats)
             })?
         }
-        ScanChunkingMode::Prefix => read.with_prefix_scan(
+        ScanChunkingMode::Prefix => ScanPlan::prefix(
             storage_space,
             Prefix {
                 bytes: Bytes::from_static(b"point-"),
             },
-            opts,
-            |cursor| drain_storage_cursor(cursor, chunk_size, &mut stats),
-        )?,
+        )
+        .cursor(read, opts, |cursor| {
+            drain_storage_cursor(cursor, chunk_size, &mut stats)
+        })?,
     }
 
     assert_eq!(
@@ -3683,7 +3632,7 @@ where
 }
 
 fn drain_storage_cursor<C>(
-    cursor: &mut lix_engine::storage_v2::StorageRangeScan<'_, C>,
+    cursor: &mut lix_engine::storage_v2::ScanCursor<'_, C>,
     chunk_size: usize,
     stats: &mut ScanDrainStats,
 ) -> Result<(), BackendError>
@@ -3824,7 +3773,7 @@ where
         },
     )?;
     Ok(ScanChunk {
-        entries: ReadBatch { entries },
+        entries,
         has_more: result.has_more,
     })
 }
@@ -3855,7 +3804,7 @@ fn materialize_scan_visit(
         },
     )?;
     Ok(ScanChunk {
-        entries: ReadBatch { entries },
+        entries,
         has_more: result.has_more,
     })
 }
@@ -3872,15 +3821,14 @@ where
 }
 
 fn checked_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWriteSet {
-    let mut writes =
-        StorageWriteSet::checked_with_capacity(mutations.len(), unique_space_count(mutations));
+    let mut writes = StorageWriteSet::with_capacity(mutations.len(), unique_space_count(mutations));
     for mutation in mutations {
         match mutation {
             WriteMutation::Put(space, key, value) => {
-                writes.stage_put(*space, key.clone(), value.clone());
+                writes.put(*space, key.clone(), value.clone());
             }
             WriteMutation::Delete(space, key) => {
-                writes.stage_delete(*space, key.clone());
+                writes.delete(*space, key.clone());
             }
         }
     }
@@ -3913,7 +3861,7 @@ fn canonical_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWri
         }
     }
 
-    let mut writes = StorageWriteSet::canonical_with_capacity(mutations.len(), counts.len());
+    let mut writes = StorageWriteSet::with_capacity(mutations.len(), counts.len());
     for space in space_order {
         if let Some((_, puts, deletes)) = counts.get(&space.id).copied() {
             writes.reserve_space(space, puts, deletes);
@@ -3923,10 +3871,10 @@ fn canonical_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWri
     for mutation in mutations {
         match mutation {
             WriteMutation::Put(space, key, value) => {
-                writes.stage_canonical_put(*space, key.clone(), value.clone());
+                writes.put(*space, key.clone(), value.clone());
             }
             WriteMutation::Delete(space, key) => {
-                writes.stage_canonical_delete(*space, key.clone());
+                writes.delete(*space, key.clone());
             }
         }
     }

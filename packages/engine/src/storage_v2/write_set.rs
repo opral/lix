@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -15,8 +14,6 @@ type FastHashBuilder = RandomState;
 pub struct StorageWriteSet {
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
-    mutation_index: Option<HashMap<(SpaceId, Key), StorageSpace, FastHashBuilder>>,
-    duplicate_mutations: Vec<(StorageSpace, Key)>,
     stats: StorageWriteSetStats,
 }
 
@@ -43,47 +40,22 @@ pub enum StorageWriteSetError {
 }
 
 impl StorageWriteSet {
-    /// Creates an empty checked write set.
+    /// Creates an empty canonical write set.
     ///
-    /// Checked write sets validate duplicate `(space, key)` mutations while
-    /// staging. This is the safe default for generic callers and tests.
+    /// Callers must stage at most one final mutation for each `(space, key)`.
+    /// Debug builds validate that contract before lowering or commit.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a checked write set with capacity hints.
-    ///
-    /// Use this when the caller has not already canonicalized final mutations.
-    pub fn checked_with_capacity(expected_mutations: usize, expected_spaces: usize) -> Self {
-        Self {
-            groups: Vec::with_capacity(expected_spaces),
-            group_index: HashMap::with_capacity_and_hasher(
-                expected_spaces,
-                FastHashBuilder::with_seeds(0, 0, 0, 0),
-            ),
-            mutation_index: Some(HashMap::with_capacity_and_hasher(
-                expected_mutations,
-                FastHashBuilder::with_seeds(0, 0, 0, 0),
-            )),
-            duplicate_mutations: Vec::new(),
-            stats: StorageWriteSetStats::default(),
-        }
-    }
-
     /// Creates a canonical write set with capacity hints.
-    ///
-    /// Canonical write sets skip per-mutation duplicate validation. Use this
-    /// only when the caller has already produced at most one final mutation for
-    /// each `(StorageSpace.id, Key)`.
-    pub fn canonical_with_capacity(_expected_mutations: usize, expected_spaces: usize) -> Self {
+    pub fn with_capacity(_expected_mutations: usize, expected_spaces: usize) -> Self {
         Self {
             groups: Vec::with_capacity(expected_spaces),
             group_index: HashMap::with_capacity_and_hasher(
                 expected_spaces,
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
-            mutation_index: None,
-            duplicate_mutations: Vec::new(),
             stats: StorageWriteSetStats::default(),
         }
     }
@@ -94,16 +66,15 @@ impl StorageWriteSet {
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
-    pub fn stage_put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
-        if let Err(error) = self.try_stage_put(space, key, value) {
-            self.record_stage_error(error);
-        }
+    pub fn put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
+        self.stats.staged_puts += 1;
+        self.stats.written_bytes += value.bytes.len() as u64;
+        self.group_mut(space).puts.push(PutEntry { key, value });
     }
 
-    pub fn stage_delete(&mut self, space: StorageSpace, key: Key) {
-        if let Err(error) = self.try_stage_delete(space, key) {
-            self.record_stage_error(error);
-        }
+    pub fn delete(&mut self, space: StorageSpace, key: Key) {
+        self.stats.staged_deletes += 1;
+        self.group_mut(space).deletes.push(key);
     }
 
     /// Reserves capacity for a storage space's grouped puts and deletes.
@@ -121,56 +92,15 @@ impl StorageWriteSet {
         group.deletes.reserve(expected_deletes);
     }
 
-    /// Stages a final put from a caller that has already canonicalized
-    /// mutations for each `(space, key)`.
-    pub fn stage_canonical_put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
-        self.stats.staged_puts += 1;
-        self.stats.written_bytes += value.bytes.len() as u64;
-        self.group_mut(space).puts.push(PutEntry { key, value });
-    }
-
-    /// Stages a final delete from a caller that has already canonicalized
-    /// mutations for each `(space, key)`.
-    pub fn stage_canonical_delete(&mut self, space: StorageSpace, key: Key) {
-        self.stats.staged_deletes += 1;
-        self.group_mut(space).deletes.push(key);
-    }
-
-    pub fn try_stage_put(
-        &mut self,
-        space: StorageSpace,
-        key: Key,
-        value: StoredValue,
-    ) -> Result<(), StorageWriteSetError> {
-        self.record_mutation(space, &key)?;
-        self.stats.staged_puts += 1;
-        self.stats.written_bytes += value.bytes.len() as u64;
-        self.group_mut(space).puts.push(PutEntry { key, value });
-        Ok(())
-    }
-
-    pub fn try_stage_delete(
-        &mut self,
-        space: StorageSpace,
-        key: Key,
-    ) -> Result<(), StorageWriteSetError> {
-        self.record_mutation(space, &key)?;
-        self.stats.staged_deletes += 1;
-        self.group_mut(space).deletes.push(key);
-        Ok(())
-    }
-
     pub fn extend(&mut self, other: StorageWriteSet) {
-        self.duplicate_mutations.extend(other.duplicate_mutations);
-
         for group in other.groups {
             let space = group.space;
             let conflicting_declarations = group.conflicting_declarations;
             for put in group.puts {
-                self.stage_put(space, put.key, put.value);
+                self.put(space, put.key, put.value);
             }
             for delete in group.deletes {
-                self.stage_delete(space, delete);
+                self.delete(space, delete);
             }
 
             let target = self.group_mut(space);
@@ -184,30 +114,61 @@ impl StorageWriteSet {
         self.stats.clone()
     }
 
+    /// Validates the canonical write-set contract.
+    ///
+    /// This performs the full duplicate/conflicting-declaration scan only in
+    /// debug builds. Release builds treat validation as a no-op so production
+    /// lowering stays on the canonical hot path.
     pub fn validate(&self) -> Result<(), StorageWriteSetError> {
-        for group in &self.groups {
-            if let Some(incoming) = group.conflicting_declarations.first() {
-                return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-                    id: group.space.id,
-                    existing_name: group.space.name,
-                    incoming_name: incoming.name,
-                });
-            }
+        #[cfg(not(debug_assertions))]
+        {
+            Ok(())
         }
 
-        if let Some((space, key)) = self.duplicate_mutations.first() {
-            return Err(StorageWriteSetError::DuplicateMutation {
-                space: *space,
-                key: key.clone(),
-            });
+        #[cfg(debug_assertions)]
+        {
+            for group in &self.groups {
+                if let Some(incoming) = group.conflicting_declarations.first() {
+                    return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
+                        id: group.space.id,
+                        existing_name: group.space.name,
+                        incoming_name: incoming.name,
+                    });
+                }
+            }
+
+            let mut seen = HashMap::<(SpaceId, Key), StorageSpace, FastHashBuilder>::with_hasher(
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+            for group in &self.groups {
+                for put in &group.puts {
+                    let key = (group.space.id, put.key.clone());
+                    if seen.insert(key, group.space).is_some() {
+                        return Err(StorageWriteSetError::DuplicateMutation {
+                            space: group.space,
+                            key: put.key.clone(),
+                        });
+                    }
+                }
+                for delete in &group.deletes {
+                    let key = (group.space.id, delete.clone());
+                    if seen.insert(key, group.space).is_some() {
+                        return Err(StorageWriteSetError::DuplicateMutation {
+                            space: group.space,
+                            key: delete.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     pub fn lower_into<W>(self, write: &mut W) -> Result<StorageWriteSetStats, StorageWriteSetError>
     where
         W: BackendWrite,
     {
+        #[cfg(debug_assertions)]
         self.validate()?;
         self.lower_validated_into(write)
     }
@@ -264,6 +225,7 @@ impl StorageWriteSet {
     where
         B: Backend,
     {
+        #[cfg(debug_assertions)]
         self.validate()?;
         let mut write = backend
             .begin_write(opts)
@@ -298,39 +260,6 @@ impl StorageWriteSet {
         }
         group
     }
-
-    fn record_mutation(
-        &mut self,
-        space: StorageSpace,
-        key: &Key,
-    ) -> Result<(), StorageWriteSetError> {
-        let mutation_index = self
-            .mutation_index
-            .get_or_insert_with(|| HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)));
-
-        match mutation_index.entry((space.id, key.clone())) {
-            Entry::Occupied(_) => Err(StorageWriteSetError::DuplicateMutation {
-                space,
-                key: key.clone(),
-            }),
-            Entry::Vacant(entry) => {
-                entry.insert(space);
-                Ok(())
-            }
-        }
-    }
-
-    fn record_stage_error(&mut self, error: StorageWriteSetError) {
-        match error {
-            StorageWriteSetError::DuplicateMutation { space, key } => {
-                self.duplicate_mutations.push((space, key));
-            }
-            StorageWriteSetError::ConflictingSpaceDeclaration { .. }
-            | StorageWriteSetError::Backend(_) => {
-                unreachable!("infallible staging can only record duplicate mutation errors")
-            }
-        }
-    }
 }
 
 impl Default for StorageWriteSet {
@@ -338,8 +267,6 @@ impl Default for StorageWriteSet {
         Self {
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
-            mutation_index: None,
-            duplicate_mutations: Vec::new(),
             stats: StorageWriteSetStats::default(),
         }
     }
@@ -420,8 +347,8 @@ mod tests {
     fn write_set_rejects_duplicate_final_mutations() {
         let backend = ConformanceBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_delete(space(1), key("a"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.delete(space(1), key("a"));
 
         let error = writes
             .commit(&backend, WriteOptions::default())
@@ -443,8 +370,8 @@ mod tests {
     fn duplicate_puts_are_rejected() {
         let backend = ConformanceBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_put(space(1), key("a"), value("B"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("a"), value("B"));
 
         assert!(matches!(
             writes.commit(&backend, WriteOptions::default()),
@@ -459,8 +386,8 @@ mod tests {
     fn duplicate_deletes_are_rejected() {
         let backend = ConformanceBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.stage_delete(space(1), key("a"));
-        writes.stage_delete(space(1), key("a"));
+        writes.delete(space(1), key("a"));
+        writes.delete(space(1), key("a"));
 
         assert!(matches!(
             writes.commit(&backend, WriteOptions::default()),
@@ -472,53 +399,51 @@ mod tests {
     }
 
     #[test]
-    fn try_stage_put_rejects_duplicate_immediately() {
+    fn put_records_stats_without_immediate_duplicate_validation() {
         let mut writes = StorageWriteSet::new();
-        writes
-            .try_stage_put(space(1), key("a"), value("A"))
-            .expect("first put");
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("a"), value("B"));
+
+        let stats = writes.stats();
+        assert_eq!(stats.staged_puts, 2);
+        assert_eq!(stats.written_bytes, 2);
 
         assert!(matches!(
-            writes.try_stage_put(space(1), key("a"), value("B")),
+            writes.validate(),
             Err(StorageWriteSetError::DuplicateMutation {
                 space: duplicate_space,
                 key: duplicate_key
             }) if duplicate_space == space(1) && duplicate_key == key("a")
         ));
-
-        let stats = writes.stats();
-        assert_eq!(stats.staged_puts, 1);
-        assert_eq!(stats.written_bytes, 1);
     }
 
     #[test]
-    fn try_stage_delete_rejects_duplicate_against_put_immediately() {
+    fn delete_records_stats_without_immediate_duplicate_validation() {
         let mut writes = StorageWriteSet::new();
-        writes
-            .try_stage_put(space(1), key("a"), value("A"))
-            .expect("put");
+        writes.put(space(1), key("a"), value("A"));
+        writes.delete(space(1), key("a"));
+
+        let stats = writes.stats();
+        assert_eq!(stats.staged_puts, 1);
+        assert_eq!(stats.staged_deletes, 1);
 
         assert!(matches!(
-            writes.try_stage_delete(space(1), key("a")),
+            writes.validate(),
             Err(StorageWriteSetError::DuplicateMutation {
                 space: duplicate_space,
                 key: duplicate_key
             }) if duplicate_space == space(1) && duplicate_key == key("a")
         ));
-
-        let stats = writes.stats();
-        assert_eq!(stats.staged_puts, 1);
-        assert_eq!(stats.staged_deletes, 0);
     }
 
     #[test]
     fn canonical_staging_tracks_stats_and_lowers_without_duplicate_index() {
-        let mut writes = StorageWriteSet::canonical_with_capacity(3, 2);
+        let mut writes = StorageWriteSet::with_capacity(3, 2);
         writes.reserve_space(space(1), 2, 0);
         writes.reserve_space(space(2), 0, 1);
-        writes.stage_canonical_put(space(1), key("a"), value("A"));
-        writes.stage_canonical_put(space(1), key("b"), value("B"));
-        writes.stage_canonical_delete(space(2), key("c"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("b"), value("B"));
+        writes.delete(space(2), key("c"));
 
         let stats = writes.stats();
         assert_eq!(stats.staged_puts, 2);
@@ -540,12 +465,12 @@ mod tests {
     fn conflicting_space_declarations_are_rejected() {
         let backend = ConformanceBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(
+        writes.put(
             StorageSpace::new(SpaceId(1), "test.space.one"),
             key("a"),
             value("A"),
         );
-        writes.stage_put(
+        writes.put(
             StorageSpace::new(SpaceId(1), "test.space.renamed"),
             key("b"),
             value("B"),
@@ -568,12 +493,12 @@ mod tests {
     #[test]
     fn write_set_groups_by_space_id_not_name() {
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(
+        writes.put(
             StorageSpace::new(SpaceId(1), "test.space.one"),
             key("a"),
             value("A"),
         );
-        writes.stage_put(
+        writes.put(
             StorageSpace::new(SpaceId(1), "test.space.renamed"),
             key("b"),
             value("B"),
@@ -596,14 +521,14 @@ mod tests {
     fn conflicting_space_declaration_across_extend_is_rejected() {
         let backend = ConformanceBackend::new();
         let mut left = StorageWriteSet::new();
-        left.stage_put(
+        left.put(
             StorageSpace::new(SpaceId(1), "test.space.one"),
             key("a"),
             value("A"),
         );
 
         let mut right = StorageWriteSet::new();
-        right.stage_put(
+        right.put(
             StorageSpace::new(SpaceId(1), "test.space.renamed"),
             key("b"),
             value("B"),
@@ -625,8 +550,8 @@ mod tests {
     fn duplicate_validation_happens_before_opening_backend_write() {
         let backend = CountingBackend::default();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_put(space(1), key("a"), value("B"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("a"), value("B"));
 
         assert!(matches!(
             writes.commit(&backend, WriteOptions::default()),
@@ -641,12 +566,12 @@ mod tests {
     fn conflicting_space_validation_happens_before_opening_backend_write() {
         let backend = CountingBackend::default();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(
+        writes.put(
             StorageSpace::new(SpaceId(1), "test.space.one"),
             key("a"),
             value("A"),
         );
-        writes.stage_put(
+        writes.put(
             StorageSpace::new(SpaceId(1), "test.space.renamed"),
             key("b"),
             value("B"),
@@ -665,7 +590,7 @@ mod tests {
     fn lower_failure_rolls_back_once() {
         let backend = CountingBackend::failing(FailPoint::PutMany);
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("a"), value("A"));
 
         assert!(matches!(
             writes.commit(&backend, WriteOptions::default()),
@@ -680,7 +605,7 @@ mod tests {
     fn delete_lower_failure_rolls_back_once() {
         let backend = CountingBackend::failing(FailPoint::DeleteMany);
         let mut writes = StorageWriteSet::new();
-        writes.stage_delete(space(1), key("a"));
+        writes.delete(space(1), key("a"));
 
         assert!(matches!(
             writes.commit(&backend, WriteOptions::default()),
@@ -695,7 +620,7 @@ mod tests {
     fn commit_failure_is_reported_without_successful_commit_stats() {
         let backend = CountingBackend::failing(FailPoint::Commit);
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("a"), value("A"));
 
         assert!(matches!(
             writes.commit(&backend, WriteOptions::default()),
@@ -711,8 +636,8 @@ mod tests {
     fn same_key_in_different_spaces_is_allowed() {
         let backend = ConformanceBackend::new();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_put(space(2), key("a"), value("B"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(2), key("a"), value("B"));
 
         writes
             .commit(&backend, WriteOptions::default())
@@ -722,11 +647,11 @@ mod tests {
     #[test]
     fn lower_into_groups_by_space_and_operation() {
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_put(space(1), key("b"), value("B"));
-        writes.stage_put(space(2), key("a"), value("C"));
-        writes.stage_delete(space(1), key("c"));
-        writes.stage_delete(space(2), key("d"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("b"), value("B"));
+        writes.put(space(2), key("a"), value("C"));
+        writes.delete(space(1), key("c"));
+        writes.delete(space(2), key("d"));
 
         let mut write = CountingWrite::default();
         let stats = writes.lower_into(&mut write).expect("lower");
@@ -743,8 +668,8 @@ mod tests {
     fn commit_uses_one_backend_write_and_one_commit() {
         let backend = CountingBackend::default();
         let mut writes = StorageWriteSet::new();
-        writes.stage_put(space(1), key("a"), value("A"));
-        writes.stage_delete(space(1), key("b"));
+        writes.put(space(1), key("a"), value("A"));
+        writes.delete(space(1), key("b"));
 
         writes
             .commit(&backend, WriteOptions::default())
