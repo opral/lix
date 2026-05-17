@@ -2980,6 +2980,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_insert_into_entity_by_version_accepts_parameterized_version_id() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO test_state_schema_by_version (\
+             lixcol_entity_id, lixcol_version_id, value\
+             ) VALUES (lix_json('[\"entity-c\"]'), $1, 'C')",
+            &[Value::Text("version-b".to_string())],
+        )
+        .await
+        .expect("parameterized by-version entity insert should stage write");
+
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-c\"]");
+        assert_eq!(rows[0].version_id, "version-b");
+    }
+
+    #[tokio::test]
     async fn execute_sql_insert_into_active_entity_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
@@ -3755,11 +3796,11 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "DELETE FROM test_state_schema_by_version \
-             WHERE lixcol_version_id = 'version-b'",
-            &[],
+             WHERE lixcol_version_id = $1",
+            &[Value::Text("version-b".to_string())],
         )
         .await
-        .expect("DELETE entity by-version surface should stage tombstone");
+        .expect("parameterized DELETE entity by-version surface should stage tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);

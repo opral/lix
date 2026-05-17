@@ -1029,21 +1029,39 @@ fn by_version_scope(
     selector: VersionSelector,
 ) -> Result<VersionScope, LixError> {
     match (input, selector) {
-        (_, VersionSelector::Static(version_ids)) if version_ids.is_empty() => {
-            Ok(VersionScope::Empty)
-        }
+        (_, selector) if selector.is_empty() => Ok(VersionScope::Empty),
         (BoundWriteInput::Values(_), VersionSelector::Missing) => Err(super::error::unsupported(
             format!("INSERT into by-version SQL table requires explicit '{version_column}'"),
         )),
         (BoundWriteInput::Values(_), VersionSelector::Static(version_ids)) => {
             Ok(VersionScope::Explicit { version_ids })
         }
+        (
+            BoundWriteInput::Values(_),
+            VersionSelector::Dynamic {
+                version_ids,
+                param_indexes,
+            },
+        ) => Ok(VersionScope::ExplicitDynamic {
+            version_ids,
+            param_indexes,
+        }),
         (BoundWriteInput::None, VersionSelector::Missing) => Err(super::error::unsupported(
             format!("by-version SQL writes require an explicit '{version_column}' predicate"),
         )),
         (BoundWriteInput::None, VersionSelector::Static(version_ids)) => {
             Ok(VersionScope::ExplicitRequired { version_ids })
         }
+        (
+            BoundWriteInput::None,
+            VersionSelector::Dynamic {
+                version_ids,
+                param_indexes,
+            },
+        ) => Ok(VersionScope::ExplicitRequiredDynamic {
+            version_ids,
+            param_indexes,
+        }),
         (BoundWriteInput::Query { .. }, _) => Err(super::error::unsupported(
             "INSERT ... SELECT by-version writes are not supported",
         )),
@@ -1056,9 +1074,7 @@ fn lix_state_by_version_scope(
     version_selector: VersionSelector,
     global_selector: GlobalSelector,
 ) -> Result<VersionScope, LixError> {
-    if matches!(global_selector, GlobalSelector::Empty)
-        || matches!(&version_selector, VersionSelector::Static(version_ids) if version_ids.is_empty())
-    {
+    if matches!(global_selector, GlobalSelector::Empty) || version_selector.is_empty() {
         return Ok(VersionScope::Empty);
     }
 
@@ -1072,6 +1088,9 @@ fn lix_state_by_version_scope(
             }
             VersionSelector::Static(_) => Err(super::error::unsupported(
                 "lix_state_by_version writes cannot combine global = true with non-global version_id",
+            )),
+            VersionSelector::Dynamic { .. } => Err(super::error::unsupported(
+                "parameterized lix_state global scope selectors are not supported yet",
             )),
         },
         GlobalSelector::Static(false) => match &version_selector {
@@ -1281,14 +1300,65 @@ fn by_version_column_name(kind: &PublicSurfaceKind) -> Option<&'static str> {
 enum VersionSelector {
     Missing,
     Static(BTreeSet<String>),
+    Dynamic {
+        version_ids: BTreeSet<String>,
+        param_indexes: BTreeSet<usize>,
+    },
 }
 
 impl VersionSelector {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Static(version_ids) if version_ids.is_empty())
+    }
+
     fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Static(version_ids), Self::Dynamic { param_indexes, .. })
+            | (Self::Dynamic { param_indexes, .. }, Self::Static(version_ids))
+                if version_ids.is_empty() || param_indexes.is_empty() =>
+            {
+                Self::Static(BTreeSet::new())
+            }
             (Self::Static(left), Self::Static(right)) => {
                 Self::Static(left.intersection(&right).cloned().collect())
+            }
+            (
+                Self::Dynamic {
+                    mut version_ids,
+                    mut param_indexes,
+                },
+                Self::Dynamic {
+                    version_ids: right_versions,
+                    param_indexes: right_params,
+                },
+            ) => {
+                version_ids.extend(right_versions);
+                param_indexes.extend(right_params);
+                Self::Dynamic {
+                    version_ids,
+                    param_indexes,
+                }
+            }
+            (
+                Self::Static(mut version_ids),
+                Self::Dynamic {
+                    version_ids: right_versions,
+                    param_indexes,
+                },
+            )
+            | (
+                Self::Dynamic {
+                    version_ids: right_versions,
+                    param_indexes,
+                },
+                Self::Static(mut version_ids),
+            ) => {
+                version_ids.extend(right_versions);
+                Self::Dynamic {
+                    version_ids,
+                    param_indexes,
+                }
             }
         }
     }
@@ -1299,6 +1369,43 @@ impl VersionSelector {
             (Self::Static(mut left), Self::Static(right)) => {
                 left.extend(right);
                 Self::Static(left)
+            }
+            (
+                Self::Dynamic {
+                    mut version_ids,
+                    mut param_indexes,
+                },
+                Self::Dynamic {
+                    version_ids: right_versions,
+                    param_indexes: right_params,
+                },
+            ) => {
+                version_ids.extend(right_versions);
+                param_indexes.extend(right_params);
+                Self::Dynamic {
+                    version_ids,
+                    param_indexes,
+                }
+            }
+            (
+                Self::Static(mut version_ids),
+                Self::Dynamic {
+                    version_ids: right_versions,
+                    param_indexes,
+                },
+            )
+            | (
+                Self::Dynamic {
+                    version_ids: right_versions,
+                    param_indexes,
+                },
+                Self::Static(mut version_ids),
+            ) => {
+                version_ids.extend(right_versions);
+                Self::Dynamic {
+                    version_ids,
+                    param_indexes,
+                }
             }
         }
     }
@@ -1370,11 +1477,12 @@ fn value_version_selector(expr: &BoundExpr) -> Result<VersionSelector, LixError>
         BoundExpr::Literal(BoundLiteral::Text(version_id)) => Ok(VersionSelector::Static(
             BTreeSet::from([version_id.clone()]),
         )),
-        BoundExpr::Param(_) => Err(super::error::unsupported(
-            "parameterized by-version scope selectors are not supported yet",
-        )),
+        BoundExpr::Param(param) => Ok(VersionSelector::Dynamic {
+            version_ids: BTreeSet::new(),
+            param_indexes: BTreeSet::from([param.index]),
+        }),
         _ => Err(super::error::unsupported(
-            "by-version SQL write predicates require string literal version ids",
+            "by-version SQL write predicates require string version ids",
         )),
     }
 }
@@ -1730,17 +1838,38 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_parameterized_by_version_scope_selectors() {
-        let statement = parse_statement(
-            "UPDATE lix_file_by_version SET hidden = true WHERE id = 'file1' AND lixcol_version_id = $1",
+    fn bind_statement_preserves_parameterized_by_version_scope_selectors() {
+        let update = bind_statement(
+            &parse_statement(
+                "UPDATE lix_file_by_version SET hidden = true WHERE id = 'file1' AND lixcol_version_id = $1",
+            ),
+            &[],
+            "version1",
+        )
+        .expect("parameterized update version scope should bind");
+        assert_eq!(
+            update.version_scope,
+            VersionScope::ExplicitRequiredDynamic {
+                version_ids: BTreeSet::new(),
+                param_indexes: BTreeSet::from([1])
+            }
         );
-        let error = bind_statement(&statement, &[], "version1")
-            .expect_err("parameterized version scope should fail closed until scope resolution");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("parameterized by-version scope selectors"));
+        let insert = bind_statement(
+            &parse_statement(
+                "INSERT INTO lix_file_by_version (id, name, lixcol_version_id) VALUES ('file1', 'a', $1)",
+            ),
+            &[],
+            "version1",
+        )
+        .expect("parameterized insert version scope should bind");
+        assert_eq!(
+            insert.version_scope,
+            VersionScope::ExplicitDynamic {
+                version_ids: BTreeSet::new(),
+                param_indexes: BTreeSet::from([1])
+            }
+        );
     }
 
     #[test]

@@ -1184,6 +1184,12 @@ fn scan_version_ids(scope: &VersionScope) -> Result<Vec<String>, LixError> {
         VersionScope::Explicit { version_ids } | VersionScope::ExplicitRequired { version_ids } => {
             version_ids.iter().cloned().collect()
         }
+        VersionScope::ExplicitDynamic { .. } | VersionScope::ExplicitRequiredDynamic { .. } => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "parameterized version scope was not resolved before write execution",
+            ));
+        }
         VersionScope::Global => vec![crate::GLOBAL_VERSION_ID.to_string()],
         VersionScope::Empty => Vec::new(),
     })
@@ -1264,6 +1270,12 @@ fn entity_row_version_id(
         VersionScope::Explicit { version_ids } if version_ids.len() == 1 => {
             Ok(version_ids.iter().next().expect("len checked").clone())
         }
+        VersionScope::ExplicitDynamic { .. } | VersionScope::ExplicitRequiredDynamic { .. } => {
+            Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "parameterized version scope was not resolved before write execution",
+            ))
+        }
         VersionScope::Global => Ok(crate::GLOBAL_VERSION_ID.to_string()),
         VersionScope::Empty => Ok(crate::GLOBAL_VERSION_ID.to_string()),
         _ => Err(LixError::new(
@@ -1279,6 +1291,7 @@ fn insert_target_version_ids(scope: &VersionScope) -> Option<Vec<String>> {
         VersionScope::Explicit { version_ids } | VersionScope::ExplicitRequired { version_ids } => {
             Some(version_ids.iter().cloned().collect())
         }
+        VersionScope::ExplicitDynamic { .. } | VersionScope::ExplicitRequiredDynamic { .. } => None,
         VersionScope::Global => Some(vec![crate::GLOBAL_VERSION_ID.to_string()]),
         VersionScope::Empty => Some(Vec::new()),
     }
