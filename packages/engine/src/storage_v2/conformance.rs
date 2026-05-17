@@ -3,10 +3,12 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::backend_v2::{
-    ConformanceBackend, CoreProjection, GetOptions, Key, KeyRange, Prefix, ProjectedValue,
-    ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
+    ConformanceBackend, CoreProjection, GetOptions, Key, KeyRange, KeyRef, Prefix, ProjectedValue,
+    ProjectedValueRef, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
 };
-use crate::storage_v2::{StorageContext, StorageReader, StorageSpace, StorageWriteSetError};
+use crate::storage_v2::{
+    StorageContext, StorageReadStatsCollector, StorageReader, StorageSpace, StorageWriteSetError,
+};
 
 type StorageConformanceResult = Result<(), String>;
 
@@ -63,6 +65,10 @@ fn run_storage_conformance() -> StorageConformanceReport {
         StorageConformanceTest {
             name: "prefix_scan_lowers_to_backend_range",
             run: prefix_scan_lowers_to_backend_range,
+        },
+        StorageConformanceTest {
+            name: "scan_stats_collector_accumulates_chunked_drain_shape",
+            run: scan_stats_collector_accumulates_chunked_drain_shape,
         },
         StorageConformanceTest {
             name: "read_scope_pins_snapshot",
@@ -199,6 +205,83 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     Ok(())
 }
 
+fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceResult {
+    let storage = StorageContext::new(ConformanceBackend::new());
+    let mut writes = storage.new_write_set();
+    for suffix in ["0", "1", "2", "3", "4"] {
+        writes.stage_put(
+            space_one(),
+            key_with_prefix("item-", suffix),
+            value("value"),
+        );
+    }
+    storage
+        .commit_write_set(writes, WriteOptions::default())
+        .map_err(|error| format!("seed failed: {error}"))?;
+
+    let read = storage
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let mut collector = StorageReadStatsCollector::new();
+    let mut resume_after = None::<Key>;
+    let mut emitted = 0usize;
+
+    loop {
+        let mut chunk_last_key = None::<Key>;
+        let result = read
+            .visit_scan_prefix_with_stats(
+                space_one(),
+                Prefix {
+                    bytes: Bytes::from_static(b"item-"),
+                },
+                ScanOptions {
+                    projection: CoreProjection::KeyOnly,
+                    limit_rows: 2,
+                    resume_after: resume_after.as_ref(),
+                },
+                &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                    if !matches!(value, ProjectedValueRef::KeyOnly) {
+                        return Err(crate::backend_v2::BackendError::Corruption(
+                            "expected key-only scan value".to_string(),
+                        ));
+                    }
+                    chunk_last_key = Some(key.to_owned_key());
+                    Ok(())
+                },
+            )
+            .map_err(|error| format!("visit_scan_prefix_with_stats failed: {error}"))?;
+
+        emitted += result.value.emitted;
+        collector.record(result.stats);
+        resume_after = chunk_last_key;
+
+        if !result.value.has_more {
+            break;
+        }
+    }
+
+    let stats = collector.snapshot();
+    assert_eq!(emitted, 5);
+    assert_eq!(stats.backend_calls, 3);
+    assert_eq!(stats.prefix_lowered, 3);
+    assert_eq!(stats.prefix_scan_chunks, 3);
+    assert_eq!(stats.range_scan_chunks, 0);
+    assert_eq!(stats.scan_key_only_chunks, 3);
+    assert_eq!(stats.scan_full_value_chunks, 0);
+    assert_eq!(stats.scan_rows, 5);
+    assert_eq!(stats.scan_has_more, 2);
+    assert_eq!(stats.scan_resume_after, 2);
+    assert_eq!(stats.scan_limit_rows_total, 6);
+    assert_eq!(stats.scan_limit_rows_max, 2);
+
+    let before_reset = stats;
+    collector.reset();
+    assert_eq!(collector.snapshot(), Default::default());
+    assert_ne!(before_reset, collector.snapshot());
+
+    Ok(())
+}
+
 fn read_scope_pins_snapshot() -> StorageConformanceResult {
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut seed = storage.new_write_set();
@@ -275,6 +358,13 @@ fn key(bytes: &'static str) -> Key {
     Key(Bytes::from_static(bytes.as_bytes()))
 }
 
+fn key_with_prefix(prefix: &'static str, suffix: &'static str) -> Key {
+    let mut bytes = Vec::with_capacity(prefix.len() + suffix.len());
+    bytes.extend_from_slice(prefix.as_bytes());
+    bytes.extend_from_slice(suffix.as_bytes());
+    Key(Bytes::from(bytes))
+}
+
 fn value(bytes: &'static str) -> StoredValue {
     StoredValue {
         bytes: Bytes::from_static(bytes.as_bytes()),
@@ -303,6 +393,7 @@ mod tests {
                 "write_set_commits_and_reads_back",
                 "point_reads_preserve_caller_order_duplicates_and_missing",
                 "prefix_scan_lowers_to_backend_range",
+                "scan_stats_collector_accumulates_chunked_drain_shape",
                 "read_scope_pins_snapshot",
                 "write_set_rejects_conflicting_space_declarations",
             ]

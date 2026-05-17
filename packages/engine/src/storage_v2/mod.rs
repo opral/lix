@@ -47,5 +47,7 @@ pub(crate) use scan::{
 pub use scan::{BorrowedScanChunk, StorageScanBuffer};
 pub(crate) use spaces::decode_logical_key_ref;
 pub use spaces::StorageSpace;
-pub use stats::{StorageReadResult, StorageReadStats, StorageWriteSetStats};
+pub use stats::{
+    StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
+};
 pub use write_set::{StorageWriteSet, StorageWriteSetError};

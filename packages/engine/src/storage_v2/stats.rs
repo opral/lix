@@ -33,6 +33,29 @@ impl StorageReadStats {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StorageReadStatsCollector {
+    stats: StorageReadStats,
+}
+
+impl StorageReadStatsCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, stats: StorageReadStats) {
+        self.stats.add(stats);
+    }
+
+    pub fn snapshot(&self) -> StorageReadStats {
+        self.stats.clone()
+    }
+
+    pub fn reset(&mut self) {
+        self.stats = StorageReadStats::default();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageReadResult<T> {
     pub value: T,
