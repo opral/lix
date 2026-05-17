@@ -7,7 +7,7 @@ use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue, SchemaExt};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -56,7 +56,7 @@ pub(super) async fn register_lix_version_read_provider(
     Ok(())
 }
 
-pub(super) async fn register_lix_version_write_surface(
+pub(super) async fn register_write_provider(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
@@ -147,27 +147,69 @@ impl TableProvider for LixVersionProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for lix_version yet");
+        }
+        let write_ctx = self.write_access.require_write("INSERT into lix_version")?;
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+        let sink = LixVersionInsertSink::new(Arc::clone(&self.schema), write_ctx);
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
         &self,
-        _state: &dyn Session,
-        _filters: Vec<Expr>,
+        state: &dyn Session,
+        filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
+        let write_ctx = self.write_access.require_write("DELETE FROM lix_version")?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(LixVersionDeleteExec::new(
+            write_ctx,
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.version_ref),
+            Arc::clone(&self.schema),
+            physical_filters,
+        )))
     }
 
     async fn update(
         &self,
-        _state: &dyn Session,
-        _assignments: Vec<(String, Expr)>,
-        _filters: Vec<Expr>,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
+        let write_ctx = self.write_access.require_write("UPDATE lix_version")?;
+        validate_lix_version_update_assignments(&assignments)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(LixVersionUpdateExec::new(
+            write_ctx,
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.version_ref),
+            Arc::clone(&self.schema),
+            physical_assignments,
+            physical_filters,
+        )))
     }
 }
 
@@ -492,6 +534,7 @@ impl ExecutionPlan for LixVersionUpdateExec {
             let matched_batch = filter_version_batch(source_batch, &filters)?;
             let version_rows =
                 version_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
+            reject_protected_version_updates(&version_rows)?;
             let count = u64::try_from(version_rows.len())
                 .map_err(|_| DataFusionError::Execution("UPDATE row count overflow".to_string()))?;
             let rows = version_rows
@@ -823,6 +866,17 @@ fn reject_protected_version_deletes(rows: &[VersionRow], active_version_id: &str
                 "DELETE FROM lix_version cannot delete active version '{}'",
                 row.id
             )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_protected_version_updates(rows: &[VersionRow]) -> Result<()> {
+    for row in rows {
+        if row.id == GLOBAL_VERSION_ID {
+            return Err(DataFusionError::Execution(
+                "UPDATE lix_version cannot update the global version".to_string(),
+            ));
         }
     }
     Ok(())

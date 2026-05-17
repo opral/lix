@@ -54,15 +54,21 @@ pub(crate) fn require_public_column<'a>(
             .expect("checked public column"));
     }
     if table.surface.column(column_name).is_some() {
-        return Err(super::error::unsupported(format!(
-            "column '{column_name}' is not part of public SQL surface '{}'",
-            table.name
-        )));
+        return Err(LixError::new(
+            LixError::CODE_COLUMN_NOT_FOUND,
+            format!(
+                "column '{column_name}' is not part of public SQL surface '{}'",
+                table.name
+            ),
+        ));
     }
-    Err(super::error::unsupported(format!(
-        "column '{column_name}' does not exist on SQL table '{}'",
-        table.name
-    )))
+    Err(LixError::new(
+        LixError::CODE_COLUMN_NOT_FOUND,
+        format!(
+            "column '{column_name}' does not exist on SQL table '{}'",
+            table.name
+        ),
+    ))
 }
 
 pub(crate) fn require_writable_column(
@@ -77,6 +83,11 @@ pub(crate) fn require_writable_column(
         BoundWriteOp::Delete => false,
     };
     if !allowed {
+        if table.name == "lix_version" && column_name == "id" && op == BoundWriteOp::Update {
+            return Err(super::error::unsupported(
+                "UPDATE lix_version cannot change immutable column 'id'",
+            ));
+        }
         return Err(super::error::unsupported(format!(
             "column '{column_name}' is not writable on SQL table '{}'",
             table.name

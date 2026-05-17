@@ -14,6 +14,7 @@ pub(crate) enum BoundPredicate {
     True,
     False,
     And(Vec<BoundPredicate>),
+    Or(Vec<BoundPredicate>),
     Eq(BoundExpr, BoundExpr),
     In {
         expr: BoundExpr,

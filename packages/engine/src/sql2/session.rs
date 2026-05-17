@@ -1,4 +1,5 @@
 use datafusion::prelude::{SessionConfig, SessionContext};
+use std::collections::BTreeSet;
 
 use crate::LixError;
 
@@ -24,13 +25,37 @@ pub(crate) async fn build_read_session(
 pub(crate) async fn build_write_session(
     ctx: &mut dyn SqlWriteExecutionContext,
 ) -> Result<SessionContext, LixError> {
+    build_write_session_with_options(ctx, SqlWriteSessionOptions::default()).await
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SqlWriteSessionOptions {
+    pub(crate) omitted_insert_columns: BTreeSet<String>,
+}
+
+pub(crate) async fn build_write_session_with_options(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    options: SqlWriteSessionOptions,
+) -> Result<SessionContext, LixError> {
     let session = new_sql_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
+    let active_version_id = write_ctx.active_version_id();
     let active_version_commit_id = write_ctx
-        .load_version_head(&write_ctx.active_version_id())
-        .await?;
-    register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
-    providers::register_write(&session, write_ctx).await?;
+        .load_version_head(&active_version_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::version_not_found(
+                active_version_id.clone(),
+                "build SQL write session",
+                "active version",
+            )
+        })?;
+    register_sql2_functions(
+        &session,
+        write_ctx.functions(),
+        Some(active_version_commit_id),
+    );
+    providers::register_write(&session, write_ctx, options).await?;
 
     Ok(session)
 }

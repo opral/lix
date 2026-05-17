@@ -466,13 +466,13 @@ fn filesystem_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
         PublicColumn::hidden("lixcol_entity_id"),
         PublicColumn::hidden("lixcol_schema_key"),
         PublicColumn::hidden("lixcol_file_id"),
-        PublicColumn::hidden("lixcol_global"),
+        PublicColumn::public_insert_only("lixcol_global"),
         PublicColumn::hidden("lixcol_change_id"),
         PublicColumn::hidden("lixcol_created_at"),
         PublicColumn::hidden("lixcol_updated_at"),
         PublicColumn::hidden("lixcol_commit_id"),
-        PublicColumn::hidden("lixcol_untracked"),
-        PublicColumn::hidden("lixcol_metadata"),
+        PublicColumn::public_insert_only("lixcol_untracked"),
+        PublicColumn::public("lixcol_metadata"),
     ];
     if by_version {
         columns.push(PublicColumn::public_insert_only("lixcol_version_id"));

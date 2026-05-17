@@ -82,7 +82,10 @@ pub(crate) enum BoundWriteOp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundWriteInput {
     Values(Vec<BoundInsertRow>),
-    Query(Box<BoundRead>),
+    Query {
+        query: Box<BoundRead>,
+        columns: Vec<BoundColumnRef>,
+    },
     None,
 }
 

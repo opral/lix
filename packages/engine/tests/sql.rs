@@ -23,7 +23,6 @@ macro_rules! simulation_test {
     (@single $name:ident, $simulation:ident, $mode:ident, $options:expr, |$sim:ident| $body:expr) => {
         paste::paste! {
             #[test]
-            #[ignore = "Phase 1 disables public SQL writes; re-enable this SQL integration harness through the bound write pipeline"]
             fn [<$name _ $simulation>]() {
                 let simulation_mode =
                     crate::support::simulation_test::engine::SimulationMode::$mode;

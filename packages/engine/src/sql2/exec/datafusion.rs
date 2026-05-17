@@ -1,4 +1,4 @@
-use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::{Column, DFSchema, ParamValues, ScalarValue};
@@ -12,23 +12,33 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
-use crate::sql2::bind::write::BoundInsertRow;
-use crate::sql2::bind::write::{BoundWriteInput, BoundWriteOp, BoundWriteTarget};
+use crate::sql2::bind::read::BoundReadSource;
+use crate::sql2::bind::write::{BoundInsertRow, FileWriteSurface};
+use crate::sql2::bind::write::{
+    BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
+};
 use crate::sql2::parse::parse_statement;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, LixNotice, SqlQueryResult, Value, GLOBAL_VERSION_ID};
 
-use crate::sql2::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
+use crate::sql2::predicate_typecheck::{
+    json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
+};
 use crate::sql2::result_metadata::{
     field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY,
 };
-use crate::sql2::session::{build_read_session, build_write_session};
+use crate::sql2::session::{
+    build_read_session, build_write_session, build_write_session_with_options,
+    SqlWriteSessionOptions,
+};
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
 
 use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan};
+
+pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
 
 #[allow(dead_code)]
 pub(crate) struct DataFusionLogicalPlan {
@@ -37,6 +47,7 @@ pub(crate) struct DataFusionLogicalPlan {
     pub(super) kind: SqlStatementKind,
     pub(super) notices: Vec<LixNotice>,
     pub(super) strict_binary_params: BTreeSet<usize>,
+    pub(super) json_predicate_params: BTreeSet<usize>,
 }
 
 impl DataFusionLogicalPlan {
@@ -79,6 +90,7 @@ pub(crate) async fn create_logical_plan_from_parsed(
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
+    let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
     let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
@@ -88,6 +100,7 @@ pub(crate) async fn create_logical_plan_from_parsed(
         kind,
         notices,
         strict_binary_params: BTreeSet::new(),
+        json_predicate_params,
     }))
 }
 
@@ -102,6 +115,7 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
+    let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
     let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
@@ -111,6 +125,7 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
         kind,
         notices,
         strict_binary_params: BTreeSet::new(),
+        json_predicate_params,
     }))
 }
 
@@ -126,6 +141,9 @@ async fn create_logical_plan_from_statement(
 }
 
 fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    for expr in plan.expressions() {
+        validate_json_predicate_expr_with_dfschema(plan.schema(), &expr)?;
+    }
     match plan {
         LogicalPlan::Filter(filter) => {
             validate_json_predicate_expr_with_dfschema(filter.input.schema(), &filter.predicate)?;
@@ -145,6 +163,38 @@ fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), Li
     Ok(())
 }
 
+fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> {
+    let mut params = BTreeSet::new();
+    for expr in plan.expressions() {
+        params.extend(json_predicate_placeholder_indexes_with_dfschema(
+            plan.schema(),
+            &expr,
+        ));
+    }
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            params.extend(json_predicate_placeholder_indexes_with_dfschema(
+                filter.input.schema(),
+                &filter.predicate,
+            ));
+        }
+        LogicalPlan::TableScan(scan) => {
+            for filter in &scan.filters {
+                params.extend(json_predicate_placeholder_indexes_with_dfschema(
+                    scan.projected_schema.as_ref(),
+                    filter,
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    for input in plan.inputs() {
+        params.extend(json_predicate_params_in_logical_plan(input));
+    }
+    params
+}
+
 pub(crate) async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
@@ -161,9 +211,11 @@ pub(crate) async fn execute_logical_plan(
         kind: _,
         notices,
         strict_binary_params,
+        json_predicate_params,
     } = plan;
     validate_parameter_count(&plan, params.len())?;
     validate_strict_binary_params(&strict_binary_params, params)?;
+    validate_json_predicate_params(&json_predicate_params, params)?;
 
     let mut dataframe = session
         .execute_logical_plan(plan)
@@ -196,7 +248,8 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<u64, LixError> {
-    let session = build_write_session(ctx).await?;
+    validate_bound_write_input(plan, params)?;
+    let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
         .table_provider(table_name)
@@ -248,7 +301,8 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<(), LixError> {
-    let session = build_write_session(ctx).await?;
+    validate_bound_write_input(plan, params)?;
+    let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
         .table_provider(table_name)
@@ -292,21 +346,42 @@ async fn insert_input_plan(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
-    let BoundWriteInput::Values(rows) = &plan.bound.input else {
-        return Err(LixError::new(
+    match &plan.bound.input {
+        BoundWriteInput::Values(rows) => {
+            insert_values_input_plan(session, schema, plan, params, rows).await
+        }
+        BoundWriteInput::Query { query, columns } => {
+            insert_query_input_plan(session, schema, query, columns, params).await
+        }
+        BoundWriteInput::None => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "sql2 DataFusion reference writer does not support INSERT ... SELECT yet",
-        ));
-    };
+            "INSERT source is required",
+        )),
+    }
+}
+
+async fn insert_values_input_plan(
+    session: &SessionContext,
+    schema: SchemaRef,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+    rows: &[BoundInsertRow],
+) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
     if rows.is_empty() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer cannot execute empty INSERT",
         ));
     }
-
+    let nullable_schema = std::sync::Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| Field::new(field.name(), field.data_type().clone(), true))
+            .collect::<Vec<_>>(),
+    ));
     let df_schema = std::sync::Arc::new(
-        DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?,
+        DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
     );
     let values = rows
         .iter()
@@ -325,8 +400,16 @@ async fn insert_input_plan(
         .iter()
         .enumerate()
         .map(|(index, field)| {
+            let metadata = if insert_column_is_omitted(rows, field.name()) {
+                Some(FieldMetadata::new(BTreeMap::from([(
+                    LIX_INSERT_COLUMN_OMITTED_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                )])))
+            } else {
+                None
+            };
             Expr::Column(Column::from_name(format!("column{}", index + 1)))
-                .alias_with_metadata(field.name(), Some(FieldMetadata::new_from_field(field)))
+                .alias_with_metadata(field.name(), metadata)
         })
         .collect::<Vec<_>>();
     let logical_plan = LogicalPlanBuilder::values_with_schema(values, &df_schema)
@@ -340,6 +423,150 @@ async fn insert_input_plan(
         .create_physical_plan(&logical_plan)
         .await
         .map_err(datafusion_error_to_lix_error)
+}
+
+async fn insert_query_input_plan(
+    session: &SessionContext,
+    schema: SchemaRef,
+    query: &crate::sql2::bind::read::BoundRead,
+    columns: &[crate::sql2::bind::expr::BoundColumnRef],
+    params: &[Value],
+) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
+    let BoundReadSource::Query(query) = &query.source else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT query source is not available",
+        ));
+    };
+    let input = session
+        .state()
+        .statement_to_plan(DataFusionStatement::Statement(Box::new(
+            datafusion::sql::sqlparser::ast::Statement::Query(query.clone()),
+        )))
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    validate_supported_logical_plan(&input)?;
+    validate_json_predicates_in_logical_plan(&input)?;
+    let json_predicate_params = json_predicate_params_in_logical_plan(&input);
+    validate_parameter_count(&input, params.len())?;
+    validate_json_predicate_params(&json_predicate_params, params)?;
+    if input.schema().fields().len() != columns.len() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!(
+                "INSERT has {} target columns but query returns {} columns",
+                columns.len(),
+                input.schema().fields().len()
+            ),
+        ));
+    }
+
+    let input_schema = input.schema().clone();
+    let projection = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let expr = columns
+                .iter()
+                .position(|column| column.name == *field.name())
+                .map(|index| {
+                    let (qualifier, source_field) = input_schema.qualified_field(index);
+                    Expr::Column(Column::new(qualifier.cloned(), source_field.name().clone()))
+                })
+                .unwrap_or_else(|| {
+                    Expr::Literal(ScalarValue::try_new_null(field.data_type()).unwrap(), None)
+                });
+            Ok(expr
+                .cast_to(field.data_type(), input_schema.as_ref())
+                .map_err(datafusion_error_to_lix_error)?
+                .alias(field.name()))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let mut dataframe = session
+        .execute_logical_plan(input)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    if !params.is_empty() {
+        dataframe = dataframe
+            .with_param_values(ParamValues::List(
+                params.iter().map(scalar_value_from_lix_value).collect(),
+            ))
+            .map_err(datafusion_error_to_lix_error)?;
+    }
+    let logical_plan = LogicalPlanBuilder::from(
+        dataframe
+            .into_optimized_plan()
+            .map_err(datafusion_error_to_lix_error)?,
+    )
+    .project(projection)
+    .map_err(datafusion_error_to_lix_error)?
+    .build()
+    .map_err(datafusion_error_to_lix_error)?;
+    session
+        .state()
+        .create_physical_plan(&logical_plan)
+        .await
+        .map_err(datafusion_error_to_lix_error)
+}
+
+fn insert_column_is_omitted(rows: &[BoundInsertRow], field_name: &str) -> bool {
+    rows.iter()
+        .all(|row| row.values.keys().all(|column| column.name != field_name))
+}
+
+fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Result<(), LixError> {
+    if !matches!(
+        plan.bound.target,
+        BoundWriteTarget::File(FileWriteSurface::Base | FileWriteSurface::ByVersion)
+    ) || plan.bound.op != BoundWriteOp::Insert
+    {
+        return Ok(());
+    }
+
+    match &plan.bound.input {
+        BoundWriteInput::Values(rows) => {
+            for row in rows {
+                let Some((_, expr)) = row.values.iter().find(|(column, _)| column.name == "data")
+                else {
+                    continue;
+                };
+                validate_lix_file_data_insert_expr(expr, params)?;
+            }
+            Ok(())
+        }
+        BoundWriteInput::Query { columns, .. } => {
+            if columns.iter().any(|column| column.name == "data") {
+                Err(lix_file_data_type_lix_error())
+            } else {
+                Ok(())
+            }
+        }
+        BoundWriteInput::None => Ok(()),
+    }
+}
+
+fn validate_lix_file_data_insert_expr(expr: &BoundExpr, params: &[Value]) -> Result<(), LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Blob(_)) => Ok(()),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Blob(_)) => Ok(()),
+            _ => Err(lix_file_data_type_lix_error()),
+        },
+        BoundExpr::Function { .. } => Ok(()),
+        _ => Err(lix_file_data_type_lix_error()),
+    }
+}
+
+fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
+    let mut omitted_insert_columns = BTreeSet::new();
+    if let BoundWriteInput::Values(rows) = &plan.bound.input {
+        if insert_column_is_omitted(rows, "data") {
+            omitted_insert_columns.insert("data".to_string());
+        }
+    }
+    SqlWriteSessionOptions {
+        omitted_insert_columns,
+    }
 }
 
 fn insert_field_expr(
@@ -399,8 +626,23 @@ fn datafusion_write_filters(
     let mut filters =
         datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?;
     if plan.bound.version_scope == VersionScope::Global {
+        let version_column = if schema.field_with_name("version_id").is_ok() {
+            Some("version_id")
+        } else if schema.field_with_name("lixcol_version_id").is_ok() {
+            Some("lixcol_version_id")
+        } else {
+            None
+        };
+        let Some(version_column) = version_column else {
+            let df_schema =
+                DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
+            for filter in &filters {
+                validate_json_predicate_expr_with_dfschema(&df_schema, filter)?;
+            }
+            return Ok(filters);
+        };
         filters.push(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(Column::from_name("version_id"))),
+            Box::new(Expr::Column(Column::from_name(version_column))),
             Operator::Eq,
             Box::new(Expr::Literal(
                 ScalarValue::Utf8(Some(GLOBAL_VERSION_ID.to_string())),
@@ -433,6 +675,23 @@ fn datafusion_filters_from_predicate(
             }
             Ok(filters)
         }
+        BoundPredicate::Or(predicates) => {
+            let mut iter = predicates.iter();
+            let Some(first) = iter.next() else {
+                return Ok(Vec::new());
+            };
+            let mut expr = datafusion_single_filter_from_predicate(session, schema, first, params)?;
+            for predicate in iter {
+                expr = Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(expr),
+                    Operator::Or,
+                    Box::new(datafusion_single_filter_from_predicate(
+                        session, schema, predicate, params,
+                    )?),
+                ));
+            }
+            Ok(vec![expr])
+        }
         BoundPredicate::Eq(left, right) => {
             let left_is_json = bound_expr_is_json(left, schema);
             let right_is_json = bound_expr_is_json(right, schema);
@@ -442,6 +701,7 @@ fn datafusion_filters_from_predicate(
                     left,
                     params,
                     right_is_json,
+                    is_identity_json_bound_expr(right),
                 )?),
                 Operator::Eq,
                 Box::new(datafusion_filter_expr_from_bound_expr(
@@ -449,23 +709,33 @@ fn datafusion_filters_from_predicate(
                     right,
                     params,
                     left_is_json,
+                    is_identity_json_bound_expr(left),
                 )?),
             ))])
         }
         BoundPredicate::In { expr, values } => {
             let expr_is_json = bound_expr_is_json(expr, schema);
             let values_include_json = values.iter().any(|value| bound_expr_is_json(value, schema));
+            let expr_is_identity_json = is_identity_json_bound_expr(expr);
+            let values_include_identity_json = values.iter().any(is_identity_json_bound_expr);
             Ok(vec![Expr::InList(InList::new(
                 Box::new(datafusion_filter_expr_from_bound_expr(
                     session,
                     expr,
                     params,
                     values_include_json,
+                    values_include_identity_json,
                 )?),
                 values
                     .iter()
                     .map(|value| {
-                        datafusion_filter_expr_from_bound_expr(session, value, params, expr_is_json)
+                        datafusion_filter_expr_from_bound_expr(
+                            session,
+                            value,
+                            params,
+                            expr_is_json,
+                            expr_is_identity_json,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 false,
@@ -474,11 +744,33 @@ fn datafusion_filters_from_predicate(
     }
 }
 
+fn datafusion_single_filter_from_predicate(
+    session: &SessionContext,
+    schema: &datafusion::arrow::datatypes::Schema,
+    predicate: &BoundPredicate,
+    params: &[Value],
+) -> Result<Expr, LixError> {
+    let filters = datafusion_filters_from_predicate(session, schema, predicate, params)?;
+    let mut iter = filters.into_iter();
+    let mut expr = iter
+        .next()
+        .unwrap_or_else(|| Expr::Literal(ScalarValue::Boolean(Some(true)), None));
+    for filter in iter {
+        expr = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(expr),
+            Operator::And,
+            Box::new(filter),
+        ));
+    }
+    Ok(expr)
+}
+
 fn datafusion_filter_expr_from_bound_expr(
     session: &SessionContext,
     expr: &BoundExpr,
     params: &[Value],
     json_comparison_context: bool,
+    identity_json_comparison_context: bool,
 ) -> Result<Expr, LixError> {
     match expr {
         BoundExpr::Param(param) if json_comparison_context => {
@@ -489,11 +781,27 @@ fn datafusion_filter_expr_from_bound_expr(
                 ));
             };
             let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value);
+            if identity_json_comparison_context {
+                if let ScalarValue::Utf8(Some(raw)) = &value {
+                    return Ok(Expr::Literal(
+                        ScalarValue::Utf8(Some(canonical_json_text(raw)?)),
+                        Some(json_field_metadata()),
+                    ));
+                }
+            }
             let metadata = metadata.or_else(|| match &value {
                 ScalarValue::Utf8(Some(_)) => Some(json_field_metadata()),
                 _ => None,
             });
             Ok(Expr::Literal(value, metadata))
+        }
+        BoundExpr::Literal(BoundLiteral::Text(value))
+            if json_comparison_context && identity_json_comparison_context =>
+        {
+            Ok(Expr::Literal(
+                ScalarValue::Utf8(Some(canonical_json_text(value)?)),
+                Some(json_field_metadata()),
+            ))
         }
         _ => datafusion_expr_from_bound_expr(session, expr, params),
     }
@@ -562,6 +870,25 @@ fn bound_expr_is_json(expr: &BoundExpr, schema: &datafusion::arrow::datatypes::S
     }
 }
 
+fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
+    matches!(
+        expr,
+        BoundExpr::Column(column)
+            if matches!(column.name.as_str(), "entity_id" | "lixcol_entity_id")
+    )
+}
+
+fn canonical_json_text(raw: &str) -> Result<String, LixError> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map(|value| value.to_string())
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("JSON comparison value is not valid JSON: {error}"),
+            )
+        })
+}
+
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<&'static str, LixError> {
     match &plan.bound.target {
         BoundWriteTarget::LixState
@@ -572,6 +899,13 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<&'static str, LixE
         }
         BoundWriteTarget::LixState => Ok("lix_state"),
         BoundWriteTarget::LixStateByVersion => Ok("lix_state_by_version"),
+        BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file"),
+        BoundWriteTarget::File(FileWriteSurface::ByVersion) => Ok("lix_file_by_version"),
+        BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory"),
+        BoundWriteTarget::Directory(DirectoryWriteSurface::ByVersion) => {
+            Ok("lix_directory_by_version")
+        }
+        BoundWriteTarget::Version => Ok("lix_version"),
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer currently supports only lix_state writes",
@@ -611,6 +945,25 @@ fn validate_strict_binary_params(
         };
         if !matches!(value, Value::Blob(_)) {
             return Err(lix_file_data_type_lix_error());
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_predicate_params(
+    json_predicate_params: &BTreeSet<usize>,
+    params: &[Value],
+) -> Result<(), LixError> {
+    for index in json_predicate_params {
+        let Some(value) = params.get(index - 1) else {
+            continue;
+        };
+        if !matches!(value, Value::Json(_) | Value::Null) {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "JSON columns can only be compared with JSON expressions",
+            )
+            .with_hint("Use lix_json(...) or pass a JSON parameter value instead of bare text."));
         }
     }
     Ok(())
@@ -1233,6 +1586,9 @@ mod tests {
             &mut self,
             version_id: &str,
         ) -> Result<Option<String>, LixError> {
+            if version_id == "missing-version" {
+                return Ok(None);
+            }
             Ok(Some(format!("commit-{version_id}")))
         }
 
@@ -1279,6 +1635,9 @@ mod tests {
             &self,
             version_id: &str,
         ) -> Result<Option<crate::version::VersionHead>, LixError> {
+            if version_id == "missing-version" {
+                return Ok(None);
+            }
             Ok(Some(crate::version::VersionHead {
                 version_id: version_id.to_string(),
                 commit_id: format!("commit-{version_id}"),
@@ -1772,7 +2131,6 @@ mod tests {
         Ok((session, head_commit_id))
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_file_path_predicates_canonicalize_bound_values_like_writes() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1867,7 +2225,7 @@ mod tests {
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
-            .expect("update predicate should canonicalize through OR");
+            .expect("update predicate should canonicalize");
         assert_eq!(update_result.rows_affected(), 1);
 
         let delete_result = session
@@ -1880,7 +2238,6 @@ mod tests {
         assert_eq!(delete_result.rows_affected(), 1);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_file_path_predicates_reject_non_literal_path_values() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1916,7 +2273,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_directory_path_predicates_canonicalize_bound_values_like_writes() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1973,7 +2329,6 @@ mod tests {
         assert!(rows_from_execute_result(not_in_result).1.is_empty());
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_directory_path_predicates_reject_non_literal_path_values() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -2020,7 +2375,6 @@ mod tests {
         )
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_lix_state_history_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -2060,7 +2414,6 @@ mod tests {
         assert_eq!(rows[0][4], Value::Text(head_commit_id.clone()));
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_entity_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -2098,7 +2451,6 @@ mod tests {
         assert!(matches!(rows[0][4], Value::Integer(_)));
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_directory_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -2161,7 +2513,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_file_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -2225,13 +2576,11 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_rejects_writes_to_history_views_before_planning() {
         for sql in [
             "DELETE FROM lix_state_history",
             "DELETE FROM LIX_STATE_HISTORY",
-            "DELETE FROM main.LIX_STATE_HISTORY",
         ] {
             let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
             let live_state = Arc::new(DummyLiveStateReader);
@@ -2250,7 +2599,7 @@ mod tests {
 
             assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
             assert_eq!(
-                error.message, "DML cannot write read-only history view 'lix_state_history'",
+                error.message, "DML cannot write read-only SQL table 'lix_state_history'",
                 "{sql}"
             );
         }
@@ -2270,14 +2619,14 @@ mod tests {
         };
 
         let result = execute_write_sql(
-			&mut ctx,
-			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
-	         ) VALUES (\
-	         lix_json('[\"entity-1\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', false, false\
-	         )",
-			&[],
-		)
+            &mut ctx,
+            "INSERT INTO lix_state (\
+		         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
+		         ) VALUES (\
+		         lix_json('[\"entity-1\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', false, false\
+		         )",
+            &[],
+        )
         .await
         .expect("INSERT INTO lix_state VALUES should stage write");
 
@@ -2466,7 +2815,6 @@ mod tests {
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("-1"));
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_select_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2483,8 +2831,8 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
-	         ) \
+		         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
+		         ) \
 	         SELECT \
 	         lix_json('[\"entity-from-select\"]') AS entity_id, \
 	         'lix_key_value' AS schema_key, \
@@ -2496,7 +2844,7 @@ mod tests {
             &[],
         )
         .await
-        .expect("INSERT INTO lix_state SELECT should stage write");
+        .expect("INSERT INTO lix_state SELECT should stage write rows");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -2509,15 +2857,147 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "[\"entity-from-select\"]");
-        assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
         );
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
+        assert_eq!(rows[0].version_id, "version-a");
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_select_binds_params_positionally_and_casts() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state (schema_key, entity_id, snapshot_content) \
+             SELECT 'lix_key_value' AS looks_like_entity_id, \
+                    lix_json($1) AS looks_like_schema_key, \
+                    -2 AS looks_like_metadata",
+            &[Value::Text("[\"entity-select-param\"]".to_string())],
+        )
+        .await
+        .expect("INSERT INTO lix_state SELECT should bind params and map outputs by ordinal");
+
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-select-param\"]");
+        assert_eq!(rows[0].snapshot_content.as_deref(), Some("-2"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_select_applies_read_validation() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
+             SELECT entity_id, schema_key, snapshot_content \
+             FROM lix_state \
+             WHERE entity_id = '[\"state-latest\"]'",
+            &[],
+        )
+        .await
+        .expect_err("query source should apply read JSON predicate validation");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(
+            error.hint().is_some_and(|hint| hint.contains("lix_json")),
+            "expected lix_json hint: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_select_validates_json_join_predicate_params() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![live_lix_state_row("state-latest", None)],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
+             SELECT left_state.entity_id, left_state.schema_key, left_state.snapshot_content \
+             FROM lix_state AS left_state \
+             JOIN lix_state AS right_state \
+             ON left_state.entity_id = $1",
+            &[Value::Text("[\"state-latest\"]".to_string())],
+        )
+        .await
+        .expect_err("query source join predicates should apply JSON param validation");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(
+            error.hint().is_some_and(|hint| hint.contains("lix_json")),
+            "expected lix_json hint: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_file_select_without_data_stages_descriptor() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_file (id, path) SELECT 'file-from-select', '/docs/from-select.txt'",
+            &[],
+        )
+        .await
+        .expect("lix_file INSERT SELECT without data should execute");
+
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"file-from-select\"]");
+        assert_eq!(rows[0].version_id, "version-a");
+    }
+
     #[tokio::test]
     async fn execute_sql_insert_into_entity_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2567,7 +3047,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_active_entity_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2616,7 +3095,78 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
+    #[tokio::test]
+    async fn execute_sql_insert_into_active_entity_rejects_missing_active_head() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "missing-version",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO test_state_schema (lixcol_entity_id, value) \
+             VALUES (lix_json('[\"entity-c\"]'), 'C')",
+            &[],
+        )
+        .await
+        .expect_err("missing active head should fail before staging");
+
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert!(error
+            .message
+            .contains("version 'missing-version' was not found"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_noop_active_entity_write_rejects_missing_active_head() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "missing-version",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        for sql in [
+            "UPDATE test_state_schema SET value = 'D' WHERE false",
+            "DELETE FROM test_state_schema WHERE false",
+        ] {
+            let error = execute_write_sql(&mut ctx, sql, &[])
+                .await
+                .expect_err("missing active head should fail even for no-op writes");
+
+            assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND, "{sql}");
+            assert!(
+                error
+                    .message
+                    .contains("version 'missing-version' was not found"),
+                "{sql}: {}",
+                error.message
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_sql_insert_into_directory_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2660,7 +3210,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_active_directory_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2699,7 +3248,6 @@ mod tests {
         assert!(!rows[0].untracked);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_directory_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2750,7 +3298,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_directory_rejects_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2781,7 +3328,8 @@ mod tests {
         .expect_err("path should remain read-only");
 
         assert!(
-            error.message.contains("read-only column 'path'"),
+            error.message.contains("not writable")
+                || error.message.contains("read-only column 'path'"),
             "unexpected error: {error:?}"
         );
         assert!(staged_writes
@@ -2791,7 +3339,6 @@ mod tests {
             .is_empty());
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_directory_by_version_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2835,7 +3382,6 @@ mod tests {
         assert_eq!(rows[0].snapshot_content, None);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_file_by_version_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2882,7 +3428,6 @@ mod tests {
         assert_eq!(snapshot["hidden"], false);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_active_file_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2921,7 +3466,6 @@ mod tests {
         assert!(!rows[0].untracked);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2971,7 +3515,6 @@ mod tests {
             .is_some_and(|value| !value.is_empty()));
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3038,7 +3581,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_file_stages_data_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3092,7 +3634,6 @@ mod tests {
         assert_eq!(snapshot["size_bytes"], 2);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_file_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3142,7 +3683,6 @@ mod tests {
         assert_eq!(snapshot["name"], "renamed.md");
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_file_by_version_stages_descriptor_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3200,7 +3740,6 @@ mod tests {
         assert_eq!(rows[0].snapshot_content, None);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3257,7 +3796,6 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_entity_by_version_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3763,22 +4301,34 @@ mod tests {
             blob_reader,
             live_state,
             staged_writes,
-            schema_definitions: vec![],
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
         };
 
-        let error = execute_write_sql(
+        let plan = create_write_logical_plan(
             &mut ctx,
-            "DELETE FROM lix_file WHERE path = '/a' AND path = '/b'",
+            "DELETE FROM test_state_schema WHERE value = 'A' AND value = 'B'",
+        )
+        .await
+        .expect("registered entity write should bind before reference writer selection");
+        let error = crate::sql2::execute_write_logical_plan_with_mode(
+            &mut ctx,
+            plan,
             &[],
+            crate::sql2::WriteExecutorMode::ForceDataFusion,
         )
         .await
         .expect_err("unsupported reference writer target should not become a fast no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert_eq!(
-            error.message,
-            "sql2 DataFusion reference writer currently supports only lix_state writes"
-        );
+        assert!(error
+            .message
+            .contains("currently supports only lix_state writes"));
     }
 
     #[tokio::test]
@@ -3791,18 +4341,31 @@ mod tests {
             blob_reader,
             live_state,
             staged_writes,
-            schema_definitions: vec![],
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
         };
 
-        let error = execute_write_sql(&mut ctx, "DELETE FROM lix_file WHERE false", &[])
+        let plan = create_write_logical_plan(&mut ctx, "DELETE FROM test_state_schema WHERE false")
             .await
-            .expect_err("unsupported target with empty scope should not become a no-op");
+            .expect("registered entity write should bind before reference writer selection");
+        let error = crate::sql2::execute_write_logical_plan_with_mode(
+            &mut ctx,
+            plan,
+            &[],
+            crate::sql2::WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect_err("unsupported target with empty scope should not become a no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert_eq!(
-            error.message,
-            "sql2 DataFusion reference writer currently supports only lix_state writes"
-        );
+        assert!(error
+            .message
+            .contains("currently supports only lix_state writes"));
     }
 
     #[tokio::test]

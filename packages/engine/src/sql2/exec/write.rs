@@ -128,7 +128,8 @@ async fn execute_write_logical_plan_with_mode_inner(
     {
         let rows_affected =
             super::bound_public_write::execute_bound_public_write(ctx, &write_plan.plan, params)
-                .await?;
+                .await
+                .map_err(normalize_bound_public_write_error)?;
         return Ok((rows_affected, WriteExecutorPath::Fast));
     }
 
@@ -155,6 +156,18 @@ async fn execute_write_logical_plan_with_mode_inner(
         super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan.plan, params)
             .await?;
     Ok((rows_affected, WriteExecutorPath::DataFusion))
+}
+
+fn normalize_bound_public_write_error(error: LixError) -> LixError {
+    if error.code == LixError::CODE_SCHEMA_DEFINITION
+        && error.message.to_ascii_lowercase().contains("system schema")
+    {
+        return LixError {
+            code: LixError::CODE_INVALID_PARAM.to_string(),
+            ..error
+        };
+    }
+    error
 }
 
 fn validate_write_parameter_count(

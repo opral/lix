@@ -44,7 +44,9 @@ use crate::sql2::{
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
-use crate::sql2::predicate_typecheck::validate_json_predicate_filters;
+use crate::sql2::predicate_typecheck::{
+    canonicalize_json_identity_text_filters, validate_json_predicate_filters,
+};
 use crate::sql2::result_metadata::json_field;
 
 pub(super) async fn register_lix_state_active_provider(
@@ -226,15 +228,13 @@ impl TableProvider for LixStateProvider {
             &route,
             limit,
         );
-        if !route.contradictory {
-            request.filter.version_ids = resolve_provider_version_ids(
-                self.version_ref.as_ref(),
-                &self.version_binding,
-                request.filter.version_ids,
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-        }
+        request.filter.version_ids = resolve_provider_version_ids(
+            self.version_ref.as_ref(),
+            &self.version_binding,
+            request.filter.version_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixStateScanExec::new(
             Arc::clone(&self.live_state),
             projected_schema,
@@ -271,6 +271,7 @@ impl TableProvider for LixStateProvider {
         let write_ctx = self.write_access.require_write("DELETE FROM lix_state")?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
@@ -298,8 +299,10 @@ impl TableProvider for LixStateProvider {
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let write_ctx = self.write_access.require_write("UPDATE lix_state")?;
+        validate_lix_state_update_assignments(&self.schema, &assignments)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_assignments = assignments
             .iter()
@@ -931,6 +934,28 @@ fn lix_state_write_rows_from_batch(
             })
         })
         .collect()
+}
+
+fn validate_lix_state_update_assignments(
+    schema: &SchemaRef,
+    assignments: &[(String, Expr)],
+) -> Result<()> {
+    for (column_name, _) in assignments {
+        schema.field_with_name(column_name).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "UPDATE lix_state failed: column '{column_name}' does not exist"
+            ))
+        })?;
+        if !matches!(
+            column_name.as_str(),
+            "snapshot_content" | "metadata" | "global" | "untracked"
+        ) {
+            return Err(DataFusionError::Execution(format!(
+                "UPDATE lix_state cannot stage read-only column '{column_name}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn required_string_value(
@@ -2069,6 +2094,39 @@ mod tests {
         assert!(request.filter.schema_keys.is_empty());
     }
 
+    #[tokio::test]
+    async fn active_provider_contradictory_filters_still_validate_active_head() {
+        let provider = LixStateProvider::active_version(
+            "missing-version",
+            Arc::new(EmptyLiveStateReader),
+            empty_version_ref(),
+        );
+        let session = SessionContext::new();
+        let filters = vec![
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("schema_key")),
+                Operator::Eq,
+                Box::new(str_lit("a")),
+            )),
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("schema_key")),
+                Operator::Eq,
+                Box::new(str_lit("b")),
+            )),
+        ];
+
+        let error = provider
+            .scan(&session.state(), None, &filters, None)
+            .await
+            .expect_err("missing active version should be checked before zero-row scan");
+        let error = super::datafusion_error_to_lix_error(error);
+
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert!(error
+            .message
+            .contains("version 'missing-version' was not found"));
+    }
+
     #[test]
     fn active_version_view_pins_version_filter() {
         let schema = super::lix_state_schema();
@@ -2119,7 +2177,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn insert_into_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
@@ -2139,7 +2196,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
@@ -2162,7 +2218,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn delete_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
@@ -2181,7 +2236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn delete_returns_lix_state_delete_exec_with_write_ctx() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2197,7 +2251,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_rejects_read_only_lix_state_columns() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2220,7 +2273,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_returns_lix_state_update_exec_with_write_ctx() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2240,7 +2292,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn insert_into_returns_data_sink_exec_with_write_ctx() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2343,7 +2394,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn insert_plan_returns_datafusion_count_uint64() {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext::default();
@@ -2377,7 +2427,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_plan_evaluates_filters_assignments_and_stages_rows() {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext {
@@ -2453,7 +2502,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn delete_plan_with_empty_filters_stages_all_visible_rows() {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext {

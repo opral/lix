@@ -16,6 +16,7 @@ mod lix_state;
 mod version;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
+use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
 pub(crate) async fn register_read(
@@ -157,6 +158,7 @@ pub(crate) async fn register_read(
 pub(crate) async fn register_write(
     session: &SessionContext,
     write_ctx: SqlWriteContext,
+    options: SqlWriteSessionOptions,
 ) -> Result<(), LixError> {
     let catalog = PublicCatalog::from_visible_schemas(&write_ctx.list_visible_schemas()?)?;
     for surface in catalog.surfaces() {
@@ -177,12 +179,44 @@ pub(crate) async fn register_write(
                 )
                 .await?;
             }
-            PublicSurfaceKind::Version
-            | PublicSurfaceKind::File
-            | PublicSurfaceKind::FileByVersion
-            | PublicSurfaceKind::Directory
-            | PublicSurfaceKind::DirectoryByVersion
-            | PublicSurfaceKind::Change
+            PublicSurfaceKind::Version => {
+                version::register_write_provider(session, &surface.name, write_ctx.clone()).await?;
+            }
+            PublicSurfaceKind::File => {
+                file::register_active_write_provider(
+                    session,
+                    &surface.name,
+                    write_ctx.clone(),
+                    options.clone(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::FileByVersion => {
+                file::register_by_version_write_provider(
+                    session,
+                    &surface.name,
+                    write_ctx.clone(),
+                    options.clone(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::Directory => {
+                directory::register_active_write_provider(
+                    session,
+                    &surface.name,
+                    write_ctx.clone(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::DirectoryByVersion => {
+                directory::register_by_version_write_provider(
+                    session,
+                    &surface.name,
+                    write_ctx.clone(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::Change
             | PublicSurfaceKind::History
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}

@@ -89,6 +89,7 @@ fn collect_predicate_filters(
             }
             Ok(())
         }
+        BoundPredicate::Or(_) => Ok(()),
         BoundPredicate::Eq(left, right) => {
             apply_binary_filter(left, right, filters)?;
             apply_binary_filter(right, left, filters)

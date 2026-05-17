@@ -117,8 +117,31 @@ pub(crate) async fn resolve_sql_version_scope(
     scope: SqlVersionScope,
 ) -> Result<Vec<String>, LixError> {
     match scope {
-        SqlVersionScope::Active(version_id) => Ok(vec![version_id]),
-        SqlVersionScope::Explicit(version_ids) => Ok(version_ids),
+        SqlVersionScope::Active(version_id) => {
+            if version_ref.load_head(&version_id).await?.is_none() {
+                return Err(LixError::version_not_found(
+                    version_id,
+                    "resolve SQL active version scope",
+                    "active version",
+                ));
+            }
+            Ok(vec![version_id])
+        }
+        SqlVersionScope::Explicit(version_ids) => {
+            for version_id in &version_ids {
+                if version_id == GLOBAL_VERSION_ID {
+                    continue;
+                }
+                if version_ref.load_head(version_id).await?.is_none() {
+                    return Err(LixError::version_not_found(
+                        version_id.clone(),
+                        "resolve SQL explicit version scope",
+                        "requested version",
+                    ));
+                }
+            }
+            Ok(version_ids)
+        }
         SqlVersionScope::AllVisible => visible_version_ids(version_ref).await,
     }
 }
@@ -235,7 +258,10 @@ mod tests {
 
     #[tokio::test]
     async fn active_scope_uses_session_version() {
-        let version_ref = RowsVersionRefReader::new(Vec::new());
+        let version_ref = RowsVersionRefReader::new(vec![VersionHead {
+            version_id: "main".to_string(),
+            commit_id: "commit-main".to_string(),
+        }]);
         let ids =
             resolve_provider_version_ids(&version_ref, &VersionBinding::active("main"), Vec::new())
                 .await
@@ -245,8 +271,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_scope_keeps_requested_versions() {
+    async fn active_scope_rejects_missing_version_ref() {
         let version_ref = RowsVersionRefReader::new(Vec::new());
+        let error =
+            resolve_provider_version_ids(&version_ref, &VersionBinding::active("main"), Vec::new())
+                .await
+                .expect_err("missing active version should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert!(error.message.contains("version 'main' was not found"));
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_requested_versions() {
+        let version_ref = RowsVersionRefReader::new(vec![VersionHead {
+            version_id: "version-a".to_string(),
+            commit_id: "commit-version-a".to_string(),
+        }]);
         let ids = resolve_provider_version_ids(
             &version_ref,
             &VersionBinding::explicit(),
@@ -256,6 +297,23 @@ mod tests {
         .expect("scope should resolve");
 
         assert_eq!(ids, vec!["version-a".to_string(), "global".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_rejects_missing_version_ref() {
+        let version_ref = RowsVersionRefReader::new(Vec::new());
+        let error = resolve_provider_version_ids(
+            &version_ref,
+            &VersionBinding::explicit(),
+            vec!["missing-version".to_string()],
+        )
+        .await
+        .expect_err("missing explicit version should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert!(error
+            .message
+            .contains("version 'missing-version' was not found"));
     }
 
     #[tokio::test]

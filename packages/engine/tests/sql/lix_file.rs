@@ -1729,3 +1729,44 @@ simulation_test!(lix_file_by_version_expands_global_rows, |sim| async move {
         ],
     );
 });
+
+simulation_test!(
+    lix_file_global_path_insert_reuses_existing_global_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_global) \
+                 VALUES ('global-shared-dir-for-file', '/shared/', true)",
+                &[],
+            )
+            .await
+            .expect("global directory insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_global) \
+                 VALUES ('global-shared-file', '/shared/a.txt', lix_text_encode('a'), true)",
+                &[],
+            )
+            .await
+            .expect("global file insert should reuse existing global parent directory");
+
+        let result = session
+            .execute(
+                "SELECT path FROM lix_file WHERE id = 'global-shared-file'",
+                &[],
+            )
+            .await
+            .expect("global file should read through active overlay");
+        assert_rows_eq(result, vec![vec![Value::Text("/shared/a.txt".to_string())]]);
+    }
+);
