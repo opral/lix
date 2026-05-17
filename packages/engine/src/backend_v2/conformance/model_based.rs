@@ -10,8 +10,8 @@ use crate::backend_v2::conformance::{
 };
 use crate::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendRead,
-    BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch,
-    ReadEntry, ReadOptions, ScanChunk, ScanOptions, WriteOptions,
+    BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -151,7 +151,7 @@ where
         },
     )
     .map_err(|error| format!("{label}: scan_range failed: {error}"))?;
-    let actual_scan = chunk_entries(&chunk.entries.entries);
+    let actual_scan = chunk_entries(&chunk.entries);
     let expected_scan = model_scan(model, &range, Some(3));
     if actual_scan != expected_scan {
         return Err(format!(
@@ -184,7 +184,7 @@ where
         },
     )?;
     Ok(ScanChunk {
-        entries: ReadBatch { entries },
+        entries,
         has_more: result.has_more,
     })
 }

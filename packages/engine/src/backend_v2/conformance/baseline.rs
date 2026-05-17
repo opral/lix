@@ -10,8 +10,8 @@ use crate::backend_v2::conformance::{
 use crate::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
     BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
-    ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SpaceId, WriteOptions,
+    ProjectedValue, ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
+    WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -345,7 +345,7 @@ where
         },
     )
     .map_err(|error| format!("first scan_range failed: {error}"))?;
-    assert_read_entries(&first.entries.entries, &[("b", "B"), ("c", "C")])?;
+    assert_read_entries(&first.entries, &[("b", "B"), ("c", "C")])?;
     if !first.has_more {
         return Err("first scan chunk did not report has_more".to_string());
     }
@@ -361,7 +361,7 @@ where
         },
     )
     .map_err(|error| format!("second scan_range failed: {error}"))?;
-    assert_read_entries(&second.entries.entries, &[("d", "D")])?;
+    assert_read_entries(&second.entries, &[("d", "D")])?;
     if second.has_more {
         return Err("last scan chunk unexpectedly reported has_more".to_string());
     }
@@ -393,7 +393,7 @@ where
         ScanOptions::default(),
     )
     .map_err(|error| format!("included range scan failed: {error}"))?;
-    assert_read_entries(&included.entries.entries, &[("b", "B"), ("c", "C")])?;
+    assert_read_entries(&included.entries, &[("b", "B"), ("c", "C")])?;
 
     let excluded = scan_range(
         &read,
@@ -405,7 +405,7 @@ where
         ScanOptions::default(),
     )
     .map_err(|error| format!("excluded range scan failed: {error}"))?;
-    assert_read_entries(&excluded.entries.entries, &[("c", "C")])
+    assert_read_entries(&excluded.entries, &[("c", "C")])
 }
 
 fn scan_range_orders_raw_byte_keys<F>(factory: &F) -> ConformanceResult
@@ -454,7 +454,7 @@ where
     .map_err(|error| format!("scan_range failed: {error}"))?;
 
     assert_read_entries_bytes(
-        &chunk.entries.entries,
+        &chunk.entries,
         &[
             (Bytes::new(), Bytes::from_static(b"empty")),
             (Bytes::from_static(&[0x00]), Bytes::from_static(b"00")),
@@ -529,8 +529,8 @@ where
                 },
             )
             .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&chunk.entries.entries));
-            resume_after = chunk.entries.entries.last().map(|entry| entry.key.clone());
+            actual.extend(entries_to_key_values(&chunk.entries));
+            resume_after = chunk.entries.last().map(|entry| entry.key.clone());
             if !chunk.has_more {
                 break;
             }
@@ -647,7 +647,7 @@ where
         ScanOptions::default(),
     )
     .map_err(|error| format!("scan_range failed: {error}"))?;
-    if chunk.entries.entries.is_empty() {
+    if chunk.entries.is_empty() {
         Ok(())
     } else {
         Err(format!("empty range returned entries: {:?}", chunk.entries))
@@ -771,7 +771,7 @@ where
         ScanOptions::default(),
     )
     .map_err(|error| format!("old read scan_range failed: {error}"))?;
-    assert_read_entries(&old_scan.entries.entries, &[("a", "A")])?;
+    assert_read_entries(&old_scan.entries, &[("a", "A")])?;
 
     assert_get_entries(&backend, test_space, &[("a", Some("C"))])
 }
@@ -827,7 +827,7 @@ where
         },
     )
     .map_err(|error| format!("KeyOnly scan_range failed: {error}"))?;
-    assert_key_only_entries(&key_only_scan.entries.entries, &[key("a")])
+    assert_key_only_entries(&key_only_scan.entries, &[key("a")])
 }
 
 fn assert_key_only_entries(entries: &[ReadEntry], expected_keys: &[Key]) -> ConformanceResult {
@@ -939,7 +939,7 @@ where
         },
     )?;
     Ok(ScanChunk {
-        entries: ReadBatch { entries },
+        entries,
         has_more: result.has_more,
     })
 }

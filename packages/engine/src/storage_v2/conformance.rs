@@ -7,7 +7,8 @@ use crate::backend_v2::{
     ProjectedValueRef, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
 };
 use crate::storage_v2::{
-    StorageContext, StorageReadStatsCollector, StorageReader, StorageSpace, StorageWriteSetError,
+    PointReadPlan, ScanPlan, StorageContext, StorageReadStatsCollector, StorageSpace,
+    StorageWriteSetError,
 };
 
 type StorageConformanceResult = Result<(), String>;
@@ -97,10 +98,10 @@ fn run_storage_conformance() -> StorageConformanceReport {
 fn write_set_commits_and_reads_back() -> StorageConformanceResult {
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut writes = storage.new_write_set();
-    writes.stage_put(space_one(), key("a"), value("A"));
-    writes.stage_put(space_one(), key("b"), value("B"));
-    writes.stage_put(space_two(), key("a"), value("space-two"));
-    writes.stage_delete(space_one(), key("missing"));
+    writes.put(space_one(), key("a"), value("A"));
+    writes.put(space_one(), key("b"), value("B"));
+    writes.put(space_two(), key("a"), value("space-two"));
+    writes.delete(space_one(), key("missing"));
 
     let (_commit, stats) = storage
         .commit_write_set(writes, WriteOptions::default())
@@ -115,12 +116,12 @@ fn write_set_commits_and_reads_back() -> StorageConformanceResult {
     let read = storage
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let slots = read
-        .get_many_caller_order(space_one(), &[key("a"), key("b")], GetOptions::default())
-        .map_err(|error| format!("get_many_caller_order failed: {error}"))?;
+    let result = PointReadPlan::new(space_one(), &[key("a"), key("b")])
+        .materialize(&read, GetOptions::default())
+        .map_err(|error| format!("get_many failed: {error}"))?;
 
     assert_eq!(
-        slots.into_iter().map(|slot| slot.value).collect::<Vec<_>>(),
+        result.value,
         vec![
             Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
             Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
@@ -133,8 +134,8 @@ fn write_set_commits_and_reads_back() -> StorageConformanceResult {
 fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConformanceResult {
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut writes = storage.new_write_set();
-    writes.stage_put(space_one(), key("a"), value("A"));
-    writes.stage_put(space_one(), key("b"), value("B"));
+    writes.put(space_one(), key("a"), value("A"));
+    writes.put(space_one(), key("b"), value("B"));
     storage
         .commit_write_set(writes, WriteOptions::default())
         .map_err(|error| format!("seed failed: {error}"))?;
@@ -142,27 +143,23 @@ fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConforma
     let read = storage
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let slots = read
-        .get_many_caller_order(
-            space_one(),
-            &[key("b"), key("missing"), key("a"), key("b")],
+    let result = PointReadPlan::new(space_one(), &[key("b"), key("missing"), key("a"), key("b")])
+        .materialize(
+            &read,
             GetOptions {
                 projection: CoreProjection::KeyOnly,
                 ..GetOptions::default()
             },
         )
-        .map_err(|error| format!("get_many_caller_order failed: {error}"))?;
+        .map_err(|error| format!("get_many failed: {error}"))?;
 
     assert_eq!(
-        slots
-            .iter()
-            .map(|slot| (&slot.key, &slot.value))
-            .collect::<Vec<_>>(),
+        result.value,
         vec![
-            (&key("b"), &Some(ProjectedValue::KeyOnly)),
-            (&key("missing"), &None),
-            (&key("a"), &Some(ProjectedValue::KeyOnly)),
-            (&key("b"), &Some(ProjectedValue::KeyOnly)),
+            Some(ProjectedValue::KeyOnly),
+            None,
+            Some(ProjectedValue::KeyOnly),
+            Some(ProjectedValue::KeyOnly),
         ]
     );
 
@@ -172,9 +169,9 @@ fn point_reads_preserve_caller_order_duplicates_and_missing() -> StorageConforma
 fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut writes = storage.new_write_set();
-    writes.stage_put(space_one(), key("aa"), value("AA"));
-    writes.stage_put(space_one(), key("ab"), value("AB"));
-    writes.stage_put(space_one(), key("b"), value("B"));
+    writes.put(space_one(), key("aa"), value("AA"));
+    writes.put(space_one(), key("ab"), value("AB"));
+    writes.put(space_one(), key("b"), value("B"));
     storage
         .commit_write_set(writes, WriteOptions::default())
         .map_err(|error| format!("seed failed: {error}"))?;
@@ -182,19 +179,18 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     let read = storage
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let chunk = read
-        .scan_prefix(
-            space_one(),
-            Prefix {
-                bytes: Bytes::from_static(b"a"),
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("scan_prefix failed: {error}"))?;
+    let chunk = ScanPlan::prefix(
+        space_one(),
+        Prefix {
+            bytes: Bytes::from_static(b"a"),
+        },
+    )
+    .collect(&read, ScanOptions::default())
+    .map_err(|error| format!("scan_prefix failed: {error}"))?;
 
     assert_eq!(
         chunk
-            .entries
+            .value
             .entries
             .into_iter()
             .map(|entry| entry.key)
@@ -209,7 +205,7 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut writes = storage.new_write_set();
     for suffix in ["0", "1", "2", "3", "4"] {
-        writes.stage_put(
+        writes.put(
             space_one(),
             key_with_prefix("item-", suffix),
             value("value"),
@@ -228,28 +224,30 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
 
     loop {
         let mut chunk_last_key = None::<Key>;
-        let result = read
-            .visit_scan_prefix_with_stats(
-                space_one(),
-                Prefix {
-                    bytes: Bytes::from_static(b"item-"),
-                },
-                ScanOptions {
-                    projection: CoreProjection::KeyOnly,
-                    limit_rows: 2,
-                    resume_after: resume_after.as_ref(),
-                },
-                &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                    if !matches!(value, ProjectedValueRef::KeyOnly) {
-                        return Err(crate::backend_v2::BackendError::Corruption(
-                            "expected key-only scan value".to_string(),
-                        ));
-                    }
-                    chunk_last_key = Some(key.to_owned_key());
-                    Ok(())
-                },
-            )
-            .map_err(|error| format!("visit_scan_prefix_with_stats failed: {error}"))?;
+        let result = ScanPlan::prefix(
+            space_one(),
+            Prefix {
+                bytes: Bytes::from_static(b"item-"),
+            },
+        )
+        .visit(
+            &read,
+            ScanOptions {
+                projection: CoreProjection::KeyOnly,
+                limit_rows: 2,
+                resume_after: resume_after.as_ref(),
+            },
+            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                if !matches!(value, ProjectedValueRef::KeyOnly) {
+                    return Err(crate::backend_v2::BackendError::Corruption(
+                        "expected key-only scan value".to_string(),
+                    ));
+                }
+                chunk_last_key = Some(key.to_owned_key());
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("scan plan visit failed: {error}"))?;
 
         emitted += result.value.emitted;
         collector.record(result.stats);
@@ -285,7 +283,7 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
 fn read_scope_pins_snapshot() -> StorageConformanceResult {
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut seed = storage.new_write_set();
-    seed.stage_put(space_one(), key("a"), value("A"));
+    seed.put(space_one(), key("a"), value("A"));
     storage
         .commit_write_set(seed, WriteOptions::default())
         .map_err(|error| format!("seed failed: {error}"))?;
@@ -295,25 +293,24 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
     let mut later = storage.new_write_set();
-    later.stage_put(space_one(), key("a"), value("B"));
+    later.put(space_one(), key("a"), value("B"));
     storage
         .commit_write_set(later, WriteOptions::default())
         .map_err(|error| format!("later commit failed: {error}"))?;
 
-    let chunk = read
-        .scan_range(
-            space_one(),
-            KeyRange {
-                lower: Bound::Included(key("a")),
-                upper: Bound::Included(key("a")),
-            },
-            ScanOptions::default(),
-        )
-        .map_err(|error| format!("scan_range failed: {error}"))?;
+    let chunk = ScanPlan::range(
+        space_one(),
+        KeyRange {
+            lower: Bound::Included(key("a")),
+            upper: Bound::Included(key("a")),
+        },
+    )
+    .collect(&read, ScanOptions::default())
+    .map_err(|error| format!("scan_range failed: {error}"))?;
 
     assert_eq!(
         chunk
-            .entries
+            .value
             .entries
             .into_iter()
             .map(|entry| entry.value)
@@ -327,8 +324,8 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
 fn write_set_rejects_conflicting_space_declarations() -> StorageConformanceResult {
     let storage = StorageContext::new(ConformanceBackend::new());
     let mut writes = storage.new_write_set();
-    writes.stage_put(space_one(), key("a"), value("A"));
-    writes.stage_put(
+    writes.put(space_one(), key("a"), value("A"));
+    writes.put(
         StorageSpace::new(SpaceId(1), "storage.conformance.renamed"),
         key("b"),
         value("B"),

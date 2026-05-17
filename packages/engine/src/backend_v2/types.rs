@@ -22,11 +22,6 @@ pub struct ReadEntry {
     pub value: ProjectedValue,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadBatch {
-    pub entries: Vec<ReadEntry>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PutEntry {
     pub key: Key,
@@ -69,7 +64,7 @@ pub struct ScanOptions<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanChunk {
-    pub entries: ReadBatch,
+    pub entries: Vec<ReadEntry>,
     pub has_more: bool,
 }
 

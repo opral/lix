@@ -7,6 +7,7 @@
 mod context;
 mod point;
 mod read_scope;
+#[cfg(test)]
 mod reader;
 mod scan;
 mod spaces;
@@ -17,34 +18,12 @@ mod write_set;
 mod conformance;
 
 pub use context::StorageContext;
-pub(crate) use point::{
-    get_many_borrowed_indexed_values_for_physical_plan,
-    get_many_borrowed_indexed_values_for_physical_plan_with_stats,
-    get_many_borrowed_indexed_values_for_plan,
-    get_many_borrowed_indexed_values_for_plan_with_stats, get_many_caller_order,
-    get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
-    get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_physical_plan,
-    get_many_indexed_values_for_physical_plan_into,
-    get_many_indexed_values_for_physical_plan_into_with_stats,
-    get_many_indexed_values_for_physical_plan_with_stats, get_many_indexed_values_for_plan,
-    get_many_indexed_values_for_plan_into, get_many_indexed_values_for_plan_into_with_stats,
-    get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
-    get_many_values_caller_order_with_stats, visit_unique_point_values_for_physical_plan,
-    visit_unique_point_values_for_plan,
-};
 pub use point::{
-    BorrowedIndexedPointValues, BufferedIndexedPointValues, IndexedPointValues,
-    PhysicalPointRequestPlan, PointRequestPlan, PointSlot, PointValueBuffer, RequestedToUnique,
+    PointReadBuffer, PointReadPlan, PointValues, PointValuesRef, RequestedToUnique,
     RequestedToUniqueRef,
 };
 pub use read_scope::StorageReadScope;
-pub use reader::StorageReader;
-pub(crate) use scan::{
-    scan_prefix, scan_prefix_into, scan_prefix_with_stats, scan_range, scan_range_into,
-    scan_range_with_stats, visit_scan_prefix, visit_scan_prefix_with_stats, visit_scan_range,
-    visit_scan_range_with_stats, with_prefix_scan, with_range_scan,
-};
-pub use scan::{BorrowedScanChunk, StorageRangeScan, StorageScanBuffer};
+pub use scan::{ScanBuffer, ScanChunkRef, ScanCursor, ScanPlan};
 pub(crate) use spaces::decode_logical_key_ref;
 pub use spaces::StorageSpace;
 pub use stats::{

@@ -1,18 +1,18 @@
 use crate::backend_v2::{
     visit_range as backend_visit_range, BackendError, BackendRead, CoreProjection, Key, KeyRange,
-    KeyRef, Prefix, ProjectedValueRef, ReadBatch, ReadEntry, ScanChunk, ScanOptions, ScanResult,
-    ScanVisitor, SpaceId,
+    KeyRef, Prefix, ProjectedValueRef, ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
+    SpaceId,
 };
 use crate::storage_v2::{
-    decode_logical_key_ref, StorageReadResult, StorageReadStats, StorageSpace,
+    decode_logical_key_ref, StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StorageScanBuffer {
+pub struct ScanBuffer {
     entries: Vec<ReadEntry>,
 }
 
-impl StorageScanBuffer {
+impl ScanBuffer {
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,19 +37,156 @@ impl StorageScanBuffer {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BorrowedScanChunk<'a> {
+pub struct ScanChunkRef<'a> {
     pub entries: &'a [ReadEntry],
     pub has_more: bool,
 }
 
-pub struct StorageRangeScan<'a, C> {
+pub struct ScanCursor<'a, C> {
     inner: &'a mut C,
     kind: ScanKind,
     projection: CoreProjection,
     chunks_seen: u64,
 }
 
-impl<C> StorageRangeScan<'_, C>
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanPlan {
+    space: StorageSpace,
+    kind: ScanPlanKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScanPlanKind {
+    Range(KeyRange),
+    Prefix(Prefix),
+}
+
+impl ScanPlan {
+    pub fn range(space: StorageSpace, range: KeyRange) -> Self {
+        Self {
+            space,
+            kind: ScanPlanKind::Range(range),
+        }
+    }
+
+    pub fn prefix(space: StorageSpace, prefix: Prefix) -> Self {
+        Self {
+            space,
+            kind: ScanPlanKind::Prefix(prefix),
+        }
+    }
+
+    pub fn collect<R>(
+        &self,
+        read: &StorageReadScope<R>,
+        opts: ScanOptions<'_>,
+    ) -> Result<StorageReadResult<ScanChunk>, BackendError>
+    where
+        R: BackendRead,
+    {
+        match &self.kind {
+            ScanPlanKind::Range(range) => {
+                scan_range_with_stats(read.backend_read(), self.space.id, range.clone(), opts)
+            }
+            ScanPlanKind::Prefix(prefix) => {
+                scan_prefix_with_stats(read.backend_read(), self.space.id, prefix.clone(), opts)
+            }
+        }
+    }
+
+    pub fn collect_into<'a, R>(
+        &self,
+        read: &StorageReadScope<R>,
+        opts: ScanOptions<'_>,
+        buffer: &'a mut ScanBuffer,
+    ) -> Result<StorageReadResult<ScanChunkRef<'a>>, BackendError>
+    where
+        R: BackendRead,
+    {
+        let chunk = match &self.kind {
+            ScanPlanKind::Range(range) => scan_range_into(
+                read.backend_read(),
+                self.space.id,
+                range.clone(),
+                opts,
+                buffer,
+            )?,
+            ScanPlanKind::Prefix(prefix) => scan_prefix_into(
+                read.backend_read(),
+                self.space.id,
+                prefix.clone(),
+                opts,
+                buffer,
+            )?,
+        };
+        let backend_calls = u64::from(opts.limit_rows != 0);
+        let kind = match self.kind {
+            ScanPlanKind::Range(_) => ScanKind::Range,
+            ScanPlanKind::Prefix(_) => ScanKind::Prefix,
+        };
+        let mut stats = scan_trace_stats(
+            kind,
+            opts,
+            chunk.entries.len() as u64,
+            chunk.has_more,
+            backend_calls,
+        );
+        if matches!(kind, ScanKind::Prefix) {
+            stats.prefix_lowered = 1;
+        }
+        Ok(StorageReadResult::new(chunk, stats))
+    }
+
+    pub fn visit<R, V>(
+        &self,
+        read: &StorageReadScope<R>,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadResult<ScanResult>, BackendError>
+    where
+        R: BackendRead,
+        V: ScanVisitor + ?Sized,
+    {
+        match &self.kind {
+            ScanPlanKind::Range(range) => visit_scan_range_with_stats(
+                read.backend_read(),
+                self.space.id,
+                range.clone(),
+                opts,
+                visitor,
+            ),
+            ScanPlanKind::Prefix(prefix) => visit_scan_prefix_with_stats(
+                read.backend_read(),
+                self.space.id,
+                prefix.clone(),
+                opts,
+                visitor,
+            ),
+        }
+    }
+
+    pub fn cursor<R, T, F>(
+        &self,
+        read: &StorageReadScope<R>,
+        opts: ScanOptions<'_>,
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        R: BackendRead,
+        F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
+    {
+        match &self.kind {
+            ScanPlanKind::Range(range) => {
+                with_range_scan(read.backend_read(), self.space.id, range.clone(), opts, f)
+            }
+            ScanPlanKind::Prefix(prefix) => {
+                with_prefix_scan(read.backend_read(), self.space.id, prefix.clone(), opts, f)
+            }
+        }
+    }
+}
+
+impl<C> ScanCursor<'_, C>
 where
     C: crate::backend_v2::BackendRangeScan,
 {
@@ -147,7 +284,7 @@ pub(crate) fn with_range_scan<R, T, F>(
 ) -> Result<T, BackendError>
 where
     R: BackendRead,
-    F: FnOnce(&mut StorageRangeScan<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
+    F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
 {
     let storage_space = StorageSpace::new(space, "storage_v2.scan");
     let resume_after = opts.resume_after;
@@ -157,7 +294,7 @@ where
         ..opts
     };
     read.with_range_scan(physical_range, physical_opts, |backend_cursor| {
-        let mut cursor = StorageRangeScan {
+        let mut cursor = ScanCursor {
             inner: backend_cursor,
             kind: ScanKind::Range,
             projection: opts.projection,
@@ -176,7 +313,7 @@ pub(crate) fn with_prefix_scan<R, T, F>(
 ) -> Result<T, BackendError>
 where
     R: BackendRead,
-    F: FnOnce(&mut StorageRangeScan<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
+    F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
 {
     with_range_scan(read, space, prefix.to_range()?, opts, |cursor| {
         cursor.kind = ScanKind::Prefix;
@@ -193,16 +330,14 @@ pub(crate) fn scan_range<R>(
 where
     R: BackendRead,
 {
-    let mut buffer = StorageScanBuffer::with_capacity(opts.limit_rows);
+    let mut buffer = ScanBuffer::with_capacity(opts.limit_rows);
     let has_more = {
         let chunk = scan_range_into(read, space, range, opts, &mut buffer)?;
         chunk.has_more
     };
 
     Ok(ScanChunk {
-        entries: ReadBatch {
-            entries: buffer.entries,
-        },
+        entries: buffer.entries,
         has_more,
     })
 }
@@ -212,15 +347,15 @@ pub(crate) fn scan_range_into<'a, R>(
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    buffer: &'a mut StorageScanBuffer,
-) -> Result<BorrowedScanChunk<'a>, BackendError>
+    buffer: &'a mut ScanBuffer,
+) -> Result<ScanChunkRef<'a>, BackendError>
 where
     R: BackendRead,
 {
     buffer.clear();
 
     if opts.limit_rows == 0 {
-        return Ok(BorrowedScanChunk {
+        return Ok(ScanChunkRef {
             entries: buffer.entries(),
             has_more: false,
         });
@@ -254,7 +389,7 @@ where
         },
     )?;
 
-    Ok(BorrowedScanChunk {
+    Ok(ScanChunkRef {
         entries: buffer.entries(),
         has_more: result.has_more,
     })
@@ -347,7 +482,7 @@ where
     let mut stats = scan_trace_stats(
         ScanKind::Range,
         opts,
-        chunk.entries.entries.len() as u64,
+        chunk.entries.len() as u64,
         chunk.has_more,
         backend_calls,
     );
@@ -360,8 +495,8 @@ pub(crate) fn scan_prefix_into<'a, R>(
     space: SpaceId,
     prefix: Prefix,
     opts: ScanOptions<'_>,
-    buffer: &'a mut StorageScanBuffer,
-) -> Result<BorrowedScanChunk<'a>, BackendError>
+    buffer: &'a mut ScanBuffer,
+) -> Result<ScanChunkRef<'a>, BackendError>
 where
     R: BackendRead,
 {
@@ -414,7 +549,7 @@ where
         stats.prefix_lowered = 1;
         return Ok(StorageReadResult::new(
             ScanChunk {
-                entries: ReadBatch::default(),
+                entries: Vec::new(),
                 has_more: false,
             },
             stats,
@@ -424,7 +559,7 @@ where
     let mut stats = scan_trace_stats(
         ScanKind::Prefix,
         opts,
-        chunk.entries.entries.len() as u64,
+        chunk.entries.len() as u64,
         chunk.has_more,
         1,
     );
@@ -477,12 +612,13 @@ mod tests {
 
     use bytes::Bytes;
 
+    use super::scan_prefix;
     use crate::backend_v2::{
         BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, ConformanceBackend,
         GetOptions, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
         ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
-    use crate::storage_v2::{scan_prefix, StorageContext, StorageReader, StorageSpace};
+    use crate::storage_v2::{ScanPlan, StorageContext, StorageSpace};
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -509,7 +645,7 @@ mod tests {
     fn prefix_scan_limit_zero_returns_empty_page() {
         let storage = StorageContext::new(ConformanceBackend::new());
         let mut writes = storage.new_write_set();
-        writes.stage_put(space(1), key("aa"), value("AA"));
+        writes.put(space(1), key("aa"), value("AA"));
         storage
             .commit_write_set(writes, WriteOptions::default())
             .expect("seed");
@@ -517,21 +653,23 @@ mod tests {
         let read = storage
             .begin_read(ReadOptions::default())
             .expect("begin read");
-        let chunk = read
-            .scan_prefix(
-                space(1),
-                Prefix {
-                    bytes: Bytes::from_static(b"a"),
-                },
-                ScanOptions {
-                    limit_rows: 0,
-                    ..ScanOptions::default()
-                },
-            )
-            .expect("prefix scan");
+        let chunk = ScanPlan::prefix(
+            space(1),
+            Prefix {
+                bytes: Bytes::from_static(b"a"),
+            },
+        )
+        .collect(
+            &read,
+            ScanOptions {
+                limit_rows: 0,
+                ..ScanOptions::default()
+            },
+        )
+        .expect("prefix scan");
 
-        assert!(chunk.entries.entries.is_empty());
-        assert!(!chunk.has_more);
+        assert!(chunk.value.entries.is_empty());
+        assert!(!chunk.value.has_more);
     }
 
     #[test]

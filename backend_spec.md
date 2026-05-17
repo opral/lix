@@ -235,11 +235,6 @@ pub struct ReadEntry {
     pub value: ProjectedValue,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ReadBatch {
-    pub entries: Vec<ReadEntry>,
-}
-
 #[derive(Clone, Debug)]
 pub struct PutEntry {
     pub key: Key,
@@ -499,7 +494,7 @@ Materialized scan chunks are a storage adapter convenience:
 
 ```rust
 pub struct ScanChunk {
-    pub entries: ReadBatch,
+    pub entries: Vec<ReadEntry>,
     pub has_more: bool,
 }
 ```

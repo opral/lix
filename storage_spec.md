@@ -38,6 +38,7 @@ Generic storage adapter: storage_v2
   prefix-to-range lowering
   caller-order point reconstruction
   backend scan cursor wrapping
+  storage scan plans
   read-shape stats
   write-set stats
 
@@ -131,7 +132,7 @@ The current engine already has this shape:
 
 ```text
 tracked_state
-  -> StorageReader / StorageWriteSet
+  -> PointReadPlan / ScanPlan / StorageWriteSet
   -> StorageContext transaction
   -> backend transaction
 ```
@@ -298,20 +299,20 @@ The write set should not encode domain semantics such as "publish commit
 visibility". Domain stores decide what to stage; storage_v2 decides how to batch
 and lower it.
 
-There are two construction modes:
+There is one construction mode: canonical final mutations.
 
 ```text
-checked write set:
-  safe default
-  validates duplicate (StorageSpace.id, Key) mutations while staging
-  intended for generic callers, tests, and defensive code
-
-canonical write set:
-  fast domain-store path
-  caller has already canonicalized final mutations
-  skips per-mutation duplicate validation
-  intended for hot paths that can prove one final mutation per key
+StorageWriteSet:
+  caller stages final mutations
+  caller must stage at most one mutation per (StorageSpace.id, Key)
+  storage_v2 groups by StorageSpace and operation
+  debug builds validate the canonical contract before lowering/commit
+  release builds do not pay duplicate-validation hash-map cost
 ```
+
+This is deliberately stricter than an ordered write script. Domain stores own
+local overwrite/coalescing rules before staging. `StorageWriteSet` owns the
+shared aggregation and physical lowering path.
 
 API sketch:
 
@@ -319,23 +320,16 @@ API sketch:
 impl StorageWriteSet {
     pub fn new() -> Self;
 
-    pub fn checked_with_capacity(
+    pub fn with_capacity(
         expected_mutations: usize,
         expected_spaces: usize,
     ) -> Self;
 
-    pub fn canonical_with_capacity(
-        expected_mutations: usize,
-        expected_spaces: usize,
-    ) -> Self;
-
-    pub fn stage_put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
-        // Checked staging. Records duplicate mutations.
+    pub fn put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
         self.group_mut(space.id).puts.push(PutEntry { key, value });
     }
 
-    pub fn stage_delete(&mut self, space: StorageSpace, key: Key) {
-        // Checked staging. Records duplicate mutations.
+    pub fn delete(&mut self, space: StorageSpace, key: Key) {
         self.group_mut(space.id).deletes.push(key);
     }
 
@@ -346,21 +340,12 @@ impl StorageWriteSet {
         expected_deletes: usize,
     );
 
-    pub fn stage_canonical_put(
-        &mut self,
-        space: StorageSpace,
-        key: Key,
-        value: StoredValue,
-    );
-
-    pub fn stage_canonical_delete(
-        &mut self,
-        space: StorageSpace,
-        key: Key,
-    );
-
     pub fn extend(&mut self, other: StorageWriteSet) {
         // O(K_other), or O(G_other) when group ownership can be moved.
+    }
+
+    pub fn validate(&self) -> Result<(), StorageWriteSetError> {
+        // Debug/conformance diagnostic. Release builds are a no-op.
     }
 
     pub fn lower_into<W: BackendWrite>(
@@ -426,13 +411,10 @@ Conflicting duplicate keys are invalid at the storage_v2 boundary.
 Domain stores must canonicalize local overwrites before staging.
 ```
 
-Checked staging may detect duplicates earlier, but the normative boundary is
-the sealed write set passed to lowering.
-
-Canonical staging is valid only when the caller has already enforced this rule.
-The current benchmark baseline shows canonical construction is materially faster
-for synthetic write sets because it avoids the per-mutation duplicate index; it
-should be used by domain-store hot paths that already emit final canonical rows.
+Debug builds detect duplicates before lower/commit. Release builds trust the
+canonical contract so the implementation can keep hot-path staging cheap. Tests
+and conformance checks may call `validate()` directly; in release builds it is a
+no-op diagnostic hook.
 
 This keeps lowering cheap and avoids backend-specific behavior for put/delete
 ordering within one write set.
@@ -440,8 +422,11 @@ ordering within one write set.
 Optional debug validation:
 
 ```text
-seal/validate:
+debug seal/validate:
   O(K) expected with a hash set
+
+release seal/validate:
+  O(1) no-op
 ```
 
 ## Read Scopes
@@ -453,10 +438,6 @@ Sketch:
 
 ```rust
 pub struct StorageReadScope<R> {
-    read: R,
-}
-
-pub struct ScopedStorageReader<R> {
     read: R,
 }
 ```
@@ -481,11 +462,10 @@ Point reads:
 domain store requests M keys, possibly with duplicates
 storage_v2 may dedupe to U unique keys
 backend_v2 visit_keys visits one borrowed value slot per unique/requested backend key
-storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
-storage_v2 can return either materialized caller-order values or an indexed
-  shape with one value slot per unique key plus requested-slot indexes
-storage_v2 can reuse a PointRequestPlan when the same requested-key shape is
-  read repeatedly
+storage_v2 reconstructs caller-order values, duplicate slots, and missing slots
+storage_v2 uses PointReadPlan for repeated point-read shapes; the plan owns
+  logical unique keys, pre-encoded physical backend keys, and requested-slot
+  indexes
 ```
 
 Target:
@@ -496,24 +476,32 @@ backend point I/O:
 
 storage reconstruction:
   O(M + U) time
-  indexed result: O(U) value slots plus O(M) indexes
-  materialized result: O(M) value slots
+  one-shot get_many: O(M) caller-order value slots
+  planned read: O(U) value slots plus O(M) indexes
   reusable point plan: O(M + U) once to build, then O(U) per read
 ```
 
-Recommended point-read API choices:
+Point-read API choices:
 
 ```text
 one-shot arbitrary key list:
-  use the normal caller-order helper
+  PointReadPlan::new(space, keys).materialize(read, opts)
   cost: O(M + U)
 
 repeated key shape:
-  build PointRequestPlan once and reuse it
+  build PointReadPlan::new(space, keys) once and call plan.collect(...)
   cost: O(M + U) once, then O(U) per read
 
+repeated key shape with caller-owned value buffer:
+  build PointReadPlan::new(space, keys) once and call plan.collect_into(...)
+  cost: O(M + U) once, then O(U) per read with reusable allocation
+
+stream over unique planned values:
+  build PointReadPlan::new(space, keys) once and call plan.visit(...)
+  cost: O(M + U) once, then O(U) per read without materializing a point result
+
 already-unique owned key list:
-  build PointRequestPlan::from_unique_keys(...)
+  build PointReadPlan::from_unique_keys(space, unique_keys)
   cost: O(U) to own/drop the key vector, no dedupe hash map, and no
   requested-to-unique index allocation because the identity mapping is implicit
 
@@ -533,6 +521,32 @@ empty prefix -> whole space
 Native prefix scan is a backend extension. Generic correctness comes from range
 lowering.
 
+Scan API choices:
+
+```text
+one-shot materialized range:
+  ScanPlan::range(space, range).collect(read, opts)
+  returns StorageReadResult<ScanChunk>
+
+one-shot materialized prefix:
+  ScanPlan::prefix(space, prefix).collect(read, opts)
+  returns StorageReadResult<ScanChunk>
+
+buffered/materialized reusable scan:
+  ScanPlan::range(space, range).collect_into(read, opts, buffer)
+  ScanPlan::prefix(space, prefix).collect_into(read, opts, buffer)
+
+visitor scan:
+  ScanPlan::range(space, range).visit(read, opts, visitor)
+  ScanPlan::prefix(space, prefix).visit(read, opts, visitor)
+
+chunked cursor drain:
+  ScanPlan::{range,prefix}(...).cursor(read, opts, |scan| ...)
+```
+
+There is no separate `StorageReader` trait. Point and scan plans are the read
+API; the `StorageReadScope` only owns the coherent backend read view.
+
 Backend scan cursors:
 
 ```text
@@ -545,10 +559,10 @@ cursor.visit_next(limit_rows, visitor)
 ```
 
 The cursor is backend/read-scope local and may only be used inside the
-`with_range_scan` callback. It is not a public resume token, and it does not
-relax storage cursor validation rules. Storage still owns logical space
-decoding, prefix-to-range lowering, and scan trace stats around each emitted
-chunk.
+`ScanPlan::cursor` callback. It is not a public resume token, and it
+does not relax storage cursor validation rules. Storage still owns logical
+space decoding, prefix-to-range lowering, and scan trace stats around each
+emitted chunk.
 
 The backend cursor uses one callback-scoped API with an associated cursor type.
 There is no separate fast cursor. The cursor can borrow local statement or
@@ -676,14 +690,17 @@ S = backend segments/files/objects touched
 Write-set staging:
 
 ```text
-checked stage_put/stage_delete:
-  O(1) amortized per mutation with O(1) group lookup
+put/delete:
+  O(1) amortized per mutation with expected O(1) group lookup
   O(G) with tiny Vec group lookup, acceptable only while G is bounded/small
-  duplicate tracking adds O(K) memory and expected O(1) hash work per mutation
 
-canonical stage_canonical_put/stage_canonical_delete:
-  O(1) amortized per mutation with O(1) group lookup
-  skips duplicate tracking
+debug validation before lower/commit:
+  O(K) time
+  O(K) temporary memory
+  checks duplicate (StorageSpace.id, Key) mutations and conflicting space names
+
+release validation before lower/commit:
+  O(1) no-op
   requires caller to provide final canonical mutations
 
 total staging memory:
@@ -895,8 +912,8 @@ write_set_batches_by_space:
 
 caller_order_reconstruction:
   storage dedupes to unique backend keys; backend returns one slot per unique
-  key; storage reconstructs requested slots, duplicate keys, and duplicate
-  missing keys
+  key; storage reconstructs requested value slots, duplicate keys, and duplicate
+  missing keys without requiring the backend to echo logical keys
 
 read_shape_stats:
   point reads report requested keys, unique backend keys, and backend calls;
@@ -995,9 +1012,6 @@ write_set.rs:
 
 read_scope.rs:
   shared read transaction/scope helpers
-
-reader.rs:
-  StorageReader trait over a shared read scope
 
 point.rs:
   caller-order point reconstruction, indexed point values, and requested-key
