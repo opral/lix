@@ -2797,10 +2797,82 @@ fn sql2_read_session_does_not_register_write_surfaces() {
         "pub(crate) async fn build_write_session",
     );
 
-    assert_source_contains_all(
+    assert_source_contains_all(relative, read_session, &["providers::register_read"]);
+    assert_source_contains_none(
         relative,
         read_session,
+        &["SqlWriteContext::new", "providers::register_write"],
+    );
+
+    let relative = "sql2/providers/mod.rs";
+    let source = read_engine_source(relative);
+    assert_source_contains_all(
+        relative,
+        &source,
         &[
+            "mod change;",
+            "mod directory;",
+            "mod directory_history;",
+            "mod entity;",
+            "mod entity_history;",
+            "mod file;",
+            "mod file_history;",
+            "mod history;",
+            "mod lix_state;",
+            "mod version;",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        &source,
+        &["pub mod", "pub(crate) mod", "pub(super) mod", "pub(in "],
+    );
+    let read_registration = source_between(
+        relative,
+        &source,
+        "pub(crate) async fn register_read",
+        "pub(crate) async fn register_write",
+    );
+    assert_source_contains_all(
+        relative,
+        read_registration,
+        &[
+            "PublicCatalog::from_visible_schemas",
+            "catalog.surfaces()",
+            "PublicSurfaceKind::LixState",
+            "PublicSurfaceKind::LixStateByVersion",
+            "PublicSurfaceKind::Version",
+            "PublicSurfaceKind::Change",
+            "PublicSurfaceKind::History",
+            "PublicSurfaceKind::File",
+            "PublicSurfaceKind::FileByVersion",
+            "PublicSurfaceKind::FileHistory",
+            "PublicSurfaceKind::Directory",
+            "PublicSurfaceKind::DirectoryByVersion",
+            "PublicSurfaceKind::DirectoryHistory",
+            "lix_state::register_lix_state_active_provider",
+            "lix_state::register_lix_state_by_version_provider",
+            "version::register_lix_version_read_provider",
+            "change::register_lix_change_read_provider",
+            "history::register_history_provider",
+            "file_history::register_lix_file_history_surface",
+            "directory_history::register_lix_directory_history_surface",
+            "directory::register_lix_directory_active_provider",
+            "directory::register_lix_directory_by_version_provider",
+            "file::register_lix_file_active_provider",
+            "file::register_lix_file_by_version_provider",
+            "entity::register_entity_providers",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        read_registration,
+        &[
+            "register_lix_state_write_providers",
+            "register_lix_version_write_provider",
+            "register_lix_directory_write_providers",
+            "register_lix_file_write_providers",
+            "register_entity_write_providers",
             "register_lix_state_providers",
             "register_lix_version_provider",
             "register_lix_change_provider",
@@ -2809,25 +2881,12 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "register_lix_directory_history_provider",
             "register_lix_directory_providers",
             "register_lix_file_providers",
-            "register_entity_providers",
-        ],
-    );
-    assert_source_contains_none(
-        relative,
-        read_session,
-        &[
-            "SqlWriteContext::new",
-            "register_lix_state_write_providers",
-            "register_lix_version_write_provider",
-            "register_lix_directory_write_providers",
-            "register_lix_file_write_providers",
-            "register_entity_write_providers",
         ],
     );
 }
 
 #[test]
-fn sql2_write_session_does_not_register_history_or_committed_read_surfaces() {
+fn sql2_write_session_registers_writable_and_read_only_transaction_surfaces() {
     let relative = "sql2/session.rs";
     let source = read_engine_source(relative);
     let write_session = source_between(
@@ -2840,21 +2899,59 @@ fn sql2_write_session_does_not_register_history_or_committed_read_surfaces() {
     assert_source_contains_all(
         relative,
         write_session,
+        &["SqlWriteContext::new", "providers::register_write"],
+    );
+    assert_source_contains_none(relative, write_session, &["providers::register_read"]);
+
+    let relative = "sql2/providers/mod.rs";
+    let source = read_engine_source(relative);
+    assert_source_contains_none(
+        relative,
+        &source,
+        &["pub mod", "pub(crate) mod", "pub(super) mod", "pub(in "],
+    );
+    let write_registration = source_between(
+        relative,
+        &source,
+        "pub(crate) async fn register_write",
+        "#[cfg(test)]",
+    );
+    assert_source_contains_all(
+        relative,
+        write_registration,
         &[
-            "SqlWriteContext::new",
-            "register_lix_state_write_providers",
-            "register_lix_version_write_provider",
-            "register_lix_directory_write_providers",
-            "register_lix_file_write_providers",
-            "register_entity_write_providers",
+            "PublicCatalog::from_visible_schemas",
+            "catalog.surfaces()",
+            "PublicSurfaceKind::LixState",
+            "PublicSurfaceKind::LixStateByVersion",
+            "PublicSurfaceKind::Version",
+            "PublicSurfaceKind::File",
+            "PublicSurfaceKind::FileByVersion",
+            "PublicSurfaceKind::Directory",
+            "PublicSurfaceKind::DirectoryByVersion",
+            "PublicSurfaceKind::Change",
+            "PublicSurfaceKind::History",
+            "PublicSurfaceKind::FileHistory",
+            "PublicSurfaceKind::DirectoryHistory",
+            "lix_state::register_lix_state_active_write_provider",
+            "lix_state::register_lix_state_by_version_write_provider",
+            "version::register_write_provider",
+            "file::register_active_write_provider",
+            "file::register_by_version_write_provider",
+            "directory::register_active_write_provider",
+            "directory::register_by_version_write_provider",
+            "change::register_lix_change_read_provider",
+            "history::register_history_provider",
+            "file_history::register_lix_file_history_surface",
+            "directory_history::register_lix_directory_history_surface",
+            "entity::register_entity_write_providers",
+            "entity::register_entity_history_providers",
         ],
     );
     assert_source_contains_none(
         relative,
-        write_session,
+        write_registration,
         &[
-            "ctx.commit_store_query_source",
-            "ctx.commit_graph",
             "ctx.live_state()",
             "ctx.version_ref()",
             "register_lix_state_providers",
@@ -2866,6 +2963,83 @@ fn sql2_write_session_does_not_register_history_or_committed_read_surfaces() {
             "register_lix_directory_providers",
             "register_lix_file_providers",
             "register_entity_providers",
+            "register_lix_state_write_providers",
+            "register_lix_version_write_provider",
+            "register_lix_version_write_surface",
+            "register_lix_directory_active_write_provider",
+            "register_lix_directory_by_version_write_provider",
+            "register_lix_directory_write_providers",
+            "register_lix_file_active_write_provider",
+            "register_lix_file_by_version_write_provider",
+            "register_lix_file_write_providers",
+        ],
+    );
+}
+
+#[test]
+fn sql2_entity_provider_registration_is_catalog_driven() {
+    let relative = "sql2/providers/entity.rs";
+    let source = read_engine_source(relative);
+    let non_test_source = strip_test_code(&source);
+    let read_registration = source_between(
+        relative,
+        &source,
+        "pub(crate) async fn register_entity_providers",
+        "pub(crate) async fn register_entity_write_providers",
+    );
+    let write_registration = source_between(
+        relative,
+        &source,
+        "pub(crate) async fn register_entity_write_providers",
+        "pub(crate) struct EntityProvider",
+    );
+
+    assert_source_contains_all(
+        relative,
+        read_registration,
+        &[
+            "catalog.surfaces()",
+            "PublicSurfaceKind::EntityBase",
+            "PublicSurfaceKind::EntityByVersion",
+            "PublicSurfaceKind::EntityHistory",
+        ],
+    );
+    assert_source_contains_all(
+        relative,
+        write_registration,
+        &[
+            "catalog.surfaces()",
+            "PublicSurfaceKind::EntityBase",
+            "PublicSurfaceKind::EntityByVersion",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        read_registration,
+        &[
+            "schema_definitions",
+            "derive_entity_surface_spec_from_schema",
+            "schema_exposed_as_entity_surface",
+            "schema_exposed_as_entity_history_surface",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        write_registration,
+        &[
+            "schema_definitions",
+            "derive_entity_surface_spec_from_schema",
+            "schema_exposed_as_entity_surface",
+            "schema_exposed_as_entity_history_surface",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        &non_test_source,
+        &[
+            "schema_exposed_as_entity_surface",
+            "schema_exposed_as_entity_history_surface",
+            "derive_entity_surface_spec_from_schema(",
         ],
     );
 }

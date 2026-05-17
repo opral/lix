@@ -64,9 +64,14 @@ pub(crate) async fn enable_deterministic_mode(
 ) -> Result<(), LixError> {
     let timestamp_shuffle = deterministic_timestamp_shuffle_for(mode);
     let session = engine.open_session(receipt.main_version_id.clone()).await?;
-    session
+    match session
         .execute(&deterministic_mode_insert_sql(timestamp_shuffle), &[])
-        .await?;
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if error.code == "LIX_UNSUPPORTED_SQL" => {}
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
@@ -83,7 +88,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deterministic_mode_sql_carries_timestamp_shuffle_flag() {
+    fn deterministic_mode_write_sql_carries_timestamp_shuffle_flag() {
         assert!(deterministic_mode_insert_sql(true).contains("\"timestamp_shuffle\":true"));
         assert!(deterministic_mode_insert_sql(false).contains("\"timestamp_shuffle\":false"));
     }

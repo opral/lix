@@ -1,21 +1,10 @@
-use std::sync::Arc;
-
 use datafusion::prelude::{SessionConfig, SessionContext};
+use std::collections::BTreeSet;
 
 use crate::LixError;
 
-use super::change_provider::register_lix_change_provider;
-use super::directory_history_provider::register_lix_directory_history_provider;
-use super::directory_provider::{
-    register_lix_directory_providers, register_lix_directory_write_providers,
-};
-use super::entity_provider::{register_entity_providers, register_entity_write_providers};
-use super::file_history_provider::register_lix_file_history_provider;
-use super::file_provider::{register_lix_file_providers, register_lix_file_write_providers};
-use super::history_provider::register_history_providers;
-use super::lix_state_provider::{register_lix_state_providers, register_lix_state_write_providers};
+use super::providers;
 use super::udfs::register_sql2_functions;
-use super::version_provider::{register_lix_version_provider, register_lix_version_write_provider};
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
 pub(crate) async fn build_read_session(
@@ -28,66 +17,7 @@ pub(crate) async fn build_read_session(
         .await?
         .map(|head| head.commit_id);
     register_sql2_functions(&session, ctx.functions(), active_version_commit_id);
-    register_lix_state_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-    )
-    .await?;
-    register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
-    let commit_store_query_source = ctx.commit_store_query_source();
-    register_lix_change_provider(&session, commit_store_query_source.clone()).await?;
-    let state_history_commit_graph = ctx.commit_graph();
-    register_history_providers(
-        &session,
-        state_history_commit_graph,
-        commit_store_query_source.clone(),
-    )
-    .await?;
-    let file_history_commit_graph = ctx.commit_graph();
-    register_lix_file_history_provider(
-        &session,
-        file_history_commit_graph,
-        commit_store_query_source.clone(),
-        ctx.blob_reader(),
-    )
-    .await?;
-    let directory_history_commit_graph = ctx.commit_graph();
-    register_lix_directory_history_provider(
-        &session,
-        directory_history_commit_graph,
-        commit_store_query_source.clone(),
-    )
-    .await?;
-    let entity_commit_graph = Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()));
-    register_lix_directory_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-        ctx.functions(),
-    )
-    .await?;
-    register_lix_file_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-        ctx.blob_reader(),
-        ctx.functions(),
-    )
-    .await?;
-    register_entity_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-        entity_commit_graph,
-        commit_store_query_source,
-        &ctx.list_visible_schemas()?,
-    )
-    .await?;
+    providers::register_read(&session, ctx).await?;
 
     Ok(session)
 }
@@ -95,24 +25,37 @@ pub(crate) async fn build_read_session(
 pub(crate) async fn build_write_session(
     ctx: &mut dyn SqlWriteExecutionContext,
 ) -> Result<SessionContext, LixError> {
+    build_write_session_with_options(ctx, SqlWriteSessionOptions::default()).await
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SqlWriteSessionOptions {
+    pub(crate) omitted_insert_columns: BTreeSet<String>,
+}
+
+pub(crate) async fn build_write_session_with_options(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    options: SqlWriteSessionOptions,
+) -> Result<SessionContext, LixError> {
     let session = new_sql_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
+    let active_version_id = write_ctx.active_version_id();
     let active_version_commit_id = write_ctx
-        .load_version_head(&write_ctx.active_version_id())
-        .await?;
-    register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
-
-    register_lix_state_write_providers(&session, write_ctx.clone()).await?;
-    register_lix_version_write_provider(&session, write_ctx.clone()).await?;
-
-    register_lix_directory_write_providers(&session, write_ctx.clone()).await?;
-    register_lix_file_write_providers(&session, write_ctx.clone()).await?;
-    register_entity_write_providers(
+        .load_version_head(&active_version_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::version_not_found(
+                active_version_id.clone(),
+                "build SQL write session",
+                "active version",
+            )
+        })?;
+    register_sql2_functions(
         &session,
-        write_ctx.clone(),
-        &write_ctx.list_visible_schemas()?,
-    )
-    .await?;
+        write_ctx.functions(),
+        Some(active_version_commit_id),
+    );
+    providers::register_write(&session, write_ctx, options).await?;
 
     Ok(session)
 }

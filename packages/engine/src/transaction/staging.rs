@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::SchemaPlanId;
@@ -430,19 +430,8 @@ impl TransactionWriteBuffer {
 
     /// Builds the transaction-local read overlay from currently staged writes.
     pub(crate) fn staging_overlay(self: &Arc<Self>) -> Result<PreparedStateRowOverlay, LixError> {
-        let by_identity_guard = self.by_identity.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged identity index lock",
-            )
-        })?;
-        let slots = by_identity_guard
-            .iter()
-            .map(|(identity, slot)| (identity.clone(), *slot))
-            .collect();
         Ok(PreparedStateRowOverlay {
             staged_writes: Arc::clone(self),
-            slots,
         })
     }
 
@@ -593,12 +582,10 @@ impl TransactionWriteBuffer {
 /// Read overlay derived from staged transaction writes.
 pub(crate) struct PreparedStateRowOverlay {
     staged_writes: Arc<TransactionWriteBuffer>,
-    slots: BTreeMap<PreparedStateRowIdentity, RowSlot>,
 }
 
 pub(crate) struct StagedScanParts {
     pub(crate) rows: Vec<MaterializedLiveStateRow>,
-    pub(crate) hidden_identities: BTreeSet<PreparedStateRowIdentity>,
 }
 
 impl PreparedStateRowOverlay {
@@ -608,7 +595,17 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(self.scan_parts(request)?.rows)
+        Ok(crate::live_state::resolve_visible_rows(
+            self.scan_parts(request)?.rows,
+            Vec::new(),
+            &crate::live_state::VisibilityRequest {
+                version_scope: crate::live_state::VisibilityVersionScope::VersionIds {
+                    version_ids: request.filter.version_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: None,
+            },
+        ))
     }
 
     /// Returns staged rows and base-row identities hidden by staged rows in one pass.
@@ -619,6 +616,13 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<StagedScanParts, LixError> {
+        if matches!(
+            request.filter.rows,
+            crate::live_state::LiveStateRowFilter::None
+        ) {
+            return Ok(StagedScanParts { rows: Vec::new() });
+        }
+
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -631,10 +635,15 @@ impl PreparedStateRowOverlay {
                 "failed to acquire transaction staged adopted writes lock",
             )
         })?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged identity index lock",
+            )
+        })?;
 
         let mut rows = Vec::new();
-        let mut hidden_identities = BTreeSet::new();
-        for (identity, slot) in &self.slots {
+        for slot in by_identity_guard.values() {
             match *slot {
                 RowSlot::State(index) => {
                     let Some(row) = rows_guard.get(index).and_then(Option::as_ref) else {
@@ -643,10 +652,7 @@ impl PreparedStateRowOverlay {
                     if !staged_row_identity_matches_scan(row, request) {
                         continue;
                     }
-                    hidden_identities.insert(identity.clone());
-                    if row.snapshot.is_some() || request.filter.include_tombstones {
-                        rows.push(MaterializedLiveStateRow::from(row));
-                    }
+                    rows.push(MaterializedLiveStateRow::from(row));
                 }
                 RowSlot::Adopted(index) => {
                     let Some(row) = adopted_guard.get(index).and_then(Option::as_ref) else {
@@ -655,17 +661,11 @@ impl PreparedStateRowOverlay {
                     if !adopted_row_identity_matches_scan(row, request) {
                         continue;
                     }
-                    hidden_identities.insert(identity.clone());
-                    if row.snapshot.is_some() || request.filter.include_tombstones {
-                        rows.push(MaterializedLiveStateRow::from(row));
-                    }
+                    rows.push(MaterializedLiveStateRow::from(row));
                 }
             }
         }
-        Ok(StagedScanParts {
-            rows,
-            hidden_identities,
-        })
+        Ok(StagedScanParts { rows })
     }
 
     /// Returns a staged exact-row answer, if this transaction has one.
@@ -699,16 +699,13 @@ impl PreparedStateRowOverlay {
 
     #[cfg(test)]
     fn load_state_slot(&self, identity: &PreparedStateRowIdentity) -> Option<PreparedStateRow> {
-        let Some(RowSlot::State(index)) = self.slots.get(identity).copied() else {
+        let rows_guard = self.staged_writes.rows.lock().ok()?;
+        let _adopted_guard = self.staged_writes.adopted_rows.lock().ok()?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().ok()?;
+        let Some(RowSlot::State(index)) = by_identity_guard.get(identity).copied() else {
             return None;
         };
-        self.staged_writes
-            .rows
-            .lock()
-            .ok()?
-            .get(index)?
-            .as_ref()
-            .cloned()
+        rows_guard.get(index)?.as_ref().cloned()
     }
 
     #[cfg(test)]
@@ -716,16 +713,22 @@ impl PreparedStateRowOverlay {
         &self,
         identity: &PreparedStateRowIdentity,
     ) -> Option<PreparedAdoptedStateRow> {
-        let Some(RowSlot::Adopted(index)) = self.slots.get(identity).copied() else {
+        let _rows_guard = self.staged_writes.rows.lock().ok()?;
+        let adopted_guard = self.staged_writes.adopted_rows.lock().ok()?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().ok()?;
+        let Some(RowSlot::Adopted(index)) = by_identity_guard.get(identity).copied() else {
             return None;
         };
-        self.staged_writes
-            .adopted_rows
-            .lock()
-            .ok()?
-            .get(index)?
-            .as_ref()
-            .cloned()
+        adopted_guard.get(index)?.as_ref().cloned()
+    }
+}
+
+impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
+    fn staged_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        Ok(self.scan_parts(request)?.rows)
     }
 }
 
@@ -1042,9 +1045,7 @@ fn adopted_row_identity_matches_scan(
     {
         return false;
     }
-    if !request.filter.version_ids.is_empty()
-        && !request.filter.version_ids.contains(&row.version_id)
-    {
+    if !staged_version_matches_scan(&row.version_id, request) {
         return false;
     }
     if request.filter.untracked == Some(true) {
@@ -1066,9 +1067,7 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !request.filter.version_ids.is_empty()
-        && !request.filter.version_ids.contains(&row.version_id)
-    {
+    if !staged_version_matches_scan(&row.version_id, request) {
         return false;
     }
     if request
@@ -1089,6 +1088,21 @@ fn nullable_key_matches_filters(
         || filters
             .iter()
             .any(|filter| nullable_key_matches_filter(value, filter))
+}
+
+fn staged_version_matches_scan(version_id: &str, request: &LiveStateScanRequest) -> bool {
+    request.filter.version_ids.is_empty()
+        || request
+            .filter
+            .version_ids
+            .iter()
+            .any(|requested| requested == version_id)
+        || (version_id == GLOBAL_VERSION_ID
+            && request
+                .filter
+                .version_ids
+                .iter()
+                .any(|requested| requested != GLOBAL_VERSION_ID))
 }
 
 fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilter<String>) -> bool {
@@ -1547,7 +1561,7 @@ mod tests {
             })
             .expect("overlay scan should succeed");
 
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.entity_id
@@ -1556,11 +1570,11 @@ mod tests {
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
                 .count(),
-            2
+            1
         );
         assert!(rows.iter().any(|row| {
             row.snapshot_content.as_deref()
-                == Some("{\"key\":\"shared-entity\",\"value\":\"tracked\"}")
+                == Some("{\"key\":\"shared-entity\",\"value\":\"base\"}")
         }));
     }
 
