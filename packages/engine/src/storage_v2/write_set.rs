@@ -15,7 +15,7 @@ type FastHashBuilder = RandomState;
 pub struct StorageWriteSet {
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
-    mutation_index: HashMap<(SpaceId, Key), StorageSpace, FastHashBuilder>,
+    mutation_index: Option<HashMap<(SpaceId, Key), StorageSpace, FastHashBuilder>>,
     duplicate_mutations: Vec<(StorageSpace, Key)>,
     stats: StorageWriteSetStats,
 }
@@ -43,21 +43,46 @@ pub enum StorageWriteSetError {
 }
 
 impl StorageWriteSet {
+    /// Creates an empty checked write set.
+    ///
+    /// Checked write sets validate duplicate `(space, key)` mutations while
+    /// staging. This is the safe default for generic callers and tests.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_capacity(expected_mutations: usize, expected_spaces: usize) -> Self {
+    /// Creates a checked write set with capacity hints.
+    ///
+    /// Use this when the caller has not already canonicalized final mutations.
+    pub fn checked_with_capacity(expected_mutations: usize, expected_spaces: usize) -> Self {
         Self {
             groups: Vec::with_capacity(expected_spaces),
             group_index: HashMap::with_capacity_and_hasher(
                 expected_spaces,
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
-            mutation_index: HashMap::with_capacity_and_hasher(
+            mutation_index: Some(HashMap::with_capacity_and_hasher(
                 expected_mutations,
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
+            )),
+            duplicate_mutations: Vec::new(),
+            stats: StorageWriteSetStats::default(),
+        }
+    }
+
+    /// Creates a canonical write set with capacity hints.
+    ///
+    /// Canonical write sets skip per-mutation duplicate validation. Use this
+    /// only when the caller has already produced at most one final mutation for
+    /// each `(StorageSpace.id, Key)`.
+    pub fn canonical_with_capacity(_expected_mutations: usize, expected_spaces: usize) -> Self {
+        Self {
+            groups: Vec::with_capacity(expected_spaces),
+            group_index: HashMap::with_capacity_and_hasher(
+                expected_spaces,
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
+            mutation_index: None,
             duplicate_mutations: Vec::new(),
             stats: StorageWriteSetStats::default(),
         }
@@ -79,6 +104,36 @@ impl StorageWriteSet {
         if let Err(error) = self.try_stage_delete(space, key) {
             self.record_stage_error(error);
         }
+    }
+
+    /// Reserves capacity for a storage space's grouped puts and deletes.
+    ///
+    /// This is most useful with canonical construction, where domain stores can
+    /// often count final mutations before staging them.
+    pub fn reserve_space(
+        &mut self,
+        space: StorageSpace,
+        expected_puts: usize,
+        expected_deletes: usize,
+    ) {
+        let group = self.group_mut(space);
+        group.puts.reserve(expected_puts);
+        group.deletes.reserve(expected_deletes);
+    }
+
+    /// Stages a final put from a caller that has already canonicalized
+    /// mutations for each `(space, key)`.
+    pub fn stage_canonical_put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
+        self.stats.staged_puts += 1;
+        self.stats.written_bytes += value.bytes.len() as u64;
+        self.group_mut(space).puts.push(PutEntry { key, value });
+    }
+
+    /// Stages a final delete from a caller that has already canonicalized
+    /// mutations for each `(space, key)`.
+    pub fn stage_canonical_delete(&mut self, space: StorageSpace, key: Key) {
+        self.stats.staged_deletes += 1;
+        self.group_mut(space).deletes.push(key);
     }
 
     pub fn try_stage_put(
@@ -249,7 +304,11 @@ impl StorageWriteSet {
         space: StorageSpace,
         key: &Key,
     ) -> Result<(), StorageWriteSetError> {
-        match self.mutation_index.entry((space.id, key.clone())) {
+        let mutation_index = self
+            .mutation_index
+            .get_or_insert_with(|| HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)));
+
+        match mutation_index.entry((space.id, key.clone())) {
             Entry::Occupied(_) => Err(StorageWriteSetError::DuplicateMutation {
                 space,
                 key: key.clone(),
@@ -279,7 +338,7 @@ impl Default for StorageWriteSet {
         Self {
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
-            mutation_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
+            mutation_index: None,
             duplicate_mutations: Vec::new(),
             stats: StorageWriteSetStats::default(),
         }
@@ -450,6 +509,31 @@ mod tests {
         let stats = writes.stats();
         assert_eq!(stats.staged_puts, 1);
         assert_eq!(stats.staged_deletes, 0);
+    }
+
+    #[test]
+    fn canonical_staging_tracks_stats_and_lowers_without_duplicate_index() {
+        let mut writes = StorageWriteSet::canonical_with_capacity(3, 2);
+        writes.reserve_space(space(1), 2, 0);
+        writes.reserve_space(space(2), 0, 1);
+        writes.stage_canonical_put(space(1), key("a"), value("A"));
+        writes.stage_canonical_put(space(1), key("b"), value("B"));
+        writes.stage_canonical_delete(space(2), key("c"));
+
+        let stats = writes.stats();
+        assert_eq!(stats.staged_puts, 2);
+        assert_eq!(stats.staged_deletes, 1);
+        assert_eq!(stats.touched_spaces, 2);
+        assert_eq!(stats.written_bytes, 2);
+
+        let mut write = CountingWrite::default();
+        let stats = writes.lower_into(&mut write).expect("lower");
+
+        assert_eq!(write.put_batches.borrow().len(), 1);
+        assert_eq!(write.delete_batches.borrow().len(), 1);
+        assert_eq!(stats.put_batches, 1);
+        assert_eq!(stats.delete_batches, 1);
+        assert_eq!(stats.backend_calls, 2);
     }
 
     #[test]

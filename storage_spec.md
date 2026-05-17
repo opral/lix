@@ -295,17 +295,66 @@ The write set should not encode domain semantics such as "publish commit
 visibility". Domain stores decide what to stage; storage_v2 decides how to batch
 and lower it.
 
+There are two construction modes:
+
+```text
+checked write set:
+  safe default
+  validates duplicate (StorageSpace.id, Key) mutations while staging
+  intended for generic callers, tests, and defensive code
+
+canonical write set:
+  fast domain-store path
+  caller has already canonicalized final mutations
+  skips per-mutation duplicate validation
+  intended for hot paths that can prove one final mutation per key
+```
+
 API sketch:
 
 ```rust
 impl StorageWriteSet {
+    pub fn new() -> Self;
+
+    pub fn checked_with_capacity(
+        expected_mutations: usize,
+        expected_spaces: usize,
+    ) -> Self;
+
+    pub fn canonical_with_capacity(
+        expected_mutations: usize,
+        expected_spaces: usize,
+    ) -> Self;
+
     pub fn stage_put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
+        // Checked staging. Records duplicate mutations.
         self.group_mut(space.id).puts.push(PutEntry { key, value });
     }
 
     pub fn stage_delete(&mut self, space: StorageSpace, key: Key) {
+        // Checked staging. Records duplicate mutations.
         self.group_mut(space.id).deletes.push(key);
     }
+
+    pub fn reserve_space(
+        &mut self,
+        space: StorageSpace,
+        expected_puts: usize,
+        expected_deletes: usize,
+    );
+
+    pub fn stage_canonical_put(
+        &mut self,
+        space: StorageSpace,
+        key: Key,
+        value: StoredValue,
+    );
+
+    pub fn stage_canonical_delete(
+        &mut self,
+        space: StorageSpace,
+        key: Key,
+    );
 
     pub fn extend(&mut self, other: StorageWriteSet) {
         // O(K_other), or O(G_other) when group ownership can be moved.
@@ -373,6 +422,14 @@ Conflicting duplicate keys are invalid at the storage_v2 boundary.
 
 Domain stores must canonicalize local overwrites before staging.
 ```
+
+Checked staging may detect duplicates earlier, but the normative boundary is
+the sealed write set passed to lowering.
+
+Canonical staging is valid only when the caller has already enforced this rule.
+The current benchmark baseline shows canonical construction is materially faster
+for synthetic write sets because it avoids the per-mutation duplicate index; it
+should be used by domain-store hot paths that already emit final canonical rows.
 
 This keeps lowering cheap and avoids backend-specific behavior for put/delete
 ordering within one write set.
@@ -589,9 +646,15 @@ S = backend segments/files/objects touched
 Write-set staging:
 
 ```text
-stage_put/stage_delete:
+checked stage_put/stage_delete:
   O(1) amortized per mutation with O(1) group lookup
   O(G) with tiny Vec group lookup, acceptable only while G is bounded/small
+  duplicate tracking adds O(K) memory and expected O(1) hash work per mutation
+
+canonical stage_canonical_put/stage_canonical_delete:
+  O(1) amortized per mutation with O(1) group lookup
+  skips duplicate tracking
+  requires caller to provide final canonical mutations
 
 total staging memory:
   O(K)
