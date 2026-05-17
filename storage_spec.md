@@ -8,7 +8,7 @@ write batching, spaces, prefix lowering, caller-order reconstruction, and other
 domain-neutral storage mechanics. It also exposes baseline read/write shape
 stats so later benchmarks and optimizations can prove the physical access shape.
 Cursor wrapping, capability-aware lowering, fallback accounting, residual
-filtering loops, and projection/delete-range fallbacks are planned
+filtering loops, projection fallback, and delete-range helpers are planned
 optimization-hardening work, not implemented baseline behavior yet.
 
 ## Layering
@@ -44,7 +44,7 @@ Planned storage_v2 optimization extensions:
   capability-aware lowering
   projection fallback
   residual filtering loops
-  delete_range/precondition fallback safety gates
+  delete_range helpers and precondition fallback safety gates
   fallback accounting
 
 Backend: backend_v2
@@ -121,7 +121,7 @@ fallback stats
 capability-aware lowering helpers
 limit-after-residual scan loops
 projection/envelope helpers, only when domain-neutral
-delete_range/precondition fallback safety gates
+delete_range helpers and precondition fallback safety gates
 ```
 
 The current engine already has this shape:
@@ -638,7 +638,7 @@ Notation:
 K = total staged mutations
 G = touched storage groups, usually distinct (StorageSpace, operation)
 M = point keys requested
-Q = rows emitted by a scan or touched by a scan/delete fallback
+Q = rows emitted by a scan or touched by a range delete
 P = payload bytes read/written
 S = backend segments/files/objects touched
 ```
@@ -733,30 +733,21 @@ lack of envelope projection may increase decoded/read bytes
 storage_v2 must record that fallback in stats
 ```
 
-Delete-range fallback:
+Delete range:
 
 ```text
-native:
-  backend-native delete_range when exact and supported
-
-fallback:
-  O(Q) scan plus delete_many batches
-  one commit boundary
+backend_v2 requires delete_range as part of the v0 write core.
+storage_v2 should lower logical space/range clears to backend delete_range
+after encoding the physical key range.
 ```
 
-Exact fallback safety:
+Internal backend fallback safety:
 
 ```text
-scan-and-delete is exact only when one of these holds:
-  storage has single-writer/exclusive access for the affected space/range
-  backend has native conflict detection/preconditions that bind the scanned
-    range to commit
-  the high-level operation explicitly means "delete keys observed in this
-    snapshot"
-
-otherwise:
-  storage must reject exact delete_range or require a native delete-range
-  backend extension
+If a backend implements delete_range internally as scan-and-delete, that scan
+must be bound to the same atomic write transaction. It must not be a separate
+read snapshot followed by point deletes that can miss concurrent range inserts
+under the backend's advertised write-concurrency profile.
 ```
 
 This is the main place where moving behavior upward can silently become a
@@ -820,7 +811,6 @@ Planned fallback stats:
 ```rust
 pub enum FallbackKind {
     ProjectionFallbackToFullValue,
-    DeleteRangeScanAndDelete,
     PredicateResidualFilter,
     ReverseScanForwardBuffer,
     CallerOrderReorder,
@@ -834,7 +824,7 @@ Future fallback stats should answer questions such as:
 ```text
 Did this scan hydrate payload bytes?
 Did this query fall back from header/refs projection to FullValue?
-Was delete_range native or scan-and-delete fallback?
+Was delete_range lowered through the backend primitive?
 ```
 
 ## Storage Adapter Tests
@@ -889,9 +879,9 @@ no_direct_write_bypass_for_engine_commits:
   high-level commits stage StorageWriteSet mutations instead of calling
   backend.begin_write independently from domain stores
 
-delete_range_fallback:
-  when native delete_range is unavailable, storage does scan_range plus
-  delete_many batches with one commit boundary only under the safety matrix
+delete_range_helpers:
+  storage lowers logical range/prefix/space clears to the backend_v2
+  delete_range primitive after physical key encoding
 
 projection_fallback_accounting:
   missing HeaderAndRefs support may read FullValue, but stats record fallback

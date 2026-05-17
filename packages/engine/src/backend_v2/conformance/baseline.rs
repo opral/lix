@@ -29,6 +29,15 @@ where
     report.run("baseline::delete_many_removes_existing_keys", || {
         delete_many_removes_existing_keys(factory)
     });
+    report.run("baseline::delete_range_removes_exact_range", || {
+        delete_range_removes_exact_range(factory)
+    });
+    report.run("baseline::delete_range_applies_after_staged_puts", || {
+        delete_range_applies_after_staged_puts(factory)
+    });
+    report.run("baseline::put_many_applies_after_delete_range", || {
+        put_many_applies_after_delete_range(factory)
+    });
     report.run("baseline::put_many_overwrites_existing_value", || {
         put_many_overwrites_existing_value(factory)
     });
@@ -172,6 +181,114 @@ where
         .map_err(|error| format!("commit failed: {error}"))?;
 
     assert_get_entries(&backend, test_space, &[("a", None), ("b", Some("B"))])
+}
+
+fn delete_range_removes_exact_range<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let test_space = space(1);
+    seed_full_values(
+        &backend,
+        test_space,
+        [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")],
+    )?;
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin_write failed: {error}"))?;
+    write
+        .delete_range(KeyRange {
+            lower: Bound::Included(key("b")),
+            upper: Bound::Excluded(key("d")),
+        })
+        .map_err(|error| format!("delete_range failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    assert_get_entries(
+        &backend,
+        test_space,
+        &[
+            ("a", Some("A")),
+            ("b", None),
+            ("c", None),
+            ("d", Some("D")),
+            ("e", Some("E")),
+        ],
+    )
+}
+
+fn delete_range_applies_after_staged_puts<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let test_space = space(1);
+    seed_full_values(&backend, test_space, [("a", "A"), ("c", "C"), ("d", "D")])?;
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin_write failed: {error}"))?;
+    write
+        .put_many(put_batch([
+            full_put(key("b"), "B"),
+            full_put(key("c"), "C2"),
+        ]))
+        .map_err(|error| format!("put_many failed: {error}"))?;
+    write
+        .delete_range(KeyRange {
+            lower: Bound::Included(key("b")),
+            upper: Bound::Excluded(key("d")),
+        })
+        .map_err(|error| format!("delete_range failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    assert_get_entries(
+        &backend,
+        test_space,
+        &[("a", Some("A")), ("b", None), ("c", None), ("d", Some("D"))],
+    )
+}
+
+fn put_many_applies_after_delete_range<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let test_space = space(1);
+    seed_full_values(&backend, test_space, [("a", "A"), ("b", "B"), ("d", "D")])?;
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin_write failed: {error}"))?;
+    write
+        .delete_range(KeyRange {
+            lower: Bound::Included(key("b")),
+            upper: Bound::Excluded(key("d")),
+        })
+        .map_err(|error| format!("delete_range failed: {error}"))?;
+    write
+        .put_many(put_batch([full_put(key("c"), "C")]))
+        .map_err(|error| format!("put_many failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    assert_get_entries(
+        &backend,
+        test_space,
+        &[
+            ("a", Some("A")),
+            ("b", None),
+            ("c", Some("C")),
+            ("d", Some("D")),
+        ],
+    )
 }
 
 fn put_many_overwrites_existing_value<F>(factory: &F) -> ConformanceResult

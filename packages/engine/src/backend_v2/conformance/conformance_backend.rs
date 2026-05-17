@@ -139,6 +139,12 @@ impl BackendWrite for ConformanceWrite {
         Ok(())
     }
 
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        self.entries
+            .retain(|key, _value| !range_contains(&range, key));
+        Ok(())
+    }
+
     fn commit(self) -> Result<CommitResult, BackendError> {
         *self
             .parent

@@ -42,7 +42,6 @@ pub struct ScanCapabilities {
 
 #[derive(Clone, Debug, Default)]
 pub struct WriteCapabilities {
-    pub delete_range: bool,
     pub preconditions: bool,
     pub idempotent_commit: bool,
 }

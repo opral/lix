@@ -5223,10 +5223,116 @@ API conclusion:
 Do not change the read core yet.
 
 The next backend/storage API experiment with clear evidence is:
-  optional delete_range(range) on BackendWrite
+  required delete_range(range) on BackendWrite
   storage_v2 delete_prefix/delete_range/clear_space helpers
-  fallback = scan key-only pages + delete_many + one commit
+  compare backend primitive against scan key-only pages + delete_many fallback
 
 Cursorized scans remain a second candidate, but only if domain workloads
 actually drain large ranges with very small page sizes.
+```
+
+## 2026-05-16 - Required backend delete_range core
+
+Changed `backend_v2::BackendWrite` to require:
+
+```rust
+fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError>;
+```
+
+This makes exact range deletion a v0 backend correctness primitive, not an
+optional capability. The conformance suite now checks:
+
+```text
+baseline::delete_range_removes_exact_range
+baseline::delete_range_applies_after_staged_puts
+baseline::put_many_applies_after_delete_range
+```
+
+The staged-write tests matter because a backend write transaction must apply
+`put_many(...); delete_range(...); put_many(...)` as one ordered mutation
+stream. A backend that implements range delete by scanning only committed state
+can otherwise miss keys staged earlier in the same write, and a backend using a
+native range tombstone must still let later puts survive.
+
+Implemented backend behavior:
+
+```text
+in_memory:
+  removes overlay puts in range and stages deletes for base visible keys
+
+sqlite_temp:
+  one indexed DELETE FROM entries WHERE key range inside the write transaction
+
+redb_temp:
+  collects keys from the write transaction's table range and removes them
+
+rocksdb_temp:
+  uses WriteBatch::delete_range for finite raw-byte ranges after normalizing
+  inclusive/exclusive bounds; falls back to exact point deletes for unbounded
+  upper ranges
+```
+
+Native delete_range smoke:
+
+| Backend      |      q100 |     q1000 |   q10000 |
+| ------------ | --------: | --------: | -------: |
+| in_memory    |   9.40 us | 120.39 us |  1.32 ms |
+| sqlite_temp  | 779.33 us |   1.13 ms |  3.20 ms |
+| redb_temp    |  15.14 ms |  20.15 ms | 20.33 ms |
+| rocksdb_temp | 130.37 us | 625.16 us |  3.52 ms |
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/delete_range_native/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)'
+```
+
+Interpretation:
+
+```text
+SQLite gets the clearest win over the fallback lane at larger ranges because it
+can issue one indexed DELETE. In-memory also improves by avoiding storage-level
+scan/materialize/delete lowering.
+
+redb remains dominated by commit/durability cost in this smoke shape.
+
+rocksdb q100/q1000 are roughly comparable to fallback because the first exact
+implementation still collected concrete keys to preserve staged-put semantics.
+That motivated the follow-up below.
+```
+
+Follow-up optimization before committing:
+
+```text
+rocksdb_temp:
+  changed finite ranges to WriteBatch::delete_range after translating Lix
+  bounds into RocksDB's half-open [from, to) shape:
+    Included(lower) -> lower
+    Excluded(lower) -> lower || 0x00
+    Excluded(upper) -> upper
+    Included(upper) -> upper || 0x00
+
+redb_temp:
+  tried retain_in(), but smoke regressed:
+    q100   ~18.15 ms vs prior ~15.14 ms
+    q1000  ~21.84 ms vs prior ~20.15 ms
+    q10000 ~41.34 ms vs prior ~20.33 ms
+  kept the measured-faster range collect + remove implementation.
+```
+
+RocksDB optimized smoke:
+
+| Backend      |      q100 |     q1000 |    q10000 |
+| ------------ | --------: | --------: | --------: |
+| rocksdb_temp | 103.80 us | 119.74 us | 147.97 us |
+
+RocksDB delta from the first exact implementation:
+
+| Case | Before | After | Delta |
+| ---- | -----: | ----: | ----: |
+| q100 | 130.37 us | 103.80 us | 20% faster |
+| q1000 | 625.16 us | 119.74 us | 81% faster |
+| q10000 | 3.52 ms | 147.97 us | 96% faster |
 ```

@@ -9,7 +9,7 @@ access, forward row-bounded range visits, and atomic batched writes.
 
 Everything else is either `storage_v2` adapter behavior or an additive backend
 extension: prefix lowering, caller-order reconstruction, storage cursors,
-projection fallback, residual filtering, range delete, preconditions, predicate
+projection fallback, residual filtering, preconditions, predicate
 pushdown, envelope slicing, object/segment pruning, byte-bounded pages,
 long-lived cursors, parallel scan partitions, and native idempotent commits.
 
@@ -54,7 +54,7 @@ Generic storage adapter:
   capability-aware lowering
   projection fallback
   residual filtering loops
-  delete_range/precondition fallback when safe
+  precondition fallback when safe
   fallback stats
 
 Domain stores:
@@ -97,6 +97,7 @@ visit_many
 visit_range
 put_many
 delete_many
+delete_range
 commit
 rollback
 ```
@@ -144,7 +145,6 @@ refs-only scan
 payload-only read
 native prefix scan
 reverse scan
-delete_range
 atomic precondition registration
 idempotent commit
 exact predicate pushdown
@@ -156,8 +156,8 @@ long-lived cursors
 
 This is the "boring ordered KV first" direction: keep v0 tiny, then let
 storage_v2 use extensions to avoid payload read/decode, push predicates down,
-delete ranges natively, or resume scans with backend-native tokens when a
-backend can do that cheaply and correctly.
+or resume scans with backend-native tokens when a backend can do that cheaply
+and correctly.
 
 ## Rust API
 
@@ -192,6 +192,7 @@ FoundationDB:
   visit_range  -> transaction get_range
   put_many     -> set
   delete_many  -> clear
+  delete_range -> clear range
   commit       -> commit
 
 RocksDB:
@@ -199,6 +200,7 @@ RocksDB:
   visit_range  -> iterator seek + next
   put_many     -> WriteBatch
   delete_many  -> WriteBatch delete
+  delete_range -> WriteBatch delete range or exact range delete loop
   commit       -> DB::write / Transaction::Commit
 
 SQLite:
@@ -206,6 +208,7 @@ SQLite:
   visit_range  -> WHERE key >= ? AND key < ? ORDER BY key LIMIT ?
   put_many     -> transaction + batched INSERT/UPDATE
   delete_many  -> transaction + batched DELETE
+  delete_range -> transaction + indexed DELETE WHERE key range
 ```
 
 ## Core Types
@@ -565,6 +568,8 @@ pub trait BackendWrite {
 
     fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
 
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError>;
+
     fn commit(self) -> Result<CommitResult, BackendError>
     where
         Self: Sized;
@@ -586,11 +591,13 @@ view and/or a storage-layer staged-mutation overlay.
 Required write semantics:
 
 ```text
-put_many/delete_many mutations staged in one WriteTxn are committed atomically.
+put_many/delete_many/delete_range mutations staged in one WriteTxn are committed atomically.
 Before commit, no other read transaction is required to observe them.
 After successful commit, future read transactions observe them according to
 durability/visibility rules.
 rollback discards all staged mutations.
+delete_range removes exactly the keys in the requested raw byte-key range,
+including keys staged earlier in the same write transaction.
 ```
 
 Optional write semantics:
@@ -598,20 +605,12 @@ Optional write semantics:
 ```text
 atomic precondition registration
 idempotent_commit
-delete_range
 ```
 
 Optional write behavior is intended to live behind extension traits. These
 traits are part of the extension design, not the v0 core trait surface:
 
 ```rust
-pub trait BackendDeleteRangeExt: BackendWrite {
-    fn delete_range(
-        &mut self,
-        range: KeyRange,
-    ) -> Result<(), BackendError>;
-}
-
 pub trait BackendPreconditionExt: BackendWrite {
     fn require(
         &mut self,
@@ -685,11 +684,11 @@ If backend lacks preconditions and allows external concurrent writers:
   storage must not emulate silently.
 ```
 
-`delete_range` fallback has the same safety boundary. A scan-and-delete fallback
-is exact only when storage can prevent concurrent range inserts or bind the
-scanned range to commit with native conflict/precondition support. Otherwise,
-storage must reject the exact operation or explicitly downgrade the semantics to
-"delete keys observed in the read snapshot."
+`delete_range` is part of the v0 write core so storage does not need a
+check-then-delete fallback for exact range deletion. A backend may implement it
+internally as scan-and-delete only if that scan is bound to the same atomic
+write transaction and cannot miss concurrent range inserts under the backend's
+advertised write-concurrency profile.
 
 ## Capability Model
 
@@ -754,9 +753,6 @@ pub struct ScanCapabilities {
 
 #[derive(Clone, Debug, Default)]
 pub struct WriteCapabilities {
-    /// put_many/delete_many/commit/rollback are core.
-    pub delete_range: bool,
-
     /// Atomic precondition registration via BackendPreconditionExt.
     pub preconditions: bool,
 
@@ -1024,9 +1020,8 @@ entries.
 
 Stats are layered. Backend stats are optional diagnostics about physical calls
 and bytes. Storage stats are the normative place for fallback/cost accounting:
-projection fallback, residual filtering, caller-order reconstruction,
-scan-and-delete fallback, reverse buffering, payload hydration, and write-set
-lowering.
+projection fallback, residual filtering, caller-order reconstruction, reverse
+buffering, payload hydration, delete-range lowering, and write-set lowering.
 
 ```rust
 #[derive(Clone, Debug, Default)]
@@ -1514,7 +1509,6 @@ byte-bounded pages
 long-lived cursors
 parallel partitions
 object/segment pruning
-native delete_range
 backend diagnostics
 ```
 
@@ -1551,14 +1545,14 @@ The other conformance modules are capability-gated or profile-gated:
 persistence.rs -> non-ephemeral fixture reopen semantics
 projection.rs  -> envelope slices
 scan.rs        -> native prefix, reverse, byte limits, long-lived cursors
-write.rs       -> delete_range, preconditions, idempotent commit
+write.rs       -> preconditions, idempotent commit
 pushdown.rs    -> exact/inexact/unsupported pushdown reporting
 ```
 
 Storage-level conformance currently validates caller-order point reconstruction,
 duplicate/missing slots, prefix lowering, read-scope pinning, named-space
 validation, and write-set batching/lowering. It should grow next to cover public
-cursor scope, projection fallback, residual filtering, delete-range fallback,
+cursor scope, projection fallback, residual filtering, delete-range helpers,
 support/stat interpretation, and read-side stats.
 
 The conformance runner should expose a function-first API:
@@ -1703,6 +1697,8 @@ pub trait BackendWrite {
     fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
 
     fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError>;
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where
