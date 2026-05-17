@@ -4,7 +4,7 @@ use crate::backend_v2::{
     SpaceId,
 };
 use crate::storage_v2::{
-    decode_logical_key_ref, StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
+    decode_logical_key_ref, StorageRead, StorageReadResult, StorageReadStats, StorageSpace,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -78,11 +78,11 @@ impl ScanPlan {
 
     pub fn collect<R>(
         &self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: ScanOptions<'_>,
     ) -> Result<StorageReadResult<ScanChunk>, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
     {
         match &self.kind {
             ScanPlanKind::Range(range) => {
@@ -96,12 +96,12 @@ impl ScanPlan {
 
     pub fn collect_into<'a, R>(
         &self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: ScanOptions<'_>,
         buffer: &'a mut ScanBuffer,
     ) -> Result<StorageReadResult<ScanChunkRef<'a>>, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
     {
         let chunk = match &self.kind {
             ScanPlanKind::Range(range) => scan_range_into(
@@ -139,12 +139,12 @@ impl ScanPlan {
 
     pub fn visit<R, V>(
         &self,
-        read: &StorageReadScope<R>,
+        read: &R,
         opts: ScanOptions<'_>,
         visitor: &mut V,
     ) -> Result<StorageReadResult<ScanResult>, BackendError>
     where
-        R: BackendRead,
+        R: StorageRead + ?Sized,
         V: ScanVisitor + ?Sized,
     {
         match &self.kind {
@@ -165,15 +165,12 @@ impl ScanPlan {
         }
     }
 
-    pub fn cursor<R, T, F>(
-        &self,
-        read: &StorageReadScope<R>,
-        opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+    pub fn cursor<R, T, F>(&self, read: &R, opts: ScanOptions<'_>, f: F) -> Result<T, BackendError>
     where
-        R: BackendRead,
-        F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
+        R: StorageRead + ?Sized,
+        F: FnOnce(
+            &mut ScanCursor<'_, <R::BackendRead as BackendRead>::RangeScan<'_>>,
+        ) -> Result<T, BackendError>,
     {
         match &self.kind {
             ScanPlanKind::Range(range) => {

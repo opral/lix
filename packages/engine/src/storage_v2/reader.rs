@@ -12,7 +12,8 @@ mod tests {
         WriteOptions,
     };
     use crate::storage_v2::{
-        PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageSpace,
+        PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageRead,
+        StorageSpace,
     };
 
     fn key(bytes: &'static str) -> Key {
