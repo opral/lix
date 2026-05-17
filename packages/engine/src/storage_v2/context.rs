@@ -1,6 +1,10 @@
-use crate::backend_v2::{Backend, BackendError, CommitResult, ReadOptions, WriteOptions};
+use std::ops::Bound;
+
+use crate::backend_v2::{
+    Backend, BackendError, BackendWrite, CommitResult, KeyRange, Prefix, ReadOptions, WriteOptions,
+};
 use crate::storage_v2::{
-    StorageReadScope, StorageWriteSet, StorageWriteSetError, StorageWriteSetStats,
+    StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError, StorageWriteSetStats,
 };
 
 #[derive(Clone, Debug)]
@@ -33,6 +37,45 @@ where
         opts: WriteOptions,
     ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
         write_set.commit(&self.backend, opts)
+    }
+
+    pub fn delete_range(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, BackendError> {
+        let mut write = self.backend.begin_write(opts)?;
+        let physical_range = space.encode_range(range, None);
+        if let Err(error) = write.delete_range(physical_range) {
+            let _ = write.rollback();
+            return Err(error);
+        }
+        write.commit()
+    }
+
+    pub fn delete_prefix(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, BackendError> {
+        self.delete_range(space, prefix.to_range()?, opts)
+    }
+
+    pub fn clear_space(
+        &self,
+        space: StorageSpace,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, BackendError> {
+        self.delete_range(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            opts,
+        )
     }
 }
 
@@ -231,6 +274,82 @@ mod shape_tests {
         );
     }
 
+    #[test]
+    fn delete_range_lowers_to_one_backend_delete_range() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+
+        storage
+            .delete_range(
+                space(7),
+                KeyRange {
+                    lower: Bound::Included(key("a")),
+                    upper: Bound::Excluded(key("c")),
+                },
+                WriteOptions::default(),
+            )
+            .expect("delete range");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.delete_many_calls.get(), 0);
+        assert_eq!(
+            backend.state.delete_ranges.borrow().as_slice(),
+            &[KeyRange {
+                lower: Bound::Included(space(7).encode_key(&key("a"))),
+                upper: Bound::Excluded(space(7).encode_key(&key("c"))),
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_prefix_lowers_to_one_backend_delete_range() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+
+        storage
+            .delete_prefix(
+                space(7),
+                crate::backend_v2::Prefix {
+                    bytes: Bytes::from_static(b"ab"),
+                },
+                WriteOptions::default(),
+            )
+            .expect("delete prefix");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.delete_many_calls.get(), 0);
+        assert_eq!(
+            backend.state.delete_ranges.borrow().as_slice(),
+            &[KeyRange {
+                lower: Bound::Included(space(7).encode_key(&key("ab"))),
+                upper: Bound::Excluded(space(7).encode_key(&key("ac"))),
+            }]
+        );
+    }
+
+    #[test]
+    fn clear_space_lowers_to_one_backend_delete_range() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+
+        storage
+            .clear_space(space(7), WriteOptions::default())
+            .expect("clear space");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.delete_many_calls.get(), 0);
+        assert_eq!(
+            backend.state.delete_ranges.borrow().as_slice(),
+            &[KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"\0\0\0\x07"))),
+                upper: Bound::Excluded(Key(Bytes::from_static(b"\0\0\0\x08"))),
+            }]
+        );
+    }
+
     #[derive(Clone, Default)]
     struct CountingBackend {
         state: Rc<CountingState>,
@@ -240,12 +359,15 @@ mod shape_tests {
     struct CountingState {
         begin_write_calls: Cell<u64>,
         commit_calls: Cell<u64>,
+        delete_many_calls: Cell<u64>,
         put_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
+        delete_ranges: RefCell<Vec<KeyRange>>,
     }
 
     struct CountingWrite {
         state: Rc<CountingState>,
         put_batches: Vec<(SpaceId, Vec<Key>)>,
+        delete_ranges: Vec<KeyRange>,
     }
 
     impl Backend for CountingBackend {
@@ -274,6 +396,7 @@ mod shape_tests {
             Ok(CountingWrite {
                 state: Rc::clone(&self.state),
                 put_batches: Vec::new(),
+                delete_ranges: Vec::new(),
             })
         }
     }
@@ -297,10 +420,14 @@ mod shape_tests {
         }
 
         fn delete_many(&mut self, _keys: &[Key]) -> Result<(), BackendError> {
+            self.state
+                .delete_many_calls
+                .set(self.state.delete_many_calls.get() + 1);
             Ok(())
         }
 
-        fn delete_range(&mut self, _range: KeyRange) -> Result<(), BackendError> {
+        fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+            self.delete_ranges.push(range);
             Ok(())
         }
 
@@ -309,6 +436,10 @@ mod shape_tests {
                 .commit_calls
                 .set(self.state.commit_calls.get() + 1);
             self.state.put_batches.borrow_mut().extend(self.put_batches);
+            self.state
+                .delete_ranges
+                .borrow_mut()
+                .extend(self.delete_ranges);
             Ok(CommitResult {
                 commit_id: None,
                 stats: WriteStats::default(),

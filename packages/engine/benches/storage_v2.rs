@@ -533,6 +533,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_delete_range_native(c, SqliteTempBenchBackend::new());
     bench_delete_range_native(c, RedbTempBenchBackend::new());
     bench_delete_range_native(c, RocksDbTempBenchBackend::new());
+    bench_delete_range_storage_helpers(c, InMemoryBenchBackend);
+    bench_delete_range_storage_helpers(c, SqliteTempBenchBackend::new());
+    bench_delete_range_storage_helpers(c, RedbTempBenchBackend::new());
+    bench_delete_range_storage_helpers(c, RocksDbTempBenchBackend::new());
     bench_scan_pagination_matrix(c, InMemoryBenchBackend);
     bench_scan_pagination_matrix(c, SqliteTempBenchBackend::new());
     bench_scan_pagination_matrix(c, RedbTempBenchBackend::new());
@@ -1015,6 +1019,100 @@ where
                 BatchSize::LargeInput,
             );
         });
+    }
+
+    group.finish();
+}
+
+fn bench_delete_range_storage_helpers<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!(
+        "storage_v2/delete_range_storage_helpers/{}",
+        backend_family.name()
+    );
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    for case in DELETE_RANGE_CASES {
+        let seed = backend_family.seed_points(SpaceId(1), case.rows as u32, 32);
+        group.throughput(Throughput::Elements(case.rows as u64));
+        group.bench_with_input(
+            BenchmarkId::new("delete_range", case.name),
+            case,
+            |b, _case| {
+                b.iter_batched(
+                    || {
+                        let backend = backend_family.fork_for_write(&seed);
+                        StorageContext::new(backend)
+                    },
+                    |storage| {
+                        let commit = storage
+                            .delete_range(space(1), point_scan_range(), WriteOptions::default())
+                            .expect("storage delete_range helper");
+                        assert_eq!(commit.stats.deleted_ranges, 1);
+                        assert_eq!(commit.stats.backend_calls, 1);
+                        black_box(commit);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("delete_prefix", case.name),
+            case,
+            |b, _case| {
+                b.iter_batched(
+                    || {
+                        let backend = backend_family.fork_for_write(&seed);
+                        StorageContext::new(backend)
+                    },
+                    |storage| {
+                        let commit = storage
+                            .delete_prefix(
+                                space(1),
+                                Prefix {
+                                    bytes: Bytes::from_static(b"point-"),
+                                },
+                                WriteOptions::default(),
+                            )
+                            .expect("storage delete_prefix helper");
+                        assert_eq!(commit.stats.deleted_ranges, 1);
+                        assert_eq!(commit.stats.backend_calls, 1);
+                        black_box(commit);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("clear_space", case.name),
+            case,
+            |b, _case| {
+                b.iter_batched(
+                    || {
+                        let backend = backend_family.fork_for_write(&seed);
+                        StorageContext::new(backend)
+                    },
+                    |storage| {
+                        let commit = storage
+                            .clear_space(space(1), WriteOptions::default())
+                            .expect("storage clear_space helper");
+                        assert_eq!(commit.stats.deleted_ranges, 1);
+                        assert_eq!(commit.stats.backend_calls, 1);
+                        black_box(commit);
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();

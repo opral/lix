@@ -866,6 +866,11 @@ write_lifecycle_failures:
   duplicate/conflicting write-set validation happens before begin_write; lower
   failures roll back once; commit failures are reported without pretending
   success
+
+delete_range_helpers:
+  storage lowers logical range/prefix/space clears to one backend_v2
+  delete_range primitive after physical key encoding; shape tests assert zero
+  delete_many calls for exact range clears
 ```
 
 Planned optimization-hardening test themes:
@@ -878,10 +883,6 @@ cross_domain_write_aggregation:
 no_direct_write_bypass_for_engine_commits:
   high-level commits stage StorageWriteSet mutations instead of calling
   backend.begin_write independently from domain stores
-
-delete_range_helpers:
-  storage lowers logical range/prefix/space clears to the backend_v2
-  delete_range primitive after physical key encoding
 
 projection_fallback_accounting:
   missing HeaderAndRefs support may read FullValue, but stats record fallback
