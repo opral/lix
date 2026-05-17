@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use redb::{
-    Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
-    WriteTransaction as RedbWriteTxn,
+    Database, Range as RedbRange, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition, WriteTransaction as RedbWriteTxn,
 };
 use tempfile::TempDir;
 
@@ -38,6 +38,18 @@ pub struct RedbBackend {
 
 pub struct RedbRead {
     read: ReadTransaction,
+}
+
+pub struct RedbScanCursor<'a> {
+    rows: RedbRange<'a, &'static [u8], &'static [u8]>,
+    projection: CoreProjection,
+    pending: Option<RedbPendingRow>,
+    done: bool,
+}
+
+struct RedbPendingRow {
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
 }
 
 pub struct RedbWrite {
@@ -128,11 +140,6 @@ impl Backend for RedbBackend {
 }
 
 impl BackendRead for RedbRead {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -156,32 +163,116 @@ impl BackendRead for RedbRead {
         Ok(())
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
-        if opts.limit_rows == 0 {
-            return Ok(BufferedScanCursor::default());
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
+        let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
+        let (lower, upper) = encoded_bounds(range, opts.resume_after);
+        let lower = bound_as_slice(&lower);
+        let upper = bound_as_slice(&upper);
+        let rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
+        let mut cursor = RedbScanCursor {
+            rows,
+            projection: opts.projection,
+            pending: None,
+            done: opts.limit_rows == 0,
+        };
+        f(&mut cursor)
+    }
+}
+
+impl BackendScanCursor for RedbScanCursor<'_> {
+    fn visit_next(
+        &mut self,
+        limit_rows: usize,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
+        if limit_rows == 0 || self.done {
+            return Ok(ScanResult {
+                emitted: 0,
+                has_more: !self.done,
+            });
         }
 
-        let mut rows = Vec::new();
-        visit_range(
-            &self.read,
-            range,
-            ScanOptions {
-                limit_rows: usize::MAX,
-                ..opts
-            },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                rows.push(ReadEntry {
-                    key: key.to_owned_key(),
-                    value: value.to_owned(),
+        let mut emitted = 0;
+        while emitted < limit_rows {
+            if let Some(pending) = self.pending.take() {
+                visit_redb_pending_row(pending, self.projection, visitor)?;
+                emitted += 1;
+                continue;
+            }
+
+            let Some(row) = self.rows.next() else {
+                self.done = true;
+                return Ok(ScanResult {
+                    emitted,
+                    has_more: false,
                 });
-                Ok(())
-            },
-        )?;
-        Ok(BufferedScanCursor::new(rows))
+            };
+            let (key, value) = row.map_err(redb_error)?;
+            visitor.visit(
+                KeyRef(key.value()),
+                project_value_ref(value.value(), self.projection),
+            )?;
+            emitted += 1;
+        }
+
+        let has_more = self.ensure_pending()?;
+        Ok(ScanResult { emitted, has_more })
+    }
+}
+
+impl RedbScanCursor<'_> {
+    fn ensure_pending(&mut self) -> Result<bool, BackendError> {
+        if self.pending.is_some() {
+            return Ok(true);
+        }
+        let Some(row) = self.rows.next() else {
+            self.done = true;
+            return Ok(false);
+        };
+        let (key, value) = row.map_err(redb_error)?;
+        let value = if matches!(self.projection, CoreProjection::FullValue) {
+            Some(value.value().to_vec())
+        } else {
+            None
+        };
+        self.pending = Some(RedbPendingRow {
+            key: key.value().to_vec(),
+            value,
+        });
+        Ok(true)
+    }
+}
+
+fn visit_redb_pending_row<V>(
+    row: RedbPendingRow,
+    projection: CoreProjection,
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
+    match projection {
+        CoreProjection::KeyOnly => {
+            visitor.visit(KeyRef(row.key.as_slice()), ProjectedValueRef::KeyOnly)
+        }
+        CoreProjection::FullValue => {
+            let value = row
+                .value
+                .as_deref()
+                .ok_or_else(|| BackendError::Io("redb pending row missing value".to_string()))?;
+            visitor.visit(
+                KeyRef(row.key.as_slice()),
+                ProjectedValueRef::FullValue(value),
+            )
+        }
     }
 }
 
@@ -243,48 +334,6 @@ impl BackendWrite for RedbWrite {
     fn rollback(self) -> Result<(), BackendError> {
         self.write.abort().map_err(redb_error)
     }
-}
-
-fn visit_range<V>(
-    read: &ReadTransaction,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    if opts.limit_rows == 0 {
-        return Ok(ScanResult::default());
-    }
-
-    let table = read.open_table(ENTRIES).map_err(redb_error)?;
-    let (lower, upper) = encoded_bounds(range, opts.resume_after);
-    let lower = bound_as_slice(&lower);
-    let upper = bound_as_slice(&upper);
-    let mut emitted = 0;
-    let mut rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
-
-    while let Some(row) = rows.next() {
-        let (key, value) = row.map_err(redb_error)?;
-        if emitted == opts.limit_rows {
-            return Ok(ScanResult {
-                emitted,
-                has_more: true,
-            });
-        }
-
-        visitor.visit(
-            KeyRef(key.value()),
-            project_value_ref(value.value(), opts.projection),
-        )?;
-        emitted += 1;
-    }
-
-    Ok(ScanResult {
-        emitted,
-        has_more: false,
-    })
 }
 
 fn initialize_database(db: &Database) -> Result<(), BackendError> {

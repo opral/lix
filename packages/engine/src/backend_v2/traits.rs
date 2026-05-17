@@ -21,10 +21,6 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    type ScanCursor<'a>: BackendScanCursor + 'a
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -34,11 +30,14 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError>;
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -53,13 +52,11 @@ pub trait ScanVisitor {
 }
 
 pub trait BackendScanCursor {
-    fn visit_next<V>(
+    fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,14 +72,11 @@ impl BufferedScanCursor {
 }
 
 impl BackendScanCursor for BufferedScanCursor {
-    fn visit_next<V>(
+    fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         if limit_rows == 0 {
             return Ok(ScanResult::default());
         }
@@ -150,19 +144,17 @@ where
     Ok(GetManyResult::new(values))
 }
 
-pub fn visit_range<R, V>(
+pub fn visit_range<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut V,
+    visitor: &mut dyn ScanVisitor,
 ) -> Result<ScanResult, BackendError>
 where
     R: BackendRead + ?Sized,
-    V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
-    let mut cursor = read.open_scan_cursor(range, opts)?;
-    cursor.visit_next(limit_rows, visitor)
+    read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 
 impl<F> ScanVisitor for F

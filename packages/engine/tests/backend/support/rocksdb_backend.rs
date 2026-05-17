@@ -140,11 +140,6 @@ impl Backend for RocksDbBackend {
 }
 
 impl BackendRead for RocksDbRead<'_> {
-    type ScanCursor<'a>
-        = RocksDbScanCursor<'a>
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -175,13 +170,17 @@ impl BackendRead for RocksDbRead<'_> {
         Ok(())
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         let bounds = EncodedBounds::new(range, opts.resume_after);
-        Ok(RocksDbScanCursor {
+        let mut cursor = RocksDbScanCursor {
             iter: self
                 .snapshot
                 .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward)),
@@ -189,19 +188,17 @@ impl BackendRead for RocksDbRead<'_> {
             projection: opts.projection,
             pending: None,
             done: opts.limit_rows == 0,
-        })
+        };
+        f(&mut cursor)
     }
 }
 
 impl BackendScanCursor for RocksDbScanCursor<'_> {
-    fn visit_next<V>(
+    fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         if limit_rows == 0 || self.done {
             return Ok(ScanResult {
                 emitted: 0,

@@ -578,9 +578,10 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, BufferedScanCursor, ConformanceBackend, CoreProjection,
-        GetOptions, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef,
-        ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
+        BackendError, BackendRead, BackendScanCursor, BufferedScanCursor, ConformanceBackend,
+        CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
+        ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
+        WriteOptions,
     };
     use crate::storage_v2::{
         PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext,
@@ -616,11 +617,6 @@ mod tests {
     }
 
     impl BackendRead for SpyRead {
-        type ScanCursor<'a>
-            = BufferedScanCursor
-        where
-            Self: 'a;
-
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -641,14 +637,19 @@ mod tests {
             Ok(())
         }
 
-        fn open_scan_cursor(
+        fn with_scan_cursor<T, F>(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<Self::ScanCursor<'_>, BackendError> {
+            f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
-            Ok(BufferedScanCursor::default())
+            let mut cursor = BufferedScanCursor::default();
+            f(&mut cursor)
         }
     }
 
@@ -658,11 +659,6 @@ mod tests {
     }
 
     impl BackendRead for RequestedOrderRead {
-        type ScanCursor<'a>
-            = BufferedScanCursor
-        where
-            Self: 'a;
-
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -681,11 +677,15 @@ mod tests {
             Ok(())
         }
 
-        fn open_scan_cursor(
+        fn with_scan_cursor<T, F>(
             &self,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<Self::ScanCursor<'_>, BackendError> {
+            _f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        {
             unreachable!("requested-order point-read test does not scan")
         }
     }

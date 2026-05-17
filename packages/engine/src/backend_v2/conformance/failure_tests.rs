@@ -8,10 +8,10 @@ use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
+    BufferedScanCursor, CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
+    PointVisitor, ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions,
+    ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -301,11 +301,6 @@ impl Backend for BrokenBackend {
 }
 
 impl BackendRead for BrokenRead {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -336,11 +331,15 @@ impl BackendRead for BrokenRead {
         visit_many_from_map(entries, self.mode, keys, opts, visitor)
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         let live_entries;
         let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
             live_entries = self
@@ -352,9 +351,9 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        Ok(BufferedScanCursor::new(scan_rows_from_map(
-            entries, self.mode, range, opts,
-        )))
+        let mut cursor =
+            BufferedScanCursor::new(scan_rows_from_map(entries, self.mode, range, opts));
+        f(&mut cursor)
     }
 }
 

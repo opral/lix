@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Rows};
 use tempfile::TempDir;
 
 #[derive(Debug)]
@@ -35,6 +35,18 @@ pub struct SqliteBackend {
 pub struct SqliteRead {
     conn: Option<Connection>,
     read_pool: Arc<Mutex<Vec<Connection>>>,
+}
+
+pub struct SqliteScanCursor<'stmt> {
+    rows: Rows<'stmt>,
+    projection: CoreProjection,
+    pending: Option<SqlitePendingRow>,
+    done: bool,
+}
+
+struct SqlitePendingRow {
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
 }
 
 pub struct SqliteWrite {
@@ -151,11 +163,6 @@ impl Backend for SqliteBackend {
 }
 
 impl BackendRead for SqliteRead {
-    type ScanCursor<'a>
-        = BufferedScanCursor
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -168,36 +175,123 @@ impl BackendRead for SqliteRead {
         visit_many(self.conn(), keys, opts, visitor)
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
-        if opts.limit_rows == 0 {
-            return Ok(BufferedScanCursor::default());
-        }
-
-        let mut rows = Vec::new();
-        visit_range(
-            self.conn(),
-            range,
-            ScanOptions {
-                limit_rows: usize::MAX,
-                ..opts
-            },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                rows.push(ReadEntry {
-                    key: key.to_owned_key(),
-                    value: value.to_owned(),
-                });
-                Ok(())
-            },
-        )?;
-        Ok(BufferedScanCursor::new(rows))
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
+        let (sql, values) = scan_sql(range, opts)?;
+        let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
+        let rows = stmt
+            .query(rusqlite::params_from_iter(values))
+            .map_err(sqlite_error)?;
+        let mut cursor = SqliteScanCursor {
+            rows,
+            projection: opts.projection,
+            pending: None,
+            done: opts.limit_rows == 0,
+        };
+        f(&mut cursor)
     }
 
     fn close(mut self) -> Result<(), BackendError> {
         self.finish()
+    }
+}
+
+impl BackendScanCursor for SqliteScanCursor<'_> {
+    fn visit_next(
+        &mut self,
+        limit_rows: usize,
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
+        if limit_rows == 0 || self.done {
+            return Ok(ScanResult {
+                emitted: 0,
+                has_more: !self.done,
+            });
+        }
+
+        let mut emitted = 0;
+        while emitted < limit_rows {
+            if let Some(pending) = self.pending.take() {
+                visit_sqlite_pending_row(pending, self.projection, visitor)?;
+                emitted += 1;
+                continue;
+            }
+
+            let Some(row) = self.rows.next().map_err(sqlite_error)? else {
+                self.done = true;
+                return Ok(ScanResult {
+                    emitted,
+                    has_more: false,
+                });
+            };
+            let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
+            match self.projection {
+                CoreProjection::KeyOnly => {
+                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?
+                }
+                CoreProjection::FullValue => {
+                    let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
+                    visitor.visit(KeyRef(key), ProjectedValueRef::FullValue(value))?;
+                }
+            }
+            emitted += 1;
+        }
+
+        let has_more = self.ensure_pending()?;
+        Ok(ScanResult { emitted, has_more })
+    }
+}
+
+impl SqliteScanCursor<'_> {
+    fn ensure_pending(&mut self) -> Result<bool, BackendError> {
+        if self.pending.is_some() {
+            return Ok(true);
+        }
+        let Some(row) = self.rows.next().map_err(sqlite_error)? else {
+            self.done = true;
+            return Ok(false);
+        };
+
+        let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?.to_vec();
+        let value = if matches!(self.projection, CoreProjection::FullValue) {
+            Some(blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?.to_vec())
+        } else {
+            None
+        };
+        self.pending = Some(SqlitePendingRow { key, value });
+        Ok(true)
+    }
+}
+
+fn visit_sqlite_pending_row<V>(
+    row: SqlitePendingRow,
+    projection: CoreProjection,
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
+    match projection {
+        CoreProjection::KeyOnly => {
+            visitor.visit(KeyRef(row.key.as_slice()), ProjectedValueRef::KeyOnly)
+        }
+        CoreProjection::FullValue => {
+            let value = row
+                .value
+                .as_deref()
+                .ok_or_else(|| BackendError::Io("sqlite pending row missing value".to_string()))?;
+            visitor.visit(
+                KeyRef(row.key.as_slice()),
+                ProjectedValueRef::FullValue(value),
+            )
+        }
     }
 }
 
@@ -388,20 +482,10 @@ where
     Ok(())
 }
 
-fn visit_range<V>(
-    conn: &Connection,
+fn scan_sql(
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    let limit = opts.limit_rows;
-    if limit == 0 {
-        return Ok(ScanResult::default());
-    }
-
+) -> Result<(String, Vec<SqlValue>), BackendError> {
     let mut sql = match opts.projection {
         CoreProjection::KeyOnly => String::from("SELECT key FROM entries WHERE 1 = 1"),
         CoreProjection::FullValue => String::from("SELECT key, value FROM entries WHERE 1 = 1"),
@@ -414,37 +498,8 @@ where
         sql.push_str(" AND key > ?");
         values.push(SqlValue::Blob(resume_after.0.to_vec()));
     }
-    sql.push_str(" ORDER BY key ASC LIMIT ?");
-    values.push(SqlValue::Integer((limit.saturating_add(1)) as i64));
-
-    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(values))
-        .map_err(sqlite_error)?;
-    let mut emitted = 0;
-
-    while let Some(row) = rows.next().map_err(sqlite_error)? {
-        if emitted == limit {
-            return Ok(ScanResult {
-                emitted,
-                has_more: true,
-            });
-        }
-        let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
-        match opts.projection {
-            CoreProjection::KeyOnly => visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?,
-            CoreProjection::FullValue => {
-                let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
-                visitor.visit(KeyRef(key), ProjectedValueRef::FullValue(value))?;
-            }
-        }
-        emitted += 1;
-    }
-
-    Ok(ScanResult {
-        emitted,
-        has_more: false,
-    })
+    sql.push_str(" ORDER BY key ASC");
+    Ok((sql, values))
 }
 
 fn append_bound_sql(

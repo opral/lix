@@ -38,7 +38,7 @@ Backend:
   ordered byte keys
   opaque byte values
 visit_many
-open_scan_cursor / cursor.visit_next
+with_scan_cursor / cursor.visit_next
 put_many / delete_many
 begin_read / begin_write
 capabilities
@@ -94,7 +94,7 @@ Every v0 backend must support:
 begin_read
 begin_write
 visit_many
-open_scan_cursor
+with_scan_cursor
 put_many
 delete_many
 delete_range
@@ -320,10 +320,6 @@ space.
 
 ```rust
 pub trait BackendRead {
-    type ScanCursor<'a>: BackendScanCursor + 'a
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -333,11 +329,14 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError>;
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -365,28 +364,24 @@ pub trait ScanVisitor {
 }
 
 pub trait BackendScanCursor {
-    fn visit_next<V>(
+    fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError>;
 }
 
-pub fn visit_range<R, V>(
+pub fn visit_range<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut V,
+    visitor: &mut dyn ScanVisitor,
 ) -> Result<ScanResult, BackendError>
 where
     R: BackendRead + ?Sized,
-    V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
-    let mut cursor = read.open_scan_cursor(range, opts)?;
-    cursor.visit_next(limit_rows, visitor)
+    read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 ```
 
@@ -499,14 +494,17 @@ pub struct ScanChunk {
 ```
 
 Cursorized scans are core because deep small-chunk drains should not be forced
-to re-open the same physical range once per chunk. `visit_range` is a
-storage/backend helper outside the backend trait: it opens a cursor and calls
+to re-open the same physical range once per chunk. Backend cursors are
+callback-scoped so statement-backed backends can keep native temporary iterators
+alive without self-referential structs. `visit_range` is a storage/backend helper
+outside the backend trait: it opens a callback-scoped cursor and calls
 `visit_next(opts.limit_rows, visitor)` for callers that want a one-shot scan.
 
 The unit of continuation is a scan chunk: `cursor.visit_next(limit_rows,
-visitor)` returns at most `limit_rows` rows from the same opened scan. A cursor
-is bound to its read view, range, projection, and initial resume point. It is
-not a public, long-lived storage cursor token.
+visitor)` returns at most `limit_rows` rows from the same opened scan. A backend
+cursor is bound to its read view, range, projection, and initial resume point,
+and it may only be used inside the `with_scan_cursor` callback. It is not a
+public, long-lived storage cursor token.
 
 ## Projection / Envelope Extensions
 
@@ -970,7 +968,7 @@ payload_ref = P
 ### Pushdown Support Result
 
 The support structures below belong to pushdown/envelope extension results.
-Core v0 `visit_many` and `open_scan_cursor` / `cursor.visit_next` do not return
+Core v0 `visit_many` and `with_scan_cursor` / `cursor.visit_next` do not return
 support metadata.
 
 ```rust
@@ -1215,7 +1213,7 @@ Make the core look like native backend calls:
 
 ```text
 visit_many
-open_scan_cursor / cursor.visit_next
+with_scan_cursor / cursor.visit_next
 put_many
 delete_many
 ```
@@ -1482,7 +1480,7 @@ higher engine layer, not in backend_v2.
 begin_read
 begin_write
 visit_many
-open_scan_cursor / cursor.visit_next
+with_scan_cursor / cursor.visit_next
 put_many
 delete_many
 commit
@@ -1708,10 +1706,6 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    type ScanCursor<'a>: BackendScanCursor + 'a
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -1721,36 +1715,35 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError>;
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>;
 }
 
 pub trait BackendScanCursor {
-    fn visit_next<V>(
+    fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError>;
 }
 
-pub fn visit_range<R, V>(
+pub fn visit_range<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut V,
+    visitor: &mut dyn ScanVisitor,
 ) -> Result<ScanResult, BackendError>
 where
     R: BackendRead + ?Sized,
-    V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
-    let mut cursor = read.open_scan_cursor(range, opts)?;
-    cursor.visit_next(limit_rows, visitor)
+    read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 
 pub trait BackendWrite {

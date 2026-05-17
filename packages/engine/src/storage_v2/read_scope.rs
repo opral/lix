@@ -1,6 +1,6 @@
 use crate::backend_v2::{BackendError, BackendRead, KeyRange, Prefix, ScanOptions};
 use crate::storage_v2::{
-    open_scan_prefix_cursor, open_scan_range_cursor, StorageScanCursor, StorageSpace,
+    with_scan_prefix_cursor, with_scan_range_cursor, StorageScanCursor, StorageSpace,
 };
 
 pub struct StorageReadScope<R> {
@@ -25,21 +25,29 @@ where
         self.read.close()
     }
 
-    pub fn open_scan_range_cursor(
+    pub fn with_scan_range_cursor<T, F>(
         &self,
         space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<StorageScanCursor<R::ScanCursor<'_>>, BackendError> {
-        open_scan_range_cursor(&self.read, space.id, range, opts)
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
+    {
+        with_scan_range_cursor(&self.read, space.id, range, opts, f)
     }
 
-    pub fn open_scan_prefix_cursor(
+    pub fn with_scan_prefix_cursor<T, F>(
         &self,
         space: StorageSpace,
         prefix: Prefix,
         opts: ScanOptions<'_>,
-    ) -> Result<StorageScanCursor<R::ScanCursor<'_>>, BackendError> {
-        open_scan_prefix_cursor(&self.read, space.id, prefix, opts)
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
+    {
+        with_scan_prefix_cursor(&self.read, space.id, prefix, opts, f)
     }
 }

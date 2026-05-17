@@ -42,25 +42,19 @@ pub struct BorrowedScanChunk<'a> {
     pub has_more: bool,
 }
 
-pub struct StorageScanCursor<C> {
-    inner: C,
+pub struct StorageScanCursor<'a> {
+    inner: &'a mut dyn BackendScanCursor,
     kind: ScanKind,
     projection: CoreProjection,
     chunks_seen: u64,
 }
 
-impl<C> StorageScanCursor<C>
-where
-    C: BackendScanCursor,
-{
-    pub fn visit_next<V>(
+impl StorageScanCursor<'_> {
+    pub fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         Ok(self.visit_next_with_stats(limit_rows, visitor)?.value)
     }
 
@@ -141,14 +135,16 @@ where
     Ok(scan_prefix_with_stats(read, space, prefix, opts)?.value)
 }
 
-pub(crate) fn open_scan_range_cursor<'a, R>(
-    read: &'a R,
+pub(crate) fn with_scan_range_cursor<R, T, F>(
+    read: &R,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<StorageScanCursor<R::ScanCursor<'a>>, BackendError>
+    f: F,
+) -> Result<T, BackendError>
 where
     R: BackendRead,
+    F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
 {
     let storage_space = StorageSpace::new(space, "storage_v2.scan");
     let resume_after = opts.resume_after;
@@ -157,26 +153,32 @@ where
         resume_after: None,
         ..opts
     };
-    Ok(StorageScanCursor {
-        inner: read.open_scan_cursor(physical_range, physical_opts)?,
-        kind: ScanKind::Range,
-        projection: opts.projection,
-        chunks_seen: 0,
+    read.with_scan_cursor(physical_range, physical_opts, |backend_cursor| {
+        let mut cursor = StorageScanCursor {
+            inner: backend_cursor,
+            kind: ScanKind::Range,
+            projection: opts.projection,
+            chunks_seen: 0,
+        };
+        f(&mut cursor)
     })
 }
 
-pub(crate) fn open_scan_prefix_cursor<'a, R>(
-    read: &'a R,
+pub(crate) fn with_scan_prefix_cursor<R, T, F>(
+    read: &R,
     space: SpaceId,
     prefix: Prefix,
     opts: ScanOptions<'_>,
-) -> Result<StorageScanCursor<R::ScanCursor<'a>>, BackendError>
+    f: F,
+) -> Result<T, BackendError>
 where
     R: BackendRead,
+    F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
 {
-    let mut cursor = open_scan_range_cursor(read, space, prefix.to_range()?, opts)?;
-    cursor.kind = ScanKind::Prefix;
-    Ok(cursor)
+    with_scan_range_cursor(read, space, prefix.to_range()?, opts, |cursor| {
+        cursor.kind = ScanKind::Prefix;
+        f(cursor)
+    })
 }
 
 pub(crate) fn scan_range<R>(
@@ -473,9 +475,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, BufferedScanCursor, ConformanceBackend, GetOptions, Key,
-        KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions, ScanOptions, ScanResult,
-        ScanVisitor, SpaceId, StoredValue, WriteOptions,
+        BackendError, BackendRead, BackendScanCursor, BufferedScanCursor, ConformanceBackend,
+        GetOptions, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
+        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{scan_prefix, StorageContext, StorageReader, StorageSpace};
 
@@ -613,11 +615,6 @@ mod tests {
     }
 
     impl BackendRead for CapturingRead {
-        type ScanCursor<'a>
-            = BufferedScanCursor
-        where
-            Self: 'a;
-
         fn visit_many<V>(
             &self,
             _keys: &[Key],
@@ -630,13 +627,18 @@ mod tests {
             unimplemented!("not used by prefix lowering tests")
         }
 
-        fn open_scan_cursor(
+        fn with_scan_cursor<T, F>(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<Self::ScanCursor<'_>, BackendError> {
+            f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        {
             self.range.replace(Some(range));
-            Ok(BufferedScanCursor::default())
+            let mut cursor = BufferedScanCursor::default();
+            f(&mut cursor)
         }
     }
 }

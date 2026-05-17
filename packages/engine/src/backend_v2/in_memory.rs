@@ -147,11 +147,6 @@ impl Backend for InMemoryBackend {
 }
 
 impl BackendRead for InMemoryRead {
-    type ScanCursor<'a>
-        = InMemoryScanCursor<'a>
-    where
-        Self: 'a;
-
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -182,26 +177,35 @@ impl BackendRead for InMemoryRead {
         Ok(())
     }
 
-    fn open_scan_cursor(
+    fn with_scan_cursor<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+    {
         if opts.limit_rows == 0 {
-            return Ok(InMemoryScanCursor::Buffered(BufferedScanCursor::default()));
+            let mut cursor = InMemoryScanCursor::Buffered(BufferedScanCursor::default());
+            return f(&mut cursor);
         }
 
         let lower = lower_bound(&range, opts.resume_after);
         let upper = upper_bound(&range);
         if bounds_are_empty(&lower, &upper) {
-            return Ok(InMemoryScanCursor::Buffered(BufferedScanCursor::default()));
+            let mut cursor = InMemoryScanCursor::Buffered(BufferedScanCursor::default());
+            return f(&mut cursor);
         }
 
         match self.entries.as_ref() {
-            EntriesState::Flat(entries) => Ok(InMemoryScanCursor::Flat {
-                iter: entries.range((lower, upper)).peekable(),
-                projection: opts.projection,
-            }),
+            EntriesState::Flat(entries) => {
+                let mut cursor = InMemoryScanCursor::Flat {
+                    iter: entries.range((lower, upper)).peekable(),
+                    projection: opts.projection,
+                };
+                f(&mut cursor)
+            }
             entries => {
                 let mut rows = Vec::new();
                 visit_range(
@@ -219,21 +223,19 @@ impl BackendRead for InMemoryRead {
                         Ok(())
                     },
                 )?;
-                Ok(InMemoryScanCursor::Buffered(BufferedScanCursor::new(rows)))
+                let mut cursor = InMemoryScanCursor::Buffered(BufferedScanCursor::new(rows));
+                f(&mut cursor)
             }
         }
     }
 }
 
 impl BackendScanCursor for InMemoryScanCursor<'_> {
-    fn visit_next<V>(
+    fn visit_next(
         &mut self,
         limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         match self {
             InMemoryScanCursor::Buffered(cursor) => cursor.visit_next(limit_rows, visitor),
             InMemoryScanCursor::Flat { iter, projection } => {

@@ -5660,3 +5660,54 @@ force unsafe self-referential statement/table cursors yet. If these backends nee
 native cursors later, use a backend-specific safe abstraction or an explicit
 unsafe wrapper with tests around drop order and snapshot lifetime.
 ```
+
+## 2026-05-17 - callback-scoped cursor hard cut
+
+Changed backend scan cursors from returned cursor objects to callback-scoped
+cursors:
+
+```text
+BackendRead::with_scan_cursor(range, opts, |cursor| { ... })
+BackendScanCursor::visit_next(limit_rows, &mut dyn ScanVisitor)
+```
+
+This lets SQLite keep a prepared statement + `Rows` cursor and redb keep a table
+range iterator inside the callback without self-referential structs or unsafe
+drop-order plumbing. Storage now exposes callback-scoped cursor helpers as well.
+
+Command before and after:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'scan_chunking/.*/cursor_visit/drain_range_q10000_chunk10'
+```
+
+Criterion mean estimates:
+
+| Backend      | Case     | Before returned cursor | After callback cursor | Delta |
+| ------------ | -------- | ---------------------: | --------------------: | ----: |
+| in_memory    | chunk10  |               21.93 us |              32.94 us | 1.5x slower |
+| in_memory    | chunk100 |               20.65 us |              28.81 us | 1.4x slower |
+| sqlite_temp  | chunk10  |              643.84 us |             344.86 us | 1.9x faster |
+| sqlite_temp  | chunk100 |              602.85 us |             321.16 us | 1.9x faster |
+| redb_temp    | chunk10  |              447.42 us |             413.05 us | ~neutral |
+| redb_temp    | chunk100 |              411.39 us |             424.51 us | ~neutral |
+| rocksdb_temp | chunk10  |              912.99 us |               1.00 ms | 1.1x slower |
+| rocksdb_temp | chunk100 |              904.24 us |               1.03 ms | 1.1x slower |
+
+Interpretation:
+
+```text
+The hard cut succeeds at the primary goal: SQLite now uses native statement rows
+and improves about 1.9x on cursor chunk drains. redb is roughly neutral after
+moving to a scoped native range iterator.
+
+The cost is visible on in_memory and RocksDB because the callback-scoped cursor
+uses a dyn BackendScanCursor / dyn ScanVisitor path. That adds dispatch overhead
+to backends whose native returned cursor already fit Rust lifetimes cleanly.
+
+The next decision is whether to recover the easy-backend fast path with a
+monomorphic helper while keeping callback-scoped semantics for SQLite/redb, or
+accept the small universal abstraction cost for a simpler backend API.
+```
