@@ -391,10 +391,10 @@ mod tests {
     use std::rc::Rc;
 
     use crate::backend_v2::{
-        Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-        ConformanceBackend, GetOptions, Key, KeyRange, PointVisitor, PutBatch, ReadOptions,
-        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
-        WriteStats,
+        Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+        CommitResult, ConformanceBackend, GetOptions, Key, KeyRange, PointVisitor, PutBatch,
+        ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+        WriteOptions, WriteStats,
     };
     use crate::storage_v2::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -841,6 +841,11 @@ mod tests {
     }
 
     impl BackendRead for CountingRead {
+        type ScanCursor<'a>
+            = BufferedScanCursor
+        where
+            Self: 'a;
+
         fn visit_many<V>(
             &self,
             _keys: &[Key],
@@ -853,15 +858,11 @@ mod tests {
             unimplemented!("not used by write-set tests")
         }
 
-        fn visit_range<V>(
+        fn open_scan_cursor(
             &self,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<ScanResult, BackendError>
-        where
-            V: ScanVisitor + ?Sized,
-        {
+        ) -> Result<Self::ScanCursor<'_>, BackendError> {
             unimplemented!("not used by write-set tests")
         }
     }

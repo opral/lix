@@ -60,6 +60,7 @@ mod tests {
                 "baseline::scan_range_honors_bound_variants",
                 "baseline::scan_range_orders_raw_byte_keys",
                 "baseline::scan_range_drains_multi_chunk_limits",
+                "baseline::scan_cursor_drains_multi_chunk_limits",
                 "baseline::scan_range_empty_range_returns_empty_chunk",
                 "baseline::commit_is_atomic",
                 "baseline::rollback_discards_staged_mutations",

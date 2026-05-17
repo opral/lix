@@ -7,9 +7,10 @@ backend. `storage_v2` exists so Lix domain stores can share transactions,
 write batching, spaces, prefix lowering, caller-order reconstruction, and other
 domain-neutral storage mechanics. It also exposes baseline read/write shape
 stats so later benchmarks and optimizations can prove the physical access shape.
-Cursor wrapping, capability-aware lowering, fallback accounting, residual
-filtering loops, projection fallback, and delete-range helpers are planned
-optimization-hardening work, not implemented baseline behavior yet.
+Cursor wrapping, scan trace stats, and delete-range helpers are implemented
+baseline behavior. Capability-aware lowering, fallback accounting, residual
+filtering loops, and projection fallback remain planned optimization-hardening
+work.
 
 ## Layering
 
@@ -36,11 +37,12 @@ Generic storage adapter: storage_v2
   batching helpers
   prefix-to-range lowering
   caller-order point reconstruction
+  backend scan cursor wrapping
   read-shape stats
   write-set stats
 
 Planned storage_v2 optimization extensions:
-  storage cursor tokens
+  public storage cursor tokens
   capability-aware lowering
   projection fallback
   residual filtering loops
@@ -51,7 +53,7 @@ Backend: backend_v2
   ordered byte keys
   opaque byte values
   visit_many
-  visit_range
+  open_scan_cursor / cursor.visit_next
   put_many / delete_many / delete_range
   begin_read / begin_write
   atomic durable commit
@@ -117,6 +119,7 @@ Planned storage_v2 optimization-hardening responsibilities:
 
 ```text
 storage cursor token construction and validation
+backend scan cursor wrapping
 fallback stats
 capability-aware lowering helpers
 limit-after-residual scan loops
@@ -530,7 +533,22 @@ empty prefix -> whole space
 Native prefix scan is a backend extension. Generic correctness comes from range
 lowering.
 
-Storage cursors:
+Backend scan cursors:
+
+```text
+implemented baseline behavior
+
+storage_v2 opens a backend scan cursor for chunked drains and repeatedly calls:
+
+cursor.visit_next(limit_rows, visitor)
+```
+
+The cursor is backend/read-scope local. It is not a public resume token, and it
+does not relax storage cursor validation rules. Storage still owns logical
+space decoding, prefix-to-range lowering, and scan trace stats around each
+emitted chunk.
+
+Public storage cursors:
 
 ```text
 planned, not implemented yet
@@ -553,13 +571,6 @@ cursor.
 If storage exposes an exact "no cursor means no more eligible rows" contract, it
 must perform lookahead or buffering after residual filtering. Otherwise the
 public contract must allow an extra empty-chunk read.
-
-Deep small-chunk drains may later use a backend cursor extension. In that mode,
-storage opens one backend scan cursor and repeatedly calls:
-
-```rust
-cursor.visit_next(limit_rows, visitor)
-```
 
 The public storage concept remains a scan chunk, not a UI page or physical
 database page. `ScanChunk` is the materialized form; visitor scans emit the same
@@ -822,7 +833,7 @@ answer whether real workloads are doing range or prefix scans, whether they use
 `KeyOnly` or `FullValue`, how many rows each scan chunk emits, how often
 `has_more` is returned, whether `resume_after` is used, and which `limit_rows`
 values are common. These counters are the evidence gate for adding a
-cursorized scan extension.
+native cursor implementation to a specific backend.
 
 Implemented write-set stats:
 

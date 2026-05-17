@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
-use rocksdb::Snapshot;
+use rocksdb::{DBIteratorWithThreadMode, Snapshot};
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
 
@@ -34,6 +34,14 @@ pub struct RocksDbBackend {
 
 pub struct RocksDbRead<'a> {
     snapshot: Snapshot<'a>,
+}
+
+pub struct RocksDbScanCursor<'a> {
+    iter: DBIteratorWithThreadMode<'a, DB>,
+    bounds: EncodedBounds,
+    projection: CoreProjection,
+    pending: Option<(Box<[u8]>, Box<[u8]>)>,
+    done: bool,
 }
 
 pub struct RocksDbWrite {
@@ -132,6 +140,11 @@ impl Backend for RocksDbBackend {
 }
 
 impl BackendRead for RocksDbRead<'_> {
+    type ScanCursor<'a>
+        = RocksDbScanCursor<'a>
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -162,58 +175,102 @@ impl BackendRead for RocksDbRead<'_> {
         Ok(())
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        let bounds = EncodedBounds::new(range, opts.resume_after);
+        Ok(RocksDbScanCursor {
+            iter: self
+                .snapshot
+                .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward)),
+            bounds,
+            projection: opts.projection,
+            pending: None,
+            done: opts.limit_rows == 0,
+        })
+    }
+}
+
+impl BackendScanCursor for RocksDbScanCursor<'_> {
+    fn visit_next<V>(
+        &mut self,
+        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized,
     {
-        if opts.limit_rows == 0 {
-            return Ok(ScanResult::default());
+        if limit_rows == 0 || self.done {
+            return Ok(ScanResult {
+                emitted: 0,
+                has_more: !self.done,
+            });
         }
 
-        let bounds = EncodedBounds::new(range, opts.resume_after);
         let mut emitted = 0;
-        for item in self
-            .snapshot
-            .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
-        {
-            let (encoded_key, value) = item.map_err(rocksdb_error)?;
-            let encoded_key = encoded_key.as_ref();
-            if !bounds.after_lower(encoded_key) {
-                continue;
-            }
-            if !bounds.before_upper(encoded_key) {
-                break;
-            }
-            if emitted == opts.limit_rows {
+        while emitted < limit_rows {
+            let Some((encoded_key, value)) = self.next_row()? else {
                 return Ok(ScanResult {
                     emitted,
-                    has_more: true,
+                    has_more: false,
                 });
-            }
+            };
 
-            match opts.projection {
+            match self.projection {
                 CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(encoded_key), ProjectedValueRef::KeyOnly)?
+                    visitor.visit(KeyRef(encoded_key.as_ref()), ProjectedValueRef::KeyOnly)?
                 }
-                CoreProjection::FullValue => {
-                    visitor.visit(
-                        KeyRef(encoded_key),
-                        ProjectedValueRef::FullValue(value.as_ref()),
-                    )?;
-                }
+                CoreProjection::FullValue => visitor.visit(
+                    KeyRef(encoded_key.as_ref()),
+                    ProjectedValueRef::FullValue(value.as_ref()),
+                )?,
             }
             emitted += 1;
         }
 
-        Ok(ScanResult {
-            emitted,
-            has_more: false,
-        })
+        let has_more = self.ensure_pending()?;
+        Ok(ScanResult { emitted, has_more })
+    }
+}
+
+impl RocksDbScanCursor<'_> {
+    fn next_row(&mut self) -> Result<Option<(Box<[u8]>, Box<[u8]>)>, BackendError> {
+        if let Some(pending) = self.pending.take() {
+            return Ok(Some(pending));
+        }
+        self.read_next_row()
+    }
+
+    fn ensure_pending(&mut self) -> Result<bool, BackendError> {
+        if self.pending.is_some() {
+            return Ok(true);
+        }
+        self.pending = self.read_next_row()?;
+        Ok(self.pending.is_some())
+    }
+
+    fn read_next_row(&mut self) -> Result<Option<(Box<[u8]>, Box<[u8]>)>, BackendError> {
+        if self.done {
+            return Ok(None);
+        }
+
+        for item in self.iter.by_ref() {
+            let (encoded_key, value) = item.map_err(rocksdb_error)?;
+            let key = encoded_key.as_ref();
+            if !self.bounds.after_lower(key) {
+                continue;
+            }
+            if !self.bounds.before_upper(key) {
+                self.done = true;
+                return Ok(None);
+            }
+            return Ok(Some((encoded_key, value)));
+        }
+
+        self.done = true;
+        Ok(None)
     }
 }
 

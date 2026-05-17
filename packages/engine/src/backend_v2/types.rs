@@ -116,6 +116,15 @@ impl ProjectedValueRef<'_> {
     }
 }
 
+impl ProjectedValue {
+    pub fn as_ref(&self) -> ProjectedValueRef<'_> {
+        match self {
+            ProjectedValue::KeyOnly => ProjectedValueRef::KeyOnly,
+            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
+        }
+    }
+}
+
 impl<'a> KeyRef<'a> {
     pub fn as_bytes(self) -> &'a [u8] {
         self.0
@@ -129,15 +138,6 @@ impl<'a> KeyRef<'a> {
 impl Key {
     pub fn as_ref(&self) -> KeyRef<'_> {
         KeyRef(self.0.as_ref())
-    }
-}
-
-impl ProjectedValue {
-    pub fn as_ref(&self) -> ProjectedValueRef<'_> {
-        match self {
-            ProjectedValue::KeyOnly => ProjectedValueRef::KeyOnly,
-            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
-        }
     }
 }
 

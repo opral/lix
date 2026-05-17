@@ -31,7 +31,10 @@ pub use predicate::{
     BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
 };
-pub use traits::{get_many, Backend, BackendRead, BackendWrite, PointVisitor, ScanVisitor};
+pub use traits::{
+    get_many, visit_range, Backend, BackendRead, BackendScanCursor, BackendWrite,
+    BufferedScanCursor, PointVisitor, ScanVisitor,
+};
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,
     Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadConsistency,

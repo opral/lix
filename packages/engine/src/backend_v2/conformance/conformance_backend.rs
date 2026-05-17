@@ -5,9 +5,9 @@ use bytes::Bytes;
 
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef,
+    PutBatch, ReadEntry, ReadOptions, ScanOptions, StoredValue, WriteConcurrency, WriteOptions,
     WriteStats,
 };
 
@@ -98,6 +98,11 @@ impl Backend for ConformanceBackend {
 }
 
 impl BackendRead for ConformanceRead {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -110,16 +115,16 @@ impl BackendRead for ConformanceRead {
         visit_many_from_map(&self.entries, keys, opts, visitor)
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        visit_range_from_map(&self.entries, range, opts, visitor)
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        Ok(BufferedScanCursor::new(scan_rows_from_map(
+            &self.entries,
+            range,
+            opts,
+        )))
     }
 }
 
@@ -189,22 +194,16 @@ where
     Ok(())
 }
 
-fn visit_range_from_map<V>(
+fn scan_rows_from_map(
     entries: &ConformanceMap,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    let mut emitted = 0;
-    let mut has_more = false;
-
+) -> Vec<ReadEntry> {
     if opts.limit_rows == 0 {
-        return Ok(ScanResult::default());
+        return Vec::new();
     }
 
+    let mut rows = Vec::new();
     for (key, value) in entries {
         if !range_contains(&range, key) {
             continue;
@@ -215,15 +214,12 @@ where
         {
             continue;
         }
-        if emitted == opts.limit_rows {
-            has_more = true;
-            break;
-        }
-        visitor.visit(key.as_ref(), project_value_ref(value, opts.projection))?;
-        emitted += 1;
+        rows.push(ReadEntry {
+            key: key.clone(),
+            value: project_value_ref(value, opts.projection).to_owned(),
+        });
     }
-
-    Ok(ScanResult { emitted, has_more })
+    rows
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {

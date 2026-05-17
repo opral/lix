@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use redb::{
@@ -128,6 +128,11 @@ impl Backend for RedbBackend {
 }
 
 impl BackendRead for RedbRead {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -151,46 +156,32 @@ impl BackendRead for RedbRead {
         Ok(())
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
         if opts.limit_rows == 0 {
-            return Ok(ScanResult::default());
+            return Ok(BufferedScanCursor::default());
         }
 
-        let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
-        let (lower, upper) = encoded_bounds(range, opts.resume_after);
-        let lower = bound_as_slice(&lower);
-        let upper = bound_as_slice(&upper);
-        let mut emitted = 0;
-        let mut rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
-
-        while let Some(row) = rows.next() {
-            let (key, value) = row.map_err(redb_error)?;
-            if emitted == opts.limit_rows {
-                return Ok(ScanResult {
-                    emitted,
-                    has_more: true,
+        let mut rows = Vec::new();
+        visit_range(
+            &self.read,
+            range,
+            ScanOptions {
+                limit_rows: usize::MAX,
+                ..opts
+            },
+            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                rows.push(ReadEntry {
+                    key: key.to_owned_key(),
+                    value: value.to_owned(),
                 });
-            }
-
-            visitor.visit(
-                KeyRef(key.value()),
-                project_value_ref(value.value(), opts.projection),
-            )?;
-            emitted += 1;
-        }
-
-        Ok(ScanResult {
-            emitted,
-            has_more: false,
-        })
+                Ok(())
+            },
+        )?;
+        Ok(BufferedScanCursor::new(rows))
     }
 }
 
@@ -252,6 +243,48 @@ impl BackendWrite for RedbWrite {
     fn rollback(self) -> Result<(), BackendError> {
         self.write.abort().map_err(redb_error)
     }
+}
+
+fn visit_range<V>(
+    read: &ReadTransaction,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
+    if opts.limit_rows == 0 {
+        return Ok(ScanResult::default());
+    }
+
+    let table = read.open_table(ENTRIES).map_err(redb_error)?;
+    let (lower, upper) = encoded_bounds(range, opts.resume_after);
+    let lower = bound_as_slice(&lower);
+    let upper = bound_as_slice(&upper);
+    let mut emitted = 0;
+    let mut rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
+
+    while let Some(row) = rows.next() {
+        let (key, value) = row.map_err(redb_error)?;
+        if emitted == opts.limit_rows {
+            return Ok(ScanResult {
+                emitted,
+                has_more: true,
+            });
+        }
+
+        visitor.visit(
+            KeyRef(key.value()),
+            project_value_ref(value.value(), opts.projection),
+        )?;
+        emitted += 1;
+    }
+
+    Ok(ScanResult {
+        emitted,
+        has_more: false,
+    })
 }
 
 fn initialize_database(db: &Database) -> Result<(), BackendError> {
