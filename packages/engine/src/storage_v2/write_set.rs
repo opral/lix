@@ -841,6 +841,8 @@ mod tests {
     }
 
     impl BackendRead for CountingRead {
+        type ScanCursor<'a> = BufferedScanCursor;
+
         fn visit_many<V>(
             &self,
             _keys: &[Key],
@@ -860,7 +862,7 @@ mod tests {
             _f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
         {
             unimplemented!("not used by write-set tests")
         }

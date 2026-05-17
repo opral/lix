@@ -550,6 +550,12 @@ relax storage cursor validation rules. Storage still owns logical space
 decoding, prefix-to-range lowering, and scan trace stats around each emitted
 chunk.
 
+The backend cursor uses one callback-scoped API with an associated cursor type.
+There is no separate fast cursor. The cursor can borrow local statement or
+transaction state inside the callback, and `visit_next` remains generic over
+the scan visitor so the emitted-row loop can monomorphize for cheap iterator
+backends.
+
 Public storage cursors:
 
 ```text

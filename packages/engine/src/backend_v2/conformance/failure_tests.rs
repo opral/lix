@@ -8,10 +8,10 @@ use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
-    BufferedScanCursor, CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -301,6 +301,8 @@ impl Backend for BrokenBackend {
 }
 
 impl BackendRead for BrokenRead {
+    type ScanCursor<'a> = BufferedScanCursor;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -338,7 +340,7 @@ impl BackendRead for BrokenRead {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         let live_entries;
         let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {

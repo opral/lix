@@ -140,6 +140,8 @@ impl Backend for RedbBackend {
 }
 
 impl BackendRead for RedbRead {
+    type ScanCursor<'a> = RedbScanCursor<'a>;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -170,7 +172,7 @@ impl BackendRead for RedbRead {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
         let (lower, upper) = encoded_bounds(range, opts.resume_after);
@@ -188,11 +190,14 @@ impl BackendRead for RedbRead {
 }
 
 impl BackendScanCursor for RedbScanCursor<'_> {
-    fn visit_next(
+    fn visit_next<V>(
         &mut self,
         limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         if limit_rows == 0 || self.done {
             return Ok(ScanResult {
                 emitted: 0,

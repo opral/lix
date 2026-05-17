@@ -163,6 +163,8 @@ impl Backend for SqliteBackend {
 }
 
 impl BackendRead for SqliteRead {
+    type ScanCursor<'a> = SqliteScanCursor<'a>;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -182,7 +184,7 @@ impl BackendRead for SqliteRead {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         let (sql, values) = scan_sql(range, opts)?;
         let mut stmt = self.conn().prepare_cached(&sql).map_err(sqlite_error)?;
@@ -204,11 +206,14 @@ impl BackendRead for SqliteRead {
 }
 
 impl BackendScanCursor for SqliteScanCursor<'_> {
-    fn visit_next(
+    fn visit_next<V>(
         &mut self,
         limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         if limit_rows == 0 || self.done {
             return Ok(ScanResult {
                 emitted: 0,

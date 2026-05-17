@@ -617,6 +617,8 @@ mod tests {
     }
 
     impl BackendRead for SpyRead {
+        type ScanCursor<'a> = BufferedScanCursor;
+
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -644,7 +646,7 @@ mod tests {
             f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
         {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
@@ -659,6 +661,8 @@ mod tests {
     }
 
     impl BackendRead for RequestedOrderRead {
+        type ScanCursor<'a> = BufferedScanCursor;
+
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -684,7 +688,7 @@ mod tests {
             _f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
         {
             unreachable!("requested-order point-read test does not scan")
         }

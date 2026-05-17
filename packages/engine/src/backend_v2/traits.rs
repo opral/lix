@@ -21,6 +21,8 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
+    type ScanCursor<'cursor>: BackendScanCursor;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -37,7 +39,7 @@ pub trait BackendRead {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>;
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -52,11 +54,13 @@ pub trait ScanVisitor {
 }
 
 pub trait BackendScanCursor {
-    fn visit_next(
+    fn visit_next<V>(
         &mut self,
         limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,11 +76,14 @@ impl BufferedScanCursor {
 }
 
 impl BackendScanCursor for BufferedScanCursor {
-    fn visit_next(
+    fn visit_next<V>(
         &mut self,
         limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         if limit_rows == 0 {
             return Ok(ScanResult::default());
         }
@@ -151,7 +158,7 @@ pub fn visit_range<R>(
     visitor: &mut dyn ScanVisitor,
 ) -> Result<ScanResult, BackendError>
 where
-    R: BackendRead + ?Sized,
+    R: BackendRead,
 {
     let limit_rows = opts.limit_rows;
     read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))

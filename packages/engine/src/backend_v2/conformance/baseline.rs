@@ -9,9 +9,9 @@ use crate::backend_v2::conformance::{
 };
 use crate::backend_v2::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
-    BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    WriteOptions,
+    BackendRead, BackendScanCursor, BackendWrite, CoreProjection, GetOptions, Key, KeyRange,
+    KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)

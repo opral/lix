@@ -320,6 +320,8 @@ space.
 
 ```rust
 pub trait BackendRead {
+    type ScanCursor<'cursor>: BackendScanCursor;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -336,7 +338,7 @@ pub trait BackendRead {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>;
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -364,26 +366,35 @@ pub trait ScanVisitor {
 }
 
 pub trait BackendScanCursor {
-    fn visit_next(
+    fn visit_next<V>(
         &mut self,
         limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
 }
 
 pub fn visit_range<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut dyn ScanVisitor,
+    visitor: &mut V,
 ) -> Result<ScanResult, BackendError>
 where
-    R: BackendRead + ?Sized,
+    R: BackendRead,
+    V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
     read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 ```
+
+The scan cursor API is callback-scoped, but it is still monomorphic in the
+emitted-row loop. This keeps statement-backed engines such as SQLite and
+transaction-backed engines such as redb safe without self-referential cursor
+objects, while still letting in-memory and RocksDB keep a native iterator and a
+generic scan visitor. There is no separate "fast cursor" API.
 
 ### Get Options
 
@@ -1706,6 +1717,8 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
+    type ScanCursor<'cursor>: BackendScanCursor;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -1722,25 +1735,28 @@ pub trait BackendRead {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>;
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>;
 }
 
 pub trait BackendScanCursor {
-    fn visit_next(
+    fn visit_next<V>(
         &mut self,
         limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
 }
 
-pub fn visit_range<R>(
+pub fn visit_range<R, V>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut dyn ScanVisitor,
+    visitor: &mut V,
 ) -> Result<ScanResult, BackendError>
 where
-    R: BackendRead + ?Sized,
+    R: BackendRead,
+    V: ScanVisitor + ?Sized,
 {
     let limit_rows = opts.limit_rows;
     read.with_scan_cursor(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))

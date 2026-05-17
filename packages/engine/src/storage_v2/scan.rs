@@ -1,7 +1,7 @@
 use crate::backend_v2::{
-    visit_range as backend_visit_range, BackendError, BackendRead, BackendScanCursor,
-    CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef, ReadBatch, ReadEntry,
-    ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    visit_range as backend_visit_range, BackendError, BackendRead, CoreProjection, Key, KeyRange,
+    KeyRef, Prefix, ProjectedValueRef, ReadBatch, ReadEntry, ScanChunk, ScanOptions, ScanResult,
+    ScanVisitor, SpaceId,
 };
 use crate::storage_v2::{
     decode_logical_key_ref, StorageReadResult, StorageReadStats, StorageSpace,
@@ -42,14 +42,17 @@ pub struct BorrowedScanChunk<'a> {
     pub has_more: bool,
 }
 
-pub struct StorageScanCursor<'a> {
-    inner: &'a mut dyn BackendScanCursor,
+pub struct StorageScanCursor<'a, C> {
+    inner: &'a mut C,
     kind: ScanKind,
     projection: CoreProjection,
     chunks_seen: u64,
 }
 
-impl StorageScanCursor<'_> {
+impl<C> StorageScanCursor<'_, C>
+where
+    C: crate::backend_v2::BackendScanCursor,
+{
     pub fn visit_next(
         &mut self,
         limit_rows: usize,
@@ -144,7 +147,7 @@ pub(crate) fn with_scan_range_cursor<R, T, F>(
 ) -> Result<T, BackendError>
 where
     R: BackendRead,
-    F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
+    F: FnOnce(&mut StorageScanCursor<'_, R::ScanCursor<'_>>) -> Result<T, BackendError>,
 {
     let storage_space = StorageSpace::new(space, "storage_v2.scan");
     let resume_after = opts.resume_after;
@@ -173,7 +176,7 @@ pub(crate) fn with_scan_prefix_cursor<R, T, F>(
 ) -> Result<T, BackendError>
 where
     R: BackendRead,
-    F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
+    F: FnOnce(&mut StorageScanCursor<'_, R::ScanCursor<'_>>) -> Result<T, BackendError>,
 {
     with_scan_range_cursor(read, space, prefix.to_range()?, opts, |cursor| {
         cursor.kind = ScanKind::Prefix;
@@ -615,6 +618,8 @@ mod tests {
     }
 
     impl BackendRead for CapturingRead {
+        type ScanCursor<'a> = BufferedScanCursor;
+
         fn visit_many<V>(
             &self,
             _keys: &[Key],
@@ -634,7 +639,7 @@ mod tests {
             f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
         {
             self.range.replace(Some(range));
             let mut cursor = BufferedScanCursor::default();
