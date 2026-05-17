@@ -484,6 +484,7 @@ where
             unique_backend_keys: plan.unique_keys.len() as u64,
             backend_calls: 1,
             prefix_lowered: 0,
+            ..StorageReadStats::default()
         },
     ))
 }
@@ -567,6 +568,7 @@ where
             unique_backend_keys: plan.unique_keys.len() as u64,
             backend_calls: 1,
             prefix_lowered: 0,
+            ..StorageReadStats::default()
         },
     ))
 }
@@ -602,6 +604,7 @@ where
             unique_backend_keys: plan.logical_unique_keys.len() as u64,
             backend_calls: 1,
             prefix_lowered: 0,
+            ..StorageReadStats::default()
         },
     ))
 }
@@ -641,6 +644,7 @@ where
             unique_backend_keys: plan.unique_keys.len() as u64,
             backend_calls: 1,
             prefix_lowered: 0,
+            ..StorageReadStats::default()
         },
     ))
 }
@@ -678,6 +682,7 @@ where
             unique_backend_keys: plan.logical_unique_keys.len() as u64,
             backend_calls: 1,
             prefix_lowered: 0,
+            ..StorageReadStats::default()
         },
     ))
 }
@@ -836,6 +841,7 @@ where
         unique_backend_keys: plan.unique_keys.len() as u64,
         backend_calls: 1,
         prefix_lowered: 0,
+        ..StorageReadStats::default()
     })
 }
 
@@ -884,5 +890,6 @@ where
         unique_backend_keys: plan.logical_unique_keys.len() as u64,
         backend_calls: 1,
         prefix_lowered: 0,
+        ..StorageReadStats::default()
     })
 }

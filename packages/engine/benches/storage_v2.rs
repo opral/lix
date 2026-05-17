@@ -22,7 +22,8 @@ use lix_engine::backend_v2::{
 };
 use lix_engine::storage_v2::{
     PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
-    StorageReader, StorageScanBuffer, StorageSpace, StorageWriteSet, StorageWriteSetStats,
+    StorageReadStats, StorageReader, StorageScanBuffer, StorageSpace, StorageWriteSet,
+    StorageWriteSetStats,
 };
 use redb_backend_v2::RedbBackend;
 use rocksdb_backend_v2::RocksDbBackend;
@@ -145,11 +146,12 @@ struct DeleteRangeFallbackStats {
     write_stats: StorageWriteSetStats,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ScanDrainStats {
     scanned: usize,
     chunks: usize,
     backend_calls: u64,
+    read_stats: StorageReadStats,
 }
 
 trait StorageBenchBackend {
@@ -1180,6 +1182,7 @@ where
                     .expect("drain chunked materialized scan");
                     assert_eq!(stats.scanned, case.rows);
                     assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
+                    assert_scan_drain_stats(&stats, case);
                     black_box(stats);
                 });
             },
@@ -1192,6 +1195,7 @@ where
                         .expect("drain chunked visitor scan");
                 assert_eq!(stats.scanned, case.rows);
                 assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
+                assert_scan_drain_stats(&stats, case);
                 black_box(stats);
             });
         });
@@ -3536,6 +3540,7 @@ where
         stats.scanned += entries.len();
         stats.backend_calls += chunk.stats.backend_calls;
         stats.chunks += usize::from(!entries.is_empty() || chunk.value.has_more);
+        stats.read_stats.add(chunk.stats);
         resume_after = entries.last().map(|entry| entry.key.clone());
 
         if !chunk.value.has_more {
@@ -3576,10 +3581,13 @@ where
             Ok(())
         };
         let result = match scan {
-            ScanChunkingMode::Range => {
-                read.visit_scan_range(storage_space, point_scan_range(), opts, &mut visitor)?
-            }
-            ScanChunkingMode::Prefix => read.visit_scan_prefix(
+            ScanChunkingMode::Range => read.visit_scan_range_with_stats(
+                storage_space,
+                point_scan_range(),
+                opts,
+                &mut visitor,
+            )?,
+            ScanChunkingMode::Prefix => read.visit_scan_prefix_with_stats(
                 storage_space,
                 Prefix {
                     bytes: Bytes::from_static(b"point-"),
@@ -3589,12 +3597,13 @@ where
             )?,
         };
 
-        stats.scanned += result.emitted;
-        stats.backend_calls += 1;
-        stats.chunks += usize::from(result.emitted > 0 || result.has_more);
+        stats.scanned += result.value.emitted;
+        stats.backend_calls += result.stats.backend_calls;
+        stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
+        stats.read_stats.add(result.stats);
         resume_after = chunk_last_key;
 
-        if !result.has_more {
+        if !result.value.has_more {
             break;
         }
     }
@@ -3604,6 +3613,40 @@ where
         expected_rows.div_ceil(chunk_size) as u64
     );
     Ok(stats)
+}
+
+fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
+    let expected_chunks = case.rows.div_ceil(case.chunk_size);
+    let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
+    let expected_has_more = expected_chunks.saturating_sub(1) as u64;
+
+    assert_eq!(stats.read_stats.backend_calls, expected_chunks as u64);
+    assert_eq!(stats.read_stats.scan_rows, case.rows as u64);
+    assert_eq!(stats.read_stats.scan_resume_after, expected_resume_after);
+    assert_eq!(stats.read_stats.scan_has_more, expected_has_more);
+    assert_eq!(
+        stats.read_stats.scan_limit_rows_total,
+        (expected_chunks * case.chunk_size) as u64
+    );
+    assert_eq!(stats.read_stats.scan_limit_rows_max, case.chunk_size as u64);
+    assert_eq!(
+        stats.read_stats.scan_key_only_chunks,
+        expected_chunks as u64
+    );
+    assert_eq!(stats.read_stats.scan_full_value_chunks, 0);
+
+    match case.scan {
+        ScanChunkingMode::Range => {
+            assert_eq!(stats.read_stats.range_scan_chunks, expected_chunks as u64);
+            assert_eq!(stats.read_stats.prefix_scan_chunks, 0);
+            assert_eq!(stats.read_stats.prefix_lowered, 0);
+        }
+        ScanChunkingMode::Prefix => {
+            assert_eq!(stats.read_stats.range_scan_chunks, 0);
+            assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
+            assert_eq!(stats.read_stats.prefix_lowered, expected_chunks as u64);
+        }
+    }
 }
 
 fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {

@@ -1,6 +1,6 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef, ReadBatch,
-    ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    BackendError, BackendRead, CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef,
+    ReadBatch, ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
 };
 use crate::storage_v2::{
     decode_logical_key_ref, StorageReadResult, StorageReadStats, StorageSpace,
@@ -156,8 +156,25 @@ where
     R: BackendRead,
     V: ScanVisitor + ?Sized,
 {
+    Ok(visit_scan_range_with_stats(read, space, range, opts, visitor)?.value)
+}
+
+pub(crate) fn visit_scan_range_with_stats<R, V>(
+    read: &R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<StorageReadResult<ScanResult>, BackendError>
+where
+    R: BackendRead,
+    V: ScanVisitor + ?Sized,
+{
     if opts.limit_rows == 0 {
-        return Ok(ScanResult::default());
+        return Ok(StorageReadResult::new(
+            ScanResult::default(),
+            scan_trace_stats(ScanKind::Range, opts, 0, false, 0),
+        ));
     }
 
     let storage_space = StorageSpace::new(space, "storage_v2.scan");
@@ -185,11 +202,19 @@ where
         }
     }
 
-    read.visit_range(
+    let result = read.visit_range(
         physical_range,
         physical_opts,
         &mut LogicalScanVisitor { inner: visitor },
-    )
+    )?;
+    let stats = scan_trace_stats(
+        ScanKind::Range,
+        opts,
+        result.emitted as u64,
+        result.has_more,
+        1,
+    );
+    Ok(StorageReadResult::new(result, stats))
 }
 
 pub(crate) fn scan_range_with_stats<R>(
@@ -203,15 +228,15 @@ where
 {
     let backend_calls = u64::from(opts.limit_rows != 0);
     let chunk = scan_range(read, space, range, opts)?;
-    Ok(StorageReadResult::new(
-        chunk,
-        StorageReadStats {
-            requested_keys: 0,
-            unique_backend_keys: 0,
-            backend_calls,
-            prefix_lowered: 0,
-        },
-    ))
+    let mut stats = scan_trace_stats(
+        ScanKind::Range,
+        opts,
+        chunk.entries.entries.len() as u64,
+        chunk.has_more,
+        backend_calls,
+    );
+    stats.prefix_lowered = 0;
+    Ok(StorageReadResult::new(chunk, stats))
 }
 
 pub(crate) fn scan_prefix_into<'a, R>(
@@ -238,7 +263,25 @@ where
     R: BackendRead,
     V: ScanVisitor + ?Sized,
 {
-    visit_scan_range(read, space, prefix.to_range()?, opts, visitor)
+    Ok(visit_scan_prefix_with_stats(read, space, prefix, opts, visitor)?.value)
+}
+
+pub(crate) fn visit_scan_prefix_with_stats<R, V>(
+    read: &R,
+    space: SpaceId,
+    prefix: Prefix,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<StorageReadResult<ScanResult>, BackendError>
+where
+    R: BackendRead,
+    V: ScanVisitor + ?Sized,
+{
+    let mut result = visit_scan_range_with_stats(read, space, prefix.to_range()?, opts, visitor)?;
+    result.stats.range_scan_chunks = 0;
+    result.stats.prefix_scan_chunks = 1;
+    result.stats.prefix_lowered = 1;
+    Ok(result)
 }
 
 pub(crate) fn scan_prefix_with_stats<R>(
@@ -251,29 +294,64 @@ where
     R: BackendRead,
 {
     if opts.limit_rows == 0 {
+        let mut stats = scan_trace_stats(ScanKind::Prefix, opts, 0, false, 0);
+        stats.prefix_lowered = 1;
         return Ok(StorageReadResult::new(
             ScanChunk {
                 entries: ReadBatch::default(),
                 has_more: false,
             },
-            StorageReadStats {
-                requested_keys: 0,
-                unique_backend_keys: 0,
-                backend_calls: 0,
-                prefix_lowered: 1,
-            },
+            stats,
         ));
     }
     let chunk = scan_range(read, space, prefix.to_range()?, opts)?;
-    Ok(StorageReadResult::new(
-        chunk,
-        StorageReadStats {
-            requested_keys: 0,
-            unique_backend_keys: 0,
-            backend_calls: 1,
-            prefix_lowered: 1,
-        },
-    ))
+    let mut stats = scan_trace_stats(
+        ScanKind::Prefix,
+        opts,
+        chunk.entries.entries.len() as u64,
+        chunk.has_more,
+        1,
+    );
+    stats.prefix_lowered = 1;
+    Ok(StorageReadResult::new(chunk, stats))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanKind {
+    Range,
+    Prefix,
+}
+
+fn scan_trace_stats(
+    kind: ScanKind,
+    opts: ScanOptions<'_>,
+    emitted_rows: u64,
+    has_more: bool,
+    backend_calls: u64,
+) -> StorageReadStats {
+    let (range_scan_chunks, prefix_scan_chunks) = match kind {
+        ScanKind::Range => (1, 0),
+        ScanKind::Prefix => (0, 1),
+    };
+    let (scan_key_only_chunks, scan_full_value_chunks) = match opts.projection {
+        CoreProjection::KeyOnly => (1, 0),
+        CoreProjection::FullValue => (0, 1),
+    };
+    StorageReadStats {
+        requested_keys: 0,
+        unique_backend_keys: 0,
+        backend_calls,
+        prefix_lowered: 0,
+        range_scan_chunks,
+        prefix_scan_chunks,
+        scan_key_only_chunks,
+        scan_full_value_chunks,
+        scan_rows: emitted_rows,
+        scan_has_more: u64::from(has_more),
+        scan_resume_after: u64::from(opts.resume_after.is_some()),
+        scan_limit_rows_total: opts.limit_rows as u64,
+        scan_limit_rows_max: opts.limit_rows as u64,
+    }
 }
 
 #[cfg(test)]
