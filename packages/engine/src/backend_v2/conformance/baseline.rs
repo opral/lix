@@ -8,9 +8,10 @@ use crate::backend_v2::conformance::{
     open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    get_many as backend_get_many, Backend, BackendRead, BackendWrite, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, WriteOptions,
+    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendRead,
+    BackendScanCursor, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
+    ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -53,6 +54,9 @@ where
     });
     report.run("baseline::scan_range_drains_multi_chunk_limits", || {
         scan_range_drains_multi_chunk_limits(factory)
+    });
+    report.run("baseline::scan_cursor_drains_multi_chunk_limits", || {
+        scan_cursor_drains_multi_chunk_limits(factory)
     });
     report.run(
         "baseline::scan_range_empty_range_returns_empty_chunk",
@@ -543,6 +547,86 @@ where
     Ok(())
 }
 
+fn scan_cursor_drains_multi_chunk_limits<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let test_space = space(1);
+    seed_full_values(
+        &backend,
+        test_space,
+        [
+            ("a", "A"),
+            ("b", "B"),
+            ("c", "C"),
+            ("d", "D"),
+            ("e", "E"),
+            ("f", "F"),
+            ("g", "G"),
+            ("h", "H"),
+        ],
+    )?;
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let range = KeyRange {
+        lower: Bound::Included(key("b")),
+        upper: Bound::Excluded(key("h")),
+    };
+    let expected = vec![
+        (key("b"), Bytes::from_static(b"B")),
+        (key("c"), Bytes::from_static(b"C")),
+        (key("d"), Bytes::from_static(b"D")),
+        (key("e"), Bytes::from_static(b"E")),
+        (key("f"), Bytes::from_static(b"F")),
+        (key("g"), Bytes::from_static(b"G")),
+    ];
+
+    for limit in [1usize, 2, 3] {
+        let mut cursor = read
+            .open_scan_cursor(
+                range.clone(),
+                ScanOptions {
+                    limit_rows: limit,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| format!("open_scan_cursor limit {limit} failed: {error}"))?;
+        let mut actual = Vec::new();
+        loop {
+            let mut entries = Vec::new();
+            let result = cursor
+                .visit_next(
+                    limit,
+                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                        entries.push(ReadEntry {
+                            key: key.to_owned_key(),
+                            value: value.to_owned(),
+                        });
+                        Ok(())
+                    },
+                )
+                .map_err(|error| format!("cursor visit_next limit {limit} failed: {error}"))?;
+            actual.extend(entries_to_key_values(&entries));
+            if !result.has_more {
+                break;
+            }
+            if actual.len() > expected.len() {
+                return Err(format!(
+                    "cursor limit {limit} emitted too many rows: {actual:?}"
+                ));
+            }
+        }
+        if actual != expected {
+            return Err(format!(
+                "cursor drain mismatch for limit {limit}: expected {expected:?}, got {actual:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn scan_range_empty_range_returns_empty_chunk<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
@@ -842,7 +926,8 @@ where
     R: BackendRead,
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = read.visit_range(
+    let result = backend_visit_range(
+        read,
         range,
         opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {

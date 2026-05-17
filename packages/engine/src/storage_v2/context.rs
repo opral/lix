@@ -181,10 +181,10 @@ mod shape_tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-        GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
-        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
-        WriteStats,
+        Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+        CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch,
+        ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+        WriteOptions, WriteStats,
     };
     use crate::storage_v2::{StorageContext, StorageReadScope, StorageReader, StorageSpace};
 
@@ -459,6 +459,11 @@ mod shape_tests {
     }
 
     impl BackendRead for SpyRead {
+        type ScanCursor<'a>
+            = BufferedScanCursor
+        where
+            Self: 'a;
+
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -477,18 +482,14 @@ mod shape_tests {
             Ok(())
         }
 
-        fn visit_range<V>(
+        fn open_scan_cursor(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<ScanResult, BackendError>
-        where
-            V: ScanVisitor + ?Sized,
-        {
+        ) -> Result<Self::ScanCursor<'_>, BackendError> {
             self.scan_range_calls.set(self.scan_range_calls.get() + 1);
             self.scan_range.replace(Some(range));
-            Ok(ScanResult::default())
+            Ok(BufferedScanCursor::default())
         }
     }
 

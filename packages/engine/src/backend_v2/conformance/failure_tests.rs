@@ -8,10 +8,10 @@ use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef,
-    ProjectionCapabilities, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -301,6 +301,11 @@ impl Backend for BrokenBackend {
 }
 
 impl BackendRead for BrokenRead {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -331,15 +336,11 @@ impl BackendRead for BrokenRead {
         visit_many_from_map(entries, self.mode, keys, opts, visitor)
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
         let live_entries;
         let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
             live_entries = self
@@ -351,7 +352,9 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        visit_range_from_map(entries, self.mode, range, opts, visitor)
+        Ok(BufferedScanCursor::new(scan_rows_from_map(
+            entries, self.mode, range, opts,
+        )))
     }
 }
 
@@ -519,6 +522,29 @@ where
     }
 
     Ok(ScanResult { emitted, has_more })
+}
+
+fn scan_rows_from_map(
+    entries: &BrokenMap,
+    mode: BrokenMode,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Vec<ReadEntry> {
+    let mut rows = Vec::new();
+    let _ = visit_range_from_map(
+        entries,
+        mode,
+        range,
+        opts,
+        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            rows.push(ReadEntry {
+                key: key.to_owned_key(),
+                value: value.to_owned(),
+            });
+            Ok(())
+        },
+    );
+    rows
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {

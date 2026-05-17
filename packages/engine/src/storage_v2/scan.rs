@@ -1,6 +1,7 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef,
-    ReadBatch, ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    visit_range as backend_visit_range, BackendError, BackendRead, BackendScanCursor,
+    CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef, ReadBatch, ReadEntry,
+    ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
 };
 use crate::storage_v2::{
     decode_logical_key_ref, StorageReadResult, StorageReadStats, StorageSpace,
@@ -41,6 +42,76 @@ pub struct BorrowedScanChunk<'a> {
     pub has_more: bool,
 }
 
+pub struct StorageScanCursor<C> {
+    inner: C,
+    kind: ScanKind,
+    projection: CoreProjection,
+    chunks_seen: u64,
+}
+
+impl<C> StorageScanCursor<C>
+where
+    C: BackendScanCursor,
+{
+    pub fn visit_next<V>(
+        &mut self,
+        limit_rows: usize,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        Ok(self.visit_next_with_stats(limit_rows, visitor)?.value)
+    }
+
+    pub fn visit_next_with_stats<V>(
+        &mut self,
+        limit_rows: usize,
+        visitor: &mut V,
+    ) -> Result<StorageReadResult<ScanResult>, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        struct LogicalScanVisitor<'a, V: ?Sized> {
+            inner: &'a mut V,
+        }
+
+        impl<V> ScanVisitor for LogicalScanVisitor<'_, V>
+        where
+            V: ScanVisitor + ?Sized,
+        {
+            fn visit(
+                &mut self,
+                key: KeyRef<'_>,
+                value: ProjectedValueRef<'_>,
+            ) -> Result<(), BackendError> {
+                self.inner.visit(decode_logical_key_ref(key)?, value)
+            }
+        }
+
+        let result = self
+            .inner
+            .visit_next(limit_rows, &mut LogicalScanVisitor { inner: visitor })?;
+        let mut stats = scan_trace_stats(
+            self.kind,
+            ScanOptions {
+                projection: self.projection,
+                limit_rows,
+                resume_after: None,
+            },
+            result.emitted as u64,
+            result.has_more,
+            u64::from(limit_rows != 0),
+        );
+        stats.scan_resume_after = u64::from(self.chunks_seen > 0);
+        if matches!(self.kind, ScanKind::Prefix) {
+            stats.prefix_lowered = u64::from(self.chunks_seen == 0);
+        }
+        self.chunks_seen += u64::from(result.emitted > 0 || result.has_more);
+        Ok(StorageReadResult::new(result, stats))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScanResumeKey {
     pub last_key: Option<Key>,
@@ -68,6 +139,44 @@ where
     R: BackendRead,
 {
     Ok(scan_prefix_with_stats(read, space, prefix, opts)?.value)
+}
+
+pub(crate) fn open_scan_range_cursor<'a, R>(
+    read: &'a R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Result<StorageScanCursor<R::ScanCursor<'a>>, BackendError>
+where
+    R: BackendRead,
+{
+    let storage_space = StorageSpace::new(space, "storage_v2.scan");
+    let resume_after = opts.resume_after;
+    let physical_range = storage_space.encode_range(range, resume_after);
+    let physical_opts = ScanOptions {
+        resume_after: None,
+        ..opts
+    };
+    Ok(StorageScanCursor {
+        inner: read.open_scan_cursor(physical_range, physical_opts)?,
+        kind: ScanKind::Range,
+        projection: opts.projection,
+        chunks_seen: 0,
+    })
+}
+
+pub(crate) fn open_scan_prefix_cursor<'a, R>(
+    read: &'a R,
+    space: SpaceId,
+    prefix: Prefix,
+    opts: ScanOptions<'_>,
+) -> Result<StorageScanCursor<R::ScanCursor<'a>>, BackendError>
+where
+    R: BackendRead,
+{
+    let mut cursor = open_scan_range_cursor(read, space, prefix.to_range()?, opts)?;
+    cursor.kind = ScanKind::Prefix;
+    Ok(cursor)
 }
 
 pub(crate) fn scan_range<R>(
@@ -126,7 +235,8 @@ where
         ..opts
     };
 
-    let result = read.visit_range(
+    let result = backend_visit_range(
+        read,
         physical_range,
         physical_opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
@@ -202,7 +312,8 @@ where
         }
     }
 
-    let result = read.visit_range(
+    let result = backend_visit_range(
+        read,
         physical_range,
         physical_opts,
         &mut LogicalScanVisitor { inner: visitor },
@@ -362,9 +473,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, ConformanceBackend, GetOptions, Key, KeyRange, PointVisitor,
-        Prefix, ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-        StoredValue, WriteOptions,
+        BackendError, BackendRead, BufferedScanCursor, ConformanceBackend, GetOptions, Key,
+        KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions, ScanOptions, ScanResult,
+        ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{scan_prefix, StorageContext, StorageReader, StorageSpace};
 
@@ -502,6 +613,11 @@ mod tests {
     }
 
     impl BackendRead for CapturingRead {
+        type ScanCursor<'a>
+            = BufferedScanCursor
+        where
+            Self: 'a;
+
         fn visit_many<V>(
             &self,
             _keys: &[Key],
@@ -514,17 +630,13 @@ mod tests {
             unimplemented!("not used by prefix lowering tests")
         }
 
-        fn visit_range<V>(
+        fn open_scan_cursor(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<ScanResult, BackendError>
-        where
-            V: ScanVisitor + ?Sized,
-        {
+        ) -> Result<Self::ScanCursor<'_>, BackendError> {
             self.range.replace(Some(range));
-            Ok(ScanResult::default())
+            Ok(BufferedScanCursor::default())
         }
     }
 }

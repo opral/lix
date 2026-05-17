@@ -578,9 +578,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend_v2::{
-        BackendError, BackendRead, ConformanceBackend, CoreProjection, GetOptions, Key, KeyRange,
-        KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
-        ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
+        BackendError, BackendRead, BufferedScanCursor, ConformanceBackend, CoreProjection,
+        GetOptions, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef,
+        ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage_v2::{
         PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext,
@@ -616,6 +616,11 @@ mod tests {
     }
 
     impl BackendRead for SpyRead {
+        type ScanCursor<'a>
+            = BufferedScanCursor
+        where
+            Self: 'a;
+
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -636,18 +641,14 @@ mod tests {
             Ok(())
         }
 
-        fn visit_range<V>(
+        fn open_scan_cursor(
             &self,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<ScanResult, BackendError>
-        where
-            V: ScanVisitor + ?Sized,
-        {
+        ) -> Result<Self::ScanCursor<'_>, BackendError> {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
-            Ok(ScanResult::default())
+            Ok(BufferedScanCursor::default())
         }
     }
 
@@ -657,6 +658,11 @@ mod tests {
     }
 
     impl BackendRead for RequestedOrderRead {
+        type ScanCursor<'a>
+            = BufferedScanCursor
+        where
+            Self: 'a;
+
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -675,15 +681,11 @@ mod tests {
             Ok(())
         }
 
-        fn visit_range<V>(
+        fn open_scan_cursor(
             &self,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut V,
-        ) -> Result<ScanResult, BackendError>
-        where
-            V: ScanVisitor + ?Sized,
-        {
+        ) -> Result<Self::ScanCursor<'_>, BackendError> {
             unreachable!("requested-order point-read test does not scan")
         }
     }

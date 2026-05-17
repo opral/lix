@@ -4,12 +4,12 @@ The stable core is:
 
 ```text
 An ordered byte-key entry backend with coherent read views, batched point
-access, forward row-bounded range visits, and atomic batched writes.
+access, forward row-bounded range visits/cursors, and atomic batched writes.
 ```
 
 Everything else is either `storage_v2` adapter behavior or an additive backend
-extension: prefix lowering, caller-order reconstruction, storage cursors,
-projection fallback, residual filtering, preconditions, predicate
+extension: prefix lowering, caller-order reconstruction, public storage cursor
+tokens, projection fallback, residual filtering, preconditions, predicate
 pushdown, envelope slicing, object/segment pruning, byte-bounded chunks,
 long-lived cursors, parallel scan partitions, and native idempotent commits.
 
@@ -37,11 +37,11 @@ The important cut:
 Backend:
   ordered byte keys
   opaque byte values
-  visit_many
-  visit_range
-  put_many / delete_many
-  begin_read / begin_write
-  capabilities
+visit_many
+open_scan_cursor / cursor.visit_next
+put_many / delete_many
+begin_read / begin_write
+capabilities
 
 Generic storage adapter:
   write sets
@@ -94,7 +94,7 @@ Every v0 backend must support:
 begin_read
 begin_write
 visit_many
-visit_range
+open_scan_cursor
 put_many
 delete_many
 delete_range
@@ -189,7 +189,7 @@ Backend author mapping:
 ```text
 FoundationDB:
   visit_many   -> transaction get calls
-  visit_range  -> transaction get_range
+  scan cursor  -> transaction get_range stream
   put_many     -> set
   delete_many  -> clear
   delete_range -> clear range
@@ -197,7 +197,7 @@ FoundationDB:
 
 RocksDB:
   visit_many   -> MultiGet
-  visit_range  -> iterator seek + next
+  scan cursor  -> iterator seek + next
   put_many     -> WriteBatch
   delete_many  -> WriteBatch delete
   delete_range -> WriteBatch delete range or exact range delete loop
@@ -205,7 +205,7 @@ RocksDB:
 
 SQLite:
   visit_many   -> SELECT ... WHERE key IN (...)
-  visit_range  -> WHERE key >= ? AND key < ? ORDER BY key LIMIT ?
+  scan cursor  -> prepared SELECT ... WHERE key range ORDER BY key
   put_many     -> transaction + batched INSERT/UPDATE
   delete_many  -> transaction + batched DELETE
   delete_range -> transaction + indexed DELETE WHERE key range
@@ -320,6 +320,10 @@ space.
 
 ```rust
 pub trait BackendRead {
+    type ScanCursor<'a>: BackendScanCursor + 'a
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -329,14 +333,11 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
+    ) -> Result<Self::ScanCursor<'_>, BackendError>;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -361,6 +362,31 @@ pub trait ScanVisitor {
         key: KeyRef<'_>,
         value: ProjectedValueRef<'_>,
     ) -> Result<(), BackendError>;
+}
+
+pub trait BackendScanCursor {
+    fn visit_next<V>(
+        &mut self,
+        limit_rows: usize,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
+}
+
+pub fn visit_range<R, V>(
+    read: &R,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    R: BackendRead + ?Sized,
+    V: ScanVisitor + ?Sized,
+{
+    let limit_rows = opts.limit_rows;
+    let mut cursor = read.open_scan_cursor(range, opts)?;
+    cursor.visit_next(limit_rows, visitor)
 }
 ```
 
@@ -451,8 +477,8 @@ pub struct GetManyResult {
 useful for conformance tests and simple callers, but backend authors implement
 `visit_many`, not owned `get_many`.
 
-V0 scans are forward only. Reverse scans, byte limits, predicates, and native
-opaque cursors are extension paths. Storage-level helpers may normalize
+V0 scans are forward only. Reverse scans, byte limits, predicates, and
+long-lived opaque cursors are extension paths. Storage-level helpers may normalize
 `limit_rows = 0`, wrap public cursor tokens, validate cursor scope, and perform
 lookahead/buffering when they want an exact public "no cursor means no more
 eligible rows" promise.
@@ -472,36 +498,15 @@ pub struct ScanChunk {
 }
 ```
 
-Cursorized scans are a future extension for deep small-chunk drains. They keep
-`visit_range` as the simple required primitive, but allow backends with native
-iterators/statements/range cursors to seek once and emit repeated chunks:
+Cursorized scans are core because deep small-chunk drains should not be forced
+to re-open the same physical range once per chunk. `visit_range` is a
+storage/backend helper outside the backend trait: it opens a cursor and calls
+`visit_next(opts.limit_rows, visitor)` for callers that want a one-shot scan.
 
-```rust
-pub trait BackendCursorRead: BackendRead {
-    type Cursor<'a>: BackendScanCursor + 'a
-    where
-        Self: 'a;
-
-    fn open_range_cursor<'a>(
-        &'a self,
-        range: KeyRange,
-        opts: ScanOptions<'a>,
-    ) -> Result<Self::Cursor<'a>, BackendError>;
-}
-
-pub trait BackendScanCursor {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
-}
-```
-
-The unit of continuation is a scan chunk: `visit_next(limit_rows, visitor)`
-returns at most `limit_rows` rows from the same opened scan.
+The unit of continuation is a scan chunk: `cursor.visit_next(limit_rows,
+visitor)` returns at most `limit_rows` rows from the same opened scan. A cursor
+is bound to its read view, range, projection, and initial resume point. It is
+not a public, long-lived storage cursor token.
 
 ## Projection / Envelope Extensions
 
@@ -965,7 +970,8 @@ payload_ref = P
 ### Pushdown Support Result
 
 The support structures below belong to pushdown/envelope extension results.
-Core v0 `visit_many` and `visit_range` do not return support metadata.
+Core v0 `visit_many` and `open_scan_cursor` / `cursor.visit_next` do not return
+support metadata.
 
 ```rust
 #[derive(Clone, Debug)]
@@ -1209,7 +1215,7 @@ Make the core look like native backend calls:
 
 ```text
 visit_many
-visit_range
+open_scan_cursor / cursor.visit_next
 put_many
 delete_many
 ```
@@ -1313,7 +1319,8 @@ let deleted_false = BackendPredicate {
 let range = Prefix { bytes: schema_file_prefix }.to_range()?;
 let physical_range = TRACKED_BY_FILE_SPACE.encode_range(range, storage_cursor.last_key());
 let mut chunk_entries = Vec::new();
-let result = read.visit_range(
+let result = backend_v2::visit_range(
+    read,
     physical_range,
     ScanOptions {
         projection: CoreProjection::FullValue,
@@ -1475,7 +1482,7 @@ higher engine layer, not in backend_v2.
 begin_read
 begin_write
 visit_many
-visit_range
+open_scan_cursor / cursor.visit_next
 put_many
 delete_many
 commit
@@ -1701,6 +1708,10 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
+    type ScanCursor<'a>: BackendScanCursor + 'a
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -1710,14 +1721,36 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
+    ) -> Result<Self::ScanCursor<'_>, BackendError>;
+}
+
+pub trait BackendScanCursor {
+    fn visit_next<V>(
+        &mut self,
+        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized;
+}
+
+pub fn visit_range<R, V>(
+    read: &R,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    R: BackendRead + ?Sized,
+    V: ScanVisitor + ?Sized,
+{
+    let limit_rows = opts.limit_rows;
+    let mut cursor = read.open_scan_cursor(range, opts)?;
+    cursor.visit_next(limit_rows, visitor)
 }
 
 pub trait BackendWrite {

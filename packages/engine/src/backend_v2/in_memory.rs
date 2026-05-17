@@ -1,4 +1,6 @@
+use std::collections::btree_map;
 use std::collections::{BTreeMap, BTreeSet};
+use std::iter::Peekable;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
@@ -6,10 +8,10 @@ use bytes::Bytes;
 
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendScanCursor, BackendWrite,
+    BufferedScanCursor, CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
@@ -41,6 +43,14 @@ pub struct InMemoryBackendFixture {
 
 pub struct InMemoryRead {
     entries: Arc<EntriesState>,
+}
+
+pub enum InMemoryScanCursor<'a> {
+    Flat {
+        iter: Peekable<btree_map::Range<'a, Key, Bytes>>,
+        projection: CoreProjection,
+    },
+    Buffered(BufferedScanCursor),
 }
 
 pub type InMemoryScanVisitResult = ScanResult;
@@ -137,6 +147,11 @@ impl Backend for InMemoryBackend {
 }
 
 impl BackendRead for InMemoryRead {
+    type ScanCursor<'a>
+        = InMemoryScanCursor<'a>
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -167,16 +182,86 @@ impl BackendRead for InMemoryRead {
         Ok(())
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        if opts.limit_rows == 0 {
+            return Ok(InMemoryScanCursor::Buffered(BufferedScanCursor::default()));
+        }
+
+        let lower = lower_bound(&range, opts.resume_after);
+        let upper = upper_bound(&range);
+        if bounds_are_empty(&lower, &upper) {
+            return Ok(InMemoryScanCursor::Buffered(BufferedScanCursor::default()));
+        }
+
+        match self.entries.as_ref() {
+            EntriesState::Flat(entries) => Ok(InMemoryScanCursor::Flat {
+                iter: entries.range((lower, upper)).peekable(),
+                projection: opts.projection,
+            }),
+            entries => {
+                let mut rows = Vec::new();
+                visit_range(
+                    entries,
+                    range,
+                    ScanOptions {
+                        limit_rows: usize::MAX,
+                        ..opts
+                    },
+                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                        rows.push(crate::backend_v2::ReadEntry {
+                            key: key.to_owned_key(),
+                            value: value.to_owned(),
+                        });
+                        Ok(())
+                    },
+                )?;
+                Ok(InMemoryScanCursor::Buffered(BufferedScanCursor::new(rows)))
+            }
+        }
+    }
+}
+
+impl BackendScanCursor for InMemoryScanCursor<'_> {
+    fn visit_next<V>(
+        &mut self,
+        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized,
     {
-        visit_range(&self.entries, range, opts, visitor)
+        match self {
+            InMemoryScanCursor::Buffered(cursor) => cursor.visit_next(limit_rows, visitor),
+            InMemoryScanCursor::Flat { iter, projection } => {
+                if limit_rows == 0 {
+                    return Ok(ScanResult {
+                        emitted: 0,
+                        has_more: iter.peek().is_some(),
+                    });
+                }
+
+                let mut emitted = 0;
+                while emitted < limit_rows {
+                    let Some((key, value)) = iter.next() else {
+                        return Ok(ScanResult {
+                            emitted,
+                            has_more: false,
+                        });
+                    };
+                    visitor.visit(key.as_ref(), project_value_ref(value, *projection))?;
+                    emitted += 1;
+                }
+
+                Ok(ScanResult {
+                    emitted,
+                    has_more: iter.peek().is_some(),
+                })
+            }
+        }
     }
 }
 

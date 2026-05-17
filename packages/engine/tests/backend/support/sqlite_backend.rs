@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendV2Factory, BackendV2Fixture, BackendV2TestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
@@ -151,6 +151,11 @@ impl Backend for SqliteBackend {
 }
 
 impl BackendRead for SqliteRead {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -163,16 +168,32 @@ impl BackendRead for SqliteRead {
         visit_many(self.conn(), keys, opts, visitor)
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        visit_range(self.conn(), range, opts, visitor)
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
+        if opts.limit_rows == 0 {
+            return Ok(BufferedScanCursor::default());
+        }
+
+        let mut rows = Vec::new();
+        visit_range(
+            self.conn(),
+            range,
+            ScanOptions {
+                limit_rows: usize::MAX,
+                ..opts
+            },
+            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                rows.push(ReadEntry {
+                    key: key.to_owned_key(),
+                    value: value.to_owned(),
+                });
+                Ok(())
+            },
+        )?;
+        Ok(BufferedScanCursor::new(rows))
     }
 
     fn close(mut self) -> Result<(), BackendError> {

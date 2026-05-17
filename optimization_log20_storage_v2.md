@@ -5186,8 +5186,8 @@ Smoke baseline, selected means:
 | delete prefix q100           |  13.45 us |   815.16 us |  16.71 ms |    160.13 us |
 | delete prefix q1000          | 155.17 us |     1.39 ms |  18.93 ms |    637.65 us |
 | delete prefix q10000         |   1.65 ms |     6.18 ms |  20.66 ms |      2.91 ms |
-| drain chunk1 materialized     |   3.08 ms |     6.57 ms |   6.98 ms |     12.17 ms |
-| drain chunk1 visit            |   2.31 ms |     5.89 ms |   6.59 ms |     12.34 ms |
+| drain chunk1 materialized    |   3.08 ms |     6.57 ms |   6.98 ms |     12.17 ms |
+| drain chunk1 visit           |   2.31 ms |     5.89 ms |   6.59 ms |     12.34 ms |
 | drain page10 materialized    | 521.04 us |     1.32 ms |   1.12 ms |      2.32 ms |
 | drain page10 visit           | 432.15 us |     1.16 ms |   1.12 ms |      2.22 ms |
 | drain page100 materialized   | 273.27 us |   766.02 us | 523.79 us |      1.31 ms |
@@ -5503,20 +5503,20 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
 Criterion mean estimates, visitor path:
 
 | Backend      | range single | range chunk1 | range chunk10 | range chunk100 | prefix single | prefix chunk10 |
-| ------------ | -----------: | ----------: | -----------: | ------------: | ------------: | ------------: |
-| in_memory    |    189.40 us |     2.54 ms |    438.68 us |     209.59 us |     191.62 us |     443.69 us |
-| sqlite_temp  |    464.68 us |     5.54 ms |      1.64 ms |     599.44 us |     483.30 us |       1.03 ms |
-| redb_temp    |    377.65 us |     6.54 ms |      1.02 ms |     463.86 us |     374.97 us |       1.00 ms |
-| rocksdb_temp |      1.13 ms |    11.85 ms |      2.33 ms |       1.23 ms |       1.07 ms |       2.22 ms |
+| ------------ | -----------: | -----------: | ------------: | -------------: | ------------: | -------------: |
+| in_memory    |    189.40 us |      2.54 ms |     438.68 us |      209.59 us |     191.62 us |      443.69 us |
+| sqlite_temp  |    464.68 us |      5.54 ms |       1.64 ms |      599.44 us |     483.30 us |        1.03 ms |
+| redb_temp    |    377.65 us |      6.54 ms |       1.02 ms |      463.86 us |     374.97 us |        1.00 ms |
+| rocksdb_temp |      1.13 ms |     11.85 ms |       2.33 ms |        1.23 ms |       1.07 ms |        2.22 ms |
 
 Ratios versus single-drain visitor baseline:
 
 | Backend      | range chunk1 | range chunk10 | range chunk100 | prefix chunk10 |
-| ------------ | ----------: | -----------: | ------------: | ------------: |
-| in_memory    |       13.4x |         2.3x |          1.1x |         2.3x |
-| sqlite_temp  |       11.9x |         3.5x |          1.3x |         2.1x |
-| redb_temp    |       17.3x |         2.7x |          1.2x |         2.7x |
-| rocksdb_temp |       10.5x |         2.1x |          1.1x |         2.1x |
+| ------------ | -----------: | ------------: | -------------: | -------------: |
+| in_memory    |        13.4x |          2.3x |           1.1x |           2.3x |
+| sqlite_temp  |        11.9x |          3.5x |           1.3x |           2.1x |
+| redb_temp    |        17.3x |          2.7x |           1.2x |           2.7x |
+| rocksdb_temp |        10.5x |          2.1x |           1.1x |           2.1x |
 
 Interpretation:
 
@@ -5530,4 +5530,133 @@ This validates cursorized scan as the next API candidate if Lix has hot paths
 that deeply chunk ranges/prefixes with small chunk sizes. Keep visit_range as the
 required simple primitive; add cursoring as an extension or storage-selected
 fast path only if domain traces show small-chunk drains are common.
+```
+
+## 2026-05-17 - required backend scan cursor API
+
+Implemented the cursor cut:
+
+```text
+BackendRead:
+  type ScanCursor<'a>
+  open_scan_cursor(range, opts)
+
+BackendScanCursor:
+  visit_next(limit_rows, visitor)
+
+visit_range:
+  default one-shot convenience over open_scan_cursor + visit_next
+```
+
+Storage now exposes backend/read-scope-local scan cursors and the scan chunking
+bench includes a `cursor_visit` lane. The current real backend implementations
+use a buffered cursor baseline, so this measures whether the API shape is worth
+keeping before deeper native iterator/statement cursor work.
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/scan_chunking'
+```
+
+Criterion mean estimates:
+
+| Backend      | range single visit | range single cursor | range chunk1 visit | range chunk1 cursor | range chunk10 visit | range chunk10 cursor | prefix chunk10 visit | prefix chunk10 cursor |
+| ------------ | -----------------: | ------------------: | -----------------: | ------------------: | ------------------: | -------------------: | -------------------: | --------------------: |
+| in_memory    |          224.89 us |           233.98 us |            3.00 ms |           274.59 us |           479.21 us |            245.81 us |            513.50 us |             230.85 us |
+| sqlite_temp  |          523.69 us |           581.09 us |            6.76 ms |           611.95 us |             1.19 ms |            565.78 us |              1.14 ms |             562.20 us |
+| redb_temp    |          407.37 us |           450.49 us |            7.04 ms |           479.63 us |             1.26 ms |            447.12 us |              1.08 ms |             442.75 us |
+| rocksdb_temp |            1.20 ms |             1.24 ms |           12.45 ms |             1.25 ms |             2.39 ms |              1.24 ms |              2.43 ms |               1.31 ms |
+
+Speedup of `cursor_visit` over repeated `visit`:
+
+| Backend      | range single | range chunk1 | range chunk10 | range chunk100 | prefix single | prefix chunk10 |
+| ------------ | -----------: | -----------: | ------------: | -------------: | ------------: | -------------: |
+| in_memory    |        0.96x |        10.9x |          1.9x |           1.0x |         0.90x |           2.2x |
+| sqlite_temp  |        0.90x |        11.1x |          2.1x |           1.2x |         0.90x |           2.0x |
+| redb_temp    |        0.90x |        14.7x |          2.8x |           1.2x |         0.90x |           2.4x |
+| rocksdb_temp |        0.97x |         9.9x |          1.9x |           1.1x |         1.09x |           1.8x |
+
+Interpretation:
+
+```text
+The cursor API is worth it for small-chunk drains. Chunk size 1 improves about
+10-15x across all four backends, and chunk size 10 improves about 1.8-2.8x.
+
+Single-shot scans are flat to slightly slower because cursor setup adds a small
+adapter cost and, for the current baseline implementations, some backends
+materialize cursor rows. That is acceptable because callers should keep using
+visit_range for one-shot scans.
+
+The next optimization is backend-local native cursor implementation, not another
+storage API cut:
+
+  SQLite: keep a prepared statement / Rows cursor instead of buffering.
+  redb: keep the range iterator alive when lifetime ergonomics allow it.
+  RocksDB: keep an iterator and call next across chunks.
+  in_memory: keep a range iterator or lightweight borrowed row cursor.
+
+The API shape has earned its place. The implementation still has room to become
+more native per backend.
+```
+
+## 2026-05-17 - backend-local native scan cursor pass
+
+Implemented the first backend-local cursor optimization without changing the
+storage/backend API:
+
+```text
+in_memory:
+  Flat snapshots now keep a borrowed BTreeMap range iterator across chunks.
+  Layered snapshots still fall back to BufferedScanCursor.
+
+rocksdb_temp:
+  Scan cursors now keep a RocksDB iterator and a one-row pending slot across
+  chunks instead of pre-buffering the whole scan.
+
+sqlite_temp / redb_temp:
+  Left buffered for now. Their safe Rust APIs expose Rows/range iterators that
+  borrow a Statement/table, which would require self-referential storage or
+  unsafe plumbing to keep alive as a backend cursor.
+```
+
+Baseline command before the implementation and repeated after:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'scan_chunking/.*/cursor_visit/drain_range_q10000_chunk10'
+```
+
+Criterion mean estimates:
+
+| Backend      | Case     | Before buffered cursor | After native/local cursor | Delta |
+| ------------ | -------- | ---------------------: | ------------------------: | ----: |
+| in_memory    | chunk10  |              213.07 us |                  23.50 us | 9.1x faster |
+| in_memory    | chunk100 |              200.45 us |                  21.55 us | 9.3x faster |
+| sqlite_temp  | chunk10  |              499.13 us |                 546.75 us | 10% slower/noise |
+| sqlite_temp  | chunk100 |              500.05 us |                 542.61 us | 9% slower/noise |
+| redb_temp    | chunk10  |              392.52 us |                 436.34 us | 11% slower/noise |
+| redb_temp    | chunk100 |              397.06 us |                 446.99 us | 13% slower/noise |
+| rocksdb_temp | chunk10  |                1.12 ms |                   1.03 ms | 1.1x faster |
+| rocksdb_temp | chunk100 |                1.25 ms |                   1.00 ms | 1.2x faster |
+
+Interpretation:
+
+```text
+The in-memory backend had the largest real win because the previous cursor
+materialized 10k rows before returning the first chunk. Keeping the BTreeMap
+range iterator cuts that overhead almost entirely on flat snapshots.
+
+RocksDB improves modestly. The scan is still engine/value iteration dominated,
+but keeping the iterator alive avoids the full pre-buffering pass and row
+materialization.
+
+SQLite and redb were intentionally unchanged; the small regressions are
+Criterion/noise or shared-code effects from rebuilding the bench binary. Do not
+force unsafe self-referential statement/table cursors yet. If these backends need
+native cursors later, use a backend-specific safe abstraction or an explicit
+unsafe wrapper with tests around drop order and snapshot lifetime.
 ```

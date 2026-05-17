@@ -14,11 +14,11 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use lix_engine::backend_v2::{
-    get_many as backend_get_many, Backend, BackendCapabilities, BackendError, BackendRead,
-    BackendWrite, CommitResult, ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend,
-    Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch,
-    PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
-    SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
+    BackendError, BackendRead, BackendWrite, BufferedScanCursor, CommitResult, ConformanceBackend,
+    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix,
+    ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PhysicalPointRequestPlan, PointRequestPlan, PointValueBuffer, StorageContext, StorageReadScope,
@@ -1199,6 +1199,27 @@ where
                 black_box(stats);
             });
         });
+
+        group.bench_with_input(
+            BenchmarkId::new("cursor_visit", case.name),
+            case,
+            |b, case| {
+                b.iter(|| {
+                    let stats = drain_scan_cursor_visit(
+                        &scope,
+                        space(1),
+                        case.scan,
+                        case.rows,
+                        case.chunk_size,
+                    )
+                    .expect("drain cursor chunked visitor scan");
+                    assert_eq!(stats.scanned, case.rows);
+                    assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
+                    assert_cursor_scan_drain_stats(&stats, case);
+                    black_box(stats);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -2191,22 +2212,22 @@ where
                         .begin_read(ReadOptions::default())
                         .expect("begin direct scan visitor read");
                     let mut visited = 0usize;
-                    let result = read
-                        .visit_range(
-                            scan_range.clone(),
-                            ScanOptions {
-                                limit_rows: 1_001,
-                                projection: CoreProjection::KeyOnly,
-                                ..ScanOptions::default()
-                            },
-                            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                                visited += 1;
-                                assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                                black_box(key);
-                                Ok(())
-                            },
-                        )
-                        .expect("direct scan visitor");
+                    let result = backend_visit_range(
+                        &read,
+                        scan_range.clone(),
+                        ScanOptions {
+                            limit_rows: 1_001,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                            visited += 1;
+                            assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                            black_box(key);
+                            Ok(())
+                        },
+                    )
+                    .expect("direct scan visitor");
                     assert_eq!(visited, 1_000);
                     assert_eq!(result.emitted, 1_000);
                     assert!(!result.has_more);
@@ -3090,6 +3111,11 @@ impl PointReadBackend {
 }
 
 impl BackendRead for PointReadBackend {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -3111,15 +3137,11 @@ impl BackendRead for PointReadBackend {
         Ok(())
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
         unreachable!("point-read benchmark does not scan")
     }
 }
@@ -3147,6 +3169,11 @@ impl LeanPointReadBackend {
 }
 
 impl BackendRead for LeanPointReadBackend {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -3167,15 +3194,11 @@ impl BackendRead for LeanPointReadBackend {
         Ok(())
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
         unreachable!("lean point-read benchmark does not scan")
     }
 }
@@ -3203,6 +3226,11 @@ impl PrefixReadBackend {
 }
 
 impl BackendRead for PrefixReadBackend {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         _keys: &[Key],
@@ -3215,26 +3243,17 @@ impl BackendRead for PrefixReadBackend {
         unreachable!("prefix-scan benchmark does not point-read")
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
         assert_eq!(range.lower, Bound::Included(key("row-")));
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
-        let mut emitted = 0;
-        for entry in self.entries.iter().take(opts.limit_rows) {
-            visitor.visit(entry.key.as_ref(), ProjectedValueRef::KeyOnly)?;
-            emitted += 1;
+        if opts.limit_rows == 0 {
+            return Ok(BufferedScanCursor::default());
         }
-        Ok(ScanResult {
-            emitted,
-            has_more: opts.limit_rows < self.entries.len(),
-        })
+        Ok(BufferedScanCursor::new((*self.entries).clone()))
     }
 }
 
@@ -3242,6 +3261,11 @@ impl BackendRead for PrefixReadBackend {
 struct EmptyRead;
 
 impl BackendRead for EmptyRead {
+    type ScanCursor<'a>
+        = BufferedScanCursor
+    where
+        Self: 'a;
+
     fn visit_many<V>(
         &self,
         _keys: &[Key],
@@ -3254,15 +3278,11 @@ impl BackendRead for EmptyRead {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    fn visit_range<V>(
+    fn open_scan_cursor(
         &self,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
+    ) -> Result<Self::ScanCursor<'_>, BackendError> {
         unreachable!("write-set benchmark does not scan")
     }
 }
@@ -3615,6 +3635,61 @@ where
     Ok(stats)
 }
 
+fn drain_scan_cursor_visit<R>(
+    read: &StorageReadScope<R>,
+    storage_space: StorageSpace,
+    scan: ScanChunkingMode,
+    expected_rows: usize,
+    chunk_size: usize,
+) -> Result<ScanDrainStats, BackendError>
+where
+    R: BackendRead,
+{
+    let opts = ScanOptions {
+        limit_rows: chunk_size,
+        projection: CoreProjection::KeyOnly,
+        resume_after: None,
+    };
+    let mut cursor = match scan {
+        ScanChunkingMode::Range => {
+            read.open_scan_range_cursor(storage_space, point_scan_range(), opts)?
+        }
+        ScanChunkingMode::Prefix => read.open_scan_prefix_cursor(
+            storage_space,
+            Prefix {
+                bytes: Bytes::from_static(b"point-"),
+            },
+            opts,
+        )?,
+    };
+    let mut stats = ScanDrainStats::default();
+
+    loop {
+        let result = cursor.visit_next_with_stats(
+            chunk_size,
+            &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                Ok(())
+            },
+        )?;
+
+        stats.scanned += result.value.emitted;
+        stats.backend_calls += result.stats.backend_calls;
+        stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
+        stats.read_stats.add(result.stats);
+
+        if !result.value.has_more {
+            break;
+        }
+    }
+
+    assert_eq!(
+        stats.backend_calls,
+        expected_rows.div_ceil(chunk_size) as u64
+    );
+    Ok(stats)
+}
+
 fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
     let expected_chunks = case.rows.div_ceil(case.chunk_size);
     let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
@@ -3645,6 +3720,40 @@ fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
             assert_eq!(stats.read_stats.range_scan_chunks, 0);
             assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
             assert_eq!(stats.read_stats.prefix_lowered, expected_chunks as u64);
+        }
+    }
+}
+
+fn assert_cursor_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
+    let expected_chunks = case.rows.div_ceil(case.chunk_size);
+    let expected_resume_after = expected_chunks.saturating_sub(1) as u64;
+    let expected_has_more = expected_chunks.saturating_sub(1) as u64;
+
+    assert_eq!(stats.read_stats.backend_calls, expected_chunks as u64);
+    assert_eq!(stats.read_stats.scan_rows, case.rows as u64);
+    assert_eq!(stats.read_stats.scan_resume_after, expected_resume_after);
+    assert_eq!(stats.read_stats.scan_has_more, expected_has_more);
+    assert_eq!(
+        stats.read_stats.scan_limit_rows_total,
+        (expected_chunks * case.chunk_size) as u64
+    );
+    assert_eq!(stats.read_stats.scan_limit_rows_max, case.chunk_size as u64);
+    assert_eq!(
+        stats.read_stats.scan_key_only_chunks,
+        expected_chunks as u64
+    );
+    assert_eq!(stats.read_stats.scan_full_value_chunks, 0);
+
+    match case.scan {
+        ScanChunkingMode::Range => {
+            assert_eq!(stats.read_stats.range_scan_chunks, expected_chunks as u64);
+            assert_eq!(stats.read_stats.prefix_scan_chunks, 0);
+            assert_eq!(stats.read_stats.prefix_lowered, 0);
+        }
+        ScanChunkingMode::Prefix => {
+            assert_eq!(stats.read_stats.range_scan_chunks, 0);
+            assert_eq!(stats.read_stats.prefix_scan_chunks, expected_chunks as u64);
+            assert_eq!(stats.read_stats.prefix_lowered, 1);
         }
     }
 }
@@ -3681,7 +3790,8 @@ where
     R: BackendRead,
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = read.visit_range(
+    let result = backend_visit_range(
+        read,
         range,
         opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
