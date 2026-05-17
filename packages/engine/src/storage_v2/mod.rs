@@ -43,7 +43,7 @@ pub(crate) use scan::{
     scan_prefix, scan_prefix_into, scan_prefix_with_stats, scan_range, scan_range_into,
     scan_range_with_stats, visit_scan_prefix, visit_scan_range,
 };
-pub use scan::{BorrowedScanPage, StorageScanBuffer};
+pub use scan::{BorrowedScanChunk, StorageScanBuffer};
 pub(crate) use spaces::decode_logical_key_ref;
 pub use spaces::StorageSpace;
 pub use stats::{StorageReadResult, StorageReadStats, StorageWriteSetStats};

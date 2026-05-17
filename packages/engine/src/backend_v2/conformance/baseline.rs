@@ -10,7 +10,7 @@ use crate::backend_v2::conformance::{
 use crate::backend_v2::{
     get_many as backend_get_many, Backend, BackendRead, BackendWrite, CoreProjection, GetOptions,
     Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanPage, SpaceId, WriteOptions,
+    ScanChunk, ScanOptions, SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -42,8 +42,8 @@ where
         put_many_overwrites_existing_value(factory)
     });
     report.run(
-        "baseline::scan_range_returns_forward_row_bounded_pages",
-        || scan_range_returns_forward_row_bounded_pages(factory),
+        "baseline::scan_range_returns_forward_row_bounded_chunks",
+        || scan_range_returns_forward_row_bounded_chunks(factory),
     );
     report.run("baseline::scan_range_honors_bound_variants", || {
         scan_range_honors_bound_variants(factory)
@@ -51,12 +51,12 @@ where
     report.run("baseline::scan_range_orders_raw_byte_keys", || {
         scan_range_orders_raw_byte_keys(factory)
     });
-    report.run("baseline::scan_range_drains_multi_page_limits", || {
-        scan_range_drains_multi_page_limits(factory)
+    report.run("baseline::scan_range_drains_multi_chunk_limits", || {
+        scan_range_drains_multi_chunk_limits(factory)
     });
     report.run(
-        "baseline::scan_range_empty_range_returns_empty_page",
-        || scan_range_empty_range_returns_empty_page(factory),
+        "baseline::scan_range_empty_range_returns_empty_chunk",
+        || scan_range_empty_range_returns_empty_chunk(factory),
     );
     report.run("baseline::commit_is_atomic", || commit_is_atomic(factory));
     report.run("baseline::rollback_discards_staged_mutations", || {
@@ -312,7 +312,7 @@ where
     assert_get_entries(&backend, test_space, &[("a", Some("B"))])
 }
 
-fn scan_range_returns_forward_row_bounded_pages<F>(factory: &F) -> ConformanceResult
+fn scan_range_returns_forward_row_bounded_chunks<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -343,7 +343,7 @@ where
     .map_err(|error| format!("first scan_range failed: {error}"))?;
     assert_read_entries(&first.entries.entries, &[("b", "B"), ("c", "C")])?;
     if !first.has_more {
-        return Err("first scan page did not report has_more".to_string());
+        return Err("first scan chunk did not report has_more".to_string());
     }
 
     let second = scan_range(
@@ -359,7 +359,7 @@ where
     .map_err(|error| format!("second scan_range failed: {error}"))?;
     assert_read_entries(&second.entries.entries, &[("d", "D")])?;
     if second.has_more {
-        return Err("last scan page unexpectedly reported has_more".to_string());
+        return Err("last scan chunk unexpectedly reported has_more".to_string());
     }
     Ok(())
 }
@@ -438,7 +438,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let page = scan_range(
+    let chunk = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -450,7 +450,7 @@ where
     .map_err(|error| format!("scan_range failed: {error}"))?;
 
     assert_read_entries_bytes(
-        &page.entries.entries,
+        &chunk.entries.entries,
         &[
             (Bytes::new(), Bytes::from_static(b"empty")),
             (Bytes::from_static(&[0x00]), Bytes::from_static(b"00")),
@@ -474,7 +474,7 @@ where
     )
 }
 
-fn scan_range_drains_multi_page_limits<F>(factory: &F) -> ConformanceResult
+fn scan_range_drains_multi_chunk_limits<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -514,7 +514,7 @@ where
         let mut resume_after = None;
         let mut actual = Vec::new();
         loop {
-            let page = scan_range(
+            let chunk = scan_range(
                 &read,
                 test_space,
                 range.clone(),
@@ -525,9 +525,9 @@ where
                 },
             )
             .map_err(|error| format!("scan_range limit {limit} failed: {error}"))?;
-            actual.extend(entries_to_key_values(&page.entries.entries));
-            resume_after = page.entries.entries.last().map(|entry| entry.key.clone());
-            if !page.has_more {
+            actual.extend(entries_to_key_values(&chunk.entries.entries));
+            resume_after = chunk.entries.entries.last().map(|entry| entry.key.clone());
+            if !chunk.has_more {
                 break;
             }
             if actual.len() > expected.len() {
@@ -543,7 +543,7 @@ where
     Ok(())
 }
 
-fn scan_range_empty_range_returns_empty_page<F>(factory: &F) -> ConformanceResult
+fn scan_range_empty_range_returns_empty_chunk<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -553,7 +553,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let page = scan_range(
+    let chunk = scan_range(
         &read,
         test_space,
         KeyRange {
@@ -563,10 +563,10 @@ where
         ScanOptions::default(),
     )
     .map_err(|error| format!("scan_range failed: {error}"))?;
-    if page.entries.entries.is_empty() {
+    if chunk.entries.entries.is_empty() {
         Ok(())
     } else {
-        Err(format!("empty range returned entries: {:?}", page.entries))
+        Err(format!("empty range returned entries: {:?}", chunk.entries))
     }
 }
 
@@ -837,7 +837,7 @@ fn scan_range<R>(
     _test_space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, crate::backend_v2::BackendError>
+) -> Result<ScanChunk, crate::backend_v2::BackendError>
 where
     R: BackendRead,
 {
@@ -853,7 +853,7 @@ where
             Ok(())
         },
     )?;
-    Ok(ScanPage {
+    Ok(ScanChunk {
         entries: ReadBatch { entries },
         has_more: result.has_more,
     })

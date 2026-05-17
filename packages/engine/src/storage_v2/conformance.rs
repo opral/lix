@@ -176,7 +176,7 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
     let read = storage
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let page = read
+    let chunk = read
         .scan_prefix(
             space_one(),
             Prefix {
@@ -187,7 +187,8 @@ fn prefix_scan_lowers_to_backend_range() -> StorageConformanceResult {
         .map_err(|error| format!("scan_prefix failed: {error}"))?;
 
     assert_eq!(
-        page.entries
+        chunk
+            .entries
             .entries
             .into_iter()
             .map(|entry| entry.key)
@@ -216,7 +217,7 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
         .commit_write_set(later, WriteOptions::default())
         .map_err(|error| format!("later commit failed: {error}"))?;
 
-    let page = read
+    let chunk = read
         .scan_range(
             space_one(),
             KeyRange {
@@ -228,7 +229,8 @@ fn read_scope_pins_snapshot() -> StorageConformanceResult {
         .map_err(|error| format!("scan_range failed: {error}"))?;
 
     assert_eq!(
-        page.entries
+        chunk
+            .entries
             .entries
             .into_iter()
             .map(|entry| entry.value)

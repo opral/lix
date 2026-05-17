@@ -35,6 +35,6 @@ pub use traits::{get_many, Backend, BackendRead, BackendWrite, PointVisitor, Sca
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,
     Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch, ReadConsistency,
-    ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, SnapshotRef, SpaceId, StoredValue,
+    ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, SnapshotRef, SpaceId, StoredValue,
     Value, WriteOptions, WriteStats,
 };

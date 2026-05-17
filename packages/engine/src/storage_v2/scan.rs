@@ -1,6 +1,6 @@
 use crate::backend_v2::{
     BackendError, BackendRead, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef, ReadBatch,
-    ReadEntry, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId,
+    ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
 };
 use crate::storage_v2::{
     decode_logical_key_ref, StorageReadResult, StorageReadStats, StorageSpace,
@@ -36,7 +36,7 @@ impl StorageScanBuffer {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BorrowedScanPage<'a> {
+pub struct BorrowedScanChunk<'a> {
     pub entries: &'a [ReadEntry],
     pub has_more: bool,
 }
@@ -63,7 +63,7 @@ pub(crate) fn scan_prefix<R>(
     space: SpaceId,
     prefix: Prefix,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, BackendError>
+) -> Result<ScanChunk, BackendError>
 where
     R: BackendRead,
 {
@@ -75,17 +75,17 @@ pub(crate) fn scan_range<R>(
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, BackendError>
+) -> Result<ScanChunk, BackendError>
 where
     R: BackendRead,
 {
     let mut buffer = StorageScanBuffer::with_capacity(opts.limit_rows);
     let has_more = {
-        let page = scan_range_into(read, space, range, opts, &mut buffer)?;
-        page.has_more
+        let chunk = scan_range_into(read, space, range, opts, &mut buffer)?;
+        chunk.has_more
     };
 
-    Ok(ScanPage {
+    Ok(ScanChunk {
         entries: ReadBatch {
             entries: buffer.entries,
         },
@@ -99,14 +99,14 @@ pub(crate) fn scan_range_into<'a, R>(
     range: KeyRange,
     opts: ScanOptions<'_>,
     buffer: &'a mut StorageScanBuffer,
-) -> Result<BorrowedScanPage<'a>, BackendError>
+) -> Result<BorrowedScanChunk<'a>, BackendError>
 where
     R: BackendRead,
 {
     buffer.clear();
 
     if opts.limit_rows == 0 {
-        return Ok(BorrowedScanPage {
+        return Ok(BorrowedScanChunk {
             entries: buffer.entries(),
             has_more: false,
         });
@@ -139,7 +139,7 @@ where
         },
     )?;
 
-    Ok(BorrowedScanPage {
+    Ok(BorrowedScanChunk {
         entries: buffer.entries(),
         has_more: result.has_more,
     })
@@ -197,14 +197,14 @@ pub(crate) fn scan_range_with_stats<R>(
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<StorageReadResult<ScanPage>, BackendError>
+) -> Result<StorageReadResult<ScanChunk>, BackendError>
 where
     R: BackendRead,
 {
     let backend_calls = u64::from(opts.limit_rows != 0);
-    let page = scan_range(read, space, range, opts)?;
+    let chunk = scan_range(read, space, range, opts)?;
     Ok(StorageReadResult::new(
-        page,
+        chunk,
         StorageReadStats {
             requested_keys: 0,
             unique_backend_keys: 0,
@@ -220,7 +220,7 @@ pub(crate) fn scan_prefix_into<'a, R>(
     prefix: Prefix,
     opts: ScanOptions<'_>,
     buffer: &'a mut StorageScanBuffer,
-) -> Result<BorrowedScanPage<'a>, BackendError>
+) -> Result<BorrowedScanChunk<'a>, BackendError>
 where
     R: BackendRead,
 {
@@ -246,13 +246,13 @@ pub(crate) fn scan_prefix_with_stats<R>(
     space: SpaceId,
     prefix: Prefix,
     opts: ScanOptions<'_>,
-) -> Result<StorageReadResult<ScanPage>, BackendError>
+) -> Result<StorageReadResult<ScanChunk>, BackendError>
 where
     R: BackendRead,
 {
     if opts.limit_rows == 0 {
         return Ok(StorageReadResult::new(
-            ScanPage {
+            ScanChunk {
                 entries: ReadBatch::default(),
                 has_more: false,
             },
@@ -264,9 +264,9 @@ where
             },
         ));
     }
-    let page = scan_range(read, space, prefix.to_range()?, opts)?;
+    let chunk = scan_range(read, space, prefix.to_range()?, opts)?;
     Ok(StorageReadResult::new(
-        page,
+        chunk,
         StorageReadStats {
             requested_keys: 0,
             unique_backend_keys: 0,
@@ -323,7 +323,7 @@ mod tests {
         let read = storage
             .begin_read(ReadOptions::default())
             .expect("begin read");
-        let page = read
+        let chunk = read
             .scan_prefix(
                 space(1),
                 Prefix {
@@ -336,8 +336,8 @@ mod tests {
             )
             .expect("prefix scan");
 
-        assert!(page.entries.entries.is_empty());
-        assert!(!page.has_more);
+        assert!(chunk.entries.entries.is_empty());
+        assert!(!chunk.has_more);
     }
 
     #[test]

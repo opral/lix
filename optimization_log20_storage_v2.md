@@ -2122,8 +2122,8 @@ The post-space-map scan profile showed Vec growth as the next concrete hotspot:
   ~19% Vec growth inclusive
   ~18% ReadEntry Vec drop inclusive
 
-The backend already knows the page limit and per-space map length, so the
-bounded page can reserve its maximum possible emitted row count.
+The backend already knows the chunk limit and per-space map length, so the
+bounded chunk can reserve its maximum possible emitted row count.
 ```
 
 Validation:
@@ -2146,7 +2146,7 @@ Interpretation:
 This is a clean backend-local win. Range lookup was already cheap; the scan
 path now spends less time growing the output vector. Remaining scan cost is
 mostly unavoidable owned result materialization: cloning emitted keys and
-dropping ReadEntry values after the benchmark consumes the page.
+dropping ReadEntry values after the benchmark consumes the chunk.
 ```
 
 ### 2026-05-14: Borrowed Scan Visitor Experiment
@@ -2258,7 +2258,7 @@ Storage materialization from visitor:
 | key-only q1000       |                6.8907 us |                 6.8789 us |       parity |
 | full-value q1000 v32 |                9.1617 us |                 14.732 us | slower/noisy |
 
-Limit/page-size scans:
+Limit/chunk-size scans:
 
 | Case            | Owned ScanPage | Borrowed Visitor | Visitor Speedup |
 | --------------- | -------------: | ---------------: | --------------: |
@@ -2285,7 +2285,7 @@ callers:
 
 The Big-O remains O(log_B N + Q), but the visitor path removes forced O(Q)
 owned ReadEntry allocation/cloning/drop work when callers do not need a
-materialized page.
+materialized chunk.
 
 The important regression guard is storage materialization. Visitor -> owned
 ScanPage is at parity for key-only q1000, which means storage can preserve the
@@ -2304,12 +2304,12 @@ Change backend_v2 core only if we accept this split:
     visit_range as the physical primitive
 
   storage_v2:
-    scan_range / scan_prefix owned-page helpers
+    scan_range / scan_prefix owned-chunk helpers
     cursor and residual-filter loops
     streaming key/value visitor helpers for domain hot paths
 
 This aligns with the reference systems: physical layers iterate/stream/fill
-caller-provided output; higher layers materialize pages or result batches when
+caller-provided output; higher layers materialize chunks or result batches when
 needed.
 ```
 
@@ -2444,7 +2444,7 @@ Streaming/key-walk scan callers now have a clear win:
   key-only q10000:    65.907 us -> 18.804 us
 
 Storage-owned materialization remains available, but key-only materialization
-from visitor is now slower than the pre-cut owned page baseline. That is the
+from visitor is now slower than the pre-cut owned chunk baseline. That is the
 next scan-specific optimization target if materialized scans remain hot.
 
 The point-read numbers should not be interpreted as caused by the scan API
@@ -2549,7 +2549,7 @@ Materialized key-only scan:
   The hot leaf frames are now Bytes clone/drop, Vec<ReadEntry> construction,
   and the ScanVisitor closure. This means the storage-owned materialization
   path is paying exactly the cost we expect: clone keys into ReadEntry and drop
-  the materialized page after the benchmark iteration.
+  the materialized chunk after the benchmark iteration.
 
 Planned point read, lean fake backend:
   The hot frames are mostly Bytes clone/drop and Vec construction for returned
@@ -2625,7 +2625,7 @@ owned ReadEntry construction and Bytes clone/drop. That matches the previous
 profile: the cost is not primarily capacity allocation.
 
 The API is still useful as a low-level storage hook for callers that repeatedly
-materialize pages and want ownership over scratch memory, but it should not be
+materialize chunks and want ownership over scratch memory, but it should not be
 treated as the main materialized-scan optimization. The first-principles next
 cut would be borrowed scan entries or domain visitors that avoid materializing
 ReadEntry at all, but that is a larger semantic/API decision.
@@ -2668,8 +2668,8 @@ Interpretation:
 
 ```text
 The storage visitor path is the right cut for scan-heavy domain callers that do
-not need owned rows. It is 5-6x faster than materializing key-only pages in this
-run and about 9x faster than materializing full-value v32 pages.
+not need owned rows. It is 5-6x faster than materializing key-only chunks in this
+run and about 9x faster than materializing full-value v32 chunks.
 
 The storage visitor is not always identical to the raw in-memory inherent
 visitor benchmark. The remaining gap is mostly API shape: storage goes through
@@ -2679,7 +2679,7 @@ wrapping, while the raw inherent benchmark is the thinnest in-memory loop.
 This confirms the first-principles split:
   - use visit_scan_* for filtering/counting/index walks that can consume rows
     immediately;
-  - use scan_* / scan_*_into only when callers need an owned page.
+  - use scan_* / scan_*_into only when callers need an owned chunk.
 ```
 
 ### 2026-05-15: Isolated Storage Visitor Gap Profile
@@ -5167,7 +5167,7 @@ Added benchmark groups for the next suspected API cuts:
 
 ```text
 storage_v2/delete_range_fallback/<backend>/delete_prefix_q{100,1000,10000}
-storage_v2/scan_pagination/<backend>/{materialized,visit}/drain_range_q10000_page{1,10,100}
+storage_v2/scan_chunking/<backend>/{materialized,visit}/drain_range_q10000_chunk{1,10,100}
 storage_v2/durability_matrix/<backend>/{default,durable,relaxed}/puts_k1024_g16_v32
 ```
 
@@ -5176,7 +5176,7 @@ Command:
 ```sh
 STORAGE_V2_BENCH_SMOKE=1 \
 cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
-  'storage_v2/(delete_range_fallback|scan_pagination|durability_matrix)/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)'
+  'storage_v2/(delete_range_fallback|scan_chunking|durability_matrix)/(in_memory|sqlite_temp|redb_temp|rocksdb_temp)'
 ```
 
 Smoke baseline, selected means:
@@ -5186,8 +5186,8 @@ Smoke baseline, selected means:
 | delete prefix q100           |  13.45 us |   815.16 us |  16.71 ms |    160.13 us |
 | delete prefix q1000          | 155.17 us |     1.39 ms |  18.93 ms |    637.65 us |
 | delete prefix q10000         |   1.65 ms |     6.18 ms |  20.66 ms |      2.91 ms |
-| drain page1 materialized     |   3.08 ms |     6.57 ms |   6.98 ms |     12.17 ms |
-| drain page1 visit            |   2.31 ms |     5.89 ms |   6.59 ms |     12.34 ms |
+| drain chunk1 materialized     |   3.08 ms |     6.57 ms |   6.98 ms |     12.17 ms |
+| drain chunk1 visit            |   2.31 ms |     5.89 ms |   6.59 ms |     12.34 ms |
 | drain page10 materialized    | 521.04 us |     1.32 ms |   1.12 ms |      2.32 ms |
 | drain page10 visit           | 432.15 us |     1.16 ms |   1.12 ms |      2.22 ms |
 | drain page100 materialized   | 273.27 us |   766.02 us | 523.79 us |      1.31 ms |
@@ -5205,9 +5205,9 @@ delete_range:
   this smoke shape. This is enough evidence to benchmark a native
   delete_range/clear_prefix extension next, especially for SQLite and RocksDB.
 
-scan pagination:
-  Tiny page sizes are expensive across all real backends because storage
-  resumes by issuing many range scans. page1 is the stress case. page10/page100
+scan scan chunking:
+  Tiny chunk sizes are expensive across all real backends because storage
+  resumes by issuing many range scans. chunk1 is the stress case. page10/page100
   are much healthier. This creates the evidence lane needed before considering
   an optional cursorized scan extension.
 
@@ -5225,10 +5225,10 @@ Do not change the read core yet.
 The next backend/storage API experiment with clear evidence is:
   required delete_range(range) on BackendWrite
   storage_v2 delete_prefix/delete_range/clear_space helpers
-  compare backend primitive against scan key-only pages + delete_many fallback
+  compare backend primitive against scan key-only chunks + delete_many fallback
 
 Cursorized scans remain a second candidate, but only if domain workloads
-actually drain large ranges with very small page sizes.
+actually drain large ranges with very small chunk sizes.
 ```
 
 ## 2026-05-16 - Required backend delete_range core
@@ -5476,4 +5476,58 @@ For RocksDB, the native range tombstone shape is the big win:
   q10000 storage helper ~107 us
 
 This completes the delete-range API/storage cut from a performance perspective.
+```
+
+## 2026-05-17 - scan chunked-scan cursor probe
+
+Added chunking lanes to decide whether a cursorized scan API is worth the
+backend/lifetime complexity:
+
+```text
+drain_range_q10000_single
+drain_range_q10000_chunk1
+drain_range_q10000_chunk10
+drain_range_q10000_chunk100
+drain_prefix_q10000_chunk10
+drain_prefix_q10000_single
+```
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/scan_chunking'
+```
+
+Criterion mean estimates, visitor path:
+
+| Backend      | range single | range chunk1 | range chunk10 | range chunk100 | prefix single | prefix chunk10 |
+| ------------ | -----------: | ----------: | -----------: | ------------: | ------------: | ------------: |
+| in_memory    |    189.40 us |     2.54 ms |    438.68 us |     209.59 us |     191.62 us |     443.69 us |
+| sqlite_temp  |    464.68 us |     5.54 ms |      1.64 ms |     599.44 us |     483.30 us |       1.03 ms |
+| redb_temp    |    377.65 us |     6.54 ms |      1.02 ms |     463.86 us |     374.97 us |       1.00 ms |
+| rocksdb_temp |      1.13 ms |    11.85 ms |      2.33 ms |       1.23 ms |       1.07 ms |       2.22 ms |
+
+Ratios versus single-drain visitor baseline:
+
+| Backend      | range chunk1 | range chunk10 | range chunk100 | prefix chunk10 |
+| ------------ | ----------: | -----------: | ------------: | ------------: |
+| in_memory    |       13.4x |         2.3x |          1.1x |         2.3x |
+| sqlite_temp  |       11.9x |         3.5x |          1.3x |         2.1x |
+| redb_temp    |       17.3x |         2.7x |          1.2x |         2.7x |
+| rocksdb_temp |       10.5x |         2.1x |          1.1x |         2.1x |
+
+Interpretation:
+
+```text
+The repeated-resume scan chunking cost is real. Chunk size 1 is 10-17x slower
+than single-drain on every backend. Chunk size 10 is still 2-3.5x slower across
+all backends. Chunk size 100 is close to single-drain, so large chunks do not
+justify cursor complexity.
+
+This validates cursorized scan as the next API candidate if Lix has hot paths
+that deeply chunk ranges/prefixes with small chunk sizes. Keep visit_range as the
+required simple primitive; add cursoring as an extension or storage-selected
+fast path only if domain traces show small-chunk drains are common.
 ```

@@ -12,7 +12,7 @@ pub struct BackendCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendProfile {
     /// Ordered byte keys, coherent read views, batched point reads,
-    /// paged forward scans, and atomic write commit.
+    /// chunked forward scans, and atomic write commit.
     V0 { write_concurrency: WriteConcurrency },
 }
 

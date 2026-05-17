@@ -68,7 +68,7 @@ pub struct ScanOptions<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanPage {
+pub struct ScanChunk {
     pub entries: ReadBatch,
     pub has_more: bool,
 }

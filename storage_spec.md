@@ -552,7 +552,18 @@ cursor.
 
 If storage exposes an exact "no cursor means no more eligible rows" contract, it
 must perform lookahead or buffering after residual filtering. Otherwise the
-public contract must allow an extra empty-page read.
+public contract must allow an extra empty-chunk read.
+
+Deep small-chunk drains may later use a backend cursor extension. In that mode,
+storage opens one backend scan cursor and repeatedly calls:
+
+```rust
+cursor.visit_next(limit_rows, visitor)
+```
+
+The public storage concept remains a scan chunk, not a UI page or physical
+database page. `ScanChunk` is the materialized form; visitor scans emit the same
+logical chunk without allocating owned entries.
 
 ## Capability-Aware Lowering
 
@@ -591,8 +602,8 @@ If any eligibility-affecting predicate is inexact, final user limits belong
 above residual filtering.
 ```
 
-This means storage must keep scanning backend pages until it has enough rows
-after residual filtering or proves end-of-range. Backend `limit_rows` is a page
+This means storage must keep scanning backend chunks until it has enough rows
+after residual filtering or proves end-of-range. Backend `limit_rows` is a chunk
 hint whenever predicates/projections are not exact for final eligibility.
 
 For writes, storage_v2 is mandatory. For reads, storage_v2 helpers are
@@ -718,7 +729,7 @@ point batch:
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations
   backend_v2 exposes visitor-first point and range reads with borrowed KeyRef
-  and ProjectedValueRef row data; storage_v2 owns materializing point/ScanPage
+  and ProjectedValueRef row data; storage_v2 owns materializing point/ScanChunk
   shapes when callers need owned entries
 
 storage cursor resume:
@@ -901,7 +912,7 @@ storage_cursor_scope:
 
 residual_limit_correctness:
   final user limits are applied after residual filtering, not to raw backend
-  pages when predicates are not exact
+  chunks when predicates are not exact
 ```
 
 ## Suggested Initial File Structure

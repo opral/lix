@@ -170,10 +170,10 @@ fn detects_bad_byte_ordering_violation() {
 }
 
 #[test]
-fn detects_multi_page_drain_repeat_violation() {
+fn detects_multi_chunk_drain_repeat_violation() {
     assert_failed(
         BrokenMode::KeyResumeRepeatsLastKey,
-        "baseline::scan_range_drains_multi_page_limits",
+        "baseline::scan_range_drains_multi_chunk_limits",
     );
 }
 
