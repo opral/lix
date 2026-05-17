@@ -17,7 +17,7 @@ use lix_engine::backend_v2::{
     get_many as backend_get_many, Backend, BackendCapabilities, BackendError, BackendRead,
     BackendWrite, CommitResult, ConformanceBackend, CoreProjection, GetOptions, InMemoryBackend,
     Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch,
-    PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor,
+    PutEntry, ReadBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
     SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
@@ -120,28 +120,35 @@ struct PrefixCase {
 struct DeleteRangeCase {
     name: &'static str,
     rows: usize,
-    page_size: usize,
+    chunk_size: usize,
 }
 
 #[derive(Clone, Copy)]
-struct PaginationCase {
+struct ScanChunkingCase {
     name: &'static str,
     rows: usize,
-    page_size: usize,
+    chunk_size: usize,
+    scan: ScanChunkingMode,
+}
+
+#[derive(Clone, Copy)]
+enum ScanChunkingMode {
+    Range,
+    Prefix,
 }
 
 #[derive(Clone, Debug)]
 struct DeleteRangeFallbackStats {
     scanned: usize,
     deleted: usize,
-    pages: usize,
+    chunks: usize,
     write_stats: StorageWriteSetStats,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ScanDrainStats {
     scanned: usize,
-    pages: usize,
+    chunks: usize,
     backend_calls: u64,
 }
 
@@ -468,35 +475,56 @@ const DELETE_RANGE_CASES: &[DeleteRangeCase] = &[
     DeleteRangeCase {
         name: "delete_prefix_q100",
         rows: 100,
-        page_size: 256,
+        chunk_size: 256,
     },
     DeleteRangeCase {
         name: "delete_prefix_q1000",
         rows: 1_000,
-        page_size: 512,
+        chunk_size: 512,
     },
     DeleteRangeCase {
         name: "delete_prefix_q10000",
         rows: 10_000,
-        page_size: 1_024,
+        chunk_size: 1_024,
     },
 ];
 
-const PAGINATION_CASES: &[PaginationCase] = &[
-    PaginationCase {
-        name: "drain_range_q10000_page1",
+const SCAN_CHUNKING_CASES: &[ScanChunkingCase] = &[
+    ScanChunkingCase {
+        name: "drain_range_q10000_single",
         rows: 10_000,
-        page_size: 1,
+        chunk_size: 10_001,
+        scan: ScanChunkingMode::Range,
     },
-    PaginationCase {
-        name: "drain_range_q10000_page10",
+    ScanChunkingCase {
+        name: "drain_range_q10000_chunk1",
         rows: 10_000,
-        page_size: 10,
+        chunk_size: 1,
+        scan: ScanChunkingMode::Range,
     },
-    PaginationCase {
-        name: "drain_range_q10000_page100",
+    ScanChunkingCase {
+        name: "drain_range_q10000_chunk10",
         rows: 10_000,
-        page_size: 100,
+        chunk_size: 10,
+        scan: ScanChunkingMode::Range,
+    },
+    ScanChunkingCase {
+        name: "drain_range_q10000_chunk100",
+        rows: 10_000,
+        chunk_size: 100,
+        scan: ScanChunkingMode::Range,
+    },
+    ScanChunkingCase {
+        name: "drain_prefix_q10000_chunk10",
+        rows: 10_000,
+        chunk_size: 10,
+        scan: ScanChunkingMode::Prefix,
+    },
+    ScanChunkingCase {
+        name: "drain_prefix_q10000_single",
+        rows: 10_000,
+        chunk_size: 10_001,
+        scan: ScanChunkingMode::Prefix,
     },
 ];
 
@@ -536,10 +564,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_delete_range_storage_helpers(c, SqliteTempBenchBackend::new());
     bench_delete_range_storage_helpers(c, RedbTempBenchBackend::new());
     bench_delete_range_storage_helpers(c, RocksDbTempBenchBackend::new());
-    bench_scan_pagination_matrix(c, InMemoryBenchBackend);
-    bench_scan_pagination_matrix(c, SqliteTempBenchBackend::new());
-    bench_scan_pagination_matrix(c, RedbTempBenchBackend::new());
-    bench_scan_pagination_matrix(c, RocksDbTempBenchBackend::new());
+    bench_scan_chunking_matrix(c, InMemoryBenchBackend);
+    bench_scan_chunking_matrix(c, SqliteTempBenchBackend::new());
+    bench_scan_chunking_matrix(c, RedbTempBenchBackend::new());
+    bench_scan_chunking_matrix(c, RocksDbTempBenchBackend::new());
     bench_durable_commit(c, InMemoryBenchBackend);
     bench_durable_commit(c, SqliteTempBenchBackend::new());
     bench_durable_commit(c, RedbTempBenchBackend::new());
@@ -968,12 +996,12 @@ where
                         &storage,
                         space(1),
                         point_scan_range(),
-                        case.page_size,
+                        case.chunk_size,
                     )
                     .expect("delete range fallback");
                     assert_eq!(stats.scanned, case.rows);
                     assert_eq!(stats.deleted, case.rows);
-                    assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
+                    assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
                     assert_eq!(stats.write_stats.staged_deletes, case.rows as u64);
                     black_box(stats);
                 },
@@ -1117,11 +1145,11 @@ where
     group.finish();
 }
 
-fn bench_scan_pagination_matrix<B>(c: &mut Criterion, backend_family: B)
+fn bench_scan_chunking_matrix<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
 {
-    let group_name = format!("storage_v2/scan_pagination/{}", backend_family.name());
+    let group_name = format!("storage_v2/scan_chunking/{}", backend_family.name());
     let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
@@ -1132,10 +1160,10 @@ where
     let seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
     let read = seed
         .begin_read(ReadOptions::default())
-        .expect("begin pagination read");
+        .expect("begin chunked scan read");
     let scope = StorageReadScope::new(read);
 
-    for case in PAGINATION_CASES {
+    for case in SCAN_CHUNKING_CASES {
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(
             BenchmarkId::new("materialized", case.name),
@@ -1145,13 +1173,13 @@ where
                     let stats = drain_scan_materialized(
                         &scope,
                         space(1),
-                        point_scan_range(),
+                        case.scan,
                         case.rows,
-                        case.page_size,
+                        case.chunk_size,
                     )
-                    .expect("drain paginated materialized scan");
+                    .expect("drain chunked materialized scan");
                     assert_eq!(stats.scanned, case.rows);
-                    assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
+                    assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
                     black_box(stats);
                 });
             },
@@ -1159,16 +1187,11 @@ where
 
         group.bench_with_input(BenchmarkId::new("visit", case.name), case, |b, case| {
             b.iter(|| {
-                let stats = drain_scan_visit(
-                    &scope,
-                    space(1),
-                    point_scan_range(),
-                    case.rows,
-                    case.page_size,
-                )
-                .expect("drain paginated visitor scan");
+                let stats =
+                    drain_scan_visit(&scope, space(1), case.scan, case.rows, case.chunk_size)
+                        .expect("drain chunked visitor scan");
                 assert_eq!(stats.scanned, case.rows);
-                assert_eq!(stats.pages, case.rows.div_ceil(case.page_size));
+                assert_eq!(stats.chunks, case.rows.div_ceil(case.chunk_size));
                 black_box(stats);
             });
         });
@@ -1535,7 +1558,7 @@ fn bench_conformance_backend(c: &mut Criterion) {
     let scan_range = physical_point_scan_range(1);
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
-            let page = materialize_backend_scan(
+            let chunk = materialize_backend_scan(
                 &scan_read,
                 scan_range.clone(),
                 ScanOptions {
@@ -1545,8 +1568,8 @@ fn bench_conformance_backend(c: &mut Criterion) {
                 },
             )
             .expect("scan range");
-            assert_eq!(page.entries.entries.len(), 1_000);
-            black_box(page);
+            assert_eq!(chunk.entries.entries.len(), 1_000);
+            black_box(chunk);
         });
     });
 
@@ -1761,7 +1784,7 @@ where
 
         group.bench_function(format!("scan_range_q{rows}"), |b| {
             b.iter(|| {
-                let page = scan_scope
+                let chunk = scan_scope
                     .scan_range_with_stats(
                         space(1),
                         point_scan_range(),
@@ -1772,15 +1795,15 @@ where
                         },
                     )
                     .expect("backend matrix small materialized scan");
-                assert_eq!(page.value.entries.entries.len(), rows);
-                assert_eq!(page.stats.backend_calls, 1);
-                black_box(page.value);
+                assert_eq!(chunk.value.entries.entries.len(), rows);
+                assert_eq!(chunk.stats.backend_calls, 1);
+                black_box(chunk.value);
             });
         });
 
         group.bench_function(format!("prefix_scan_q{rows}"), |b| {
             b.iter(|| {
-                let page = scan_scope
+                let chunk = scan_scope
                     .scan_prefix_with_stats(
                         space(1),
                         Prefix {
@@ -1793,10 +1816,10 @@ where
                         },
                     )
                     .expect("backend matrix small prefix scan");
-                assert_eq!(page.value.entries.entries.len(), rows);
-                assert_eq!(page.stats.backend_calls, 1);
-                assert_eq!(page.stats.prefix_lowered, 1);
-                black_box(page.value);
+                assert_eq!(chunk.value.entries.entries.len(), rows);
+                assert_eq!(chunk.stats.backend_calls, 1);
+                assert_eq!(chunk.stats.prefix_lowered, 1);
+                black_box(chunk.value);
             });
         });
     }
@@ -1836,7 +1859,7 @@ where
 
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
-            let page = scan_scope
+            let chunk = scan_scope
                 .scan_range_with_stats(
                     space(1),
                     point_scan_range(),
@@ -1847,15 +1870,15 @@ where
                     },
                 )
                 .expect("backend matrix materialized scan");
-            assert_eq!(page.value.entries.entries.len(), 1_000);
-            assert_eq!(page.stats.backend_calls, 1);
-            black_box(page.value);
+            assert_eq!(chunk.value.entries.entries.len(), 1_000);
+            assert_eq!(chunk.stats.backend_calls, 1);
+            black_box(chunk.value);
         });
     });
 
     group.bench_function("prefix_scan_q1000", |b| {
         b.iter(|| {
-            let page = scan_scope
+            let chunk = scan_scope
                 .scan_prefix_with_stats(
                     space(1),
                     Prefix {
@@ -1868,10 +1891,10 @@ where
                     },
                 )
                 .expect("backend matrix prefix scan");
-            assert_eq!(page.value.entries.entries.len(), 1_000);
-            assert_eq!(page.stats.backend_calls, 1);
-            assert_eq!(page.stats.prefix_lowered, 1);
-            black_box(page.value);
+            assert_eq!(chunk.value.entries.entries.len(), 1_000);
+            assert_eq!(chunk.stats.backend_calls, 1);
+            assert_eq!(chunk.stats.prefix_lowered, 1);
+            black_box(chunk.value);
         });
     });
 
@@ -2195,7 +2218,7 @@ where
                     let read = scan_backend
                         .begin_read(ReadOptions::default())
                         .expect("begin direct materialized scan read");
-                    let page = materialize_backend_scan(
+                    let chunk = materialize_backend_scan(
                         &read,
                         scan_range.clone(),
                         ScanOptions {
@@ -2205,10 +2228,10 @@ where
                         },
                     )
                     .expect("direct materialized scan");
-                    assert_eq!(page.entries.entries.len(), 1_000);
-                    assert!(!page.has_more);
+                    assert_eq!(chunk.entries.entries.len(), 1_000);
+                    assert!(!chunk.has_more);
                     read.close().expect("close direct materialized scan read");
-                    black_box(page);
+                    black_box(chunk);
                 });
             });
         }
@@ -2545,7 +2568,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
     let scan_range = physical_point_scan_range(1);
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
-            let page = materialize_backend_scan(
+            let chunk = materialize_backend_scan(
                 &scan_read,
                 scan_range.clone(),
                 ScanOptions {
@@ -2555,8 +2578,8 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                 },
             )
             .expect("scan range");
-            assert_eq!(page.entries.entries.len(), 1_000);
-            black_box(page);
+            assert_eq!(chunk.entries.entries.len(), 1_000);
+            black_box(chunk);
         });
     });
 
@@ -2610,7 +2633,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         group.throughput(Throughput::Elements(rows as u64));
         group.bench_function(format!("owned_key_only_q{rows}"), |b| {
             b.iter(|| {
-                let page = materialize_backend_scan(
+                let chunk = materialize_backend_scan(
                     &read,
                     scan_range.clone(),
                     ScanOptions {
@@ -2620,8 +2643,8 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     },
                 )
                 .expect("scan range");
-                assert_eq!(page.entries.entries.len(), rows);
-                black_box(page);
+                assert_eq!(chunk.entries.entries.len(), rows);
+                black_box(chunk);
             });
         });
 
@@ -2660,7 +2683,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1_000));
         group.bench_function(format!("owned_full_value_q1000_v{value_size}"), |b| {
             b.iter(|| {
-                let page = materialize_backend_scan(
+                let chunk = materialize_backend_scan(
                     &read,
                     scan_range.clone(),
                     ScanOptions {
@@ -2670,8 +2693,8 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     },
                 )
                 .expect("scan range");
-                assert_eq!(page.entries.entries.len(), 1_000);
-                black_box(page);
+                assert_eq!(chunk.entries.entries.len(), 1_000);
+                black_box(chunk);
             });
         });
 
@@ -2716,18 +2739,18 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("visit_materialize_key_only_q1000", |b| {
         b.iter(|| {
-            let page =
+            let chunk =
                 materialize_scan_visit(&materialize_read, CoreProjection::KeyOnly, 1_001, None)
                     .expect("materialize visitor scan");
-            assert_eq!(page.entries.entries.len(), 1_000);
-            black_box(page);
+            assert_eq!(chunk.entries.entries.len(), 1_000);
+            black_box(chunk);
         });
     });
 
     group.bench_function("storage_buffer_key_only_q1000", |b| {
         let mut buffer = StorageScanBuffer::with_capacity(1_001);
         b.iter(|| {
-            let page = storage_materialize_read
+            let chunk = storage_materialize_read
                 .scan_range_into(
                     space(1),
                     point_scan_range(),
@@ -2739,9 +2762,9 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     &mut buffer,
                 )
                 .expect("storage scan buffer");
-            assert_eq!(page.entries.len(), 1_000);
-            black_box(page.entries);
-            black_box(page.has_more);
+            assert_eq!(chunk.entries.len(), 1_000);
+            black_box(chunk.entries);
+            black_box(chunk.has_more);
         });
     });
 
@@ -2773,11 +2796,11 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
 
     group.bench_function("visit_materialize_full_value_q1000_v32", |b| {
         b.iter(|| {
-            let page =
+            let chunk =
                 materialize_scan_visit(&materialize_read, CoreProjection::FullValue, 1_001, None)
                     .expect("materialize visitor scan");
-            assert_eq!(page.entries.entries.len(), 1_000);
-            black_box(page);
+            assert_eq!(chunk.entries.entries.len(), 1_000);
+            black_box(chunk);
         });
     });
 
@@ -2815,7 +2838,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
     group.bench_function("storage_buffer_full_value_q1000_v32", |b| {
         let mut buffer = StorageScanBuffer::with_capacity(1_001);
         b.iter(|| {
-            let page = storage_materialize_read
+            let chunk = storage_materialize_read
                 .scan_range_into(
                     space(1),
                     point_scan_range(),
@@ -2827,9 +2850,9 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     &mut buffer,
                 )
                 .expect("storage scan buffer");
-            assert_eq!(page.entries.len(), 1_000);
-            black_box(page.entries);
-            black_box(page.has_more);
+            assert_eq!(chunk.entries.len(), 1_000);
+            black_box(chunk.entries);
+            black_box(chunk.has_more);
         });
     });
 
@@ -2842,7 +2865,7 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         group.throughput(Throughput::Elements(limit_rows as u64));
         group.bench_function(format!("owned_key_only_q1000_limit{limit_rows}"), |b| {
             b.iter(|| {
-                let page = materialize_backend_scan(
+                let chunk = materialize_backend_scan(
                     &read,
                     scan_range.clone(),
                     ScanOptions {
@@ -2852,9 +2875,9 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     },
                 )
                 .expect("scan range");
-                assert_eq!(page.entries.entries.len(), limit_rows);
-                assert_eq!(page.has_more, limit_rows < 1_000);
-                black_box(page);
+                assert_eq!(chunk.entries.entries.len(), limit_rows);
+                assert_eq!(chunk.has_more, limit_rows < 1_000);
+                black_box(chunk);
             });
         });
 
@@ -2884,70 +2907,76 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         });
     }
 
-    for page_size in [10usize, 100] {
+    for chunk_size in [10usize, 100] {
         let backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
         let read = backend
             .begin_read(ReadOptions::default())
             .expect("begin read");
         let scan_range = physical_point_scan_range(1);
         group.throughput(Throughput::Elements(1_000));
-        group.bench_function(format!("owned_drain_key_only_q1000_page{page_size}"), |b| {
-            b.iter(|| {
-                let mut emitted = 0usize;
-                let mut resume_after = None;
-                loop {
-                    let page = materialize_backend_scan(
-                        &read,
-                        scan_range.clone(),
-                        ScanOptions {
-                            limit_rows: page_size,
-                            projection: CoreProjection::KeyOnly,
-                            resume_after: resume_after.as_ref(),
-                        },
-                    )
-                    .expect("scan range");
-                    emitted += page.entries.entries.len();
-                    resume_after = page.entries.entries.last().map(|entry| entry.key.clone());
-                    if !page.has_more {
-                        break;
-                    }
-                }
-                assert_eq!(emitted, 1_000);
-                black_box(resume_after);
-            });
-        });
-
-        group.bench_function(format!("visit_drain_key_only_q1000_page{page_size}"), |b| {
-            b.iter(|| {
-                let mut emitted = 0usize;
-                let mut resume_after = None;
-                loop {
-                    let mut page_last_key = None;
-                    let result = read
-                        .visit_scan_range(
+        group.bench_function(
+            format!("owned_drain_key_only_q1000_chunk{chunk_size}"),
+            |b| {
+                b.iter(|| {
+                    let mut emitted = 0usize;
+                    let mut resume_after = None;
+                    loop {
+                        let chunk = materialize_backend_scan(
+                            &read,
                             scan_range.clone(),
                             ScanOptions {
-                                limit_rows: page_size,
+                                limit_rows: chunk_size,
                                 projection: CoreProjection::KeyOnly,
                                 resume_after: resume_after.as_ref(),
                             },
-                            |key, value| {
-                                assert!(value.is_none());
-                                page_last_key = Some(key.to_owned_key());
-                                black_box(key);
-                            },
                         )
-                        .expect("visit scan range");
-                    emitted += result.emitted;
-                    resume_after = page_last_key;
-                    if !result.has_more {
-                        break;
+                        .expect("scan range");
+                        emitted += chunk.entries.entries.len();
+                        resume_after = chunk.entries.entries.last().map(|entry| entry.key.clone());
+                        if !chunk.has_more {
+                            break;
+                        }
                     }
-                }
-                assert_eq!(emitted, 1_000);
-                black_box(resume_after);
-            });
-        });
+                    assert_eq!(emitted, 1_000);
+                    black_box(resume_after);
+                });
+            },
+        );
+
+        group.bench_function(
+            format!("visit_drain_key_only_q1000_chunk{chunk_size}"),
+            |b| {
+                b.iter(|| {
+                    let mut emitted = 0usize;
+                    let mut resume_after = None;
+                    loop {
+                        let mut chunk_last_key = None;
+                        let result = read
+                            .visit_scan_range(
+                                scan_range.clone(),
+                                ScanOptions {
+                                    limit_rows: chunk_size,
+                                    projection: CoreProjection::KeyOnly,
+                                    resume_after: resume_after.as_ref(),
+                                },
+                                |key, value| {
+                                    assert!(value.is_none());
+                                    chunk_last_key = Some(key.to_owned_key());
+                                    black_box(key);
+                                },
+                            )
+                            .expect("visit scan range");
+                        emitted += result.emitted;
+                        resume_after = chunk_last_key;
+                        if !result.has_more {
+                            break;
+                        }
+                    }
+                    assert_eq!(emitted, 1_000);
+                    black_box(resume_after);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -3411,7 +3440,7 @@ fn fallback_delete_range<B>(
     storage: &StorageContext<B>,
     storage_space: StorageSpace,
     range: KeyRange,
-    page_size: usize,
+    chunk_size: usize,
 ) -> Result<DeleteRangeFallbackStats, String>
 where
     B: Backend,
@@ -3422,23 +3451,23 @@ where
     let mut keys = Vec::new();
     let mut resume_after = None::<Key>;
     let mut scanned = 0usize;
-    let mut pages = 0usize;
+    let mut chunks = 0usize;
 
     loop {
-        let mut page_last_key = None::<Key>;
+        let mut chunk_last_key = None::<Key>;
         let result = read
             .visit_scan_range(
                 storage_space,
                 range.clone(),
                 ScanOptions {
-                    limit_rows: page_size,
+                    limit_rows: chunk_size,
                     projection: CoreProjection::KeyOnly,
                     resume_after: resume_after.as_ref(),
                 },
                 &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                     assert!(matches!(value, ProjectedValueRef::KeyOnly));
                     let key = key.to_owned_key();
-                    page_last_key = Some(key.clone());
+                    chunk_last_key = Some(key.clone());
                     keys.push(key);
                     Ok(())
                 },
@@ -3446,8 +3475,8 @@ where
             .map_err(|error| error.to_string())?;
 
         scanned += result.emitted;
-        pages += usize::from(result.emitted > 0 || result.has_more);
-        resume_after = page_last_key;
+        chunks += usize::from(result.emitted > 0 || result.has_more);
+        resume_after = chunk_last_key;
 
         if !result.has_more {
             break;
@@ -3466,7 +3495,7 @@ where
     Ok(DeleteRangeFallbackStats {
         scanned,
         deleted: write_stats.staged_deletes as usize,
-        pages,
+        chunks,
         write_stats,
     })
 }
@@ -3474,9 +3503,9 @@ where
 fn drain_scan_materialized<R>(
     read: &R,
     storage_space: StorageSpace,
-    range: KeyRange,
+    scan: ScanChunkingMode,
     expected_rows: usize,
-    page_size: usize,
+    chunk_size: usize,
 ) -> Result<ScanDrainStats, BackendError>
 where
     R: StorageReader,
@@ -3485,30 +3514,38 @@ where
     let mut stats = ScanDrainStats::default();
 
     loop {
-        let page = read.scan_range_with_stats(
-            storage_space,
-            range.clone(),
-            ScanOptions {
-                limit_rows: page_size,
-                projection: CoreProjection::KeyOnly,
-                resume_after: resume_after.as_ref(),
-            },
-        )?;
+        let opts = ScanOptions {
+            limit_rows: chunk_size,
+            projection: CoreProjection::KeyOnly,
+            resume_after: resume_after.as_ref(),
+        };
+        let chunk = match scan {
+            ScanChunkingMode::Range => {
+                read.scan_range_with_stats(storage_space, point_scan_range(), opts)?
+            }
+            ScanChunkingMode::Prefix => read.scan_prefix_with_stats(
+                storage_space,
+                Prefix {
+                    bytes: Bytes::from_static(b"point-"),
+                },
+                opts,
+            )?,
+        };
 
-        let entries = &page.value.entries.entries;
+        let entries = &chunk.value.entries.entries;
         stats.scanned += entries.len();
-        stats.backend_calls += page.stats.backend_calls;
-        stats.pages += usize::from(!entries.is_empty() || page.value.has_more);
+        stats.backend_calls += chunk.stats.backend_calls;
+        stats.chunks += usize::from(!entries.is_empty() || chunk.value.has_more);
         resume_after = entries.last().map(|entry| entry.key.clone());
 
-        if !page.value.has_more {
+        if !chunk.value.has_more {
             break;
         }
     }
 
     assert_eq!(
         stats.backend_calls,
-        expected_rows.div_ceil(page_size) as u64
+        expected_rows.div_ceil(chunk_size) as u64
     );
     Ok(stats)
 }
@@ -3516,9 +3553,9 @@ where
 fn drain_scan_visit<R>(
     read: &R,
     storage_space: StorageSpace,
-    range: KeyRange,
+    scan: ScanChunkingMode,
     expected_rows: usize,
-    page_size: usize,
+    chunk_size: usize,
 ) -> Result<ScanDrainStats, BackendError>
 where
     R: StorageReader,
@@ -3527,26 +3564,35 @@ where
     let mut stats = ScanDrainStats::default();
 
     loop {
-        let mut page_last_key = None::<Key>;
-        let result = read.visit_scan_range(
-            storage_space,
-            range.clone(),
-            ScanOptions {
-                limit_rows: page_size,
-                projection: CoreProjection::KeyOnly,
-                resume_after: resume_after.as_ref(),
-            },
-            &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                page_last_key = Some(key.to_owned_key());
-                Ok(())
-            },
-        )?;
+        let mut chunk_last_key = None::<Key>;
+        let opts = ScanOptions {
+            limit_rows: chunk_size,
+            projection: CoreProjection::KeyOnly,
+            resume_after: resume_after.as_ref(),
+        };
+        let mut visitor = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            assert!(matches!(value, ProjectedValueRef::KeyOnly));
+            chunk_last_key = Some(key.to_owned_key());
+            Ok(())
+        };
+        let result = match scan {
+            ScanChunkingMode::Range => {
+                read.visit_scan_range(storage_space, point_scan_range(), opts, &mut visitor)?
+            }
+            ScanChunkingMode::Prefix => read.visit_scan_prefix(
+                storage_space,
+                Prefix {
+                    bytes: Bytes::from_static(b"point-"),
+                },
+                opts,
+                &mut visitor,
+            )?,
+        };
 
         stats.scanned += result.emitted;
         stats.backend_calls += 1;
-        stats.pages += usize::from(result.emitted > 0 || result.has_more);
-        resume_after = page_last_key;
+        stats.chunks += usize::from(result.emitted > 0 || result.has_more);
+        resume_after = chunk_last_key;
 
         if !result.has_more {
             break;
@@ -3555,7 +3601,7 @@ where
 
     assert_eq!(
         stats.backend_calls,
-        expected_rows.div_ceil(page_size) as u64
+        expected_rows.div_ceil(chunk_size) as u64
     );
     Ok(stats)
 }
@@ -3587,7 +3633,7 @@ fn materialize_backend_scan<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, BackendError>
+) -> Result<ScanChunk, BackendError>
 where
     R: BackendRead,
 {
@@ -3603,7 +3649,7 @@ where
             Ok(())
         },
     )?;
-    Ok(ScanPage {
+    Ok(ScanChunk {
         entries: ReadBatch { entries },
         has_more: result.has_more,
     })
@@ -3614,7 +3660,7 @@ fn materialize_scan_visit(
     projection: CoreProjection,
     limit_rows: usize,
     resume_after: Option<&Key>,
-) -> Result<ScanPage, BackendError> {
+) -> Result<ScanChunk, BackendError> {
     let mut entries = Vec::with_capacity(limit_rows);
     let result = read.visit_scan_range(
         physical_point_scan_range(1),
@@ -3634,7 +3680,7 @@ fn materialize_scan_visit(
             });
         },
     )?;
-    Ok(ScanPage {
+    Ok(ScanChunk {
         entries: ReadBatch { entries },
         has_more: result.has_more,
     })

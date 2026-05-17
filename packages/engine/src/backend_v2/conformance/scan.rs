@@ -13,7 +13,7 @@ where
         report.add_pending("scan::reverse_returns_descending_keys");
     }
     if capabilities.scan.limit_bytes {
-        report.add_pending("scan::limit_bytes_bounds_page_size");
+        report.add_pending("scan::limit_bytes_bounds_chunk_size");
     }
     if capabilities.scan.long_lived_cursors {
         report.add_pending("scan::long_lived_cursors_resume_across_read_views");

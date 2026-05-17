@@ -10,7 +10,7 @@ access, forward row-bounded range visits, and atomic batched writes.
 Everything else is either `storage_v2` adapter behavior or an additive backend
 extension: prefix lowering, caller-order reconstruction, storage cursors,
 projection fallback, residual filtering, preconditions, predicate
-pushdown, envelope slicing, object/segment pruning, byte-bounded pages,
+pushdown, envelope slicing, object/segment pruning, byte-bounded chunks,
 long-lived cursors, parallel scan partitions, and native idempotent commits.
 
 The public extension point is backend, not "bring your own storage".
@@ -71,7 +71,7 @@ Domain stores:
 ```
 
 This keeps the backend close to FoundationDB/RocksDB-style primitives while
-preserving the important goals: explicit access shape, paged reads, batching,
+preserving the important goals: explicit access shape, chunked reads, batching,
 snapshots, atomic writes, and Big-O-visible fallback costs in `storage_v2`.
 
 Most users should bring their own backend. A backend author implements the
@@ -120,7 +120,7 @@ write transaction:
   atomic mutation unit; write handles are mutation sinks, not read handles
 
 range scans:
-  forward, row-bounded, paged
+  forward, row-bounded, 
   continuation resumes strictly after the last emitted key
 
 point reads:
@@ -150,7 +150,7 @@ idempotent commit
 exact predicate pushdown
 inexact segment/object pruning
 parallel scan partitions
-byte-bounded pages
+byte-bounded chunks
 long-lived cursors
 ```
 
@@ -463,14 +463,45 @@ buffer, SQLite row value, RocksDB slice, redb table value, or in-memory map
 entry. Callers that need to retain rows must materialize them above the backend
 boundary.
 
-Materialized scan pages are a storage adapter convenience:
+Materialized scan chunks are a storage adapter convenience:
 
 ```rust
-pub struct ScanPage {
+pub struct ScanChunk {
     pub entries: ReadBatch,
     pub has_more: bool,
 }
 ```
+
+Cursorized scans are a future extension for deep small-chunk drains. They keep
+`visit_range` as the simple required primitive, but allow backends with native
+iterators/statements/range cursors to seek once and emit repeated chunks:
+
+```rust
+pub trait BackendCursorRead: BackendRead {
+    type Cursor<'a>: BackendScanCursor + 'a
+    where
+        Self: 'a;
+
+    fn open_range_cursor<'a>(
+        &'a self,
+        range: KeyRange,
+        opts: ScanOptions<'a>,
+    ) -> Result<Self::Cursor<'a>, BackendError>;
+}
+
+pub trait BackendScanCursor {
+    fn visit_next<V>(
+        &mut self,
+        limit_rows: usize,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
+}
+```
+
+The unit of continuation is a scan chunk: `visit_next(limit_rows, visitor)`
+returns at most `limit_rows` rows from the same opened scan.
 
 ## Projection / Envelope Extensions
 
@@ -707,7 +738,7 @@ pub struct BackendCapabilities {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendProfile {
-    /// Ordered byte keys, coherent read views, paged forward scans,
+    /// Ordered byte keys, coherent read views, chunked forward scans,
     /// batched visit_many, and atomic write commit.
     V0 {
         write_concurrency: WriteConcurrency,
@@ -740,7 +771,7 @@ pub struct ScanCapabilities {
     /// Forward scan is core. Reverse is optional.
     pub reverse: bool,
 
-    /// Row-bounded forward pages are core. Byte-bounded pages are optional.
+    /// Row-bounded forward chunks are core. Byte-bounded chunks are optional.
     pub limit_bytes: bool,
 
     /// Core v0 scan continuation is key-resume. This means the backend exposes
@@ -836,7 +867,7 @@ pub trait BackendPushdownExt {
         &self,
         range: KeyRange,
         opts: PushdownScanOptions<'_>,
-    ) -> Result<PushdownScanPage, BackendError>;
+    ) -> Result<PushdownScanChunk, BackendError>;
 }
 ```
 
@@ -981,7 +1012,7 @@ pub enum OrderSupport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitSupport {
     Final,
-    PageHintOnly,
+    ChunkHintOnly,
     NotApplied,
 }
 ```
@@ -1005,7 +1036,7 @@ LimitSupport::Final:
   only allowed if all eligibility-affecting predicates are Exact or
   Unsupported-not-applied.
 
-LimitSupport::PageHintOnly:
+LimitSupport::ChunkHintOnly:
   backend may use limit for batching, but storage owns final limit.
 
 LimitSupport::NotApplied:
@@ -1171,7 +1202,7 @@ are specified and measured against real backends.
 Do not make every backend implement this as the core:
 
 ```rust
-read(ReadPlan) -> ReadPage
+read(ReadPlan) -> ReadChunk
 ```
 
 Make the core look like native backend calls:
@@ -1281,7 +1312,7 @@ let deleted_false = BackendPredicate {
 
 let range = Prefix { bytes: schema_file_prefix }.to_range()?;
 let physical_range = TRACKED_BY_FILE_SPACE.encode_range(range, storage_cursor.last_key());
-let mut page_entries = Vec::new();
+let mut chunk_entries = Vec::new();
 let result = read.visit_range(
     physical_range,
     ScanOptions {
@@ -1290,7 +1321,7 @@ let result = read.visit_range(
         resume_after: None,
     },
     &mut |key, value| {
-        page_entries.push((key.to_owned_key(), value.to_owned()));
+        chunk_entries.push((key.to_owned_key(), value.to_owned()));
         Ok(())
     },
 )?;
@@ -1420,7 +1451,7 @@ space
 key prefix/range
 projection
 optional physical predicate
-paged scan
+chunked scan
 point batch
 atomic mutation batch
 ```
@@ -1457,7 +1488,7 @@ Required guarantees:
 ordered keys
 coherent read view
 batched visit_many over requested keys
-forward row-bounded paged scans
+forward row-bounded chunked scans
 key-resume continuation within the same read view
 atomic write commit
 FullValue and KeyOnly projections
@@ -1501,7 +1532,7 @@ limit correctness rules
 ```text
 native prefix optimization
 reverse scan
-byte-bounded pages
+byte-bounded chunks
 long-lived cursors
 parallel partitions
 object/segment pruning
@@ -1531,7 +1562,7 @@ packages/engine/src/backend_v2/conformance/
 `baseline.rs` contains the required tests every backend must pass before
 capabilities matter. It validates the v0 invariants: raw lexicographic byte-key
 ordering, opaque byte value preservation, coherent reads pinned across later
-commits, batched `visit_many`, forward row-bounded scans, multi-page key-resume
+commits, batched `visit_many`, forward row-bounded scans, multi-chunk key-resume
 draining without repeats/skips, atomic writes, rollback for
 new/overwrite/delete mutations, and `FullValue`/`KeyOnly`.
 

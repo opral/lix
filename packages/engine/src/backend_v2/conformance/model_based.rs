@@ -10,8 +10,8 @@ use crate::backend_v2::conformance::{
 };
 use crate::backend_v2::{
     get_many as backend_get_many, Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange,
-    KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
-    ScanPage, WriteOptions,
+    KeyRef, ProjectedValue, ProjectedValueRef, ReadBatch, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -142,7 +142,7 @@ where
         lower: Bound::Included(lower),
         upper: Bound::Included(upper),
     };
-    let page = scan_range(
+    let chunk = scan_range(
         read,
         range.clone(),
         ScanOptions {
@@ -151,7 +151,7 @@ where
         },
     )
     .map_err(|error| format!("{label}: scan_range failed: {error}"))?;
-    let actual_scan = page_entries(&page.entries.entries);
+    let actual_scan = chunk_entries(&chunk.entries.entries);
     let expected_scan = model_scan(model, &range, Some(3));
     if actual_scan != expected_scan {
         return Err(format!(
@@ -166,7 +166,7 @@ fn scan_range<R>(
     read: &R,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, crate::backend_v2::BackendError>
+) -> Result<ScanChunk, crate::backend_v2::BackendError>
 where
     R: BackendRead,
 {
@@ -182,7 +182,7 @@ where
             Ok(())
         },
     )?;
-    Ok(ScanPage {
+    Ok(ScanChunk {
         entries: ReadBatch { entries },
         has_more: result.has_more,
     })
@@ -211,7 +211,7 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
     lower_matches && upper_matches
 }
 
-fn page_entries(entries: &[crate::backend_v2::ReadEntry]) -> Vec<(Key, Bytes)> {
+fn chunk_entries(entries: &[crate::backend_v2::ReadEntry]) -> Vec<(Key, Bytes)> {
     entries
         .iter()
         .map(|entry| (entry.key.clone(), projected_value_bytes(&entry.value)))
@@ -219,7 +219,7 @@ fn page_entries(entries: &[crate::backend_v2::ReadEntry]) -> Vec<(Key, Bytes)> {
 }
 
 fn entries_to_map(entries: &[crate::backend_v2::ReadEntry]) -> BTreeMap<Key, Bytes> {
-    page_entries(entries).into_iter().collect()
+    chunk_entries(entries).into_iter().collect()
 }
 
 fn projected_value_bytes(value: &ProjectedValue) -> Bytes {

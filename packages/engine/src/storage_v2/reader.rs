@@ -1,6 +1,6 @@
 use crate::backend_v2::{
     BackendError, BackendRead, GetOptions, Key, KeyRange, PointVisitor, Prefix, ProjectedValue,
-    ProjectedValueRef, ScanOptions, ScanPage, ScanResult, ScanVisitor,
+    ProjectedValueRef, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
 };
 use crate::storage_v2::{
     get_many_borrowed_indexed_values_for_physical_plan,
@@ -17,7 +17,7 @@ use crate::storage_v2::{
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_into, scan_prefix_with_stats,
     scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix, visit_scan_range,
     visit_unique_point_values_for_physical_plan, visit_unique_point_values_for_plan,
-    BorrowedIndexedPointValues, BorrowedScanPage, BufferedIndexedPointValues, IndexedPointValues,
+    BorrowedIndexedPointValues, BorrowedScanChunk, BufferedIndexedPointValues, IndexedPointValues,
     PhysicalPointRequestPlan, PointRequestPlan, PointSlot, PointValueBuffer, StorageReadResult,
     StorageReadScope, StorageReadStats, StorageScanBuffer, StorageSpace,
 };
@@ -171,14 +171,14 @@ pub trait StorageReader {
         space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError>;
+    ) -> Result<ScanChunk, BackendError>;
 
     fn scan_prefix(
         &self,
         space: StorageSpace,
         prefix: Prefix,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError>;
+    ) -> Result<ScanChunk, BackendError>;
 
     fn scan_range_into<'a>(
         &self,
@@ -186,7 +186,7 @@ pub trait StorageReader {
         range: KeyRange,
         opts: ScanOptions<'_>,
         buffer: &'a mut StorageScanBuffer,
-    ) -> Result<BorrowedScanPage<'a>, BackendError>;
+    ) -> Result<BorrowedScanChunk<'a>, BackendError>;
 
     fn scan_prefix_into<'a>(
         &self,
@@ -194,7 +194,7 @@ pub trait StorageReader {
         prefix: Prefix,
         opts: ScanOptions<'_>,
         buffer: &'a mut StorageScanBuffer,
-    ) -> Result<BorrowedScanPage<'a>, BackendError>;
+    ) -> Result<BorrowedScanChunk<'a>, BackendError>;
 
     fn visit_scan_range<V>(
         &self,
@@ -221,14 +221,14 @@ pub trait StorageReader {
         space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<StorageReadResult<ScanPage>, BackendError>;
+    ) -> Result<StorageReadResult<ScanChunk>, BackendError>;
 
     fn scan_prefix_with_stats(
         &self,
         space: StorageSpace,
         prefix: Prefix,
         opts: ScanOptions<'_>,
-    ) -> Result<StorageReadResult<ScanPage>, BackendError>;
+    ) -> Result<StorageReadResult<ScanChunk>, BackendError>;
 }
 
 impl<R> StorageReader for StorageReadScope<R>
@@ -445,7 +445,7 @@ where
         space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+    ) -> Result<ScanChunk, BackendError> {
         scan_range(self.backend_read(), space.id, range, opts)
     }
 
@@ -454,7 +454,7 @@ where
         space: StorageSpace,
         prefix: Prefix,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+    ) -> Result<ScanChunk, BackendError> {
         scan_prefix(self.backend_read(), space.id, prefix, opts)
     }
 
@@ -464,7 +464,7 @@ where
         range: KeyRange,
         opts: ScanOptions<'_>,
         buffer: &'a mut StorageScanBuffer,
-    ) -> Result<BorrowedScanPage<'a>, BackendError> {
+    ) -> Result<BorrowedScanChunk<'a>, BackendError> {
         scan_range_into(self.backend_read(), space.id, range, opts, buffer)
     }
 
@@ -474,7 +474,7 @@ where
         prefix: Prefix,
         opts: ScanOptions<'_>,
         buffer: &'a mut StorageScanBuffer,
-    ) -> Result<BorrowedScanPage<'a>, BackendError> {
+    ) -> Result<BorrowedScanChunk<'a>, BackendError> {
         scan_prefix_into(self.backend_read(), space.id, prefix, opts, buffer)
     }
 
@@ -509,7 +509,7 @@ where
         space: StorageSpace,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<StorageReadResult<ScanPage>, BackendError> {
+    ) -> Result<StorageReadResult<ScanChunk>, BackendError> {
         scan_range_with_stats(self.backend_read(), space.id, range, opts)
     }
 
@@ -518,7 +518,7 @@ where
         space: StorageSpace,
         prefix: Prefix,
         opts: ScanOptions<'_>,
-    ) -> Result<StorageReadResult<ScanPage>, BackendError> {
+    ) -> Result<StorageReadResult<ScanChunk>, BackendError> {
         scan_prefix_with_stats(self.backend_read(), space.id, prefix, opts)
     }
 }
@@ -1079,7 +1079,7 @@ mod tests {
         let read = storage
             .begin_read(ReadOptions::default())
             .expect("begin read");
-        let page = read
+        let chunk = read
             .scan_prefix(
                 space(1),
                 Prefix {
@@ -1094,7 +1094,8 @@ mod tests {
             .expect("prefix scan");
 
         assert_eq!(
-            page.entries
+            chunk
+                .entries
                 .entries
                 .into_iter()
                 .map(|entry| (entry.key, entry.value))
@@ -1104,7 +1105,7 @@ mod tests {
                 (key("ab"), ProjectedValue::KeyOnly),
             ]
         );
-        assert!(!page.has_more);
+        assert!(!chunk.has_more);
     }
 
     #[test]
@@ -1124,7 +1125,7 @@ mod tests {
         let mut buffer = StorageScanBuffer::with_capacity(8);
 
         {
-            let page = read
+            let chunk = read
                 .scan_range_into(
                     space(1),
                     KeyRange {
@@ -1141,7 +1142,8 @@ mod tests {
                 .expect("scan range into");
 
             assert_eq!(
-                page.entries
+                chunk
+                    .entries
                     .iter()
                     .map(|entry| (&entry.key, &entry.value))
                     .collect::<Vec<_>>(),
@@ -1150,14 +1152,14 @@ mod tests {
                     (&key("ab"), &ProjectedValue::KeyOnly),
                 ]
             );
-            assert!(!page.has_more);
+            assert!(!chunk.has_more);
         }
 
         let capacity_after_first_scan = buffer.capacity();
         assert!(capacity_after_first_scan >= 8);
 
         {
-            let page = read
+            let chunk = read
                 .scan_prefix_into(
                     space(1),
                     Prefix {
@@ -1173,7 +1175,8 @@ mod tests {
                 .expect("scan prefix into");
 
             assert_eq!(
-                page.entries
+                chunk
+                    .entries
                     .iter()
                     .map(|entry| (&entry.key, &entry.value))
                     .collect::<Vec<_>>(),
@@ -1188,7 +1191,7 @@ mod tests {
                     ),
                 ]
             );
-            assert!(!page.has_more);
+            assert!(!chunk.has_more);
         }
 
         assert_eq!(buffer.capacity(), capacity_after_first_scan);
