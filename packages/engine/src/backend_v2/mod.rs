@@ -32,8 +32,8 @@ pub use predicate::{
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
 };
 pub use traits::{
-    get_many, visit_range, Backend, BackendRead, BackendScanCursor, BackendWrite,
-    BufferedScanCursor, PointVisitor, ScanVisitor,
+    get_many, visit_range, Backend, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+    PointVisitor, ScanVisitor,
 };
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,

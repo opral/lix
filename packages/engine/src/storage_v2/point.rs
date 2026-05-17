@@ -767,7 +767,7 @@ where
         }
     }
 
-    read.visit_many(physical_unique_keys, opts, &mut Collector { values })
+    read.visit_keys(physical_unique_keys, opts, &mut Collector { values })
 }
 
 fn collect_unique_values_into<R>(
@@ -828,7 +828,7 @@ where
         }
     }
 
-    read.visit_many(
+    read.visit_keys(
         &physical_keys,
         opts,
         &mut LogicalPointVisitor {
@@ -877,7 +877,7 @@ where
         }
     }
 
-    read.visit_many(
+    read.visit_keys(
         &plan.physical_unique_keys,
         opts,
         &mut LogicalPointVisitor {

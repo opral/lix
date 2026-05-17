@@ -8,7 +8,7 @@ use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedScanCursor,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
     ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
     ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
@@ -301,9 +301,9 @@ impl Backend for BrokenBackend {
 }
 
 impl BackendRead for BrokenRead {
-    type ScanCursor<'a> = BufferedScanCursor;
+    type RangeScan<'a> = BufferedRangeScan;
 
-    fn visit_many<V>(
+    fn visit_keys<V>(
         &self,
         keys: &[Key],
         opts: GetOptions<'_>,
@@ -330,17 +330,17 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        visit_many_from_map(entries, self.mode, keys, opts, visitor)
+        visit_keys_from_map(entries, self.mode, keys, opts, visitor)
     }
 
-    fn with_scan_cursor<T, F>(
+    fn with_range_scan<T, F>(
         &self,
         range: KeyRange,
         opts: ScanOptions<'_>,
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         let live_entries;
         let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
@@ -354,7 +354,7 @@ impl BackendRead for BrokenRead {
             &self.snapshot
         };
         let mut cursor =
-            BufferedScanCursor::new(scan_rows_from_map(entries, self.mode, range, opts));
+            BufferedRangeScan::new(scan_rows_from_map(entries, self.mode, range, opts));
         f(&mut cursor)
     }
 }
@@ -443,7 +443,7 @@ impl BrokenBackend {
     }
 }
 
-fn visit_many_from_map<V>(
+fn visit_keys_from_map<V>(
     entries: &BrokenMap,
     mode: BrokenMode,
     keys: &[Key],

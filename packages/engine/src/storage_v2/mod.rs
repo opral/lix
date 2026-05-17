@@ -42,9 +42,9 @@ pub use reader::StorageReader;
 pub(crate) use scan::{
     scan_prefix, scan_prefix_into, scan_prefix_with_stats, scan_range, scan_range_into,
     scan_range_with_stats, visit_scan_prefix, visit_scan_prefix_with_stats, visit_scan_range,
-    visit_scan_range_with_stats, with_scan_prefix_cursor, with_scan_range_cursor,
+    visit_scan_range_with_stats, with_prefix_scan, with_range_scan,
 };
-pub use scan::{BorrowedScanChunk, StorageScanBuffer, StorageScanCursor};
+pub use scan::{BorrowedScanChunk, StorageRangeScan, StorageScanBuffer};
 pub(crate) use spaces::decode_logical_key_ref;
 pub use spaces::StorageSpace;
 pub use stats::{
