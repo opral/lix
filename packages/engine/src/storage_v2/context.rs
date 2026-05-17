@@ -459,6 +459,8 @@ mod shape_tests {
     }
 
     impl BackendRead for SpyRead {
+        type ScanCursor<'a> = BufferedScanCursor;
+
         fn visit_many<V>(
             &self,
             keys: &[Key],
@@ -484,7 +486,7 @@ mod shape_tests {
             f: F,
         ) -> Result<T, BackendError>
         where
-            F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+            F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
         {
             self.scan_range_calls.set(self.scan_range_calls.get() + 1);
             self.scan_range.replace(Some(range));

@@ -33,7 +33,7 @@ where
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut StorageScanCursor<'_, R::ScanCursor<'_>>) -> Result<T, BackendError>,
     {
         with_scan_range_cursor(&self.read, space.id, range, opts, f)
     }
@@ -46,7 +46,7 @@ where
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut StorageScanCursor<'_>) -> Result<T, BackendError>,
+        F: FnOnce(&mut StorageScanCursor<'_, R::ScanCursor<'_>>) -> Result<T, BackendError>,
     {
         with_scan_prefix_cursor(&self.read, space.id, prefix, opts, f)
     }

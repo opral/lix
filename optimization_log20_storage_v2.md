@@ -5711,3 +5711,108 @@ The next decision is whether to recover the easy-backend fast path with a
 monomorphic helper while keeping callback-scoped semantics for SQLite/redb, or
 accept the small universal abstraction cost for a simpler backend API.
 ```
+
+## 2026-05-17 - fast monomorphic scan cursor extension
+
+Added an optional fast scan cursor extension:
+
+```text
+BackendReadFastScan::with_fast_scan_cursor(...)
+FastBackendScanCursor::visit_next_fast<V: ScanVisitor>(...)
+```
+
+The required backend API remains callback-scoped and object-safe for SQLite/redb.
+The fast path is implemented for in-memory and RocksDB, where the native cursor
+can borrow cleanly from the read snapshot and keep the row visitor monomorphic.
+
+Before command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'scan_chunking/(in_memory|rocksdb_temp|sqlite_temp|redb_temp)/cursor_visit/drain_range_q10000_chunk(10|100)'
+```
+
+After command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'scan_chunking/(in_memory|rocksdb_temp)/(cursor_visit|fast_cursor_visit)/drain_range_q10000_chunk(10|100)'
+```
+
+Criterion mean estimates:
+
+| Backend      | Case     | Required cursor before | Required cursor after | Fast cursor after | Fast vs before |
+| ------------ | -------- | ---------------------: | --------------------: | ----------------: | -------------: |
+| in_memory    | chunk10  |               31.50 us |              33.11 us |          25.93 us |     1.2x faster |
+| in_memory    | chunk100 |               24.39 us |              28.61 us |          19.61 us |     1.2x faster |
+| rocksdb_temp | chunk10  |              874.37 us |             934.78 us |         925.39 us |         neutral |
+| rocksdb_temp | chunk100 |              877.87 us |             986.05 us |         891.12 us |         neutral |
+
+Interpretation:
+
+```text
+The extension pays off clearly for in_memory, where the row loop is cheap enough
+that Rust dispatch and adapter shape still matter. The fast path recovers and
+slightly improves the pre-callback cursor cost while preserving the SQLite-safe
+required API.
+
+RocksDB is essentially neutral in smoke measurements. The fast path removes the
+storage-side dyn visitor boundary, but RocksDB scan cost is now dominated by the
+engine iterator/value path and benchmark noise rather than the storage adapter.
+
+Do not hard-require the fast cursor extension. Keep it as an optimization
+extension for backends with easy native cursor lifetimes.
+```
+
+## 2026-05-17 - consolidated single scan cursor API
+
+Replaced the temporary required-cursor plus fast-cursor split with one scan
+cursor API:
+
+```text
+BackendRead::ScanCursor<'cursor>
+BackendRead::with_scan_cursor(...)
+BackendScanCursor::visit_next<V: ScanVisitor + ?Sized>(...)
+```
+
+This keeps the callback-scoped lifetime model needed by SQLite/redb, while
+making the emitted-row visitor generic on the one required cursor path. The
+backend API is back to "one API, one job": open a scan cursor and visit the next
+chunk.
+
+Command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'scan_chunking/(in_memory|rocksdb_temp|sqlite_temp|redb_temp)/cursor_visit/drain_range_q10000_chunk(10|100)'
+```
+
+Criterion mean estimates:
+
+| Backend      | Case     | Callback dyn cursor | Unified cursor | Delta |
+| ------------ | -------- | ------------------: | -------------: | ----: |
+| in_memory    | chunk10  |            33.11 us |       24.35 us | 1.4x faster |
+| in_memory    | chunk100 |            28.61 us |       21.04 us | 1.4x faster |
+| sqlite_temp  | chunk10  |           304.84 us |      336.69 us | 10% slower |
+| sqlite_temp  | chunk100 |           292.72 us |      307.16 us | 5% slower |
+| redb_temp    | chunk10  |           368.27 us |      307.28 us | 1.2x faster |
+| redb_temp    | chunk100 |           343.36 us |      304.08 us | 1.1x faster |
+| rocksdb_temp | chunk10  |           934.78 us |        1.04 ms | 11% slower |
+| rocksdb_temp | chunk100 |           986.05 us |        1.04 ms | 6% slower |
+
+Interpretation:
+
+```text
+The unified cursor removes the conceptual split and recovers the in-memory
+benefit on the required path. redb also improves in this smoke lane. SQLite and
+RocksDB are slightly slower in this run; those lanes are now dominated by
+backend-local statement/iterator/value costs and smoke-run noise more than the
+storage API shape.
+
+Given the API simplicity win, keep the single associated cursor unless a fuller
+scorecard shows a durable RocksDB regression large enough to justify more
+complexity.
+```

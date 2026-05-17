@@ -3112,6 +3112,8 @@ impl PointReadBackend {
 }
 
 impl BackendRead for PointReadBackend {
+    type ScanCursor<'a> = BufferedScanCursor;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -3140,7 +3142,7 @@ impl BackendRead for PointReadBackend {
         _f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         unreachable!("point-read benchmark does not scan")
     }
@@ -3169,6 +3171,8 @@ impl LeanPointReadBackend {
 }
 
 impl BackendRead for LeanPointReadBackend {
+    type ScanCursor<'a> = BufferedScanCursor;
+
     fn visit_many<V>(
         &self,
         keys: &[Key],
@@ -3196,7 +3200,7 @@ impl BackendRead for LeanPointReadBackend {
         _f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         unreachable!("lean point-read benchmark does not scan")
     }
@@ -3225,6 +3229,8 @@ impl PrefixReadBackend {
 }
 
 impl BackendRead for PrefixReadBackend {
+    type ScanCursor<'a> = BufferedScanCursor;
+
     fn visit_many<V>(
         &self,
         _keys: &[Key],
@@ -3244,7 +3250,7 @@ impl BackendRead for PrefixReadBackend {
         f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         assert_eq!(range.lower, Bound::Included(key("row-")));
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
@@ -3261,6 +3267,8 @@ impl BackendRead for PrefixReadBackend {
 struct EmptyRead;
 
 impl BackendRead for EmptyRead {
+    type ScanCursor<'a> = BufferedScanCursor;
+
     fn visit_many<V>(
         &self,
         _keys: &[Key],
@@ -3280,7 +3288,7 @@ impl BackendRead for EmptyRead {
         _f: F,
     ) -> Result<T, BackendError>
     where
-        F: FnOnce(&mut dyn BackendScanCursor) -> Result<T, BackendError>,
+        F: FnOnce(&mut Self::ScanCursor<'_>) -> Result<T, BackendError>,
     {
         unreachable!("write-set benchmark does not scan")
     }
@@ -3650,31 +3658,12 @@ where
         resume_after: None,
     };
     let mut stats = ScanDrainStats::default();
-    let mut drain = |cursor: &mut lix_engine::storage_v2::StorageScanCursor<'_>| {
-        loop {
-            let result = cursor.visit_next_with_stats(
-                chunk_size,
-                &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                    Ok(())
-                },
-            )?;
-
-            stats.scanned += result.value.emitted;
-            stats.backend_calls += result.stats.backend_calls;
-            stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
-            stats.read_stats.add(result.stats);
-
-            if !result.value.has_more {
-                break;
-            }
-        }
-        Ok::<(), BackendError>(())
-    };
 
     match scan {
         ScanChunkingMode::Range => {
-            read.with_scan_range_cursor(storage_space, point_scan_range(), opts, &mut drain)?
+            read.with_scan_range_cursor(storage_space, point_scan_range(), opts, |cursor| {
+                drain_storage_cursor(cursor, chunk_size, &mut stats)
+            })?
         }
         ScanChunkingMode::Prefix => read.with_scan_prefix_cursor(
             storage_space,
@@ -3682,7 +3671,7 @@ where
                 bytes: Bytes::from_static(b"point-"),
             },
             opts,
-            &mut drain,
+            |cursor| drain_storage_cursor(cursor, chunk_size, &mut stats),
         )?,
     }
 
@@ -3691,6 +3680,35 @@ where
         expected_rows.div_ceil(chunk_size) as u64
     );
     Ok(stats)
+}
+
+fn drain_storage_cursor<C>(
+    cursor: &mut lix_engine::storage_v2::StorageScanCursor<'_, C>,
+    chunk_size: usize,
+    stats: &mut ScanDrainStats,
+) -> Result<(), BackendError>
+where
+    C: BackendScanCursor,
+{
+    loop {
+        let result = cursor.visit_next_with_stats(
+            chunk_size,
+            &mut |_key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+                assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                Ok(())
+            },
+        )?;
+
+        stats.scanned += result.value.emitted;
+        stats.backend_calls += result.stats.backend_calls;
+        stats.chunks += usize::from(result.value.emitted > 0 || result.value.has_more);
+        stats.read_stats.add(result.stats);
+
+        if !result.value.has_more {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn assert_scan_drain_stats(stats: &ScanDrainStats, case: &ScanChunkingCase) {
