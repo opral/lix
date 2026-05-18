@@ -29,7 +29,7 @@ use crate::sql2::result_metadata::{
     field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY,
 };
 use crate::sql2::session::{
-    build_read_session, build_write_session, build_write_session_with_options,
+    build_read_session, build_transaction_read_session, build_write_session_with_options,
     SqlWriteSessionOptions,
 };
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
@@ -53,28 +53,34 @@ pub(crate) struct DataFusionLogicalPlan {
 ///
 /// `catalog()` is intentionally omitted from the MVP boundary for now.
 #[allow(dead_code)]
-pub(crate) async fn execute_sql(
-    ctx: &dyn SqlExecutionContext,
+pub(crate) async fn execute_sql<C>(
+    ctx: &C,
     sql: &str,
     params: &[Value],
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let plan = create_logical_plan(ctx, sql).await?;
     execute_logical_plan(plan, params).await
 }
 
-pub(crate) async fn create_logical_plan(
-    ctx: &dyn SqlExecutionContext,
-    sql: &str,
-) -> Result<SqlLogicalPlan, LixError> {
+pub(crate) async fn create_logical_plan<C>(ctx: &C, sql: &str) -> Result<SqlLogicalPlan, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let statement = parse_statement(sql)?;
     create_logical_plan_from_parsed(ctx, sql, statement).await
 }
 
-pub(crate) async fn create_logical_plan_from_parsed(
-    ctx: &dyn SqlExecutionContext,
+pub(crate) async fn create_logical_plan_from_parsed<C>(
+    ctx: &C,
     sql: &str,
     statement: DataFusionStatement,
-) -> Result<SqlLogicalPlan, LixError> {
+) -> Result<SqlLogicalPlan, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     crate::sql2::bind_read_statement(sql, &statement)?;
     let session = build_read_session(ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
@@ -92,12 +98,13 @@ pub(crate) async fn create_logical_plan_from_parsed(
 }
 
 pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    read_ctx: &impl SqlExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
-    let session = build_write_session(ctx).await?;
+    let session = build_transaction_read_session(read_ctx, write_ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
@@ -1298,10 +1305,10 @@ mod tests {
         bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
         plan_write,
     };
-    use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlReadStore};
+    use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
     use crate::storage::{
-        KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
-        KvValuePage, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
+        InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
+        StorageReadScope,
     };
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
@@ -1321,42 +1328,12 @@ mod tests {
     }
     struct DummyCommitGraphReader;
     struct DummyVersionRefReader;
-    struct TestReadTransaction(StorageContext);
-
     fn test_read_scope(
-        storage: StorageContext,
-    ) -> StorageReadScope<Box<dyn StorageReadTransaction + Send + Sync + 'static>> {
-        StorageReadScope::new(Box::new(TestReadTransaction(storage)))
-    }
-
-    #[async_trait]
-    impl StorageReader for TestReadTransaction {
-        async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-            self.0.get_values(request).await
-        }
-
-        async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-            self.0.exists_many(request).await
-        }
-
-        async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-            self.0.scan_keys(request).await
-        }
-
-        async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-            self.0.scan_values(request).await
-        }
-
-        async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-            self.0.scan_entries(request).await
-        }
-    }
-
-    #[async_trait]
-    impl StorageReadTransaction for TestReadTransaction {
-        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
-        }
+        storage: &StorageContext<InMemoryStorageBackend>,
+    ) -> StorageReadScope<InMemoryStorageRead> {
+        storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open")
     }
 
     #[allow(dead_code)]
@@ -1450,6 +1427,8 @@ mod tests {
     }
 
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
+        type ReadStore = StorageReadScope<InMemoryStorageRead>;
+
         fn active_version_id(&self) -> &str {
             self.active_version_id
         }
@@ -1466,11 +1445,9 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
-            let base_scope = test_read_scope(StorageContext::new(Arc::new(
-                crate::backend::testing::UnitTestBackend::new(),
-            )));
-            let read_scope = StorageReadScope::new(SqlReadStore::scoped(base_scope.store()));
+        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
+            let storage = StorageContext::new(InMemoryStorageBackend::new());
+            let read_scope = test_read_scope(&storage);
             CommitStoreQuerySource {
                 commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -2011,9 +1988,9 @@ mod tests {
     }
 
     async fn setup_engine_history_fixture() -> Result<(SessionContext, String), LixError> {
-        let backend = crate::backend::testing::UnitTestBackend::new();
-        let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
-        let engine = Engine::new(Box::new(backend)).await?;
+        let backend = crate::storage::InMemoryStorageBackend::new();
+        let init_receipt = Engine::initialize(backend.clone()).await?;
+        let engine = Engine::new(backend).await?;
         let session = engine.open_session(init_receipt.main_version_id).await?;
 
         session
@@ -2065,13 +2042,11 @@ mod tests {
 
     #[tokio::test]
     async fn lix_file_path_predicates_canonicalize_bound_values_like_writes() {
-        let backend = crate::backend::testing::UnitTestBackend::new();
-        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+        let backend = crate::storage::InMemoryStorageBackend::new();
+        let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(Box::new(backend))
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -2172,13 +2147,11 @@ mod tests {
 
     #[tokio::test]
     async fn lix_file_path_predicates_reject_non_literal_path_values() {
-        let backend = crate::backend::testing::UnitTestBackend::new();
-        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+        let backend = crate::storage::InMemoryStorageBackend::new();
+        let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(Box::new(backend))
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -2207,13 +2180,11 @@ mod tests {
 
     #[tokio::test]
     async fn lix_directory_path_predicates_canonicalize_bound_values_like_writes() {
-        let backend = crate::backend::testing::UnitTestBackend::new();
-        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+        let backend = crate::storage::InMemoryStorageBackend::new();
+        let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(Box::new(backend))
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -2263,13 +2234,11 @@ mod tests {
 
     #[tokio::test]
     async fn lix_directory_path_predicates_reject_non_literal_path_values() {
-        let backend = crate::backend::testing::UnitTestBackend::new();
-        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+        let backend = crate::storage::InMemoryStorageBackend::new();
+        let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(Box::new(backend))
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -4476,6 +4445,8 @@ mod tests {
     }
 
     impl SqlExecutionContext for BackendSqlExecutionContext<'_> {
+        type ReadStore = StorageReadScope<InMemoryStorageRead>;
+
         fn active_version_id(&self) -> &str {
             self.active_version_id
         }
@@ -4492,9 +4463,8 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
-            let base_scope = test_read_scope(self.storage.clone());
-            let read_scope = StorageReadScope::new(SqlReadStore::scoped(base_scope.store()));
+        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
+            let read_scope = test_read_scope(&self.storage);
             CommitStoreQuerySource {
                 commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -4508,7 +4478,7 @@ mod tests {
         fn version_ref(&self) -> Arc<dyn VersionRefReader> {
             Arc::new(
                 crate::version::VersionContext::new(Arc::new(UntrackedStateContext::new()))
-                    .ref_reader(self.storage.clone()),
+                    .ref_reader(test_read_scope(&self.storage)),
             )
         }
 

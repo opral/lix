@@ -1,10 +1,10 @@
 use std::future::Future;
 
+use lix_engine::backend::InMemoryBackend;
 use lix_engine::LixError;
 use lix_engine::{Engine, InitReceipt};
 
 use super::expect_same::{SharedExpectSameRun, SharedExpectSameRunGuard, SimulationAssertions};
-use super::kv_backend::{InMemoryKvBackend, KvMap};
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::deterministic_timestamp_shuffle_for;
 use super::simulation::Simulation;
@@ -30,7 +30,7 @@ pub async fn run_single_simulation_test<F, Fut>(
     let sim = Simulation::from_bootstrap(
         mode,
         options,
-        bootstrap.snapshot,
+        bootstrap.backend,
         bootstrap.receipt,
         SimulationAssertions::shared(expect_same),
     )
@@ -42,18 +42,15 @@ pub async fn run_single_simulation_test<F, Fut>(
 
 #[derive(Clone)]
 struct Bootstrap {
-    snapshot: KvMap,
+    backend: InMemoryBackend,
     receipt: InitReceipt,
 }
 
 impl Bootstrap {
     async fn create() -> Result<Self, LixError> {
-        let backend = InMemoryKvBackend::new();
-        let receipt = Engine::initialize(Box::new(backend.clone())).await?;
-        Ok(Self {
-            snapshot: backend.snapshot(),
-            receipt,
-        })
+        let backend = InMemoryBackend::new();
+        let receipt = Engine::initialize(backend.clone()).await?;
+        Ok(Self { backend, receipt })
     }
 }
 

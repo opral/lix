@@ -2,15 +2,23 @@ use crate::commit_store::{
     Change, ChangeIndexEntry, ChangeLocator, ChangeRef, Commit, CommitDraftRef,
     StagedCommitStoreCommit, StoredCommitRef,
 };
+use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageReader, StorageWriteSet,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions,
+    StorageSpaceId, StorageValue,
 };
 use crate::LixError;
+use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const COMMIT_NAMESPACE: &str = "commit_store.commit";
 pub(crate) const CHANGE_PACK_NAMESPACE: &str = "commit_store.change_pack";
 pub(crate) const MEMBERSHIP_PACK_NAMESPACE: &str = "commit_store.membership_pack";
+const COMMIT_SPACE: StorageSpace = StorageSpace::new(StorageSpaceId(0x0003_0001), COMMIT_NAMESPACE);
+const CHANGE_PACK_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0003_0002), CHANGE_PACK_NAMESPACE);
+const MEMBERSHIP_PACK_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0003_0003), MEMBERSHIP_PACK_NAMESPACE);
 
 const SINGLE_PACK_ID: u32 = 0;
 
@@ -50,22 +58,24 @@ fn stage_commit_with_authored_pack(
     };
 
     writes.put(
-        COMMIT_NAMESPACE,
-        commit_key(commit.id),
-        crate::commit_store::codec::encode_commit_ref(stored_commit)?,
+        COMMIT_SPACE,
+        key(commit_key(commit.id)),
+        value(crate::commit_store::codec::encode_commit_ref(
+            stored_commit,
+        )?),
     );
 
     let mut authored_locators = Vec::with_capacity(authored_changes.len());
     if !authored_changes.is_empty() {
         if write_authored_change_pack {
             writes.put(
-                CHANGE_PACK_NAMESPACE,
-                pack_key(commit.id, SINGLE_PACK_ID)?,
-                crate::commit_store::codec::encode_change_pack(
+                CHANGE_PACK_SPACE,
+                key(pack_key(commit.id, SINGLE_PACK_ID)?),
+                value(crate::commit_store::codec::encode_change_pack(
                     commit.id,
                     SINGLE_PACK_ID,
                     &authored_changes,
-                )?,
+                )?),
             );
         }
         for (source_ordinal, change) in authored_changes.iter().enumerate() {
@@ -85,13 +95,13 @@ fn stage_commit_with_authored_pack(
 
     if !adopted_changes.is_empty() {
         writes.put(
-            MEMBERSHIP_PACK_NAMESPACE,
-            pack_key(commit.id, SINGLE_PACK_ID)?,
-            crate::commit_store::codec::encode_membership_pack(
+            MEMBERSHIP_PACK_SPACE,
+            key(pack_key(commit.id, SINGLE_PACK_ID)?),
+            value(crate::commit_store::codec::encode_membership_pack(
                 commit.id,
                 SINGLE_PACK_ID,
                 adopted_changes.iter().map(ChangeLocator::as_ref),
-            )?,
+            )?),
         );
     }
 
@@ -102,38 +112,56 @@ fn stage_commit_with_authored_pack(
 }
 
 pub(crate) async fn load_commit(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<Commit>, LixError> {
-    let Some(bytes) = get_one(store, COMMIT_NAMESPACE, commit_key(commit_id)).await? else {
+    let Some(bytes) = get_one(store, COMMIT_SPACE, commit_key(commit_id)).await? else {
         return Ok(None);
     };
     crate::commit_store::codec::decode_commit(&bytes).map(Some)
 }
 
 pub(crate) async fn scan_commits(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
 ) -> Result<Vec<Commit>, LixError> {
-    let page = store
-        .scan_values(KvScanRequest {
-            namespace: COMMIT_NAMESPACE.to_string(),
-            range: KvScanRange::prefix(Vec::new()),
-            after: None,
-            limit: usize::MAX,
-        })
-        .await?;
-    page.values
-        .iter()
-        .map(|bytes| crate::commit_store::codec::decode_commit(bytes))
-        .collect()
+    let plan = ScanPlan::prefix(
+        COMMIT_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut commits = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan.collect(
+            store,
+            StorageScanOptions {
+                resume_after: resume_after.as_ref(),
+                ..StorageScanOptions::default()
+            },
+        )?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        commits.extend(
+            page.value
+                .entries
+                .into_iter()
+                .filter_map(|entry| full_value(entry.value))
+                .map(|bytes| crate::commit_store::codec::decode_commit(bytes.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(commits)
 }
 
 pub(crate) async fn load_change_pack(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
     pack_id: u32,
 ) -> Result<Option<Vec<Change>>, LixError> {
-    let Some(bytes) = get_one(store, CHANGE_PACK_NAMESPACE, pack_key(commit_id, pack_id)?).await?
+    let Some(bytes) = get_one(store, CHANGE_PACK_SPACE, pack_key(commit_id, pack_id)?).await?
     else {
         return load_tracked_authored_change_pack(store, commit_id, pack_id).await;
     };
@@ -150,7 +178,7 @@ pub(crate) async fn load_change_pack(
 }
 
 pub(crate) async fn load_tracked_authored_change_pack(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
     pack_id: u32,
 ) -> Result<Option<Vec<Change>>, LixError> {
@@ -201,16 +229,11 @@ pub(crate) async fn load_tracked_authored_change_pack(
 }
 
 pub(crate) async fn load_membership_pack(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
     pack_id: u32,
 ) -> Result<Option<Vec<ChangeLocator>>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        MEMBERSHIP_PACK_NAMESPACE,
-        pack_key(commit_id, pack_id)?,
-    )
-    .await?
+    let Some(bytes) = get_one(store, MEMBERSHIP_PACK_SPACE, pack_key(commit_id, pack_id)?).await?
     else {
         return Ok(None);
     };
@@ -227,7 +250,7 @@ pub(crate) async fn load_membership_pack(
 }
 
 pub(crate) async fn load_change_index_entries(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     change_ids: &[String],
 ) -> Result<Vec<Option<ChangeIndexEntry>>, LixError> {
     if change_ids.is_empty() {
@@ -301,22 +324,36 @@ pub(crate) async fn load_change_index_entries(
 }
 
 async fn get_one(
-    store: &mut (impl StorageReader + ?Sized),
-    namespace: &str,
+    store: &(impl StorageRead + ?Sized),
+    space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    Ok(store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: namespace.to_string(),
-                keys: vec![key],
-            }],
-        })
-        .await?
-        .groups
+    let result = PointReadPlan::new(space, &[StorageKey(Bytes::from(key))])
+        .materialize(store, StorageGetOptions::default())?;
+    Ok(result
+        .value
         .into_iter()
         .next()
-        .and_then(|group| group.single_value_owned()))
+        .flatten()
+        .and_then(full_value)
+        .map(|bytes| bytes.to_vec()))
+}
+
+fn key(bytes: Vec<u8>) -> StorageKey {
+    StorageKey(Bytes::from(bytes))
+}
+
+fn value(bytes: Vec<u8>) -> StorageValue {
+    StorageValue {
+        bytes: Bytes::from(bytes),
+    }
+}
+
+fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
+    match value {
+        StorageProjectedValue::FullValue(bytes) => Some(bytes),
+        StorageProjectedValue::KeyOnly => None,
+    }
 }
 
 fn ensure_pack_identity(
@@ -357,25 +394,19 @@ fn pack_key(commit_id: &str, pack_id: u32) -> Result<Vec<u8>, LixError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::backend::testing::UnitTestBackend;
     use crate::commit_store::CommitDraftRef;
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
-    use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 
     use super::*;
 
     #[tokio::test]
     async fn stage_commit_writes_all_commit_store_namespaces() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut writes = storage.new_write_set();
         let commit = test_commit();
         let change = test_change("change-1");
         let adopted = ChangeLocator {
@@ -398,11 +429,9 @@ mod tests {
             vec![adopted.clone()],
         )
         .expect("commit should stage");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("writes should apply");
-        tx.commit().await.expect("commit should succeed");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
         assert_eq!(
             staged.authored_locators,
@@ -415,28 +444,30 @@ mod tests {
         );
         assert_eq!(staged.adopted_locators, vec![adopted.clone()]);
 
-        let mut reader = storage.clone();
+        let reader = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_commit(&mut reader, "commit-1")
+            load_commit(&reader, "commit-1")
                 .await
                 .expect("commit should load"),
             Some(commit)
         );
         assert_eq!(
-            load_change_pack(&mut reader, "commit-1", 0)
+            load_change_pack(&reader, "commit-1", 0)
                 .await
                 .expect("change pack should load"),
             Some(vec![change])
         );
         assert_eq!(
-            load_membership_pack(&mut reader, "commit-1", 0)
+            load_membership_pack(&reader, "commit-1", 0)
                 .await
                 .expect("membership pack should load"),
             Some(vec![adopted])
         );
 
         let index_entries = load_change_index_entries(
-            &mut reader,
+            &reader,
             &["commit-change-1".to_string(), "change-1".to_string()],
         )
         .await
@@ -462,12 +493,11 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_commit_change_pack_loads_from_delta_pack() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         let commit = test_commit();
         let change = test_change("change-1");
 
@@ -491,29 +521,25 @@ mod tests {
             updated_at: "2026-01-02T00:00:00Z",
         }];
         TrackedStateContext::new()
-            .writer(&mut tx.as_mut(), &mut writes)
+            .writer(&read, &mut writes)
             .stage_delta(&commit.id, None, &deltas)
             .await
             .expect("tracked delta should stage");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("writes should apply");
-        tx.commit().await.expect("commit should succeed");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut reader = storage.clone();
+        let reader = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            get_one(
-                &mut reader,
-                CHANGE_PACK_NAMESPACE,
-                pack_key("commit-1", 0).unwrap()
-            )
-            .await
-            .expect("direct change pack lookup should succeed"),
+            get_one(&reader, CHANGE_PACK_SPACE, pack_key("commit-1", 0).unwrap())
+                .await
+                .expect("direct change pack lookup should succeed"),
             None
         );
         assert_eq!(
-            load_change_pack(&mut reader, "commit-1", 0)
+            load_change_pack(&reader, "commit-1", 0)
                 .await
                 .expect("tracked change pack should load"),
             Some(vec![Change {
@@ -522,7 +548,7 @@ mod tests {
             }])
         );
         assert_eq!(
-            load_change_index_entries(&mut reader, &["change-1".to_string()])
+            load_change_index_entries(&reader, &["change-1".to_string()])
                 .await
                 .expect("index entries should load"),
             vec![Some(ChangeIndexEntry::PackedChange {
@@ -533,12 +559,11 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_commit_change_pack_rejects_sparse_delta_ordinals() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         let commit = test_commit();
         let change = test_change("change-1");
         let sparse_locator = ChangeLocator {
@@ -554,18 +579,18 @@ mod tests {
             updated_at: "2026-01-02T00:00:00Z",
         }];
         TrackedStateContext::new()
-            .writer(&mut tx.as_mut(), &mut writes)
+            .writer(&read, &mut writes)
             .stage_delta(&commit.id, None, &deltas)
             .await
             .expect("tracked delta should stage");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("writes should apply");
-        tx.commit().await.expect("commit should succeed");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut reader = storage.clone();
-        let error = load_change_pack(&mut reader, "commit-1", 0)
+        let reader = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = load_change_pack(&reader, "commit-1", 0)
             .await
             .expect_err("sparse tracked authored ordinals should reject");
         assert!(

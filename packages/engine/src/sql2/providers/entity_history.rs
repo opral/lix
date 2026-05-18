@@ -37,20 +37,21 @@ use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot, string_array,
 };
 use crate::sql2::SqlCommitStoreQuerySource;
+use crate::storage::StorageRead;
 
 /// Schema-specific history surface backed directly by the commit graph.
 ///
 /// The provider does not query `lix_state_history` through SQL. It uses the same
 /// commit graph primitive as the generic history surface, then shapes canonical
 /// changes into the typed entity columns for one registered schema.
-pub(crate) struct EntityHistoryProvider {
+pub(crate) struct EntityHistoryProvider<S> {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
 }
 
-impl std::fmt::Debug for EntityHistoryProvider {
+impl<S> std::fmt::Debug for EntityHistoryProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityHistoryProvider")
             .field("schema_key", &self.spec.schema_key)
@@ -58,11 +59,11 @@ impl std::fmt::Debug for EntityHistoryProvider {
     }
 }
 
-impl EntityHistoryProvider {
+impl<S> EntityHistoryProvider<S> {
     pub(crate) fn new(
         spec: Arc<EntitySurfaceSpec>,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntitySurfaceShape::History),
@@ -74,7 +75,10 @@ impl EntityHistoryProvider {
 }
 
 #[async_trait]
-impl TableProvider for EntityHistoryProvider {
+impl<S> TableProvider for EntityHistoryProvider<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -123,17 +127,17 @@ impl TableProvider for EntityHistoryProvider {
     }
 }
 
-struct EntityHistoryScanExec {
+struct EntityHistoryScanExec<S> {
     spec: Arc<EntitySurfaceSpec>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     schema: SchemaRef,
     route: HistoryRoute,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
 
-impl std::fmt::Debug for EntityHistoryScanExec {
+impl<S> std::fmt::Debug for EntityHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityHistoryScanExec")
             .field("schema_key", &self.spec.schema_key)
@@ -143,11 +147,11 @@ impl std::fmt::Debug for EntityHistoryScanExec {
     }
 }
 
-impl EntityHistoryScanExec {
+impl<S> EntityHistoryScanExec<S> {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
         schema: SchemaRef,
         route: HistoryRoute,
         limit: Option<usize>,
@@ -170,7 +174,7 @@ impl EntityHistoryScanExec {
     }
 }
 
-impl DisplayAs for EntityHistoryScanExec {
+impl<S> DisplayAs for EntityHistoryScanExec<S> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
@@ -183,7 +187,10 @@ impl DisplayAs for EntityHistoryScanExec {
     }
 }
 
-impl ExecutionPlan for EntityHistoryScanExec {
+impl<S> ExecutionPlan for EntityHistoryScanExec<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn name(&self) -> &str {
         "EntityHistoryScanExec"
     }
@@ -253,13 +260,16 @@ struct EntityHistoryRow {
     depth: u32,
 }
 
-async fn load_entity_history_rows(
+async fn load_entity_history_rows<S>(
     spec: &EntitySurfaceSpec,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     route: &HistoryRoute,
     limit: Option<usize>,
-) -> Result<Vec<EntityHistoryRow>, LixError> {
+) -> Result<Vec<EntityHistoryRow>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     let history_view_name = format!("{}_history", spec.schema_key);
     let entries = load_history_entries(
         HistoryViewDescriptor {

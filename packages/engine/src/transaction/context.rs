@@ -11,16 +11,17 @@ use crate::commit_store::CommitStoreContext;
 use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::live_state::overlay_scan_rows;
 use crate::live_state::{
-    overlay_scan_rows, LiveStateContext, LiveStateRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateRow,
+    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
+use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
 use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
-    StorageContext, StorageWriteSet, StorageWriteTransaction,
+    InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
 };
+use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -54,9 +55,8 @@ pub(crate) struct TransactionCommitOutcome;
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the backend write transaction has begun, rather than from session-level
 /// helpers.
-pub(crate) struct Transaction {
+pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     active_version_id: String,
-    storage: StorageContext,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -64,46 +64,48 @@ pub(crate) struct Transaction {
     version_ctx: Arc<VersionContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
-    storage_transaction: Box<dyn StorageWriteTransaction + Send + Sync + 'static>,
+    staged_storage_writes: StorageWriteSet,
+    storage: StorageContext<B>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
 }
 
-impl Transaction {
+impl<B> Transaction<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Opens a backend write transaction and creates an execution-scoped
     /// staging area for SQL/provider hooks.
     async fn open(
         mode: &SessionMode,
-        storage: StorageContext,
+        storage: StorageContext<B>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
-    ) -> Result<OpenTransaction, LixError> {
-        let mut storage_transaction = storage.begin_write_transaction().await?;
+    ) -> Result<OpenTransaction<B>, LixError> {
+        let read = storage.begin_read(StorageReadOptions::default())?;
         let setup_result = async {
-            let active_version_id = resolve_active_version_id(
-                mode,
-                live_state.as_ref(),
-                version_ctx.as_ref(),
-                storage_transaction.as_mut(),
-            )
-            .await?;
+            let active_version_id =
+                resolve_active_version_id(mode, live_state.as_ref(), version_ctx.as_ref(), &read)
+                    .await?;
             let runtime_functions = {
-                let runtime_live_state = live_state.reader(storage_transaction.as_mut());
+                let runtime_live_state = live_state.reader(&read);
                 FunctionContext::prepare(&runtime_live_state).await?
             };
             let functions = runtime_functions.provider();
             let visible_schemas = {
-                let visible_live_state = live_state.reader(storage_transaction.as_mut());
+                let visible_live_state = live_state.reader(&read);
                 catalog_context
                     .schema_jsons_for_sql_read_planning(&visible_live_state, &active_version_id)
                     .await?
             };
             let schema_facts = {
-                let visible_live_state = live_state.reader(storage_transaction.as_mut());
+                let visible_live_state = live_state.reader(&read);
                 catalog_context
                     .schema_facts_for_domain(
                         &visible_live_state,
@@ -124,7 +126,6 @@ impl Transaction {
             match setup_result {
                 Ok(result) => result,
                 Err(error) => {
-                    let _ = storage_transaction.rollback().await;
                     return Err(error);
                 }
             };
@@ -137,7 +138,6 @@ impl Transaction {
         Ok(OpenTransaction {
             transaction: Self {
                 active_version_id,
-                storage,
                 live_state,
                 tracked_state,
                 binary_cas,
@@ -145,7 +145,8 @@ impl Transaction {
                 version_ctx,
                 schema_resolver,
                 staged_writes,
-                storage_transaction,
+                staged_storage_writes: StorageWriteSet::new(),
+                storage,
                 visible_schemas,
                 functions,
             },
@@ -165,7 +166,6 @@ impl Transaction {
         let prepared_writes = match self.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
-                let _ = self.storage_transaction.rollback().await;
                 return Err(error);
             }
         };
@@ -173,23 +173,25 @@ impl Transaction {
             .validate_prepared_writes_by_version(&prepared_writes)
             .await
         {
-            let _ = self.storage_transaction.rollback().await;
             return Err(error);
         }
-        if let Err(error) = commit::commit_prepared_writes(
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let mut writes = match commit::commit_prepared_writes(
             &self.binary_cas,
             &self.commit_store,
             self.version_ctx.as_ref(),
             Some(runtime_functions),
-            self.storage_transaction.as_mut(),
+            &read,
             prepared_writes,
         )
         .await
         {
-            let _ = self.storage_transaction.rollback().await;
-            return Err(error);
-        }
-        self.storage_transaction.commit().await?;
+            Ok(writes) => writes,
+            Err(error) => return Err(error),
+        };
+        writes.extend(self.staged_storage_writes);
+        self.storage
+            .commit_write_set(writes, StorageWriteOptions::default())?;
         Ok(TransactionCommitOutcome::default())
     }
 
@@ -200,7 +202,7 @@ impl Transaction {
     /// rely on.
     #[allow(dead_code)]
     pub(crate) async fn rollback(self) -> Result<(), LixError> {
-        self.storage_transaction.rollback().await
+        Ok(())
     }
 
     /// Stages one decoded write batch into this transaction.
@@ -264,7 +266,8 @@ impl Transaction {
     ) -> Result<Vec<PreparedStateRow>, LixError> {
         let row_count = rows.len();
         let staged = self.staged_writes.staging_overlay()?;
-        let live_state = self.live_state.reader(self.storage_transaction.as_mut());
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let live_state = self.live_state.reader(&read);
         let mut rows_by_scope = BTreeMap::<Domain, Vec<(usize, TransactionWriteRow)>>::new();
         for (index, row) in rows.into_iter().enumerate() {
             rows_by_scope
@@ -329,7 +332,8 @@ impl Transaction {
     ) -> Result<Vec<PreparedAdoptedStateRow>, LixError> {
         let change_count = changes.len();
         let staged = self.staged_writes.staging_overlay()?;
-        let live_state = self.live_state.reader(self.storage_transaction.as_mut());
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let live_state = self.live_state.reader(&read);
         let mut changes_by_scope =
             BTreeMap::<Domain, Vec<(usize, TransactionAdoptedChange)>>::new();
         for (index, change) in changes.into_iter().enumerate() {
@@ -419,7 +423,8 @@ impl Transaction {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_version();
             let version_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
-            let live_state = self.live_state.reader(self.storage_transaction.as_mut());
+            let read = self.storage.begin_read(StorageReadOptions::default())?;
+            let live_state = self.live_state.reader(&read);
             let schema_catalog = self
                 .schema_resolver
                 .catalog_for_validation(&live_state, scope)
@@ -452,9 +457,8 @@ impl Transaction {
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
         let version_ids = transaction_write_version_ids(write);
-        let reader = self
-            .version_ctx
-            .ref_reader(self.storage_transaction.as_mut());
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let reader = self.version_ctx.ref_reader(&read);
         for version_id in version_ids {
             if version_id == GLOBAL_VERSION_ID {
                 continue;
@@ -478,6 +482,24 @@ impl Transaction {
     /// Returns this transaction's prepared runtime functions.
     pub(crate) fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
+    }
+
+    pub(crate) fn sql_read_execution_context(
+        &self,
+    ) -> Result<TransactionSqlReadExecutionContext<B::Read<'_>>, LixError> {
+        let read_store = self.storage.begin_read(StorageReadOptions::default())?;
+        let staged = self.staged_writes.staging_overlay()?;
+        Ok(TransactionSqlReadExecutionContext {
+            active_version_id: self.active_version_id.clone(),
+            read_store,
+            live_state: Arc::clone(&self.live_state),
+            binary_cas: Arc::clone(&self.binary_cas),
+            commit_store: Arc::clone(&self.commit_store),
+            version_ctx: Arc::clone(&self.version_ctx),
+            visible_schemas: self.visible_schemas.clone(),
+            functions: self.functions.clone(),
+            staged,
+        })
     }
 
     /// Adds an extra parent to the commit generated for `version_id`.
@@ -504,14 +526,9 @@ impl Transaction {
         commit_id: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp();
-        let mut writes = StorageWriteSet::new();
         let canonical_row = prepare_version_ref_row(version_id, commit_id, &timestamp)?;
         self.version_ctx
-            .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
-        writes
-            .apply(&mut self.storage_transaction.as_mut())
-            .await
-            .map(|_| ())
+            .stage_canonical_ref_rows(&mut self.staged_storage_writes, &[canonical_row.row])
     }
 
     /// Returns the commit id currently staged for `version_id`, if tracked rows
@@ -527,22 +544,138 @@ impl Transaction {
 
     /// Creates a version-ref reader scoped to this write transaction.
     pub(crate) fn version_ref_reader(&mut self) -> impl VersionRefReader + '_ {
-        self.version_ctx
-            .ref_reader(self.storage_transaction.as_mut())
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .expect("open transaction read scope");
+        self.version_ctx.ref_reader(read)
     }
 
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) fn tracked_state_reader(
         &mut self,
-    ) -> TrackedStateStoreReader<&mut dyn StorageWriteTransaction> {
-        self.tracked_state.reader(self.storage_transaction.as_mut())
+    ) -> TrackedStateStoreReader<StorageReadScope<B::Read<'_>>> {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .expect("open transaction read scope");
+        self.tracked_state.reader(read)
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) fn commit_graph_reader(
         &mut self,
-    ) -> CommitGraphStoreReader<&mut dyn StorageWriteTransaction> {
-        CommitGraphContext::new().reader(self.storage_transaction.as_mut())
+    ) -> CommitGraphStoreReader<StorageReadScope<B::Read<'_>>> {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .expect("open transaction read scope");
+        CommitGraphContext::new().reader(read)
+    }
+}
+
+pub(crate) struct TransactionSqlReadExecutionContext<R> {
+    active_version_id: String,
+    read_store: StorageReadScope<R>,
+    live_state: Arc<LiveStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    commit_store: Arc<CommitStoreContext>,
+    version_ctx: Arc<VersionContext>,
+    visible_schemas: Vec<JsonValue>,
+    functions: FunctionProviderHandle,
+    staged: crate::transaction::staging::PreparedStateRowOverlay,
+}
+
+impl<R> TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage::StorageBackendRead,
+{
+    pub(crate) fn close(self) -> Result<(), LixError> {
+        self.read_store.close().map_err(Into::into)
+    }
+}
+
+impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage::StorageBackendRead + Clone + Send + Sync + 'static,
+{
+    type ReadStore = StorageReadScope<R>;
+
+    fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    fn live_state(&self) -> Arc<dyn crate::live_state::LiveStateReader> {
+        Arc::new(TransactionReadLiveStateReader {
+            base: self.live_state.reader(self.read_store.clone()),
+            staged: self.staged.clone(),
+        })
+    }
+
+    fn functions(&self) -> FunctionProviderHandle {
+        self.functions.clone()
+    }
+
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
+        CommitStoreQuerySource {
+            commit_store_reader: Arc::new(self.commit_store.reader(self.read_store.store())),
+            json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.store()),
+        }
+    }
+
+    fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {
+        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+    }
+
+    fn version_ref(&self) -> Arc<dyn VersionRefReader> {
+        Arc::new(self.version_ctx.ref_reader(self.read_store.clone()))
+    }
+
+    fn blob_reader(&self) -> Arc<dyn crate::binary_cas::BlobDataReader> {
+        Arc::new(self.binary_cas.reader(self.read_store.clone()))
+    }
+
+    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        Ok(self.visible_schemas.clone())
+    }
+}
+
+struct TransactionReadLiveStateReader<R> {
+    base: crate::live_state::LiveStateStoreReader<StorageReadScope<R>>,
+    staged: crate::transaction::staging::PreparedStateRowOverlay,
+}
+
+#[async_trait]
+impl<R> crate::live_state::LiveStateReader for TransactionReadLiveStateReader<R>
+where
+    R: crate::storage::StorageBackendRead + Clone + Send + Sync,
+{
+    async fn scan_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        overlay_scan_rows(&self.base, &self.staged, request).await
+    }
+
+    async fn load_row(
+        &self,
+        request: &LiveStateRowRequest,
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+        Ok(self
+            .scan_rows(&LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec![request.schema_key.clone()],
+                    entity_ids: vec![request.entity_id.clone()],
+                    version_ids: vec![request.version_id.clone()],
+                    file_ids: vec![request.file_id.clone()],
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .next())
     }
 }
 
@@ -665,21 +798,26 @@ fn stage_materialized_json_text(
     stage_json_from_value(prepared, context)
 }
 
-pub(crate) struct OpenTransaction {
-    pub(crate) transaction: Transaction,
+pub(crate) struct OpenTransaction<B: StorageBackend = InMemoryStorageBackend> {
+    pub(crate) transaction: Transaction<B>,
     pub(crate) runtime_functions: FunctionContext,
 }
 
-pub(crate) async fn open_transaction(
+pub(crate) async fn open_transaction<B>(
     mode: &SessionMode,
-    storage: StorageContext,
+    storage: StorageContext<B>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     catalog_context: Arc<CatalogContext>,
-) -> Result<OpenTransaction, LixError> {
+) -> Result<OpenTransaction<B>, LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     Transaction::open(
         mode,
         storage,
@@ -694,7 +832,12 @@ pub(crate) async fn open_transaction(
 }
 
 #[async_trait]
-impl SqlWriteExecutionContext for Transaction {
+impl<B> SqlWriteExecutionContext for Transaction<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     fn active_version_id(&self) -> &str {
         &self.active_version_id
     }
@@ -707,42 +850,9 @@ impl SqlWriteExecutionContext for Transaction {
         Ok(self.visible_schemas.clone())
     }
 
-    fn storage_context(&self) -> Option<StorageContext> {
-        Some(self.storage.clone())
-    }
-
-    fn commit_store_context(&self) -> Option<Arc<CommitStoreContext>> {
-        Some(Arc::clone(&self.commit_store))
-    }
-
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
-        self.binary_cas
-            .reader(self.storage_transaction.as_mut())
-            .load_bytes_many(hashes)
-            .await
-    }
-
-    async fn read_get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        self.storage_transaction.as_mut().get_values(request).await
-    }
-
-    async fn read_exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        self.storage_transaction.as_mut().exists_many(request).await
-    }
-
-    async fn read_scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        self.storage_transaction.as_mut().scan_keys(request).await
-    }
-
-    async fn read_scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        self.storage_transaction.as_mut().scan_values(request).await
-    }
-
-    async fn read_scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        self.storage_transaction
-            .as_mut()
-            .scan_entries(request)
-            .await
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        self.binary_cas.reader(&read).load_bytes_many(hashes).await
     }
 
     async fn scan_live_state(
@@ -750,15 +860,19 @@ impl SqlWriteExecutionContext for Transaction {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
-        let base = self.live_state.reader(self.storage_transaction.as_mut());
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let base = self.live_state.reader(&read);
         overlay_scan_rows(&base, &staged, request).await
     }
 
     async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError> {
-        self.version_ctx
-            .ref_reader(self.storage_transaction.as_mut())
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let result = self
+            .version_ctx
+            .ref_reader(&read)
             .load_head_commit_id(version_id)
-            .await
+            .await;
+        result
     }
 
     async fn stage_write(
@@ -853,23 +967,21 @@ async fn resolve_active_version_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut dyn StorageWriteTransaction,
+    read: &(impl StorageRead + Send + Sync + ?Sized),
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { version_id } => Ok(version_id.clone()),
-        SessionMode::Workspace => {
-            load_workspace_version_id(live_state, version_ctx, transaction).await
-        }
+        SessionMode::Workspace => load_workspace_version_id(live_state, version_ctx, read).await,
     }
 }
 
 async fn load_workspace_version_id(
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut dyn StorageWriteTransaction,
+    read: &(impl StorageRead + Send + Sync + ?Sized),
 ) -> Result<String, LixError> {
     let row = live_state
-        .reader(&mut *transaction)
+        .reader(read)
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
@@ -908,7 +1020,7 @@ async fn load_workspace_version_id(
         .to_string();
 
     let head = version_ctx
-        .ref_reader(&mut *transaction)
+        .ref_reader(read)
         .load_head_commit_id(&version_id)
         .await?;
     if head.is_none() {
@@ -929,13 +1041,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::backend::testing::UnitTestBackend;
     use crate::commit_store::{ChangeScanRequest, CommitStoreContext};
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
     use crate::version::VersionContext;
-    use crate::Backend;
     use crate::NullableKeyFilter;
     use crate::GLOBAL_VERSION_ID;
 
@@ -951,8 +1062,8 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let backend = InMemoryStorageBackend::new();
+        let storage = StorageContext::new(backend.clone());
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
@@ -990,7 +1101,11 @@ mod tests {
             .expect("transaction should commit");
 
         let changes = changelog
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_changes(&ChangeScanRequest::default())
             .await
             .expect("changelog should scan");
@@ -1014,14 +1129,22 @@ mod tests {
         );
 
         let head_commit_id = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref should load")
             .expect("tracked commit should advance the global version ref");
 
         let tracked_row = crate::tracked_state::TrackedStateContext::new()
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_rows_at_commit(
                 &head_commit_id,
                 &[TrackedStateRowRequest {
@@ -1044,7 +1167,11 @@ mod tests {
         );
 
         let untracked_row = crate::untracked_state::UntrackedStateContext::new()
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&UntrackedStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1060,7 +1187,11 @@ mod tests {
         );
 
         let live_untracked_row = live_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1075,7 +1206,11 @@ mod tests {
         assert_eq!(live_untracked_row.version_id, GLOBAL_VERSION_ID);
 
         let tracked_rows = crate::tracked_state::TrackedStateContext::new()
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_rows_at_commit(&head_commit_id, &TrackedStateScanRequest::default())
             .await
             .expect("tracked state should scan");
@@ -1090,8 +1225,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_validates_staged_rows_before_persistence() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let backend = InMemoryStorageBackend::new();
+        let storage = StorageContext::new(backend.clone());
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
@@ -1135,7 +1270,11 @@ mod tests {
         );
 
         let changes = changelog
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_changes(&ChangeScanRequest::default())
             .await
             .expect("changelog should scan after failed commit");
@@ -1149,7 +1288,11 @@ mod tests {
             "validation failure must happen before changelog persistence"
         );
         let head = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref should load after failed commit");
@@ -1162,8 +1305,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_rejects_non_object_metadata_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let backend = InMemoryStorageBackend::new();
+        let storage = StorageContext::new(backend.clone());
         let (live_state, _binary_cas, changelog, version_ref, runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
@@ -1196,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_key_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let (
             _live_state,
             _binary_cas,
@@ -1225,7 +1368,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_missing_version_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let (
             _live_state,
             _binary_cas,
@@ -1255,7 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_invalid_storage_scope_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let (
             _live_state,
             _binary_cas,
@@ -1283,7 +1426,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let (
             _live_state,
             _binary_cas,
@@ -1310,8 +1453,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let backend = InMemoryStorageBackend::new();
+        let storage = StorageContext::new(backend.clone());
         let (live_state, _binary_cas, changelog, version_ref, runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
@@ -1346,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let (
             _live_state,
             _binary_cas,
@@ -1386,7 +1529,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_primary_key_entity_id_mismatch_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let (
             _live_state,
             _binary_cas,
@@ -1414,7 +1557,7 @@ mod tests {
     }
 
     async fn open_test_transaction(
-        backend: &Arc<dyn Backend + Send + Sync>,
+        backend: &InMemoryStorageBackend,
     ) -> (
         Arc<LiveStateContext>,
         Arc<BinaryCasContext>,
@@ -1423,7 +1566,7 @@ mod tests {
         FunctionContext,
         Transaction,
     ) {
-        let storage = StorageContext::new(Arc::clone(backend));
+        let storage = StorageContext::new(backend.clone());
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
@@ -1487,12 +1630,12 @@ mod tests {
             "1970-01-01T00:00:00.000Z",
         )
         .expect("schema fixture version ref should stage");
-        let mut storage_transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("schema fixture transaction should open");
+        let read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("schema fixture read should open");
         crate::test_support::stage_tracked_root_from_materialized(
-            storage_transaction.as_mut(),
+            &read,
+            &mut writes,
             &crate::tracked_state::TrackedStateContext::new(),
             SCHEMA_FIXTURE_COMMIT_ID,
             None,
@@ -1504,13 +1647,8 @@ mod tests {
             .writer(&mut writes)
             .stage_rows([version_ref_row.row.as_ref()])
             .expect("schema fixture version ref should stage");
-        writes
-            .apply(&mut storage_transaction.as_mut())
-            .await
-            .expect("schema fixture rows should apply");
-        storage_transaction
-            .commit()
-            .await
+        storage
+            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
             .expect("schema fixture transaction should commit");
     }
 
@@ -1522,7 +1660,11 @@ mod tests {
         rejected_entity_id: &str,
     ) {
         let changes = changelog
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .scan_changes(&ChangeScanRequest::default())
             .await
             .expect("changelog should scan after failed commit");
@@ -1536,7 +1678,11 @@ mod tests {
             "validation failure must happen before changelog persistence"
         );
         let head = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref should load after failed commit");
@@ -1546,7 +1692,11 @@ mod tests {
             "validation failure must not advance the version ref"
         );
         let row = live_state
-            .reader(storage)
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),

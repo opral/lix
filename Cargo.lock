@@ -3017,9 +3017,11 @@ dependencies = [
 name = "lix_engine"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "cel",
  "chrono",
  "codspeed-criterion-compat",
@@ -3032,8 +3034,10 @@ dependencies = [
  "jsonschema",
  "paste",
  "precis-profiles",
+ "redb",
  "rocksdb",
  "rusqlite",
+ "rustc-hash 2.1.1",
  "ruzstd",
  "serde",
  "serde_json",
@@ -3729,6 +3733,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "redb"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

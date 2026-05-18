@@ -37,18 +37,22 @@ use crate::sql2::history_route::{
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::SqlCommitStoreQuerySource;
+use crate::storage::StorageRead;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
-pub(super) async fn register_lix_file_history_surface(
+pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     session
         .register_table(
             surface_name,
@@ -62,23 +66,23 @@ pub(super) async fn register_lix_file_history_surface(
     Ok(())
 }
 
-struct LixFileHistoryProvider {
+struct LixFileHistoryProvider<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
 }
 
-impl std::fmt::Debug for LixFileHistoryProvider {
+impl<S> std::fmt::Debug for LixFileHistoryProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixFileHistoryProvider").finish()
     }
 }
 
-impl LixFileHistoryProvider {
+impl<S> LixFileHistoryProvider<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
         blob_reader: Arc<dyn BlobDataReader>,
     ) -> Self {
         Self {
@@ -91,7 +95,10 @@ impl LixFileHistoryProvider {
 }
 
 #[async_trait]
-impl TableProvider for LixFileHistoryProvider {
+impl<S> TableProvider for LixFileHistoryProvider<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -149,9 +156,9 @@ impl TableProvider for LixFileHistoryProvider {
     }
 }
 
-struct LixFileHistoryScanExec {
+struct LixFileHistoryScanExec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
     schema: SchemaRef,
     needs_data: bool,
@@ -160,7 +167,7 @@ struct LixFileHistoryScanExec {
     properties: Arc<PlanProperties>,
 }
 
-impl std::fmt::Debug for LixFileHistoryScanExec {
+impl<S> std::fmt::Debug for LixFileHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixFileHistoryScanExec")
             .field("route", &self.route)
@@ -169,10 +176,10 @@ impl std::fmt::Debug for LixFileHistoryScanExec {
     }
 }
 
-impl LixFileHistoryScanExec {
+impl<S> LixFileHistoryScanExec<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
         blob_reader: Arc<dyn BlobDataReader>,
         schema: SchemaRef,
         needs_data: bool,
@@ -198,7 +205,7 @@ impl LixFileHistoryScanExec {
     }
 }
 
-impl DisplayAs for LixFileHistoryScanExec {
+impl<S> DisplayAs for LixFileHistoryScanExec<S> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
@@ -211,7 +218,10 @@ impl DisplayAs for LixFileHistoryScanExec {
     }
 }
 
-impl ExecutionPlan for LixFileHistoryScanExec {
+impl<S> ExecutionPlan for LixFileHistoryScanExec<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn name(&self) -> &str {
         "LixFileHistoryScanExec"
     }
@@ -352,13 +362,16 @@ struct BlobRefSnapshot {
     blob_hash: String,
 }
 
-async fn load_file_history_rows(
+async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     blob_reader: &Arc<dyn BlobDataReader>,
     route: &HistoryRoute,
     needs_data: bool,
-) -> Result<Vec<FileHistoryOutputRow>, LixError> {
+) -> Result<Vec<FileHistoryOutputRow>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     let event_route = route.traversal_only();
     let event_entries = load_history_entries(
         HistoryViewDescriptor {

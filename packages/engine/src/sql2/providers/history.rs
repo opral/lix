@@ -29,13 +29,17 @@ use crate::sql2::history_route::{
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::SqlCommitStoreQuerySource;
+use crate::storage::StorageRead;
 
-pub(super) async fn register_history_provider(
+pub(super) async fn register_history_provider<S>(
     session: &SessionContext,
     surface_name: &str,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlCommitStoreQuerySource,
-) -> Result<Arc<dyn TableProvider>, LixError> {
+    query_source: SqlCommitStoreQuerySource<S>,
+) -> Result<Arc<dyn TableProvider>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new(
         Arc::new(Mutex::new(commit_graph)),
         query_source,
@@ -46,22 +50,22 @@ pub(super) async fn register_history_provider(
     Ok(provider)
 }
 
-pub(crate) struct LixStateHistoryProvider {
+pub(crate) struct LixStateHistoryProvider<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
 }
 
-impl std::fmt::Debug for LixStateHistoryProvider {
+impl<S> std::fmt::Debug for LixStateHistoryProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixStateHistoryProvider").finish()
     }
 }
 
-impl LixStateHistoryProvider {
+impl<S> LixStateHistoryProvider<S> {
     pub(crate) fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
     ) -> Self {
         Self {
             schema: lix_state_history_schema(),
@@ -72,7 +76,10 @@ impl LixStateHistoryProvider {
 }
 
 #[async_trait]
-impl TableProvider for LixStateHistoryProvider {
+impl<S> TableProvider for LixStateHistoryProvider<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -120,9 +127,9 @@ impl TableProvider for LixStateHistoryProvider {
     }
 }
 
-struct LixStateHistoryScanExec {
+struct LixStateHistoryScanExec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     route: HistoryRoute,
@@ -130,7 +137,7 @@ struct LixStateHistoryScanExec {
     properties: Arc<PlanProperties>,
 }
 
-impl std::fmt::Debug for LixStateHistoryScanExec {
+impl<S> std::fmt::Debug for LixStateHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixStateHistoryScanExec")
             .field("limit", &self.limit)
@@ -139,10 +146,10 @@ impl std::fmt::Debug for LixStateHistoryScanExec {
     }
 }
 
-impl LixStateHistoryScanExec {
+impl<S> LixStateHistoryScanExec<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         route: HistoryRoute,
@@ -166,7 +173,7 @@ impl LixStateHistoryScanExec {
     }
 }
 
-impl DisplayAs for LixStateHistoryScanExec {
+impl<S> DisplayAs for LixStateHistoryScanExec<S> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -181,7 +188,10 @@ impl DisplayAs for LixStateHistoryScanExec {
     }
 }
 
-impl ExecutionPlan for LixStateHistoryScanExec {
+impl<S> ExecutionPlan for LixStateHistoryScanExec<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn name(&self) -> &str {
         "LixStateHistoryScanExec"
     }
@@ -359,11 +369,14 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }
 
-async fn load_state_history_rows(
+async fn load_state_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     route: &HistoryRoute,
-) -> Result<Vec<StateHistorySqlRow>, LixError> {
+) -> Result<Vec<StateHistorySqlRow>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_state_history",

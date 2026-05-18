@@ -19,10 +19,10 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
-pub(crate) async fn register_read(
-    session: &SessionContext,
-    ctx: &dyn SqlExecutionContext,
-) -> Result<(), LixError> {
+pub(crate) async fn register_read<C>(session: &SessionContext, ctx: &C) -> Result<(), LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let version_ref = ctx.version_ref();
     let commit_store_query_source = ctx.commit_store_query_source();
     let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
@@ -164,6 +164,7 @@ pub(crate) async fn register_write(
     for surface in catalog.surfaces() {
         match &surface.kind {
             PublicSurfaceKind::LixState => {
+                replace_registered_table(session, &surface.name)?;
                 lix_state::register_lix_state_active_write_provider(
                     session,
                     &surface.name,
@@ -172,6 +173,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::LixStateByVersion => {
+                replace_registered_table(session, &surface.name)?;
                 lix_state::register_lix_state_by_version_write_provider(
                     session,
                     &surface.name,
@@ -180,9 +182,11 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::Version => {
+                replace_registered_table(session, &surface.name)?;
                 version::register_write_provider(session, &surface.name, write_ctx.clone()).await?;
             }
             PublicSurfaceKind::File => {
+                replace_registered_table(session, &surface.name)?;
                 file::register_active_write_provider(
                     session,
                     &surface.name,
@@ -192,6 +196,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::FileByVersion => {
+                replace_registered_table(session, &surface.name)?;
                 file::register_by_version_write_provider(
                     session,
                     &surface.name,
@@ -201,6 +206,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::Directory => {
+                replace_registered_table(session, &surface.name)?;
                 directory::register_active_write_provider(
                     session,
                     &surface.name,
@@ -209,6 +215,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::DirectoryByVersion => {
+                replace_registered_table(session, &surface.name)?;
                 directory::register_by_version_write_provider(
                     session,
                     &surface.name,
@@ -225,71 +232,27 @@ pub(crate) async fn register_write(
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
-    entity::register_entity_write_providers(session, write_ctx.clone(), &catalog).await?;
-
-    if !write_ctx.supports_committed_read_surfaces() {
-        return Ok(());
-    }
-
-    let commit_store_query_source = write_ctx.commit_store_query_source().await?;
     for surface in catalog.surfaces() {
-        match &surface.kind {
-            PublicSurfaceKind::Change => {
-                change::register_lix_change_read_provider(
-                    session,
-                    &surface.name,
-                    commit_store_query_source.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::History => {
-                history::register_history_provider(
-                    session,
-                    &surface.name,
-                    write_ctx.commit_graph()?,
-                    commit_store_query_source.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::FileHistory => {
-                file_history::register_lix_file_history_surface(
-                    session,
-                    &surface.name,
-                    write_ctx.commit_graph()?,
-                    commit_store_query_source.clone(),
-                    write_ctx.blob_reader(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::DirectoryHistory => {
-                directory_history::register_lix_directory_history_surface(
-                    session,
-                    &surface.name,
-                    write_ctx.commit_graph()?,
-                    commit_store_query_source.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::LixState
-            | PublicSurfaceKind::LixStateByVersion
-            | PublicSurfaceKind::Version
-            | PublicSurfaceKind::File
-            | PublicSurfaceKind::FileByVersion
-            | PublicSurfaceKind::Directory
-            | PublicSurfaceKind::DirectoryByVersion
-            | PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByVersion { .. }
-            | PublicSurfaceKind::EntityHistory { .. } => {}
+        if matches!(
+            surface.kind,
+            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByVersion { .. }
+        ) {
+            replace_registered_table(session, &surface.name)?;
         }
     }
-    entity::register_entity_history_providers(
-        session,
-        Arc::new(tokio::sync::Mutex::new(write_ctx.commit_graph()?)),
-        commit_store_query_source,
-        &catalog,
-    )
-    .await?;
+    entity::register_entity_write_providers(session, write_ctx.clone(), &catalog).await?;
     Ok(())
+}
+
+fn replace_registered_table(session: &SessionContext, name: &str) -> Result<(), LixError> {
+    match session.deregister_table(name) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("not found") => Ok(()),
+        Err(error) => Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("sql2 DataFusion error: {error}"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -312,8 +275,11 @@ mod tests {
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::catalog::{derive_entity_surface_spec_from_schema, PublicCatalog};
-    use crate::sql2::{CommitStoreQuerySource, SqlReadStore};
-    use crate::storage::{StorageContext, StorageReadScope};
+    use crate::sql2::CommitStoreQuerySource;
+    use crate::storage::{
+        InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
+        StorageReadScope,
+    };
     use crate::version::{VersionHead, VersionRefReader};
     use crate::LixError;
 
@@ -467,18 +433,12 @@ mod tests {
         );
     }
 
-    async fn empty_commit_store_query_source() -> crate::sql2::SqlCommitStoreQuerySource {
-        let storage =
-            StorageContext::new(Arc::new(crate::backend::testing::UnitTestBackend::new()));
-        let read_scope = StorageReadScope::new(SqlReadStore::scoped(
-            StorageReadScope::new(
-                storage
-                    .begin_read_transaction()
-                    .await
-                    .expect("read transaction should open"),
-            )
-            .store(),
-        ));
+    async fn empty_commit_store_query_source(
+    ) -> crate::sql2::SqlCommitStoreQuerySource<StorageReadScope<InMemoryStorageRead>> {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read_scope = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         CommitStoreQuerySource {
             commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
             json_reader: JsonStoreContext::new().reader(read_scope.store()),
