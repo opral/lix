@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+use crate::entity_identity::EntityIdentity;
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageRead, StorageScanOptions, StorageSpace, StorageSpaceId,
@@ -20,16 +21,20 @@ pub(crate) async fn scan_rows(
     store: &impl StorageRead,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
-    let mut rows = scan_all_canonical_rows(store).await?;
-    rows.retain(|row| row_matches_scan(row, request));
-    if let Some(limit) = request.limit {
-        rows.truncate(limit);
-    }
     let projection = UntrackedMaterializationProjection::from_columns(&request.projection.columns);
-    let mut materialized = Vec::with_capacity(rows.len());
-    for row in rows {
-        materialized.push(crate::untracked_state::materialize_row(row, &projection)?);
+    let plans = scan_plans_for_request(request)?;
+    let mut materialized = Vec::new();
+
+    for plan in plans {
+        scan_matching_rows(store, request, &projection, &plan, &mut materialized)?;
+        if request
+            .limit
+            .is_some_and(|limit| materialized.len() >= limit)
+        {
+            break;
+        }
     }
+
     Ok(materialized)
 }
 
@@ -153,39 +158,139 @@ where
     }
 }
 
-async fn scan_all_canonical_rows(
+fn scan_matching_rows(
     store: &impl StorageRead,
-) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let plan = ScanPlan::prefix(
-        UNTRACKED_STATE_ROW_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut rows = Vec::new();
+    request: &UntrackedStateScanRequest,
+    projection: &UntrackedMaterializationProjection,
+    plan: &ScanPlan,
+    materialized: &mut Vec<MaterializedUntrackedStateRow>,
+) -> Result<(), LixError> {
     let mut resume_after = None;
     loop {
+        let remaining_limit = request
+            .limit
+            .map(|limit| limit.saturating_sub(materialized.len()));
+        if matches!(remaining_limit, Some(0)) {
+            break;
+        }
         let page = plan.collect(
             store,
             StorageScanOptions {
                 resume_after: resume_after.as_ref(),
+                limit_rows: remaining_limit
+                    .unwrap_or_else(|| StorageScanOptions::default().limit_rows),
                 ..StorageScanOptions::default()
             },
         )?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        rows.extend(
-            page.value
-                .entries
-                .into_iter()
-                .filter_map(|entry| full_value(entry.value))
-                .map(|bytes| crate::untracked_state::codec::decode_row(bytes.as_ref()))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+
+        for entry in page.value.entries {
+            let Some(bytes) = full_value(entry.value) else {
+                continue;
+            };
+            let row = crate::untracked_state::codec::decode_row(bytes.as_ref())?;
+            if !row_matches_scan(&row, request) {
+                continue;
+            }
+            materialized.push(crate::untracked_state::materialize_row(row, projection)?);
+            if request
+                .limit
+                .is_some_and(|limit| materialized.len() >= limit)
+            {
+                break;
+            }
+        }
+
         if !page.value.has_more || resume_after.is_none() {
             break;
         }
     }
-    Ok(rows)
+    Ok(())
+}
+
+fn scan_plans_for_request(request: &UntrackedStateScanRequest) -> Result<Vec<ScanPlan>, LixError> {
+    let mut prefixes = scan_prefixes_for_filter(&request.filter)?;
+    prefixes.sort();
+    prefixes.dedup();
+    Ok(prefixes
+        .into_iter()
+        .map(|prefix| {
+            ScanPlan::prefix(
+                UNTRACKED_STATE_ROW_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::from(prefix),
+                },
+            )
+        })
+        .collect())
+}
+
+fn scan_prefixes_for_filter(
+    filter: &crate::untracked_state::UntrackedStateFilter,
+) -> Result<Vec<Vec<u8>>, LixError> {
+    if filter.version_ids.is_empty() {
+        return Ok(vec![Vec::new()]);
+    }
+
+    let mut prefixes = Vec::new();
+    for version_id in &filter.version_ids {
+        let mut version_prefix = Vec::new();
+        push_component(&mut version_prefix, version_id);
+        if filter.schema_keys.is_empty() {
+            prefixes.push(version_prefix);
+            continue;
+        }
+
+        for schema_key in &filter.schema_keys {
+            let mut schema_prefix = version_prefix.clone();
+            push_component(&mut schema_prefix, schema_key);
+            if filter.entity_ids.is_empty() {
+                prefixes.push(schema_prefix);
+                continue;
+            }
+
+            for entity_id in &filter.entity_ids {
+                let mut entity_prefix = schema_prefix.clone();
+                push_entity_component(&mut entity_prefix, entity_id)?;
+                append_file_prefixes(&mut prefixes, entity_prefix, &filter.file_ids);
+            }
+        }
+    }
+    Ok(prefixes)
+}
+
+fn push_entity_component(out: &mut Vec<u8>, entity_id: &EntityIdentity) -> Result<(), LixError> {
+    let entity_id = entity_id.as_json_array_text()?;
+    push_component(out, &entity_id);
+    Ok(())
+}
+
+fn append_file_prefixes(
+    prefixes: &mut Vec<Vec<u8>>,
+    entity_prefix: Vec<u8>,
+    file_filters: &[NullableKeyFilter<String>],
+) {
+    if file_filters.is_empty()
+        || file_filters
+            .iter()
+            .any(|filter| matches!(filter, NullableKeyFilter::Any))
+    {
+        prefixes.push(entity_prefix);
+        return;
+    }
+
+    for filter in file_filters {
+        let mut prefix = entity_prefix.clone();
+        match filter {
+            NullableKeyFilter::Null => prefix.push(0),
+            NullableKeyFilter::Value(file_id) => {
+                prefix.push(1);
+                push_component(&mut prefix, file_id);
+            }
+            NullableKeyFilter::Any => unreachable!("Any handled before exact file prefixes"),
+        }
+        prefixes.push(prefix);
+    }
 }
 
 fn full_value(value: StorageProjectedValue) -> Option<Bytes> {

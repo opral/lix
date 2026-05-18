@@ -1,36 +1,54 @@
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
+use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use lix_engine::{
-    storage_bench, Backend, BackendKvAccessSegment, BackendKvEntryPage, BackendKvGetRequest,
-    BackendKvKeyPage, BackendKvKeySpace, BackendKvRead4Order, BackendKvRead4Page,
-    BackendKvRead4Projection, BackendKvRead4ValuePart, BackendKvReadV3Page,
-    BackendKvReadV3Projection, BackendKvReadV3Request, BackendKvReadV3Source, BackendKvScanRequest,
-    BackendKvTableId, BackendKvTableReadRequest, BackendKvValueBatch, BackendKvValuePage,
-    BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    LixError,
+use lix_engine::backend::{
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
+    GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    SpaceId, WriteOptions,
+};
+use lix_engine::storage::{
+    PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions,
+    StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
+    StorageWriteOptions,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
-use tokio::runtime::Runtime;
 
-mod backends;
+#[allow(dead_code)]
+#[path = "../../tests/backend/support/redb_backend.rs"]
+mod redb_backend;
+#[allow(dead_code)]
+#[path = "../../tests/backend/support/rocksdb_backend.rs"]
+mod rocksdb_backend;
+#[allow(dead_code)]
+#[path = "../../tests/backend/support/sqlite_backend.rs"]
+mod sqlite_backend;
 
-use backends::{LixBackendProfile, LIX_BACKEND_PROFILES};
+use redb_backend::RedbBackend;
+use rocksdb_backend::RocksDbBackend;
+use sqlite_backend::SqliteBackend;
 
 const SMOKE_ROWS: usize = 1_000;
 const REAL_WORKLOAD_ROWS: usize = 10_000;
 const PNPM_LOCK_JSON: &str = include_str!("pnpm-lock.fixture.json");
-const UNTRACKED_ROW_NAMESPACE: &str = "u3";
+const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0001_0001), "untracked_state.row");
 
 #[derive(Clone)]
 struct PointerRow {
     path: String,
     value_json: String,
     updated_value_json: String,
+}
+
+#[derive(Clone)]
+struct BenchRow {
+    key: Key,
+    value: StorageValue,
+    updated_value: StorageValue,
 }
 
 #[derive(Clone)]
@@ -52,18 +70,6 @@ struct RawSqliteFixture {
     _dir: TempDir,
 }
 
-#[derive(Clone)]
-struct RawProjectedRow {
-    key: Vec<u8>,
-    header: Vec<u8>,
-    payload: Vec<u8>,
-}
-
-struct RawProjectedSqliteFixture {
-    conn: Connection,
-    _dir: TempDir,
-}
-
 #[derive(Debug, Clone, Default)]
 struct IoStats {
     get_calls: usize,
@@ -71,15 +77,6 @@ struct IoStats {
     get_key_bytes: usize,
     get_values: usize,
     get_value_bytes: usize,
-    exists_calls: usize,
-    exists_keys: usize,
-    exists_key_bytes: usize,
-    scan_key_calls: usize,
-    scan_keys: usize,
-    scan_key_bytes: usize,
-    scan_value_calls: usize,
-    scan_values: usize,
-    scan_value_bytes: usize,
     scan_entry_calls: usize,
     scan_entries: usize,
     scan_entry_key_bytes: usize,
@@ -97,27 +94,20 @@ impl IoStats {
     }
 
     fn read_ops(&self) -> usize {
-        self.get_calls
-            + self.exists_calls
-            + self.scan_key_calls
-            + self.scan_value_calls
-            + self.scan_entry_calls
+        self.get_calls + self.scan_entry_calls
     }
 
     fn scan_calls(&self) -> usize {
-        self.scan_key_calls + self.scan_value_calls + self.scan_entry_calls
+        self.scan_entry_calls
     }
 
     fn read_rows(&self) -> usize {
-        self.get_values + self.scan_keys + self.scan_values + self.scan_entries + self.exists_keys
+        self.get_values + self.scan_entries
     }
 
     fn read_bytes(&self) -> usize {
         self.get_key_bytes
             + self.get_value_bytes
-            + self.exists_key_bytes
-            + self.scan_key_bytes
-            + self.scan_value_bytes
             + self.scan_entry_key_bytes
             + self.scan_entry_value_bytes
     }
@@ -131,376 +121,231 @@ impl IoStats {
     }
 }
 
-struct CountingBackend {
-    inner: Arc<dyn Backend + Send + Sync>,
+#[derive(Clone)]
+struct CountingBackend<B> {
+    inner: B,
     stats: Arc<Mutex<IoStats>>,
 }
 
-struct CountingReadTransaction {
-    inner: Box<dyn BackendReadTransaction + Send + Sync + 'static>,
+struct CountingRead<R> {
+    inner: R,
     stats: Arc<Mutex<IoStats>>,
 }
 
-struct CountingWriteTransaction {
-    inner: Box<dyn BackendWriteTransaction + Send + Sync + 'static>,
+struct CountingWrite<W> {
+    inner: W,
     stats: Arc<Mutex<IoStats>>,
 }
 
-#[async_trait]
-impl Backend for CountingBackend {
-    async fn begin_read_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-        Ok(Box::new(CountingReadTransaction {
-            inner: self.inner.begin_read_transaction().await?,
+impl<B> CountingBackend<B> {
+    fn new(inner: B) -> (Self, Arc<Mutex<IoStats>>) {
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        (
+            Self {
+                inner,
+                stats: Arc::clone(&stats),
+            },
+            stats,
+        )
+    }
+}
+
+impl<B> Backend for CountingBackend<B>
+where
+    B: Backend,
+{
+    type Read<'a>
+        = CountingRead<B::Read<'a>>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = CountingWrite<B::Write<'a>>
+    where
+        Self: 'a;
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        Ok(CountingRead {
+            inner: self.inner.begin_read(opts)?,
             stats: Arc::clone(&self.stats),
-        }))
+        })
     }
 
-    async fn begin_write_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
-        Ok(Box::new(CountingWriteTransaction {
-            inner: self.inner.begin_write_transaction().await?,
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        Ok(CountingWrite {
+            inner: self.inner.begin_write(opts)?,
             stats: Arc::clone(&self.stats),
-        }))
+        })
     }
 }
 
-#[async_trait]
-impl BackendReadTransaction for CountingReadTransaction {
-    async fn get_values(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvValueBatch, LixError> {
-        record_get_request(&self.stats, &request, false);
-        let batch = self.inner.get_values(request).await?;
-        record_value_batch(&self.stats, &batch);
-        Ok(batch)
+impl<R> BackendRead for CountingRead<R>
+where
+    R: BackendRead,
+{
+    type RangeScan<'cursor> = R::RangeScan<'cursor>;
+
+    fn visit_keys<V>(
+        &self,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        {
+            let mut stats = self.stats.lock().expect("io stats mutex");
+            stats.get_calls += 1;
+            stats.get_keys += keys.len();
+            stats.get_key_bytes += keys.iter().map(|key| key.0.len()).sum::<usize>();
+        }
+        let mut counting = CountingPointVisitor {
+            inner: visitor,
+            stats: Arc::clone(&self.stats),
+        };
+        self.inner.visit_keys(keys, opts, &mut counting)
     }
 
-    async fn exists_many(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<lix_engine::BackendKvExistsBatch, LixError> {
-        record_get_request(&self.stats, &request, true);
-        self.inner.exists_many(request).await
+    fn with_range_scan<T, F>(
+        &self,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+    {
+        {
+            let mut stats = self.stats.lock().expect("io stats mutex");
+            stats.scan_entry_calls += 1;
+        }
+        self.inner.with_range_scan(range, opts, f)
     }
 
-    async fn scan_keys(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvKeyPage, LixError> {
-        let page = self.inner.scan_keys(request).await?;
-        record_scan_keys(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn scan_values(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvValuePage, LixError> {
-        let page = self.inner.scan_values(request).await?;
-        record_scan_values(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn scan_entries(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvEntryPage, LixError> {
-        let page = self.inner.scan_entries(request).await?;
-        record_scan_entries(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn read_v3(
-        &mut self,
-        request: BackendKvReadV3Request,
-    ) -> Result<BackendKvReadV3Page, LixError> {
-        let page = self.inner.read_v3(request.clone()).await?;
-        record_read_v3(&self.stats, &request, &page);
-        Ok(page)
-    }
-
-    async fn read4(
-        &mut self,
-        request: BackendKvTableReadRequest,
-    ) -> Result<BackendKvRead4Page, LixError> {
-        let page = self.inner.read4(request.clone()).await?;
-        record_read4(&self.stats, &request, &page);
-        Ok(page)
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        self.inner.rollback().await
+    fn close(self) -> Result<(), BackendError>
+    where
+        Self: Sized,
+    {
+        self.inner.close()
     }
 }
 
-#[async_trait]
-impl BackendReadTransaction for CountingWriteTransaction {
-    async fn get_values(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvValueBatch, LixError> {
-        record_get_request(&self.stats, &request, false);
-        let batch = self.inner.get_values(request).await?;
-        record_value_batch(&self.stats, &batch);
-        Ok(batch)
-    }
-
-    async fn exists_many(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<lix_engine::BackendKvExistsBatch, LixError> {
-        record_get_request(&self.stats, &request, true);
-        self.inner.exists_many(request).await
-    }
-
-    async fn scan_keys(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvKeyPage, LixError> {
-        let page = self.inner.scan_keys(request).await?;
-        record_scan_keys(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn scan_values(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvValuePage, LixError> {
-        let page = self.inner.scan_values(request).await?;
-        record_scan_values(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn scan_entries(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvEntryPage, LixError> {
-        let page = self.inner.scan_entries(request).await?;
-        record_scan_entries(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn read_v3(
-        &mut self,
-        request: BackendKvReadV3Request,
-    ) -> Result<BackendKvReadV3Page, LixError> {
-        let page = self.inner.read_v3(request.clone()).await?;
-        record_read_v3(&self.stats, &request, &page);
-        Ok(page)
-    }
-
-    async fn read4(
-        &mut self,
-        request: BackendKvTableReadRequest,
-    ) -> Result<BackendKvRead4Page, LixError> {
-        let page = self.inner.read4(request.clone()).await?;
-        record_read4(&self.stats, &request, &page);
-        Ok(page)
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        self.inner.rollback().await
-    }
+struct CountingPointVisitor<'a, V: ?Sized> {
+    inner: &'a mut V,
+    stats: Arc<Mutex<IoStats>>,
 }
 
-#[async_trait]
-impl BackendWriteTransaction for CountingWriteTransaction {
-    async fn write_kv_batch(
+impl<V> PointVisitor for CountingPointVisitor<'_, V>
+where
+    V: PointVisitor + ?Sized,
+{
+    fn visit(
         &mut self,
-        batch: BackendKvWriteBatch,
-    ) -> Result<BackendKvWriteStats, LixError> {
-        let write_stats = self.inner.write_kv_batch(batch).await?;
-        let mut stats = self.stats.lock().expect("io stats mutex should lock");
-        stats.write_batches += 1;
-        stats.write_puts += write_stats.puts;
-        stats.write_deletes += write_stats.deletes;
-        stats.write_delete_ranges += write_stats.delete_ranges;
-        stats.write_bytes += write_stats.bytes_written;
-        Ok(write_stats)
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), LixError> {
-        self.inner.commit().await
-    }
-}
-
-fn record_get_request(
-    stats: &Arc<Mutex<IoStats>>,
-    request: &BackendKvGetRequest,
-    exists_only: bool,
-) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    let keys: usize = request.groups.iter().map(|group| group.keys.len()).sum();
-    let key_bytes: usize = request
-        .groups
-        .iter()
-        .flat_map(|group| group.keys.iter())
-        .map(Vec::len)
-        .sum();
-    if exists_only {
-        stats.exists_calls += 1;
-        stats.exists_keys += keys;
-        stats.exists_key_bytes += key_bytes;
-    } else {
-        stats.get_calls += 1;
-        stats.get_keys += keys;
-        stats.get_key_bytes += key_bytes;
-    }
-}
-
-fn record_value_batch(stats: &Arc<Mutex<IoStats>>, batch: &BackendKvValueBatch) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    for group in &batch.groups {
-        for value in group.values_iter().flatten() {
+        index: usize,
+        key: &Key,
+        value: Option<ProjectedValueRef<'_>>,
+    ) -> Result<(), BackendError> {
+        if let Some(value) = value {
+            let mut stats = self.stats.lock().expect("io stats mutex");
             stats.get_values += 1;
-            stats.get_value_bytes += value.len();
+            stats.get_value_bytes += projected_value_len(value);
         }
+        self.inner.visit(index, key, value)
     }
 }
 
-fn record_scan_keys(stats: &Arc<Mutex<IoStats>>, page: &BackendKvKeyPage) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    stats.scan_key_calls += 1;
-    stats.scan_keys += page.keys.len();
-    stats.scan_key_bytes += page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
-}
-
-fn record_scan_values(stats: &Arc<Mutex<IoStats>>, page: &BackendKvValuePage) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    stats.scan_value_calls += 1;
-    stats.scan_values += page.values.len();
-    stats.scan_value_bytes += page.values.iter().map(|bytes| bytes.len()).sum::<usize>();
-}
-
-fn record_scan_entries(stats: &Arc<Mutex<IoStats>>, page: &BackendKvEntryPage) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    stats.scan_entry_calls += 1;
-    stats.scan_entries += page.len();
-    stats.scan_entry_key_bytes += page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
-    stats.scan_entry_value_bytes += page.values.iter().map(|bytes| bytes.len()).sum::<usize>();
-}
-
-fn record_read_v3(
-    stats: &Arc<Mutex<IoStats>>,
-    request: &BackendKvReadV3Request,
-    page: &BackendKvReadV3Page,
-) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    let key_bytes = page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
-    let value_bytes = page
-        .values
-        .iter()
-        .flat_map(|values| values.iter())
-        .map(|bytes| bytes.len())
-        .sum::<usize>();
-    let is_key_only = matches!(request.projection, BackendKvReadV3Projection::KeysOnly);
-    let point_like = matches!(request.source, BackendKvReadV3Source::Keys { .. });
-    if point_like {
-        if is_key_only {
-            stats.exists_calls += 1;
-            stats.exists_keys += page.presence_len();
-            stats.exists_key_bytes += key_bytes;
-        } else {
-            stats.get_calls += 1;
-            stats.get_keys += page.presence_len();
-            stats.get_key_bytes += key_bytes;
-            stats.get_values += page.present_count();
-            stats.get_value_bytes += value_bytes;
+impl<W> BackendWrite for CountingWrite<W>
+where
+    W: BackendWrite,
+{
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        {
+            let mut stats = self.stats.lock().expect("io stats mutex");
+            stats.write_batches += 1;
+            stats.write_puts += entries.entries.len();
+            stats.write_bytes += entries
+                .entries
+                .iter()
+                .map(|entry| entry.key.0.len() + entry.value.bytes.len())
+                .sum::<usize>();
         }
-    } else if is_key_only {
-        stats.scan_key_calls += 1;
-        stats.scan_keys += page.keys.len();
-        stats.scan_key_bytes += key_bytes;
-    } else {
-        stats.scan_entry_calls += 1;
-        stats.scan_entries += page.keys.len();
-        stats.scan_entry_key_bytes += key_bytes;
-        stats.scan_entry_value_bytes += value_bytes;
+        self.inner.put_many(entries)
+    }
+
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+        {
+            let mut stats = self.stats.lock().expect("io stats mutex");
+            stats.write_batches += 1;
+            stats.write_deletes += keys.len();
+            stats.write_bytes += keys.iter().map(|key| key.0.len()).sum::<usize>();
+        }
+        self.inner.delete_many(keys)
+    }
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        {
+            let mut stats = self.stats.lock().expect("io stats mutex");
+            stats.write_batches += 1;
+            stats.write_delete_ranges += 1;
+            stats.write_bytes += range_bound_len(&range.lower) + range_bound_len(&range.upper);
+        }
+        self.inner.delete_range(range)
+    }
+
+    fn commit(self) -> Result<CommitResult, BackendError>
+    where
+        Self: Sized,
+    {
+        self.inner.commit()
+    }
+
+    fn rollback(self) -> Result<(), BackendError>
+    where
+        Self: Sized,
+    {
+        self.inner.rollback()
     }
 }
 
-fn record_read4(
-    stats: &Arc<Mutex<IoStats>>,
-    request: &BackendKvTableReadRequest,
-    page: &BackendKvRead4Page,
-) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    let key_bytes = page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
-    let value_bytes = page
-        .values
-        .iter()
-        .flat_map(|values| values.iter())
-        .map(|bytes| bytes.len())
-        .sum::<usize>();
-    let is_key_only = matches!(request.projection, BackendKvRead4Projection::KeysOnly);
-    let point_like = request
-        .access
-        .iter()
-        .all(|segment| !matches!(segment, BackendKvAccessSegment::Span { .. }));
-    if point_like {
-        if is_key_only {
-            stats.exists_calls += 1;
-            stats.exists_keys += page.presence_len();
-            stats.exists_key_bytes += key_bytes;
-        } else {
-            stats.get_calls += 1;
-            stats.get_keys += page.presence_len();
-            stats.get_key_bytes += key_bytes;
-            stats.get_values += page.present_count();
-            stats.get_value_bytes += value_bytes;
+#[derive(Clone, Copy)]
+enum LixBackendProfile {
+    Sqlite,
+    RocksDb,
+    Redb,
+}
+
+const LIX_BACKEND_PROFILES: [LixBackendProfile; 3] = [
+    LixBackendProfile::Sqlite,
+    LixBackendProfile::RocksDb,
+    LixBackendProfile::Redb,
+];
+
+impl LixBackendProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sqlite => "lix_sqlite",
+            Self::RocksDb => "lix_rocksdb",
+            Self::Redb => "lix_redb",
         }
-    } else if is_key_only {
-        stats.scan_key_calls += 1;
-        stats.scan_keys += page.keys.len();
-        stats.scan_key_bytes += key_bytes;
-    } else {
-        stats.scan_entry_calls += 1;
-        stats.scan_entries += page.keys.len();
-        stats.scan_entry_key_bytes += key_bytes;
-        stats.scan_entry_value_bytes += value_bytes;
     }
-}
-
-fn counting_backend(
-    profile: LixBackendProfile,
-) -> (Arc<dyn Backend + Send + Sync>, Arc<Mutex<IoStats>>) {
-    let stats = Arc::new(Mutex::new(IoStats::default()));
-    let backend = Arc::new(CountingBackend {
-        inner: profile.backend(),
-        stats: Arc::clone(&stats),
-    });
-    (backend, stats)
-}
-
-fn reset_io_stats(stats: &Arc<Mutex<IoStats>>) {
-    stats.lock().expect("io stats mutex should lock").reset();
-}
-
-fn snapshot_io_stats(stats: &Arc<Mutex<IoStats>>) -> IoStats {
-    stats.lock().expect("io stats mutex should lock").clone()
 }
 
 fn untracked_state_crud_benches(c: &mut Criterion) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("create tokio runtime for untracked-state CRUD benchmarks");
     let rows = fixture_rows();
-    maybe_print_io_report(&runtime, &rows);
+    maybe_print_io_report(&rows);
 
-    bench_storage_plan_smoke(c, &runtime, &rows);
-    bench_read4_density_smoke(c, &runtime, &rows);
     bench_raw_sqlite(c, &rows, SMOKE_ROWS, "smoke");
-    bench_lix(c, &runtime, &rows, SMOKE_ROWS, "smoke");
+    bench_lix(c, &rows, SMOKE_ROWS, "smoke");
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
-    bench_lix(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
+    bench_lix(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
 }
 
-fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
+fn maybe_print_io_report(all_rows: &[PointerRow]) {
     let Ok(mode) = std::env::var("LIX_UNTRACKED_STATE_CRUD_IO") else {
         return;
     };
@@ -514,18 +359,12 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
     };
 
     println!("\nuntracked_state_crud/io");
-    println!(
-        "logical backend KV request/result accounting; not physical disk, WAL, or compaction I/O"
-    );
-    println!(
-        "| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | delete ranges | write bytes | write bytes/row |"
-    );
-    println!(
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-    );
+    println!("logical storage_v2 backend request/result accounting; not physical disk, WAL, or compaction I/O");
+    println!("| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | delete ranges | write bytes | write bytes/row |");
+    println!("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
 
     for (label, row_count) in workloads {
-        let rows = storage_rows(&all_rows[..row_count]);
+        let rows = bench_rows(&all_rows[..row_count]);
         for profile in LIX_BACKEND_PROFILES {
             for operation in [
                 "insert_all_rows",
@@ -539,10 +378,11 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
                 "delete_all_rows",
                 "delete_one_by_pk",
             ] {
-                let stats = measure_lix_io(runtime, profile, operation, &rows);
+                let stats = measure_lix_io(profile, operation, &rows);
                 let logical_rows = operation_logical_rows(operation, row_count);
                 println!(
-                    "| {label}/{rows_label} | {} | `{operation}` | {logical_rows} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {label}/{} | {} | `{operation}` | {logical_rows} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    row_label(row_count),
                     profile.name(),
                     stats.io_ops(),
                     ratio(stats.io_ops(), logical_rows),
@@ -561,193 +401,11 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
                     stats.write_delete_ranges,
                     stats.write_bytes,
                     ratio(stats.write_bytes, logical_rows),
-                    rows_label = row_label(row_count),
                 );
             }
         }
     }
     println!();
-}
-
-fn measure_lix_io(
-    runtime: &Runtime,
-    profile: LixBackendProfile,
-    operation: &str,
-    rows: &[storage_bench::JsonPointerStorageRow],
-) -> IoStats {
-    let (backend, stats) = counting_backend(profile);
-    match operation {
-        "insert_all_rows" => {
-            let fixture = runtime
-                .block_on(storage_bench::prepare_json_pointer_untracked_state_write_rows(rows))
-                .expect("prepare untracked_state insert io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(storage_bench::untracked_state_write_rows_only_prepared(
-                    &backend, &fixture,
-                ))
-                .expect("measure untracked_state insert io");
-        }
-        "select_all_rows" => {
-            let fixture = runtime
-                .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
-                    &backend, rows,
-                ))
-                .expect("prepare untracked_state select all io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::json_pointer_untracked_state_scan_full_rows_prepared(
-                        &backend, &fixture,
-                    ),
-                )
-                .expect("measure untracked_state select all io");
-        }
-        "select_keys_only" => {
-            let fixture = runtime
-                .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
-                    &backend, rows,
-                ))
-                .expect("prepare untracked_state select keys io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::json_pointer_untracked_state_scan_keys_only_prepared(
-                        &backend, &fixture,
-                    ),
-                )
-                .expect("measure untracked_state select keys io");
-        }
-        "select_headers_only" => {
-            let fixture = runtime
-                .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
-                    &backend, rows,
-                ))
-                .expect("prepare untracked_state select headers io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::json_pointer_untracked_state_scan_headers_only_prepared(
-                        &backend, &fixture,
-                    ),
-                )
-                .expect("measure untracked_state select headers io");
-        }
-        "select_one_by_pk" => {
-            let fixture = runtime
-                .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
-                    &backend, rows,
-                ))
-                .expect("prepare untracked_state select one io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::json_pointer_untracked_state_read_point_hit_constant_prepared(
-                        &backend, &fixture, 1,
-                    ),
-                )
-                .expect("measure untracked_state select one io");
-        }
-        "select_all_by_pk" => {
-            let fixture = runtime
-                .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
-                    &backend, rows,
-                ))
-                .expect("prepare untracked_state select all by pk io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::json_pointer_untracked_state_read_point_hit_prepared(
-                        &backend, &fixture,
-                    ),
-                )
-                .expect("measure untracked_state select all by pk io");
-        }
-        "update_all_rows" => {
-            let fixture = runtime
-                .block_on(
-                    storage_bench::prepare_json_pointer_untracked_state_overwrite_rows(
-                        &backend,
-                        rows,
-                        rows.len(),
-                    ),
-                )
-                .expect("prepare untracked_state update all io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(storage_bench::untracked_state_write_rows_only_prepared(
-                    &backend, &fixture,
-                ))
-                .expect("measure untracked_state update all io");
-        }
-        "update_one_by_pk" => {
-            let fixture = runtime
-                .block_on(
-                    storage_bench::prepare_json_pointer_untracked_state_overwrite_rows(
-                        &backend, rows, 1,
-                    ),
-                )
-                .expect("prepare untracked_state update one io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(storage_bench::untracked_state_write_rows_only_prepared(
-                    &backend, &fixture,
-                ))
-                .expect("measure untracked_state update one io");
-        }
-        "delete_all_rows" => {
-            let fixture = runtime
-                .block_on(
-                    storage_bench::prepare_json_pointer_untracked_state_delete_rows(
-                        &backend,
-                        rows,
-                        rows.len(),
-                    ),
-                )
-                .expect("prepare untracked_state delete all io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::untracked_state_delete_existing_only_prepared(
-                        &backend, &fixture,
-                    ),
-                )
-                .expect("measure untracked_state delete all io");
-        }
-        "delete_one_by_pk" => {
-            let fixture = runtime
-                .block_on(
-                    storage_bench::prepare_json_pointer_untracked_state_delete_rows(
-                        &backend, rows, 1,
-                    ),
-                )
-                .expect("prepare untracked_state delete one io");
-            reset_io_stats(&stats);
-            runtime
-                .block_on(
-                    storage_bench::untracked_state_delete_existing_only_prepared(
-                        &backend, &fixture,
-                    ),
-                )
-                .expect("measure untracked_state delete one io");
-        }
-        _ => unreachable!("unknown untracked_state io operation"),
-    }
-    snapshot_io_stats(&stats)
-}
-
-fn operation_logical_rows(operation: &str, row_count: usize) -> usize {
-    match operation {
-        "select_one_by_pk" | "update_one_by_pk" | "delete_one_by_pk" => 1,
-        _ => row_count,
-    }
-}
-
-fn ratio(numerator: usize, denominator: usize) -> String {
-    if denominator == 0 {
-        return "-".to_string();
-    }
-    format!("{:.2}", numerator as f64 / denominator as f64)
 }
 
 fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize, label: &str) {
@@ -762,7 +420,6 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.bench_function(format!("select_all_rows/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -770,7 +427,6 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.bench_function(format!("select_one_by_pk/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -778,7 +434,6 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.bench_function(format!("update_all_rows/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -786,7 +441,6 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.bench_function(format!("update_one_by_pk/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -794,7 +448,6 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.bench_function(format!("delete_all_rows/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -802,7 +455,6 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.bench_function(format!("delete_one_by_pk/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -810,709 +462,487 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
-
     group.finish();
 }
 
-fn bench_lix(
-    c: &mut Criterion,
-    runtime: &Runtime,
-    all_rows: &[PointerRow],
-    row_count: usize,
-    label: &str,
-) {
-    let rows = storage_rows(&all_rows[..row_count]);
+fn bench_lix(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize, label: &str) {
+    let rows = bench_rows(&all_rows[..row_count]);
     for profile in LIX_BACKEND_PROFILES {
         let mut group =
             c.benchmark_group(format!("untracked_state_crud/{}/{label}", profile.name()));
         configure_group(&mut group, row_count);
 
-        group.bench_function(format!("insert_all_rows/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || {
-                    let backend = profile.backend();
-                    let fixture = runtime
-                        .block_on(
-                            storage_bench::prepare_json_pointer_untracked_state_write_rows(&rows),
-                        )
-                        .expect("prepare untracked_state insert");
-                    (backend, fixture)
-                },
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(storage_bench::untracked_state_write_rows_only_prepared(
-                                &backend, &fixture,
-                            ))
-                            .expect("untracked_state insert"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("select_all_rows/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::json_pointer_untracked_state_scan_full_rows_prepared(
-                                    &backend, &fixture,
-                                ),
-                            )
-                            .expect("untracked_state scan full rows"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("select_keys_only/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::json_pointer_untracked_state_scan_keys_only_prepared(
-                                    &backend, &fixture,
-                                ),
-                            )
-                            .expect("untracked_state scan keys"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("select_headers_only/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::json_pointer_untracked_state_scan_headers_only_prepared(
-                                    &backend, &fixture,
-                                ),
-                            )
-                            .expect("untracked_state scan headers"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("select_one_by_pk/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::json_pointer_untracked_state_read_point_hit_constant_prepared(
-                                    &backend, &fixture, 1,
-                                ),
-                            )
-                            .expect("untracked_state point hit"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("select_all_by_pk/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::json_pointer_untracked_state_read_point_hit_prepared(
-                                    &backend, &fixture,
-                                ),
-                            )
-                            .expect("untracked_state point hits"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("update_all_rows/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || {
-                    let backend = profile.backend();
-                    let fixture = runtime
-                        .block_on(
-                            storage_bench::prepare_json_pointer_untracked_state_overwrite_rows(
-                                &backend, &rows, row_count,
-                            ),
-                        )
-                        .expect("prepare untracked_state update all");
-                    (backend, fixture)
-                },
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(storage_bench::untracked_state_write_rows_only_prepared(
-                                &backend, &fixture,
-                            ))
-                            .expect("untracked_state update all"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("update_one_by_pk/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || {
-                    let backend = profile.backend();
-                    let fixture = runtime
-                        .block_on(
-                            storage_bench::prepare_json_pointer_untracked_state_overwrite_rows(
-                                &backend, &rows, 1,
-                            ),
-                        )
-                        .expect("prepare untracked_state update one");
-                    (backend, fixture)
-                },
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(storage_bench::untracked_state_write_rows_only_prepared(
-                                &backend, &fixture,
-                            ))
-                            .expect("untracked_state update one"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("delete_all_rows/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || {
-                    let backend = profile.backend();
-                    let fixture = runtime
-                        .block_on(
-                            storage_bench::prepare_json_pointer_untracked_state_delete_rows(
-                                &backend, &rows, row_count,
-                            ),
-                        )
-                        .expect("prepare untracked_state delete all");
-                    (backend, fixture)
-                },
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::untracked_state_delete_existing_only_prepared(
-                                    &backend, &fixture,
-                                ),
-                            )
-                            .expect("untracked_state delete all"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(format!("delete_one_by_pk/{}", row_label(row_count)), |b| {
-            b.iter_batched(
-                || {
-                    let backend = profile.backend();
-                    let fixture = runtime
-                        .block_on(
-                            storage_bench::prepare_json_pointer_untracked_state_delete_rows(
-                                &backend, &rows, 1,
-                            ),
-                        )
-                        .expect("prepare untracked_state delete one");
-                    (backend, fixture)
-                },
-                |(backend, fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(
-                                storage_bench::untracked_state_delete_existing_only_prepared(
-                                    &backend, &fixture,
-                                ),
-                            )
-                            .expect("untracked_state delete one"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
+        bench_lix_profile(&mut group, profile, &rows);
         group.finish();
     }
 }
 
-fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[PointerRow]) {
-    let rows = storage_rows(&all_rows[..SMOKE_ROWS]);
-    for profile in LIX_BACKEND_PROFILES {
-        let mut group = c.benchmark_group(format!(
-            "untracked_state_crud/storage_plans/{}/smoke",
-            profile.name()
-        ));
-        configure_group(&mut group, SMOKE_ROWS);
-
-        group.bench_function(
-            format!("read4_span_header/{}", row_label(SMOKE_ROWS)),
-            |b| {
-                b.iter_batched(
-                    || prepare_lix_read(runtime, profile, &rows),
-                    |(backend, _fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(storage_plan_read4_header(&backend, SMOKE_ROWS))
-                                .expect("storage plan read4 header"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(
-            format!("read4_span_header_payload/{}", row_label(SMOKE_ROWS)),
-            |b| {
-                b.iter_batched(
-                    || prepare_lix_read(runtime, profile, &rows),
-                    |(backend, _fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(storage_plan_read4_header_payload(&backend, SMOKE_ROWS))
-                                .expect("storage plan read4 header payload"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(format!("read4_span_full/{}", row_label(SMOKE_ROWS)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, _fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(storage_plan_read4_full(&backend, SMOKE_ROWS))
-                            .expect("storage plan read4 full"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.finish();
-    }
-
-    let raw_rows = raw_projected_rows(&all_rows[..SMOKE_ROWS]);
-    let mut group =
-        c.benchmark_group("untracked_state_crud/storage_plans/raw_sqlite_projected/smoke");
-    configure_group(&mut group, SMOKE_ROWS);
-    group.bench_function(format!("scan_keys/{}", row_label(SMOKE_ROWS)), |b| {
-        b.iter_batched(
-            || prepare_raw_projected_sqlite_seeded(&raw_rows),
-            |fixture| black_box(raw_projected_sqlite_scan_keys(fixture, SMOKE_ROWS)),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("scan_header/{}", row_label(SMOKE_ROWS)), |b| {
-        b.iter_batched(
-            || prepare_raw_projected_sqlite_seeded(&raw_rows),
-            |fixture| black_box(raw_projected_sqlite_scan_header(fixture, SMOKE_ROWS)),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("scan_full/{}", row_label(SMOKE_ROWS)), |b| {
-        b.iter_batched(
-            || prepare_raw_projected_sqlite_seeded(&raw_rows),
-            |fixture| black_box(raw_projected_sqlite_scan_full(fixture, SMOKE_ROWS)),
-            BatchSize::LargeInput,
-        )
-    });
-    group.finish();
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Read4DensityShape {
-    Points,
-    Run,
-    Span,
-}
-
-impl Read4DensityShape {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Points => "points",
-            Self::Run => "run",
-            Self::Span => "span",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Read4DensityProjection {
-    KeysOnly,
-    Header,
-    PayloadRef,
-    FullValue,
-}
-
-impl Read4DensityProjection {
-    fn label(self) -> &'static str {
-        match self {
-            Self::KeysOnly => "keys",
-            Self::Header => "header",
-            Self::PayloadRef => "payload_ref",
-            Self::FullValue => "full",
-        }
-    }
-
-    fn projection(self) -> BackendKvRead4Projection {
-        match self {
-            Self::KeysOnly => BackendKvRead4Projection::KeysOnly,
-            Self::Header => BackendKvRead4Projection::Parts(vec![BackendKvRead4ValuePart::Header]),
-            Self::PayloadRef => {
-                BackendKvRead4Projection::Parts(vec![BackendKvRead4ValuePart::PayloadRef])
-            }
-            Self::FullValue => {
-                BackendKvRead4Projection::Parts(vec![BackendKvRead4ValuePart::FullValue])
-            }
-        }
-    }
-
-    fn part_count(self) -> usize {
-        match self {
-            Self::KeysOnly => 0,
-            Self::Header | Self::PayloadRef | Self::FullValue => 1,
-        }
-    }
-}
-
-fn bench_read4_density_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[PointerRow]) {
-    let rows = storage_rows(&all_rows[..SMOKE_ROWS]);
-    let projections = [
-        Read4DensityProjection::KeysOnly,
-        Read4DensityProjection::Header,
-        Read4DensityProjection::PayloadRef,
-        Read4DensityProjection::FullValue,
-    ];
-    for profile in LIX_BACKEND_PROFILES {
-        let mut group = c.benchmark_group(format!(
-            "untracked_state_crud/read4_density/{}/smoke",
-            profile.name()
-        ));
-        configure_group(&mut group, SMOKE_ROWS);
-
-        for density in [1usize, 10, 50, 100] {
-            for ordered in [true, false] {
-                for shape in [Read4DensityShape::Points, Read4DensityShape::Run] {
-                    for projection in projections {
-                        group.bench_function(
-                            format!(
-                                "{}/{}/{}/{}/{}",
-                                shape.label(),
-                                if ordered { "sorted" } else { "random" },
-                                projection.label(),
-                                density,
-                                row_label(SMOKE_ROWS)
-                            ),
-                            |b| {
-                                b.iter_batched(
-                                    || {
-                                        let (backend, _fixture) =
-                                            prepare_lix_read(runtime, profile, &rows);
-                                        let all_keys = runtime
-                                            .block_on(collect_untracked_keys(&backend, SMOKE_ROWS))
-                                            .expect("collect untracked keys");
-                                        let selected =
-                                            select_density_keys(&all_keys, density, ordered);
-                                        (backend, selected)
-                                    },
-                                    |(backend, selected)| {
-                                        black_box(
-                                            runtime
-                                                .block_on(storage_plan_read4_density(
-                                                    &backend, shape, projection, selected,
-                                                    SMOKE_ROWS,
-                                                ))
-                                                .expect("read4 density plan"),
-                                        )
-                                    },
-                                    BatchSize::LargeInput,
-                                )
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        for projection in projections {
-            group.bench_function(
-                format!(
-                    "span/key_order/{}/100/{}",
-                    projection.label(),
-                    row_label(SMOKE_ROWS)
-                ),
-                |b| {
-                    b.iter_batched(
-                        || {
-                            let (backend, _fixture) = prepare_lix_read(runtime, profile, &rows);
-                            let all_keys = runtime
-                                .block_on(collect_untracked_keys(&backend, SMOKE_ROWS))
-                                .expect("collect untracked keys");
-                            (backend, all_keys)
-                        },
-                        |(backend, keys)| {
-                            black_box(
-                                runtime
-                                    .block_on(storage_plan_read4_density(
-                                        &backend,
-                                        Read4DensityShape::Span,
-                                        projection,
-                                        keys,
-                                        SMOKE_ROWS,
-                                    ))
-                                    .expect("read4 span density plan"),
-                            )
-                        },
-                        BatchSize::LargeInput,
-                    )
-                },
-            );
-        }
-
-        group.finish();
-    }
-}
-
-fn prepare_lix_read(
-    runtime: &Runtime,
+fn bench_lix_profile(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     profile: LixBackendProfile,
-    rows: &[storage_bench::JsonPointerStorageRow],
-) -> (
-    Arc<dyn Backend + Send + Sync>,
-    storage_bench::JsonPointerUntrackedStateReadFixture,
+    rows: &[BenchRow],
 ) {
-    let backend = profile.backend();
-    let fixture = runtime
-        .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
-            &backend, rows,
-        ))
-        .expect("prepare untracked_state read");
-    (backend, fixture)
+    group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || profile_storage(profile),
+            |storage| black_box(storage.insert_all(rows)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("select_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.select_all(rows.len(), StorageCoreProjection::FullValue)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("select_keys_only/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(
+        format!("select_headers_only/{}", row_label(rows.len())),
+        |b| {
+            b.iter_batched(
+                || prepare_lix_seeded(profile, rows),
+                |storage| {
+                    black_box(storage.select_all(rows.len(), StorageCoreProjection::FullValue))
+                },
+                BatchSize::LargeInput,
+            )
+        },
+    );
+    group.bench_function(format!("select_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.select_points(std::slice::from_ref(&rows[rows.len() / 2]))),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("select_all_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.select_points(rows)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.update_all(rows)),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.update_all(&rows[..1])),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.delete_all()),
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched(
+            || prepare_lix_seeded(profile, rows),
+            |storage| black_box(storage.delete_one(&rows[rows.len() / 2])),
+            BatchSize::LargeInput,
+        )
+    });
 }
 
-async fn collect_untracked_keys(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<Vec<Vec<u8>>, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let page = tx
-        .read4(BackendKvTableReadRequest {
-            table: BackendKvTableId {
-                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            },
-            key_space: BackendKvKeySpace::OrderedBytes,
-            access: vec![BackendKvAccessSegment::Span {
-                lower: Vec::new(),
-                upper: Vec::new(),
-            }],
-            after: None,
-            projection: BackendKvRead4Projection::KeysOnly,
-            residual_filter: None,
-            output_order: BackendKvRead4Order::KeyOrder,
-            limit: Some(expected_rows),
-            session: None,
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(page.keys.len(), expected_rows);
-    Ok(page.keys.iter().map(<[u8]>::to_vec).collect())
-}
-
-fn select_density_keys(keys: &[Vec<u8>], density: usize, sorted: bool) -> Vec<Vec<u8>> {
-    let count = keys.len().saturating_mul(density).div_ceil(100).max(1);
-    let mut selected = if sorted {
-        keys.iter().take(count).cloned().collect::<Vec<_>>()
-    } else {
-        let step = if keys.len() > 1 { keys.len() - 3 } else { 1 };
-        (0..count)
-            .map(|index| keys[(index * step) % keys.len()].clone())
-            .collect::<Vec<_>>()
-    };
-    if sorted {
-        selected.sort();
-    }
-    selected
-}
-
-async fn storage_plan_read4_density(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    shape: Read4DensityShape,
-    projection: Read4DensityProjection,
-    keys: Vec<Vec<u8>>,
-    expected_total_rows: usize,
-) -> Result<usize, LixError> {
-    let expected_rows = match shape {
-        Read4DensityShape::Span => expected_total_rows,
-        Read4DensityShape::Points | Read4DensityShape::Run => keys.len(),
-    };
-    let access = read4_density_access(shape, &keys)?;
-    let mut tx = backend.begin_read_transaction().await?;
-    let page = tx
-        .read4(BackendKvTableReadRequest {
-            table: BackendKvTableId {
-                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            },
-            key_space: BackendKvKeySpace::OrderedBytes,
-            access,
-            after: None,
-            projection: projection.projection(),
-            residual_filter: None,
-            output_order: match shape {
-                Read4DensityShape::Span => BackendKvRead4Order::KeyOrder,
-                Read4DensityShape::Points | Read4DensityShape::Run => {
-                    BackendKvRead4Order::RequestOrder
-                }
-            },
-            limit: Some(expected_rows),
-            session: None,
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(page.keys.len(), expected_rows);
-    assert_eq!(page.values.len(), projection.part_count());
-    for values in &page.values {
-        assert_eq!(values.len(), expected_rows);
-    }
-    Ok(page.keys.iter().map(|key| key.len()).sum::<usize>()
-        + page
-            .values
-            .iter()
-            .flat_map(|values| values.iter())
-            .map(|value| value.len())
-            .sum::<usize>())
-}
-
-fn read4_density_access(
-    shape: Read4DensityShape,
-    keys: &[Vec<u8>],
-) -> Result<Vec<BackendKvAccessSegment>, LixError> {
-    let request_indexes = (0..keys.len())
-        .map(|index| u32::try_from(index).map_err(|_| LixError::unknown("read4 index overflow")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(match shape {
-        Read4DensityShape::Points => vec![BackendKvAccessSegment::Points {
-            keys: keys.to_vec(),
-            request_indexes,
-        }],
-        Read4DensityShape::Run => {
-            let mut sorted = keys.to_vec();
-            sorted.sort();
-            let lower = sorted.first().cloned().unwrap_or_default();
-            let mut upper = sorted.last().cloned().unwrap_or_default();
-            upper.push(0);
-            vec![BackendKvAccessSegment::Run {
-                lower,
-                upper,
-                keys: keys.to_vec(),
-                request_indexes,
-            }]
+fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
+    match profile {
+        LixBackendProfile::Sqlite => measure_lix_io_for_backend(sqlite_backend(), operation, rows),
+        LixBackendProfile::RocksDb => {
+            measure_lix_io_for_backend(rocksdb_backend(), operation, rows)
         }
-        Read4DensityShape::Span => vec![BackendKvAccessSegment::Span {
-            lower: Vec::new(),
-            upper: Vec::new(),
-        }],
-    })
-}
-
-async fn storage_plan_read4_header(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    storage_plan_read4_value_parts(backend, expected_rows, &[BackendKvRead4ValuePart::Header]).await
-}
-
-async fn storage_plan_read4_header_payload(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    storage_plan_read4_value_parts(
-        backend,
-        expected_rows,
-        &[
-            BackendKvRead4ValuePart::Header,
-            BackendKvRead4ValuePart::Payload,
-        ],
-    )
-    .await
-}
-
-async fn storage_plan_read4_full(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    storage_plan_read4_value_parts(
-        backend,
-        expected_rows,
-        &[BackendKvRead4ValuePart::FullValue],
-    )
-    .await
-}
-
-async fn storage_plan_read4_value_parts(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-    parts: &[BackendKvRead4ValuePart],
-) -> Result<usize, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let page = tx
-        .read4(BackendKvTableReadRequest {
-            table: BackendKvTableId {
-                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            },
-            key_space: BackendKvKeySpace::OrderedBytes,
-            access: vec![BackendKvAccessSegment::Span {
-                lower: Vec::new(),
-                upper: Vec::new(),
-            }],
-            after: None,
-            projection: BackendKvRead4Projection::Parts(parts.to_vec()),
-            residual_filter: None,
-            output_order: BackendKvRead4Order::KeyOrder,
-            limit: Some(expected_rows),
-            session: None,
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(page.keys.len(), expected_rows);
-    assert_eq!(page.values.len(), parts.len());
-    for values in &page.values {
-        assert_eq!(values.len(), expected_rows);
+        LixBackendProfile::Redb => measure_lix_io_for_backend(redb_backend(), operation, rows),
     }
-    Ok(page.keys.iter().map(|key| key.len()).sum::<usize>()
-        + page
-            .values
-            .iter()
-            .flat_map(|values| values.iter())
-            .map(|value| value.len())
-            .sum::<usize>())
+}
+
+fn measure_lix_io_for_backend<B>(backend: B, operation: &str, rows: &[BenchRow]) -> IoStats
+where
+    B: Backend,
+{
+    let (backend, stats) = CountingBackend::new(backend);
+    let storage = StorageContext::new(backend);
+    if !matches!(operation, "insert_all_rows") {
+        lix_insert_all(&storage, rows);
+        stats.lock().expect("io stats mutex").reset();
+    }
+    match operation {
+        "insert_all_rows" => {
+            lix_insert_all(&storage, rows);
+        }
+        "select_all_rows" | "select_headers_only" => {
+            lix_select_all(&storage, rows.len(), StorageCoreProjection::FullValue);
+            record_scan_result(&stats, rows, true);
+        }
+        "select_keys_only" => {
+            lix_select_all(&storage, rows.len(), StorageCoreProjection::KeyOnly);
+            record_scan_result(&stats, rows, false);
+        }
+        "select_one_by_pk" => {
+            lix_select_points(&storage, std::slice::from_ref(&rows[rows.len() / 2]));
+        }
+        "select_all_by_pk" => {
+            lix_select_points(&storage, rows);
+        }
+        "update_all_rows" => {
+            lix_update_all(&storage, rows);
+        }
+        "update_one_by_pk" => {
+            lix_update_all(&storage, &rows[..1]);
+        }
+        "delete_all_rows" => {
+            lix_delete_all(&storage);
+        }
+        "delete_one_by_pk" => {
+            lix_delete_one(&storage, &rows[rows.len() / 2]);
+        }
+        _ => unreachable!("unknown operation"),
+    }
+    let snapshot = stats.lock().expect("io stats mutex").clone();
+    snapshot
+}
+
+fn record_scan_result(stats: &Arc<Mutex<IoStats>>, rows: &[BenchRow], include_values: bool) {
+    let mut stats = stats.lock().expect("io stats mutex");
+    stats.scan_entries += rows.len();
+    stats.scan_entry_key_bytes += rows.iter().map(|row| row.key.0.len()).sum::<usize>();
+    if include_values {
+        stats.scan_entry_value_bytes += rows.iter().map(|row| row.value.bytes.len()).sum::<usize>();
+    }
+}
+
+fn lix_insert_all<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+where
+    B: Backend,
+{
+    let mut writes = storage.new_write_set();
+    for row in rows {
+        writes.put(ROW_SPACE, row.key.clone(), row.value.clone());
+    }
+    let (_commit, stats) = storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .expect("commit insert rows");
+    assert_eq!(stats.staged_puts, rows.len() as u64);
+    rows.len()
+}
+
+fn lix_update_all<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+where
+    B: Backend,
+{
+    let mut writes = storage.new_write_set();
+    for row in rows {
+        writes.put(ROW_SPACE, row.key.clone(), row.updated_value.clone());
+    }
+    let (_commit, stats) = storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .expect("commit update rows");
+    assert_eq!(stats.staged_puts, rows.len() as u64);
+    rows.len()
+}
+
+fn lix_delete_one<B>(storage: &StorageContext<B>, row: &BenchRow) -> usize
+where
+    B: Backend,
+{
+    let mut writes = storage.new_write_set();
+    writes.delete(ROW_SPACE, row.key.clone());
+    let (_commit, stats) = storage
+        .commit_write_set(writes, StorageWriteOptions::default())
+        .expect("commit delete row");
+    assert_eq!(stats.staged_deletes, 1);
+    1
+}
+
+fn lix_delete_all<B>(storage: &StorageContext<B>) -> usize
+where
+    B: Backend,
+{
+    storage
+        .clear_space(ROW_SPACE, StorageWriteOptions::default())
+        .expect("clear untracked rows");
+    1
+}
+
+fn lix_select_all<B>(
+    storage: &StorageContext<B>,
+    expected_rows: usize,
+    projection: StorageCoreProjection,
+) -> usize
+where
+    B: Backend,
+{
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .expect("begin read");
+    let plan = ScanPlan::prefix(
+        ROW_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let page = plan
+        .collect(
+            &read,
+            StorageScanOptions {
+                projection,
+                limit_rows: expected_rows + 1,
+                ..StorageScanOptions::default()
+            },
+        )
+        .expect("scan rows");
+    assert_eq!(page.value.entries.len(), expected_rows);
+    expected_rows
+}
+
+fn lix_select_points<B>(storage: &StorageContext<B>, rows: &[BenchRow]) -> usize
+where
+    B: Backend,
+{
+    let read = storage
+        .begin_read(StorageReadOptions::default())
+        .expect("begin read");
+    let keys = rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
+    let result = PointReadPlan::new(ROW_SPACE, &keys)
+        .materialize(&read, StorageGetOptions::default())
+        .expect("point read rows");
+    assert_eq!(result.value.len(), rows.len());
+    assert!(result.value.iter().all(Option::is_some));
+    result.value.len()
+}
+
+fn prepare_lix_seeded(profile: LixBackendProfile, rows: &[BenchRow]) -> ProfileStorage {
+    let storage = profile_storage(profile);
+    storage.insert_all(rows);
+    storage
+}
+
+fn profile_storage(profile: LixBackendProfile) -> ProfileStorage {
+    match profile {
+        LixBackendProfile::Sqlite => ProfileStorage::Sqlite(StorageContext::new(sqlite_backend())),
+        LixBackendProfile::RocksDb => {
+            ProfileStorage::RocksDb(StorageContext::new(rocksdb_backend()))
+        }
+        LixBackendProfile::Redb => ProfileStorage::Redb(StorageContext::new(redb_backend())),
+    }
+}
+
+enum ProfileStorage {
+    Sqlite(StorageContext<SqliteBackend>),
+    RocksDb(StorageContext<RocksDbBackend>),
+    Redb(StorageContext<RedbBackend>),
+}
+
+impl ProfileStorage {
+    fn insert_all(&self, rows: &[BenchRow]) -> usize {
+        match self {
+            Self::Sqlite(storage) => lix_insert_all(storage, rows),
+            Self::RocksDb(storage) => lix_insert_all(storage, rows),
+            Self::Redb(storage) => lix_insert_all(storage, rows),
+        }
+    }
+
+    fn update_all(&self, rows: &[BenchRow]) -> usize {
+        match self {
+            Self::Sqlite(storage) => lix_update_all(storage, rows),
+            Self::RocksDb(storage) => lix_update_all(storage, rows),
+            Self::Redb(storage) => lix_update_all(storage, rows),
+        }
+    }
+
+    fn delete_one(&self, row: &BenchRow) -> usize {
+        match self {
+            Self::Sqlite(storage) => lix_delete_one(storage, row),
+            Self::RocksDb(storage) => lix_delete_one(storage, row),
+            Self::Redb(storage) => lix_delete_one(storage, row),
+        }
+    }
+
+    fn delete_all(&self) -> usize {
+        match self {
+            Self::Sqlite(storage) => lix_delete_all(storage),
+            Self::RocksDb(storage) => lix_delete_all(storage),
+            Self::Redb(storage) => lix_delete_all(storage),
+        }
+    }
+
+    fn select_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
+        match self {
+            Self::Sqlite(storage) => lix_select_all(storage, expected_rows, projection),
+            Self::RocksDb(storage) => lix_select_all(storage, expected_rows, projection),
+            Self::Redb(storage) => lix_select_all(storage, expected_rows, projection),
+        }
+    }
+
+    fn select_points(&self, rows: &[BenchRow]) -> usize {
+        match self {
+            Self::Sqlite(storage) => lix_select_points(storage, rows),
+            Self::RocksDb(storage) => lix_select_points(storage, rows),
+            Self::Redb(storage) => lix_select_points(storage, rows),
+        }
+    }
+}
+
+fn sqlite_backend() -> SqliteBackend {
+    let dir = TempDir::new().expect("create sqlite backend tempdir");
+    let path = dir.keep().join("bench.sqlite");
+    SqliteBackend::open(path).expect("open sqlite backend")
+}
+
+fn rocksdb_backend() -> RocksDbBackend {
+    let dir = TempDir::new().expect("create rocksdb backend tempdir");
+    let path = dir.keep().join("bench.rocksdb");
+    RocksDbBackend::open(path).expect("open rocksdb backend")
+}
+
+fn redb_backend() -> RedbBackend {
+    let dir = TempDir::new().expect("create redb backend tempdir");
+    let path = dir.keep().join("bench.redb");
+    RedbBackend::open(path).expect("open redb backend")
+}
+
+fn configure_group(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    row_count: usize,
+) {
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(250));
+    group.measurement_time(if row_count >= REAL_WORKLOAD_ROWS {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(1)
+    });
+}
+
+fn fixture_rows() -> Vec<PointerRow> {
+    let json: JsonValue = serde_json::from_str(PNPM_LOCK_JSON).expect("parse pnpm-lock fixture");
+    let mut rows = Vec::new();
+    flatten_json("", &json, &mut rows);
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
+    assert!(rows.len() >= REAL_WORKLOAD_ROWS);
+    rows
+}
+
+fn flatten_json(path: &str, value: &JsonValue, rows: &mut Vec<PointerRow>) {
+    let value_json = serde_json::to_string(value).expect("serialize JSON pointer value");
+    let updated_value_json = serde_json::to_string(&serde_json::json!({
+        "path": path,
+        "value": value,
+        "updated": true
+    }))
+    .expect("serialize updated JSON pointer value");
+    rows.push(PointerRow {
+        path: path.to_string(),
+        value_json,
+        updated_value_json,
+    });
+
+    match value {
+        JsonValue::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                flatten_json(&format!("{path}/{index}"), item, rows);
+            }
+        }
+        JsonValue::Object(map) => {
+            for (key, item) in map {
+                flatten_json(&format!("{path}/{}", escape_json_pointer(key)), item, rows);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn escape_json_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
+    rows.iter()
+        .map(|row| {
+            let entity_id = entity_id(row);
+            let value = snapshot_value(row.path.as_str(), row.value_json.as_str());
+            let updated_value = snapshot_value(row.path.as_str(), row.updated_value_json.as_str());
+            BenchRow {
+                key: Key(Bytes::from(row_key(&entity_id))),
+                value: StorageValue {
+                    bytes: Bytes::from(value),
+                },
+                updated_value: StorageValue {
+                    bytes: Bytes::from(updated_value),
+                },
+            }
+        })
+        .collect()
+}
+
+fn raw_rows(rows: &[PointerRow]) -> Vec<RawUntrackedRow> {
+    rows.iter()
+        .map(|row| RawUntrackedRow {
+            version_id: "bench-version".to_string(),
+            schema_key: "json_pointer".to_string(),
+            entity_id: entity_id(row),
+            file_id: String::new(),
+            snapshot_content: snapshot_value(row.path.as_str(), row.value_json.as_str()),
+            updated_snapshot_content: snapshot_value(
+                row.path.as_str(),
+                row.updated_value_json.as_str(),
+            ),
+            metadata: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            global: false,
+        })
+        .collect()
+}
+
+fn entity_id(row: &PointerRow) -> String {
+    if row.path.is_empty() {
+        "/".to_string()
+    } else {
+        row.path.clone()
+    }
+}
+
+fn row_key(entity_id: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_component(&mut out, "bench-version");
+    push_component(&mut out, "json_pointer");
+    push_component(&mut out, entity_id);
+    push_component(&mut out, "");
+    out
+}
+
+fn push_component(out: &mut Vec<u8>, value: &str) {
+    let len = u32::try_from(value.len()).expect("component length fits u32");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn snapshot_value(path: &str, value_json: &str) -> String {
+    format!(r#"{{"path":{},"value":{}}}"#, json_string(path), value_json)
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serialize JSON string")
 }
 
 fn prepare_raw_sqlite_empty() -> RawSqliteFixture {
     let dir = TempDir::new().expect("create raw sqlite tempdir");
-    let conn = Connection::open(dir.path().join("untracked_state.sqlite"))
-        .expect("open raw sqlite database");
+    let conn =
+        Connection::open(dir.path().join("untracked_state.sqlite")).expect("open raw sqlite db");
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
@@ -1533,59 +963,12 @@ fn prepare_raw_sqlite_empty() -> RawSqliteFixture {
         ) WITHOUT ROWID;
         ",
     )
-    .expect("create raw sqlite untracked_state table");
+    .expect("create raw sqlite table");
     RawSqliteFixture { conn, _dir: dir }
 }
 
-fn prepare_raw_projected_sqlite_empty() -> RawProjectedSqliteFixture {
-    let dir = TempDir::new().expect("create raw projected sqlite tempdir");
-    let conn = Connection::open(dir.path().join("untracked_projected.sqlite"))
-        .expect("open raw projected sqlite database");
-    conn.execute_batch(
-        "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
-        PRAGMA temp_store = MEMORY;
-        PRAGMA foreign_keys = ON;
-        CREATE TABLE untracked_projected (
-            key BLOB NOT NULL PRIMARY KEY,
-            header BLOB NOT NULL,
-            payload BLOB NOT NULL
-        ) WITHOUT ROWID;
-        ",
-    )
-    .expect("create raw projected sqlite untracked table");
-    RawProjectedSqliteFixture { conn, _dir: dir }
-}
-
 fn prepare_raw_sqlite_seeded(rows: &[RawUntrackedRow]) -> RawSqliteFixture {
-    let fixture = prepare_raw_sqlite_empty();
-    raw_sqlite_insert_all(fixture, rows)
-}
-
-fn prepare_raw_projected_sqlite_seeded(rows: &[RawProjectedRow]) -> RawProjectedSqliteFixture {
-    let mut fixture = prepare_raw_projected_sqlite_empty();
-    let tx = fixture
-        .conn
-        .transaction()
-        .expect("begin raw projected sqlite insert");
-    {
-        let mut statement = tx
-            .prepare_cached(
-                "
-                INSERT INTO untracked_projected (key, header, payload)
-                VALUES (?1, ?2, ?3)
-                ",
-            )
-            .expect("prepare raw projected sqlite insert");
-        for row in rows {
-            statement
-                .execute(params![row.key, row.header, row.payload])
-                .expect("execute raw projected sqlite insert");
-        }
-    }
-    tx.commit().expect("commit raw projected sqlite insert");
-    fixture
+    raw_sqlite_insert_all(prepare_raw_sqlite_empty(), rows)
 }
 
 fn raw_sqlite_insert_all(
@@ -1745,204 +1128,45 @@ fn raw_sqlite_delete_one_by_pk(fixture: RawSqliteFixture, row: &RawUntrackedRow)
     affected
 }
 
-fn raw_projected_sqlite_scan_keys(
-    fixture: RawProjectedSqliteFixture,
-    expected_rows: usize,
-) -> usize {
-    let mut statement = fixture
-        .conn
-        .prepare_cached("SELECT key FROM untracked_projected ORDER BY key")
-        .expect("prepare raw projected keys scan");
-    let bytes = statement
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .expect("execute raw projected keys scan")
-        .map(|row| row.expect("raw projected key row").len())
-        .sum::<usize>();
-    assert!(bytes > expected_rows);
-    bytes
-}
-
-fn raw_projected_sqlite_scan_header(
-    fixture: RawProjectedSqliteFixture,
-    expected_rows: usize,
-) -> usize {
-    let mut statement = fixture
-        .conn
-        .prepare_cached("SELECT key, header FROM untracked_projected ORDER BY key")
-        .expect("prepare raw projected header scan");
-    let mut rows = 0usize;
-    let bytes = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .expect("execute raw projected header scan")
-        .map(|row| {
-            rows += 1;
-            let (key, header) = row.expect("raw projected header row");
-            key.len() + header.len()
-        })
-        .sum::<usize>();
-    assert_eq!(rows, expected_rows);
-    bytes
-}
-
-fn raw_projected_sqlite_scan_full(
-    fixture: RawProjectedSqliteFixture,
-    expected_rows: usize,
-) -> usize {
-    let mut statement = fixture
-        .conn
-        .prepare_cached("SELECT key, header, payload FROM untracked_projected ORDER BY key")
-        .expect("prepare raw projected full scan");
-    let mut rows = 0usize;
-    let bytes = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .expect("execute raw projected full scan")
-        .map(|row| {
-            rows += 1;
-            let (key, header, payload) = row.expect("raw projected full row");
-            key.len() + header.len() + payload.len()
-        })
-        .sum::<usize>();
-    assert_eq!(rows, expected_rows);
-    bytes
-}
-
-fn fixture_rows() -> Vec<PointerRow> {
-    let root: JsonValue = serde_json::from_str(PNPM_LOCK_JSON).expect("pnpm lock JSON fixture");
-    let mut rows = Vec::new();
-    flatten_json("", &root, &mut rows);
-    assert!(
-        rows.len() >= REAL_WORKLOAD_ROWS,
-        "pnpm lock fixture should have at least {REAL_WORKLOAD_ROWS} pointer rows, got {}",
-        rows.len()
-    );
-    rows
-}
-
-fn storage_rows(rows: &[PointerRow]) -> Vec<storage_bench::JsonPointerStorageRow> {
-    rows.iter()
-        .map(|row| storage_bench::JsonPointerStorageRow {
-            path: row.path.clone(),
-            value_json: row.value_json.clone(),
-            updated_value_json: row.updated_value_json.clone(),
-        })
-        .collect()
-}
-
-fn raw_rows(rows: &[PointerRow]) -> Vec<RawUntrackedRow> {
-    rows.iter()
-        .map(|index| RawUntrackedRow {
-            version_id: "bench-version".to_string(),
-            schema_key: "json_pointer".to_string(),
-            entity_id: index.path.clone(),
-            file_id: "".to_string(),
-            snapshot_content: json_pointer_snapshot(index, false),
-            updated_snapshot_content: json_pointer_snapshot(index, true),
-            metadata: None,
-            created_at: timestamp(0),
-            updated_at: timestamp(1),
-            global: false,
-        })
-        .collect()
-}
-
-fn raw_projected_rows(rows: &[PointerRow]) -> Vec<RawProjectedRow> {
-    rows.iter()
-        .map(|row| RawProjectedRow {
-            key: row.path.as_bytes().to_vec(),
-            header: format!(
-                "{{\"version_id\":\"bench-version\",\"schema_key\":\"json_pointer\",\"entity_id\":{},\"created_at\":\"{}\",\"updated_at\":\"{}\",\"global\":false}}",
-                serde_json::to_string(&row.path).expect("path serializes"),
-                timestamp(0),
-                timestamp(1)
-            )
-            .into_bytes(),
-            payload: json_pointer_snapshot(row, false).into_bytes(),
-        })
-        .collect()
-}
-
-fn configure_group(
-    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    _row_count: usize,
-) {
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(250));
-    group.measurement_time(Duration::from_secs(1));
-}
-
 fn pick_pk_row(rows: &[RawUntrackedRow]) -> &RawUntrackedRow {
     &rows[rows.len() / 2]
 }
 
-fn row_label(rows: usize) -> String {
-    if rows >= 1_000 {
-        format!("{}k", rows / 1_000)
-    } else {
-        rows.to_string()
+fn operation_logical_rows(operation: &str, row_count: usize) -> usize {
+    match operation {
+        "select_one_by_pk" | "update_one_by_pk" | "delete_one_by_pk" => 1,
+        _ => row_count,
     }
 }
 
-fn flatten_json(path: &str, value: &JsonValue, rows: &mut Vec<PointerRow>) {
-    rows.push(PointerRow {
-        path: path.to_string(),
-        value_json: value.to_string(),
-        updated_value_json: updated_value_for(path),
-    });
+fn ratio(numerator: usize, denominator: usize) -> String {
+    if denominator == 0 {
+        "-".to_string()
+    } else {
+        format!("{:.2}", numerator as f64 / denominator as f64)
+    }
+}
 
+fn row_label(row_count: usize) -> &'static str {
+    match row_count {
+        SMOKE_ROWS => "1k",
+        REAL_WORKLOAD_ROWS => "10k",
+        _ => "custom",
+    }
+}
+
+fn projected_value_len(value: ProjectedValueRef<'_>) -> usize {
     match value {
-        JsonValue::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                let child_path = format!("{path}/{}", index);
-                flatten_json(&child_path, item, rows);
-            }
-        }
-        JsonValue::Object(map) => {
-            for (key, child) in map {
-                let child_path = format!("{path}/{}", escape_pointer_token(key));
-                flatten_json(&child_path, child, rows);
-            }
-        }
-        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {}
+        ProjectedValueRef::KeyOnly => 0,
+        ProjectedValueRef::FullValue(value) => value.len(),
     }
 }
 
-fn json_pointer_snapshot(row: &PointerRow, updated: bool) -> String {
-    let value_json = if updated {
-        row.updated_value_json.as_str()
-    } else {
-        row.value_json.as_str()
-    };
-    let value = serde_json::from_str::<JsonValue>(value_json)
-        .unwrap_or_else(|_| JsonValue::String(value_json.to_string()));
-    serde_json::json!({
-        "path": row.path,
-        "value": value,
-    })
-    .to_string()
-}
-
-fn updated_value_for(path: &str) -> String {
-    serde_json::json!({
-        "updated": true,
-        "path": path,
-    })
-    .to_string()
-}
-
-fn escape_pointer_token(token: &str) -> String {
-    token.replace('~', "~0").replace('/', "~1")
-}
-
-fn timestamp(index: usize) -> String {
-    format!("2024-01-01T00:00:{:02}.000Z", index % 60)
+fn range_bound_len(bound: &Bound<Key>) -> usize {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => key.0.len(),
+        Bound::Unbounded => 0,
+    }
 }
 
 criterion_group!(benches, untracked_state_crud_benches);

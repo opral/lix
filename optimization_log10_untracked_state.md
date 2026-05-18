@@ -3981,3 +3981,203 @@ backend/storage API updates and reconnecting untracked-state work to main's
 backend/storage surface. The I/O table is stable and should be the primary
 shape comparison; several timing rows are normal Criterion window movement.
 ```
+
+## Post-Merge Main-API Scorecard: restored untracked_state_crud
+
+Context:
+
+```text
+branch: untracked-speedup
+date: 2026-05-18
+base: after merging origin/main and dropping the branch-local backend/storage API
+target: restored packages/engine/benches/untracked_state_crud/main.rs
+API: storage_v2-style Backend + StorageContext + PointReadPlan/ScanPlan + StorageWriteSet
+```
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb|lix_redb)/smoke/.*/1k'
+```
+
+Build result:
+
+```text
+bench target built cleanly
+I/O probe completed
+smoke timing profile completed for lix_sqlite, lix_rocksdb, and lix_redb
+```
+
+Compatibility note:
+
+```text
+The old branch-local backend API no longer exists after the merge. The restored
+target now measures the same logical untracked CRUD shapes through main's
+storage_v2 API. The current storage API exposes key-only and full-value
+projections, so select_headers_only is mapped to a full-value read in this
+restored scorecard.
+```
+
+Smoke I/O profile:
+
+```text
+The logical I/O shape is identical for lix_sqlite, lix_rocksdb, and lix_redb.
+Scan reads are one backend range scan. Point reads are one backend get call.
+Writes are one backend write batch per operation. delete_all_rows uses one
+delete_range request.
+```
+
+| operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | write batches | puts | deletes | delete ranges | write bytes/row |
+| --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ------------: | ---: | ------: | ------------: | --------------: |
+| `insert_all_rows`     |         1000 |      1 |       884.83 |          0 |         0 |        0 |          0 |         0 |           0.00 |             1 | 1000 |       0 |             0 |          884.83 |
+| `select_all_rows`     |         1000 |      1 |       880.83 |          1 |         0 |        0 |          1 |      1000 |         880.83 |             0 |    0 |       0 |             0 |            0.00 |
+| `select_keys_only`    |         1000 |      1 |        92.20 |          1 |         0 |        0 |          1 |      1000 |          92.20 |             0 |    0 |       0 |             0 |            0.00 |
+| `select_headers_only` |         1000 |      1 |       880.83 |          1 |         0 |        0 |          1 |      1000 |         880.83 |             0 |    0 |       0 |             0 |            0.00 |
+| `select_one_by_pk`    |            1 |      1 |       243.00 |          1 |         1 |        1 |          0 |         1 |         243.00 |             0 |    0 |       0 |             0 |            0.00 |
+| `select_all_by_pk`    |         1000 |      1 |       884.83 |          1 |         1 |     1000 |          0 |      1000 |         884.83 |             0 |    0 |       0 |             0 |            0.00 |
+| `update_all_rows`     |         1000 |      1 |       971.03 |          0 |         0 |        0 |          0 |         0 |           0.00 |             1 | 1000 |       0 |             0 |          971.03 |
+| `update_one_by_pk`    |            1 |      1 |    392414.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |             1 |    1 |       0 |             0 |       392414.00 |
+| `delete_all_rows`     |         1000 |      1 |         0.01 |          0 |         0 |        0 |          0 |         0 |           0.00 |             1 |    0 |       0 |             1 |            0.01 |
+| `delete_one_by_pk`    |            1 |      1 |       130.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |             1 |    0 |       1 |             0 |          130.00 |
+
+Smoke timing profile:
+
+| backend     | operation                |          time 95% CI | Criterion result |
+| ----------- | ------------------------ | -------------------: | ---------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.2864 ms..6.4098 ms | regressed        |
+| lix_sqlite  | `select_all_rows/1k`     | 984.47 us..1.0018 ms | regressed        |
+| lix_sqlite  | `select_keys_only/1k`    | 738.50 us..750.15 us | no change        |
+| lix_sqlite  | `select_headers_only/1k` | 943.23 us..956.60 us | noise threshold  |
+| lix_sqlite  | `select_one_by_pk/1k`    | 404.55 us..409.78 us | regressed        |
+| lix_sqlite  | `select_all_by_pk/1k`    | 2.7235 ms..2.7978 ms | no change        |
+| lix_sqlite  | `update_all_rows/1k`     | 6.8527 ms..6.9146 ms | improved         |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.2696 ms..3.5214 ms | improved         |
+| lix_sqlite  | `delete_all_rows/1k`     | 2.8926 ms..2.9945 ms | no change        |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 1.3726 ms..1.4833 ms | no change        |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.0676 ms..2.1005 ms | no change        |
+| lix_rocksdb | `select_all_rows/1k`     | 369.86 us..379.05 us | noise threshold  |
+| lix_rocksdb | `select_keys_only/1k`    | 319.71 us..323.15 us | regressed        |
+| lix_rocksdb | `select_headers_only/1k` | 376.60 us..382.43 us | no change        |
+| lix_rocksdb | `select_one_by_pk/1k`    | 156.60 us..159.21 us | no change        |
+| lix_rocksdb | `select_all_by_pk/1k`    | 887.60 us..900.30 us | no change        |
+| lix_rocksdb | `update_all_rows/1k`     | 2.2465 ms..2.3158 ms | no change        |
+| lix_rocksdb | `update_one_by_pk/1k`    | 718.76 us..736.54 us | no change        |
+| lix_rocksdb | `delete_all_rows/1k`     | 154.60 us..161.49 us | no change        |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 157.19 us..161.49 us | no change        |
+| lix_redb    | `insert_all_rows/1k`     | 4.0148 ms..4.2304 ms | no change        |
+| lix_redb    | `select_all_rows/1k`     | 1.0645 ms..1.2398 ms | no change        |
+| lix_redb    | `select_keys_only/1k`    | 986.47 us..1.0069 ms | no change        |
+| lix_redb    | `select_headers_only/1k` | 1.0929 ms..1.1525 ms | no change        |
+| lix_redb    | `select_one_by_pk/1k`    | 953.77 us..1.1259 ms | no change        |
+| lix_redb    | `select_all_by_pk/1k`    | 1.5057 ms..1.6328 ms | no change        |
+| lix_redb    | `update_all_rows/1k`     | 4.0472 ms..4.1509 ms | no change        |
+| lix_redb    | `update_one_by_pk/1k`    | 2.1402 ms..2.2310 ms | no change        |
+| lix_redb    | `delete_all_rows/1k`     | 2.3616 ms..2.4917 ms | regressed        |
+| lix_redb    | `delete_one_by_pk/1k`    | 1.3347 ms..1.4268 ms | no change        |
+
+Result:
+
+```text
+Main's storage API collapses the restored scorecard to one logical backend
+operation per CRUD benchmark row family, including batched point reads and
+range delete. The timing profile is much faster than the pre-merge branch API
+for read-heavy rows, especially point reads and full scans.
+
+The remaining first-principles optimization gap is production untracked-state
+scan behavior: packages/engine/src/untracked_state/storage.rs now uses
+StorageRead/PointReadPlan/ScanPlan/StorageWriteSet, but scan_rows still scans
+all canonical rows, decodes full values, filters in memory, and materializes
+afterward. existing_identities already uses a KeyOnly point plan.
+```
+
+## Optimization 44: Range-Aware Production Untracked Scans
+
+Date: 2026-05-18
+
+Axis:
+
+```text
+packages/engine/src/untracked_state/storage.rs
+```
+
+Change:
+
+```text
+scan_rows now derives storage prefixes from the ordered untracked row key:
+
+  version_id / schema_key / entity_id / file_id
+
+When a request constrains version_id, schema_key, entity_id, and/or exact
+file_id in that key order, production reads use the narrowest corresponding
+ScanPlan::prefix calls instead of scanning the full untracked_state.row space.
+The residual row_matches_scan check remains in place for safety and for filter
+shapes that are not representable as a contiguous prefix.
+
+The scan loop now also applies request.limit during pagination, so a limited
+scan can stop once enough matching rows have been materialized instead of
+finishing the whole canonical scan first.
+```
+
+Projection note:
+
+```text
+This deliberately keeps full-value decoding for returned production rows.
+Although the storage API supports KeyOnly scans, live-state overlay resolution
+still needs fields that are not present in the key, especially deleted and
+global. Using key-only rows here would be API-compatible but semantically
+unsafe without a separate header/index row or a narrower internal row type.
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state:: --lib
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+cargo check -p lix_engine --features storage-benches --benches --tests
+```
+
+Results:
+
+```text
+untracked_state tests passed: 3 passed
+untracked_state_crud bench target built cleanly
+bench/test check passed
+```
+
+Focused scorecard command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb|lix_redb)/smoke/(select_all_rows|select_keys_only|select_headers_only)/1k'
+```
+
+Criterion delta on the restored storage-level smoke scorecard:
+
+| backend     | operation                |          time 95% CI | Criterion result |
+| ----------- | ------------------------ | -------------------: | ---------------- |
+| lix_sqlite  | `select_all_rows/1k`     | 901.23 us..915.27 us | improved         |
+| lix_sqlite  | `select_keys_only/1k`    | 756.89 us..763.83 us | regressed        |
+| lix_sqlite  | `select_headers_only/1k` | 944.30 us..950.15 us | no change        |
+| lix_rocksdb | `select_all_rows/1k`     | 364.33 us..370.27 us | no change        |
+| lix_rocksdb | `select_keys_only/1k`    | 300.37 us..304.63 us | improved         |
+| lix_rocksdb | `select_headers_only/1k` | 378.03 us..388.53 us | no change        |
+| lix_redb    | `select_all_rows/1k`     | 1.1391 ms..1.1768 ms | no change        |
+| lix_redb    | `select_keys_only/1k`    | 1.0303 ms..1.2156 ms | regressed        |
+| lix_redb    | `select_headers_only/1k` | 1.1350 ms..1.2704 ms | no change        |
+
+Interpretation:
+
+```text
+The focused Criterion numbers are retained as a scorecard continuity check, but
+the restored untracked_state_crud target currently exercises storage-level CRUD
+directly. It does not call production UntrackedStateContext::scan_rows, so it is
+not a clean measurement of this optimization.
+
+The production delta is structural: selective untracked scans no longer have to
+read and decode the full untracked_state.row keyspace when the filter includes
+ordered key-prefix fields. For the common live-state request shape with
+version_ids populated by scan_scope and schema/entity filters from the query,
+the backend scan narrows at least to version_id and often to
+version_id/schema_key or exact entity/file prefixes.
+```
