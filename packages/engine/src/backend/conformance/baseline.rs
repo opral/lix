@@ -53,6 +53,10 @@ where
     report.run("baseline::scan_range_honors_bound_variants", || {
         scan_range_honors_bound_variants(factory)
     });
+    report.run(
+        "baseline::scan_range_resume_before_lower_does_not_widen_range",
+        || scan_range_resume_before_lower_does_not_widen_range(factory),
+    );
     report.run("baseline::scan_range_orders_raw_byte_keys", || {
         scan_range_orders_raw_byte_keys(factory)
     });
@@ -445,6 +449,37 @@ where
     )
     .map_err(|error| format!("excluded range scan failed: {error}"))?;
     assert_read_entries(&excluded.entries, &[("c", "C")])
+}
+
+fn scan_range_resume_before_lower_does_not_widen_range<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let test_space = space(1);
+    seed_full_values(
+        &backend,
+        test_space,
+        [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")],
+    )?;
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin_read failed: {error}"))?;
+    let chunk = scan_range(
+        &read,
+        test_space,
+        KeyRange {
+            lower: Bound::Included(key("c")),
+            upper: Bound::Excluded(key("e")),
+        },
+        ScanOptions {
+            resume_after: Some(&key("a")),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| format!("scan_range failed: {error}"))?;
+
+    assert_read_entries(&chunk.entries, &[("c", "C"), ("d", "D")])
 }
 
 fn scan_range_orders_raw_byte_keys<F>(factory: &F) -> ConformanceResult

@@ -4,6 +4,7 @@ use crate::functions::FunctionContext;
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use crate::transaction::{open_transaction, Transaction};
 use crate::LixError;
+use tokio::sync::OwnedMutexGuard;
 
 use super::context::SessionTransactionGuard;
 use super::SessionContext;
@@ -12,6 +13,7 @@ pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) transaction: Option<Transaction<B>>,
     pub(super) runtime_functions: FunctionContext,
     _transaction_guard: SessionTransactionGuard,
+    _write_guard: OwnedMutexGuard<()>,
 }
 
 impl<B> SessionContext<B>
@@ -23,6 +25,7 @@ where
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
         self.ensure_open()?;
         let transaction_guard = self.reserve_session_transaction()?;
+        let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
         let opened = match open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -44,6 +47,7 @@ where
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             _transaction_guard: transaction_guard,
+            _write_guard: write_guard,
         })
     }
 }

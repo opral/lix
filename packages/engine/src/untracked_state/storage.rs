@@ -156,19 +156,36 @@ where
 async fn scan_all_canonical_rows(
     store: &impl StorageRead,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let page = ScanPlan::prefix(
+    let plan = ScanPlan::prefix(
         UNTRACKED_STATE_ROW_SPACE,
         StoragePrefix {
             bytes: Bytes::new(),
         },
-    )
-    .collect(store, StorageScanOptions::default())?;
-    page.value
-        .entries
-        .into_iter()
-        .filter_map(|entry| full_value(entry.value))
-        .map(|bytes| crate::untracked_state::codec::decode_row(bytes.as_ref()))
-        .collect()
+    );
+    let mut rows = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan.collect(
+            store,
+            StorageScanOptions {
+                resume_after: resume_after.as_ref(),
+                ..StorageScanOptions::default()
+            },
+        )?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        rows.extend(
+            page.value
+                .entries
+                .into_iter()
+                .filter_map(|entry| full_value(entry.value))
+                .map(|bytes| crate::untracked_state::codec::decode_row(bytes.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 fn full_value(value: StorageProjectedValue) -> Option<Bytes> {

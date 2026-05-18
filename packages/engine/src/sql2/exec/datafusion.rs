@@ -29,7 +29,7 @@ use crate::sql2::result_metadata::{
     field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY,
 };
 use crate::sql2::session::{
-    build_read_session, build_write_session, build_write_session_with_options,
+    build_read_session, build_transaction_read_session, build_write_session_with_options,
     SqlWriteSessionOptions,
 };
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
@@ -65,10 +65,7 @@ where
     execute_logical_plan(plan, params).await
 }
 
-pub(crate) async fn create_logical_plan<C>(
-    ctx: &C,
-    sql: &str,
-) -> Result<SqlLogicalPlan, LixError>
+pub(crate) async fn create_logical_plan<C>(ctx: &C, sql: &str) -> Result<SqlLogicalPlan, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
@@ -101,12 +98,13 @@ where
 }
 
 pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
-    ctx: &mut dyn SqlWriteExecutionContext,
+    read_ctx: &impl SqlExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
-    let session = build_write_session(ctx).await?;
+    let session = build_transaction_read_session(read_ctx, write_ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
@@ -2048,9 +2046,7 @@ mod tests {
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(backend)
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -2155,9 +2151,7 @@ mod tests {
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(backend)
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -2190,9 +2184,7 @@ mod tests {
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(backend)
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await
@@ -2246,9 +2238,7 @@ mod tests {
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
-        let engine = Engine::new(backend)
-            .await
-            .expect("engine should open");
+        let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
             .open_session(init_receipt.main_version_id)
             .await

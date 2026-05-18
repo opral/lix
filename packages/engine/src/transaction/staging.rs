@@ -580,6 +580,7 @@ impl TransactionWriteBuffer {
 }
 
 /// Read overlay derived from staged transaction writes.
+#[derive(Clone)]
 pub(crate) struct PreparedStateRowOverlay {
     staged_writes: Arc<TransactionWriteBuffer>,
 }

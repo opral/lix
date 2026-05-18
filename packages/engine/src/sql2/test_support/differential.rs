@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::InMemoryStorageBackend;
     use crate::common::serialize_row_metadata;
     use crate::entity_identity::EntityIdentity;
     use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
@@ -12,6 +11,7 @@ mod tests {
         DifferentialProbe, DifferentialSqlCase, ExpectedExecution, ACTIVE_VERSION_PROBE_ID,
     };
     use crate::sql2::{WriteExecutorMode, WriteExecutorPath};
+    use crate::storage::InMemoryStorageBackend;
     use crate::{Engine, ExecuteResult, LixError, Value};
 
     #[derive(Debug, Clone)]

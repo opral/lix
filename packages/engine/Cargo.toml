@@ -2,45 +2,10 @@
 name = "lix_engine"
 version = "0.1.0"
 edition = "2021"
+autobenches = false
 
 [features]
 storage-benches = []
-
-[[bench]]
-name = "storage"
-path = "benches/storage/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "transaction"
-path = "benches/transaction/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "physical_layout"
-path = "benches/physical_layout/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "json_pointer_crud"
-path = "benches/json_pointer_crud/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "optimization9_sql2"
-path = "benches/optimization9_sql2/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "json_pointer_physical"
-path = "benches/json_pointer_physical/main.rs"
-harness = false
-required-features = ["storage-benches"]
 
 [[bench]]
 name = "storage_v2"

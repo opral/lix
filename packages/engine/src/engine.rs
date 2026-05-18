@@ -26,6 +26,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     catalog_context: Arc<CatalogContext>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<B> Engine<B>
@@ -83,6 +84,7 @@ where
             live_state,
             version_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -121,6 +123,7 @@ where
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.write_lock),
         )
         .await
     }
@@ -134,6 +137,7 @@ where
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.write_lock),
         )
         .await
     }

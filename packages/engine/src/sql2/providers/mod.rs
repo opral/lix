@@ -19,10 +19,7 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
-pub(crate) async fn register_read<C>(
-    session: &SessionContext,
-    ctx: &C,
-) -> Result<(), LixError>
+pub(crate) async fn register_read<C>(session: &SessionContext, ctx: &C) -> Result<(), LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
@@ -167,6 +164,7 @@ pub(crate) async fn register_write(
     for surface in catalog.surfaces() {
         match &surface.kind {
             PublicSurfaceKind::LixState => {
+                replace_registered_table(session, &surface.name)?;
                 lix_state::register_lix_state_active_write_provider(
                     session,
                     &surface.name,
@@ -175,6 +173,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::LixStateByVersion => {
+                replace_registered_table(session, &surface.name)?;
                 lix_state::register_lix_state_by_version_write_provider(
                     session,
                     &surface.name,
@@ -183,9 +182,11 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::Version => {
+                replace_registered_table(session, &surface.name)?;
                 version::register_write_provider(session, &surface.name, write_ctx.clone()).await?;
             }
             PublicSurfaceKind::File => {
+                replace_registered_table(session, &surface.name)?;
                 file::register_active_write_provider(
                     session,
                     &surface.name,
@@ -195,6 +196,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::FileByVersion => {
+                replace_registered_table(session, &surface.name)?;
                 file::register_by_version_write_provider(
                     session,
                     &surface.name,
@@ -204,6 +206,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::Directory => {
+                replace_registered_table(session, &surface.name)?;
                 directory::register_active_write_provider(
                     session,
                     &surface.name,
@@ -212,6 +215,7 @@ pub(crate) async fn register_write(
                 .await?;
             }
             PublicSurfaceKind::DirectoryByVersion => {
+                replace_registered_table(session, &surface.name)?;
                 directory::register_by_version_write_provider(
                     session,
                     &surface.name,
@@ -228,8 +232,27 @@ pub(crate) async fn register_write(
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
+    for surface in catalog.surfaces() {
+        if matches!(
+            surface.kind,
+            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByVersion { .. }
+        ) {
+            replace_registered_table(session, &surface.name)?;
+        }
+    }
     entity::register_entity_write_providers(session, write_ctx.clone(), &catalog).await?;
     Ok(())
+}
+
+fn replace_registered_table(session: &SessionContext, name: &str) -> Result<(), LixError> {
+    match session.deregister_table(name) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("not found") => Ok(()),
+        Err(error) => Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("sql2 DataFusion error: {error}"),
+        )),
+    }
 }
 
 #[cfg(test)]

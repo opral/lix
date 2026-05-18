@@ -179,6 +179,52 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
 }
 
 #[tokio::test]
+async fn transaction_read_can_query_history_surfaces() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('history-visible-in-tx', 'value')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+
+    let mut tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+    let result = tx
+        .execute(
+            "SELECT entity_id FROM lix_state_history \
+             WHERE start_commit_id = lix_active_version_commit_id() \
+             AND schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .expect("transaction read should register history surfaces");
+
+    assert!(
+        !result.rows().is_empty(),
+        "transaction history read should see committed history rows"
+    );
+
+    tx.rollback()
+        .await
+        .expect("transaction rollback should succeed");
+}
+
+#[tokio::test]
 async fn begin_transaction_cannot_race_with_opening_session_write() {
     let backend = BlockingBeginWriteBackend::new();
     let gate = backend.gate();

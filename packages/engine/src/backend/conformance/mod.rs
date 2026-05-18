@@ -57,6 +57,7 @@ mod tests {
                 "baseline::scan_range_sees_overwritten_existing_value",
                 "baseline::scan_range_returns_forward_row_bounded_chunks",
                 "baseline::scan_range_honors_bound_variants",
+                "baseline::scan_range_resume_before_lower_does_not_widen_range",
                 "baseline::scan_range_orders_raw_byte_keys",
                 "baseline::scan_range_drains_multi_chunk_limits",
                 "baseline::scan_cursor_drains_multi_chunk_limits",

@@ -43,7 +43,7 @@ impl StorageWriteSet {
     /// Creates an empty canonical write set.
     ///
     /// Callers must stage at most one final mutation for each `(space, key)`.
-    /// Debug builds validate that contract before lowering or commit.
+    /// The set validates that contract before lowering or commit.
     pub fn new() -> Self {
         Self::default()
     }
@@ -116,59 +116,49 @@ impl StorageWriteSet {
 
     /// Validates the canonical write-set contract.
     ///
-    /// This performs the full duplicate/conflicting-declaration scan only in
-    /// debug builds. Release builds treat validation as a no-op so production
-    /// lowering stays on the canonical hot path.
+    /// This performs the full duplicate/conflicting-declaration scan before
+    /// lowering so the backend never receives ambiguous final mutations.
     pub fn validate(&self) -> Result<(), StorageWriteSetError> {
-        #[cfg(not(debug_assertions))]
-        {
-            Ok(())
+        for group in &self.groups {
+            if let Some(incoming) = group.conflicting_declarations.first() {
+                return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
+                    id: group.space.id,
+                    existing_name: group.space.name,
+                    incoming_name: incoming.name,
+                });
+            }
         }
 
-        #[cfg(debug_assertions)]
-        {
-            for group in &self.groups {
-                if let Some(incoming) = group.conflicting_declarations.first() {
-                    return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
-                        id: group.space.id,
-                        existing_name: group.space.name,
-                        incoming_name: incoming.name,
+        let mut seen = HashMap::<(SpaceId, Key), StorageSpace, FastHashBuilder>::with_hasher(
+            FastHashBuilder::with_seeds(0, 0, 0, 0),
+        );
+        for group in &self.groups {
+            for put in &group.puts {
+                let key = (group.space.id, put.key.clone());
+                if seen.insert(key, group.space).is_some() {
+                    return Err(StorageWriteSetError::DuplicateMutation {
+                        space: group.space,
+                        key: put.key.clone(),
                     });
                 }
             }
-
-            let mut seen = HashMap::<(SpaceId, Key), StorageSpace, FastHashBuilder>::with_hasher(
-                FastHashBuilder::with_seeds(0, 0, 0, 0),
-            );
-            for group in &self.groups {
-                for put in &group.puts {
-                    let key = (group.space.id, put.key.clone());
-                    if seen.insert(key, group.space).is_some() {
-                        return Err(StorageWriteSetError::DuplicateMutation {
-                            space: group.space,
-                            key: put.key.clone(),
-                        });
-                    }
-                }
-                for delete in &group.deletes {
-                    let key = (group.space.id, delete.clone());
-                    if seen.insert(key, group.space).is_some() {
-                        return Err(StorageWriteSetError::DuplicateMutation {
-                            space: group.space,
-                            key: delete.clone(),
-                        });
-                    }
+            for delete in &group.deletes {
+                let key = (group.space.id, delete.clone());
+                if seen.insert(key, group.space).is_some() {
+                    return Err(StorageWriteSetError::DuplicateMutation {
+                        space: group.space,
+                        key: delete.clone(),
+                    });
                 }
             }
-            Ok(())
         }
+        Ok(())
     }
 
     pub fn lower_into<W>(self, write: &mut W) -> Result<StorageWriteSetStats, StorageWriteSetError>
     where
         W: BackendWrite,
     {
-        #[cfg(debug_assertions)]
         self.validate()?;
         self.lower_validated_into(write)
     }
@@ -225,7 +215,6 @@ impl StorageWriteSet {
     where
         B: Backend,
     {
-        #[cfg(debug_assertions)]
         self.validate()?;
         let mut write = backend
             .begin_write(opts)
