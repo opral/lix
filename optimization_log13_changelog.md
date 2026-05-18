@@ -1202,3 +1202,89 @@ enough for correctness and trend visibility, but direct typed backend dispatch
 or first-class scorecard helpers would remove that extra buffering from scan
 rows.
 ```
+
+## Entry 16: Scoped Native Changelog Read Job
+
+Change:
+
+```text
+Changelog benchmark read jobs now open one native StorageReadScope and pass that
+scope into ChangelogContext::reader for commit loads, change loads, and plan_gc.
+
+This cuts the benchmark-facing changelog API away from the StorageContext
+compatibility fallback for these hot read jobs. The remaining visible-read work
+still uses the same native changelog spaces and membership proof shape; this
+entry isolates the read-snapshot boundary from the proof algorithm.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_16_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.079 |
+| decode_segment / 1c_1000ch              |       3.276 |
+| view_segment / 1c_1000ch                |       0.025 |
+| validate_segment_shape / 1c_1000ch      |       4.840 |
+| build_decoded_segment_index / 1c_1000ch |       0.239 |
+| build_by_change / 1c_1000ch             |       0.690 |
+| build_by_change_membership / 1c_1000ch  |       0.033 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms | redb_tempfile_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: | ---------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.432 |              3.716 |              3.877 |           55.816 |
+| stage_segment / 1c_1000ch                            |       4.961 |              8.084 |              7.019 |           47.669 |
+| stage_publish_commit / 1c_1ch                        |       0.043 |              0.201 |              0.045 |            3.953 |
+| stage_publish_commit / 1c_100ch                      |       0.486 |              0.701 |              0.495 |            3.961 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.313 |              6.369 |              5.101 |            7.981 |
+| load_commits_visible_batched / 1c_100ch              |       0.189 |              0.216 |              0.199 |            0.195 |
+| load_changes_visible_batched / 1c_100ch              |       0.196 |              0.359 |              0.327 |            0.410 |
+| load_changes_visible_batched / 1c_1000ch             |       3.426 |              3.193 |              3.044 |            3.850 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       1.238 |              2.161 |              1.408 |            2.120 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |       2.261 |              6.074 |              3.779 |            2.720 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.288 |              7.640 |              6.976 |           12.949 |
+| plan_gc / live_50pct_mixed_segments                  |       6.930 |              7.016 |              8.226 |            6.572 |
+| collect_garbage / live_50pct_mixed_segments          |       6.566 |              8.020 |              7.381 |           10.572 |
+
+Read:
+
+```text
+The scoped read job mostly confirms the first-principles boundary:
+StorageContext's per-call compatibility reader was measurable for SQLite, but
+not the dominant remaining cost.
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 15 sqlite:  7.193ms
+  entry 16 sqlite:  6.074ms
+  entry 15 rocksdb: 3.686ms
+  entry 16 rocksdb: 3.779ms
+  entry 15 redb:    2.914ms
+  entry 16 redb:    2.720ms
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 15 sqlite:  5.655ms
+  entry 16 sqlite:  3.193ms
+  entry 15 rocksdb: 2.794ms
+  entry 16 rocksdb: 3.044ms
+
+The measured delta says the compatibility reader boundary is worth removing,
+especially for SQLite, but the remaining hot path is still the visible
+membership proof shape. Once the scan-heavy proof shape is removed, the next
+useful backend work is reducing point-read copies/allocation rather than tuning
+range scans around the current membership layout.
+
+Next hard cut: add a derived native visible-change proof space so scattered
+visible change loads become batched point reads instead of per-change
+by_change_membership prefix scans.
+```
