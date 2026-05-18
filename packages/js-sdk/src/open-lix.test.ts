@@ -168,6 +168,115 @@ test("execute supports UNION ALL without trapping wasm", async () => {
 	await lix.close();
 });
 
+test("beginTransaction commits multiple statements together", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const tx = await lix.beginTransaction();
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		["tx-task-1", "First", false, JSON.stringify({ batch: 1 })],
+	);
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		["tx-task-2", "Second", true, JSON.stringify({ batch: 1 })],
+	);
+
+	const staged = await tx.execute(
+		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+		["tx-task-1", "tx-task-2"],
+	);
+	expect(staged.rows.map((row) => row.get("id"))).toEqual([
+		"tx-task-1",
+		"tx-task-2",
+	]);
+
+	await tx.commit();
+
+	const committed = await lix.execute(
+		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+		["tx-task-1", "tx-task-2"],
+	);
+	expect(committed.rows.map((row) => row.get("id"))).toEqual([
+		"tx-task-1",
+		"tx-task-2",
+	]);
+	await expect(tx.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+
+	await lix.close();
+});
+
+test("beginTransaction rollback discards writes and closes handle", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const tx = await lix.beginTransaction();
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		["rolled-back-task", "Rollback", false, JSON.stringify({ batch: 1 })],
+	);
+	await tx.rollback();
+
+	const result = await lix.execute("SELECT id FROM crm_task WHERE id = $1", [
+		"rolled-back-task",
+	]);
+	expect(result.rows).toHaveLength(0);
+	await expect(tx.rollback()).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+
+	await lix.close();
+});
+
+test("beginTransaction blocks session writes on the same handle", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const tx = await lix.beginTransaction();
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		["tx-only-task", "Inside tx", false, JSON.stringify({ batch: 1 })],
+	);
+
+	await expect(
+		lix.execute(
+			"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+			["outside-task", "Outside tx", false, JSON.stringify({ batch: 1 })],
+		),
+	).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+
+	await tx.commit();
+
+	const committed = await lix.execute(
+		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+		["outside-task", "tx-only-task"],
+	);
+	expect(committed.rows.map((row) => row.get("id"))).toEqual([
+		"tx-only-task",
+	]);
+
+	await lix.close();
+});
+
+test("beginTransaction blocks session reads on the same handle", async () => {
+	const lix = await openLix();
+	const tx = await lix.beginTransaction();
+
+	await expect(lix.execute("SELECT 1 AS ok")).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+
+	const result = await tx.execute("SELECT 1 AS ok");
+	expect(result.rows[0]?.get("ok")).toBe(1);
+
+	await tx.rollback();
+	await lix.close();
+});
+
 test("unsupported UNION DISTINCT returns a JS error without trapping wasm", async () => {
 	const { stdout } = await execFileAsync(
 		process.execPath,

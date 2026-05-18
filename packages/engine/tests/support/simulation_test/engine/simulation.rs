@@ -1,12 +1,12 @@
-use lix_engine::{Backend, LixError, Value};
+use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt, Engine, ExecuteResult, InitReceipt,
     MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
-    SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
+    SessionContext, SessionTransaction, SwitchVersionOptions, SwitchVersionReceipt,
 };
+use lix_engine::{LixError, Value};
 
 use super::expect_same::SimulationAssertions;
-use super::kv_backend::InMemoryKvBackend;
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 
@@ -15,7 +15,7 @@ use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
 pub struct Simulation {
     mode: SimulationMode,
     #[allow(dead_code)]
-    backend: InMemoryKvBackend,
+    backend: InMemoryBackend,
     engine: Engine,
     receipt: InitReceipt,
     rebuild_tracked_state: RebuildTrackedStateSimulation,
@@ -27,12 +27,11 @@ impl Simulation {
     pub(super) async fn from_bootstrap(
         mode: SimulationMode,
         options: SimulationOptions,
-        snapshot: super::kv_backend::KvMap,
+        backend: InMemoryBackend,
         receipt: InitReceipt,
         assertions: SimulationAssertions,
     ) -> Result<Self, LixError> {
-        let backend = InMemoryKvBackend::from_snapshot(snapshot);
-        let engine = Engine::new(Box::new(backend.clone())).await?;
+        let engine = Engine::new(backend.clone()).await?;
         if options.deterministic {
             super::macro_runtime::enable_deterministic_mode(&engine, &receipt, mode).await?;
         }
@@ -58,10 +57,7 @@ impl Simulation {
     /// same repository. It lets tests distinguish persisted workspace state
     /// from in-memory session state.
     pub async fn reboot_engine_from_current_snapshot(&self) -> Result<Engine, LixError> {
-        Engine::new(Box::new(InMemoryKvBackend::from_snapshot(
-            self.backend.snapshot(),
-        )))
-        .await
+        Engine::new(self.backend.clone()).await
     }
 
     /// Wraps a normal engine session with simulation hooks.
@@ -74,8 +70,8 @@ impl Simulation {
     }
 
     /// Returns a fresh, empty backend for lifecycle tests.
-    pub fn uninitialized_backend(&self) -> Box<dyn Backend + Send + Sync> {
-        Box::new(InMemoryKvBackend::new())
+    pub fn uninitialized_backend(&self) -> InMemoryBackend {
+        InMemoryBackend::new()
     }
 
     /// Returns the initialized Lix id.
@@ -120,24 +116,38 @@ impl SimSession {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        match classify_statement(sql) {
-            StatementKind::Read => {
-                let active_version_id = self.session.active_version_id().await?;
-                self.sim
-                    .rebuild_tracked_state
-                    .before_read(&self.engine, &active_version_id)
-                    .await?;
-                self.session.execute(sql, params).await
-            }
-            StatementKind::Write => {
-                let result = self.session.execute(sql, params).await;
-                if result.is_ok() {
-                    self.sim.rebuild_tracked_state.after_successful_write();
-                }
-                result
-            }
-            StatementKind::Utility => self.session.execute(sql, params).await,
+        let statement_kind = classify_statement(sql);
+        if statement_kind == StatementKind::Read {
+            let active_version_id = self.session.active_version_id().await?;
+            self.sim
+                .rebuild_tracked_state
+                .before_read(&self.engine, &active_version_id)
+                .await?;
         }
+
+        let result = self.session.execute(sql, params).await;
+        if let Ok(result) = &result {
+            if statement_kind == StatementKind::Write || execute_result_looks_like_write(result) {
+                self.sim.rebuild_tracked_state.after_successful_write();
+            }
+        }
+        result
+    }
+
+    pub async fn begin_transaction(&self) -> Result<SimTransaction, LixError> {
+        let active_version_id = self.session.active_version_id().await?;
+        self.sim
+            .rebuild_tracked_state
+            .before_read(&self.engine, &active_version_id)
+            .await?;
+        let transaction = self.session.begin_transaction().await?;
+        Ok(SimTransaction {
+            sim: self.sim.clone(),
+            engine: self.engine.clone(),
+            session: self.session.clone(),
+            transaction,
+            saw_write: false,
+        })
     }
 
     pub async fn create_version(
@@ -185,6 +195,57 @@ impl SimSession {
     }
 }
 
+/// Transaction wrapper that injects simulation behavior around normal execution.
+#[allow(dead_code)]
+pub struct SimTransaction {
+    sim: Simulation,
+    engine: Engine,
+    session: SessionContext,
+    transaction: SessionTransaction,
+    saw_write: bool,
+}
+
+#[allow(dead_code)]
+impl SimTransaction {
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        let statement_kind = classify_statement(sql);
+        match statement_kind {
+            StatementKind::Read => {
+                let active_version_id = self.session.active_version_id().await?;
+                self.sim
+                    .rebuild_tracked_state
+                    .before_read(&self.engine, &active_version_id)
+                    .await?;
+            }
+            StatementKind::Write => {}
+            StatementKind::Utility => {}
+        }
+        let result = self.transaction.execute(sql, params).await;
+        if let Ok(result) = &result {
+            if statement_kind == StatementKind::Write || execute_result_looks_like_write(result) {
+                self.saw_write = true;
+            }
+        }
+        result
+    }
+
+    pub async fn commit(self) -> Result<(), LixError> {
+        let result = self.transaction.commit().await;
+        if result.is_ok() && self.saw_write {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn rollback(self) -> Result<(), LixError> {
+        self.transaction.rollback().await
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementKind {
     Read,
@@ -193,17 +254,88 @@ enum StatementKind {
 }
 
 fn classify_statement(sql: &str) -> StatementKind {
-    let keyword = sql
-        .trim_start()
-        .split(|ch: char| ch.is_whitespace() || ch == '(')
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
+    let sql = skip_leading_sql_trivia(sql);
+    if let Some(inner) = sql.strip_prefix('(') {
+        return classify_statement(inner);
+    }
+
+    let (keyword, _rest) = first_keyword_and_rest(sql);
     match keyword.as_str() {
-        "SELECT" | "WITH" => StatementKind::Read,
+        "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" => StatementKind::Read,
         "INSERT" | "UPDATE" | "DELETE" => StatementKind::Write,
+        "EXPLAIN" => StatementKind::Read,
         _ => StatementKind::Utility,
     }
+}
+
+fn first_keyword_and_rest(sql: &str) -> (String, &str) {
+    let sql = skip_leading_sql_trivia(sql);
+    let end_index = sql
+        .char_indices()
+        .find_map(|(index, ch)| {
+            if !(ch.is_ascii_alphanumeric() || ch == '_') {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(sql.len());
+    (sql[..end_index].to_ascii_uppercase(), &sql[end_index..])
+}
+
+fn skip_leading_sql_trivia(mut sql: &str) -> &str {
+    loop {
+        let trimmed = sql.trim_start();
+        if trimmed.len() != sql.len() {
+            sql = trimmed;
+            continue;
+        }
+
+        if let Some(comment_body) = sql.strip_prefix("--") {
+            let Some(newline_index) = comment_body.find('\n') else {
+                return "";
+            };
+            sql = &comment_body[newline_index + 1..];
+            continue;
+        }
+
+        if let Some(comment_body) = sql.strip_prefix("/*") {
+            let Some(end_index) = end_of_nested_block_comment(comment_body) else {
+                return "";
+            };
+            sql = &comment_body[end_index..];
+            continue;
+        }
+
+        return sql;
+    }
+}
+
+fn end_of_nested_block_comment(comment_body: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = 0usize;
+    while index < comment_body.len() {
+        let rest = &comment_body[index..];
+        if rest.starts_with("/*") {
+            depth += 1;
+            index += 2;
+            continue;
+        }
+        if rest.starts_with("*/") {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return Some(index);
+            }
+            continue;
+        }
+        index += rest.chars().next().map(char::len_utf8).unwrap_or_default();
+    }
+    None
+}
+
+fn execute_result_looks_like_write(result: &ExecuteResult) -> bool {
+    result.columns().is_empty() && result.rows().is_empty()
 }
 
 #[cfg(test)]
@@ -218,6 +350,18 @@ mod tests {
             StatementKind::Read
         );
         assert_eq!(
+            classify_statement("-- leading comment\nSELECT 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            classify_statement("/* leading block */ INSERT INTO t VALUES (1)"),
+            StatementKind::Write
+        );
+        assert_eq!(
+            classify_statement("/* outer /* inner */ outer */ SELECT 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
             classify_statement("INSERT INTO t VALUES (1)"),
             StatementKind::Write
         );
@@ -226,9 +370,41 @@ mod tests {
             StatementKind::Write
         );
         assert_eq!(classify_statement("DELETE FROM t"), StatementKind::Write);
+        assert_eq!(classify_statement("EXPLAIN SELECT 1"), StatementKind::Read);
         assert_eq!(
-            classify_statement("EXPLAIN SELECT 1"),
-            StatementKind::Utility
+            classify_statement("EXPLAIN ANALYZE INSERT INTO t VALUES (1)"),
+            StatementKind::Read
         );
+        assert_eq!(
+            classify_statement("EXPLAIN FORMAT INDENT SELECT 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            classify_statement("EXPLAIN FORMAT 'INDENT' SELECT 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            classify_statement("EXPLAIN FORMAT \"INDENT\" SELECT 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            classify_statement("SELECT/* comment */ 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            classify_statement("EXPLAIN/* comment */ SELECT 1"),
+            StatementKind::Read
+        );
+        assert_eq!(
+            classify_statement("EXPLAIN (SELECT 1)"),
+            StatementKind::Read
+        );
+        assert_eq!(classify_statement("VALUES (1), (2)"), StatementKind::Read);
+        assert_eq!(
+            classify_statement("FROM lix_file SELECT id"),
+            StatementKind::Read
+        );
+        assert_eq!(classify_statement("(SELECT 1)"), StatementKind::Read);
+        assert_eq!(classify_statement("((SELECT 1))"), StatementKind::Read);
     }
 }

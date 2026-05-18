@@ -1,25 +1,22 @@
-use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
-use async_trait::async_trait;
-use lix_engine::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
-    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
-    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
-    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, Engine, LixError,
+use lix_engine::backend::{
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
+    GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor,
+    PutBatch, ReadOptions, ScanOptions, WriteOptions,
 };
-
-type KvKey = (String, Vec<u8>);
-type KvMap = BTreeMap<KvKey, Vec<u8>>;
+use lix_engine::Engine;
 
 #[tokio::test]
-async fn read_sql_rolls_back_read_transaction_when_pre_plan_setup_fails() {
+async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
     let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(Box::new(backend.clone()))
+    let _receipt = Engine::initialize(backend.clone())
         .await
         .expect("backend should initialize");
-    let engine = Engine::new(Box::new(backend.clone()))
+    let engine = Engine::new(backend.clone())
         .await
         .expect("initialized backend should create an engine");
     let session = engine
@@ -49,18 +46,18 @@ async fn read_sql_rolls_back_read_transaction_when_pre_plan_setup_fails() {
     let delta = backend.stats().delta_since(&before);
     assert_eq!(delta.read_opened, 1, "read SQL should open one read tx");
     assert_eq!(
-        delta.read_rolled_back, 1,
-        "read SQL pre-plan errors must roll back the opened read tx"
+        delta.write_opened, 0,
+        "failed read SQL must not open writes"
     );
 }
 
 #[tokio::test]
-async fn write_transaction_open_rolls_back_when_active_version_resolution_fails() {
+async fn write_setup_failure_does_not_open_backend_write() {
     let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(Box::new(backend.clone()))
+    let _receipt = Engine::initialize(backend.clone())
         .await
         .expect("backend should initialize");
-    let engine = Engine::new(Box::new(backend.clone()))
+    let engine = Engine::new(backend.clone())
         .await
         .expect("initialized backend should create an engine");
     let session = engine
@@ -88,24 +85,23 @@ async fn write_transaction_open_rolls_back_when_active_version_resolution_fails(
     assert_eq!(error.code, "LIX_VERSION_NOT_FOUND");
 
     let delta = backend.stats().delta_since(&before);
-    assert_eq!(delta.write_opened, 1, "write path should open one write tx");
     assert_eq!(
-        delta.write_rolled_back, 1,
-        "write open errors must roll back the opened write tx"
+        delta.write_opened, 0,
+        "write setup failure should not open a backend write"
     );
     assert_eq!(
         delta.write_committed, 0,
-        "failed write open must not commit"
+        "failed write setup must not commit"
     );
 }
 
 #[tokio::test]
-async fn rebuild_tracked_state_rolls_back_read_and_write_transactions_on_failure() {
+async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
     let backend = RecordingBackend::new();
-    let receipt = Engine::initialize(Box::new(backend.clone()))
+    let receipt = Engine::initialize(backend.clone())
         .await
         .expect("backend should initialize");
-    let engine = Engine::new(Box::new(backend.clone()))
+    let engine = Engine::new(backend.clone())
         .await
         .expect("initialized backend should create an engine");
 
@@ -122,22 +118,281 @@ async fn rebuild_tracked_state_rolls_back_read_and_write_transactions_on_failure
 
     let delta = backend.stats().delta_since(&before);
     assert_eq!(
-        delta.read_opened, delta.read_rolled_back,
-        "every read tx opened during failed rebuild must be rolled back"
-    );
-    assert_eq!(delta.write_opened, 1, "rebuild should open one write tx");
-    assert_eq!(
-        delta.write_rolled_back, 1,
-        "failed rebuild must roll back the opened write tx"
+        delta.write_opened, 0,
+        "failed rebuild should not open a backend write"
     );
     assert_eq!(delta.write_committed, 0, "failed rebuild must not commit");
 }
 
+#[tokio::test]
+async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+             VALUES ('lix_deterministic_mode', \
+             lix_json('{\"enabled\":true}'), true, true)",
+            &[],
+        )
+        .await
+        .expect("deterministic mode insert should succeed");
+
+    let mut tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+
+    let error = session
+        .execute("SELECT lix_uuid_v7()", &[])
+        .await
+        .expect_err("session read should be blocked while transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let result = tx
+        .execute("SELECT lix_uuid_v7()", &[])
+        .await
+        .expect("deterministic transaction read should succeed");
+    assert_eq!(
+        result
+            .rows()
+            .first()
+            .expect("read should return a row")
+            .get::<String>("lix_uuid_v7()")
+            .expect("uuid should be returned as text"),
+        "01920000-0000-7000-8000-000000000000",
+    );
+
+    tx.rollback()
+        .await
+        .expect("transaction rollback should succeed");
+}
+
+#[tokio::test]
+async fn transaction_read_can_query_history_surfaces() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('history-visible-in-tx', 'value')",
+            &[],
+        )
+        .await
+        .expect("seed write should succeed");
+
+    let mut tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+    let result = tx
+        .execute(
+            "SELECT entity_id FROM lix_state_history \
+             WHERE start_commit_id = lix_active_version_commit_id() \
+             AND schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .expect("transaction read should register history surfaces");
+
+    assert!(
+        !result.rows().is_empty(),
+        "transaction history read should see committed history rows"
+    );
+
+    tx.rollback()
+        .await
+        .expect("transaction rollback should succeed");
+}
+
+#[tokio::test]
+async fn begin_transaction_cannot_race_with_opening_session_write() {
+    let backend = BlockingBeginWriteBackend::new();
+    let gate = backend.gate();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+
+    gate.block_next_write();
+    let writer_session = Arc::clone(&session);
+    let writer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            writer_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('racing-session-write', 'value')",
+                    &[],
+                )
+                .await
+        })
+    });
+
+    gate.wait_until_blocked();
+    let error = match session.begin_transaction().await {
+        Ok(_) => panic!("explicit transaction should not race past a session write reservation"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    gate.release();
+    writer
+        .join()
+        .expect("writer thread should not panic")
+        .expect("session write should complete after release");
+
+    let result = session
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = 'racing-session-write'",
+            &[],
+        )
+        .await
+        .expect("session write should be committed");
+    assert_eq!(result.len(), 1);
+}
+
 #[derive(Clone, Default)]
 struct RecordingBackend {
-    data: Arc<Mutex<KvMap>>,
+    inner: InMemoryBackend,
     stats: Arc<TransactionStats>,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone)]
+struct BlockingBeginWriteBackend {
+    inner: RecordingBackend,
+    gate: BlockingBeginWriteGate,
+}
+
+impl BlockingBeginWriteBackend {
+    fn new() -> Self {
+        Self {
+            inner: RecordingBackend::new(),
+            gate: BlockingBeginWriteGate::new(),
+        }
+    }
+
+    fn gate(&self) -> BlockingBeginWriteGate {
+        self.gate.clone()
+    }
+}
+
+impl Backend for BlockingBeginWriteBackend {
+    type Read<'a>
+        = <RecordingBackend as Backend>::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = <RecordingBackend as Backend>::Write<'a>
+    where
+        Self: 'a;
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.gate.maybe_block();
+        self.inner.begin_write(opts)
+    }
+}
+
+#[derive(Clone)]
+struct BlockingBeginWriteGate {
+    state: Arc<(Mutex<BlockingBeginWriteState>, Condvar)>,
+}
+
+impl BlockingBeginWriteGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(BlockingBeginWriteState::default()),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn block_next_write(&self) {
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        state.block_next = true;
+        state.blocked = false;
+        state.released = false;
+    }
+
+    fn maybe_block(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        if !state.block_next {
+            return;
+        }
+        state.block_next = false;
+        state.blocked = true;
+        condvar.notify_all();
+        while !state.released {
+            state = condvar
+                .wait(state)
+                .expect("blocking gate lock should be available after wait");
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        while !state.blocked {
+            state = condvar
+                .wait(state)
+                .expect("blocking gate lock should be available after wait");
+        }
+    }
+
+    fn release(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        state.released = true;
+        condvar.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct BlockingBeginWriteState {
+    block_next: bool,
+    blocked: bool,
+    released: bool,
 }
 
 impl RecordingBackend {
@@ -157,302 +412,156 @@ impl RecordingBackend {
     }
 }
 
-#[async_trait]
 impl Backend for RecordingBackend {
-    async fn begin_read_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-        self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(RecordingTransaction {
-            data: Arc::clone(&self.data),
-            pending: BTreeMap::new(),
-            stats: Arc::clone(&self.stats),
-            fail_read_namespace: Arc::clone(&self.fail_read_namespace),
-            mode: RecordingTransactionMode::Read,
-        }))
+    type Read<'a>
+        = RecordingRead
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = RecordingWrite
+    where
+        Self: 'a;
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
     }
 
-    async fn begin_write_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
-        self.stats.write_opened.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(RecordingTransaction {
-            data: Arc::clone(&self.data),
-            pending: BTreeMap::new(),
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
+        Ok(RecordingRead {
+            inner: self.inner.begin_read(opts)?,
             stats: Arc::clone(&self.stats),
             fail_read_namespace: Arc::clone(&self.fail_read_namespace),
-            mode: RecordingTransactionMode::Write,
-        }))
+        })
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        self.stats.write_opened.fetch_add(1, Ordering::SeqCst);
+        Ok(RecordingWrite {
+            inner: self.inner.begin_write(opts)?,
+            stats: Arc::clone(&self.stats),
+        })
     }
 }
 
-struct RecordingTransaction {
-    data: Arc<Mutex<KvMap>>,
-    pending: BTreeMap<KvKey, Option<Vec<u8>>>,
+#[derive(Clone)]
+struct RecordingRead {
+    inner: InMemoryRead,
     stats: Arc<TransactionStats>,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
-    mode: RecordingTransactionMode,
 }
 
-#[derive(Clone, Copy)]
-enum RecordingTransactionMode {
-    Read,
-    Write,
+struct RecordingWrite {
+    inner: InMemoryWrite,
+    stats: Arc<TransactionStats>,
 }
 
-#[async_trait]
-impl BackendReadTransaction for RecordingTransaction {
-    async fn get_values(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvValueBatch, LixError> {
-        self.fail_if_get_namespace_matches(&request)?;
-        let data = self.data.lock().expect("recording backend lock poisoned");
-        let mut groups = Vec::with_capacity(request.groups.len());
-        for group in request.groups {
-            let namespace = group.namespace.clone();
-            let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
-            let mut present = Vec::with_capacity(group.keys.len());
-            for key in group.keys {
-                let identity = (namespace.clone(), key.clone());
-                let value = self
-                    .pending
-                    .get(&identity)
-                    .cloned()
-                    .unwrap_or_else(|| data.get(&identity).cloned());
-                if let Some(value) = value {
-                    values.push(value);
-                    present.push(true);
-                } else {
-                    values.push([]);
-                    present.push(false);
-                }
-            }
-            groups.push(BackendKvValueGroup::new(
-                namespace,
-                values.finish(),
-                present,
-            ));
-        }
-        Ok(BackendKvValueBatch { groups })
-    }
+impl BackendRead for RecordingRead {
+    type RangeScan<'cursor> = <InMemoryRead as BackendRead>::RangeScan<'cursor>;
 
-    async fn exists_many(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvExistsBatch, LixError> {
-        self.fail_if_get_namespace_matches(&request)?;
-        let data = self.data.lock().expect("recording backend lock poisoned");
-        let mut groups = Vec::with_capacity(request.groups.len());
-        for group in request.groups {
-            let namespace = group.namespace.clone();
-            let mut exists = Vec::with_capacity(group.keys.len());
-            for key in group.keys {
-                let identity = (namespace.clone(), key.clone());
-                exists.push(
-                    self.pending
-                        .get(&identity)
-                        .map(|value| value.is_some())
-                        .unwrap_or_else(|| data.contains_key(&identity)),
-                );
-            }
-            groups.push(BackendKvExistsGroup { namespace, exists });
-        }
-        Ok(BackendKvExistsBatch { groups })
-    }
-
-    async fn scan_keys(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvKeyPage, LixError> {
-        let entries = self.scan_visible_entries(request)?;
-        Ok(BackendKvKeyPage {
-            keys: entries.keys,
-            resume_after: entries.resume_after,
-        })
-    }
-
-    async fn scan_values(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvValuePage, LixError> {
-        self.fail_if_scan_namespace_matches(&request)?;
-        let entries = self.scan_visible_entries(request)?;
-        Ok(BackendKvValuePage {
-            values: entries.values,
-            resume_after: entries.resume_after,
-        })
-    }
-
-    async fn scan_entries(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvEntryPage, LixError> {
-        self.fail_if_scan_namespace_matches(&request)?;
-        self.scan_visible_entries(request)
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        match self.mode {
-            RecordingTransactionMode::Read => {
-                self.stats.read_rolled_back.fetch_add(1, Ordering::SeqCst);
-            }
-            RecordingTransactionMode::Write => {
-                self.stats.write_rolled_back.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl BackendWriteTransaction for RecordingTransaction {
-    async fn write_kv_batch(
-        &mut self,
-        batch: BackendKvWriteBatch,
-    ) -> Result<BackendKvWriteStats, LixError> {
-        let mut stats = BackendKvWriteStats::default();
-        for group in batch.groups {
-            let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let key = group.put_key(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
-                })?;
-                let value = group.put_value(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
-                })?;
-                stats.puts += 1;
-                stats.bytes_written += key.len() + value.len();
-                self.pending
-                    .insert((namespace.clone(), key.to_vec()), Some(value.to_vec()));
-            }
-            for index in 0..group.delete_count() {
-                let key = group.delete_key(index).ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "backend write batch missing delete key",
-                    )
-                })?;
-                stats.deletes += 1;
-                stats.bytes_written += key.len();
-                self.pending.insert((namespace.clone(), key.to_vec()), None);
-            }
-        }
-        Ok(stats)
-    }
-
-    async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
-        self.stats.write_committed.fetch_add(1, Ordering::SeqCst);
-        let mut guard = self.data.lock().expect("recording backend lock poisoned");
-        for (key, value) in std::mem::take(&mut self.pending) {
-            match value {
-                Some(value) => {
-                    guard.insert(key, value);
-                }
-                None => {
-                    guard.remove(&key);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl RecordingTransaction {
-    fn fail_if_get_namespace_matches(&self, request: &BackendKvGetRequest) -> Result<(), LixError> {
-        for group in &request.groups {
-            self.fail_if_namespace_matches(&group.namespace)?;
-        }
-        Ok(())
-    }
-
-    fn fail_if_scan_namespace_matches(
+    fn visit_keys<V>(
         &self,
-        request: &BackendKvScanRequest,
-    ) -> Result<(), LixError> {
-        self.fail_if_namespace_matches(&request.namespace)
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        self.fail_if_keys_match(keys)?;
+        self.inner.visit_keys(keys, opts, visitor)
     }
 
-    fn fail_if_namespace_matches(&self, namespace: &str) -> Result<(), LixError> {
-        if self
-            .fail_read_namespace
+    fn with_range_scan<T, F>(
+        &self,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+    {
+        self.fail_if_range_matches(&range)?;
+        self.inner.with_range_scan(range, opts, f)
+    }
+
+    fn close(self) -> Result<(), BackendError> {
+        self.stats.read_rolled_back.fetch_add(1, Ordering::SeqCst);
+        self.inner.close()
+    }
+}
+
+impl BackendWrite for RecordingWrite {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(entries)
+    }
+
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(keys)
+    }
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(range)
+    }
+
+    fn commit(self) -> Result<CommitResult, BackendError> {
+        self.stats.write_committed.fetch_add(1, Ordering::SeqCst);
+        self.inner.commit()
+    }
+
+    fn rollback(self) -> Result<(), BackendError> {
+        self.stats.write_rolled_back.fetch_add(1, Ordering::SeqCst);
+        self.inner.rollback()
+    }
+}
+
+impl RecordingRead {
+    fn fail_if_keys_match(&self, keys: &[Key]) -> Result<(), BackendError> {
+        if self.should_fail_read() && keys.iter().any(key_is_commit_store_commit) {
+            return Err(forced_read_failure());
+        }
+        Ok(())
+    }
+
+    fn fail_if_range_matches(&self, range: &KeyRange) -> Result<(), BackendError> {
+        if self.should_fail_read() && range_may_include_commit_store_commit(range) {
+            return Err(forced_read_failure());
+        }
+        Ok(())
+    }
+
+    fn should_fail_read(&self) -> bool {
+        self.fail_read_namespace
             .lock()
             .expect("fail namespace lock should not poison")
             .as_deref()
-            == Some(namespace)
-        {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("forced read failure for namespace {namespace}"),
-            ));
-        }
-        Ok(())
-    }
-
-    fn scan_visible_entries(
-        &self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvEntryPage, LixError> {
-        let mut visible = self
-            .data
-            .lock()
-            .expect("recording backend lock poisoned")
-            .clone();
-        for (key, value) in &self.pending {
-            match value {
-                Some(value) => {
-                    visible.insert(key.clone(), value.clone());
-                }
-                None => {
-                    visible.remove(key);
-                }
-            }
-        }
-        Ok(scan_map(&visible, &request))
+            == Some("commit_store.commit")
     }
 }
 
-fn scan_map(map: &KvMap, request: &BackendKvScanRequest) -> BackendKvEntryPage {
-    let mut pairs = map
-        .iter()
-        .filter_map(|((entry_namespace, key), value)| {
-            if entry_namespace != &request.namespace || !key_in_range(key, &request.range) {
-                return None;
-            }
-            if request
-                .after
-                .as_deref()
-                .is_some_and(|after| key.as_slice() <= after)
-            {
-                return None;
-            }
-            Some((key.clone(), value.clone()))
-        })
-        .collect::<Vec<_>>();
-    pairs.sort_by(|left, right| left.0.cmp(&right.0));
-    let has_more = pairs.len() > request.limit;
-    pairs.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| pairs.last().map(|(key, _)| key.clone()))
-        .flatten();
-    let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
-    let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
-    for (key, value) in pairs {
-        keys.push(key);
-        values.push(value);
-    }
-    BackendKvEntryPage {
-        keys: keys.finish(),
-        values: values.finish(),
-        resume_after,
-    }
+const COMMIT_STORE_COMMIT_SPACE_PREFIX: [u8; 4] = 0x0003_0001u32.to_be_bytes();
+
+fn key_is_commit_store_commit(key: &Key) -> bool {
+    key.0.starts_with(&COMMIT_STORE_COMMIT_SPACE_PREFIX)
 }
 
-fn key_in_range(key: &[u8], range: &BackendKvScanRange) -> bool {
-    match range {
-        BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
-        BackendKvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
-    }
+fn range_may_include_commit_store_commit(range: &KeyRange) -> bool {
+    let lower_allows = match &range.lower {
+        Bound::Unbounded => true,
+        Bound::Included(key) => key.0.as_ref() <= COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
+        Bound::Excluded(key) => key.0.as_ref() < COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
+    };
+    let upper_allows = match &range.upper {
+        Bound::Unbounded => true,
+        Bound::Included(key) => key.0.as_ref() >= COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
+        Bound::Excluded(key) => key.0.as_ref() > COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
+    };
+    lower_allows && upper_allows
+}
+
+fn forced_read_failure() -> BackendError {
+    BackendError::Io("forced read failure for namespace commit_store.commit".to_string())
 }
 
 #[derive(Default)]

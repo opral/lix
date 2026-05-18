@@ -1141,6 +1141,801 @@ simulation_test!(
 );
 
 simulation_test!(
+    typed_entity_update_accepts_parseable_json_text_identity_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_identity_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_identity_literal_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity insert should succeed");
+
+        let update = session
+            .execute(
+                "UPDATE engine_identity_literal_schema \
+                 SET name = 'after' \
+                 WHERE lixcol_entity_id = '[\"row-1\"]'",
+                &[],
+            )
+            .await
+            .expect("parseable JSON text identity predicate should be accepted");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT name FROM engine_identity_literal_schema WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("updated typed entity should read");
+        assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
+    }
+);
+
+simulation_test!(
+    typed_entity_update_accepts_parseable_json_text_identity_in_predicate,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_identity_in_literal_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_identity_in_literal_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity insert should succeed");
+
+        let update = session
+            .execute(
+                "UPDATE engine_identity_in_literal_schema \
+                 SET name = 'after' \
+                 WHERE lixcol_entity_id IN ('[\"row-1\"]')",
+                &[],
+            )
+            .await
+            .expect("parseable JSON text identity IN predicate should be accepted");
+        assert_eq!(update, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT name FROM engine_identity_in_literal_schema WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("updated typed entity should read");
+        assert_rows_eq(result, vec![vec![Value::Text("after".to_string())]]);
+    }
+);
+
+simulation_test!(
+    typed_entity_base_update_cannot_override_active_version_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine_base_version_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("base-filter-draft".to_string()),
+            name: "Base Filter Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created after schema registration");
+
+        let draft = sim.wrap_session(
+            engine
+                .open_session("base-filter-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+
+        draft
+            .execute(
+                "INSERT INTO engine_base_version_filter_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'draft', false, false)",
+                &[],
+            )
+            .await
+            .expect("draft entity insert should succeed");
+
+        let error = main
+            .execute(
+                "UPDATE engine_base_version_filter_schema \
+                 SET name = 'main-updated-draft' \
+                 WHERE lixcol_entity_id = '[\"row-1\"]' \
+                   AND lixcol_version_id = 'base-filter-draft'",
+                &[],
+            )
+            .await
+            .expect_err("base entity table should not expose lixcol_version_id");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+
+        let result = main
+            .execute(
+                "SELECT name \
+                 FROM engine_base_version_filter_schema_by_version \
+                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                   AND lixcol_version_id = 'base-filter-draft'",
+                &[],
+            )
+            .await
+            .expect("by-version query should succeed");
+        assert_rows_eq(result, vec![vec![Value::Text("draft".to_string())]]);
+    }
+);
+
+simulation_test!(
+    typed_entity_base_insert_cannot_override_active_version_scope,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine_base_insert_version_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("base-insert-draft".to_string()),
+            name: "Base Insert Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created after schema registration");
+
+        let error = main
+            .execute(
+                "INSERT INTO engine_base_insert_version_schema \
+                 (id, name, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('row-1', 'draft', 'base-insert-draft', false)",
+                &[],
+            )
+            .await
+            .expect_err("base entity table should not expose lixcol_version_id");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+
+        let result = main
+            .execute(
+                "SELECT name \
+                 FROM engine_base_insert_version_schema_by_version \
+                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                   AND lixcol_version_id = 'base-insert-draft'",
+                &[],
+            )
+            .await
+            .expect("by-version query should succeed");
+        assert_rows_eq(result, vec![]);
+    }
+);
+
+simulation_test!(
+    typed_entity_insert_rejects_unknown_column,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_unknown_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO engine_unknown_insert_column_schema \
+                 (id, name, missing_column, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', 'ignored-before-fix', false, false)",
+                &[],
+            )
+            .await
+            .expect_err("typed entity insert should not ignore unknown columns");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+
+        let result = session
+            .execute("SELECT id FROM engine_unknown_insert_column_schema", &[])
+            .await
+            .expect("select should succeed");
+        assert_rows_eq(result, Vec::<Vec<Value>>::new());
+    }
+);
+
+simulation_test!(
+    typed_entity_insert_rejects_duplicate_columns,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_duplicate_insert_column_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO engine_duplicate_insert_column_schema \
+                 (id, name, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', 'after', false, false)",
+                &[],
+            )
+            .await
+            .expect_err("typed entity insert should not accept duplicate columns");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+
+        let result = session
+            .execute("SELECT id FROM engine_duplicate_insert_column_schema", &[])
+            .await
+            .expect("select should succeed");
+        assert_rows_eq(result, Vec::<Vec<Value>>::new());
+    }
+);
+
+simulation_test!(
+    typed_entity_insert_rejects_unresolved_qualified_table,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_qualified_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO bogus.engine_qualified_insert_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'wrong', false, false)",
+                &[],
+            )
+            .await
+            .expect_err("qualified unresolved table should fall back to normal planning");
+
+        let result = session
+            .execute("SELECT id FROM engine_qualified_insert_schema", &[])
+            .await
+            .expect("select should succeed");
+        assert_rows_eq(result, Vec::<Vec<Value>>::new());
+    }
+);
+
+simulation_test!(
+    typed_entity_base_insert_cannot_override_active_version_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine_base_version_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("base-insert-draft".to_string()),
+            name: "Base Insert Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created after schema registration");
+
+        let error = main
+            .execute(
+                "INSERT INTO engine_base_version_insert_schema \
+                 (id, name, lixcol_version_id, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'draft-via-main', 'base-insert-draft', false, false)",
+                &[],
+            )
+            .await
+            .expect_err("base entity table should not expose lixcol_version_id");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+
+        let result = main
+            .execute(
+                "SELECT id \
+                 FROM engine_base_version_insert_schema_by_version \
+                 WHERE lixcol_version_id = 'base-insert-draft'",
+                &[],
+            )
+            .await
+            .expect("by-version query should succeed");
+        assert_rows_eq(result, Vec::<Vec<Value>>::new());
+    }
+);
+
+simulation_test!(
+    typed_entity_by_version_delete_requires_explicit_version_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine_by_version_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("by-version-delete-draft".to_string()),
+            name: "By-version Delete Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created after schema registration");
+
+        main.execute(
+            "INSERT INTO engine_by_version_delete_scope_schema \
+             (id, name, lixcol_global, lixcol_untracked) \
+             VALUES ('row-1', 'main', false, false)",
+            &[],
+        )
+        .await
+        .expect("main entity insert should succeed");
+
+        let draft = sim.wrap_session(
+            engine
+                .open_session("by-version-delete-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+        draft
+            .execute(
+                "INSERT INTO engine_by_version_delete_scope_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'draft', false, false)",
+                &[],
+            )
+            .await
+            .expect("draft entity insert should succeed");
+
+        main.execute(
+            "DELETE FROM engine_by_version_delete_scope_schema_by_version \
+             WHERE lixcol_entity_id = '[\"row-1\"]'",
+            &[],
+        )
+        .await
+        .expect_err("_by_version delete should not delete all versions without a version filter");
+
+        let result = main
+            .execute(
+                &format!(
+                    "SELECT name, lixcol_version_id \
+                 FROM engine_by_version_delete_scope_schema_by_version \
+                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                   AND lixcol_version_id IN ('{}', 'by-version-delete-draft') \
+                 ORDER BY name",
+                    sim.main_version_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("by-version query should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("draft".to_string()),
+                    Value::Text("by-version-delete-draft".to_string()),
+                ],
+                vec![
+                    Value::Text("main".to_string()),
+                    Value::Text(sim.main_version_id().to_string()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    typed_entity_by_version_update_requires_explicit_version_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine_by_version_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("by-version-update-draft".to_string()),
+            name: "By-version Update Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created after schema registration");
+
+        main.execute(
+            "INSERT INTO engine_by_version_update_scope_schema \
+             (id, name, lixcol_global, lixcol_untracked) \
+             VALUES ('row-1', 'main', false, false)",
+            &[],
+        )
+        .await
+        .expect("main entity insert should succeed");
+
+        let draft = sim.wrap_session(
+            engine
+                .open_session("by-version-update-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+        draft
+            .execute(
+                "INSERT INTO engine_by_version_update_scope_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'draft', false, false)",
+                &[],
+            )
+            .await
+            .expect("draft entity insert should succeed");
+
+        main.execute(
+            "UPDATE engine_by_version_update_scope_schema_by_version \
+             SET name = 'updated-all' \
+             WHERE lixcol_entity_id = '[\"row-1\"]'",
+            &[],
+        )
+        .await
+        .expect_err("_by_version update should not update all versions without a version filter");
+
+        let result = main
+            .execute(
+                &format!(
+                    "SELECT name, lixcol_version_id \
+                 FROM engine_by_version_update_scope_schema_by_version \
+                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                   AND lixcol_version_id IN ('{}', 'by-version-update-draft') \
+                 ORDER BY name",
+                    sim.main_version_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("by-version query should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("draft".to_string()),
+                    Value::Text("by-version-update-draft".to_string()),
+                ],
+                vec![
+                    Value::Text("main".to_string()),
+                    Value::Text(sim.main_version_id().to_string()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    typed_entity_by_version_dml_rejects_version_id_alias,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine_by_version_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("by-version-alias-draft".to_string()),
+            name: "By-version Alias Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created after schema registration");
+
+        main.execute(
+            "INSERT INTO engine_by_version_alias_scope_schema \
+             (id, name, lixcol_global, lixcol_untracked) \
+             VALUES ('row-1', 'main', false, false)",
+            &[],
+        )
+        .await
+        .expect("main entity insert should succeed");
+
+        let draft = sim.wrap_session(
+            engine
+                .open_session("by-version-alias-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+        draft
+            .execute(
+                "INSERT INTO engine_by_version_alias_scope_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'draft', false, false)",
+                &[],
+            )
+            .await
+            .expect("draft entity insert should succeed");
+
+        let update_error = main
+            .execute(
+                "UPDATE engine_by_version_alias_scope_schema_by_version \
+                 SET name = 'updated-via-alias' \
+                 WHERE lixcol_entity_id = '[\"row-1\"]' \
+                   AND version_id = 'by-version-alias-draft'",
+                &[],
+            )
+            .await
+            .expect_err("_by_version update should not accept version_id alias");
+        assert_eq!(update_error.code, LixError::CODE_COLUMN_NOT_FOUND);
+
+        let delete_error = main
+            .execute(
+                "DELETE FROM engine_by_version_alias_scope_schema_by_version \
+                 WHERE lixcol_entity_id = '[\"row-1\"]' \
+                   AND version_id = 'by-version-alias-draft'",
+                &[],
+            )
+            .await
+            .expect_err("_by_version delete should not accept version_id alias");
+        assert_eq!(delete_error.code, LixError::CODE_COLUMN_NOT_FOUND);
+
+        let result = main
+            .execute(
+                &format!(
+                    "SELECT name, lixcol_version_id \
+                 FROM engine_by_version_alias_scope_schema_by_version \
+                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                   AND lixcol_version_id IN ('{}', 'by-version-alias-draft') \
+                 ORDER BY name",
+                    sim.main_version_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("by-version query should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("draft".to_string()),
+                    Value::Text("by-version-alias-draft".to_string()),
+                ],
+                vec![
+                    Value::Text("main".to_string()),
+                    Value::Text(sim.main_version_id().to_string()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    typed_entity_update_rejects_duplicate_assignments,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_duplicate_update_assignment_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine_duplicate_update_assignment_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', false, false)",
+                &[],
+            )
+            .await
+            .expect("entity insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE engine_duplicate_update_assignment_schema \
+                 SET name = 'first', name = 'second' \
+                 WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect_err("typed entity update should not accept duplicate assignments");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+
+        let result = session
+            .execute(
+                "SELECT name FROM engine_duplicate_update_assignment_schema WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("select should succeed");
+        assert_rows_eq(result, vec![vec![Value::Text("before".to_string())]]);
+    }
+);
+
+simulation_test!(
     typed_entity_update_preserves_absent_optional_non_nullable_fields,
     |sim| async move {
         let engine = sim.boot_engine().await;

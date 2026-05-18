@@ -7,6 +7,7 @@ use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, Normal
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
+use crate::storage::StorageBackend;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
@@ -14,8 +15,6 @@ use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 use serde_json::json;
-#[cfg(test)]
-use std::sync::Arc;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ID_KEY: &str = "lix_id";
@@ -172,19 +171,24 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 /// only responsible for durably writing those facts to their owning stores:
 /// commit_store for tracked changes, and live_state for the serving projection
 /// plus untracked moving refs.
-pub(crate) async fn initialize(
-    storage: StorageContext,
+pub(crate) async fn initialize<B>(
+    storage: StorageContext<B>,
     commit_store: &CommitStoreContext,
     tracked_state: &TrackedStateContext,
     untracked_state: &UntrackedStateContext,
-) -> Result<InitReceipt, LixError> {
+) -> Result<InitReceipt, LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     let functions = SharedFunctionProvider::new(
         Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
     );
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
-    let mut transaction = storage.begin_write_transaction().await?;
+    let read = storage.begin_read(crate::storage::StorageReadOptions::default())?;
     let mut writes = StorageWriteSet::new();
 
     let authored_changes = plan
@@ -211,7 +215,7 @@ pub(crate) async fn initialize(
             author_account_ids: &plan.commit.author_account_ids,
             created_at: &plan.commit.created_at,
         };
-        let mut writer = commit_store.writer(transaction.as_mut(), &mut writes);
+        let mut writer = commit_store.writer(&read, &mut writes);
         writer
             .stage_tracked_commit_draft(
                 commit,
@@ -241,14 +245,13 @@ pub(crate) async fn initialize(
                 updated_at: &change.created_at,
             })
             .collect::<Vec<_>>();
-        let mut writer = tracked_state.writer(transaction.as_mut(), &mut writes);
+        let mut writer = tracked_state.writer(&read, &mut writes);
         writer
             .stage_delta(&receipt.initial_commit_id, None, &deltas)
             .await?;
     }
 
-    writes.apply(&mut transaction.as_mut()).await?;
-    transaction.commit().await?;
+    storage.commit_write_set(writes, crate::storage::StorageWriteOptions::default())?;
     Ok(receipt)
 }
 
@@ -353,8 +356,8 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::functions::{FunctionProvider, SharedFunctionProvider};
+    use crate::storage::InMemoryStorageBackend;
     use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateContext;
     use crate::untracked_state::UntrackedStateContext;
@@ -481,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_writes_initial_commit_through_commit_store() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend);
         let commit_store = CommitStoreContext::new();
         let tracked_state = TrackedStateContext::new();
@@ -495,7 +498,10 @@ mod tests {
         )
         .await
         .expect("engine should initialize");
-        let reader = commit_store.reader(storage.clone());
+        let read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let reader = commit_store.reader(read);
         let commit = reader
             .load_commit(&receipt.initial_commit_id)
             .await

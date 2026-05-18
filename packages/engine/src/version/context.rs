@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 
 use super::refs::VersionRefContext;
@@ -25,7 +25,7 @@ impl VersionContext {
     /// Creates a version-ref reader over a caller-provided KV store.
     pub(crate) fn ref_reader<S>(&self, store: S) -> impl VersionRefReader
     where
-        S: StorageReader + Send,
+        S: StorageRead + Send + Sync,
     {
         self.refs.reader(store)
     }
