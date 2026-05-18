@@ -4,7 +4,9 @@ use super::types::{
     CommitLoadRequest, CommitVisibility, GcPlan, GcRoot, RebuildIndexStats, Segment,
     StateRowIdentity,
 };
+use crate::backend::SpaceId;
 use crate::common::LixError;
+use crate::storage::StorageSpace;
 use async_trait::async_trait;
 
 pub(crate) const SEGMENT_NAMESPACE: &str = "changelog.segment";
@@ -15,6 +17,17 @@ pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE: &str =
     "changelog.index.by_change_membership";
 pub(crate) const BY_KEY_VALUE_INDEX_NAMESPACE: &str = "changelog.index.by_key_value";
 pub(crate) const BY_KEY_COMMIT_INDEX_NAMESPACE: &str = "changelog.index.by_key_commit";
+
+pub(crate) const SEGMENT_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0004_0001), SEGMENT_NAMESPACE);
+pub(crate) const COMMIT_VISIBILITY_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0004_0002), COMMIT_VISIBILITY_NAMESPACE);
+pub(crate) const BY_COMMIT_INDEX_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0004_0003), BY_COMMIT_INDEX_NAMESPACE);
+pub(crate) const BY_CHANGE_INDEX_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0004_0004), BY_CHANGE_INDEX_NAMESPACE);
+pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0004_0005), BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE);
 
 pub(crate) fn segment_key(segment_id: &str) -> Vec<u8> {
     identity_key(segment_id)

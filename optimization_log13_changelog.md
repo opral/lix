@@ -1153,20 +1153,20 @@ Times are milliseconds.
 Times are milliseconds.
 
 | row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms | redb_tempfile_ms |
-| ---------------------------------------------------- | ----------: | -----------------: | -----------------: | ----------------: |
-| stage_segment_raw_no_indexes / 1c_1000ch             |       0.507 |              4.465 |              4.329 |            53.851 |
-| stage_segment / 1c_1000ch                            |       4.781 |              8.233 |              7.740 |            54.898 |
-| stage_publish_commit / 1c_1ch                        |       0.046 |              0.232 |              0.053 |             4.192 |
-| stage_publish_commit / 1c_100ch                      |       0.460 |              0.809 |              0.492 |             4.173 |
-| stage_publish_commit / 1c_1000ch single-shot         |       4.423 |              5.501 |              4.815 |             8.753 |
-| load_commits_visible_batched / 1c_100ch              |       0.180 |              0.207 |              0.185 |             0.203 |
-| load_changes_visible_batched / 1c_100ch              |       0.216 |              0.519 |              0.471 |             0.285 |
-| load_changes_visible_batched / 1c_1000ch             |       1.764 |              5.655 |              2.794 |             2.582 |
-| load_changes_physical_scattered / 100seg_100c_1000ch |       1.049 |              2.161 |              1.439 |             1.194 |
-| load_changes_visible_scattered / 100seg_100c_1000ch  |       2.165 |              7.193 |              3.686 |             2.914 |
-| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.324 |              7.559 |              6.683 |            12.201 |
-| plan_gc / live_50pct_mixed_segments                  |       6.409 |              6.911 |              6.860 |             6.596 |
-| collect_garbage / live_50pct_mixed_segments          |       6.850 |              7.657 |              6.914 |            11.867 |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: | ---------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.507 |              4.465 |              4.329 |           53.851 |
+| stage_segment / 1c_1000ch                            |       4.781 |              8.233 |              7.740 |           54.898 |
+| stage_publish_commit / 1c_1ch                        |       0.046 |              0.232 |              0.053 |            4.192 |
+| stage_publish_commit / 1c_100ch                      |       0.460 |              0.809 |              0.492 |            4.173 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.423 |              5.501 |              4.815 |            8.753 |
+| load_commits_visible_batched / 1c_100ch              |       0.180 |              0.207 |              0.185 |            0.203 |
+| load_changes_visible_batched / 1c_100ch              |       0.216 |              0.519 |              0.471 |            0.285 |
+| load_changes_visible_batched / 1c_1000ch             |       1.764 |              5.655 |              2.794 |            2.582 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       1.049 |              2.161 |              1.439 |            1.194 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |       2.165 |              7.193 |              3.686 |            2.914 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.324 |              7.559 |              6.683 |           12.201 |
+| plan_gc / live_50pct_mixed_segments                  |       6.409 |              6.911 |              6.860 |            6.596 |
+| collect_garbage / live_50pct_mixed_segments          |       6.850 |              7.657 |              6.914 |           11.867 |
 
 Read:
 

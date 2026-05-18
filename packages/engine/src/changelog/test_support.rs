@@ -1,19 +1,20 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use super::context::ChangelogStorageRead;
 use super::segment::{canonicalize_segment, directory_change_location, directory_commit_location};
 use super::store::{
-    BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE, by_change_index_value, by_change_key, by_change_membership_index_value,
+    by_change_index_value, by_change_key, by_change_membership_index_value,
     by_change_membership_key, by_commit_index_value, by_commit_key, segment_key, segment_value,
+    BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
+    SEGMENT_NAMESPACE, SEGMENT_SPACE,
 };
 use super::{
-    ByChangeEntry, ByCommitEntry, CommitBody, CommitHeader, CommitVisibility, MembershipRecord,
-    MembershipRole, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
-    SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentObjectLocation,
-    StateRowIdentity, decode_by_change_entry, decode_by_commit_entry,
+    decode_by_change_entry, decode_by_commit_entry, ByChangeEntry, ByCommitEntry, CommitBody,
+    CommitHeader, CommitVisibility, MembershipRecord, MembershipRole, Segment, SegmentChange,
+    SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
+    SegmentObjectLocation, StateRowIdentity,
 };
-use crate::LixError;
 use crate::backend::InMemoryBackend;
 use crate::changelog::ChangelogContext;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
@@ -22,6 +23,7 @@ use crate::storage::{
     KvEntryPage, KvExistsBatch, KvGetGroup, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
     KvValuePage, StorageContext, StorageReader, StorageWriteSet,
 };
+use crate::LixError;
 
 pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageContext) {
     (
@@ -348,5 +350,32 @@ impl StorageReader for CountingReader {
 
     async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
         self.inner.scan_entries(request).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChangelogStorageRead for CountingReader {
+    async fn changelog_get_many(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+        if space == SEGMENT_SPACE {
+            self.segment_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.changelog_get_many(space, keys).await
+    }
+
+    async fn changelog_scan(
+        &mut self,
+        space: crate::storage::StorageSpace,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+        projection: crate::backend::CoreProjection,
+    ) -> Result<super::context::ChangelogScanPage, LixError> {
+        self.inner
+            .changelog_scan(space, prefix, after, limit, projection)
+            .await
     }
 }

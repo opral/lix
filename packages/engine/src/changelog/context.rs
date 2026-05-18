@@ -1,4 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Bound;
+
+use async_trait::async_trait;
+use bytes::Bytes;
 
 use super::by_change_index::by_change_entries_for_segments;
 use super::by_change_membership_index::by_change_membership_entries_for_segments;
@@ -13,8 +17,11 @@ use super::store::{
     by_change_index_value, by_change_key, by_change_membership_commit_id_from_key,
     by_change_membership_index_value, by_change_membership_key, by_change_membership_prefix,
     by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
-    segment_key, segment_value, BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
-    BY_COMMIT_INDEX_NAMESPACE, COMMIT_VISIBILITY_NAMESPACE, SEGMENT_NAMESPACE,
+    segment_key, segment_value, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+    BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE,
+};
+use crate::backend::{
+    CoreProjection, GetOptions, Key, KeyRange, Prefix, ProjectedValue, ReadOptions, ScanOptions,
 };
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
@@ -29,7 +36,7 @@ use crate::changelog::{
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageReader, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageContext, StorageRead, StorageSpace, StorageWriteSet,
 };
 use crate::LixError;
 
@@ -49,7 +56,7 @@ impl ChangelogContext {
     /// Creates a reader over a caller-provided storage snapshot or transaction.
     pub(crate) fn reader<S>(&self, store: S) -> ChangelogStoreReader<S>
     where
-        S: StorageReader,
+        S: ChangelogStorageRead,
     {
         ChangelogStoreReader { store }
     }
@@ -64,7 +71,7 @@ impl ChangelogContext {
         writes: &'a mut StorageWriteSet,
     ) -> ChangelogStoreWriter<'a, S>
     where
-        S: StorageReader + ?Sized,
+        S: ChangelogStorageRead + ?Sized,
     {
         ChangelogStoreWriter {
             store,
@@ -81,6 +88,97 @@ impl ChangelogContext {
 /// Store-backed changelog reader created by [`ChangelogContext`].
 pub(crate) struct ChangelogStoreReader<S> {
     store: S,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChangelogScanPage {
+    pub(super) keys: Vec<Vec<u8>>,
+    pub(super) values: Vec<Vec<u8>>,
+    pub(super) resume_after: Option<Vec<u8>>,
+}
+
+impl ChangelogScanPage {
+    pub(super) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(super) fn key(&self, index: usize) -> Option<&[u8]> {
+        self.keys.get(index).map(Vec::as_slice)
+    }
+
+    pub(super) fn value(&self, index: usize) -> Option<&[u8]> {
+        self.values.get(index).map(Vec::as_slice)
+    }
+}
+
+#[async_trait(?Send)]
+pub(crate) trait ChangelogStorageRead {
+    async fn changelog_get_many(
+        &mut self,
+        space: StorageSpace,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError>;
+
+    async fn changelog_scan(
+        &mut self,
+        space: StorageSpace,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+        projection: CoreProjection,
+    ) -> Result<ChangelogScanPage, LixError>;
+}
+
+#[async_trait(?Send)]
+impl<T> ChangelogStorageRead for T
+where
+    T: StorageRead,
+{
+    async fn changelog_get_many(
+        &mut self,
+        space: StorageSpace,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+        native_get_many(self, space, keys)
+    }
+
+    async fn changelog_scan(
+        &mut self,
+        space: StorageSpace,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+        projection: CoreProjection,
+    ) -> Result<ChangelogScanPage, LixError> {
+        native_scan(self, space, prefix, after, limit, projection)
+    }
+}
+
+#[async_trait(?Send)]
+impl<B> ChangelogStorageRead for StorageContext<B>
+where
+    B: crate::backend::Backend,
+{
+    async fn changelog_get_many(
+        &mut self,
+        space: StorageSpace,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        native_get_many(&mut read, space, keys)
+    }
+
+    async fn changelog_scan(
+        &mut self,
+        space: StorageSpace,
+        prefix: Vec<u8>,
+        after: Option<Vec<u8>>,
+        limit: usize,
+        projection: CoreProjection,
+    ) -> Result<ChangelogScanPage, LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        native_scan(&mut read, space, prefix, after, limit, projection)
+    }
 }
 
 struct SegmentByteIndex {
@@ -253,7 +351,7 @@ impl SegmentByteIndex {
 
 impl<S> ChangelogStoreReader<S>
 where
-    S: StorageReader,
+    S: ChangelogStorageRead,
 {
     pub(crate) async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError> {
         super::gc::plan_gc(&mut self.store, roots).await
@@ -474,7 +572,7 @@ where
     ) -> Result<Option<CommitVisibility>, LixError> {
         get_one(
             &mut self.store,
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_visibility_key(commit_id),
         )
         .await?
@@ -494,7 +592,7 @@ where
     async fn load_by_commit(&mut self, commit_id: &str) -> Result<Option<ByCommitEntry>, LixError> {
         get_one(
             &mut self.store,
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key(commit_id),
         )
         .await?
@@ -514,7 +612,7 @@ where
     async fn load_by_change(&mut self, change_id: &str) -> Result<Option<ByChangeEntry>, LixError> {
         get_one(
             &mut self.store,
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key(change_id),
         )
         .await?
@@ -537,7 +635,7 @@ where
     ) -> Result<Vec<Option<CommitVisibility>>, LixError> {
         let values = get_many(
             &mut self.store,
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_ids
                 .iter()
                 .map(|commit_id| commit_visibility_key(commit_id))
@@ -571,7 +669,7 @@ where
     ) -> Result<Vec<Option<ByCommitEntry>>, LixError> {
         let values = get_many(
             &mut self.store,
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             commit_ids
                 .iter()
                 .map(|commit_id| by_commit_key(commit_id))
@@ -605,7 +703,7 @@ where
     ) -> Result<Vec<Option<ByChangeEntry>>, LixError> {
         let values = get_many(
             &mut self.store,
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             change_ids
                 .iter()
                 .map(|change_id| by_change_key(change_id))
@@ -639,7 +737,7 @@ where
     ) -> Result<HashMap<String, DecodedSegmentIndex>, LixError> {
         let values = get_many(
             &mut self.store,
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_ids
                 .iter()
                 .map(|segment_id| segment_key(segment_id))
@@ -659,8 +757,7 @@ where
         &mut self,
         segment_id: &str,
     ) -> Result<Option<SegmentByteIndex>, LixError> {
-        let Some(bytes) =
-            get_one(&mut self.store, SEGMENT_NAMESPACE, segment_key(segment_id)).await?
+        let Some(bytes) = get_one(&mut self.store, SEGMENT_SPACE, segment_key(segment_id)).await?
         else {
             return Ok(None);
         };
@@ -673,7 +770,7 @@ where
     ) -> Result<HashMap<String, SegmentByteIndex>, LixError> {
         let values = get_many(
             &mut self.store,
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_ids
                 .iter()
                 .map(|segment_id| segment_key(segment_id))
@@ -699,12 +796,13 @@ where
         loop {
             let page = self
                 .store
-                .scan_keys(KvScanRequest {
-                    namespace: BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE.to_string(),
-                    range: KvScanRange::prefix(prefix.clone()),
+                .changelog_scan(
+                    BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+                    prefix.clone(),
                     after,
-                    limit: 256,
-                })
+                    256,
+                    CoreProjection::KeyOnly,
+                )
                 .await?;
             for index in 0..page.keys.len() {
                 let Some(key) = page.keys.get(index) else {
@@ -765,8 +863,7 @@ where
     }
 
     async fn load_segment(&mut self, segment_id: &str) -> Result<Option<Segment>, LixError> {
-        let Some(bytes) =
-            get_one(&mut self.store, SEGMENT_NAMESPACE, segment_key(segment_id)).await?
+        let Some(bytes) = get_one(&mut self.store, SEGMENT_SPACE, segment_key(segment_id)).await?
         else {
             return Ok(None);
         };
@@ -781,12 +878,13 @@ where
         loop {
             let page = self
                 .store
-                .scan_entries(KvScanRequest {
-                    namespace: SEGMENT_NAMESPACE.to_string(),
-                    range: KvScanRange::prefix(Vec::new()),
+                .changelog_scan(
+                    SEGMENT_SPACE,
+                    Vec::new(),
                     after,
-                    limit: 64,
-                })
+                    64,
+                    CoreProjection::FullValue,
+                )
                 .await?;
             for index in 0..page.len() {
                 let Some(bytes) = page.value(index) else {
@@ -929,12 +1027,13 @@ where
         loop {
             let page = self
                 .store
-                .scan_entries(KvScanRequest {
-                    namespace: SEGMENT_NAMESPACE.to_string(),
-                    range: KvScanRange::prefix(Vec::new()),
+                .changelog_scan(
+                    SEGMENT_SPACE,
+                    Vec::new(),
                     after,
-                    limit: 64,
-                })
+                    64,
+                    CoreProjection::FullValue,
+                )
                 .await?;
             for index in 0..page.len() {
                 let Some(bytes) = page.value(index) else {
@@ -1032,12 +1131,13 @@ where
         loop {
             let page = self
                 .store
-                .scan_keys(KvScanRequest {
-                    namespace: COMMIT_VISIBILITY_NAMESPACE.to_string(),
-                    range: KvScanRange::prefix(Vec::new()),
+                .changelog_scan(
+                    COMMIT_VISIBILITY_SPACE,
+                    Vec::new(),
                     after,
-                    limit: 256,
-                })
+                    256,
+                    CoreProjection::KeyOnly,
+                )
                 .await?;
             for index in 0..page.keys.len() {
                 let Some(key) = page.keys.get(index) else {
@@ -1074,12 +1174,13 @@ where
         loop {
             let page = self
                 .store
-                .scan_keys(KvScanRequest {
-                    namespace: COMMIT_VISIBILITY_NAMESPACE.to_string(),
-                    range: KvScanRange::prefix(Vec::new()),
+                .changelog_scan(
+                    COMMIT_VISIBILITY_SPACE,
+                    Vec::new(),
                     after,
-                    limit: 256,
-                })
+                    256,
+                    CoreProjection::KeyOnly,
+                )
                 .await?;
             for index in 0..page.keys.len() {
                 let Some(key) = page.keys.get(index) else {
@@ -1123,7 +1224,7 @@ pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
 
 impl<S> ChangelogStoreWriter<'_, S>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     pub(crate) async fn stage_segment(&mut self, segment: Segment) -> Result<(), LixError> {
         let segment = canonicalize_segment(segment)?;
@@ -1131,7 +1232,7 @@ where
         self.reject_duplicate_logical_ids(&segment).await?;
         let segment_id = segment.header.segment_id.clone();
         self.writes.put(
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_key(&segment_id),
             segment_value(&segment)?,
         );
@@ -1142,7 +1243,7 @@ where
         let by_commit_entries = by_commit_entries_for_segment(&segment, &external_generations)?;
         for entry in by_commit_entries {
             self.writes.put(
-                BY_COMMIT_INDEX_NAMESPACE,
+                BY_COMMIT_INDEX_SPACE,
                 by_commit_key(&entry.commit_id),
                 by_commit_index_value(&entry)?,
             );
@@ -1154,7 +1255,7 @@ where
 
         for entry in by_change_membership_entries_for_segments(std::slice::from_ref(&segment)) {
             self.writes.put(
-                BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+                BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
                 by_change_membership_key(&entry.change_id, &entry.commit_id),
                 by_change_membership_index_value(),
             );
@@ -1162,7 +1263,7 @@ where
 
         for entry in by_change_entries_for_segments(std::slice::from_ref(&segment))? {
             self.writes.put(
-                BY_CHANGE_INDEX_NAMESPACE,
+                BY_CHANGE_INDEX_SPACE,
                 by_change_key(&entry.change_id),
                 by_change_index_value(&entry)?,
             );
@@ -1259,7 +1360,7 @@ where
     async fn load_parent_generation(&mut self, commit_id: &str) -> Result<Option<u64>, LixError> {
         get_one(
             &mut *self.store,
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key(commit_id),
         )
         .await?
@@ -1273,7 +1374,7 @@ where
         } else {
             let Some(entry) = get_one(
                 &mut *self.store,
-                BY_COMMIT_INDEX_NAMESPACE,
+                BY_COMMIT_INDEX_SPACE,
                 by_commit_key(commit_id),
             )
             .await?
@@ -1301,7 +1402,7 @@ where
             location,
         };
         self.writes.put(
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_visibility_key(&visibility.commit_id),
             commit_visibility_value(&visibility)?,
         );
@@ -1327,7 +1428,7 @@ where
         }
         let Some(bytes) = get_one(
             &mut *self.store,
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_key(&location.segment_id),
         )
         .await?
@@ -1444,7 +1545,7 @@ where
     ) -> Result<(), LixError> {
         let values = get_many(
             &mut *self.store,
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             change_ids
                 .iter()
                 .map(|change_id| by_change_key(change_id))
@@ -1470,7 +1571,7 @@ where
 
         let segment_values = get_many(
             &mut *self.store,
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_ids
                 .iter()
                 .map(|segment_id| segment_key(segment_id))
@@ -1556,7 +1657,7 @@ where
     ) -> Result<bool, LixError> {
         let Some(bytes) = get_one(
             &mut *self.store,
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_visibility_key(commit_id),
         )
         .await?
@@ -1624,12 +1725,13 @@ where
         loop {
             let page = self
                 .store
-                .scan_entries(KvScanRequest {
-                    namespace: SEGMENT_NAMESPACE.to_string(),
-                    range: KvScanRange::prefix(Vec::new()),
+                .changelog_scan(
+                    SEGMENT_SPACE,
+                    Vec::new(),
                     after,
-                    limit: 64,
-                })
+                    64,
+                    CoreProjection::FullValue,
+                )
                 .await?;
             for index in 0..page.len() {
                 let Some(bytes) = page.value(index) else {
@@ -1660,7 +1762,7 @@ where
             );
         }
         let stats = self
-            .stage_index_rebuild(BY_COMMIT_INDEX_NAMESPACE, &expected_rows)
+            .stage_index_rebuild(BY_COMMIT_INDEX_SPACE, &expected_rows)
             .await?;
         for entry in entries {
             self.staged_commits
@@ -1683,7 +1785,7 @@ where
                 by_change_index_value(entry)?,
             );
         }
-        self.stage_index_rebuild(BY_CHANGE_INDEX_NAMESPACE, &expected_rows)
+        self.stage_index_rebuild(BY_CHANGE_INDEX_SPACE, &expected_rows)
             .await
     }
 
@@ -1699,13 +1801,13 @@ where
                 by_change_membership_index_value(),
             );
         }
-        self.stage_index_rebuild(BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, &expected_rows)
+        self.stage_index_rebuild(BY_CHANGE_MEMBERSHIP_INDEX_SPACE, &expected_rows)
             .await
     }
 
     async fn stage_index_rebuild(
         &mut self,
-        namespace: &'static str,
+        space: StorageSpace,
         expected_rows: &HashMap<Vec<u8>, Vec<u8>>,
     ) -> Result<RebuildIndexStats, LixError> {
         let mut after = None;
@@ -1716,12 +1818,7 @@ where
         loop {
             let page = self
                 .store
-                .scan_entries(KvScanRequest {
-                    namespace: namespace.to_string(),
-                    range: KvScanRange::prefix(Vec::new()),
-                    after,
-                    limit: 256,
-                })
+                .changelog_scan(space, Vec::new(), after, 256, CoreProjection::FullValue)
                 .await?;
             for index in 0..page.len() {
                 let Some(key) = page.key(index) else {
@@ -1729,7 +1826,8 @@ where
                 };
                 let Some(value) = page.value(index) else {
                     return Err(LixError::unknown(format!(
-                        "changelog index namespace '{namespace}' returned a key without a value"
+                        "changelog index space '{}' returned a key without a value",
+                        space.name
                     )));
                 };
                 if let Some(expected_value) = expected_rows.get(key) {
@@ -1737,12 +1835,11 @@ where
                     if expected_value.as_slice() == value {
                         unchanged += 1;
                     } else {
-                        self.writes
-                            .put(namespace, key.to_vec(), expected_value.clone());
+                        self.writes.put(space, key.to_vec(), expected_value.clone());
                         put += 1;
                     }
                 } else {
-                    self.writes.delete(namespace, key.to_vec());
+                    self.writes.delete(space, key.to_vec());
                     deleted += 1;
                 }
             }
@@ -1753,7 +1850,7 @@ where
         }
         for (key, value) in expected_rows {
             if !seen.contains(key) {
-                self.writes.put(namespace, key.clone(), value.clone());
+                self.writes.put(space, key.clone(), value.clone());
                 put += 1;
             }
         }
@@ -1836,46 +1933,92 @@ fn changelog_not_implemented(operation: &str) -> LixError {
 }
 
 async fn get_one(
-    store: &mut (impl StorageReader + ?Sized),
-    namespace: &str,
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+    space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    Ok(store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: namespace.to_string(),
-                keys: vec![key],
-            }],
-        })
+    Ok(get_many(store, space, vec![key])
         .await?
-        .groups
         .into_iter()
         .next()
-        .and_then(|group| group.single_value_owned()))
+        .flatten())
 }
 
 async fn get_many(
-    store: &mut (impl StorageReader + ?Sized),
-    namespace: &str,
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+    space: StorageSpace,
     keys: Vec<Vec<u8>>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let batch = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: namespace.to_string(),
-                keys,
-            }],
+    store.changelog_get_many(space, keys).await
+}
+
+fn native_get_many<R>(
+    read: &mut R,
+    space: StorageSpace,
+    keys: Vec<Vec<u8>>,
+) -> Result<Vec<Option<Vec<u8>>>, LixError>
+where
+    R: StorageRead + ?Sized,
+{
+    let keys = keys
+        .into_iter()
+        .map(|key| Key(Bytes::from(key)))
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::new(space, &keys).materialize(read, GetOptions::default())?;
+    Ok(result
+        .value
+        .into_iter()
+        .map(|value| match value {
+            Some(ProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+            Some(ProjectedValue::KeyOnly) => Some(Vec::new()),
+            None => None,
         })
-        .await?;
-    let Some(group) = batch.groups.into_iter().next() else {
-        return Ok(Vec::new());
-    };
-    Ok((0..group.len())
-        .map(|index| group.value(index).flatten().map(<[u8]>::to_vec))
         .collect())
+}
+
+fn native_scan<R>(
+    read: &mut R,
+    space: StorageSpace,
+    prefix: Vec<u8>,
+    after: Option<Vec<u8>>,
+    limit: usize,
+    projection: CoreProjection,
+) -> Result<ChangelogScanPage, LixError>
+where
+    R: StorageRead + ?Sized,
+{
+    let after_key = after.map(|key| Key(Bytes::from(key)));
+    let opts = ScanOptions {
+        projection,
+        limit_rows: limit,
+        resume_after: after_key.as_ref(),
+    };
+    let chunk = ScanPlan::prefix(
+        space,
+        Prefix {
+            bytes: Bytes::from(prefix),
+        },
+    )
+    .collect(read, opts)?
+    .value;
+    let has_more = chunk.has_more;
+    let mut keys = Vec::with_capacity(chunk.entries.len());
+    let mut values = Vec::with_capacity(chunk.entries.len());
+    for entry in chunk.entries {
+        keys.push(entry.key.0.to_vec());
+        if let ProjectedValue::FullValue(bytes) = entry.value {
+            values.push(bytes.to_vec());
+        }
+    }
+    let resume_after = has_more.then(|| keys.last().cloned()).flatten();
+    Ok(ChangelogScanPage {
+        keys,
+        values,
+        resume_after,
+    })
 }
 
 #[cfg(test)]
@@ -1887,7 +2030,7 @@ mod tests {
         SegmentCommitDirectory,
     };
     use crate::entity_identity::EntityIdentity;
-    use crate::storage::{KvGetGroup, KvGetRequest, StorageWriteSet};
+    use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
 
     use super::*;
 
@@ -1913,23 +2056,23 @@ mod tests {
             .get_values(KvGetRequest {
                 groups: vec![
                     KvGetGroup {
-                        namespace: SEGMENT_NAMESPACE.to_string(),
+                        namespace: SEGMENT_SPACE.name.to_string(),
                         keys: vec![segment_key("segment-1")],
                     },
                     KvGetGroup {
-                        namespace: BY_COMMIT_INDEX_NAMESPACE.to_string(),
+                        namespace: BY_COMMIT_INDEX_SPACE.name.to_string(),
                         keys: vec![by_commit_key("commit-1")],
                     },
                     KvGetGroup {
-                        namespace: BY_CHANGE_INDEX_NAMESPACE.to_string(),
+                        namespace: BY_CHANGE_INDEX_SPACE.name.to_string(),
                         keys: vec![by_change_key("change-1")],
                     },
                     KvGetGroup {
-                        namespace: BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE.to_string(),
+                        namespace: BY_CHANGE_MEMBERSHIP_INDEX_SPACE.name.to_string(),
                         keys: vec![by_change_membership_key("change-1", "commit-1")],
                     },
                     KvGetGroup {
-                        namespace: COMMIT_VISIBILITY_NAMESPACE.to_string(),
+                        namespace: COMMIT_VISIBILITY_SPACE.name.to_string(),
                         keys: vec![commit_visibility_key("commit-1")],
                     },
                 ],
@@ -2172,7 +2315,7 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment).await.unwrap();
         }
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1"));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -2196,7 +2339,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key("commit-1"),
             b"not a by_commit entry".to_vec(),
         );
@@ -2228,7 +2371,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key("commit-1"),
             by_commit_index_value(&ByCommitEntry {
                 commit_id: "commit-1".to_string(),
@@ -2318,7 +2461,7 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment).await.unwrap();
         }
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1"));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -2342,7 +2485,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key("change-1"),
             b"not a by_change entry".to_vec(),
         );
@@ -2374,7 +2517,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key("change-1"),
             by_change_index_value(&ByChangeEntry {
                 change_id: "change-1".to_string(),
@@ -2507,7 +2650,7 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1"));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -2598,9 +2741,9 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1"));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key("change-1", "commit-1"),
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -2635,7 +2778,7 @@ mod tests {
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
         writes.put(
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key("change-1"),
             b"not a by_change entry".to_vec(),
         );
@@ -2672,10 +2815,10 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1"));
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1"));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key("change-1", "commit-1"),
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -2739,10 +2882,10 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment.clone()).await.unwrap();
         }
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1"));
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1"));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key("change-1", "commit-1"),
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -2903,17 +3046,17 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key("commit-1"),
             b"not a by_commit value".to_vec(),
         );
         writes.put(
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key("change-1"),
             b"not a by_change value".to_vec(),
         );
         writes.put(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key("change-1", "commit-1"),
             b"not empty".to_vec(),
         );
@@ -2958,7 +3101,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key("commit-1"),
             by_commit_index_value(&ByCommitEntry {
                 commit_id: "commit-1".to_string(),
@@ -2969,7 +3112,7 @@ mod tests {
             .unwrap(),
         );
         writes.put(
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key("change-1"),
             by_change_index_value(&ByChangeEntry {
                 change_id: "change-1".to_string(),
@@ -3036,7 +3179,7 @@ mod tests {
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1"));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -3072,7 +3215,7 @@ mod tests {
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1"));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -3113,7 +3256,7 @@ mod tests {
         let result = transaction
             .get_values(KvGetRequest {
                 groups: vec![KvGetGroup {
-                    namespace: BY_COMMIT_INDEX_NAMESPACE.to_string(),
+                    namespace: BY_COMMIT_INDEX_SPACE.name.to_string(),
                     keys: vec![by_commit_key("commit-1"), by_commit_key("commit-2")],
                 }],
             })
@@ -3189,7 +3332,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_key("segment-1"),
             segment_value(&segment).unwrap(),
         );
@@ -3227,7 +3370,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_key("segment-1"),
             segment_value(&segment).unwrap(),
         );
@@ -3264,7 +3407,7 @@ mod tests {
         let mut bad_visibility = commit_visibility_from_segment(&segment, "commit-1");
         bad_visibility.location.offset = bad_visibility.location.offset.saturating_add(999);
         writes.put(
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_visibility_key("commit-1"),
             commit_visibility_value(&bad_visibility).unwrap(),
         );
@@ -3299,7 +3442,7 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
         }
         writes.put(
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key("commit-1"),
             by_commit_index_value(&ByCommitEntry {
                 commit_id: "commit-1".to_string(),

@@ -1,30 +1,32 @@
 use std::collections::{HashMap, HashSet};
 
+use super::context::ChangelogStorageRead;
 use super::segment::validate_segment_shape;
 use super::store::{
-    BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    COMMIT_VISIBILITY_NAMESPACE, SEGMENT_NAMESPACE, by_change_index_value, by_change_key,
-    by_change_membership_ids_from_key, by_change_membership_index_value, by_change_membership_key,
-    by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
-    segment_key,
+    by_change_index_value, by_change_key, by_change_membership_ids_from_key,
+    by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
+    by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
+    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE,
 };
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet, Segment,
     SegmentChange, SegmentCommit, SegmentObjectLocation,
 };
-use crate::LixError;
+use crate::backend::CoreProjection;
 use crate::changelog::decode_segment;
 use crate::json_store::{self, JsonRef};
-use crate::storage::{KvScanRange, KvScanRequest, StorageReader, StorageWriteSet};
+use crate::storage::{StorageSpace, StorageWriteSet};
+use crate::LixError;
 
 pub(super) async fn plan_gc<S>(store: &mut S, roots: &[GcRoot]) -> Result<GcPlan, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     let segments = scan_all_segments(store).await?;
-    let all_commit_visibility = scan_utf8_keys(store, COMMIT_VISIBILITY_NAMESPACE).await?;
-    let all_by_commit = scan_utf8_keys(store, BY_COMMIT_INDEX_NAMESPACE).await?;
-    let all_by_change = scan_utf8_keys(store, BY_CHANGE_INDEX_NAMESPACE).await?;
+    let all_commit_visibility = scan_utf8_keys(store, COMMIT_VISIBILITY_SPACE).await?;
+    let all_by_commit = scan_utf8_keys(store, BY_COMMIT_INDEX_SPACE).await?;
+    let all_by_change = scan_utf8_keys(store, BY_CHANGE_INDEX_SPACE).await?;
     let all_by_change_membership = scan_by_change_membership_keys(store).await?;
     let all_json_payloads = scan_json_payload_keys(store).await?;
 
@@ -185,7 +187,7 @@ pub(super) async fn collect_garbage<S>(
     roots: &[GcRoot],
 ) -> Result<GcPlan, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     let plan = plan_gc(store, roots).await?;
     stage_gc_sweep(writes, &plan)?;
@@ -194,23 +196,20 @@ where
 
 pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Result<(), LixError> {
     for segment_id in &plan.sweep.segments {
-        writes.delete(SEGMENT_NAMESPACE, segment_key(segment_id));
+        writes.delete(SEGMENT_SPACE, segment_key(segment_id));
     }
     for commit_id in &plan.sweep.commit_visibility {
-        writes.delete(
-            COMMIT_VISIBILITY_NAMESPACE,
-            commit_visibility_key(commit_id),
-        );
+        writes.delete(COMMIT_VISIBILITY_SPACE, commit_visibility_key(commit_id));
     }
     for commit_id in &plan.sweep.by_commit {
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key(commit_id));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key(commit_id));
     }
     for change_id in &plan.sweep.by_change {
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key(change_id));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key(change_id));
     }
     for (change_id, commit_id) in &plan.sweep.by_change_membership {
         writes.delete(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key(change_id, commit_id),
         );
     }
@@ -222,18 +221,19 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
 
 async fn scan_all_segments<S>(store: &mut S) -> Result<Vec<Segment>, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     let mut after = None;
     let mut segments = Vec::new();
     loop {
         let page = store
-            .scan_entries(KvScanRequest {
-                namespace: SEGMENT_NAMESPACE.to_string(),
-                range: KvScanRange::prefix(Vec::new()),
+            .changelog_scan(
+                SEGMENT_SPACE,
+                Vec::new(),
                 after,
-                limit: 64,
-            })
+                64,
+                CoreProjection::FullValue,
+            )
             .await?;
         for index in 0..page.len() {
             let Some(bytes) = page.value(index) else {
@@ -251,20 +251,15 @@ where
     Ok(segments)
 }
 
-async fn scan_utf8_keys<S>(store: &mut S, namespace: &str) -> Result<Vec<String>, LixError>
+async fn scan_utf8_keys<S>(store: &mut S, space: StorageSpace) -> Result<Vec<String>, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     let mut after = None;
     let mut out = Vec::new();
     loop {
         let page = store
-            .scan_keys(KvScanRequest {
-                namespace: namespace.to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after,
-                limit: 256,
-            })
+            .changelog_scan(space, Vec::new(), after, 256, CoreProjection::KeyOnly)
             .await?;
         for index in 0..page.keys.len() {
             let Some(key) = page.keys.get(index) else {
@@ -274,7 +269,8 @@ where
                 std::str::from_utf8(key)
                     .map_err(|error| {
                         LixError::unknown(format!(
-                            "changelog GC found invalid UTF-8 key in namespace '{namespace}': {error}"
+                            "changelog GC found invalid UTF-8 key in namespace '{}': {error}",
+                            space.name
                         ))
                     })?
                     .to_string(),
@@ -290,18 +286,19 @@ where
 
 async fn scan_by_change_membership_keys<S>(store: &mut S) -> Result<Vec<(String, String)>, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     let mut after = None;
     let mut out = Vec::new();
     loop {
         let page = store
-            .scan_keys(KvScanRequest {
-                namespace: BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE.to_string(),
-                range: KvScanRange::prefix(Vec::new()),
+            .changelog_scan(
+                BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+                Vec::new(),
                 after,
-                limit: 256,
-            })
+                256,
+                CoreProjection::KeyOnly,
+            )
             .await?;
         for index in 0..page.keys.len() {
             let Some(key) = page.keys.get(index) else {
@@ -319,13 +316,19 @@ where
 
 async fn scan_json_payload_keys<S>(store: &mut S) -> Result<Vec<JsonRef>, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: ChangelogStorageRead + ?Sized,
 {
     let mut after = None;
     let mut out = Vec::new();
     loop {
         let page = store
-            .scan_keys(json_store::direct_json_payload_scan_request(after, 256))
+            .changelog_scan(
+                json_store::store::JSON_SPACE,
+                Vec::new(),
+                after,
+                256,
+                CoreProjection::KeyOnly,
+            )
             .await?;
         for index in 0..page.keys.len() {
             let Some(key) = page.keys.get(index) else {
@@ -382,10 +385,10 @@ mod tests {
     use crate::backend::InMemoryBackend;
     use crate::changelog::segment::canonicalize_segment;
     use crate::changelog::{
-        ChangelogContext, CommitBody, CommitHeader, MembershipRecord, MembershipRole,
-        RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
-        SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentInlinePayload,
-        SegmentPayloadLocation, encode_segment,
+        encode_segment, ChangelogContext, CommitBody, CommitHeader, MembershipRecord,
+        MembershipRole, RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory,
+        SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
+        SegmentInlinePayload, SegmentPayloadLocation,
     };
     use crate::common::{CanonicalSchemaKey, EntityId, FileId};
     use crate::entity_identity::EntityIdentity;
@@ -425,16 +428,14 @@ mod tests {
 
         assert_eq!(plan.live.commits, vec!["commit-1"]);
         assert_eq!(plan.live.changes, vec!["change-1"]);
-        assert!(
-            plan.live
-                .payloads
-                .contains(&JsonRef::from_hash_bytes([7; 32]))
-        );
-        assert!(
-            plan.live
-                .payloads
-                .contains(&JsonRef::from_hash_bytes([8; 32]))
-        );
+        assert!(plan
+            .live
+            .payloads
+            .contains(&JsonRef::from_hash_bytes([7; 32])));
+        assert!(plan
+            .live
+            .payloads
+            .contains(&JsonRef::from_hash_bytes([8; 32])));
         assert_eq!(plan.live.segments, vec!["segment-1"]);
         assert_eq!(plan.sweep.segments, vec!["segment-dead"]);
         assert_eq!(plan.sweep.by_commit, vec!["commit-dead"]);
@@ -470,11 +471,11 @@ mod tests {
         assert_missing(
             &storage,
             vec![
-                (SEGMENT_NAMESPACE, segment_key("segment-1")),
-                (BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1")),
-                (BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1")),
+                (SEGMENT_SPACE, segment_key("segment-1")),
+                (BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1")),
+                (BY_CHANGE_INDEX_SPACE, by_change_key("change-1")),
                 (
-                    BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+                    BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
                     by_change_membership_key("change-1", "commit-1"),
                 ),
             ],
@@ -585,7 +586,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            BY_COMMIT_INDEX_NAMESPACE,
+            BY_COMMIT_INDEX_SPACE,
             by_commit_key("stale-commit"),
             by_commit_index_value(&ByCommitEntry {
                 commit_id: "stale-commit".to_string(),
@@ -596,7 +597,7 @@ mod tests {
             .unwrap(),
         );
         writes.put(
-            BY_CHANGE_INDEX_NAMESPACE,
+            BY_CHANGE_INDEX_SPACE,
             by_change_key("stale-change"),
             by_change_index_value(&ByChangeEntry {
                 change_id: "stale-change".to_string(),
@@ -605,7 +606,7 @@ mod tests {
             .unwrap(),
         );
         writes.put(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key("stale-change", "stale-commit"),
             by_change_membership_index_value(),
         );
@@ -633,10 +634,10 @@ mod tests {
         assert_missing(
             &storage,
             vec![
-                (BY_COMMIT_INDEX_NAMESPACE, by_commit_key("stale-commit")),
-                (BY_CHANGE_INDEX_NAMESPACE, by_change_key("stale-change")),
+                (BY_COMMIT_INDEX_SPACE, by_commit_key("stale-commit")),
+                (BY_CHANGE_INDEX_SPACE, by_change_key("stale-change")),
                 (
-                    BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+                    BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
                     by_change_membership_key("stale-change", "stale-commit"),
                 ),
             ],
@@ -664,7 +665,7 @@ mod tests {
             writer.stage_publish_commit("commit-live").await.unwrap();
         }
         writes.put(
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_visibility_key("stale-commit"),
             commit_visibility_value(&CommitVisibility {
                 commit_id: "stale-commit".to_string(),
@@ -695,7 +696,7 @@ mod tests {
         let result = transaction
             .get_values(KvGetRequest {
                 groups: vec![KvGetGroup {
-                    namespace: COMMIT_VISIBILITY_NAMESPACE.to_string(),
+                    namespace: COMMIT_VISIBILITY_SPACE.name.to_string(),
                     keys: vec![
                         commit_visibility_key("commit-live"),
                         commit_visibility_key("stale-commit"),
@@ -930,11 +931,9 @@ mod tests {
             .plan_gc(&[GcRoot::VersionHead("commit-1".to_string())])
             .await
             .expect_err("missing membership change must be corruption");
-        assert!(
-            error
-                .message
-                .contains("references missing change 'change-1'")
-        );
+        assert!(error
+            .message
+            .contains("references missing change 'change-1'"));
     }
 
     #[tokio::test]
@@ -1023,11 +1022,9 @@ mod tests {
                 .await
                 .expect_err("missing membership change must abort collect_garbage")
         };
-        assert!(
-            error
-                .message
-                .contains("references missing change 'change-1'")
-        );
+        assert!(error
+            .message
+            .contains("references missing change 'change-1'"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -1070,11 +1067,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("duplicate commit ids must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("contains duplicate commit 'commit-1'")
-        );
+        assert!(error
+            .message
+            .contains("contains duplicate commit 'commit-1'"));
     }
 
     #[tokio::test]
@@ -1096,11 +1091,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("duplicate change ids must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("contains duplicate change 'change-1'")
-        );
+        assert!(error
+            .message
+            .contains("contains duplicate change 'change-1'"));
     }
 
     #[tokio::test]
@@ -1121,11 +1114,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership_count drift must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("membership_count 0 does not match 1")
-        );
+        assert!(error
+            .message
+            .contains("membership_count 0 does not match 1"));
     }
 
     #[tokio::test]
@@ -1146,11 +1137,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership directory drift must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("is missing membership ordinal for change 'change-1'")
-        );
+        assert!(error
+            .message
+            .contains("is missing membership ordinal for change 'change-1'"));
     }
 
     #[tokio::test]
@@ -1178,11 +1167,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("payload directory drift must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("payload directory entry does not match inline payload")
-        );
+        assert!(error
+            .message
+            .contains("payload directory entry does not match inline payload"));
     }
 
     #[tokio::test]
@@ -1221,10 +1208,10 @@ mod tests {
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
-        writes.delete(BY_COMMIT_INDEX_NAMESPACE, by_commit_key("commit-1"));
-        writes.delete(BY_CHANGE_INDEX_NAMESPACE, by_change_key("change-1"));
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
+        writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
-            BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key("change-1", "commit-1"),
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -1309,7 +1296,7 @@ mod tests {
         let existing = transaction
             .get_values(KvGetRequest {
                 groups: vec![KvGetGroup {
-                    namespace: SEGMENT_NAMESPACE.to_string(),
+                    namespace: SEGMENT_SPACE.name.to_string(),
                     keys: vec![segment_key(&segment_id)],
                 }],
             })
@@ -1327,7 +1314,7 @@ mod tests {
         let result = transaction
             .get_values(KvGetRequest {
                 groups: vec![KvGetGroup {
-                    namespace: SEGMENT_NAMESPACE.to_string(),
+                    namespace: SEGMENT_SPACE.name.to_string(),
                     keys: vec![segment_key(&segment_id)],
                 }],
             })
@@ -1346,7 +1333,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_key(&segment.header.segment_id),
             encode_segment(segment).unwrap(),
         );
@@ -1375,7 +1362,7 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         writes.put(
-            COMMIT_VISIBILITY_NAMESPACE,
+            COMMIT_VISIBILITY_SPACE,
             commit_visibility_key(commit_id),
             commit_visibility_value(&visibility).unwrap(),
         );
@@ -1383,14 +1370,14 @@ mod tests {
         transaction.commit().await.unwrap();
     }
 
-    async fn assert_missing(storage: &StorageContext, keys: Vec<(&'static str, Vec<u8>)>) {
+    async fn assert_missing(storage: &StorageContext, keys: Vec<(StorageSpace, Vec<u8>)>) {
         let mut transaction = storage.begin_read_transaction().await.unwrap();
         let result = transaction
             .get_values(KvGetRequest {
                 groups: keys
                     .into_iter()
-                    .map(|(namespace, key)| KvGetGroup {
-                        namespace: namespace.to_string(),
+                    .map(|(space, key)| KvGetGroup {
+                        namespace: space.name.to_string(),
                         keys: vec![key],
                     })
                     .collect(),
