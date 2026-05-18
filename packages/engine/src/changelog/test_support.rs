@@ -6,8 +6,7 @@ use super::segment::{canonicalize_segment, directory_change_location, directory_
 use super::store::{
     by_change_index_value, by_change_key, by_change_membership_index_value,
     by_change_membership_key, by_commit_index_value, by_commit_key, segment_key, segment_value,
-    BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE, SEGMENT_SPACE,
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
 };
 use super::{
     decode_by_change_entry, decode_by_commit_entry, ByChangeEntry, ByCommitEntry, CommitBody,
@@ -15,14 +14,11 @@ use super::{
     SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
     SegmentObjectLocation, StateRowIdentity,
 };
-use crate::backend::InMemoryBackend;
+use crate::backend::{InMemoryBackend, Key, ProjectedValue, ReadOptions};
 use crate::changelog::ChangelogContext;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
-use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetGroup, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
-    KvValuePage, StorageContext, StorageReader, StorageWriteSet,
-};
+use crate::storage::{PointReadPlan, StorageContext, StorageGetOptions, StorageSpace, StorageWriteSet};
 use crate::LixError;
 
 pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageContext) {
@@ -166,28 +162,19 @@ pub(crate) async fn assert_mandatory_index_rows_match_segment(
     storage: &StorageContext,
     segment: &Segment,
 ) {
-    let mut transaction = storage.begin_read_transaction().await.unwrap();
-    let result = transaction
-        .get_values(KvGetRequest {
-            groups: vec![
-                KvGetGroup {
-                    namespace: BY_COMMIT_INDEX_NAMESPACE.to_string(),
-                    keys: vec![by_commit_key("commit-1")],
-                },
-                KvGetGroup {
-                    namespace: BY_CHANGE_INDEX_NAMESPACE.to_string(),
-                    keys: vec![by_change_key("change-1")],
-                },
-                KvGetGroup {
-                    namespace: BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE.to_string(),
-                    keys: vec![by_change_membership_key("change-1", "commit-1")],
-                },
-            ],
-        })
-        .await
-        .unwrap();
+    let result = read_test_value_groups(
+        storage,
+        vec![
+            (BY_COMMIT_INDEX_SPACE, vec![by_commit_key("commit-1")]),
+            (BY_CHANGE_INDEX_SPACE, vec![by_change_key("change-1")]),
+            (
+                BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+                vec![by_change_membership_key("change-1", "commit-1")],
+            ),
+        ],
+    );
 
-    let by_commit = decode_by_commit_entry(result.groups[0].value(0).unwrap().unwrap()).unwrap();
+    let by_commit = decode_by_commit_entry(result[0][0].as_deref().unwrap()).unwrap();
     assert_eq!(by_commit.commit_id, "commit-1");
     assert_eq!(
         by_commit.location,
@@ -196,20 +183,19 @@ pub(crate) async fn assert_mandatory_index_rows_match_segment(
     assert_eq!(by_commit.parent_commit_ids, Vec::<String>::new());
     assert_eq!(by_commit.generation, 0);
 
-    let by_change = decode_by_change_entry(result.groups[1].value(0).unwrap().unwrap()).unwrap();
+    let by_change = decode_by_change_entry(result[1][0].as_deref().unwrap()).unwrap();
     assert_eq!(by_change.change_id, "change-1");
     assert_eq!(
         by_change.location,
         directory_change_location(segment, "change-1").unwrap()
     );
 
-    assert_eq!(result.groups[2].value(0), Some(Some([].as_slice())));
-    transaction.rollback().await.unwrap();
+    assert_eq!(result[2][0].as_deref(), Some([].as_slice()));
 }
 
 pub(crate) fn stage_stale_mandatory_index_rows(writes: &mut StorageWriteSet) {
     writes.put(
-        BY_COMMIT_INDEX_NAMESPACE,
+        BY_COMMIT_INDEX_SPACE,
         by_commit_key("stale-commit"),
         by_commit_index_value(&ByCommitEntry {
             commit_id: "stale-commit".to_string(),
@@ -220,7 +206,7 @@ pub(crate) fn stage_stale_mandatory_index_rows(writes: &mut StorageWriteSet) {
         .unwrap(),
     );
     writes.put(
-        BY_CHANGE_INDEX_NAMESPACE,
+        BY_CHANGE_INDEX_SPACE,
         by_change_key("stale-change"),
         by_change_index_value(&ByChangeEntry {
             change_id: "stale-change".to_string(),
@@ -229,51 +215,47 @@ pub(crate) fn stage_stale_mandatory_index_rows(writes: &mut StorageWriteSet) {
         .unwrap(),
     );
     writes.put(
-        BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+        BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
         by_change_membership_key("stale-change", "stale-commit"),
         by_change_membership_index_value(),
     );
 }
 
 pub(crate) async fn assert_stale_mandatory_index_rows_deleted(storage: &StorageContext) {
-    let mut transaction = storage.begin_read_transaction().await.unwrap();
-    let result = transaction
-        .get_values(KvGetRequest {
-            groups: vec![
-                KvGetGroup {
-                    namespace: BY_COMMIT_INDEX_NAMESPACE.to_string(),
-                    keys: vec![by_commit_key("stale-commit"), by_commit_key("commit-1")],
-                },
-                KvGetGroup {
-                    namespace: BY_CHANGE_INDEX_NAMESPACE.to_string(),
-                    keys: vec![by_change_key("stale-change"), by_change_key("change-1")],
-                },
-                KvGetGroup {
-                    namespace: BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE.to_string(),
-                    keys: vec![
-                        by_change_membership_key("stale-change", "stale-commit"),
-                        by_change_membership_key("change-1", "commit-1"),
-                    ],
-                },
-            ],
-        })
-        .await
-        .unwrap();
+    let result = read_test_value_groups(
+        storage,
+        vec![
+            (
+                BY_COMMIT_INDEX_SPACE,
+                vec![by_commit_key("stale-commit"), by_commit_key("commit-1")],
+            ),
+            (
+                BY_CHANGE_INDEX_SPACE,
+                vec![by_change_key("stale-change"), by_change_key("change-1")],
+            ),
+            (
+                BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+                vec![
+                    by_change_membership_key("stale-change", "stale-commit"),
+                    by_change_membership_key("change-1", "commit-1"),
+                ],
+            ),
+        ],
+    );
 
-    assert_eq!(result.groups[0].value(0), Some(None));
-    assert!(result.groups[0].value(1).unwrap().is_some());
-    assert_eq!(result.groups[1].value(0), Some(None));
-    assert!(result.groups[1].value(1).unwrap().is_some());
-    assert_eq!(result.groups[2].value(0), Some(None));
-    assert_eq!(result.groups[2].value(1), Some(Some([].as_slice())));
-    transaction.rollback().await.unwrap();
+    assert_eq!(result[0][0], None);
+    assert!(result[0][1].is_some());
+    assert_eq!(result[1][0], None);
+    assert!(result[1][1].is_some());
+    assert_eq!(result[2][0], None);
+    assert_eq!(result[2][1].as_deref(), Some([].as_slice()));
 }
 
 pub(crate) async fn write_raw_segment(storage: &StorageContext, segment: &Segment) {
     let mut transaction = storage.begin_write_transaction().await.unwrap();
     let mut writes = StorageWriteSet::new();
     writes.put(
-        SEGMENT_NAMESPACE,
+        SEGMENT_SPACE,
         segment_key(&segment.header.segment_id),
         segment_value(segment).unwrap(),
     );
@@ -324,36 +306,6 @@ pub(crate) struct CountingReader {
 }
 
 #[async_trait::async_trait(?Send)]
-impl StorageReader for CountingReader {
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        if request
-            .groups
-            .iter()
-            .any(|group| group.namespace == SEGMENT_NAMESPACE)
-        {
-            self.segment_gets.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.get_values(request).await
-    }
-
-    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        self.inner.exists_many(request).await
-    }
-
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        self.inner.scan_keys(request).await
-    }
-
-    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        self.inner.scan_values(request).await
-    }
-
-    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        self.inner.scan_entries(request).await
-    }
-}
-
-#[async_trait::async_trait(?Send)]
 impl ChangelogStorageRead for CountingReader {
     async fn changelog_get_many(
         &mut self,
@@ -378,4 +330,31 @@ impl ChangelogStorageRead for CountingReader {
             .changelog_scan(space, prefix, after, limit, projection)
             .await
     }
+}
+
+pub(crate) fn read_test_value_groups(
+    storage: &StorageContext,
+    groups: Vec<(StorageSpace, Vec<Vec<u8>>)>,
+) -> Vec<Vec<Option<Vec<u8>>>> {
+    let mut read = storage.begin_read(ReadOptions::default()).unwrap();
+    groups
+        .into_iter()
+        .map(|(space, keys)| {
+            let keys = keys
+                .into_iter()
+                .map(|key| Key(bytes::Bytes::from(key)))
+                .collect::<Vec<_>>();
+            PointReadPlan::new(space, &keys)
+                .materialize(&mut read, StorageGetOptions::default())
+                .unwrap()
+                .value
+                .into_iter()
+                .map(|value| match value {
+                    Some(ProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+                    Some(ProjectedValue::KeyOnly) => Some(Vec::new()),
+                    None => None,
+                })
+                .collect()
+        })
+        .collect()
 }

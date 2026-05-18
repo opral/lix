@@ -2215,7 +2215,7 @@ mod tests {
         SegmentCommitDirectory,
     };
     use crate::entity_identity::EntityIdentity;
-    use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
+    use crate::storage::StorageWriteSet;
 
     use super::*;
 
@@ -2233,69 +2233,55 @@ mod tests {
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
         let stats = writes.apply(&mut *transaction).await.unwrap();
-        assert_eq!(stats.puts, 6);
+        assert_eq!(stats.staged_puts, 6);
         transaction.commit().await.unwrap();
 
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let result = transaction
-            .get_values(KvGetRequest {
-                groups: vec![
-                    KvGetGroup {
-                        namespace: SEGMENT_SPACE.name.to_string(),
-                        keys: vec![segment_key("segment-1")],
-                    },
-                    KvGetGroup {
-                        namespace: BY_COMMIT_INDEX_SPACE.name.to_string(),
-                        keys: vec![by_commit_key("commit-1")],
-                    },
-                    KvGetGroup {
-                        namespace: BY_CHANGE_INDEX_SPACE.name.to_string(),
-                        keys: vec![by_change_key("change-1")],
-                    },
-                    KvGetGroup {
-                        namespace: BY_CHANGE_MEMBERSHIP_INDEX_SPACE.name.to_string(),
-                        keys: vec![by_change_membership_key("change-1", "commit-1")],
-                    },
-                    KvGetGroup {
-                        namespace: COMMIT_VISIBILITY_SPACE.name.to_string(),
-                        keys: vec![commit_visibility_key("commit-1")],
-                    },
-                    KvGetGroup {
-                        namespace: VISIBLE_CHANGE_PROOF_SPACE.name.to_string(),
-                        keys: vec![visible_change_proof_key("change-1")],
-                    },
-                ],
-            })
-            .await
-            .unwrap();
+        let result = read_test_value_groups(
+            &storage,
+            vec![
+                (SEGMENT_SPACE, vec![segment_key("segment-1")]),
+                (BY_COMMIT_INDEX_SPACE, vec![by_commit_key("commit-1")]),
+                (BY_CHANGE_INDEX_SPACE, vec![by_change_key("change-1")]),
+                (
+                    BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+                    vec![by_change_membership_key("change-1", "commit-1")],
+                ),
+                (
+                    COMMIT_VISIBILITY_SPACE,
+                    vec![commit_visibility_key("commit-1")],
+                ),
+                (
+                    VISIBLE_CHANGE_PROOF_SPACE,
+                    vec![visible_change_proof_key("change-1")],
+                ),
+            ],
+        );
 
-        let segment_bytes = result.groups[0].value(0).unwrap().unwrap();
+        let segment_bytes = result[0][0].as_deref().unwrap();
         assert_eq!(decode_segment(segment_bytes).unwrap(), segment);
 
-        let by_commit_bytes = result.groups[1].value(0).unwrap().unwrap();
+        let by_commit_bytes = result[1][0].as_deref().unwrap();
         let by_commit = decode_by_commit_entry(by_commit_bytes).unwrap();
         assert_eq!(by_commit.commit_id, "commit-1");
         assert_eq!(by_commit.location.segment_id, "segment-1");
 
-        let by_change_bytes = result.groups[2].value(0).unwrap().unwrap();
+        let by_change_bytes = result[2][0].as_deref().unwrap();
         let by_change = decode_by_change_entry(by_change_bytes).unwrap();
         assert_eq!(by_change.change_id, "change-1");
         assert_eq!(by_change.location.segment_id, "segment-1");
 
-        assert_eq!(result.groups[3].value(0), Some(Some([].as_slice())));
+        assert_eq!(result[3][0].as_deref(), Some([].as_slice()));
 
-        let visibility_bytes = result.groups[4].value(0).unwrap().unwrap();
+        let visibility_bytes = result[4][0].as_deref().unwrap();
         assert_eq!(
             decode_commit_visibility(visibility_bytes).unwrap(),
             expected_visibility
         );
-        let visible_proof_bytes = result.groups[5].value(0).unwrap().unwrap();
+        let visible_proof_bytes = result[5][0].as_deref().unwrap();
         assert_eq!(
             decode_commit_visibility(visible_proof_bytes).unwrap(),
             expected_visibility
         );
-
-        transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -3481,21 +3467,17 @@ mod tests {
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let result = transaction
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: BY_COMMIT_INDEX_SPACE.name.to_string(),
-                    keys: vec![by_commit_key("commit-1"), by_commit_key("commit-2")],
-                }],
-            })
-            .await
-            .unwrap();
-        let commit_1 = decode_by_commit_entry(result.groups[0].value(0).unwrap().unwrap()).unwrap();
-        let commit_2 = decode_by_commit_entry(result.groups[0].value(1).unwrap().unwrap()).unwrap();
+        let result = read_test_value_groups(
+            &storage,
+            vec![(
+                BY_COMMIT_INDEX_SPACE,
+                vec![by_commit_key("commit-1"), by_commit_key("commit-2")],
+            )],
+        );
+        let commit_1 = decode_by_commit_entry(result[0][0].as_deref().unwrap()).unwrap();
+        let commit_2 = decode_by_commit_entry(result[0][1].as_deref().unwrap()).unwrap();
         assert_eq!(commit_1.generation, 0);
         assert_eq!(commit_2.generation, 1);
-        transaction.rollback().await.unwrap();
     }
 
     #[tokio::test]

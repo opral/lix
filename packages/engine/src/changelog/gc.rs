@@ -402,9 +402,7 @@ mod tests {
     use crate::common::{CanonicalSchemaKey, EntityId, FileId};
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
-    use crate::storage::{
-        KvGetGroup, KvGetRequest, StorageContext, StorageReader, StorageWriteSet,
-    };
+    use crate::storage::{StorageContext, StorageWriteSet};
 
     #[tokio::test]
     async fn gc_plan_marks_live_commit_membership_changes_payloads_and_segments() {
@@ -701,22 +699,18 @@ mod tests {
         assert_eq!(plan.live.commits, vec!["commit-live"]);
         assert_eq!(plan.sweep.commit_visibility, vec!["stale-commit"]);
 
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let result = transaction
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: COMMIT_VISIBILITY_SPACE.name.to_string(),
-                    keys: vec![
-                        commit_visibility_key("commit-live"),
-                        commit_visibility_key("stale-commit"),
-                    ],
-                }],
-            })
-            .await
-            .unwrap();
-        assert!(result.groups[0].value(0).unwrap().is_some());
-        assert_eq!(result.groups[0].value(1), Some(None));
-        transaction.rollback().await.unwrap();
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(
+                COMMIT_VISIBILITY_SPACE,
+                vec![
+                    commit_visibility_key("commit-live"),
+                    commit_visibility_key("stale-commit"),
+                ],
+            )],
+        );
+        assert!(result[0][0].is_some());
+        assert_eq!(result[0][1], None);
     }
 
     #[tokio::test]
@@ -910,16 +904,18 @@ mod tests {
 
         assert_eq!(plan.sweep.json_payloads, vec![dead_ref]);
 
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let result = transaction
-            .get_values(json_store::direct_json_payload_get_request([
-                &live_ref, &dead_ref,
-            ]))
-            .await
-            .unwrap();
-        assert_eq!(result.groups[0].value(0), Some(Some(&b"live"[..])));
-        assert_eq!(result.groups[0].value(1), Some(None));
-        transaction.rollback().await.unwrap();
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(
+                json_store::store::JSON_SPACE,
+                vec![
+                    live_ref.as_hash_bytes().to_vec(),
+                    dead_ref.as_hash_bytes().to_vec(),
+                ],
+            )],
+        );
+        assert_eq!(result[0][0].as_deref(), Some(&b"live"[..]));
+        assert_eq!(result[0][1], None);
     }
 
     #[tokio::test]
@@ -1301,40 +1297,20 @@ mod tests {
         segment: Segment,
     ) -> Segment {
         let segment_id = segment.header.segment_id.clone();
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let existing = transaction
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: SEGMENT_SPACE.name.to_string(),
-                    keys: vec![segment_key(&segment_id)],
-                }],
-            })
-            .await
-            .unwrap();
-        let existing = existing.groups[0]
-            .value(0)
-            .unwrap()
-            .map(|bytes| bytes.to_vec());
-        transaction.rollback().await.unwrap();
+        let existing = crate::changelog::test_support::read_test_value_groups(
+            storage,
+            vec![(SEGMENT_SPACE, vec![segment_key(&segment_id)])],
+        )[0][0]
+            .clone();
         if existing.is_none() {
             write_segments(storage, context, vec![segment], &[]).await;
         }
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let result = transaction
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: SEGMENT_SPACE.name.to_string(),
-                    keys: vec![segment_key(&segment_id)],
-                }],
-            })
-            .await
-            .unwrap();
-        let bytes = result.groups[0]
-            .value(0)
-            .unwrap()
-            .expect("stored segment bytes");
+        let result = crate::changelog::test_support::read_test_value_groups(
+            storage,
+            vec![(SEGMENT_SPACE, vec![segment_key(&segment_id)])],
+        );
+        let bytes = result[0][0].as_deref().expect("stored segment bytes");
         let segment = decode_segment(bytes).unwrap();
-        transaction.rollback().await.unwrap();
         segment
     }
 
@@ -1380,23 +1356,15 @@ mod tests {
     }
 
     async fn assert_missing(storage: &StorageContext, keys: Vec<(StorageSpace, Vec<u8>)>) {
-        let mut transaction = storage.begin_read_transaction().await.unwrap();
-        let result = transaction
-            .get_values(KvGetRequest {
-                groups: keys
-                    .into_iter()
-                    .map(|(space, key)| KvGetGroup {
-                        namespace: space.name.to_string(),
-                        keys: vec![key],
-                    })
-                    .collect(),
-            })
-            .await
-            .unwrap();
-        for group in result.groups {
-            assert_eq!(group.value(0), Some(None));
+        let result = crate::changelog::test_support::read_test_value_groups(
+            storage,
+            keys.into_iter()
+                .map(|(space, key)| (space, vec![key]))
+                .collect(),
+        );
+        for group in result {
+            assert_eq!(group[0], None);
         }
-        transaction.rollback().await.unwrap();
     }
 
     fn single_commit_segment(segment_id: &str, commit_id: &str, change_id: &str) -> Segment {

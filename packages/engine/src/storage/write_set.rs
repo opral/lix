@@ -5,11 +5,9 @@ use crate::backend::{
     Backend, BackendError, BackendWrite, CommitResult, Key, PutBatch, PutEntry, SpaceId,
     StoredValue, WriteOptions,
 };
-use crate::storage::legacy::{
-    key as legacy_key, legacy_space_from_namespace, stored_value, KvWriteStats, StorageWriter,
-};
 use crate::storage::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
+use bytes::Bytes;
 
 type FastHashBuilder = RandomState;
 
@@ -20,12 +18,6 @@ pub trait IntoStorageSpace {
 impl IntoStorageSpace for StorageSpace {
     fn into_storage_space(self) -> StorageSpace {
         self
-    }
-}
-
-impl IntoStorageSpace for &'static str {
-    fn into_storage_space(self) -> StorageSpace {
-        legacy_space_from_namespace(self)
     }
 }
 
@@ -41,13 +33,13 @@ impl IntoStorageKey for Key {
 
 impl IntoStorageKey for Vec<u8> {
     fn into_storage_key(self) -> Key {
-        legacy_key(self)
+        Key(Bytes::from(self))
     }
 }
 
 impl IntoStorageKey for &[u8] {
     fn into_storage_key(self) -> Key {
-        legacy_key(self.to_vec())
+        Key(Bytes::copy_from_slice(self))
     }
 }
 
@@ -63,13 +55,17 @@ impl IntoStorageValue for StoredValue {
 
 impl IntoStorageValue for Vec<u8> {
     fn into_storage_value(self) -> StoredValue {
-        stored_value(self)
+        StoredValue {
+            bytes: Bytes::from(self),
+        }
     }
 }
 
 impl IntoStorageValue for &[u8] {
     fn into_storage_value(self) -> StoredValue {
-        stored_value(self.to_vec())
+        StoredValue {
+            bytes: Bytes::copy_from_slice(self),
+        }
     }
 }
 
@@ -129,11 +125,14 @@ impl StorageWriteSet {
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
-    pub(crate) async fn apply<W>(self, writer: &mut W) -> Result<KvWriteStats, crate::LixError>
+    pub(crate) async fn apply<B>(
+        self,
+        writer: &mut crate::storage::context::StorageWriteTransaction<'_, B>,
+    ) -> Result<StorageWriteSetStats, crate::LixError>
     where
-        W: StorageWriter + ?Sized,
+        B: Backend,
     {
-        writer.write_storage_set(self).await
+        writer.write_set(self)
     }
 
     pub fn put<S, K, V>(&mut self, space: S, key: K, value: V)
