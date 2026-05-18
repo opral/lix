@@ -1288,3 +1288,105 @@ Next hard cut: add a derived native visible-change proof space so scattered
 visible change loads become batched point reads instead of per-change
 by_change_membership prefix scans.
 ```
+
+## Entry 17: Native Visible-Change Proof Layout
+
+Change:
+
+```text
+Changelog now maintains a derived native visible-change proof space:
+
+  changelog.index.visible_change
+    key:   change_id
+    value: commit_visibility proof for one visible commit containing the change
+
+stage_publish_commit writes visible proof rows for commit membership changes.
+load_changes_visible first batch-reads visible proof rows and validates them
+against current commit visibility plus the segment membership directory. Missing
+or stale proof rows fall back to the existing by_change_membership path.
+rebuild_mandatory_indexes and GC now cover the derived proof space.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_17_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.076 |
+| decode_segment / 1c_1000ch              |       3.551 |
+| view_segment / 1c_1000ch                |       0.025 |
+| validate_segment_shape / 1c_1000ch      |       4.652 |
+| build_decoded_segment_index / 1c_1000ch |       0.237 |
+| build_by_change / 1c_1000ch             |       0.693 |
+| build_by_change_membership / 1c_1000ch  |       0.033 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms | redb_tempfile_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: | ---------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.470 |              3.659 |              4.147 |           45.606 |
+| stage_segment / 1c_1000ch                            |       4.808 |              8.865 |              7.307 |           53.552 |
+| stage_publish_commit / 1c_1ch                        |       0.029 |              0.183 |              0.048 |            4.372 |
+| stage_publish_commit / 1c_100ch                      |       0.507 |              1.227 |              0.545 |            4.921 |
+| stage_publish_commit / 1c_1000ch single-shot         |       5.060 |              7.383 |              5.496 |           10.119 |
+| load_commits_visible_batched / 1c_100ch              |       0.164 |              0.234 |              0.180 |            0.182 |
+| load_changes_visible_batched / 1c_100ch              |       0.239 |              0.390 |              0.282 |            0.241 |
+| load_changes_visible_batched / 1c_1000ch             |       1.843 |              3.177 |              2.569 |            1.982 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       1.151 |              2.195 |              1.438 |            1.112 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |       2.278 |              3.777 |              2.960 |            2.455 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.329 |             12.857 |             10.741 |           12.123 |
+| plan_gc / live_50pct_mixed_segments                  |       6.569 |              6.784 |              6.995 |            6.621 |
+| collect_garbage / live_50pct_mixed_segments          |       6.964 |              8.066 |              7.069 |           10.866 |
+
+Read:
+
+```text
+The visible-change proof layout cuts the scattered visible tax sharply for
+SQLite and materially for RocksDB:
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 16 sqlite:  6.074ms
+  entry 17 sqlite:  3.777ms  (-37.8%)
+  entry 16 rocksdb: 3.779ms
+  entry 17 rocksdb: 2.960ms  (-21.7%)
+  entry 16 redb:    2.720ms
+  entry 17 redb:    2.455ms  (-9.7%)
+
+Compared with physical scattered reads in the same run, the remaining visible
+tax is now:
+
+  sqlite:  3.777ms - 2.195ms = 1.582ms
+  rocksdb: 2.960ms - 1.438ms = 1.522ms
+  redb:    2.455ms - 1.112ms = 1.343ms
+
+The read layout is now much closer to physically optimal for visible scattered
+loads: visibility is proven by batched point reads plus segment membership
+validation instead of per-change membership prefix scans.
+
+Write-side cost moved as expected because publish now writes visible proof rows:
+
+stage_publish_commit / 1c_1000ch single-shot:
+  entry 16 sqlite:  6.369ms
+  entry 17 sqlite:  7.383ms
+  entry 16 rocksdb: 5.101ms
+  entry 17 rocksdb: 5.496ms
+  entry 16 redb:    7.981ms
+  entry 17 redb:   10.119ms
+
+rebuild_mandatory_indexes is also slower because it now rebuilds the derived
+visible proof space. That is acceptable for this cut: the goal was to move the
+hot visible read path from scan-shaped proof to point-shaped proof.
+
+Next hard cut: reduce the remaining visible tax by avoiding extra segment/proof
+materialization in the fast proof path, especially the duplicated segment loads
+between by_change physical resolution and visible membership validation.
+```

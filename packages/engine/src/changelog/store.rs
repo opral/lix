@@ -15,6 +15,7 @@ pub(crate) const BY_COMMIT_INDEX_NAMESPACE: &str = "changelog.index.by_commit";
 pub(crate) const BY_CHANGE_INDEX_NAMESPACE: &str = "changelog.index.by_change";
 pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE: &str =
     "changelog.index.by_change_membership";
+pub(crate) const VISIBLE_CHANGE_PROOF_NAMESPACE: &str = "changelog.index.visible_change";
 pub(crate) const BY_KEY_VALUE_INDEX_NAMESPACE: &str = "changelog.index.by_key_value";
 pub(crate) const BY_KEY_COMMIT_INDEX_NAMESPACE: &str = "changelog.index.by_key_commit";
 
@@ -28,6 +29,8 @@ pub(crate) const BY_CHANGE_INDEX_SPACE: StorageSpace =
     StorageSpace::new(SpaceId(0x0004_0004), BY_CHANGE_INDEX_NAMESPACE);
 pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_SPACE: StorageSpace =
     StorageSpace::new(SpaceId(0x0004_0005), BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE);
+pub(crate) const VISIBLE_CHANGE_PROOF_SPACE: StorageSpace =
+    StorageSpace::new(SpaceId(0x0004_0006), VISIBLE_CHANGE_PROOF_NAMESPACE);
 
 pub(crate) fn segment_key(segment_id: &str) -> Vec<u8> {
     identity_key(segment_id)
@@ -42,6 +45,10 @@ pub(crate) fn by_commit_key(commit_id: &str) -> Vec<u8> {
 }
 
 pub(crate) fn by_change_key(change_id: &str) -> Vec<u8> {
+    identity_key(change_id)
+}
+
+pub(crate) fn visible_change_proof_key(change_id: &str) -> Vec<u8> {
     identity_key(change_id)
 }
 
@@ -117,6 +124,12 @@ pub(crate) fn segment_value(segment: &Segment) -> Result<Vec<u8>, LixError> {
 }
 
 pub(crate) fn commit_visibility_value(visibility: &CommitVisibility) -> Result<Vec<u8>, LixError> {
+    codec::encode_commit_visibility(visibility)
+}
+
+pub(crate) fn visible_change_proof_value(
+    visibility: &CommitVisibility,
+) -> Result<Vec<u8>, LixError> {
     codec::encode_commit_visibility(visibility)
 }
 
@@ -241,6 +254,10 @@ mod tests {
             BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
             "changelog.index.by_change_membership"
         );
+        assert_eq!(
+            VISIBLE_CHANGE_PROOF_NAMESPACE,
+            "changelog.index.visible_change"
+        );
         assert_eq!(BY_KEY_VALUE_INDEX_NAMESPACE, "changelog.index.by_key_value");
         assert_eq!(
             BY_KEY_COMMIT_INDEX_NAMESPACE,
@@ -254,6 +271,7 @@ mod tests {
         assert_eq!(commit_visibility_key("commit-1"), b"commit-1".to_vec());
         assert_eq!(by_commit_key("commit-1"), b"commit-1".to_vec());
         assert_eq!(by_change_key("change-1"), b"change-1".to_vec());
+        assert_eq!(visible_change_proof_key("change-1"), b"change-1".to_vec());
     }
 
     #[test]

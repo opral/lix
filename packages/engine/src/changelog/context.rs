@@ -17,8 +17,9 @@ use super::store::{
     by_change_index_value, by_change_key, by_change_membership_commit_id_from_key,
     by_change_membership_index_value, by_change_membership_key, by_change_membership_prefix,
     by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
-    segment_key, segment_value, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-    BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE,
+    segment_key, segment_value, visible_change_proof_key, visible_change_proof_value,
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
+    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use crate::backend::{
     CoreProjection, GetOptions, Key, KeyRange, Prefix, ProjectedValue, ReadOptions, ScanOptions,
@@ -81,6 +82,7 @@ impl ChangelogContext {
             staged_changes: HashSet::new(),
             staged_generations: HashMap::new(),
             staged_publications: HashSet::new(),
+            staged_visible_change_proofs: HashSet::new(),
         }
     }
 }
@@ -663,6 +665,25 @@ where
             .collect()
     }
 
+    async fn load_visible_change_proofs_many(
+        &mut self,
+        change_ids: &[String],
+    ) -> Result<Vec<Option<CommitVisibility>>, LixError> {
+        let values = get_many(
+            &mut self.store,
+            VISIBLE_CHANGE_PROOF_SPACE,
+            change_ids
+                .iter()
+                .map(|change_id| visible_change_proof_key(change_id))
+                .collect(),
+        )
+        .await?;
+        values
+            .into_iter()
+            .map(|value| value.map(|bytes| decode_commit_visibility(&bytes)).transpose())
+            .collect()
+    }
+
     async fn load_by_commit_many(
         &mut self,
         commit_ids: &[String],
@@ -829,8 +850,14 @@ where
             return Ok(HashSet::new());
         }
 
+        let (mut proven, mut checked_commits) =
+            self.prove_visible_changes_from_native_proofs(change_ids).await?;
+        if proven.len() == requested.len() {
+            return Ok(proven);
+        }
+
         let mut candidate_changes_by_commit: HashMap<String, HashSet<String>> = HashMap::new();
-        for change_id in &requested {
+        for change_id in requested.difference(&proven) {
             for commit_id in self.load_change_membership_candidates(change_id).await? {
                 candidate_changes_by_commit
                     .entry(commit_id)
@@ -839,12 +866,15 @@ where
             }
         }
 
-        let mut proven = HashSet::new();
-        let mut checked_commits = HashSet::new();
         for (commit_id, candidate_change_ids) in candidate_changes_by_commit {
-            checked_commits.insert(commit_id.clone());
-            self.prove_visible_changes_from_commit(&commit_id, &candidate_change_ids, &mut proven)
+            if checked_commits.insert(commit_id.clone()) {
+                self.prove_visible_changes_from_commit(
+                    &commit_id,
+                    &candidate_change_ids,
+                    &mut proven,
+                )
                 .await?;
+            }
             if proven.len() == requested.len() {
                 return Ok(proven);
             }
@@ -860,6 +890,72 @@ where
         self.scan_visible_commits_for_changes(&remaining, checked_commits, &mut proven)
             .await?;
         Ok(proven)
+    }
+
+    async fn prove_visible_changes_from_native_proofs(
+        &mut self,
+        change_ids: &[String],
+    ) -> Result<(HashSet<String>, HashSet<String>), LixError> {
+        let proofs = self.load_visible_change_proofs_many(change_ids).await?;
+        let mut changes_by_commit: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut proof_by_commit = HashMap::new();
+        for (change_id, proof) in change_ids.iter().zip(proofs.into_iter()) {
+            let Some(proof) = proof else {
+                continue;
+            };
+            proof_by_commit
+                .entry(proof.commit_id.clone())
+                .or_insert_with(|| proof.clone());
+            changes_by_commit
+                .entry(proof.commit_id)
+                .or_default()
+                .insert(change_id.clone());
+        }
+        if changes_by_commit.is_empty() {
+            return Ok((HashSet::new(), HashSet::new()));
+        }
+
+        let commit_ids = changes_by_commit.keys().cloned().collect::<Vec<_>>();
+        let current_visibilities = self.load_commit_visibility_many(&commit_ids).await?;
+        let mut segment_ids = Vec::new();
+        let mut usable = Vec::new();
+        for (commit_id, current) in commit_ids.iter().zip(current_visibilities.into_iter()) {
+            let Some(current) = current else {
+                continue;
+            };
+            let Some(proof) = proof_by_commit.get(commit_id) else {
+                continue;
+            };
+            if proof.location != current.location || proof.checksum != current.checksum {
+                continue;
+            }
+            push_unique(&mut segment_ids, current.location.segment_id.clone());
+            usable.push(current);
+        }
+
+        let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
+        let mut proven = HashSet::new();
+        let mut checked_commits = HashSet::new();
+        for visibility in usable {
+            checked_commits.insert(visibility.commit_id.clone());
+            let Some(requested_change_ids) = changes_by_commit.get(&visibility.commit_id) else {
+                continue;
+            };
+            let Some(segment) = segments.get(&visibility.location.segment_id) else {
+                continue;
+            };
+            if visibility.checksum != visibility.location.checksum {
+                continue;
+            }
+            for change_id in segment.prove_commit_membership(
+                &visibility.location,
+                &visibility.commit_id,
+                requested_change_ids,
+            )? {
+                proven.insert(change_id);
+            }
+        }
+        Ok((proven, checked_commits))
     }
 
     async fn load_segment(&mut self, segment_id: &str) -> Result<Option<Segment>, LixError> {
@@ -1220,6 +1316,7 @@ pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
     staged_changes: HashSet<String>,
     staged_generations: HashMap<String, u64>,
     staged_publications: HashSet<String>,
+    staged_visible_change_proofs: HashSet<String>,
 }
 
 impl<S> ChangelogStoreWriter<'_, S>
@@ -1406,6 +1503,18 @@ where
             commit_visibility_key(&visibility.commit_id),
             commit_visibility_value(&visibility)?,
         );
+        for membership in &commit.body.membership {
+            if self
+                .staged_visible_change_proofs
+                .insert(membership.member_change_id.clone())
+            {
+                self.writes.put(
+                    VISIBLE_CHANGE_PROOF_SPACE,
+                    visible_change_proof_key(&membership.member_change_id),
+                    visible_change_proof_value(&visibility)?,
+                );
+            }
+        }
         self.staged_publications.insert(commit_id.to_string());
         Ok(())
     }
@@ -1697,7 +1806,8 @@ where
             .combine(
                 self.stage_by_change_membership_index_rebuild(&segments)
                     .await?,
-            );
+            )
+            .combine(self.stage_visible_change_proof_rebuild(&segments).await?);
         Ok(stats)
     }
 
@@ -1803,6 +1913,81 @@ where
         }
         self.stage_index_rebuild(BY_CHANGE_MEMBERSHIP_INDEX_SPACE, &expected_rows)
             .await
+    }
+
+    async fn stage_visible_change_proof_rebuild(
+        &mut self,
+        segments: &[Segment],
+    ) -> Result<RebuildIndexStats, LixError> {
+        let mut segments_by_id = HashMap::new();
+        for segment in segments {
+            segments_by_id.insert(segment.header.segment_id.as_str(), segment);
+        }
+
+        let mut expected_rows = HashMap::new();
+        for visibility in self.scan_commit_visibilities().await? {
+            let Some(segment) = segments_by_id.get(visibility.location.segment_id.as_str()) else {
+                continue;
+            };
+            let Some(commit) = segment_commit(segment, &visibility.commit_id) else {
+                continue;
+            };
+            validate_commit_location(&visibility.location, segment, &visibility.commit_id)?;
+            validate_commit_checksum(&visibility.checksum, &visibility.commit_id, commit)?;
+            for membership in &commit.body.membership {
+                expected_rows.insert(
+                    visible_change_proof_key(&membership.member_change_id),
+                    visible_change_proof_value(&visibility)?,
+                );
+            }
+        }
+        self.stage_index_rebuild(VISIBLE_CHANGE_PROOF_SPACE, &expected_rows)
+            .await
+    }
+
+    async fn scan_commit_visibilities(&mut self) -> Result<Vec<CommitVisibility>, LixError> {
+        let mut after = None;
+        let mut visibilities = Vec::new();
+        loop {
+            let page = self
+                .store
+                .changelog_scan(
+                    COMMIT_VISIBILITY_SPACE,
+                    Vec::new(),
+                    after,
+                    256,
+                    CoreProjection::FullValue,
+                )
+                .await?;
+            for index in 0..page.len() {
+                let Some(key) = page.key(index) else {
+                    continue;
+                };
+                let commit_id = std::str::from_utf8(key).map_err(|error| {
+                    LixError::unknown(format!(
+                        "changelog commit_visibility key contains invalid UTF-8: {error}"
+                    ))
+                })?;
+                let Some(value) = page.value(index) else {
+                    return Err(LixError::unknown(
+                        "changelog commit_visibility scan returned key without value".to_string(),
+                    ));
+                };
+                let visibility = decode_commit_visibility(value)?;
+                if visibility.commit_id != commit_id {
+                    return Err(LixError::unknown(format!(
+                        "commit_visibility key for '{commit_id}' contains commit_id '{}'",
+                        visibility.commit_id
+                    )));
+                }
+                visibilities.push(visibility);
+            }
+            let Some(next_after) = page.resume_after else {
+                break;
+            };
+            after = Some(next_after);
+        }
+        Ok(visibilities)
     }
 
     async fn stage_index_rebuild(
@@ -2048,7 +2233,7 @@ mod tests {
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
         let stats = writes.apply(&mut *transaction).await.unwrap();
-        assert_eq!(stats.puts, 5);
+        assert_eq!(stats.puts, 6);
         transaction.commit().await.unwrap();
 
         let mut transaction = storage.begin_read_transaction().await.unwrap();
@@ -2075,6 +2260,10 @@ mod tests {
                         namespace: COMMIT_VISIBILITY_SPACE.name.to_string(),
                         keys: vec![commit_visibility_key("commit-1")],
                     },
+                    KvGetGroup {
+                        namespace: VISIBLE_CHANGE_PROOF_SPACE.name.to_string(),
+                        keys: vec![visible_change_proof_key("change-1")],
+                    },
                 ],
             })
             .await
@@ -2098,6 +2287,11 @@ mod tests {
         let visibility_bytes = result.groups[4].value(0).unwrap().unwrap();
         assert_eq!(
             decode_commit_visibility(visibility_bytes).unwrap(),
+            expected_visibility
+        );
+        let visible_proof_bytes = result.groups[5].value(0).unwrap().unwrap();
+        assert_eq!(
+            decode_commit_visibility(visible_proof_bytes).unwrap(),
             expected_visibility
         );
 
@@ -2315,6 +2509,11 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment).await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -2461,6 +2660,11 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment).await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -2650,6 +2854,11 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -2741,6 +2950,11 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
             BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
@@ -2777,6 +2991,11 @@ mod tests {
             writer.stage_segment(segment).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.put(
             BY_CHANGE_INDEX_SPACE,
             by_change_key("change-1"),
@@ -2815,6 +3034,11 @@ mod tests {
             writer.stage_segment(segment.clone()).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
@@ -2833,10 +3057,10 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 3,
+                expected: 4,
                 put: 3,
                 deleted: 0,
-                unchanged: 0
+                unchanged: 1
             }
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -2882,6 +3106,11 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment.clone()).await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
         writes.delete(BY_CHANGE_INDEX_SPACE, by_change_key("change-1"));
         writes.delete(
@@ -3441,6 +3670,11 @@ mod tests {
             let mut writer = context.writer(&mut *transaction, &mut writes);
             writer.stage_segment(segment.clone()).await.unwrap();
         }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
         writes.put(
             BY_COMMIT_INDEX_SPACE,
             by_commit_key("commit-1"),

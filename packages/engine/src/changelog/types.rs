@@ -362,6 +362,7 @@ pub(crate) struct GcSweepSet {
     pub(crate) by_commit: Vec<CommitId>,
     pub(crate) by_change: Vec<ChangeId>,
     pub(crate) by_change_membership: Vec<(ChangeId, CommitId)>,
+    pub(crate) visible_change_proof: Vec<ChangeId>,
     pub(crate) json_payloads: Vec<JsonRef>,
 }
 

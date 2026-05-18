@@ -307,6 +307,9 @@ pub(crate) fn legacy_space_from_namespace(namespace: &str) -> StorageSpace {
         "changelog.index.by_change_membership" => {
             StorageSpace::new(SpaceId(0x0004_0005), "changelog.index.by_change_membership")
         }
+        "changelog.index.visible_change" => {
+            StorageSpace::new(SpaceId(0x0004_0006), "changelog.index.visible_change")
+        }
         _ => StorageSpace::new(SpaceId(fnv1a_32(namespace)), "legacy.dynamic"),
     }
 }

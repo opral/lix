@@ -1718,7 +1718,8 @@ impl From<GcPlan> for BenchGcStats {
             sweep_segments: plan.sweep.segments.len(),
             sweep_index_rows: plan.sweep.by_commit.len()
                 + plan.sweep.by_change.len()
-                + plan.sweep.by_change_membership.len(),
+                + plan.sweep.by_change_membership.len()
+                + plan.sweep.visible_change_proof.len(),
         }
     }
 }
