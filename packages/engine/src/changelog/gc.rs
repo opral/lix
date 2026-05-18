@@ -6,8 +6,9 @@ use super::store::{
     by_change_index_value, by_change_key, by_change_membership_ids_from_key,
     by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
     by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
+    visible_change_proof_key,
     BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE,
+    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet, Segment,
@@ -28,6 +29,7 @@ where
     let all_by_commit = scan_utf8_keys(store, BY_COMMIT_INDEX_SPACE).await?;
     let all_by_change = scan_utf8_keys(store, BY_CHANGE_INDEX_SPACE).await?;
     let all_by_change_membership = scan_by_change_membership_keys(store).await?;
+    let all_visible_change_proof = scan_utf8_keys(store, VISIBLE_CHANGE_PROOF_SPACE).await?;
     let all_json_payloads = scan_json_payload_keys(store).await?;
 
     let mut commit_index: HashMap<String, (String, SegmentCommit)> = HashMap::new();
@@ -141,6 +143,10 @@ where
                 !live_changes.contains(change_id) || !live_commits.contains(commit_id)
             })
             .collect(),
+        visible_change_proof: all_visible_change_proof
+            .into_iter()
+            .filter(|change_id| !live_changes.contains(change_id))
+            .collect(),
         json_payloads: all_json_payloads
             .into_iter()
             .filter(|json_ref| !live.payloads.contains(json_ref))
@@ -212,6 +218,9 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
             BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             by_change_membership_key(change_id, commit_id),
         );
+    }
+    for change_id in &plan.sweep.visible_change_proof {
+        writes.delete(VISIBLE_CHANGE_PROOF_SPACE, visible_change_proof_key(change_id));
     }
     for json_ref in &plan.sweep.json_payloads {
         json_store::stage_direct_json_payload_delete(writes, json_ref);
@@ -1226,10 +1235,10 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 3,
+                expected: 4,
                 put: 3,
                 deleted: 0,
-                unchanged: 0
+                unchanged: 1
             }
         );
         writes.apply(&mut *transaction).await.unwrap();
