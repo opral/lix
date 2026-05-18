@@ -370,7 +370,7 @@ fn value(bytes: &'static str) -> StoredValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_storage_conformance, StorageConformanceStatus};
+    use super::{StorageConformanceStatus, run_storage_conformance};
 
     #[test]
     fn in_memory_backend_passes_storage_conformance() {

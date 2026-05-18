@@ -1,20 +1,20 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::segment::{canonicalize_segment, directory_change_location, directory_commit_location};
 use super::store::{
-    by_change_index_value, by_change_key, by_change_membership_index_value,
-    by_change_membership_key, by_commit_index_value, by_commit_key, segment_key, segment_value,
     BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE,
+    SEGMENT_NAMESPACE, by_change_index_value, by_change_key, by_change_membership_index_value,
+    by_change_membership_key, by_commit_index_value, by_commit_key, segment_key, segment_value,
 };
 use super::{
-    decode_by_change_entry, decode_by_commit_entry, ByChangeEntry, ByCommitEntry, CommitBody,
-    CommitHeader, CommitVisibility, MembershipRecord, MembershipRole, Segment, SegmentChange,
-    SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
-    SegmentObjectLocation, StateRowIdentity,
+    ByChangeEntry, ByCommitEntry, CommitBody, CommitHeader, CommitVisibility, MembershipRecord,
+    MembershipRole, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
+    SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentObjectLocation,
+    StateRowIdentity, decode_by_change_entry, decode_by_commit_entry,
 };
-use crate::backend::{testing::UnitTestBackend, Backend};
+use crate::LixError;
+use crate::backend::InMemoryBackend;
 use crate::changelog::ChangelogContext;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
@@ -22,11 +22,12 @@ use crate::storage::{
     KvEntryPage, KvExistsBatch, KvGetGroup, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
     KvValuePage, StorageContext, StorageReader, StorageWriteSet,
 };
-use crate::LixError;
 
 pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageContext) {
-    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-    (ChangelogContext::new(), StorageContext::new(backend))
+    (
+        ChangelogContext::new(),
+        StorageContext::new(InMemoryBackend::new()),
+    )
 }
 
 pub(crate) fn test_segment() -> Segment {
@@ -320,7 +321,7 @@ pub(crate) struct CountingReader {
     segment_gets: Arc<AtomicUsize>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl StorageReader for CountingReader {
     async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
         if request

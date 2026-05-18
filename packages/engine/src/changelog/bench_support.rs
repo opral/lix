@@ -4,7 +4,6 @@
 //! crates. The normal changelog module stays crate-private.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use super::by_change_index::by_change_entries_for_segments;
 use super::by_change_membership_index::by_change_membership_entries_for_segments;
@@ -14,15 +13,15 @@ use super::codec::{
 };
 use super::context::ChangelogContext;
 use super::segment::{
-    canonicalize_segment, directory_change_location, directory_commit_location,
-    validate_change_checksum, validate_commit_checksum, validate_segment_shape,
-    DecodedSegmentIndex,
+    DecodedSegmentIndex, canonicalize_segment, directory_change_location,
+    directory_commit_location, validate_change_checksum, validate_commit_checksum,
+    validate_segment_shape,
 };
 use super::store::{
-    by_change_key, by_change_membership_commit_id_from_key, by_change_membership_key,
-    by_change_membership_prefix, by_commit_key, segment_key, segment_value,
     BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE,
+    SEGMENT_NAMESPACE, by_change_key, by_change_membership_commit_id_from_key,
+    by_change_membership_key, by_change_membership_prefix, by_commit_key, segment_key,
+    segment_value,
 };
 use super::types::{
     ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, CommitLoadRequest, CommitProjection,
@@ -30,6 +29,8 @@ use super::types::{
     SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
     SegmentInlinePayload, StateRowIdentity,
 };
+use crate::LixError;
+use crate::backend::InMemoryBackend;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
@@ -37,7 +38,6 @@ use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageContext, StorageReader,
     StorageWriteSet,
 };
-use crate::{Backend, LixError};
 
 #[derive(Clone)]
 pub struct BenchSegment {
@@ -128,7 +128,7 @@ impl BenchCorpus {
 #[derive(Clone)]
 pub struct BenchStore {
     context: ChangelogContext,
-    storage: StorageContext,
+    storage: StorageContext<InMemoryBackend>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -584,7 +584,7 @@ pub fn validate_publication_closure(segment: &BenchSegment) -> Result<usize, Lix
     Ok(checked)
 }
 
-pub fn new_store(backend: Arc<dyn Backend + Send + Sync>) -> BenchStore {
+pub fn new_store(backend: InMemoryBackend) -> BenchStore {
     BenchStore {
         context: ChangelogContext::new(),
         storage: StorageContext::new(backend),
@@ -592,7 +592,7 @@ pub fn new_store(backend: Arc<dyn Backend + Send + Sync>) -> BenchStore {
 }
 
 pub async fn stage_segment_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError> {
     let store = new_store(backend);
@@ -600,7 +600,7 @@ pub async fn stage_segment_once(
 }
 
 pub async fn stage_segment_raw_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError> {
     let store = new_store(backend);
@@ -608,7 +608,7 @@ pub async fn stage_segment_raw_once(
 }
 
 pub async fn prepare_store(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     segment: &BenchSegment,
     publish: bool,
 ) -> Result<BenchStore, LixError> {
@@ -621,7 +621,7 @@ pub async fn prepare_store(
 }
 
 pub async fn prepare_corpus_store(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
     publish: bool,
 ) -> Result<BenchStore, LixError> {
@@ -645,7 +645,7 @@ pub async fn prepare_corpus_store(
 }
 
 pub async fn prepare_rebuild_store(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
     mode: BenchRebuildMode,
 ) -> Result<BenchStore, LixError> {
@@ -671,7 +671,7 @@ pub async fn prepare_rebuild_store(
 }
 
 pub async fn prepare_gc_store(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     live_segments: usize,
     dead_segments: usize,
     changes_per_segment: usize,
@@ -724,7 +724,7 @@ pub async fn prepare_gc_store(
 }
 
 pub async fn stage_publish_first_commit_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError> {
     let store = prepare_store(backend, segment, false).await?;
@@ -750,7 +750,7 @@ pub async fn stage_publish_first_commit_in_store(
 }
 
 pub async fn stage_corpus_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let store = new_store(backend);
@@ -768,7 +768,7 @@ pub async fn stage_corpus_once(
 }
 
 pub async fn stage_corpus_raw_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let store = new_store(backend);
@@ -776,7 +776,7 @@ pub async fn stage_corpus_raw_once(
 }
 
 pub async fn stage_incremental_segment_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let store = prepare_corpus_store(backend, corpus, false).await?;
@@ -785,7 +785,7 @@ pub async fn stage_incremental_segment_once(
 }
 
 pub async fn stage_incremental_segment_raw_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let store = new_store(backend);
@@ -795,7 +795,7 @@ pub async fn stage_incremental_segment_raw_once(
 }
 
 pub async fn stage_publish_all_commits_once(
-    backend: Arc<dyn Backend + Send + Sync>,
+    backend: InMemoryBackend,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let store = prepare_corpus_store(backend, corpus, false).await?;

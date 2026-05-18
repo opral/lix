@@ -4,8 +4,13 @@ use crate::backend::{
     Backend, BackendError, BackendWrite, CommitResult, InMemoryBackend, KeyRange, Prefix,
     ReadOptions, WriteOptions,
 };
+use crate::storage::legacy::{
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
+    KvWriteStats, StorageReader, StorageWriter,
+};
 use crate::storage::{
-    StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError, StorageWriteSetStats,
+    StorageRead, StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError,
+    StorageWriteSetStats,
 };
 
 #[derive(Clone, Debug)]
@@ -30,6 +35,23 @@ where
 
     pub fn new_write_set(&self) -> StorageWriteSet {
         StorageWriteSet::new()
+    }
+
+    pub async fn begin_read_transaction(
+        &self,
+    ) -> Result<Box<StorageCompatReadTransaction<B::Read<'_>>>, crate::LixError> {
+        Ok(Box::new(StorageCompatReadTransaction {
+            read: self.begin_read(ReadOptions::default())?,
+        }))
+    }
+
+    pub async fn begin_write_transaction(
+        &self,
+    ) -> Result<Box<StorageCompatWriteTransaction<'_, B>>, crate::LixError> {
+        Ok(Box::new(StorageCompatWriteTransaction {
+            storage: self,
+            read: self.begin_read(ReadOptions::default())?,
+        }))
     }
 
     pub fn commit_write_set(
@@ -77,6 +99,121 @@ where
             },
             opts,
         )
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<B> StorageReader for StorageContext<B>
+where
+    B: Backend,
+{
+    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, crate::LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        read.get_values(request).await
+    }
+
+    async fn exists_many(
+        &mut self,
+        request: KvGetRequest,
+    ) -> Result<KvExistsBatch, crate::LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        read.exists_many(request).await
+    }
+
+    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, crate::LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        read.scan_keys(request).await
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: KvScanRequest,
+    ) -> Result<KvValuePage, crate::LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        read.scan_values(request).await
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: KvScanRequest,
+    ) -> Result<KvEntryPage, crate::LixError> {
+        let mut read = self.begin_read(ReadOptions::default())?;
+        read.scan_entries(request).await
+    }
+}
+
+pub struct StorageCompatReadTransaction<R>
+where
+    R: crate::backend::BackendRead,
+{
+    read: StorageReadScope<R>,
+}
+
+impl<R> StorageCompatReadTransaction<R>
+where
+    R: crate::backend::BackendRead,
+{
+    pub async fn rollback(self: Box<Self>) -> Result<(), crate::LixError> {
+        Ok(())
+    }
+}
+
+impl<R> StorageRead for StorageCompatReadTransaction<R>
+where
+    R: crate::backend::BackendRead,
+{
+    type BackendRead = R;
+
+    fn backend_read(&self) -> &Self::BackendRead {
+        self.read.backend_read()
+    }
+}
+
+pub struct StorageCompatWriteTransaction<'a, B>
+where
+    B: Backend,
+{
+    storage: &'a StorageContext<B>,
+    read: StorageReadScope<B::Read<'a>>,
+}
+
+impl<B> StorageCompatWriteTransaction<'_, B>
+where
+    B: Backend,
+{
+    pub async fn commit(self: Box<Self>) -> Result<(), crate::LixError> {
+        Ok(())
+    }
+
+    pub async fn rollback(self: Box<Self>) -> Result<(), crate::LixError> {
+        Ok(())
+    }
+}
+
+impl<'a, B> StorageRead for StorageCompatWriteTransaction<'a, B>
+where
+    B: Backend,
+{
+    type BackendRead = B::Read<'a>;
+
+    fn backend_read(&self) -> &Self::BackendRead {
+        self.read.backend_read()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<B> StorageWriter for StorageCompatWriteTransaction<'_, B>
+where
+    B: Backend,
+{
+    async fn write_storage_set(
+        &mut self,
+        write_set: StorageWriteSet,
+    ) -> Result<KvWriteStats, crate::LixError> {
+        let (_commit, stats) = self
+            .storage
+            .commit_write_set(write_set, WriteOptions::default())?;
+        Ok(stats.into())
     }
 }
 

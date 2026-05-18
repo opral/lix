@@ -5,10 +5,73 @@ use crate::backend::{
     Backend, BackendError, BackendWrite, CommitResult, Key, PutBatch, PutEntry, SpaceId,
     StoredValue, WriteOptions,
 };
+use crate::storage::legacy::{
+    KvWriteStats, StorageWriter, key as legacy_key, legacy_space_from_namespace, stored_value,
+};
 use crate::storage::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
 
 type FastHashBuilder = RandomState;
+
+pub trait IntoStorageSpace {
+    fn into_storage_space(self) -> StorageSpace;
+}
+
+impl IntoStorageSpace for StorageSpace {
+    fn into_storage_space(self) -> StorageSpace {
+        self
+    }
+}
+
+impl IntoStorageSpace for &'static str {
+    fn into_storage_space(self) -> StorageSpace {
+        legacy_space_from_namespace(self)
+    }
+}
+
+pub trait IntoStorageKey {
+    fn into_storage_key(self) -> Key;
+}
+
+impl IntoStorageKey for Key {
+    fn into_storage_key(self) -> Key {
+        self
+    }
+}
+
+impl IntoStorageKey for Vec<u8> {
+    fn into_storage_key(self) -> Key {
+        legacy_key(self)
+    }
+}
+
+impl IntoStorageKey for &[u8] {
+    fn into_storage_key(self) -> Key {
+        legacy_key(self.to_vec())
+    }
+}
+
+pub trait IntoStorageValue {
+    fn into_storage_value(self) -> StoredValue;
+}
+
+impl IntoStorageValue for StoredValue {
+    fn into_storage_value(self) -> StoredValue {
+        self
+    }
+}
+
+impl IntoStorageValue for Vec<u8> {
+    fn into_storage_value(self) -> StoredValue {
+        stored_value(self)
+    }
+}
+
+impl IntoStorageValue for &[u8] {
+    fn into_storage_value(self) -> StoredValue {
+        stored_value(self.to_vec())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StorageWriteSet {
@@ -66,15 +129,39 @@ impl StorageWriteSet {
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
-    pub fn put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
-        self.stats.staged_puts += 1;
-        self.stats.written_bytes += value.bytes.len() as u64;
-        self.group_mut(space).puts.push(PutEntry { key, value });
+    pub(crate) async fn apply<W>(self, writer: &mut W) -> Result<KvWriteStats, crate::LixError>
+    where
+        W: StorageWriter + ?Sized,
+    {
+        writer.write_storage_set(self).await
     }
 
-    pub fn delete(&mut self, space: StorageSpace, key: Key) {
+    pub fn put<S, K, V>(&mut self, space: S, key: K, value: V)
+    where
+        S: IntoStorageSpace,
+        K: IntoStorageKey,
+        V: IntoStorageValue,
+    {
+        let value = value.into_storage_value();
+        self.stats.staged_puts += 1;
+        self.stats.written_bytes += value.bytes.len() as u64;
+        self.group_mut(space.into_storage_space())
+            .puts
+            .push(PutEntry {
+                key: key.into_storage_key(),
+                value,
+            });
+    }
+
+    pub fn delete<S, K>(&mut self, space: S, key: K)
+    where
+        S: IntoStorageSpace,
+        K: IntoStorageKey,
+    {
         self.stats.staged_deletes += 1;
-        self.group_mut(space).deletes.push(key);
+        self.group_mut(space.into_storage_space())
+            .deletes
+            .push(key.into_storage_key());
     }
 
     /// Reserves capacity for a storage space's grouped puts and deletes.
@@ -350,9 +437,11 @@ mod tests {
                 key: ref duplicate_key
             } if duplicate_space == space(1) && *duplicate_key == key("a")
         ));
-        assert!(error
-            .to_string()
-            .contains("duplicate storage mutation for test.space.one"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate storage mutation for test.space.one")
+        );
     }
 
     #[test]
