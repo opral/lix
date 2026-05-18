@@ -7,9 +7,10 @@ use super::providers;
 use super::udfs::register_sql2_functions;
 use super::{SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext};
 
-pub(crate) async fn build_read_session(
-    ctx: &dyn SqlExecutionContext,
-) -> Result<SessionContext, LixError> {
+pub(crate) async fn build_read_session<C>(ctx: &C) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
     let session = new_sql_session_context();
     let version_ref = ctx.version_ref();
     let active_version_commit_id = version_ref
@@ -22,10 +23,17 @@ pub(crate) async fn build_read_session(
     Ok(session)
 }
 
-pub(crate) async fn build_write_session(
-    ctx: &mut dyn SqlWriteExecutionContext,
-) -> Result<SessionContext, LixError> {
-    build_write_session_with_options(ctx, SqlWriteSessionOptions::default()).await
+pub(crate) async fn build_transaction_read_session<C>(
+    read_ctx: &C,
+    write_ctx: &mut dyn SqlWriteExecutionContext,
+) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let session = build_read_session(read_ctx).await?;
+    let write_ctx = SqlWriteContext::new(write_ctx);
+    providers::register_write(&session, write_ctx, SqlWriteSessionOptions::default()).await?;
+    Ok(session)
 }
 
 #[derive(Clone, Debug, Default)]

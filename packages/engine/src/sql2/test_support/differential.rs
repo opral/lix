@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::testing::UnitTestBackend;
     use crate::common::serialize_row_metadata;
     use crate::entity_identity::EntityIdentity;
     use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
@@ -12,6 +11,7 @@ mod tests {
         DifferentialProbe, DifferentialSqlCase, ExpectedExecution, ACTIVE_VERSION_PROBE_ID,
     };
     use crate::sql2::{WriteExecutorMode, WriteExecutorPath};
+    use crate::storage::InMemoryStorageBackend;
     use crate::{Engine, ExecuteResult, LixError, Value};
 
     #[derive(Debug, Clone)]
@@ -256,11 +256,11 @@ mod tests {
     }
 
     async fn open_initialized_engine() -> Engine {
-        let backend = UnitTestBackend::new();
-        Engine::initialize(Box::new(backend.clone()))
+        let backend = InMemoryStorageBackend::new();
+        Engine::initialize(backend.clone())
             .await
             .expect("unit backend should initialize");
-        Engine::new(Box::new(backend))
+        Engine::new(backend)
             .await
             .expect("engine should open over initialized unit backend")
     }

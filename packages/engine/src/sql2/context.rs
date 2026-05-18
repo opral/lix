@@ -6,57 +6,26 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
-use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
-use crate::commit_store::{CommitStoreContext, CommitStoreReader};
+use crate::commit_graph::CommitGraphReader;
+use crate::commit_store::CommitStoreReader;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonStoreContext;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
     MaterializedLiveStateRow,
 };
-use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
-    ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
-};
+use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::version::{VersionHead, VersionRefReader};
 use crate::LixError;
 
-pub(crate) type SqlCommitStoreQuerySource = CommitStoreQuerySource<SqlReadStore>;
-pub(crate) type SqlJsonReader = JsonStoreReader<ScopedStorageReader<SqlReadStore>>;
-
-#[derive(Clone)]
-pub(crate) struct SqlReadStore {
-    inner: SqlReadStoreInner,
-}
-
-#[derive(Clone)]
-enum SqlReadStoreInner {
-    Scoped(ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>),
-    Write(SqlWriteContext),
-}
-
-impl SqlReadStore {
-    pub(crate) fn scoped(
-        store: ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>,
-    ) -> Self {
-        Self {
-            inner: SqlReadStoreInner::Scoped(store),
-        }
-    }
-
-    fn write(write_ctx: SqlWriteContext) -> Self {
-        Self {
-            inner: SqlReadStoreInner::Write(write_ctx),
-        }
-    }
-}
+pub(crate) type SqlCommitStoreQuerySource<S> = CommitStoreQuerySource<S>;
+pub(crate) type SqlJsonReader<S> = JsonStoreReader<S>;
 
 #[derive(Clone)]
 pub(crate) struct CommitStoreQuerySource<S> {
-    pub(crate) commit_store_reader: Arc<CommitStoreReader<ScopedStorageReader<S>>>,
-    pub(crate) json_reader: JsonStoreReader<ScopedStorageReader<S>>,
+    pub(crate) commit_store_reader: Arc<CommitStoreReader<S>>,
+    pub(crate) json_reader: JsonStoreReader<S>,
 }
 
 /// Read-only execution boundary for `sql2::execute_sql(...)`.
@@ -70,10 +39,12 @@ pub(crate) struct CommitStoreQuerySource<S> {
 /// sources.
 #[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
+    type ReadStore: StorageRead + Clone + Send + Sync + 'static;
+
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
-    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource;
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn version_ref(&self) -> Arc<dyn VersionRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
@@ -88,65 +59,12 @@ pub(crate) trait SqlExecutionContext {
 /// authority without adding another translation layer.
 #[async_trait]
 #[allow(dead_code)]
-pub(crate) trait SqlWriteExecutionContext: Send {
+pub(crate) trait SqlWriteExecutionContext {
     fn active_version_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 
-    fn storage_context(&self) -> Option<StorageContext> {
-        None
-    }
-
-    fn commit_store_context(&self) -> Option<Arc<CommitStoreContext>> {
-        None
-    }
-
-    fn supports_committed_read_surfaces(&self) -> bool {
-        self.storage_context().is_some() && self.commit_store_context().is_some()
-    }
-
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
-
-    async fn read_get_values(&mut self, _request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "storage reads are unavailable in this SQL write context",
-        ))
-    }
-
-    async fn read_exists_many(
-        &mut self,
-        _request: KvGetRequest,
-    ) -> Result<KvExistsBatch, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "storage reads are unavailable in this SQL write context",
-        ))
-    }
-
-    async fn read_scan_keys(&mut self, _request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "storage reads are unavailable in this SQL write context",
-        ))
-    }
-
-    async fn read_scan_values(&mut self, _request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "storage reads are unavailable in this SQL write context",
-        ))
-    }
-
-    async fn read_scan_entries(
-        &mut self,
-        _request: KvScanRequest,
-    ) -> Result<KvEntryPage, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "storage reads are unavailable in this SQL write context",
-        ))
-    }
 
     async fn scan_live_state(
         &mut self,
@@ -206,120 +124,6 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().active_version_id().to_string() }
     }
 
-    pub(crate) async fn load_bytes_many(
-        &self,
-        hashes: &[BlobHash],
-    ) -> Result<BlobBytesBatch, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .load_bytes_many(hashes)
-                .await
-        }
-    }
-
-    pub(crate) async fn commit_store_query_source(
-        &self,
-    ) -> Result<SqlCommitStoreQuerySource, LixError> {
-        let commit_store =
-            unsafe { self.ptr.0.as_ref().commit_store_context() }.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "transaction read-only commit-store surfaces are unavailable in this write context",
-                )
-            })?;
-        let read_scope = StorageReadScope::new(SqlReadStore::write(self.clone()));
-        Ok(CommitStoreQuerySource {
-            commit_store_reader: Arc::new(commit_store.reader(read_scope.store())),
-            json_reader: JsonStoreContext::new().reader(read_scope.store()),
-        })
-    }
-
-    pub(crate) fn commit_graph(&self) -> Result<Box<dyn CommitGraphReader>, LixError> {
-        if !self.supports_committed_read_surfaces() {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "transaction read-only history surfaces are unavailable in this write context",
-            ));
-        }
-        Ok(Box::new(
-            CommitGraphContext::new().reader(SqlReadStore::write(self.clone())),
-        ))
-    }
-
-    pub(crate) fn supports_committed_read_surfaces(&self) -> bool {
-        unsafe { self.ptr.0.as_ref().supports_committed_read_surfaces() }
-    }
-
-    async fn read_get_values(&self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .read_get_values(request)
-                .await
-        }
-    }
-
-    async fn read_exists_many(&self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .read_exists_many(request)
-                .await
-        }
-    }
-
-    async fn read_scan_keys(&self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .read_scan_keys(request)
-                .await
-        }
-    }
-
-    async fn read_scan_values(&self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .read_scan_values(request)
-                .await
-        }
-    }
-
-    async fn read_scan_entries(&self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        let _guard = self.gate.lock().await;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .read_scan_entries(request)
-                .await
-        }
-    }
-
     pub(crate) async fn scan_live_state(
         &self,
         request: &LiveStateScanRequest,
@@ -332,6 +136,22 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .scan_live_state(request)
+                .await
+        }
+    }
+
+    pub(crate) async fn load_bytes_many(
+        &self,
+        hashes: &[BlobHash],
+    ) -> Result<BlobBytesBatch, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .load_bytes_many(hashes)
                 .await
         }
     }
@@ -365,44 +185,6 @@ impl SqlWriteContext {
                 .unwrap()
                 .stage_write(write)
                 .await
-        }
-    }
-}
-
-#[async_trait]
-impl StorageReader for SqlReadStore {
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        match &mut self.inner {
-            SqlReadStoreInner::Scoped(store) => store.get_values(request).await,
-            SqlReadStoreInner::Write(write_ctx) => write_ctx.read_get_values(request).await,
-        }
-    }
-
-    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        match &mut self.inner {
-            SqlReadStoreInner::Scoped(store) => store.exists_many(request).await,
-            SqlReadStoreInner::Write(write_ctx) => write_ctx.read_exists_many(request).await,
-        }
-    }
-
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        match &mut self.inner {
-            SqlReadStoreInner::Scoped(store) => store.scan_keys(request).await,
-            SqlReadStoreInner::Write(write_ctx) => write_ctx.read_scan_keys(request).await,
-        }
-    }
-
-    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        match &mut self.inner {
-            SqlReadStoreInner::Scoped(store) => store.scan_values(request).await,
-            SqlReadStoreInner::Write(write_ctx) => write_ctx.read_scan_values(request).await,
-        }
-    }
-
-    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        match &mut self.inner {
-            SqlReadStoreInner::Scoped(store) => store.scan_entries(request).await,
-            SqlReadStoreInner::Write(write_ctx) => write_ctx.read_scan_entries(request).await,
         }
     }
 }

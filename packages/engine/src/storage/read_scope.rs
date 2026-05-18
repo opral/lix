@@ -1,88 +1,67 @@
-use std::sync::Arc;
+use crate::backend::{BackendError, BackendRead};
 
-use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
-    StorageReadTransaction, StorageReader,
-};
-use crate::LixError;
-use tokio::sync::Mutex;
+pub trait StorageRead {
+    type BackendRead: BackendRead;
 
-/// Shared read visibility over one KV store handle.
-///
-/// This lets multiple subsystem readers share the same transaction/backend view
-/// even when the underlying handle itself is not cloneable.
-pub(crate) struct StorageReadScope<S> {
-    store: Arc<Mutex<S>>,
+    fn backend_read(&self) -> &Self::BackendRead;
 }
 
-impl<S> StorageReadScope<S>
+#[derive(Clone)]
+pub struct StorageReadScope<R> {
+    read: R,
+}
+
+impl<R> StorageReadScope<R> {
+    pub fn new(read: R) -> Self {
+        Self { read }
+    }
+
+    pub fn store(&self) -> Self
+    where
+        R: Clone,
+    {
+        self.clone()
+    }
+}
+
+impl<R> StorageReadScope<R>
 where
-    S: StorageReader,
+    R: BackendRead,
 {
-    pub(crate) fn new(store: S) -> Self {
-        Self {
-            store: Arc::new(Mutex::new(store)),
-        }
-    }
-
-    pub(crate) fn store(&self) -> ScopedStorageReader<S> {
-        ScopedStorageReader {
-            store: Arc::clone(&self.store),
-        }
+    pub fn close(self) -> Result<(), BackendError> {
+        self.read.close()
     }
 }
 
-impl StorageReadScope<Box<dyn StorageReadTransaction + Send + Sync + 'static>> {
-    pub(crate) async fn rollback(self) -> Result<(), LixError> {
-        let store = Arc::try_unwrap(self.store).map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "cannot close storage read scope while scoped readers are still alive",
-            )
-        })?;
-        store.into_inner().rollback().await
-    }
-}
-
-pub(crate) struct ScopedStorageReader<S> {
-    store: Arc<Mutex<S>>,
-}
-
-impl<S> Clone for ScopedStorageReader<S> {
-    fn clone(&self) -> Self {
-        Self {
-            store: Arc::clone(&self.store),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl<S> StorageReader for ScopedStorageReader<S>
+impl<R> StorageRead for StorageReadScope<R>
 where
-    S: StorageReader,
+    R: BackendRead,
 {
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        let mut store = self.store.lock().await;
-        store.get_values(request).await
-    }
+    type BackendRead = R;
 
-    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        let mut store = self.store.lock().await;
-        store.exists_many(request).await
+    fn backend_read(&self) -> &Self::BackendRead {
+        &self.read
     }
+}
 
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        let mut store = self.store.lock().await;
-        store.scan_keys(request).await
+impl<T> StorageRead for &T
+where
+    T: StorageRead + ?Sized,
+{
+    type BackendRead = T::BackendRead;
+
+    fn backend_read(&self) -> &Self::BackendRead {
+        (*self).backend_read()
     }
+}
 
-    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        let mut store = self.store.lock().await;
-        store.scan_values(request).await
-    }
+impl<T> StorageRead for &mut T
+where
+    T: StorageRead + ?Sized,
+{
+    type BackendRead = T::BackendRead;
 
-    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        let mut store = self.store.lock().await;
-        store.scan_entries(request).await
+    fn backend_read(&self) -> &Self::BackendRead {
+        (**self).backend_read()
     }
 }

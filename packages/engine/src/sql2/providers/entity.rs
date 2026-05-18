@@ -43,16 +43,20 @@ use crate::sql2::{
 };
 
 use super::entity_history::EntityHistoryProvider;
+use crate::storage::StorageRead;
 
-pub(crate) async fn register_entity_providers(
+pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     catalog: &PublicCatalog,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     for surface in catalog.surfaces() {
         match &surface.kind {
             PublicSurfaceKind::EntityBase { schema_key } => {
@@ -132,12 +136,15 @@ pub(crate) async fn register_entity_write_providers(
     Ok(())
 }
 
-pub(crate) async fn register_entity_history_providers(
+pub(crate) async fn register_entity_history_providers<S>(
     ctx: &SessionContext,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
     catalog: &PublicCatalog,
-) -> Result<(), LixError> {
+) -> Result<(), LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     for surface in catalog.surfaces() {
         if let PublicSurfaceKind::EntityHistory { schema_key } = &surface.kind {
             let spec = catalog_entity_spec(catalog, schema_key)?;

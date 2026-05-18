@@ -31,8 +31,8 @@ pub(crate) use bind::{
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
-    SqlReadStore, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextLiveStateReader, WriteContextVersionRefReader,
+    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
+    WriteContextVersionRefReader,
 };
 #[allow(unused_imports)]
 pub(crate) use exec::{

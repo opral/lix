@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::functions::FunctionContext;
 use crate::sql2;
-use crate::storage::{StorageReadScope, StorageWriteSet};
+use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSet};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
@@ -287,7 +287,12 @@ impl RowRef<'_> {
     }
 }
 
-impl SessionContext {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
@@ -320,7 +325,8 @@ impl SessionContext {
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
-        let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
+        let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
+        let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result = async {
             let mut read_store = read_scope.store();
             let live_state: Arc<dyn crate::live_state::LiveStateReader> =
@@ -351,16 +357,17 @@ impl SessionContext {
         };
         let (runtime_functions, result) = match read_result.await {
             Ok(result) => {
-                read_scope.rollback().await?;
+                read_scope.close()?;
                 result
             }
             Err(error) => {
-                let _ = read_scope.rollback().await;
+                let _ = read_scope.close();
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
         self.persist_runtime_functions_if_needed(&runtime_functions)
             .await?;
+        drop(write_guard);
         Ok(ExecuteResult::from_sql_query_result(result))
     }
 
@@ -416,13 +423,18 @@ impl SessionContext {
         if writes.is_empty() {
             return Ok(());
         }
-        let mut transaction = self.storage.begin_write_transaction().await?;
-        writes.apply(&mut transaction.as_mut()).await?;
-        transaction.commit().await
+        self.storage
+            .commit_write_set(writes, StorageWriteOptions::default())?;
+        Ok(())
     }
 }
 
-impl SessionTransaction {
+impl<B> SessionTransaction<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Executes one SQL statement inside this transaction.
     ///
     /// Write statements are staged until `commit()`. Read statements use the
@@ -442,16 +454,29 @@ impl SessionTransaction {
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
             sql2::BoundStatementRoute::Read => {
-                let plan = sql2::create_transaction_read_logical_plan_from_parsed(
-                    transaction,
-                    sql,
-                    statement,
-                )
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                let result = sql2::execute_logical_plan(plan, params)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                let read_ctx = transaction.sql_read_execution_context()?;
+                let read_result = async {
+                    let plan = sql2::create_transaction_read_logical_plan_from_parsed(
+                        &read_ctx,
+                        transaction,
+                        sql,
+                        statement,
+                    )
+                    .await?;
+                    sql2::execute_logical_plan(plan, params).await
+                }
+                .await;
+                let close_result = read_ctx.close();
+                let result = match read_result {
+                    Ok(result) => {
+                        close_result?;
+                        result
+                    }
+                    Err(error) => {
+                        let _ = close_result;
+                        return Err(normalize_sql_surface_error(error, sql));
+                    }
+                };
                 Ok(ExecuteResult::from_sql_query_result(result))
             }
         }
@@ -503,7 +528,7 @@ impl SessionTransaction {
         request: &crate::live_state::LiveStateScanRequest,
     ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
         let transaction = self.transaction_mut()?;
-        <crate::transaction::Transaction as sql2::SqlWriteExecutionContext>::scan_live_state(
+        <crate::transaction::Transaction<B> as sql2::SqlWriteExecutionContext>::scan_live_state(
             transaction,
             request,
         )
@@ -511,23 +536,33 @@ impl SessionTransaction {
     }
 }
 
-async fn execute_transaction_write_auto(
-    transaction: &mut crate::transaction::Transaction,
+async fn execute_transaction_write_auto<B>(
+    transaction: &mut crate::transaction::Transaction<B>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
-) -> Result<ExecuteResult, LixError> {
+) -> Result<ExecuteResult, LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
     Ok(ExecuteResult::from_rows_affected(affected_rows))
 }
 
 #[cfg(test)]
-async fn execute_transaction_write_with_mode(
-    transaction: &mut crate::transaction::Transaction,
+async fn execute_transaction_write_with_mode<B>(
+    transaction: &mut crate::transaction::Transaction<B>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     mode: sql2::WriteExecutorMode,
-) -> Result<ExecuteResult, LixError> {
+) -> Result<ExecuteResult, LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let affected_rows =
         sql2::execute_write_logical_plan_with_mode(transaction, tx_plan, params, mode).await?;
@@ -535,12 +570,17 @@ async fn execute_transaction_write_with_mode(
 }
 
 #[cfg(test)]
-async fn execute_transaction_write_with_mode_and_trace(
-    transaction: &mut crate::transaction::Transaction,
+async fn execute_transaction_write_with_mode_and_trace<B>(
+    transaction: &mut crate::transaction::Transaction<B>,
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
     mode: sql2::WriteExecutorMode,
-) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
+) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let (affected_rows, path) =
         sql2::execute_write_logical_plan_with_mode_and_trace(transaction, tx_plan, params, mode)

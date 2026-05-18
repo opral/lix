@@ -26,31 +26,35 @@ use crate::commit_store::{materialize_change, MaterializedChange};
 use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::SqlCommitStoreQuerySource;
+use crate::storage::StorageRead;
 
-pub(super) async fn register_lix_change_read_provider(
+pub(super) async fn register_lix_change_read_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    query_source: SqlCommitStoreQuerySource,
-) -> Result<(), LixError> {
+    query_source: SqlCommitStoreQuerySource<S>,
+) -> Result<(), LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     session
         .register_table(surface_name, Arc::new(LixChangeProvider::new(query_source)))
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
 
-struct LixChangeProvider {
+struct LixChangeProvider<S> {
     schema: SchemaRef,
-    query_source: SqlCommitStoreQuerySource,
+    query_source: SqlCommitStoreQuerySource<S>,
 }
 
-impl std::fmt::Debug for LixChangeProvider {
+impl<S> std::fmt::Debug for LixChangeProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixChangeProvider").finish()
     }
 }
 
-impl LixChangeProvider {
-    fn new(query_source: SqlCommitStoreQuerySource) -> Self {
+impl<S> LixChangeProvider<S> {
+    fn new(query_source: SqlCommitStoreQuerySource<S>) -> Self {
         Self {
             schema: lix_change_schema(),
             query_source,
@@ -59,7 +63,10 @@ impl LixChangeProvider {
 }
 
 #[async_trait]
-impl TableProvider for LixChangeProvider {
+impl<S> TableProvider for LixChangeProvider<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -98,23 +105,23 @@ impl TableProvider for LixChangeProvider {
     }
 }
 
-struct LixChangeScanExec {
-    query_source: SqlCommitStoreQuerySource,
+struct LixChangeScanExec<S> {
+    query_source: SqlCommitStoreQuerySource<S>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
 
-impl std::fmt::Debug for LixChangeScanExec {
+impl<S> std::fmt::Debug for LixChangeScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixChangeScanExec").finish()
     }
 }
 
-impl LixChangeScanExec {
+impl<S> LixChangeScanExec<S> {
     fn new(
-        query_source: SqlCommitStoreQuerySource,
+        query_source: SqlCommitStoreQuerySource<S>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -135,7 +142,7 @@ impl LixChangeScanExec {
     }
 }
 
-impl DisplayAs for LixChangeScanExec {
+impl<S> DisplayAs for LixChangeScanExec<S> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -146,7 +153,10 @@ impl DisplayAs for LixChangeScanExec {
     }
 }
 
-impl ExecutionPlan for LixChangeScanExec {
+impl<S> ExecutionPlan for LixChangeScanExec<S>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     fn name(&self) -> &str {
         "LixChangeScanExec"
     }

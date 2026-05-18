@@ -352,6 +352,7 @@ fn build_adjacency_map(
 
 fn parse_top_level_modules(lib_source: &str) -> Vec<String> {
     let mut modules = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut pending_attributes = Vec::new();
 
     for line in lib_source.lines() {
@@ -382,7 +383,7 @@ fn parse_top_level_modules(lib_source: &str) -> Vec<String> {
                     .any(|attribute| attribute.contains("cfg(test)"));
                 if !is_test_only {
                     let name = module_name.trim();
-                    if !name.is_empty() {
+                    if !name.is_empty() && seen.insert(name.to_string()) {
                         modules.push(name.to_string());
                     }
                 }
@@ -2794,7 +2795,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
         relative,
         &source,
         "pub(crate) async fn build_read_session",
-        "pub(crate) async fn build_write_session",
+        "pub(crate) async fn build_transaction_read_session",
     );
 
     assert_source_contains_all(relative, read_session, &["providers::register_read"]);
@@ -2886,7 +2887,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
 }
 
 #[test]
-fn sql2_write_session_registers_writable_and_read_only_transaction_surfaces() {
+fn sql2_write_session_registers_writable_transaction_surfaces() {
     let relative = "sql2/session.rs";
     let source = read_engine_source(relative);
     let write_session = source_between(
@@ -2929,10 +2930,6 @@ fn sql2_write_session_registers_writable_and_read_only_transaction_surfaces() {
             "PublicSurfaceKind::FileByVersion",
             "PublicSurfaceKind::Directory",
             "PublicSurfaceKind::DirectoryByVersion",
-            "PublicSurfaceKind::Change",
-            "PublicSurfaceKind::History",
-            "PublicSurfaceKind::FileHistory",
-            "PublicSurfaceKind::DirectoryHistory",
             "lix_state::register_lix_state_active_write_provider",
             "lix_state::register_lix_state_by_version_write_provider",
             "version::register_write_provider",
@@ -2940,12 +2937,7 @@ fn sql2_write_session_registers_writable_and_read_only_transaction_surfaces() {
             "file::register_by_version_write_provider",
             "directory::register_active_write_provider",
             "directory::register_by_version_write_provider",
-            "change::register_lix_change_read_provider",
-            "history::register_history_provider",
-            "file_history::register_lix_file_history_surface",
-            "directory_history::register_lix_directory_history_surface",
             "entity::register_entity_write_providers",
-            "entity::register_entity_history_providers",
         ],
     );
     assert_source_contains_none(

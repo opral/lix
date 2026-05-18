@@ -2,7 +2,7 @@ use crate::commit_store::{
     Change, ChangeIndexEntry, ChangeLocator, ChangeRef, ChangeScanRequest, Commit, CommitDraftRef,
     LocatedChange, StagedCommitStoreCommit,
 };
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::Mutex;
@@ -19,11 +19,11 @@ impl CommitStoreContext {
     /// Creates a commit-store writer over read visibility and a pending write set.
     pub(crate) fn writer<'a, S>(
         &self,
-        store: &'a mut S,
+        store: &'a S,
         writes: &'a mut StorageWriteSet,
     ) -> CommitStoreWriter<'a, S>
     where
-        S: StorageReader + ?Sized,
+        S: StorageRead + ?Sized,
     {
         CommitStoreWriter { store, writes }
     }
@@ -31,7 +31,7 @@ impl CommitStoreContext {
     /// Creates a commit-store reader over a storage snapshot or transaction.
     pub(crate) fn reader<S>(&self, store: S) -> CommitStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead,
     {
         CommitStoreReader {
             store: Mutex::new(store),
@@ -40,7 +40,7 @@ impl CommitStoreContext {
 
     pub(crate) async fn load_commit_from(
         &self,
-        store: &mut (impl StorageReader + ?Sized),
+        store: &(impl StorageRead + ?Sized),
         commit_id: &str,
     ) -> Result<Option<Commit>, LixError> {
         crate::commit_store::storage::load_commit(store, commit_id).await
@@ -48,7 +48,7 @@ impl CommitStoreContext {
 
     pub(crate) async fn load_change_pack_from(
         &self,
-        store: &mut (impl StorageReader + ?Sized),
+        store: &(impl StorageRead + ?Sized),
         commit_id: &str,
         pack_id: u32,
     ) -> Result<Option<Vec<Change>>, LixError> {
@@ -57,7 +57,7 @@ impl CommitStoreContext {
 
     pub(crate) async fn load_membership_pack_from(
         &self,
-        store: &mut (impl StorageReader + ?Sized),
+        store: &(impl StorageRead + ?Sized),
         commit_id: &str,
         pack_id: u32,
     ) -> Result<Option<Vec<ChangeLocator>>, LixError> {
@@ -72,14 +72,14 @@ pub(crate) struct CommitStoreReader<S> {
 
 impl<S> CommitStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     pub(crate) async fn load_change_index_entries(
         &self,
         change_ids: &[String],
     ) -> Result<Vec<Option<crate::commit_store::ChangeIndexEntry>>, LixError> {
         crate::commit_store::storage::load_change_index_entries(
-            &mut *self.store.lock().await,
+            &*self.store.lock().await,
             change_ids,
         )
         .await
@@ -89,11 +89,11 @@ where
         &self,
         commit_id: &str,
     ) -> Result<Option<crate::commit_store::Commit>, LixError> {
-        crate::commit_store::storage::load_commit(&mut *self.store.lock().await, commit_id).await
+        crate::commit_store::storage::load_commit(&*self.store.lock().await, commit_id).await
     }
 
     pub(crate) async fn scan_commits(&self) -> Result<Vec<crate::commit_store::Commit>, LixError> {
-        crate::commit_store::storage::scan_commits(&mut *self.store.lock().await).await
+        crate::commit_store::storage::scan_commits(&*self.store.lock().await).await
     }
 
     pub(crate) async fn load_change_pack(
@@ -102,7 +102,7 @@ where
         pack_id: u32,
     ) -> Result<Option<Vec<crate::commit_store::Change>>, LixError> {
         crate::commit_store::storage::load_change_pack(
-            &mut *self.store.lock().await,
+            &*self.store.lock().await,
             commit_id,
             pack_id,
         )
@@ -115,7 +115,7 @@ where
         pack_id: u32,
     ) -> Result<Option<Vec<crate::commit_store::ChangeLocator>>, LixError> {
         crate::commit_store::storage::load_membership_pack(
-            &mut *self.store.lock().await,
+            &*self.store.lock().await,
             commit_id,
             pack_id,
         )
@@ -130,10 +130,9 @@ where
             return Ok(Vec::new());
         }
 
-        let mut store = self.store.lock().await;
+        let store = self.store.lock().await;
         let entries =
-            crate::commit_store::storage::load_change_index_entries(&mut *store, change_ids)
-                .await?;
+            crate::commit_store::storage::load_change_index_entries(&*store, change_ids).await?;
         let mut changes = Vec::with_capacity(entries.len());
         let mut commits_by_id = BTreeMap::new();
         let mut packs_by_locator = BTreeMap::new();
@@ -142,8 +141,7 @@ where
                 Some(ChangeIndexEntry::CommitHeader { commit_id, .. }) => {
                     if !commits_by_id.contains_key(&commit_id) {
                         let commit =
-                            crate::commit_store::storage::load_commit(&mut *store, &commit_id)
-                                .await?;
+                            crate::commit_store::storage::load_commit(&*store, &commit_id).await?;
                         commits_by_id.insert(commit_id.clone(), commit);
                     }
                     commits_by_id
@@ -154,7 +152,7 @@ where
                 }
                 Some(ChangeIndexEntry::PackedChange { locator }) => Some(
                     load_change_by_locator_cached(
-                        &mut *store,
+                        &*store,
                         &mut packs_by_locator,
                         &locator,
                         change_id,
@@ -175,10 +173,9 @@ where
             return Ok(Vec::new());
         }
 
-        let mut store = self.store.lock().await;
+        let store = self.store.lock().await;
         let entries =
-            crate::commit_store::storage::load_change_index_entries(&mut *store, change_ids)
-                .await?;
+            crate::commit_store::storage::load_change_index_entries(&*store, change_ids).await?;
         let mut changes = Vec::with_capacity(entries.len());
         let mut commits_by_id = BTreeMap::new();
         let mut packs_by_locator = BTreeMap::new();
@@ -187,8 +184,7 @@ where
                 Some(ChangeIndexEntry::CommitHeader { commit_id, .. }) => {
                     if !commits_by_id.contains_key(&commit_id) {
                         let commit =
-                            crate::commit_store::storage::load_commit(&mut *store, &commit_id)
-                                .await?;
+                            crate::commit_store::storage::load_commit(&*store, &commit_id).await?;
                         commits_by_id.insert(commit_id.clone(), commit);
                     }
                     commits_by_id
@@ -199,7 +195,7 @@ where
                 }
                 Some(ChangeIndexEntry::PackedChange { locator }) => Some(LocatedChange {
                     record: load_change_by_locator_cached(
-                        &mut *store,
+                        &*store,
                         &mut packs_by_locator,
                         &locator,
                         change_id,
@@ -218,9 +214,8 @@ where
         &self,
         commit_id: &str,
     ) -> Result<Vec<crate::commit_store::Change>, LixError> {
-        let mut store = self.store.lock().await;
-        let Some(commit) =
-            crate::commit_store::storage::load_commit(&mut *store, commit_id).await?
+        let store = self.store.lock().await;
+        let Some(commit) = crate::commit_store::storage::load_commit(&*store, commit_id).await?
         else {
             return Ok(Vec::new());
         };
@@ -228,8 +223,7 @@ where
         let mut changes = Vec::new();
         for pack_id in 0..commit.change_pack_count {
             let Some(mut pack_changes) =
-                crate::commit_store::storage::load_change_pack(&mut *store, commit_id, pack_id)
-                    .await?
+                crate::commit_store::storage::load_change_pack(&*store, commit_id, pack_id).await?
             else {
                 return Err(missing_pack_error("change", commit_id, pack_id));
             };
@@ -238,14 +232,13 @@ where
 
         for pack_id in 0..commit.membership_pack_count {
             let Some(locators) =
-                crate::commit_store::storage::load_membership_pack(&mut *store, commit_id, pack_id)
+                crate::commit_store::storage::load_membership_pack(&*store, commit_id, pack_id)
                     .await?
             else {
                 return Err(missing_pack_error("membership", commit_id, pack_id));
             };
             for locator in locators {
-                let change =
-                    load_change_by_locator(&mut *store, &locator, &locator.change_id).await?;
+                let change = load_change_by_locator(&*store, &locator, &locator.change_id).await?;
                 changes.push(change);
             }
         }
@@ -257,13 +250,13 @@ where
         &self,
         request: &ChangeScanRequest,
     ) -> Result<Vec<LocatedChange>, LixError> {
-        scan_changes_from_commit_store(&mut *self.store.lock().await, request).await
+        scan_changes_from_commit_store(&*self.store.lock().await, request).await
     }
 }
 
 /// Commit-store writer over read visibility and a transaction-local write set.
 pub(crate) struct CommitStoreWriter<'a, S: ?Sized> {
-    store: &'a mut S,
+    store: &'a S,
     writes: &'a mut StorageWriteSet,
 }
 
@@ -275,7 +268,7 @@ struct PendingCommitDraft<'a> {
 
 impl<S> CommitStoreWriter<'_, S>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + ?Sized,
 {
     /// Validates and stages canonical commit-store writes for complete commits.
     ///
@@ -389,7 +382,7 @@ where
 }
 
 async fn validate_stage_commits<'a>(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commits: &[PendingCommitDraft<'a>],
 ) -> Result<BTreeMap<&'a str, ChangeLocator>, LixError> {
     validate_new_changes_absent(store, commits).await?;
@@ -397,7 +390,7 @@ async fn validate_stage_commits<'a>(
 }
 
 async fn scan_changes_from_commit_store(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     request: &ChangeScanRequest,
 ) -> Result<Vec<LocatedChange>, LixError> {
     let limit = request.limit.unwrap_or(usize::MAX);
@@ -434,7 +427,7 @@ async fn scan_changes_from_commit_store(
 }
 
 async fn load_change_by_locator(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     locator: &ChangeLocator,
     expected_change_id: &str,
 ) -> Result<Change, LixError> {
@@ -480,7 +473,7 @@ async fn load_change_by_locator(
 }
 
 async fn load_change_by_locator_cached(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     packs_by_locator: &mut BTreeMap<(String, u32), Vec<Change>>,
     locator: &ChangeLocator,
     expected_change_id: &str,
@@ -565,7 +558,7 @@ fn missing_pack_error(label: &str, commit_id: &str, pack_id: u32) -> LixError {
 }
 
 async fn validate_new_changes_absent<'a>(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commits: &[PendingCommitDraft<'a>],
 ) -> Result<(), LixError> {
     let mut change_ids = Vec::new();
@@ -583,7 +576,7 @@ async fn validate_new_changes_absent<'a>(
         }
     }
 
-    let reader = CommitStoreContext::new().reader(&mut *store);
+    let reader = CommitStoreContext::new().reader(&*store);
     let existing_changes = reader.load_change_index_entries(&change_ids).await?;
     for (change_id, existing) in change_ids.iter().zip(existing_changes) {
         if existing.is_some() {
@@ -597,7 +590,7 @@ async fn validate_new_changes_absent<'a>(
 }
 
 async fn validate_adopted_changes_present<'a>(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commits: &[PendingCommitDraft<'a>],
 ) -> Result<BTreeMap<&'a str, ChangeLocator>, LixError> {
     let mut expected_changes = Vec::new();
@@ -624,7 +617,7 @@ async fn validate_adopted_changes_present<'a>(
         .iter()
         .map(|change| change.id.to_string())
         .collect::<Vec<_>>();
-    let reader = CommitStoreContext::new().reader(&mut *store);
+    let reader = CommitStoreContext::new().reader(&*store);
     let existing_entries = reader.load_change_index_entries(&change_ids).await?;
     let mut locators_by_change_id = BTreeMap::new();
     for (expected, existing) in expected_changes.into_iter().zip(existing_entries) {
@@ -675,7 +668,7 @@ async fn load_packed_change<S>(
     expected_change_id: &str,
 ) -> Result<Change, LixError>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     let pack = reader
         .load_change_pack(&locator.source_commit_id, locator.source_pack_id)
@@ -740,26 +733,23 @@ fn duplicate_change_id_error(change_id: &str) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::backend::testing::UnitTestBackend;
     use crate::commit_store::{
         ChangeIndexEntry, ChangeLocator, CommitDraftRef, CommitStoreContext,
     };
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
-    use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
     #[tokio::test]
     async fn load_changes_materializes_commit_header_and_packed_change() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         let parent_ids = vec!["parent-1".to_string()];
         let author_account_ids = vec!["author-1".to_string()];
         let commit_id = "commit-1".to_string();
@@ -767,7 +757,7 @@ mod tests {
         let authored_change = test_change("change-1");
 
         CommitStoreContext::new()
-            .writer(transaction.as_mut(), &mut writes)
+            .writer(&read, &mut writes)
             .stage_commit_draft(
                 CommitDraftRef {
                     id: &commit_id,
@@ -781,13 +771,14 @@ mod tests {
             )
             .await
             .expect("commit should stage");
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("writes should apply");
-        transaction.commit().await.expect("commit should persist");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("commit should persist");
 
-        let reader = CommitStoreContext::new().reader(storage.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let reader = CommitStoreContext::new().reader(read);
         let index_entries = reader
             .load_change_index_entries(&[
                 commit_change_id.clone(),
@@ -847,11 +838,11 @@ mod tests {
 
     #[tokio::test]
     async fn load_commit_changes_returns_equivalent_authored_and_adopted_changes() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let authored_change = test_change("shared-change-1");
 
         stage_test_commit(
-            storage.clone(),
+            &storage,
             "source-commit",
             "source-commit-change",
             vec![authored_change.as_ref()],
@@ -859,7 +850,7 @@ mod tests {
         )
         .await;
         stage_test_commit(
-            storage.clone(),
+            &storage,
             "adopting-commit",
             "adopting-commit-change",
             Vec::new(),
@@ -867,7 +858,10 @@ mod tests {
         )
         .await;
 
-        let reader = CommitStoreContext::new().reader(storage.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let reader = CommitStoreContext::new().reader(read);
         let source_changes = reader
             .load_commit_changes("source-commit")
             .await
@@ -894,22 +888,21 @@ mod tests {
     }
 
     async fn stage_test_commit(
-        storage: StorageContext,
+        storage: &StorageContext,
         commit_id: &str,
         commit_change_id: &str,
         authored_changes: Vec<ChangeRef<'_>>,
         adopted_changes: Vec<ChangeRef<'_>>,
     ) {
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         let parent_ids = Vec::new();
         let author_account_ids = Vec::new();
 
         CommitStoreContext::new()
-            .writer(transaction.as_mut(), &mut writes)
+            .writer(&read, &mut writes)
             .stage_commit_draft(
                 CommitDraftRef {
                     id: commit_id,
@@ -923,11 +916,9 @@ mod tests {
             )
             .await
             .expect("commit should stage");
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("writes should apply");
-        transaction.commit().await.expect("commit should persist");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("commit should persist");
     }
 
     fn test_change(id: &str) -> Change {
