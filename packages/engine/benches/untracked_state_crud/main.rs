@@ -10,13 +10,15 @@ use lix_engine::backend::{
     SpaceId, WriteOptions,
 };
 use lix_engine::storage::{
-    PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions,
-    StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
-    StorageWriteOptions,
+    InMemoryStorageBackend, PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection,
+    StorageGetOptions, StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace,
+    StorageValue, StorageWriteOptions,
 };
+use lix_engine::{Engine, SessionContext};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
+use tokio::runtime::Runtime;
 
 #[allow(dead_code)]
 #[path = "../../tests/backend/support/redb_backend.rs"]
@@ -34,7 +36,10 @@ use sqlite_backend::SqliteBackend;
 
 const SMOKE_ROWS: usize = 1_000;
 const REAL_WORKLOAD_ROWS: usize = 10_000;
-const PNPM_LOCK_JSON: &str = include_str!("pnpm-lock.fixture.json");
+const PNPM_LOCK_JSON: &str = include_str!("../fixtures/pnpm-lock.fixture.json");
+const JSON_POINTER_SCHEMA_JSON: &str =
+    include_str!("../optimization9_sql2/json_pointer.schema.json");
+const SESSION_INSERT_CHUNK_SIZE: usize = 500;
 const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0001_0001), "untracked_state.row");
 
 #[derive(Clone)]
@@ -336,13 +341,19 @@ impl LixBackendProfile {
 }
 
 fn untracked_state_crud_benches(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create tokio runtime for session execute benchmarks");
     let rows = fixture_rows();
     maybe_print_io_report(&rows);
 
     bench_raw_sqlite(c, &rows, SMOKE_ROWS, "smoke");
     bench_lix(c, &rows, SMOKE_ROWS, "smoke");
+    bench_session_execute_untracked_insert(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_lix(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
+    bench_session_execute_untracked_insert(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
 }
 
 fn maybe_print_io_report(all_rows: &[PointerRow]) {
@@ -559,6 +570,33 @@ fn bench_lix_profile(
     });
 }
 
+fn bench_session_execute_untracked_insert(
+    c: &mut Criterion,
+    runtime: &Runtime,
+    all_rows: &[PointerRow],
+    row_count: usize,
+    label: &str,
+) {
+    let rows = all_rows[..row_count].to_vec();
+    let mut group = c.benchmark_group(format!(
+        "untracked_state_crud/session_execute_untracked/in_memory/{label}"
+    ));
+    configure_group(&mut group, row_count);
+
+    group.bench_function(format!("insert_all_rows/{}", row_label(row_count)), |b| {
+        b.iter_batched(
+            || runtime.block_on(prepare_session_empty()),
+            |session| {
+                runtime.block_on(insert_untracked_json_pointer_rows(&session, &rows));
+                black_box(rows.len())
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.finish();
+}
+
 fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
     match profile {
         LixBackendProfile::Sqlite => measure_lix_io_for_backend(sqlite_backend(), operation, rows),
@@ -746,6 +784,59 @@ enum ProfileStorage {
     Redb(StorageContext<RedbBackend>),
 }
 
+async fn prepare_session_empty() -> SessionContext<InMemoryStorageBackend> {
+    let backend = InMemoryStorageBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("initialize in-memory engine");
+    let engine = Engine::new(backend).await.expect("open in-memory engine");
+    let setup = engine
+        .open_workspace_session()
+        .await
+        .expect("open in-memory setup session");
+    register_json_pointer_schema(&setup).await;
+    engine
+        .open_workspace_session()
+        .await
+        .expect("open in-memory benchmark session")
+}
+
+async fn register_json_pointer_schema<B>(session: &SessionContext<B>)
+where
+    B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let sql = format!(
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+         VALUES (lix_json('{}'), false, false)",
+        sql_string(JSON_POINTER_SCHEMA_JSON)
+    );
+    let affected = session
+        .execute(&sql, &[])
+        .await
+        .expect("register json_pointer schema")
+        .rows_affected();
+    assert_eq!(affected, 1);
+}
+
+async fn insert_untracked_json_pointer_rows<B>(session: &SessionContext<B>, rows: &[PointerRow])
+where
+    B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
+        let sql = insert_untracked_json_pointer_sql(chunk);
+        let affected = session
+            .execute(&sql, &[])
+            .await
+            .expect("insert untracked json_pointer rows")
+            .rows_affected();
+        assert_eq!(affected as usize, chunk.len());
+    }
+}
+
 impl ProfileStorage {
     fn insert_all(&self, rows: &[BenchRow]) -> usize {
         match self {
@@ -837,18 +928,20 @@ fn fixture_rows() -> Vec<PointerRow> {
 }
 
 fn flatten_json(path: &str, value: &JsonValue, rows: &mut Vec<PointerRow>) {
-    let value_json = serde_json::to_string(value).expect("serialize JSON pointer value");
-    let updated_value_json = serde_json::to_string(&serde_json::json!({
-        "path": path,
-        "value": value,
-        "updated": true
-    }))
-    .expect("serialize updated JSON pointer value");
-    rows.push(PointerRow {
-        path: path.to_string(),
-        value_json,
-        updated_value_json,
-    });
+    if !path.is_empty() {
+        let value_json = serde_json::to_string(value).expect("serialize JSON pointer value");
+        let updated_value_json = serde_json::to_string(&serde_json::json!({
+            "path": path,
+            "value": value,
+            "updated": true
+        }))
+        .expect("serialize updated JSON pointer value");
+        rows.push(PointerRow {
+            path: path.to_string(),
+            value_json,
+            updated_value_json,
+        });
+    }
 
     match value {
         JsonValue::Array(items) => {
@@ -908,12 +1001,23 @@ fn raw_rows(rows: &[PointerRow]) -> Vec<RawUntrackedRow> {
         .collect()
 }
 
-fn entity_id(row: &PointerRow) -> String {
-    if row.path.is_empty() {
-        "/".to_string()
-    } else {
-        row.path.clone()
+fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
+    let mut sql = String::from("INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ");
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!(
+            "('{}', lix_json('{}'), true)",
+            sql_string(row.path.as_str()),
+            sql_string(row.value_json.as_str())
+        ));
     }
+    sql
+}
+
+fn entity_id(row: &PointerRow) -> String {
+    row.path.clone()
 }
 
 fn row_key(entity_id: &str) -> Vec<u8> {
@@ -937,6 +1041,10 @@ fn snapshot_value(path: &str, value_json: &str) -> String {
 
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("serialize JSON string")
+}
+
+fn sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn prepare_raw_sqlite_empty() -> RawSqliteFixture {
