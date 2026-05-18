@@ -38,8 +38,8 @@ use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageContext, StorageReader,
-    StorageWriteSet,
+    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageContext, StorageReadOptions,
+    StorageReader, StorageWriteSet,
 };
 
 #[derive(Clone)]
@@ -869,7 +869,8 @@ pub async fn load_commits_physical_with_projection<B: BenchBackend>(
     commit_ids: &[String],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError> {
-    let mut reader = store.context.reader(store.storage.clone());
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut reader = store.context.reader(read);
     let batch = reader
         .load_commits(CommitLoadRequest {
             commit_ids,
@@ -892,7 +893,8 @@ pub async fn load_commits_visible_with_projection<B: BenchBackend>(
     commit_ids: &[String],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError> {
-    let mut reader = store.context.reader(store.storage.clone());
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut reader = store.context.reader(read);
     let batch = reader
         .load_commits(CommitLoadRequest {
             commit_ids,
@@ -920,7 +922,8 @@ pub async fn load_changes_physical_with_projection<B: BenchBackend>(
     change_ids: &[String],
     projection: BenchChangeProjection,
 ) -> Result<usize, LixError> {
-    let mut reader = store.context.reader(store.storage.clone());
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut reader = store.context.reader(read);
     let batch = reader
         .load_changes(ChangeLoadRequest {
             change_ids,
@@ -944,7 +947,8 @@ pub async fn load_changes_visible_with_projection<B: BenchBackend>(
     change_ids: &[String],
     projection: BenchChangeProjection,
 ) -> Result<usize, LixError> {
-    let mut reader = store.context.reader(store.storage.clone());
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut reader = store.context.reader(read);
     let batch = reader
         .load_changes(ChangeLoadRequest {
             change_ids,
@@ -1085,7 +1089,8 @@ pub async fn plan_gc<B: BenchBackend>(
     store: &BenchStore<B>,
     root_commit_id: &str,
 ) -> Result<BenchGcStats, LixError> {
-    let mut reader = store.context.reader(store.storage.clone());
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut reader = store.context.reader(read);
     let plan = reader
         .plan_gc(&[GcRoot::VersionHead(root_commit_id.to_string())])
         .await?;
