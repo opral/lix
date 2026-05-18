@@ -137,6 +137,8 @@ pub(crate) enum ScanOperator {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct LiveStateFilter {
     #[serde(default)]
+    pub(crate) rows: LiveStateRowFilter,
+    #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
     pub(crate) entity_ids: Vec<EntityIdentity>,
@@ -150,6 +152,13 @@ pub(crate) struct LiveStateFilter {
     pub(crate) constraints: Vec<ScanConstraint>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub(crate) enum LiveStateRowFilter {
+    #[default]
+    All,
+    None,
 }
 
 impl From<LiveStateFilter> for UntrackedStateFilter {

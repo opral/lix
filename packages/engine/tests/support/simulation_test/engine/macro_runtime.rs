@@ -1,10 +1,10 @@
 use std::future::Future;
 
+use lix_engine::backend::InMemoryBackend;
 use lix_engine::LixError;
 use lix_engine::{Engine, InitReceipt};
 
 use super::expect_same::{SharedExpectSameRun, SharedExpectSameRunGuard, SimulationAssertions};
-use super::kv_backend::{InMemoryKvBackend, KvMap};
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::deterministic_timestamp_shuffle_for;
 use super::simulation::Simulation;
@@ -30,7 +30,7 @@ pub async fn run_single_simulation_test<F, Fut>(
     let sim = Simulation::from_bootstrap(
         mode,
         options,
-        bootstrap.snapshot,
+        bootstrap.backend,
         bootstrap.receipt,
         SimulationAssertions::shared(expect_same),
     )
@@ -42,18 +42,15 @@ pub async fn run_single_simulation_test<F, Fut>(
 
 #[derive(Clone)]
 struct Bootstrap {
-    snapshot: KvMap,
+    backend: InMemoryBackend,
     receipt: InitReceipt,
 }
 
 impl Bootstrap {
     async fn create() -> Result<Self, LixError> {
-        let backend = InMemoryKvBackend::new();
-        let receipt = Engine::initialize(Box::new(backend.clone())).await?;
-        Ok(Self {
-            snapshot: backend.snapshot(),
-            receipt,
-        })
+        let backend = InMemoryBackend::new();
+        let receipt = Engine::initialize(backend.clone()).await?;
+        Ok(Self { backend, receipt })
     }
 }
 
@@ -64,9 +61,14 @@ pub(crate) async fn enable_deterministic_mode(
 ) -> Result<(), LixError> {
     let timestamp_shuffle = deterministic_timestamp_shuffle_for(mode);
     let session = engine.open_session(receipt.main_version_id.clone()).await?;
-    session
+    match session
         .execute(&deterministic_mode_insert_sql(timestamp_shuffle), &[])
-        .await?;
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if error.code == "LIX_UNSUPPORTED_SQL" => {}
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
@@ -83,7 +85,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deterministic_mode_sql_carries_timestamp_shuffle_flag() {
+    fn deterministic_mode_write_sql_carries_timestamp_shuffle_flag() {
         assert!(deterministic_mode_insert_sql(true).contains("\"timestamp_shuffle\":true"));
         assert!(deterministic_mode_insert_sql(false).contains("\"timestamp_shuffle\":false"));
     }

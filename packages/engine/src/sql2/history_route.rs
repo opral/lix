@@ -12,6 +12,7 @@ use crate::LixError;
 
 use super::SqlJsonReader;
 use crate::commit_store::{materialize_change, MaterializedChange};
+use crate::storage::StorageRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
@@ -204,13 +205,16 @@ pub(crate) fn commit_graph_history_request(
 ///
 /// Providers pass the schema keys they know how to shape. An empty list means
 /// "do not constrain by provider schema"; this is what `lix_state_history` uses.
-pub(crate) async fn load_history_entries(
+pub(crate) async fn load_history_entries<S>(
     descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    mut json_reader: SqlJsonReader,
+    mut json_reader: SqlJsonReader<S>,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
-) -> Result<Vec<HistoryEntry>, LixError> {
+) -> Result<Vec<HistoryEntry>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
     if route.is_contradictory() {
         return Ok(Vec::new());
     }

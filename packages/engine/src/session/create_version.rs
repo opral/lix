@@ -1,3 +1,4 @@
+use crate::storage::StorageBackend;
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 use crate::version::{
     version_descriptor_stage_row, version_ref_stage_row, VersionLifecycle, VersionOperation,
@@ -28,7 +29,12 @@ pub struct CreateVersionReceipt {
     pub commit_id: String,
 }
 
-impl SessionContext {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Creates a new version from this session's current version head.
     ///
     /// Version descriptors are tracked global facts so every version agrees on

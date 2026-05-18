@@ -2,43 +2,14 @@
 name = "lix_engine"
 version = "0.1.0"
 edition = "2021"
+autobenches = false
 
 [features]
 storage-benches = []
 
 [[bench]]
-name = "storage"
-path = "benches/storage/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "transaction"
-path = "benches/transaction/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "physical_layout"
-path = "benches/physical_layout/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "json_pointer_crud"
-path = "benches/json_pointer_crud/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "optimization9_sql2"
-path = "benches/optimization9_sql2/main.rs"
-harness = false
-required-features = ["storage-benches"]
-
-[[bench]]
-name = "json_pointer_physical"
-path = "benches/json_pointer_physical/main.rs"
+name = "storage_v2"
+path = "benches/storage_v2.rs"
 harness = false
 required-features = ["storage-benches"]
 
@@ -79,6 +50,7 @@ harness = false
 required-features = ["storage-benches"]
 
 [dependencies]
+ahash = "0.8"
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
@@ -104,12 +76,15 @@ blake3 = "1"
 fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
+bytes = "1"
 
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 iref = "4.0.0"
 paste = "1"
 rocksdb = { version = "0.22", default-features = false }
+redb = "4.1.0"
+rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }

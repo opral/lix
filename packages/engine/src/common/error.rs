@@ -259,6 +259,18 @@ impl LixError {
     }
 }
 
+impl From<crate::storage::StorageBackendError> for LixError {
+    fn from(error: crate::storage::StorageBackendError) -> Self {
+        Self::new(Self::CODE_STORAGE_ERROR, error.to_string())
+    }
+}
+
+impl From<crate::storage::StorageWriteSetError> for LixError {
+    fn from(error: crate::storage::StorageWriteSetError) -> Self {
+        Self::new(Self::CODE_STORAGE_ERROR, error.to_string())
+    }
+}
+
 impl std::fmt::Display for LixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.format())

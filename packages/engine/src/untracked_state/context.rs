@@ -1,4 +1,4 @@
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateIdentityRef,
     UntrackedStateRowRef, UntrackedStateRowRequest, UntrackedStateScanRequest,
@@ -23,7 +23,7 @@ impl UntrackedStateContext {
     /// The caller decides which KV store supplies visibility for the read.
     pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead + Send + Sync,
     {
         UntrackedStateStoreReader { store }
     }
@@ -44,20 +44,20 @@ pub(crate) struct UntrackedStateStoreReader<S> {
 
 impl<S> UntrackedStateStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     pub(crate) async fn scan_rows(
         &mut self,
         request: &UntrackedStateScanRequest,
     ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
-        crate::untracked_state::storage::scan_rows(&mut self.store, request).await
+        crate::untracked_state::storage::scan_rows(&self.store, request).await
     }
 
     pub(crate) async fn load_row(
         &mut self,
         request: &UntrackedStateRowRequest,
     ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
-        crate::untracked_state::storage::load_row(&mut self.store, request).await
+        crate::untracked_state::storage::load_row(&self.store, request).await
     }
 
     pub(crate) async fn existing_identities<'a, I>(
@@ -67,7 +67,7 @@ where
     where
         I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
     {
-        crate::untracked_state::storage::existing_identities(&mut self.store, identities).await
+        crate::untracked_state::storage::existing_identities(&self.store, identities).await
     }
 }
 
