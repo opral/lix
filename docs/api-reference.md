@@ -22,7 +22,7 @@ Returns a `Lix` with the following methods.
 lix.execute(sql: string, params?: LixRuntimeValue[]): Promise<ExecuteResult>;
 ```
 
-Run one DataFusion SQL statement. Use numbered placeholders (`$1`, `$2`); bare `?` is rejected. Use `lix_json($1)` when binding a JSON-typed parameter.
+Run one DataFusion SQL statement. Use anonymous placeholders (`?`) or numbered placeholders (`$1`, `$2`); do not mix both styles in one statement. Use `lix_json(?)` or `lix_json($1)` when binding a JSON-typed parameter.
 
 ```ts
 type ExecuteResult = {
@@ -53,14 +53,14 @@ class Row {
 
 Use `value(name)` for a `Value` with typed accessors:
 
-| Method | Returns | For |
-| --- | --- | --- |
-| `asText()` | `string \| undefined` | text columns |
-| `asBoolean()` | `boolean \| undefined` | booleans |
-| `asInteger()` | `number \| undefined` | integers |
-| `asReal()` | `number \| undefined` | decimals |
-| `asJson()` | `JsonValue \| undefined` | JSON / objects / arrays |
-| `asBlob()` | `Uint8Array \| undefined` | bytes |
+| Method        | Returns                   | For                     |
+| ------------- | ------------------------- | ----------------------- |
+| `asText()`    | `string \| undefined`     | text columns            |
+| `asBoolean()` | `boolean \| undefined`    | booleans                |
+| `asInteger()` | `number \| undefined`     | integers                |
+| `asReal()`    | `number \| undefined`     | decimals                |
+| `asJson()`    | `JsonValue \| undefined`  | JSON / objects / arrays |
+| `asBlob()`    | `Uint8Array \| undefined` | bytes                   |
 
 Accessors return `undefined` when the cell kind doesn't match. Branch on `value.kind` (`"null" | "boolean" | "integer" | "real" | "text" | "json" | "blob"`) for polymorphic columns.
 
@@ -138,14 +138,14 @@ Always close in scripts and tests.
 
 ## Built-in tables
 
-| Table | Purpose |
-| --- | --- |
-| `lix_registered_schema` | App schemas (and built-ins). Insert into `value` to register. See [Schemas](./schemas.md). |
-| `lix_change` | Immutable global change journal. Columns: `id`, `entity_id`, `schema_key`, `schema_version`, `file_id`, `metadata`, `snapshot_content`, `created_at`. No version filter; `lix_change` is global. |
-| `lix_state` / `lix_state_by_version` / `lix_state_history` | Schema-agnostic JSON state. Active version, cross-version, and time-travel respectively. See [SQL Surfaces](./surfaces.md). |
-| `lix_version` | Writable version surface: `id`, `name`, `hidden`, `commit_id`. |
-| `lix_file` / `lix_file_by_version` / `lix_file_history` | Versioned files (with `data` bytes), cross-version reads/writes, and history. |
-| `lix_directory` / `lix_directory_by_version` / `lix_directory_history` | Directory tree, cross-version, and history. |
+| Table                                                                  | Purpose                                                                                                                                                                                          |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `lix_registered_schema`                                                | App schemas (and built-ins). Insert into `value` to register. See [Schemas](./schemas.md).                                                                                                       |
+| `lix_change`                                                           | Immutable global change journal. Columns: `id`, `entity_id`, `schema_key`, `schema_version`, `file_id`, `metadata`, `snapshot_content`, `created_at`. No version filter; `lix_change` is global. |
+| `lix_state` / `lix_state_by_version` / `lix_state_history`             | Schema-agnostic JSON state. Active version, cross-version, and time-travel respectively. See [SQL Surfaces](./surfaces.md).                                                                      |
+| `lix_version`                                                          | Writable version surface: `id`, `name`, `hidden`, `commit_id`.                                                                                                                                   |
+| `lix_file` / `lix_file_by_version` / `lix_file_history`                | Versioned files (with `data` bytes), cross-version reads/writes, and history.                                                                                                                    |
+| `lix_directory` / `lix_directory_by_version` / `lix_directory_history` | Directory tree, cross-version, and history.                                                                                                                                                      |
 
 Every registered schema `X` produces three typed surfaces:
 
@@ -157,17 +157,17 @@ For the full grid of state / per-entity / file / directory surfaces and how they
 
 ## Built-in SQL functions
 
-| Function | What it does |
-| --- | --- |
-| `lix_active_version_commit_id()` | Commit id at the active version's tip. Use to scope `_history` queries (the planner rejects subqueries on `start_commit_id`). |
-| `lix_json(text)` | Parse JSON text into a JSON-typed value. Use when binding JSON parameters. |
-| `lix_json_get(json, path...)` | Project a JSON-typed value out of a JSON column. |
-| `lix_json_get_text(json, path...)` | Project a value out of a JSON column as text. |
-| `lix_uuid_v7()` | Generate a UUIDv7 string. |
-| `lix_timestamp()` | Current ISO-8601 timestamp string. |
-| `lix_text_decode(blob[, encoding])` | Decode a `BLOB` to text (default `utf-8`). |
-| `lix_text_encode(text[, encoding])` | Encode text to a `BLOB`. |
-| `lix_empty_blob()` | Zero-byte `BLOB` literal. |
+| Function                            | What it does                                                                                                                  |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `lix_active_version_commit_id()`    | Commit id at the active version's tip. Use to scope `_history` queries (the planner rejects subqueries on `start_commit_id`). |
+| `lix_json(text)`                    | Parse JSON text into a JSON-typed value. Use when binding JSON parameters.                                                    |
+| `lix_json_get(json, path...)`       | Project a JSON-typed value out of a JSON column.                                                                              |
+| `lix_json_get_text(json, path...)`  | Project a value out of a JSON column as text.                                                                                 |
+| `lix_uuid_v7()`                     | Generate a UUIDv7 string.                                                                                                     |
+| `lix_timestamp()`                   | Current ISO-8601 timestamp string.                                                                                            |
+| `lix_text_decode(blob[, encoding])` | Decode a `BLOB` to text (default `utf-8`).                                                                                    |
+| `lix_text_encode(text[, encoding])` | Encode text to a `BLOB`.                                                                                                      |
+| `lix_empty_blob()`                  | Zero-byte `BLOB` literal.                                                                                                     |
 
 See [SQL Functions](./sql-functions.md) for examples and signatures.
 

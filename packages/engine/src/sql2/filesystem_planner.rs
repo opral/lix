@@ -12,6 +12,7 @@ use crate::common::{
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 use super::filesystem_visibility::VisibleFilesystem;
 use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
@@ -675,8 +676,13 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
         let Some(snapshot_content) = row.snapshot_content.as_deref() else {
             continue;
         };
+        let storage_version_id = if row.global {
+            GLOBAL_VERSION_ID
+        } else {
+            row.version_id.as_str()
+        };
         let resolver_key = filesystem_storage_scope_key(
-            &row.version_id,
+            storage_version_id,
             row.global,
             row.untracked,
             row.file_id.as_deref(),

@@ -14,9 +14,10 @@ use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
     TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
 };
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::tracked_state::TrackedStateRowRequest;
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateRowRequest,
-    TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -147,6 +148,7 @@ where
         Ok(rows)
     }
 
+    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn load_rows_at_commit(
         &mut self,
         commit_id: &str,
@@ -925,6 +927,7 @@ fn scan_needs_json_payloads(request: &TrackedStateScanRequest) -> bool {
         .any(|column| column == "snapshot_content" || column == "metadata")
 }
 
+#[cfg(any(test, feature = "storage-benches"))]
 fn tracked_key_from_request(request: &TrackedStateRowRequest) -> Result<TrackedStateKey, LixError> {
     let file_id = match &request.file_id {
         crate::NullableKeyFilter::Null => None,

@@ -108,9 +108,9 @@ Use the version of this skill that ships with the installed `@lix-js/sdk` packag
 
 Useful installed-package references:
 
-- `dist-engine-src/src/sql2/entity_provider.rs` - registered schema SQL surfaces.
-- `dist-engine-src/src/sql2/change_provider.rs` - `lix_change` projection.
-- `dist-engine-src/src/sql2/version_provider.rs` - writable `lix_version` surface.
+- `dist-engine-src/src/sql2/providers/entity.rs` - registered schema SQL surfaces.
+- `dist-engine-src/src/sql2/providers/change.rs` - `lix_change` projection.
+- `dist-engine-src/src/sql2/providers/version.rs` - writable `lix_version` surface.
 - `dist-engine-src/src/transaction/validation.rs` - primary-key, unique, foreign-key, and shape validation.
 - `dist-engine-src/src/schema/definition.json` - Lix schema-definition meta-schema.
 - `dist-engine-src/src/schema/builtin/` - built-in entity table shapes.

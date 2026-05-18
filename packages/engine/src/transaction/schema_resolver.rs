@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    overlay_scan_rows, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
-use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::staging::PreparedStateRowOverlay;
 use crate::LixError;
 
@@ -144,6 +144,20 @@ impl LiveStateReader for TransactionSchemaLiveStateReader<'_> {
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        self.base.load_row(request).await
+        Ok(self
+            .scan_rows(&LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec![request.schema_key.clone()],
+                    entity_ids: vec![request.entity_id.clone()],
+                    version_ids: vec![request.version_id.clone()],
+                    file_ids: vec![request.file_id.clone()],
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .next())
     }
 }

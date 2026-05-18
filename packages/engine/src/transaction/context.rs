@@ -22,7 +22,7 @@ use crate::storage::{
 use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
-use crate::transaction::live_state_overlay::overlay_scan_rows;
+use crate::live_state::overlay_scan_rows;
 use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
