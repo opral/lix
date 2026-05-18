@@ -4181,3 +4181,75 @@ version_ids populated by scan_scope and schema/entity filters from the query,
 the backend scan narrows at least to version_id and often to
 version_id/schema_key or exact entity/file prefixes.
 ```
+
+## Real Session Execute Profile: untracked json_pointer insert
+
+Date: 2026-05-18
+
+Goal:
+
+```text
+Measure the real public SQL/session write path for untracked rows instead of
+the storage-level untracked_state_crud harness.
+```
+
+Benchmark target:
+
+```text
+packages/engine/benches/untracked_state_crud/main.rs
+```
+
+Workload:
+
+```text
+fixture: packages/engine/benches/fixtures/pnpm-lock.fixture.json
+schema: packages/engine/benches/optimization9_sql2/json_pointer.schema.json
+rows: smoke = 1,000; real_workload = 10,000
+SQL path: SessionContext::execute(...)
+insert shape:
+  INSERT INTO json_pointer (path, value, lixcol_untracked)
+  VALUES (..., lix_json(...), true)
+chunk size: 500 rows per execute call
+backend: in-memory StorageBackend
+```
+
+Fixture note:
+
+```text
+The root JSON pointer has an empty path. Untracked-state entity identities
+reject empty primary-key values, so the session benchmark skips the root row
+and then takes the first 1k/10k non-root JSON pointer rows.
+```
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/session_execute_untracked/in_memory/(smoke|real_workload)/insert_all_rows/(1k|10k)'
+```
+
+Result:
+
+| workload | backend   | operation             |          time 95% CI | rows | execute calls | time/row |
+| -------- | --------- | --------------------- | -------------------: | ---: | ------------: | -------: |
+| smoke    | in_memory | `insert_all_rows/1k`  | 20.198 ms..20.349 ms | 1000 |             2 | 20.3 us  |
+| real     | in_memory | `insert_all_rows/10k` | 206.62 ms..219.20 ms | 10000 |            20 | 21.1 us  |
+
+Interpretation:
+
+```text
+The real public write path is roughly linear from 1k to 10k rows at about
+20-21 microseconds per JSON pointer row on the in-memory backend. This measures
+SQL parsing/planning/execution, public write binding, transaction staging, and
+untracked-state writes through SessionContext::execute. It does not measure
+durable SQLite/RocksDB/redb backend costs because the current session Engine
+requires backend read scopes with Clone + Send + Sync bounds that the bench
+support durable backends do not currently satisfy.
+```
+
+Commit scope:
+
+```text
+Add a real SessionContext::execute profile to untracked_state_crud for
+untracked json_pointer inserts. Keep the profile in-memory until durable
+session-compatible bench backends are available.
+```
