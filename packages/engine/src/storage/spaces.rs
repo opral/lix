@@ -77,7 +77,7 @@ pub(crate) fn encode_physical_range(
     let upper = match range.upper {
         Bound::Included(key) => Bound::Included(encode_physical_key(space, &key)),
         Bound::Excluded(key) => Bound::Excluded(encode_physical_key(space, &key)),
-        Bound::Unbounded => Bound::Excluded(space_upper_bound(space)),
+        Bound::Unbounded => space_upper_bound(space),
     };
 
     KeyRange { lower, upper }
@@ -121,11 +121,11 @@ fn space_lower_bound(space: SpaceId) -> Key {
     Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))
 }
 
-fn space_upper_bound(space: SpaceId) -> Key {
+fn space_upper_bound(space: SpaceId) -> Bound<Key> {
     if space.0 == u32::MAX {
-        Key(Bytes::from_static(b"\xff\xff\xff\xff\xff"))
+        Bound::Unbounded
     } else {
-        Key(Bytes::copy_from_slice(&(space.0 + 1).to_be_bytes()))
+        Bound::Excluded(Key(Bytes::copy_from_slice(&(space.0 + 1).to_be_bytes())))
     }
 }
 
@@ -198,6 +198,35 @@ mod tests {
                 SpaceId(7),
                 &Key(bytes::Bytes::from_static(b"r"))
             ))
+        );
+    }
+
+    #[test]
+    fn max_space_unbounded_range_has_unbounded_physical_upper_bound() {
+        use std::ops::Bound;
+
+        let range = crate::backend::KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let encoded = super::encode_physical_range(SpaceId(u32::MAX), range, None);
+
+        assert_eq!(encoded.upper, Bound::Unbounded);
+    }
+
+    #[test]
+    fn non_max_space_unbounded_range_uses_next_space_exclusive_upper_bound() {
+        use std::ops::Bound;
+
+        let range = crate::backend::KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let encoded = super::encode_physical_range(SpaceId(7), range, None);
+
+        assert_eq!(
+            encoded.upper,
+            Bound::Excluded(Key(bytes::Bytes::from_static(b"\0\0\0\x08")))
         );
     }
 }
