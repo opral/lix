@@ -2,7 +2,6 @@ import { defineConfig, loadEnv, type Plugin } from "vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { pluginReadmeSync } from "./scripts/plugin-readme-sync";
 import { githubStarsPlugin } from "./src/ssg/github-stars-plugin";
 import { viteStaticCopy } from "vite-plugin-static-copy";
 import path from "path";
@@ -102,7 +101,6 @@ const config = defineConfig(({ mode, command }) => {
     plugins: [
       command === "serve" && blogAssetsPlugin(),
       command === "serve" && docsContentWatchPlugin(),
-      pluginReadmeSync(),
       githubStarsPlugin({
         token: githubToken,
       }),

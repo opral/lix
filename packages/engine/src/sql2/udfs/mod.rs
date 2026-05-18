@@ -8,14 +8,11 @@ mod lix_text_decode;
 mod lix_text_encode;
 mod lix_timestamp;
 mod lix_uuid_v7;
-mod public_call;
 
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::ScalarUDF;
 
 use crate::functions::FunctionProviderHandle;
-
-pub(crate) use public_call::validate_public_udf_calls;
 
 #[cfg(test)]
 pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {

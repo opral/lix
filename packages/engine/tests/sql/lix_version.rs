@@ -536,6 +536,37 @@ simulation_test!(lix_version_update_rejects_id_change, |sim| async move {
 });
 
 simulation_test!(
+    lix_version_update_rejects_global_version,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "UPDATE lix_version SET name = 'mutated-global' WHERE id = 'global'",
+                &[],
+            )
+            .await
+            .expect_err("global version should be immutable through UPDATE");
+        assert!(
+            error.to_string().contains("global version"),
+            "global update error should explain the restriction: {error:?}"
+        );
+
+        assert_eq!(
+            select_single_text(&session, "SELECT name FROM lix_version WHERE id = 'global'").await,
+            "global"
+        );
+    }
+);
+
+simulation_test!(
     lix_version_delete_missing_returns_zero_rows_affected,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -1,7 +1,7 @@
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{
-    UntrackedStateGetManyRequest, UntrackedStateGetManyResponse, UntrackedStateIdentityRef,
-    UntrackedStateRowRef, UntrackedStateScanRequest, UntrackedStateScanResponse,
+    MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateIdentityRef,
+    UntrackedStateRowRef, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -23,7 +23,7 @@ impl UntrackedStateContext {
     /// The caller decides which KV store supplies visibility for the read.
     pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead + Send + Sync,
     {
         UntrackedStateStoreReader { store }
     }
@@ -44,20 +44,30 @@ pub(crate) struct UntrackedStateStoreReader<S> {
 
 impl<S> UntrackedStateStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
-    pub(crate) async fn get_many(
+    pub(crate) async fn scan_rows(
         &mut self,
-        request: UntrackedStateGetManyRequest,
-    ) -> Result<UntrackedStateGetManyResponse, LixError> {
-        crate::untracked_state::storage::get_many(&mut self.store, request).await
+        request: &UntrackedStateScanRequest,
+    ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+        crate::untracked_state::storage::scan_rows(&self.store, request).await
     }
 
-    pub(crate) async fn scan(
+    pub(crate) async fn load_row(
         &mut self,
-        request: UntrackedStateScanRequest,
-    ) -> Result<UntrackedStateScanResponse, LixError> {
-        crate::untracked_state::storage::scan(&mut self.store, request).await
+        request: &UntrackedStateRowRequest,
+    ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
+        crate::untracked_state::storage::load_row(&self.store, request).await
+    }
+
+    pub(crate) async fn existing_identities<'a, I>(
+        &mut self,
+        identities: I,
+    ) -> Result<Vec<UntrackedStateIdentity>, LixError>
+    where
+        I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+    {
+        crate::untracked_state::storage::existing_identities(&self.store, identities).await
     }
 }
 

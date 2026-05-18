@@ -12,6 +12,7 @@ examples/sveltekit/package-lock.json
 .env*
 .dev.vars
 .nx
+.claude/
 
 # Benchmark reports and scratch databases
 benchmarks/engine2-json-pointer/output*/

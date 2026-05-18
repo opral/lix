@@ -1,540 +1,307 @@
-use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
+use crate::entity_identity::EntityIdentity;
+use crate::untracked_state::{UntrackedStateRow, UntrackedStateRowRef};
 use crate::LixError;
 
-const HEADER_VALUE_MAGIC: &[u8; 4] = b"LXUH";
-const PAYLOAD_VALUE_MAGIC: &[u8; 4] = b"LXUP";
-const PACKED_ROW_VALUE_MAGIC: &[u8; 4] = b"LXU2";
-const HEADER_FLAG_GLOBAL: u8 = 1 << 0;
-const PAYLOAD_FLAG_HAS_METADATA: u8 = 1 << 0;
-const PACKED_ROW_HEADER_LEN: usize = 25;
+const UNTRACKED_STATE_FILE_IDENTIFIER: &str = "LXUS";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UntrackedStatePayloadValue {
-    pub(crate) snapshot_content: String,
-    pub(crate) metadata: Option<String>,
-}
+pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
+    let entity_id = row.entity_id.as_json_array_text().map_err(|error| {
+        LixError::unknown(format!(
+            "failed to encode untracked-state entity identity: {error}"
+        ))
+    })?;
 
-pub(crate) fn encode_header_value_ref(row: UntrackedStateRowRef<'_>) -> Vec<u8> {
-    let created_at = row.created_at.as_bytes();
-    let updated_at = row.updated_at.as_bytes();
-    let mut flags = 0;
-    if row.global {
-        flags |= HEADER_FLAG_GLOBAL;
-    }
+    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
+    let entity_id = builder.create_string(&entity_id);
+    let schema_key = builder.create_string(row.schema_key);
+    let file_id = row.file_id.map(|value| builder.create_string(value));
+    let snapshot_content = row
+        .snapshot_content
+        .map(|value| builder.create_string(value));
+    let metadata = row.metadata.map(|value| builder.create_string(value));
+    let created_at = builder.create_string(row.created_at);
+    let updated_at = builder.create_string(row.updated_at);
+    let version_id = builder.create_string(row.version_id);
 
-    let mut out = Vec::with_capacity(
-        HEADER_VALUE_MAGIC.len()
-            + 1
-            + encoded_component_len(created_at)
-            + encoded_component_len(updated_at),
+    let root = flatbuffer::create_untracked_state_row(
+        &mut builder,
+        &flatbuffer::UntrackedStateRowArgs {
+            entity_id,
+            schema_key,
+            file_id,
+            snapshot_content,
+            metadata,
+            created_at,
+            updated_at,
+            global: row.global,
+            version_id,
+        },
     );
-    out.extend_from_slice(HEADER_VALUE_MAGIC);
-    out.push(flags);
-    push_component(&mut out, created_at);
-    push_component(&mut out, updated_at);
-    out
+    builder.finish(root, Some(UNTRACKED_STATE_FILE_IDENTIFIER));
+    Ok(builder.finished_data().to_vec())
 }
 
-pub(crate) fn decode_header_value(
-    bytes: &[u8],
-    identity: UntrackedStateIdentity,
-) -> Result<UntrackedStateRow, LixError> {
-    if bytes.len() < HEADER_VALUE_MAGIC.len() + 1
-        || bytes.get(..HEADER_VALUE_MAGIC.len()) != Some(HEADER_VALUE_MAGIC)
+pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
+    if bytes.len() < flatbuffers::SIZE_UOFFSET + flatbuffers::FILE_IDENTIFIER_LENGTH
+        || !flatbuffers::buffer_has_identifier(bytes, UNTRACKED_STATE_FILE_IDENTIFIER, false)
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state header value: invalid header",
+            "failed to decode untracked-state row: invalid FlatBuffers file identifier",
         ));
     }
 
-    let flags = bytes[HEADER_VALUE_MAGIC.len()];
-    if flags & !HEADER_FLAG_GLOBAL != 0 {
-        return Err(LixError::new(
+    let row = flatbuffer::root_as_untracked_state_row(bytes).map_err(|error| {
+        LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state header value: invalid flags",
-        ));
-    }
+            format!("failed to decode untracked-state row: {error}"),
+        )
+    })?;
 
-    let mut cursor = HEADER_VALUE_MAGIC.len() + 1;
-    let created_at = read_component(bytes, &mut cursor)?.to_string();
-    let updated_at = read_component(bytes, &mut cursor)?.to_string();
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state header value: trailing bytes",
-        ));
-    }
+    let entity_id = required_str(row.entity_id(), "entity_id")?;
+    let entity_id = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
+        LixError::unknown(format!(
+            "failed to decode untracked-state entity identity: {error}"
+        ))
+    })?;
 
     Ok(UntrackedStateRow {
-        entity_id: identity.entity_id,
-        schema_key: identity.schema_key,
-        file_id: identity.file_id,
-        snapshot_content: None,
-        metadata: None,
-        created_at,
-        updated_at,
-        global: flags & HEADER_FLAG_GLOBAL != 0,
-        version_id: identity.version_id,
+        entity_id,
+        schema_key: required_str(row.schema_key(), "schema_key")?.to_string(),
+        file_id: row.file_id().map(ToString::to_string),
+        snapshot_content: row.snapshot_content().map(ToString::to_string),
+        metadata: row.metadata().map(ToString::to_string),
+        created_at: required_str(row.created_at(), "created_at")?.to_string(),
+        updated_at: required_str(row.updated_at(), "updated_at")?.to_string(),
+        global: row.global(),
+        version_id: required_str(row.version_id(), "version_id")?.to_string(),
     })
 }
 
-pub(crate) fn encode_payload_value_ref(row: UntrackedStateRowRef<'_>) -> Option<Vec<u8>> {
-    let snapshot_content = row.snapshot_content?;
-    let metadata = row.metadata.map(str::as_bytes);
-    let mut flags = 0;
-    if metadata.is_some() {
-        flags |= PAYLOAD_FLAG_HAS_METADATA;
-    }
-
-    let snapshot_content = snapshot_content.as_bytes();
-    let mut out = Vec::with_capacity(
-        PAYLOAD_VALUE_MAGIC.len()
-            + 1
-            + encoded_component_len(snapshot_content)
-            + encoded_component_len(metadata.unwrap_or_default()),
-    );
-    out.extend_from_slice(PAYLOAD_VALUE_MAGIC);
-    out.push(flags);
-    push_component(&mut out, snapshot_content);
-    if let Some(metadata) = metadata {
-        push_component(&mut out, metadata);
-    }
-    Some(out)
-}
-
-pub(crate) fn decode_payload_value(bytes: &[u8]) -> Result<UntrackedStatePayloadValue, LixError> {
-    if bytes.len() < PAYLOAD_VALUE_MAGIC.len() + 1
-        || bytes.get(..PAYLOAD_VALUE_MAGIC.len()) != Some(PAYLOAD_VALUE_MAGIC)
-    {
-        return Err(LixError::new(
+fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, LixError> {
+    value.ok_or_else(|| {
+        LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state payload value: invalid header",
-        ));
-    }
-
-    let flags = bytes[PAYLOAD_VALUE_MAGIC.len()];
-    if flags & !PAYLOAD_FLAG_HAS_METADATA != 0 {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state payload value: invalid flags",
-        ));
-    }
-
-    let mut cursor = PAYLOAD_VALUE_MAGIC.len() + 1;
-    let snapshot_content = read_component(bytes, &mut cursor)?.to_string();
-    let metadata = if flags & PAYLOAD_FLAG_HAS_METADATA != 0 {
-        Some(read_component(bytes, &mut cursor)?.to_string())
-    } else {
-        None
-    };
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state payload value: trailing bytes",
-        ));
-    }
-    Ok(UntrackedStatePayloadValue {
-        snapshot_content,
-        metadata,
-    })
-}
-
-pub(crate) fn encode_packed_row_value_ref(
-    row: UntrackedStateRowRef<'_>,
-) -> Result<Option<Vec<u8>>, LixError> {
-    if row.snapshot_content.is_none() {
-        return Ok(None);
-    }
-    let header = encode_header_value_ref(row);
-    let payload = encode_payload_value_ref(row)
-        .ok_or_else(|| LixError::unknown("live untracked row missing payload"))?;
-    let header_len = u32::try_from(header.len()).map_err(|_| {
-        LixError::unknown("failed to encode untracked-state packed row: header too large")
-    })?;
-    let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        LixError::unknown("failed to encode untracked-state packed row: payload too large")
-    })?;
-    let mut out = Vec::with_capacity(PACKED_ROW_HEADER_LEN + header.len() + payload.len());
-    out.extend_from_slice(PACKED_ROW_VALUE_MAGIC);
-    out.push(0);
-    push_fixed_width_decimal(&mut out, header_len);
-    push_fixed_width_decimal(&mut out, payload_len);
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&payload);
-    Ok(Some(out))
-}
-
-#[allow(dead_code)]
-pub(crate) fn decode_packed_header_value(
-    bytes: &[u8],
-    identity: UntrackedStateIdentity,
-) -> Result<UntrackedStateRow, LixError> {
-    decode_header_value(packed_header_value(bytes)?, identity)
-}
-
-#[allow(dead_code)]
-pub(crate) fn decode_packed_payload_value(
-    bytes: &[u8],
-) -> Result<UntrackedStatePayloadValue, LixError> {
-    decode_payload_value(packed_payload_value(bytes)?)
-}
-
-pub(crate) fn decode_packed_row_value(
-    bytes: &[u8],
-    identity: UntrackedStateIdentity,
-) -> Result<UntrackedStateRow, LixError> {
-    let header = packed_header_value(bytes)?;
-    let payload = packed_payload_value(bytes)?;
-    let mut row = decode_header_value(header, identity)?;
-    let payload = decode_payload_value(payload)?;
-    row.snapshot_content = Some(payload.snapshot_content);
-    row.metadata = payload.metadata;
-    Ok(row)
-}
-
-fn packed_header_value(bytes: &[u8]) -> Result<&[u8], LixError> {
-    let (header, _) = packed_value_parts(bytes)?;
-    Ok(header)
-}
-
-fn packed_payload_value(bytes: &[u8]) -> Result<&[u8], LixError> {
-    let (_, payload) = packed_value_parts(bytes)?;
-    Ok(payload)
-}
-
-fn packed_value_parts(bytes: &[u8]) -> Result<(&[u8], &[u8]), LixError> {
-    if bytes.len() < PACKED_ROW_HEADER_LEN
-        || bytes.get(..PACKED_ROW_VALUE_MAGIC.len()) != Some(PACKED_ROW_VALUE_MAGIC)
-    {
-        return Err(LixError::unknown(
-            "failed to decode untracked-state packed row value: invalid header",
-        ));
-    }
-    if bytes[PACKED_ROW_VALUE_MAGIC.len()] != 0 {
-        return Err(LixError::unknown(
-            "failed to decode untracked-state packed row value: invalid flags",
-        ));
-    }
-    let header_len = read_fixed_width_decimal(&bytes[5..15])?;
-    let payload_len = read_fixed_width_decimal(&bytes[15..25])?;
-    let header_start = PACKED_ROW_HEADER_LEN;
-    let header_end = header_start.checked_add(header_len).ok_or_else(|| {
-        LixError::unknown("failed to decode untracked-state packed row value: length overflow")
-    })?;
-    let payload_end = header_end.checked_add(payload_len).ok_or_else(|| {
-        LixError::unknown("failed to decode untracked-state packed row value: length overflow")
-    })?;
-    if payload_end != bytes.len() {
-        return Err(LixError::unknown(
-            "failed to decode untracked-state packed row value: trailing or short bytes",
-        ));
-    }
-    let header = bytes.get(header_start..header_end).ok_or_else(|| {
-        LixError::unknown("failed to decode untracked-state packed row value: short header")
-    })?;
-    let payload = bytes.get(header_end..payload_end).ok_or_else(|| {
-        LixError::unknown("failed to decode untracked-state packed row value: short payload")
-    })?;
-    Ok((header, payload))
-}
-
-fn push_fixed_width_decimal(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(format!("{value:010}").as_bytes());
-}
-
-fn read_fixed_width_decimal(bytes: &[u8]) -> Result<usize, LixError> {
-    if bytes.len() != 10 || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
-        return Err(LixError::unknown(
-            "failed to decode untracked-state packed row value: invalid length",
-        ));
-    }
-    let text = std::str::from_utf8(bytes).map_err(|error| {
-        LixError::unknown(format!(
-            "failed to decode untracked-state packed row value: invalid length utf-8: {error}"
-        ))
-    })?;
-    text.parse::<usize>().map_err(|error| {
-        LixError::unknown(format!(
-            "failed to decode untracked-state packed row value: invalid length: {error}"
-        ))
-    })
-}
-
-fn encoded_component_len(value: &[u8]) -> usize {
-    varint_len(value.len()) + value.len()
-}
-
-fn push_component(out: &mut Vec<u8>, value: &[u8]) {
-    push_varint_len(out, value.len());
-    out.extend_from_slice(value);
-}
-
-fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, LixError> {
-    let len = read_varint_len(bytes, cursor)?;
-    let component = bytes
-        .get(*cursor..cursor.saturating_add(len))
-        .ok_or_else(|| {
-            LixError::unknown("failed to decode untracked-state row value: short value")
-        })?;
-    *cursor += len;
-    std::str::from_utf8(component).map_err(|error| {
-        LixError::unknown(format!(
-            "failed to decode untracked-state row value: invalid UTF-8: {error}"
-        ))
-    })
-}
-
-fn push_varint_len(out: &mut Vec<u8>, mut value: usize) {
-    if value < 0x80 {
-        out.push(value as u8);
-        return;
-    }
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn read_varint_len(bytes: &[u8], cursor: &mut usize) -> Result<usize, LixError> {
-    let start = *cursor;
-    let mut value = 0u128;
-    let mut shift = 0u32;
-    loop {
-        let byte = *bytes.get(*cursor).ok_or_else(|| {
-            LixError::unknown("failed to decode untracked-state row value: short varint")
-        })?;
-        *cursor += 1;
-        value |= u128::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            if value > usize::MAX as u128 {
-                return Err(LixError::unknown(
-                    "failed to decode untracked-state row value: length overflow",
-                ));
-            }
-            let value = value as usize;
-            if *cursor - start != varint_len(value) {
-                return Err(LixError::unknown(
-                    "failed to decode untracked-state row value: non-canonical length",
-                ));
-            }
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 128 {
-            return Err(LixError::unknown(
-                "failed to decode untracked-state row value: length overflow",
-            ));
-        }
-    }
-}
-
-fn varint_len(mut value: usize) -> usize {
-    if value < 0x80 {
-        return 1;
-    }
-    let mut len = 1;
-    while value >= 0x80 {
-        len += 1;
-        value >>= 7;
-    }
-    len
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::entity_identity::EntityIdentity;
-
-    fn row() -> UntrackedStateRow {
-        UntrackedStateRow {
-            entity_id: EntityIdentity::single("entity-a"),
-            schema_key: "schema-a".to_string(),
-            file_id: Some("file-a".to_string()),
-            snapshot_content: Some("{\"value\":1}".to_string()),
-            metadata: None,
-            created_at: "2026-05-12T00:00:00Z".to_string(),
-            updated_at: "2026-05-12T00:00:01Z".to_string(),
-            global: false,
-            version_id: "version-a".to_string(),
-        }
-    }
-
-    #[test]
-    fn header_value_omits_identity_payload_and_decodes_from_supplied_identity() {
-        let row = row();
-        let encoded = encode_header_value_ref(row.as_ref());
-        let encoded_text = String::from_utf8_lossy(&encoded);
-
-        assert!(!encoded_text.contains("{\"value\":1}"));
-        assert!(!encoded_text.contains("entity-a"));
-        assert!(!encoded_text.contains("schema-a"));
-        assert!(!encoded_text.contains("file-a"));
-        assert!(!encoded_text.contains("version-a"));
-
-        let supplied_identity = UntrackedStateIdentity {
-            entity_id: EntityIdentity::single("entity-from-key"),
-            schema_key: "schema-from-key".to_string(),
-            file_id: Some("file-from-key".to_string()),
-            version_id: "version-from-key".to_string(),
-        };
-        let decoded =
-            decode_header_value(&encoded, supplied_identity).expect("header value should decode");
-
-        assert_eq!(decoded.entity_id, EntityIdentity::single("entity-from-key"));
-        assert_eq!(decoded.schema_key, "schema-from-key");
-        assert_eq!(decoded.file_id.as_deref(), Some("file-from-key"));
-        assert_eq!(decoded.version_id, "version-from-key");
-        assert_eq!(decoded.snapshot_content, None);
-        assert_eq!(decoded.metadata, None);
-        assert_eq!(decoded.created_at, row.created_at);
-        assert_eq!(decoded.updated_at, row.updated_at);
-        assert_eq!(decoded.global, row.global);
-    }
-
-    #[test]
-    fn header_value_roundtrips_global() {
-        let mut row = row();
-        row.global = true;
-        let encoded = encode_header_value_ref(row.as_ref());
-        let decoded = decode_header_value(
-            &encoded,
-            UntrackedStateIdentity {
-                entity_id: row.entity_id.clone(),
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                version_id: row.version_id.clone(),
-            },
+            format!("failed to decode untracked-state row: missing required field `{field}`"),
         )
-        .expect("header value should decode");
+    })
+}
 
-        assert!(decoded.global);
+mod flatbuffer {
+    #[derive(Copy, Clone, PartialEq)]
+    pub(super) struct UntrackedStateRow<'a> {
+        table: flatbuffers::Table<'a>,
     }
 
-    #[test]
-    fn payload_value_roundtrips_snapshot_and_metadata() {
-        let mut row = row();
-        row.metadata = Some("{\"source\":\"test\"}".to_string());
-        let encoded = encode_payload_value_ref(row.as_ref()).expect("payload should encode");
-        let decoded = decode_payload_value(&encoded).expect("payload should decode");
+    impl<'a> flatbuffers::Follow<'a> for UntrackedStateRow<'a> {
+        type Inner = UntrackedStateRow<'a>;
 
-        assert_eq!(decoded.snapshot_content, "{\"value\":1}");
-        assert_eq!(decoded.metadata, row.metadata);
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                table: unsafe { flatbuffers::Table::new(buf, loc) },
+            }
+        }
     }
 
-    #[test]
-    fn payload_value_is_absent_for_removal_rows() {
-        let mut row = row();
-        row.snapshot_content = None;
-        assert_eq!(encode_payload_value_ref(row.as_ref()), None);
+    impl<'a> UntrackedStateRow<'a> {
+        const VT_ENTITY_ID: flatbuffers::VOffsetT = 4;
+        const VT_SCHEMA_KEY: flatbuffers::VOffsetT = 6;
+        const VT_FILE_ID: flatbuffers::VOffsetT = 8;
+        const VT_SNAPSHOT_CONTENT: flatbuffers::VOffsetT = 10;
+        const VT_METADATA: flatbuffers::VOffsetT = 12;
+        const VT_CREATED_AT: flatbuffers::VOffsetT = 14;
+        const VT_UPDATED_AT: flatbuffers::VOffsetT = 16;
+        const VT_GLOBAL: flatbuffers::VOffsetT = 18;
+        const VT_VERSION_ID: flatbuffers::VOffsetT = 20;
+
+        #[inline]
+        pub(super) fn entity_id(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_ENTITY_ID, None)
+            }
+        }
+
+        #[inline]
+        pub(super) fn schema_key(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SCHEMA_KEY, None)
+            }
+        }
+
+        #[inline]
+        pub(super) fn file_id(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_FILE_ID, None)
+            }
+        }
+
+        #[inline]
+        pub(super) fn snapshot_content(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SNAPSHOT_CONTENT, None)
+            }
+        }
+
+        #[inline]
+        pub(super) fn metadata(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_METADATA, None)
+            }
+        }
+
+        pub(super) fn created_at(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_CREATED_AT, None)
+            }
+        }
+
+        #[inline]
+        pub(super) fn updated_at(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_UPDATED_AT, None)
+            }
+        }
+
+        #[inline]
+        pub(super) fn global(&self) -> bool {
+            unsafe { self.table.get::<bool>(Self::VT_GLOBAL, Some(false)) }.unwrap_or(false)
+        }
+
+        #[inline]
+        pub(super) fn version_id(&self) -> Option<&'a str> {
+            unsafe {
+                self.table
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_VERSION_ID, None)
+            }
+        }
     }
 
-    #[test]
-    fn header_and_payload_values_reject_malformed_bytes() {
-        let identity = UntrackedStateIdentity {
-            entity_id: EntityIdentity::single("entity-a"),
-            schema_key: "schema-a".to_string(),
-            file_id: None,
-            version_id: "version-a".to_string(),
-        };
-
-        assert!(decode_header_value(b"BAD!", identity.clone()).is_err());
-        assert!(decode_header_value(b"LXUH\x80", identity.clone()).is_err());
-        assert!(decode_header_value(b"LXUH\x00\xff", identity.clone()).is_err());
-        assert!(decode_header_value(b"LXUH\x00\x80\x00", identity.clone()).is_err());
-        assert!(decode_payload_value(b"BAD!").is_err());
-        assert!(decode_payload_value(b"LXUP\x80").is_err());
-        assert!(decode_payload_value(b"LXUP\x00\x80\x00").is_err());
-        let mut overflow = b"LXUH\x00".to_vec();
-        overflow.extend(std::iter::repeat_n(0xff, 19));
-        overflow.push(0x01);
-        assert!(decode_header_value(&overflow, identity).is_err());
+    impl flatbuffers::Verifiable for UntrackedStateRow<'_> {
+        #[inline]
+        fn run_verifier(
+            verifier: &mut flatbuffers::Verifier,
+            position: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            verifier
+                .visit_table(position)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "entity_id",
+                    Self::VT_ENTITY_ID,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "schema_key",
+                    Self::VT_SCHEMA_KEY,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "file_id",
+                    Self::VT_FILE_ID,
+                    false,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "snapshot_content",
+                    Self::VT_SNAPSHOT_CONTENT,
+                    false,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "metadata",
+                    Self::VT_METADATA,
+                    false,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "created_at",
+                    Self::VT_CREATED_AT,
+                    true,
+                )?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "updated_at",
+                    Self::VT_UPDATED_AT,
+                    true,
+                )?
+                .visit_field::<bool>("global", Self::VT_GLOBAL, false)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
+                    "version_id",
+                    Self::VT_VERSION_ID,
+                    true,
+                )?
+                .finish();
+            Ok(())
+        }
     }
 
-    #[test]
-    fn header_and_payload_values_reject_trailing_bytes_and_invalid_utf8() {
-        let identity = UntrackedStateIdentity {
-            entity_id: EntityIdentity::single("entity-a"),
-            schema_key: "schema-a".to_string(),
-            file_id: None,
-            version_id: "version-a".to_string(),
-        };
-        let row = row();
-        let mut encoded = encode_header_value_ref(row.as_ref());
-        encoded.push(0);
-        assert!(decode_header_value(&encoded, identity.clone()).is_err());
-
-        let invalid_created_at = b"LXUH\x00\x01\xff\x01x".to_vec();
-        assert!(decode_header_value(&invalid_created_at, identity).is_err());
-
-        let invalid_payload = b"LXUP\x00\x01\xff".to_vec();
-        assert!(decode_payload_value(&invalid_payload).is_err());
+    pub(super) struct UntrackedStateRowArgs<'a> {
+        pub(super) entity_id: flatbuffers::WIPOffset<&'a str>,
+        pub(super) schema_key: flatbuffers::WIPOffset<&'a str>,
+        pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub(super) snapshot_content: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub(super) metadata: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
+        pub(super) updated_at: flatbuffers::WIPOffset<&'a str>,
+        pub(super) global: bool,
+        pub(super) version_id: flatbuffers::WIPOffset<&'a str>,
     }
 
-    #[test]
-    fn split_values_have_stable_golden_encoding() {
-        let mut row = row();
-        row.snapshot_content = Some("abc".to_string());
-        row.metadata = Some("m".to_string());
-        row.created_at = "c".to_string();
-        row.updated_at = "u".to_string();
-        row.global = true;
-
-        let header = encode_header_value_ref(row.as_ref());
-        let payload = encode_payload_value_ref(row.as_ref()).expect("payload should encode");
-        assert_eq!(header, b"LXUH\x01\x01c\x01u");
-        assert_eq!(payload, b"LXUP\x01\x03abc\x01m");
+    pub(super) fn create_untracked_state_row<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+        builder: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
+        args: &'args UntrackedStateRowArgs<'args>,
+    ) -> flatbuffers::WIPOffset<UntrackedStateRow<'bldr>> {
+        let start = builder.start_table();
+        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+            UntrackedStateRow::VT_VERSION_ID,
+            args.version_id,
+        );
+        builder.push_slot::<bool>(UntrackedStateRow::VT_GLOBAL, args.global, false);
+        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+            UntrackedStateRow::VT_UPDATED_AT,
+            args.updated_at,
+        );
+        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+            UntrackedStateRow::VT_CREATED_AT,
+            args.created_at,
+        );
+        if let Some(metadata) = args.metadata {
+            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UntrackedStateRow::VT_METADATA,
+                metadata,
+            );
+        }
+        if let Some(snapshot_content) = args.snapshot_content {
+            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UntrackedStateRow::VT_SNAPSHOT_CONTENT,
+                snapshot_content,
+            );
+        }
+        if let Some(file_id) = args.file_id {
+            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+                UntrackedStateRow::VT_FILE_ID,
+                file_id,
+            );
+        }
+        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+            UntrackedStateRow::VT_SCHEMA_KEY,
+            args.schema_key,
+        );
+        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
+            UntrackedStateRow::VT_ENTITY_ID,
+            args.entity_id,
+        );
+        let offset = builder.end_table(start);
+        flatbuffers::WIPOffset::new(offset.value())
     }
 
-    #[test]
-    fn packed_row_value_roundtrips_header_payload_and_full_row() {
-        let mut row = row();
-        row.snapshot_content = Some("abc".to_string());
-        row.metadata = Some("m".to_string());
-        row.created_at = "c".to_string();
-        row.updated_at = "u".to_string();
-        row.global = true;
-        let identity = UntrackedStateIdentity {
-            entity_id: row.entity_id.clone(),
-            schema_key: row.schema_key.clone(),
-            file_id: row.file_id.clone(),
-            version_id: row.version_id.clone(),
-        };
-
-        let packed = encode_packed_row_value_ref(row.as_ref())
-            .expect("packed row should encode")
-            .expect("live row should produce value");
-
-        let header = decode_packed_header_value(&packed, identity.clone())
-            .expect("packed header should decode");
-        assert_eq!(header.created_at, "c");
-        assert_eq!(header.updated_at, "u");
-        assert!(header.global);
-        assert_eq!(header.snapshot_content, None);
-
-        let payload = decode_packed_payload_value(&packed).expect("packed payload should decode");
-        assert_eq!(payload.snapshot_content, "abc");
-        assert_eq!(payload.metadata.as_deref(), Some("m"));
-
-        let decoded =
-            decode_packed_row_value(&packed, identity).expect("packed full row should decode");
-        assert_eq!(decoded.snapshot_content.as_deref(), Some("abc"));
-        assert_eq!(decoded.metadata.as_deref(), Some("m"));
-        assert_eq!(decoded.created_at, "c");
-    }
-
-    #[test]
-    fn packed_row_value_rejects_malformed_frame() {
-        assert!(decode_packed_payload_value(b"BAD!").is_err());
-        let mut invalid_flags = b"LXU2\x01".to_vec();
-        invalid_flags.extend_from_slice(b"0000000000");
-        invalid_flags.extend_from_slice(b"0000000000");
-        assert!(decode_packed_payload_value(&invalid_flags).is_err());
-
-        let mut short = b"LXU2\x00".to_vec();
-        short.extend_from_slice(b"0000000010");
-        short.extend_from_slice(b"0000000000");
-        assert!(decode_packed_payload_value(&short).is_err());
+    #[inline]
+    pub(super) fn root_as_untracked_state_row(
+        bytes: &[u8],
+    ) -> Result<UntrackedStateRow<'_>, flatbuffers::InvalidFlatbuffer> {
+        flatbuffers::root::<UntrackedStateRow>(bytes)
     }
 }

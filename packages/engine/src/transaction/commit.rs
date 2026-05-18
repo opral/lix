@@ -2,14 +2,13 @@ use crate::binary_cas::BinaryCasContext;
 use crate::commit_store::{ChangeRef, CommitDraftRef, CommitStoreContext, StagedCommitStoreCommit};
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::storage::{StorageReader, StorageWriteSet, StorageWriteTransaction};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateGetManyRequest, UntrackedStateIdentity,
-    UntrackedStateIdentityRef, UntrackedStateProjection, UntrackedStateRowRef,
+    UntrackedStateContext, UntrackedStateIdentity, UntrackedStateIdentityRef, UntrackedStateRowRef,
 };
 use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
@@ -30,9 +29,9 @@ pub(crate) async fn commit_prepared_writes(
     commit_store: &CommitStoreContext,
     version_ctx: &VersionContext,
     runtime_functions: Option<&FunctionContext>,
-    transaction: &mut (impl StorageWriteTransaction + ?Sized),
+    read: &(impl StorageRead + Send + Sync + ?Sized),
     prepared_writes: PreparedWriteSet,
-) -> Result<(), LixError> {
+) -> Result<StorageWriteSet, LixError> {
     let mut writes = StorageWriteSet::new();
     let mut json_writer = JsonStoreContext::new().writer();
 
@@ -49,7 +48,7 @@ pub(crate) async fn commit_prepared_writes(
         prepared_writes.commit_members_by_version,
         prepared_writes.extra_commit_parents_by_version,
         version_ctx,
-        transaction,
+        read,
     )
     .await?;
     let commit_rows = finalized.commit_rows;
@@ -70,12 +69,12 @@ pub(crate) async fn commit_prepared_writes(
         && version_heads.is_empty()
         && writes.is_empty()
     {
-        return Ok(());
+        return Ok(writes);
     }
 
     let staged_commits = stage_commit_store_commits(
         commit_store,
-        transaction,
+        read,
         &mut writes,
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
@@ -99,7 +98,7 @@ pub(crate) async fn commit_prepared_writes(
     // commit root; untracked rows remain in the separate local overlay store.
     {
         let untracked_overlay_delete_identities = existing_untracked_overlay_delete_identities(
-            transaction,
+            read,
             row_index
                 .canonical_row_indices
                 .iter()
@@ -127,7 +126,7 @@ pub(crate) async fn commit_prepared_writes(
                     .map(UntrackedStateIdentity::as_ref),
             );
         stage_tracked_roots(
-            transaction,
+            read,
             &mut writes,
             &state_rows,
             row_index.tracked_row_indices_by_commit,
@@ -149,8 +148,7 @@ pub(crate) async fn commit_prepared_writes(
         version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
-    writes.apply(transaction).await?;
-    Ok(())
+    Ok(writes)
 }
 
 fn stage_prepared_json_payloads(
@@ -220,36 +218,13 @@ fn json_payloads_from_state_row(
 }
 
 async fn existing_untracked_overlay_delete_identities<'a>(
-    transaction: &mut (impl StorageReader + ?Sized),
+    read: &(impl StorageRead + Send + Sync + ?Sized),
     identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 ) -> Result<Vec<UntrackedStateIdentity>, LixError> {
-    let mut identities = identities
-        .into_iter()
-        .map(|identity| UntrackedStateIdentity {
-            version_id: identity.version_id.to_string(),
-            schema_key: identity.schema_key.to_string(),
-            entity_id: identity.entity_id.clone(),
-            file_id: identity.file_id.map(str::to_string),
-        })
-        .collect::<Vec<_>>();
-    identities.sort();
-    identities.dedup();
-    if identities.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = UntrackedStateContext::new()
-        .reader(transaction)
-        .get_many(UntrackedStateGetManyRequest {
-            identities: identities.clone(),
-            projection: UntrackedStateProjection::Identity,
-        })
-        .await?
-        .rows;
-    Ok(identities
-        .into_iter()
-        .zip(rows)
-        .filter_map(|(identity, row)| row.is_some().then_some(identity))
-        .collect())
+    UntrackedStateContext::new()
+        .reader(read)
+        .existing_identities(identities)
+        .await
 }
 
 struct PreparedRowIndex {
@@ -307,7 +282,7 @@ fn index_adopted_rows(rows: &[PreparedAdoptedStateRow]) -> PreparedAdoptedRowInd
 
 async fn stage_commit_store_commits(
     commit_store: &CommitStoreContext,
-    transaction: &mut (impl StorageReader + ?Sized),
+    read: &(impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     tracked_row_indices_by_commit: &BTreeMap<String, Vec<RowIndex>>,
@@ -346,7 +321,7 @@ async fn stage_commit_store_commits(
         commits.push((commit, authored_changes, adopted_changes));
     }
     let staged = commit_store
-        .writer(transaction, writes)
+        .writer(read, writes)
         .stage_tracked_commit_drafts(commits)
         .await?;
     if staged.len() != commit_ids.len() {
@@ -394,7 +369,7 @@ fn change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> ChangeRef<'_> {
 }
 
 async fn stage_tracked_roots(
-    transaction: &mut (impl StorageReader + ?Sized),
+    read: &(impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     mut tracked_row_indices_by_commit: BTreeMap<String, Vec<RowIndex>>,
@@ -408,7 +383,7 @@ async fn stage_tracked_roots(
     >,
 ) -> Result<(), LixError> {
     let tracked_state = TrackedStateContext::new();
-    let mut writer = tracked_state.writer(transaction, writes);
+    let mut writer = tracked_state.writer(read, writes);
     for root in tracked_roots {
         let staged = staged_commits.remove(&root.commit_id).ok_or_else(|| {
             LixError::new(
@@ -639,7 +614,7 @@ async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     version_ctx: &VersionContext,
-    transaction: &mut (impl StorageReader + ?Sized),
+    read: &(impl StorageRead + Send + Sync + ?Sized),
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut version_heads = Vec::new();
@@ -655,7 +630,7 @@ async fn finalize_commit_rows(
         let timestamp = members.created_at;
         let _change_ids = members.change_ids;
         let parent_commit_ids = version_ctx
-            .ref_reader(&mut *transaction)
+            .ref_reader(read)
             .load_head_commit_id(&version_id)
             .await?
             .into_iter()
@@ -712,24 +687,22 @@ mod tests {
 
     use super::*;
     use crate::backend::{
-        testing::UnitTestBackend, Backend, BackendKvEntryPage, BackendKvExistsBatch,
-        BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRequest, BackendKvValueBatch,
-        BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
-        BackendWriteTransaction,
+        Backend, BackendCapabilities, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch,
     };
     use crate::catalog::SchemaPlanId;
     use crate::commit_store::{ChangeIndexEntry, ChangeLocator};
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
-    use crate::storage::StorageContext;
+    use crate::storage::{
+        InMemoryStorageBackend, InMemoryStorageRead, InMemoryStorageWrite, StorageContext,
+        StorageKey, StorageReadOptions, StorageWriteOptions,
+    };
     use crate::transaction::types::PreparedRowFacts;
     use crate::untracked_state::{
-        MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateGetManyRequest,
-        UntrackedStateIdentity, UntrackedStateProjection,
+        MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
     };
     use crate::version::VersionContext;
     use crate::NullableKeyFilter;
     use crate::GLOBAL_VERSION_ID;
-    use async_trait::async_trait;
 
     const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
     const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -744,22 +717,20 @@ mod tests {
 
     #[tokio::test]
     async fn commit_staged_writes_appends_commit_store_and_updates_serving_projection() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         let state_rows = vec![tracked_global_row("change-1")];
-        commit_prepared_writes(
+        let writes = commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
             &version_ctx,
             None,
-            transaction.as_mut(),
+            &read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
@@ -774,12 +745,15 @@ mod tests {
         )
         .await
         .expect("commit should flush staged rows");
-        transaction
-            .commit()
-            .await
-            .expect("commit should persist kv");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(storage.clone());
+        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let commit = commit_reader
             .load_commit("test-uuid-1")
             .await
@@ -819,7 +793,11 @@ mod tests {
         assert_eq!(change_pack[0].schema_key, "test_schema");
 
         let loaded_head = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref load should succeed");
@@ -828,22 +806,21 @@ mod tests {
 
     #[tokio::test]
     async fn commit_with_only_untracked_writes_does_not_create_lix_commit() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let untracked_state = UntrackedStateContext::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         let state_rows = vec![untracked_global_row("change-untracked")];
-        commit_prepared_writes(
+        let writes = commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
             &version_ctx,
             None,
-            transaction.as_mut(),
+            &read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
@@ -855,39 +832,38 @@ mod tests {
         )
         .await
         .expect("commit should flush untracked row");
-        transaction
-            .commit()
-            .await
-            .expect("commit should persist kv");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(storage.clone());
+        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let index_entries = commit_reader
             .load_change_index_entries(&["change-untracked".to_string()])
             .await
             .expect("commit-store change index should load");
         assert_eq!(index_entries, vec![None]);
 
-        let mut loaded_rows = UntrackedStateContext::new()
-            .reader(storage.clone())
-            .get_many(UntrackedStateGetManyRequest {
-                identities: vec![UntrackedStateIdentity {
-                    version_id: GLOBAL_VERSION_ID.to_string(),
+        let loaded = {
+            let mut untracked_reader = untracked_state.reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            );
+            untracked_reader
+                .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
                     entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-                    file_id: None,
-                }],
-                projection: UntrackedStateProjection::Full,
-            })
-            .await
-            .expect("untracked row load should succeed")
-            .rows;
-        let loaded = loaded_rows
-            .pop()
-            .flatten()
-            .map(|row| row.into_materialized_full())
-            .transpose()
-            .expect("untracked row should materialize")
-            .expect("untracked row should be persisted");
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("untracked row load should succeed")
+        .expect("untracked row should be persisted");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
@@ -896,17 +872,12 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_write_deletes_matching_untracked_overlay() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
         let untracked_state = UntrackedStateContext::new();
         let live_state = Arc::new(live_state_context());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
 
-        let mut seed_transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("seed transaction should open");
         let mut writes = StorageWriteSet::new();
         let staged_row = untracked_global_row("change-untracked");
         let canonical_row = crate::test_support::untracked_state_row_from_materialized(
@@ -918,26 +889,20 @@ mod tests {
             .writer(&mut writes)
             .stage_rows(std::iter::once(canonical_row.as_ref()))
             .expect("untracked seed should write");
-        writes
-            .apply(&mut seed_transaction.as_mut())
-            .await
-            .expect("untracked seed should apply");
-        seed_transaction
-            .commit()
-            .await
-            .expect("seed transaction should persist");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("untracked seed should commit");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let state_rows = vec![tracked_global_row("change-tracked")];
-        commit_prepared_writes(
+        let writes = commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
             &version_ctx,
             None,
-            transaction.as_mut(),
+            &read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
@@ -952,35 +917,27 @@ mod tests {
         )
         .await
         .expect("tracked commit should flush");
-        transaction
-            .commit()
-            .await
-            .expect("commit should persist kv");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut untracked_rows = UntrackedStateContext::new()
-            .reader(storage.clone())
-            .get_many(UntrackedStateGetManyRequest {
-                identities: vec![UntrackedStateIdentity {
-                    version_id: GLOBAL_VERSION_ID.to_string(),
-                    schema_key: "test_schema".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-                    file_id: None,
-                }],
-                projection: UntrackedStateProjection::Full,
-            })
-            .await
-            .expect("untracked load should succeed")
-            .rows;
-        let untracked = untracked_rows
-            .pop()
-            .flatten()
-            .map(|row| row.into_materialized_full())
-            .transpose()
-            .expect("untracked row should materialize");
+        let untracked = {
+            let mut untracked_reader = untracked_state.reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            );
+            untracked_reader.load_row(&untracked_request()).await
+        }
+        .expect("untracked load should succeed");
         assert_eq!(untracked, None);
 
         let visible = live_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&live_state_request())
             .await
             .expect("live-state load should succeed")
@@ -992,19 +949,43 @@ mod tests {
 
     #[tokio::test]
     async fn commit_staged_writes_applies_cross_subsystem_rows_as_one_backend_batch() {
-        let counting_backend = Arc::new(CountingBackend::new());
+        let counting_backend = CountingBackend::new();
         let write_batches = counting_backend.write_batches();
-        let backend: Arc<dyn Backend + Send + Sync> = counting_backend;
-        let storage = StorageContext::new(backend);
+        let storage = StorageContext::new(counting_backend);
         let binary_cas = BinaryCasContext::new();
         let live_state = Arc::new(live_state_context());
+        let untracked_state = UntrackedStateContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_global_version_head(storage.clone()).await;
         {
-            let mut seed_transaction = storage
-                .begin_write_transaction()
-                .await
-                .expect("seed transaction should open");
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("seed read should open");
+            let mut writes = storage.new_write_set();
+            crate::test_support::stage_tracked_root_from_materialized(
+                &read,
+                &mut writes,
+                &crate::tracked_state::TrackedStateContext::new(),
+                crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
+                None,
+                &[],
+            )
+            .await
+            .expect("empty tracked root should stage");
+            let version_ref_row = crate::transaction::prepare_version_ref_row(
+                GLOBAL_VERSION_ID,
+                crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
+                "1970-01-01T00:00:00.000Z",
+            )
+            .expect("global version ref should stage");
+            UntrackedStateContext::new()
+                .writer(&mut writes)
+                .stage_rows([version_ref_row.row.as_ref()])
+                .expect("global version ref should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("global version ref should commit");
+        }
+        {
             let mut writes = StorageWriteSet::new();
             let mode_snapshot = serde_json::to_string(&serde_json::json!({
                 "key": DETERMINISTIC_MODE_KEY,
@@ -1034,38 +1015,36 @@ mod tests {
                 .writer(&mut writes)
                 .stage_rows(std::iter::once(row.as_ref()))
                 .expect("deterministic mode should stage");
-            writes
-                .apply(&mut seed_transaction.as_mut())
-                .await
-                .expect("deterministic mode should apply");
-            seed_transaction
-                .commit()
-                .await
-                .expect("seed transaction should persist");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("deterministic mode should commit");
         }
         write_batches.store(0, Ordering::SeqCst);
         let runtime_functions = {
-            let reader = live_state.reader(storage.clone());
+            let reader = live_state.reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            );
             FunctionContext::prepare(&reader)
                 .await
                 .expect("runtime context should prepare")
         };
         runtime_functions.provider().call_uuid_v7();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         let tracked_row = tracked_global_row("change-tracked");
         let mut untracked_row = untracked_global_row("change-untracked");
         untracked_row.entity_id = crate::entity_identity::EntityIdentity::single("entity-2");
 
-        commit_prepared_writes(
+        let writes = commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
             &version_ctx,
             Some(&runtime_functions),
-            transaction.as_mut(),
+            &read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![tracked_row, untracked_row],
@@ -1083,17 +1062,19 @@ mod tests {
 
         assert_eq!(
             write_batches.load(Ordering::SeqCst),
-            1,
-            "tracked, json, untracked, commit-store, and version refs must apply as one backend write batch"
+            0,
+            "prepared writes should not touch the backend before the write set is committed"
         );
-
-        transaction
-            .commit()
-            .await
-            .expect("commit should persist kv");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
         assert_eq!(write_batches.load(Ordering::SeqCst), 1);
 
-        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(storage.clone());
+        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let commit = commit_reader
             .load_commit("test-uuid-1")
             .await
@@ -1110,40 +1091,44 @@ mod tests {
         ));
 
         let loaded_head = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref load should succeed");
         assert_eq!(loaded_head.as_deref(), Some("test-uuid-1"));
 
-        let mut untracked_rows = UntrackedStateContext::new()
-            .reader(storage.clone())
-            .get_many(UntrackedStateGetManyRequest {
-                identities: vec![UntrackedStateIdentity {
-                    version_id: GLOBAL_VERSION_ID.to_string(),
+        let untracked = {
+            let mut untracked_reader = untracked_state.reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            );
+            untracked_reader
+                .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
                     entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
-                    file_id: None,
-                }],
-                projection: UntrackedStateProjection::Full,
-            })
-            .await
-            .expect("untracked row load should succeed")
-            .rows;
-        let untracked = untracked_rows
-            .pop()
-            .flatten()
-            .map(|row| row.into_materialized_full())
-            .transpose()
-            .expect("untracked row should materialize")
-            .expect("untracked row should persist");
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("untracked row load should succeed")
+        .expect("untracked row should persist");
         assert_eq!(
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
         );
 
         let sequence_row = live_state
-            .reader(storage.clone())
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1163,8 +1148,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_version() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(storage.clone(), GLOBAL_VERSION_ID, "global-before")
@@ -1172,17 +1156,16 @@ mod tests {
         crate::test_support::seed_version_head(storage.clone(), "version-a", "version-a-before")
             .await;
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let state_rows = vec![tracked_version_row("version-a", "change-version-a")];
-        commit_prepared_writes(
+        let writes = commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
             &version_ctx,
             None,
-            transaction.as_mut(),
+            &read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
@@ -1197,12 +1180,15 @@ mod tests {
         )
         .await
         .expect("version commit should flush");
-        transaction
-            .commit()
-            .await
-            .expect("commit should persist kv");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(storage.clone());
+        let commit_reader = crate::commit_store::CommitStoreContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let commit = commit_reader
             .load_commit("test-uuid-1")
             .await
@@ -1220,12 +1206,20 @@ mod tests {
         ));
 
         let global_head = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("global head should load");
         let version_head = version_ctx
-            .ref_reader(storage.clone())
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
             .load_head_commit_id("version-a")
             .await
             .expect("version head should load");
@@ -1235,8 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
             storage.clone(),
@@ -1245,10 +1238,9 @@ mod tests {
         )
         .await;
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_VERSION_ID.to_string(),
@@ -1256,7 +1248,7 @@ mod tests {
             )]),
             BTreeMap::new(),
             &version_ctx,
-            transaction.as_mut(),
+            &read,
         )
         .await
         .expect("global commit row should finalize");
@@ -1276,13 +1268,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_VERSION_ID.to_string(),
@@ -1290,7 +1280,7 @@ mod tests {
             )]),
             BTreeMap::new(),
             &version_ctx,
-            transaction.as_mut(),
+            &read,
         )
         .await
         .expect("empty members should be ignored");
@@ -1301,23 +1291,21 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(storage.clone(), GLOBAL_VERSION_ID, "global-before")
             .await;
         crate::test_support::seed_version_head(storage.clone(), "version-a", "previous-commit")
             .await;
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             BTreeMap::new(),
             &version_ctx,
-            transaction.as_mut(),
+            &read,
         )
         .await
         .expect("active-version commit finalization should resolve parent");
@@ -1331,20 +1319,18 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(storage.clone(), "version-a", "target-head").await;
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             BTreeMap::from([("version-a".to_string(), vec!["source-head".to_string()])]),
             &version_ctx,
-            transaction.as_mut(),
+            &read,
         )
         .await
         .expect("merge commit finalization should resolve parents");
@@ -1418,6 +1404,15 @@ mod tests {
         }
     }
 
+    fn untracked_request() -> UntrackedStateRowRequest {
+        UntrackedStateRowRequest {
+            schema_key: "test_schema".to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: NullableKeyFilter::Null,
+        }
+    }
+
     fn live_state_request() -> LiveStateRowRequest {
         LiveStateRowRequest {
             schema_key: "test_schema".to_string(),
@@ -1428,14 +1423,14 @@ mod tests {
     }
 
     struct CountingBackend {
-        inner: UnitTestBackend,
+        inner: InMemoryStorageBackend,
         write_batches: Arc<AtomicUsize>,
     }
 
     impl CountingBackend {
         fn new() -> Self {
             Self {
-                inner: UnitTestBackend::new(),
+                inner: InMemoryStorageBackend::new(),
                 write_batches: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -1445,85 +1440,58 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Backend for CountingBackend {
-        async fn begin_read_transaction(
-            &self,
-        ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-            self.inner.begin_read_transaction().await
+        type Read<'a>
+            = InMemoryStorageRead
+        where
+            Self: 'a;
+
+        type Write<'a>
+            = CountingWrite
+        where
+            Self: 'a;
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
         }
 
-        async fn begin_write_transaction(
-            &self,
-        ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
-            Ok(Box::new(CountingWriteTransaction {
-                inner: self.inner.begin_write_transaction().await?,
+        fn begin_read(&self, opts: StorageReadOptions) -> Result<Self::Read<'_>, BackendError> {
+            self.inner.begin_read(opts)
+        }
+
+        fn begin_write(&self, opts: StorageWriteOptions) -> Result<Self::Write<'_>, BackendError> {
+            Ok(CountingWrite {
+                inner: self.inner.begin_write(opts)?,
                 write_batches: Arc::clone(&self.write_batches),
-            }))
+            })
         }
     }
 
-    struct CountingWriteTransaction {
-        inner: Box<dyn BackendWriteTransaction + Send + Sync + 'static>,
+    struct CountingWrite {
+        inner: InMemoryStorageWrite,
         write_batches: Arc<AtomicUsize>,
     }
 
-    #[async_trait]
-    impl BackendReadTransaction for CountingWriteTransaction {
-        async fn get_values(
-            &mut self,
-            request: BackendKvGetRequest,
-        ) -> Result<BackendKvValueBatch, LixError> {
-            self.inner.get_values(request).await
+    impl BackendWrite for CountingWrite {
+        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+            self.inner.put_many(entries)
         }
 
-        async fn exists_many(
-            &mut self,
-            request: BackendKvGetRequest,
-        ) -> Result<BackendKvExistsBatch, LixError> {
-            self.inner.exists_many(request).await
+        fn delete_many(&mut self, keys: &[StorageKey]) -> Result<(), BackendError> {
+            self.inner.delete_many(keys)
         }
 
-        async fn scan_keys(
-            &mut self,
-            request: BackendKvScanRequest,
-        ) -> Result<BackendKvKeyPage, LixError> {
-            self.inner.scan_keys(request).await
+        fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+            self.inner.delete_range(range)
         }
 
-        async fn scan_values(
-            &mut self,
-            request: BackendKvScanRequest,
-        ) -> Result<BackendKvValuePage, LixError> {
-            self.inner.scan_values(request).await
-        }
-
-        async fn scan_entries(
-            &mut self,
-            request: BackendKvScanRequest,
-        ) -> Result<BackendKvEntryPage, LixError> {
-            self.inner.scan_entries(request).await
-        }
-
-        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-            let Self { inner, .. } = *self;
-            inner.rollback().await
-        }
-    }
-
-    #[async_trait]
-    impl BackendWriteTransaction for CountingWriteTransaction {
-        async fn write_kv_batch(
-            &mut self,
-            batch: BackendKvWriteBatch,
-        ) -> Result<BackendKvWriteStats, LixError> {
+        fn commit(self) -> Result<CommitResult, BackendError> {
             self.write_batches.fetch_add(1, Ordering::SeqCst);
-            self.inner.write_kv_batch(batch).await
+            self.inner.commit()
         }
 
-        async fn commit(self: Box<Self>) -> Result<(), LixError> {
-            let Self { inner, .. } = *self;
-            inner.commit().await
+        fn rollback(self) -> Result<(), BackendError> {
+            self.inner.rollback()
         }
     }
 }

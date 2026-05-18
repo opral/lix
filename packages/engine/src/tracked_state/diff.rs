@@ -60,7 +60,7 @@ pub(crate) async fn diff_commits<S>(
     request: &TrackedStateDiffRequest,
 ) -> Result<TrackedStateDiff, LixError>
 where
-    S: crate::storage::StorageReader,
+    S: crate::storage::StorageRead + Send + Sync,
 {
     let scan_request = scan_request_for_diff(request);
     let tree_entries = reader
@@ -215,11 +215,9 @@ impl TrackedStateDiffEntry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::TrackedStateContext;
     use crate::NullableKeyFilter;
 
@@ -227,7 +225,7 @@ mod tests {
     async fn diff_commits_reports_added_rows() {
         let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -249,7 +247,7 @@ mod tests {
     async fn diff_commits_reports_removed_rows_when_right_side_is_absent() {
         let (storage, tracked_state) = seed_roots(&[row("entity-a", None, "before")], &[]).await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -275,7 +273,7 @@ mod tests {
         )
         .await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -305,7 +303,7 @@ mod tests {
         )
         .await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -335,7 +333,7 @@ mod tests {
         )
         .await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -353,7 +351,7 @@ mod tests {
         )
         .await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert!(diff.entries.is_empty());
     }
@@ -369,7 +367,7 @@ mod tests {
         )
         .await;
 
-        let diff = diff(storage.clone(), &tracked_state).await;
+        let diff = diff(&storage, &tracked_state).await;
 
         assert_eq!(diff.entries.len(), 1);
         assert_eq!(diff.entries[0].identity.file_id.as_deref(), Some("file-b"));
@@ -386,7 +384,10 @@ mod tests {
             ],
         )
         .await;
-        let mut reader = tracked_state.reader(storage.clone());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = tracked_state.reader(read);
         let diff = reader
             .diff_commits(
                 "left",
@@ -413,15 +414,15 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_between_delta_parent_and_child_reports_suffix_rows() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         write_root_for_test(
-            tx.as_mut(),
+            &read,
+            &mut writes,
             &tracked_state,
             "parent",
             None,
@@ -433,7 +434,8 @@ mod tests {
         .await
         .expect("parent should write");
         write_root_for_test(
-            tx.as_mut(),
+            &read,
+            &mut writes,
             &tracked_state,
             "child",
             Some("parent"),
@@ -441,10 +443,15 @@ mod tests {
         )
         .await
         .expect("child should write");
-        tx.commit().await.expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let diff = tracked_state
-            .reader(storage)
+            .reader(read)
             .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
             .await
             .expect("diff should load");
@@ -480,8 +487,11 @@ mod tests {
         )
         .await;
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let diff = tracked_state
-            .reader(storage)
+            .reader(read)
             .diff_commits("child", "parent", &TrackedStateDiffRequest::default())
             .await
             .expect("diff should load");
@@ -517,8 +527,11 @@ mod tests {
         )
         .await;
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let diff = tracked_state
-            .reader(storage)
+            .reader(read)
             .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
             .await
             .expect("diff should load");
@@ -539,11 +552,14 @@ mod tests {
     }
 
     async fn diff(
-        storage: StorageContext,
+        storage: &StorageContext,
         tracked_state: &TrackedStateContext,
     ) -> TrackedStateDiff {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         tracked_state
-            .reader(storage)
+            .reader(read)
             .diff_commits("left", "right", &TrackedStateDiffRequest::default())
             .await
             .expect("diff should load")
@@ -553,20 +569,28 @@ mod tests {
         left_rows: &[MaterializedTrackedStateRow],
         right_rows: &[MaterializedTrackedStateRow],
     ) -> (StorageContext, TrackedStateContext) {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        write_root_for_test(tx.as_mut(), &tracked_state, "left", None, left_rows)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        write_root_for_test(&read, &mut writes, &tracked_state, "left", None, left_rows)
             .await
             .expect("left root should write");
-        write_root_for_test(tx.as_mut(), &tracked_state, "right", None, right_rows)
-            .await
-            .expect("right root should write");
-        tx.commit().await.expect("transaction should commit");
+        write_root_for_test(
+            &read,
+            &mut writes,
+            &tracked_state,
+            "right",
+            None,
+            right_rows,
+        )
+        .await
+        .expect("right root should write");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
         (storage, tracked_state)
     }
 
@@ -574,18 +598,25 @@ mod tests {
         parent_rows: &[MaterializedTrackedStateRow],
         child_rows: &[MaterializedTrackedStateRow],
     ) -> (StorageContext, TrackedStateContext) {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        write_root_for_test(tx.as_mut(), &tracked_state, "parent", None, parent_rows)
-            .await
-            .expect("parent should write");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         write_root_for_test(
-            tx.as_mut(),
+            &read,
+            &mut writes,
+            &tracked_state,
+            "parent",
+            None,
+            parent_rows,
+        )
+        .await
+        .expect("parent should write");
+        write_root_for_test(
+            &read,
+            &mut writes,
             &tracked_state,
             "child",
             Some("parent"),
@@ -593,19 +624,23 @@ mod tests {
         )
         .await
         .expect("child should write");
-        tx.commit().await.expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
         (storage, tracked_state)
     }
 
     async fn write_root_for_test(
-        tx: &mut dyn StorageWriteTransaction,
+        read: &(impl crate::storage::StorageRead + Send + Sync + ?Sized),
+        writes: &mut crate::storage::StorageWriteSet,
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
         rows: &[MaterializedTrackedStateRow],
     ) -> Result<(), LixError> {
         crate::test_support::stage_tracked_root_from_materialized(
-            tx,
+            read,
+            writes,
             tracked_state,
             commit_id,
             parent_commit_id,

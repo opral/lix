@@ -1,4 +1,4 @@
-mod backend;
+pub mod backend;
 mod binary_cas;
 pub(crate) mod catalog;
 pub(crate) mod cel;
@@ -18,7 +18,7 @@ mod schema;
 pub mod session;
 pub(crate) mod sql2;
 #[allow(dead_code, unused_imports)]
-pub(crate) mod storage;
+pub mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 #[cfg_attr(feature = "storage-benches", allow(dead_code))]
@@ -35,20 +35,10 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
-pub use backend::{
-    project_backend_read4_value_part, project_backend_read_v3_value_part,
-    project_backend_value_part, Backend, BackendKvAccessSegment, BackendKvEntryPage,
-    BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup, BackendKvGetRequest,
-    BackendKvHeaderPayloadFramePart, BackendKvKeyPage, BackendKvKeySpace, BackendKvKeySpan,
-    BackendKvRead4Order, BackendKvRead4Page, BackendKvRead4Projection, BackendKvRead4ValuePart,
-    BackendKvReadSessionId, BackendKvReadV3Order, BackendKvReadV3Page, BackendKvReadV3Presence,
-    BackendKvReadV3Projection, BackendKvReadV3Request, BackendKvReadV3Source,
-    BackendKvReadV3Strategy, BackendKvReadV3ValuePart, BackendKvResidualFilter, BackendKvScan2Page,
-    BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvTableId, BackendKvTableReadRequest, BackendKvValueBatch, BackendKvValueGroup,
-    BackendKvValuePage, BackendKvValuePart, BackendKvWriteBatch, BackendKvWriteGroup,
-    BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    BytePage, BytePageBuilder,
+pub use backend::conformance::{
+    run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig,
+    ConformanceReport as BackendConformanceReport, ConformanceResult as BackendConformanceResult,
+    ConformanceStatus as BackendConformanceStatus, ConformanceTest as BackendConformanceTest,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
@@ -57,13 +47,11 @@ pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteRecei
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;
 pub use init::InitReceipt;
-#[cfg(feature = "storage-benches")]
-pub use session::optimization9_sql2_bench;
 pub use session::{
     CreateVersionOptions, CreateVersionReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MergeVersionOptions,
     MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
-    SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
+    SessionContext, SessionTransaction, SwitchVersionOptions, SwitchVersionReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 

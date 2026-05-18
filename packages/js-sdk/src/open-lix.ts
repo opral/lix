@@ -317,14 +317,16 @@ export type Lix = {
 	 * Executes one DataFusion SQL statement against this Lix session.
 	 *
 	 * This is not SQLite SQL. Use the DataFusion SQL dialect; positional
-	 * placeholders are `$1`, `$2`, and so on. SQLite-specific catalog tables and
+	 * placeholders are `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables and
 	 * transaction statements such as `sqlite_master`, `BEGIN`, and `COMMIT` are
-	 * not available. Use `information_schema` for catalog inspection.
+	 * not available. Use `information_schema` for catalog inspection. While a
+	 * transaction is active, call `execute()` on the transaction handle instead.
 	 */
 	execute(
 		sql: string,
 		params?: ReadonlyArray<LixRuntimeValue>,
 	): Promise<ExecuteResult>;
+	beginTransaction(): Promise<LixTransaction>;
 	activeVersionId(): Promise<string>;
 	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
 	switchVersion(options: SwitchVersionOptions): Promise<SwitchVersionResult>;
@@ -333,6 +335,15 @@ export type Lix = {
 	): Promise<MergeVersionPreviewResult>;
 	mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult>;
 	close(): Promise<void>;
+};
+
+export type LixTransaction = {
+	execute(
+		sql: string,
+		params?: ReadonlyArray<LixRuntimeValue>,
+	): Promise<ExecuteResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 };
 
 let wasmReady: Promise<void> | null = null;
@@ -350,6 +361,7 @@ type WasmLix = {
 	 * SQL contract.
 	 */
 	execute(sql: string, params: unknown[]): Promise<WasmExecuteResult>;
+	beginTransaction(): Promise<WasmLixTransaction>;
 	activeVersionId(): Promise<string>;
 	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
 	switchVersion(options: SwitchVersionOptions): Promise<SwitchVersionResult>;
@@ -358,6 +370,12 @@ type WasmLix = {
 	): Promise<MergeVersionPreviewResult>;
 	mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult>;
 	close(): Promise<void>;
+};
+
+type WasmLixTransaction = {
+	execute(sql: string, params: unknown[]): Promise<WasmExecuteResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 };
 
 async function ensureWasmReady(): Promise<void> {
@@ -428,6 +446,13 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			return normalizeExecuteResult(result);
 		},
 
+		async beginTransaction(): Promise<LixTransaction> {
+			const wasmTransaction = await runQueued(() =>
+				wasmLix.beginTransaction(),
+			);
+			return createLixTransactionHandle(wasmTransaction, runQueued);
+		},
+
 		async activeVersionId(): Promise<string> {
 			return await runQueued(() => wasmLix.activeVersionId());
 		},
@@ -456,6 +481,56 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 
 		async close(): Promise<void> {
 			await runQueued(() => wasmLix.close());
+		},
+	};
+}
+
+function createLixTransactionHandle(
+	wasmTransaction: WasmLixTransaction,
+	runQueued: <T>(operation: () => Promise<T>) => Promise<T>,
+): LixTransaction {
+	let closed = false;
+	const ensureOpen = () => {
+		if (closed) {
+			throw createLixError(
+				"LIX_INVALID_TRANSACTION_STATE",
+				"Lix transaction is closed",
+			);
+		}
+	};
+
+	return {
+		async execute(
+			sql: string,
+			params: ReadonlyArray<LixRuntimeValue> = [],
+		): Promise<ExecuteResult> {
+			ensureOpen();
+			validateExecuteArguments(sql, params);
+			const values = params.map((param, index) =>
+				valueFromExecuteParam(param, index),
+			);
+			const result = await runQueued(() =>
+				wasmTransaction.execute(sql, values),
+			);
+			return normalizeExecuteResult(result);
+		},
+
+		async commit(): Promise<void> {
+			ensureOpen();
+			try {
+				await runQueued(() => wasmTransaction.commit());
+			} finally {
+				closed = true;
+			}
+		},
+
+		async rollback(): Promise<void> {
+			ensureOpen();
+			try {
+				await runQueued(() => wasmTransaction.rollback());
+			} finally {
+				closed = true;
+			}
 		},
 	};
 }

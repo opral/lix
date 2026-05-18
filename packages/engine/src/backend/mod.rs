@@ -1,22 +1,39 @@
-mod kv;
-#[cfg(test)]
-pub(crate) mod testing;
+//! Primary backend API.
+//!
+//! This module is intentionally isolated from the current `backend` module
+//! while the ordered byte-key API and its conformance suite settle.
+
+mod capabilities;
+pub mod conformance;
+mod error;
+mod in_memory;
+mod predicate;
+mod traits;
 mod types;
 
-pub use kv::{
-    BackendKvAccessSegment, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetGroup, BackendKvGetRequest, BackendKvHeaderPayloadFramePart, BackendKvKeyPage,
-    BackendKvKeySpace, BackendKvKeySpan, BackendKvRead4Order, BackendKvRead4Page,
-    BackendKvRead4Projection, BackendKvRead4ValuePart, BackendKvReadSessionId,
-    BackendKvReadV3Order, BackendKvReadV3Page, BackendKvReadV3Presence, BackendKvReadV3Projection,
-    BackendKvReadV3Request, BackendKvReadV3Source, BackendKvReadV3Strategy,
-    BackendKvReadV3ValuePart, BackendKvResidualFilter, BackendKvScan2Page,
-    BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvTableId, BackendKvTableReadRequest, BackendKvValueBatch, BackendKvValueGroup,
-    BackendKvValuePage, BackendKvValuePart, BackendKvWriteBatch, BackendKvWriteGroup,
-    BackendKvWriteOp, BackendKvWriteStats, BytePage, BytePageBuilder,
+pub use capabilities::{
+    BackendCapabilities, BackendProfile, ProjectionCapabilities, PushdownCapabilities,
+    ScanCapabilities, WriteCapabilities, WriteConcurrency,
+};
+pub use error::{
+    BackendError, Capability, Precondition, PreconditionFailure, PreconditionItemSupport,
+    PreconditionSupportReport,
+};
+pub use in_memory::{
+    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRead,
+    InMemoryScanVisitResult, InMemoryWrite,
+};
+pub use predicate::{
+    BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
+    PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
+};
+pub use traits::{
+    get_many, visit_range, Backend, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+    PointVisitor, ScanVisitor,
 };
 pub use types::{
-    project_backend_read4_value_part, project_backend_read_v3_value_part,
-    project_backend_value_part, Backend, BackendReadTransaction, BackendWriteTransaction,
+    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,
+    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, ScanResult, SnapshotRef, SpaceId, StoredValue, Value,
+    WriteOptions, WriteStats,
 };

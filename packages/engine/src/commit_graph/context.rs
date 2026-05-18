@@ -7,8 +7,7 @@ use crate::commit_graph::{
 };
 use crate::commit_store::{Change, Commit, CommitStoreContext, CommitStoreReader, LocatedChange};
 use crate::entity_identity::EntityIdentity;
-use crate::storage::StorageReader;
-use crate::storage::{ScopedStorageReader, StorageReadScope};
+use crate::storage::StorageRead;
 use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -33,11 +32,10 @@ impl CommitGraphContext {
     /// Creates a graph reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> CommitGraphStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead + Send + Sync,
     {
-        let read_scope = StorageReadScope::new(store);
         CommitGraphStoreReader {
-            commit_store_reader: self.commit_store.reader(read_scope.store()),
+            commit_store_reader: self.commit_store.reader(store),
         }
     }
 }
@@ -45,14 +43,14 @@ impl CommitGraphContext {
 /// Commit-graph reader that resolves commit-store entities at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
-    commit_store_reader: CommitStoreReader<ScopedStorageReader<S>>,
+    commit_store_reader: CommitStoreReader<S>,
 }
 
 impl<S> CommitGraphStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     /// Loads and parses a `lix_commit` canonical change by commit id.
     pub(crate) async fn load_commit(
@@ -268,7 +266,7 @@ where
 #[async_trait::async_trait]
 impl<S> CommitGraphReader for CommitGraphStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     async fn load_commit(
         &mut self,
@@ -385,21 +383,19 @@ fn missing_pack_error(label: &str, commit_id: &str, pack_id: u32) -> LixError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
 
-    use crate::backend::testing::UnitTestBackend;
     use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
     use crate::commit_store::{
         Change, ChangeLocator, ChangeRef, CommitDraftRef, CommitStoreContext,
     };
-    use crate::storage::{StorageContext, StorageWriteSet};
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[commit_change(
                 "commit-1-change",
                 "commit-1",
@@ -410,7 +406,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let commit = reader
             .load_commit("commit-1")
             .await
@@ -425,10 +424,12 @@ mod tests {
 
     #[tokio::test]
     async fn load_commit_returns_none_for_missing_commit() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
 
         let commit = reader
             .load_commit("missing")
@@ -440,10 +441,9 @@ mod tests {
 
     #[tokio::test]
     async fn all_commits_returns_parsed_commits_sorted_by_id() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 commit_change("commit-b-change", "commit-b", &[], &[]),
                 entity_change("change-1", "entity-1", "example", "{}"),
@@ -453,7 +453,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let commits = reader
             .all_commits()
             .await
@@ -471,7 +474,11 @@ mod tests {
     #[tokio::test]
     async fn commit_edges_are_derived_from_parent_commit_ids() {
         let graph = CommitGraphContext::new();
-        let reader = graph.reader(StorageContext::new(Arc::new(UnitTestBackend::new())));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let reader = graph.reader(read);
         let commits = vec![parsed_commit(
             "commit-head",
             &[],
@@ -498,10 +505,9 @@ mod tests {
 
     #[tokio::test]
     async fn change_history_from_commit_reports_matching_canonical_changes_with_depth() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 entity_change("change-root", "entity-root", "test_schema", "{}"),
                 entity_change("change-head", "entity-head", "test_schema", "{}"),
@@ -517,7 +523,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let history = reader
             .change_history_from_commit(
                 "commit-head",
@@ -549,10 +558,9 @@ mod tests {
 
     #[tokio::test]
     async fn change_history_from_commit_filters_depth_entity_file_and_tombstones() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 entity_change_with_file(
                     "change-file-a",
@@ -581,7 +589,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let history = reader
             .change_history_from_commit(
                 "commit-head",
@@ -604,10 +615,9 @@ mod tests {
 
     #[tokio::test]
     async fn change_history_from_commit_includes_tombstones_when_requested() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
-            storage.clone(),
+            &storage,
             &[
                 entity_tombstone("change-deleted", "entity-1", "test_schema"),
                 commit_change(
@@ -621,7 +631,10 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = graph.reader(read);
         let hidden = reader
             .change_history_from_commit("commit-head", &CommitGraphChangeHistoryRequest::default())
             .await
@@ -704,12 +717,11 @@ mod tests {
         }
     }
 
-    async fn append_changes(storage: StorageContext, changes: &[TestChange]) {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+    async fn append_changes(storage: &StorageContext, changes: &[TestChange]) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
         let canonical_changes = changes
             .iter()
             .filter(|change| !change.is_commit())
@@ -762,7 +774,7 @@ mod tests {
 
             if corrupt_missing_members.is_empty() {
                 commit_store
-                    .writer(tx.as_mut(), &mut writes)
+                    .writer(&read, &mut writes)
                     .stage_commit_draft(commit_draft, authored_changes, adopted_changes)
                     .await
                     .expect("commit-store append should succeed");
@@ -784,11 +796,9 @@ mod tests {
                 .expect("corrupt commit-store fixture should stage");
             }
         }
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("writes should apply");
-        tx.commit().await.expect("commit should succeed");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("commit should succeed");
     }
 
     fn change_ref_from_canonical<'a>(change: crate::commit_store::ChangeRef<'a>) -> ChangeRef<'a> {
