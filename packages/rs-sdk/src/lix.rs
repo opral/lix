@@ -50,7 +50,7 @@ impl Lix {
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-    /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog tables
+    /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables
     /// and transaction statements such as `sqlite_master`, `BEGIN`, and
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.

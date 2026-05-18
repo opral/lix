@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use crate::functions::FunctionContext;
 use crate::sql2;
-use crate::storage::StorageBackend;
-use crate::storage::StorageWriteSet;
+use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSet};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
@@ -297,17 +296,16 @@ where
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-    /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog tables
+    /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables
     /// and transaction statements such as `sqlite_master`, `BEGIN`, and
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let _transaction_guard = self.reserve_session_transaction()?;
-        let kind = sql2::classify_statement(sql)?;
-        if kind == sql2::SqlStatementKind::Write {
-            let sql = sql.to_string();
-            let sql_for_error = sql.clone();
+        let statement = sql2::parse_statement(sql)?;
+        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+            let sql_for_error = sql.to_string();
             let params = params.to_vec();
             return self
                 .with_write_transaction_reserved(|transaction| {
@@ -315,32 +313,26 @@ where
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
                         // transaction-owned SQL write context.
-                        let tx_plan = sql2::create_write_logical_plan(transaction, &sql).await?;
-                        let result = sql2::execute_logical_plan(tx_plan, &params).await?;
-                        let affected_rows = affected_rows_from_query_result(result)?;
+                        let tx_plan =
+                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
+                                .await?;
+                        let affected_rows =
+                            sql2::execute_write_logical_plan(transaction, tx_plan, &params).await?;
                         Ok(ExecuteResult::from_rows_affected(affected_rows))
                     })
                 })
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
-        if kind == sql2::SqlStatementKind::Other {
-            return Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "SQL statement is not supported by Lix SQL",
-            ));
-        }
 
-        let read_scope = self
-            .storage
-            .begin_read(crate::storage::StorageReadOptions::default())?;
+        let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result = async {
-            let read_store = read_scope.store();
+            let mut read_store = read_scope.store();
             let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                 Arc::new(self.live_state.reader(read_store.clone()));
             let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
             let functions = runtime_functions.provider();
-            let active_version_id = self.active_version_id_from_reader(&read_store).await?;
+            let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
             let visible_schemas = self
                 .catalog_context
                 .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_version_id)
@@ -356,21 +348,60 @@ where
                 functions: functions.clone(),
             };
 
-            let plan = sql2::create_logical_plan(&ctx, sql).await?;
+            let plan = sql2::create_logical_plan_from_parsed(&ctx, sql, statement).await?;
             let result = sql2::execute_logical_plan(plan, params).await?;
             drop(ctx);
             drop(live_state);
             Ok::<_, LixError>((runtime_functions, result))
         };
         let (runtime_functions, result) = match read_result.await {
-            Ok(result) => result,
+            Ok(result) => {
+                read_scope.close()?;
+                result
+            }
             Err(error) => {
+                let _ = read_scope.close();
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
         self.persist_runtime_functions_if_needed(&runtime_functions)
             .await?;
         Ok(ExecuteResult::from_sql_query_result(result))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_with_write_executor_mode(
+        &self,
+        sql: &str,
+        params: &[Value],
+        mode: sql2::WriteExecutorMode,
+    ) -> Result<ExecuteResult, LixError> {
+        self.ensure_open()?;
+        let statement = sql2::parse_statement(sql)?;
+        if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+            let _transaction_guard = self.reserve_session_transaction()?;
+            let sql_for_error = sql.to_string();
+            let params = params.to_vec();
+            return self
+                .with_write_transaction_reserved(|transaction| {
+                    Box::pin(async move {
+                        let tx_plan =
+                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
+                                .await?;
+                        let affected_rows = sql2::execute_write_logical_plan_with_mode(
+                            transaction,
+                            tx_plan,
+                            &params,
+                            mode,
+                        )
+                        .await?;
+                        Ok(ExecuteResult::from_rows_affected(affected_rows))
+                    })
+                })
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+        }
+        self.execute(sql, params).await
     }
 
     /// Persists execution-scoped runtime function state after a successful read.
@@ -391,9 +422,8 @@ where
             return Ok(());
         }
         self.storage
-            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
-            .map(|_| ())
-            .map_err(Into::into)
+            .commit_write_set(writes, StorageWriteOptions::default())?;
+        Ok(())
     }
 }
 
@@ -413,32 +443,87 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        let kind = sql2::classify_statement(sql)?;
+        let statement = sql2::parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
-        match kind {
-            sql2::SqlStatementKind::Write => execute_transaction_write(transaction, sql, params)
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, sql)),
-            sql2::SqlStatementKind::Read => {
-                let plan = sql2::create_transaction_read_logical_plan(transaction, sql)
+        match sql2::bind_statement_route(&statement)? {
+            sql2::BoundStatementRoute::Write => {
+                execute_transaction_write_auto(transaction, statement, params)
                     .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            sql2::BoundStatementRoute::Read => {
+                let plan = sql2::create_transaction_read_logical_plan_from_parsed(
+                    transaction,
+                    sql,
+                    statement,
+                )
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, sql))?;
                 let result = sql2::execute_logical_plan(plan, params)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))?;
                 Ok(ExecuteResult::from_sql_query_result(result))
             }
-            sql2::SqlStatementKind::Other => Err(LixError::new(
-                LixError::CODE_UNSUPPORTED_SQL,
-                "SQL statement is not supported by Lix SQL",
-            )),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_with_write_executor_mode(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        mode: sql2::WriteExecutorMode,
+    ) -> Result<ExecuteResult, LixError> {
+        let statement = sql2::parse_statement(sql)?;
+        let transaction = self.transaction_mut()?;
+        match sql2::bind_statement_route(&statement)? {
+            sql2::BoundStatementRoute::Write => {
+                execute_transaction_write_with_mode(transaction, statement, params, mode)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            sql2::BoundStatementRoute::Read => self.execute(sql, params).await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_with_write_executor_mode_and_trace(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        mode: sql2::WriteExecutorMode,
+    ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
+        let statement = sql2::parse_statement(sql)?;
+        let transaction = self.transaction_mut()?;
+        match sql2::bind_statement_route(&statement)? {
+            sql2::BoundStatementRoute::Write => {
+                execute_transaction_write_with_mode_and_trace(transaction, statement, params, mode)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            sql2::BoundStatementRoute::Read => {
+                self.execute(sql, params).await.map(|result| (result, None))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn scan_live_state_for_test(
+        &mut self,
+        request: &crate::live_state::LiveStateScanRequest,
+    ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+        let transaction = self.transaction_mut()?;
+        <crate::transaction::Transaction<B> as sql2::SqlWriteExecutionContext>::scan_live_state(
+            transaction,
+            request,
+        )
+        .await
     }
 }
 
-async fn execute_transaction_write<B>(
+async fn execute_transaction_write_auto<B>(
     transaction: &mut crate::transaction::Transaction<B>,
-    sql: &str,
+    statement: datafusion::sql::parser::Statement,
     params: &[Value],
 ) -> Result<ExecuteResult, LixError>
 where
@@ -446,10 +531,46 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
-    let tx_plan = sql2::create_write_logical_plan(transaction, sql).await?;
-    let result = sql2::execute_logical_plan(tx_plan, params).await?;
-    let affected_rows = affected_rows_from_query_result(result)?;
+    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
     Ok(ExecuteResult::from_rows_affected(affected_rows))
+}
+
+#[cfg(test)]
+async fn execute_transaction_write_with_mode<B>(
+    transaction: &mut crate::transaction::Transaction<B>,
+    statement: datafusion::sql::parser::Statement,
+    params: &[Value],
+    mode: sql2::WriteExecutorMode,
+) -> Result<ExecuteResult, LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let affected_rows =
+        sql2::execute_write_logical_plan_with_mode(transaction, tx_plan, params, mode).await?;
+    Ok(ExecuteResult::from_rows_affected(affected_rows))
+}
+
+#[cfg(test)]
+async fn execute_transaction_write_with_mode_and_trace<B>(
+    transaction: &mut crate::transaction::Transaction<B>,
+    statement: datafusion::sql::parser::Statement,
+    params: &[Value],
+    mode: sql2::WriteExecutorMode,
+) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
+    let (affected_rows, path) =
+        sql2::execute_write_logical_plan_with_mode_and_trace(transaction, tx_plan, params, mode)
+            .await?;
+    Ok((ExecuteResult::from_rows_affected(affected_rows), Some(path)))
 }
 
 fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
@@ -485,28 +606,6 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
 fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     (lower.contains("lix_file") || lower.contains("lix_directory")) && lower.contains("path")
-}
-
-fn affected_rows_from_query_result(result: SqlQueryResult) -> Result<u64, LixError> {
-    let Some(first_row) = result.rows.first() else {
-        return Ok(0);
-    };
-    let Some(first_value) = first_row.first() else {
-        return Ok(0);
-    };
-    match first_value {
-        Value::Integer(value) if *value >= 0 => Ok(*value as u64),
-        Value::Text(value) => value.parse::<u64>().map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("failed to parse affected row count from SQL result: {error}"),
-            )
-        }),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("expected affected row count, got {other:?}"),
-        )),
-    }
 }
 
 #[cfg(test)]

@@ -844,3 +844,47 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_directory_global_path_insert_reuses_existing_global_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_global) \
+                 VALUES ('global-shared-dir-parent', '/shared/', true)",
+                &[],
+            )
+            .await
+            .expect("global parent directory insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_global) \
+                 VALUES ('global-shared-dir-child', '/shared/child/', true)",
+                &[],
+            )
+            .await
+            .expect("global directory insert should reuse existing global parent directory");
+
+        let result = session
+            .execute(
+                "SELECT path FROM lix_directory WHERE id = 'global-shared-dir-child'",
+                &[],
+            )
+            .await
+            .expect("global directory should read through active overlay");
+        assert_rows_eq(
+            result,
+            vec![vec![Value::Text("/shared/child/".to_string())]],
+        );
+    }
+);

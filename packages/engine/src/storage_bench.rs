@@ -489,6 +489,41 @@ pub async fn transaction_stage_only_prepared(
     })
 }
 
+pub async fn transaction_stage_rows_individually_prepared(
+    fixture: &TransactionBenchFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let opened = open_transaction(
+        &SessionMode::Pinned {
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+        },
+        fixture.storage.clone(),
+        Arc::clone(&fixture.live_state),
+        Arc::clone(&fixture.tracked_state),
+        Arc::clone(&fixture.binary_cas),
+        Arc::clone(&fixture.commit_store),
+        Arc::clone(&fixture.version_ctx),
+        Arc::clone(&fixture.catalog_context),
+    )
+    .await?;
+    let mut transaction = opened.transaction;
+    let started_at = Instant::now();
+    for row in &fixture.rows {
+        transaction
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![row.clone()],
+            })
+            .await?;
+    }
+    let elapsed = started_at.elapsed();
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: fixture.rows.len(),
+        verified_rows: fixture.rows.len(),
+        elapsed,
+    })
+}
+
 pub async fn prepare_transaction_commit_only(
     fixture: TransactionBenchFixture,
 ) -> Result<TransactionCommitOnlyFixture, LixError> {
@@ -575,9 +610,25 @@ async fn prepare_transaction_fixture(
         crate::commit_graph::CommitGraphContext::new(),
     ));
     let binary_cas = Arc::new(BinaryCasContext::new());
-    let version_ctx = Arc::new(VersionContext::new(untracked_state));
+    let version_ctx = Arc::new(VersionContext::new(Arc::clone(&untracked_state)));
     let catalog_context = Arc::new(CatalogContext::new());
-    seed_transaction_visible_schema_rows(storage.clone()).await?;
+    crate::init::initialize(
+        storage.clone(),
+        commit_store.as_ref(),
+        tracked_state.as_ref(),
+        untracked_state.as_ref(),
+    )
+    .await?;
+    seed_transaction_bench_schema_row(
+        storage.clone(),
+        Arc::clone(&live_state),
+        Arc::clone(&tracked_state),
+        Arc::clone(&binary_cas),
+        Arc::clone(&commit_store),
+        Arc::clone(&version_ctx),
+        Arc::clone(&catalog_context),
+    )
+    .await?;
     Ok(TransactionBenchFixture {
         storage,
         live_state,
@@ -590,36 +641,55 @@ async fn prepare_transaction_fixture(
     })
 }
 
-async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result<(), LixError> {
-    let mut writes = StorageWriteSet::new();
-    let rows = crate::schema::seed_schema_definitions()
-        .into_iter()
-        .cloned()
-        .chain(std::iter::once(transaction_entity_schema_definition()))
-        .map(|schema| {
-            let key = crate::schema::schema_key_from_definition(&schema)
-                .expect("seed schema key should derive");
-            let snapshot_content = serde_json::json!({ "value": schema }).to_string();
-            Ok(crate::untracked_state::UntrackedStateRow {
-                entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
-                    .expect("registered schema identity should derive"),
+async fn seed_transaction_bench_schema_row(
+    storage: StorageContext,
+    live_state: Arc<LiveStateContext>,
+    tracked_state: Arc<TrackedStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    commit_store: Arc<CommitStoreContext>,
+    version_ctx: Arc<VersionContext>,
+    catalog_context: Arc<CatalogContext>,
+) -> Result<(), LixError> {
+    let schema = transaction_entity_schema_definition();
+    let key = crate::schema::schema_key_from_definition(&schema)?;
+    let opened = open_transaction(
+        &SessionMode::Pinned {
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+        },
+        storage,
+        live_state,
+        tracked_state,
+        binary_cas,
+        commit_store,
+        version_ctx,
+        catalog_context,
+    )
+    .await?;
+    let mut transaction = opened.transaction;
+    transaction
+        .stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows: vec![TransactionWriteRow {
+                entity_id: Some(crate::schema::registered_schema_entity_id(&key.schema_key)?),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
-                version_id: crate::GLOBAL_VERSION_ID.to_string(),
-                snapshot_content: Some(snapshot_content),
+                snapshot: Some(TransactionJson::from_value_unchecked(
+                    serde_json::json!({ "value": schema }),
+                )),
                 metadata: None,
-                created_at: "1970-01-01T00:00:00.000Z".to_string(),
-                updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+                origin: None,
+                created_at: None,
+                updated_at: None,
                 global: true,
-            })
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                version_id: crate::GLOBAL_VERSION_ID.to_string(),
+            }],
         })
-        .collect::<Result<Vec<_>, LixError>>()?;
-    let mut transaction = storage.begin_write_transaction().await?;
-    UntrackedStateContext::new()
-        .writer(&mut writes)
-        .stage_rows(rows.iter().map(|row| row.as_ref()))?;
-    writes.apply(&mut transaction.as_mut()).await?;
-    transaction.commit().await
+        .await?;
+    transaction.commit(&opened.runtime_functions).await?;
+    Ok(())
 }
 
 fn transaction_entity_schema_definition() -> serde_json::Value {
