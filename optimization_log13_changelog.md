@@ -1041,3 +1041,75 @@ membership string comparisons. A likely follow-up is a batched membership index
 lookup shape or a range-scan API that can scan many change_id prefixes without
 creating one iterator per change_id.
 ```
+
+## Entry 14: Pre-Main-Merge Baseline
+
+Change:
+
+```text
+No code change. This is the final scorecard on physical-optimal before merging
+main, which brings the optimized backend and storage API that changelog should
+leverage next.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_14_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.074 |
+| decode_segment / 1c_1000ch              |       3.602 |
+| view_segment / 1c_1000ch                |       0.026 |
+| validate_segment_shape / 1c_1000ch      |       5.479 |
+| build_decoded_segment_index / 1c_1000ch |       0.240 |
+| build_by_change / 1c_1000ch             |       0.808 |
+| build_by_change_membership / 1c_1000ch  |       0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.435 |              2.859 |              3.813 |
+| stage_segment / 1c_1000ch                            |       5.245 |              8.068 |              7.382 |
+| stage_publish_commit / 1c_1ch                        |       0.041 |              0.040 |              0.054 |
+| stage_publish_commit / 1c_100ch                      |       0.460 |              0.475 |              0.482 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.433 |              7.168 |              4.636 |
+| load_commits_visible_batched / 1c_100ch              |       0.175 |              0.177 |              0.175 |
+| load_changes_visible_batched / 1c_100ch              |       0.258 |              0.474 |              0.292 |
+| load_changes_visible_batched / 1c_1000ch             |       7.666 |             14.569 |              2.857 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       0.914 |              1.213 |              1.331 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |       8.962 |             15.630 |              3.200 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.163 |              7.244 |              6.564 |
+| plan_gc / live_50pct_mixed_segments                  |       6.230 |              6.343 |              6.649 |
+| collect_garbage / live_50pct_mixed_segments          |       6.461 |              7.206 |              6.773 |
+
+Read:
+
+```text
+This is the branch baseline immediately before bringing in main's backend/storage
+API work.
+
+Compared with entry 13, the core visible-read rows are slightly faster:
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 13 rocksdb: 3.199ms
+  entry 14 rocksdb: 2.857ms
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 13 rocksdb: 3.351ms
+  entry 14 rocksdb: 3.200ms
+
+SQLite remained the slowest visible backend in this smoke loop, especially on
+1c_1000ch visible change loads. That gives the post-merge backend/storage API
+work a concrete row to target without confusing it with pre-merge changelog
+changes.
+```
