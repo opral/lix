@@ -4,10 +4,6 @@ use crate::backend::{
     Backend, BackendError, BackendWrite, CommitResult, InMemoryBackend, KeyRange, Prefix,
     ReadOptions, WriteOptions,
 };
-use crate::storage::legacy::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
-    KvWriteStats, StorageReader, StorageWriter,
-};
 use crate::storage::{
     StorageRead, StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError,
     StorageWriteSetStats,
@@ -39,16 +35,16 @@ where
 
     pub async fn begin_read_transaction(
         &self,
-    ) -> Result<Box<StorageCompatReadTransaction<B::Read<'_>>>, crate::LixError> {
-        Ok(Box::new(StorageCompatReadTransaction {
+    ) -> Result<Box<StorageReadTransaction<B::Read<'_>>>, crate::LixError> {
+        Ok(Box::new(StorageReadTransaction {
             read: self.begin_read(ReadOptions::default())?,
         }))
     }
 
     pub async fn begin_write_transaction(
         &self,
-    ) -> Result<Box<StorageCompatWriteTransaction<'_, B>>, crate::LixError> {
-        Ok(Box::new(StorageCompatWriteTransaction {
+    ) -> Result<Box<StorageWriteTransaction<'_, B>>, crate::LixError> {
+        Ok(Box::new(StorageWriteTransaction {
             storage: self,
             read: self.begin_read(ReadOptions::default())?,
         }))
@@ -102,54 +98,14 @@ where
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl<B> StorageReader for StorageContext<B>
-where
-    B: Backend,
-{
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, crate::LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
-        read.get_values(request).await
-    }
-
-    async fn exists_many(
-        &mut self,
-        request: KvGetRequest,
-    ) -> Result<KvExistsBatch, crate::LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
-        read.exists_many(request).await
-    }
-
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, crate::LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
-        read.scan_keys(request).await
-    }
-
-    async fn scan_values(
-        &mut self,
-        request: KvScanRequest,
-    ) -> Result<KvValuePage, crate::LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
-        read.scan_values(request).await
-    }
-
-    async fn scan_entries(
-        &mut self,
-        request: KvScanRequest,
-    ) -> Result<KvEntryPage, crate::LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
-        read.scan_entries(request).await
-    }
-}
-
-pub struct StorageCompatReadTransaction<R>
+pub struct StorageReadTransaction<R>
 where
     R: crate::backend::BackendRead,
 {
     read: StorageReadScope<R>,
 }
 
-impl<R> StorageCompatReadTransaction<R>
+impl<R> StorageReadTransaction<R>
 where
     R: crate::backend::BackendRead,
 {
@@ -158,7 +114,7 @@ where
     }
 }
 
-impl<R> StorageRead for StorageCompatReadTransaction<R>
+impl<R> StorageRead for StorageReadTransaction<R>
 where
     R: crate::backend::BackendRead,
 {
@@ -169,7 +125,7 @@ where
     }
 }
 
-pub struct StorageCompatWriteTransaction<'a, B>
+pub struct StorageWriteTransaction<'a, B>
 where
     B: Backend,
 {
@@ -177,7 +133,7 @@ where
     read: StorageReadScope<B::Read<'a>>,
 }
 
-impl<B> StorageCompatWriteTransaction<'_, B>
+impl<B> StorageWriteTransaction<'_, B>
 where
     B: Backend,
 {
@@ -188,9 +144,19 @@ where
     pub async fn rollback(self: Box<Self>) -> Result<(), crate::LixError> {
         Ok(())
     }
+
+    pub fn write_set(
+        &mut self,
+        write_set: StorageWriteSet,
+    ) -> Result<StorageWriteSetStats, crate::LixError> {
+        let (_commit, stats) = self
+            .storage
+            .commit_write_set(write_set, WriteOptions::default())?;
+        Ok(stats)
+    }
 }
 
-impl<'a, B> StorageRead for StorageCompatWriteTransaction<'a, B>
+impl<'a, B> StorageRead for StorageWriteTransaction<'a, B>
 where
     B: Backend,
 {
@@ -198,22 +164,6 @@ where
 
     fn backend_read(&self) -> &Self::BackendRead {
         self.read.backend_read()
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl<B> StorageWriter for StorageCompatWriteTransaction<'_, B>
-where
-    B: Backend,
-{
-    async fn write_storage_set(
-        &mut self,
-        write_set: StorageWriteSet,
-    ) -> Result<KvWriteStats, crate::LixError> {
-        let (_commit, stats) = self
-            .storage
-            .commit_write_set(write_set, WriteOptions::default())?;
-        Ok(stats.into())
     }
 }
 

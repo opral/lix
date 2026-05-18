@@ -5,7 +5,6 @@
 //! shared scopes, batching, lowering, cursors, and adapter stats.
 
 mod context;
-mod legacy;
 mod point;
 mod read_scope;
 #[cfg(test)]
@@ -33,10 +32,6 @@ pub use crate::backend::{
 };
 
 pub use context::StorageContext;
-pub(crate) use legacy::{
-    KvEntryPage, KvExistsBatch, KvExistsGroup, KvGetGroup, KvGetRequest, KvKeyPage, KvScanRange,
-    KvScanRequest, KvValueBatch, KvValueGroup, KvValuePage, KvWriteStats, StorageReader,
-};
 pub use point::{
     PointReadBuffer, PointReadPlan, PointValues, PointValuesRef, RequestedToUnique,
     RequestedToUniqueRef,

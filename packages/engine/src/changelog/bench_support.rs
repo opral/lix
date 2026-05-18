@@ -20,8 +20,7 @@ use super::segment::{
 use super::store::{
     by_change_key, by_change_membership_commit_id_from_key, by_change_membership_key,
     by_change_membership_prefix, by_commit_key, segment_key, segment_value,
-    BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE,
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
 };
 use super::types::{
     ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, CommitLoadRequest, CommitProjection,
@@ -29,7 +28,7 @@ use super::types::{
     SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
     SegmentInlinePayload, StateRowIdentity,
 };
-use crate::backend::Backend;
+use crate::backend::{Backend, CoreProjection, Key, Prefix, ScanOptions};
 use crate::LixError;
 
 pub trait BenchBackend: Backend + Clone {}
@@ -38,8 +37,8 @@ use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageContext, StorageReadOptions,
-    StorageReader, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageContext, StorageGetOptions, StorageReadOptions, StorageSpace,
+    StorageWriteSet, StorageWriteSetStats,
 };
 
 #[derive(Clone)]
@@ -965,7 +964,7 @@ pub async fn lookup_by_commit_index<B: BenchBackend>(
 ) -> Result<usize, LixError> {
     let values = get_values(
         store,
-        BY_COMMIT_INDEX_NAMESPACE,
+        BY_COMMIT_INDEX_SPACE,
         commit_ids.iter().map(|commit_id| by_commit_key(commit_id)),
     )
     .await?;
@@ -991,7 +990,7 @@ pub async fn lookup_by_change_index<B: BenchBackend>(
 ) -> Result<usize, LixError> {
     let values = get_values(
         store,
-        BY_CHANGE_INDEX_NAMESPACE,
+        BY_CHANGE_INDEX_SPACE,
         change_ids.iter().map(|change_id| by_change_key(change_id)),
     )
     .await?;
@@ -1016,30 +1015,35 @@ pub async fn scan_by_change_membership_candidates<B: BenchBackend>(
     change_id: &str,
 ) -> Result<usize, LixError> {
     let prefix = by_change_membership_prefix(change_id);
-    let mut storage = store.storage.clone();
-    let mut after = None;
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut after: Option<Vec<u8>> = None;
     let mut found = 0;
     loop {
-        let page = storage
-            .scan_keys(KvScanRequest {
-                namespace: BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE.to_string(),
-                range: KvScanRange::prefix(prefix.clone()),
-                after,
-                limit: 256,
-            })
-            .await?;
-        for index in 0..page.keys.len() {
-            let Some(key) = page.keys.get(index) else {
-                continue;
-            };
-            if by_change_membership_commit_id_from_key(change_id, key)?.is_some() {
+        let after_key = after.as_ref().map(|key| Key(bytes::Bytes::from(key.clone())));
+        let chunk = ScanPlan::prefix(
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+            Prefix {
+                bytes: bytes::Bytes::from(prefix.clone()),
+            },
+        )
+        .collect(
+            &read,
+            ScanOptions {
+                projection: CoreProjection::KeyOnly,
+                limit_rows: 256,
+                resume_after: after_key.as_ref(),
+            },
+        )?
+        .value;
+        for entry in &chunk.entries {
+            if by_change_membership_commit_id_from_key(change_id, entry.key.0.as_ref())?.is_some() {
                 found += 1;
             }
         }
-        let Some(next_after) = page.resume_after else {
+        if !chunk.has_more {
             break;
-        };
-        after = Some(next_after);
+        }
+        after = chunk.entries.last().map(|entry| entry.key.0.to_vec());
     }
     Ok(found)
 }
@@ -1047,26 +1051,37 @@ pub async fn scan_by_change_membership_candidates<B: BenchBackend>(
 pub async fn scan_segments_decode<B: BenchBackend>(
     store: &BenchStore<B>,
 ) -> Result<usize, LixError> {
-    let mut storage = store.storage.clone();
-    let mut after = None;
+    let read = store.storage.begin_read(StorageReadOptions::default())?;
+    let mut after: Option<Vec<u8>> = None;
     let mut decoded_objects = 0;
     loop {
-        let page = storage
-            .scan_values(KvScanRequest {
-                namespace: SEGMENT_NAMESPACE.to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after,
-                limit: 256,
-            })
-            .await?;
-        for value in page.values.iter() {
+        let after_key = after.as_ref().map(|key| Key(bytes::Bytes::from(key.clone())));
+        let chunk = ScanPlan::prefix(
+            SEGMENT_SPACE,
+            Prefix {
+                bytes: bytes::Bytes::new(),
+            },
+        )
+        .collect(
+            &read,
+            ScanOptions {
+                projection: CoreProjection::FullValue,
+                limit_rows: 256,
+                resume_after: after_key.as_ref(),
+            },
+        )?
+        .value;
+        for entry in &chunk.entries {
+            let Some(value) = projected_value_bytes(&entry.value) else {
+                continue;
+            };
             let segment = decode_segment(value)?;
             decoded_objects += 1 + segment.commits.len() + segment.changes.len();
         }
-        let Some(next_after) = page.resume_after else {
+        if !chunk.has_more {
             break;
-        };
-        after = Some(next_after);
+        }
+        after = chunk.entries.last().map(|entry| entry.key.0.to_vec());
     }
     Ok(decoded_objects)
 }
@@ -1439,7 +1454,7 @@ async fn write_corpus_segments_raw<B: BenchBackend>(
     let mut writes = StorageWriteSet::new();
     for segment in &corpus.segments {
         writes.put(
-            SEGMENT_NAMESPACE,
+            SEGMENT_SPACE,
             segment_key(segment.segment_id()),
             segment_value(&segment.inner)?,
         );
@@ -1455,17 +1470,17 @@ async fn inject_stale_index_rows<B: BenchBackend>(
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     writes.put(
-        BY_COMMIT_INDEX_NAMESPACE,
+        BY_COMMIT_INDEX_SPACE,
         by_commit_key("stale-commit"),
         b"stale-by-commit".to_vec(),
     );
     writes.put(
-        BY_CHANGE_INDEX_NAMESPACE,
+        BY_CHANGE_INDEX_SPACE,
         by_change_key("stale-change"),
         b"stale-by-change".to_vec(),
     );
     writes.put(
-        BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+        BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
         by_change_membership_key("stale-change", "stale-commit"),
         b"stale-by-change-membership".to_vec(),
     );
@@ -1487,17 +1502,17 @@ async fn inject_corrupt_index_values<B: BenchBackend>(
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     writes.put(
-        BY_COMMIT_INDEX_NAMESPACE,
+        BY_COMMIT_INDEX_SPACE,
         by_commit_key(first_commit),
         b"corrupt-by-commit".to_vec(),
     );
     writes.put(
-        BY_CHANGE_INDEX_NAMESPACE,
+        BY_CHANGE_INDEX_SPACE,
         by_change_key(first_change),
         b"corrupt-by-change".to_vec(),
     );
     writes.put(
-        BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+        BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
         by_change_membership_key(first_change, first_commit),
         b"corrupt-by-change-membership".to_vec(),
     );
@@ -1508,25 +1523,32 @@ async fn inject_corrupt_index_values<B: BenchBackend>(
 
 async fn get_values<B: BenchBackend>(
     store: &BenchStore<B>,
-    namespace: &'static str,
+    space: StorageSpace,
     keys: impl IntoIterator<Item = Vec<u8>>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-    let mut storage = store.storage.clone();
-    let batch = storage
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: namespace.to_string(),
-                keys: keys.into_iter().collect(),
-            }],
+    let keys = keys
+        .into_iter()
+        .map(|key| Key(bytes::Bytes::from(key)))
+        .collect::<Vec<_>>();
+    let mut read = store.storage.begin_read(StorageReadOptions::default())?;
+    let values = PointReadPlan::new(space, &keys)
+        .materialize(&mut read, StorageGetOptions::default())?
+        .value;
+    Ok(values
+        .into_iter()
+        .map(|value| match value {
+            Some(crate::backend::ProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+            Some(crate::backend::ProjectedValue::KeyOnly) => Some(Vec::new()),
+            None => None,
         })
-        .await?;
-    let Some(group) = batch.groups.first() else {
-        return Ok(Vec::new());
-    };
-    Ok(group
-        .values_iter()
-        .map(|value| value.map(<[u8]>::to_vec))
         .collect())
+}
+
+fn projected_value_bytes(value: &crate::backend::ProjectedValue) -> Option<&[u8]> {
+    match value {
+        crate::backend::ProjectedValue::FullValue(bytes) => Some(bytes.as_ref()),
+        crate::backend::ProjectedValue::KeyOnly => None,
+    }
 }
 
 fn commit_ordinal_for_change(
@@ -1689,11 +1711,11 @@ fn timestamp(index: usize) -> String {
     format!("2026-05-12T00:{:02}:{:02}Z", (index / 60) % 60, index % 60)
 }
 
-fn bench_write_stats(stats: crate::storage::KvWriteStats) -> BenchWriteStats {
+fn bench_write_stats(stats: StorageWriteSetStats) -> BenchWriteStats {
     BenchWriteStats {
-        puts: stats.puts,
-        deletes: stats.deletes,
-        bytes_written: stats.bytes_written,
+        puts: stats.staged_puts as usize,
+        deletes: stats.staged_deletes as usize,
+        bytes_written: stats.written_bytes as usize,
     }
 }
 
