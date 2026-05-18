@@ -3,8 +3,8 @@ use std::hint::black_box;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use lix_engine::changelog::bench as changelog_bench;
 use lix_engine::LixError;
+use lix_engine::changelog::bench as changelog_bench;
 
 mod backends;
 
@@ -326,6 +326,7 @@ async fn backend_row(
         mem_unit: Duration::ZERO,
         sqlite_tempfile: Duration::ZERO,
         rocksdb_tempdir: Duration::ZERO,
+        redb_tempfile: Duration::ZERO,
     };
 
     for backend in ChangelogBenchBackend::CI {
@@ -335,6 +336,7 @@ async fn backend_row(
             ChangelogBenchBackend::Unit => row.mem_unit = duration,
             ChangelogBenchBackend::SqliteTempfile => row.sqlite_tempfile = duration,
             ChangelogBenchBackend::RocksDbTempdir => row.rocksdb_tempdir = duration,
+            ChangelogBenchBackend::RedbTempfile => row.redb_tempfile = duration,
         }
     }
 
@@ -376,6 +378,7 @@ struct BackendScoreRow {
     mem_unit: Duration,
     sqlite_tempfile: Duration,
     rocksdb_tempdir: Duration,
+    redb_tempfile: Duration,
 }
 
 fn print_scorecard(cpu: &[(&'static str, Duration)], backend: &[BackendScoreRow]) {
@@ -389,15 +392,16 @@ fn print_scorecard(cpu: &[(&'static str, Duration)], backend: &[BackendScoreRow]
     println!();
     println!("## Backend Smoke Scoreboard");
     println!();
-    println!("| row | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |");
-    println!("| --- | ---: | ---: | ---: |");
+    println!("| row | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms | redb_tempfile_ms |");
+    println!("| --- | ---: | ---: | ---: | ---: |");
     for row in backend {
         println!(
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} |",
             row.label,
             ms(row.mem_unit),
             ms(row.sqlite_tempfile),
-            ms(row.rocksdb_tempdir)
+            ms(row.rocksdb_tempdir),
+            ms(row.redb_tempfile)
         );
     }
 }

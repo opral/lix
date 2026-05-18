@@ -30,7 +30,10 @@ use super::types::{
     SegmentInlinePayload, StateRowIdentity,
 };
 use crate::LixError;
-use crate::backend::InMemoryBackend;
+use crate::backend::Backend;
+
+pub trait BenchBackend: Backend + Clone {}
+impl<T> BenchBackend for T where T: Backend + Clone {}
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
@@ -126,9 +129,12 @@ impl BenchCorpus {
 }
 
 #[derive(Clone)]
-pub struct BenchStore {
+pub struct BenchStore<B = crate::backend::InMemoryBackend>
+where
+    B: BenchBackend,
+{
     context: ChangelogContext,
-    storage: StorageContext<InMemoryBackend>,
+    storage: StorageContext<B>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -584,34 +590,46 @@ pub fn validate_publication_closure(segment: &BenchSegment) -> Result<usize, Lix
     Ok(checked)
 }
 
-pub fn new_store(backend: InMemoryBackend) -> BenchStore {
+pub fn new_store<B: BenchBackend>(backend: B) -> BenchStore<B>
+where
+    B: BenchBackend,
+{
     BenchStore {
         context: ChangelogContext::new(),
         storage: StorageContext::new(backend),
     }
 }
 
-pub async fn stage_segment_once(
-    backend: InMemoryBackend,
+pub async fn stage_segment_once<B: BenchBackend>(
+    backend: B,
     segment: &BenchSegment,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = new_store(backend);
     stage_segment_in_store(&store, segment).await
 }
 
-pub async fn stage_segment_raw_once(
-    backend: InMemoryBackend,
+pub async fn stage_segment_raw_once<B: BenchBackend>(
+    backend: B,
     segment: &BenchSegment,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = new_store(backend);
     write_corpus_segments_raw(&store, &BenchCorpus::from_segments(vec![segment.clone()])).await
 }
 
-pub async fn prepare_store(
-    backend: InMemoryBackend,
+pub async fn prepare_store<B: BenchBackend>(
+    backend: B,
     segment: &BenchSegment,
     publish: bool,
-) -> Result<BenchStore, LixError> {
+) -> Result<BenchStore<B>, LixError>
+where
+    B: BenchBackend,
+{
     prepare_corpus_store(
         backend,
         &BenchCorpus::from_segments(vec![segment.clone()]),
@@ -620,11 +638,14 @@ pub async fn prepare_store(
     .await
 }
 
-pub async fn prepare_corpus_store(
-    backend: InMemoryBackend,
+pub async fn prepare_corpus_store<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
     publish: bool,
-) -> Result<BenchStore, LixError> {
+) -> Result<BenchStore<B>, LixError>
+where
+    B: BenchBackend,
+{
     let store = new_store(backend);
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
@@ -644,11 +665,14 @@ pub async fn prepare_corpus_store(
     Ok(store)
 }
 
-pub async fn prepare_rebuild_store(
-    backend: InMemoryBackend,
+pub async fn prepare_rebuild_store<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
     mode: BenchRebuildMode,
-) -> Result<BenchStore, LixError> {
+) -> Result<BenchStore<B>, LixError>
+where
+    B: BenchBackend,
+{
     let store = match mode {
         BenchRebuildMode::Noop => prepare_corpus_store(backend, corpus, false).await?,
         BenchRebuildMode::EmptyIndexes => {
@@ -670,12 +694,15 @@ pub async fn prepare_rebuild_store(
     Ok(store)
 }
 
-pub async fn prepare_gc_store(
-    backend: InMemoryBackend,
+pub async fn prepare_gc_store<B: BenchBackend>(
+    backend: B,
     live_segments: usize,
     dead_segments: usize,
     changes_per_segment: usize,
-) -> Result<(BenchStore, String), LixError> {
+) -> Result<(BenchStore<B>, String), LixError>
+where
+    B: BenchBackend,
+{
     let live_segments = live_segments.max(1);
     let changes_per_segment = changes_per_segment.max(1);
     let live = corpus_with_shape(
@@ -723,16 +750,19 @@ pub async fn prepare_gc_store(
     Ok((store, root_commit_id))
 }
 
-pub async fn stage_publish_first_commit_once(
-    backend: InMemoryBackend,
+pub async fn stage_publish_first_commit_once<B: BenchBackend>(
+    backend: B,
     segment: &BenchSegment,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = prepare_store(backend, segment, false).await?;
     stage_publish_first_commit_in_store(&store, segment).await
 }
 
-pub async fn stage_publish_first_commit_in_store(
-    store: &BenchStore,
+pub async fn stage_publish_first_commit_in_store<B: BenchBackend>(
+    store: &BenchStore<B>,
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError> {
     let first_commit = segment.commit_ids().into_iter().next().ok_or_else(|| {
@@ -749,10 +779,13 @@ pub async fn stage_publish_first_commit_in_store(
     Ok(bench_write_stats(stats))
 }
 
-pub async fn stage_corpus_once(
-    backend: InMemoryBackend,
+pub async fn stage_corpus_once<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = new_store(backend);
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
@@ -767,37 +800,49 @@ pub async fn stage_corpus_once(
     Ok(bench_write_stats(stats))
 }
 
-pub async fn stage_corpus_raw_once(
-    backend: InMemoryBackend,
+pub async fn stage_corpus_raw_once<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = new_store(backend);
     write_corpus_segments_raw(&store, corpus).await
 }
 
-pub async fn stage_incremental_segment_once(
-    backend: InMemoryBackend,
+pub async fn stage_incremental_segment_once<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = prepare_corpus_store(backend, corpus, false).await?;
     let segment = incremental_segment_for_corpus(corpus)?;
     stage_segment_in_store(&store, &segment).await
 }
 
-pub async fn stage_incremental_segment_raw_once(
-    backend: InMemoryBackend,
+pub async fn stage_incremental_segment_raw_once<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = new_store(backend);
     write_corpus_segments_raw(&store, corpus).await?;
     let segment = incremental_segment_for_corpus(corpus)?;
     write_corpus_segments_raw(&store, &BenchCorpus::from_segments(vec![segment])).await
 }
 
-pub async fn stage_publish_all_commits_once(
-    backend: InMemoryBackend,
+pub async fn stage_publish_all_commits_once<B: BenchBackend>(
+    backend: B,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend,
+{
     let store = prepare_corpus_store(backend, corpus, false).await?;
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
@@ -812,15 +857,15 @@ pub async fn stage_publish_all_commits_once(
     Ok(bench_write_stats(stats))
 }
 
-pub async fn load_commits_physical(
-    store: &BenchStore,
+pub async fn load_commits_physical<B: BenchBackend>(
+    store: &BenchStore<B>,
     commit_ids: &[String],
 ) -> Result<usize, LixError> {
     load_commits_physical_with_projection(store, commit_ids, BenchCommitProjection::Header).await
 }
 
-pub async fn load_commits_physical_with_projection(
-    store: &BenchStore,
+pub async fn load_commits_physical_with_projection<B: BenchBackend>(
+    store: &BenchStore<B>,
     commit_ids: &[String],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError> {
@@ -835,15 +880,15 @@ pub async fn load_commits_physical_with_projection(
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-pub async fn load_commits_visible(
-    store: &BenchStore,
+pub async fn load_commits_visible<B: BenchBackend>(
+    store: &BenchStore<B>,
     commit_ids: &[String],
 ) -> Result<usize, LixError> {
     load_commits_visible_with_projection(store, commit_ids, BenchCommitProjection::Header).await
 }
 
-pub async fn load_commits_visible_with_projection(
-    store: &BenchStore,
+pub async fn load_commits_visible_with_projection<B: BenchBackend>(
+    store: &BenchStore<B>,
     commit_ids: &[String],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError> {
@@ -858,8 +903,8 @@ pub async fn load_commits_visible_with_projection(
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-pub async fn load_changes_physical(
-    store: &BenchStore,
+pub async fn load_changes_physical<B: BenchBackend>(
+    store: &BenchStore<B>,
     change_ids: &[String],
 ) -> Result<usize, LixError> {
     load_changes_physical_with_projection(
@@ -870,8 +915,8 @@ pub async fn load_changes_physical(
     .await
 }
 
-pub async fn load_changes_physical_with_projection(
-    store: &BenchStore,
+pub async fn load_changes_physical_with_projection<B: BenchBackend>(
+    store: &BenchStore<B>,
     change_ids: &[String],
     projection: BenchChangeProjection,
 ) -> Result<usize, LixError> {
@@ -886,16 +931,16 @@ pub async fn load_changes_physical_with_projection(
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-pub async fn load_changes_visible(
-    store: &BenchStore,
+pub async fn load_changes_visible<B: BenchBackend>(
+    store: &BenchStore<B>,
     change_ids: &[String],
 ) -> Result<usize, LixError> {
     load_changes_visible_with_projection(store, change_ids, BenchChangeProjection::PhysicalLocation)
         .await
 }
 
-pub async fn load_changes_visible_with_projection(
-    store: &BenchStore,
+pub async fn load_changes_visible_with_projection<B: BenchBackend>(
+    store: &BenchStore<B>,
     change_ids: &[String],
     projection: BenchChangeProjection,
 ) -> Result<usize, LixError> {
@@ -910,8 +955,8 @@ pub async fn load_changes_visible_with_projection(
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-pub async fn lookup_by_commit_index(
-    store: &BenchStore,
+pub async fn lookup_by_commit_index<B: BenchBackend>(
+    store: &BenchStore<B>,
     commit_ids: &[String],
 ) -> Result<usize, LixError> {
     let values = get_values(
@@ -936,8 +981,8 @@ pub async fn lookup_by_commit_index(
     Ok(found)
 }
 
-pub async fn lookup_by_change_index(
-    store: &BenchStore,
+pub async fn lookup_by_change_index<B: BenchBackend>(
+    store: &BenchStore<B>,
     change_ids: &[String],
 ) -> Result<usize, LixError> {
     let values = get_values(
@@ -962,8 +1007,8 @@ pub async fn lookup_by_change_index(
     Ok(found)
 }
 
-pub async fn scan_by_change_membership_candidates(
-    store: &BenchStore,
+pub async fn scan_by_change_membership_candidates<B: BenchBackend>(
+    store: &BenchStore<B>,
     change_id: &str,
 ) -> Result<usize, LixError> {
     let prefix = by_change_membership_prefix(change_id);
@@ -995,7 +1040,9 @@ pub async fn scan_by_change_membership_candidates(
     Ok(found)
 }
 
-pub async fn scan_segments_decode(store: &BenchStore) -> Result<usize, LixError> {
+pub async fn scan_segments_decode<B: BenchBackend>(
+    store: &BenchStore<B>,
+) -> Result<usize, LixError> {
     let mut storage = store.storage.clone();
     let mut after = None;
     let mut decoded_objects = 0;
@@ -1020,7 +1067,9 @@ pub async fn scan_segments_decode(store: &BenchStore) -> Result<usize, LixError>
     Ok(decoded_objects)
 }
 
-pub async fn rebuild_mandatory_indexes(store: &BenchStore) -> Result<BenchRebuildStats, LixError> {
+pub async fn rebuild_mandatory_indexes<B: BenchBackend>(
+    store: &BenchStore<B>,
+) -> Result<BenchRebuildStats, LixError> {
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     let stats = {
@@ -1032,7 +1081,10 @@ pub async fn rebuild_mandatory_indexes(store: &BenchStore) -> Result<BenchRebuil
     Ok(stats.into())
 }
 
-pub async fn plan_gc(store: &BenchStore, root_commit_id: &str) -> Result<BenchGcStats, LixError> {
+pub async fn plan_gc<B: BenchBackend>(
+    store: &BenchStore<B>,
+    root_commit_id: &str,
+) -> Result<BenchGcStats, LixError> {
     let mut reader = store.context.reader(store.storage.clone());
     let plan = reader
         .plan_gc(&[GcRoot::VersionHead(root_commit_id.to_string())])
@@ -1040,8 +1092,8 @@ pub async fn plan_gc(store: &BenchStore, root_commit_id: &str) -> Result<BenchGc
     Ok(plan.into())
 }
 
-pub async fn collect_garbage(
-    store: &BenchStore,
+pub async fn collect_garbage<B: BenchBackend>(
+    store: &BenchStore<B>,
     root_commit_id: &str,
 ) -> Result<BenchGcStats, LixError> {
     let mut transaction = store.storage.begin_write_transaction().await?;
@@ -1065,8 +1117,8 @@ pub enum BenchRebuildMode {
     CorruptValues,
 }
 
-async fn stage_segment_in_store(
-    store: &BenchStore,
+async fn stage_segment_in_store<B: BenchBackend>(
+    store: &BenchStore<B>,
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError> {
     let mut transaction = store.storage.begin_write_transaction().await?;
@@ -1374,8 +1426,8 @@ impl BenchCorpus {
     }
 }
 
-async fn write_corpus_segments_raw(
-    store: &BenchStore,
+async fn write_corpus_segments_raw<B: BenchBackend>(
+    store: &BenchStore<B>,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let mut transaction = store.storage.begin_write_transaction().await?;
@@ -1392,7 +1444,9 @@ async fn write_corpus_segments_raw(
     Ok(bench_write_stats(stats))
 }
 
-async fn inject_stale_index_rows(store: &BenchStore) -> Result<BenchWriteStats, LixError> {
+async fn inject_stale_index_rows<B: BenchBackend>(
+    store: &BenchStore<B>,
+) -> Result<BenchWriteStats, LixError> {
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     writes.put(
@@ -1415,8 +1469,8 @@ async fn inject_stale_index_rows(store: &BenchStore) -> Result<BenchWriteStats, 
     Ok(bench_write_stats(stats))
 }
 
-async fn inject_corrupt_index_values(
-    store: &BenchStore,
+async fn inject_corrupt_index_values<B: BenchBackend>(
+    store: &BenchStore<B>,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError> {
     let first_commit = corpus.first_commit_id().ok_or_else(|| {
@@ -1447,8 +1501,8 @@ async fn inject_corrupt_index_values(
     Ok(bench_write_stats(stats))
 }
 
-async fn get_values(
-    store: &BenchStore,
+async fn get_values<B: BenchBackend>(
+    store: &BenchStore<B>,
     namespace: &'static str,
     keys: impl IntoIterator<Item = Vec<u8>>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {

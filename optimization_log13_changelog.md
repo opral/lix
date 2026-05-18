@@ -1113,3 +1113,92 @@ SQLite remained the slowest visible backend in this smoke loop, especially on
 work a concrete row to target without confusing it with pre-merge changelog
 changes.
 ```
+
+## Entry 15: New Backend API Scorecard
+
+Change:
+
+```text
+Changelog benchmark support now runs on the merged backend/storage API.
+The scorecard backend loop uses the new Backend trait directly and covers:
+
+  mem_unit         InMemoryBackend
+  sqlite_tempfile  SQLite temp file backend
+  rocksdb_tempdir  RocksDB temp directory backend
+  redb_tempfile    Redb temp file backend
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_15_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.077 |
+| decode_segment / 1c_1000ch              |       3.452 |
+| view_segment / 1c_1000ch                |       0.026 |
+| validate_segment_shape / 1c_1000ch      |       5.023 |
+| build_decoded_segment_index / 1c_1000ch |       0.240 |
+| build_by_change / 1c_1000ch             |       0.814 |
+| build_by_change_membership / 1c_1000ch  |       0.033 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms | redb_tempfile_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: | ----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.507 |              4.465 |              4.329 |            53.851 |
+| stage_segment / 1c_1000ch                            |       4.781 |              8.233 |              7.740 |            54.898 |
+| stage_publish_commit / 1c_1ch                        |       0.046 |              0.232 |              0.053 |             4.192 |
+| stage_publish_commit / 1c_100ch                      |       0.460 |              0.809 |              0.492 |             4.173 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.423 |              5.501 |              4.815 |             8.753 |
+| load_commits_visible_batched / 1c_100ch              |       0.180 |              0.207 |              0.185 |             0.203 |
+| load_changes_visible_batched / 1c_100ch              |       0.216 |              0.519 |              0.471 |             0.285 |
+| load_changes_visible_batched / 1c_1000ch             |       1.764 |              5.655 |              2.794 |             2.582 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       1.049 |              2.161 |              1.439 |             1.194 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |       2.165 |              7.193 |              3.686 |             2.914 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.324 |              7.559 |              6.683 |            12.201 |
+| plan_gc / live_50pct_mixed_segments                  |       6.409 |              6.911 |              6.860 |             6.596 |
+| collect_garbage / live_50pct_mixed_segments          |       6.850 |              7.657 |              6.914 |            11.867 |
+
+Read:
+
+```text
+The merged backend/storage API materially improves the old SQLite visible-read
+pain point while keeping RocksDB roughly stable:
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 14 sqlite: 14.569ms
+  entry 15 sqlite:  5.655ms
+  entry 14 rocksdb: 2.857ms
+  entry 15 rocksdb: 2.794ms
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 14 sqlite: 15.630ms
+  entry 15 sqlite:  7.193ms
+  entry 14 rocksdb: 3.200ms
+  entry 15 rocksdb: 3.686ms
+
+Redb is competitive on read-heavy rows but currently pays a large fixed cost on
+segment staging and small publish writes:
+
+stage_segment / 1c_1000ch:
+  redb: 54.898ms
+
+stage_publish_commit / 1c_1ch:
+  redb: 4.192ms
+
+The next changelog-specific cut should target the storage bridge and scan path:
+the scorecard backend enum buffers range scans into BufferedRangeScan to bridge
+the new GAT backend API into the existing changelog smoke harness. That is good
+enough for correctness and trend visibility, but direct typed backend dispatch
+or first-class scorecard helpers would remove that extra buffering from scan
+rows.
+```
