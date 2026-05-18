@@ -13,14 +13,14 @@ use bytes::Bytes;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
-use lix_engine::backend_v2::{
+use lix_engine::backend::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
     BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
     CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix,
     ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk,
     ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
-use lix_engine::storage_v2::{
+use lix_engine::storage::{
     PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
     StorageReadStats, StorageSpace, StorageWriteSet, StorageWriteSetStats,
 };
@@ -3536,7 +3536,7 @@ where
 }
 
 fn drain_storage_cursor<C>(
-    cursor: &mut lix_engine::storage_v2::ScanCursor<'_, C>,
+    cursor: &mut lix_engine::storage::ScanCursor<'_, C>,
     chunk_size: usize,
     stats: &mut ScanDrainStats,
 ) -> Result<(), BackendError>
@@ -3683,7 +3683,7 @@ where
 }
 
 fn materialize_scan_visit(
-    read: &lix_engine::backend_v2::InMemoryRead,
+    read: &lix_engine::backend::InMemoryRead,
     projection: CoreProjection,
     limit_rows: usize,
     resume_after: Option<&Key>,

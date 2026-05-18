@@ -23,10 +23,17 @@ where
     Ok(session)
 }
 
-pub(crate) async fn build_write_session(
-    ctx: &mut dyn SqlWriteExecutionContext,
-) -> Result<SessionContext, LixError> {
-    build_write_session_with_options(ctx, SqlWriteSessionOptions::default()).await
+pub(crate) async fn build_transaction_read_session<C>(
+    read_ctx: &C,
+    write_ctx: &mut dyn SqlWriteExecutionContext,
+) -> Result<SessionContext, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let session = build_read_session(read_ctx).await?;
+    let write_ctx = SqlWriteContext::new(write_ctx);
+    providers::register_write(&session, write_ctx, SqlWriteSessionOptions::default()).await?;
+    Ok(session)
 }
 
 #[derive(Clone, Debug, Default)]

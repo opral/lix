@@ -80,6 +80,7 @@ where
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.write_lock),
             self.closed_flag(),
             self.active_transaction_flag(),
         );

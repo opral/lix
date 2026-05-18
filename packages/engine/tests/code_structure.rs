@@ -2795,7 +2795,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
         relative,
         &source,
         "pub(crate) async fn build_read_session",
-        "pub(crate) async fn build_write_session",
+        "pub(crate) async fn build_transaction_read_session",
     );
 
     assert_source_contains_all(relative, read_session, &["providers::register_read"]);

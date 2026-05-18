@@ -325,6 +325,7 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
+        let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
         let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result = async {
             let mut read_store = read_scope.store();
@@ -366,6 +367,7 @@ where
         };
         self.persist_runtime_functions_if_needed(&runtime_functions)
             .await?;
+        drop(write_guard);
         Ok(ExecuteResult::from_sql_query_result(result))
     }
 
@@ -452,16 +454,29 @@ where
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
             sql2::BoundStatementRoute::Read => {
-                let plan = sql2::create_transaction_read_logical_plan_from_parsed(
-                    transaction,
-                    sql,
-                    statement,
-                )
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                let result = sql2::execute_logical_plan(plan, params)
-                    .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                let read_ctx = transaction.sql_read_execution_context()?;
+                let read_result = async {
+                    let plan = sql2::create_transaction_read_logical_plan_from_parsed(
+                        &read_ctx,
+                        transaction,
+                        sql,
+                        statement,
+                    )
+                    .await?;
+                    sql2::execute_logical_plan(plan, params).await
+                }
+                .await;
+                let close_result = read_ctx.close();
+                let result = match read_result {
+                    Ok(result) => {
+                        close_result?;
+                        result
+                    }
+                    Err(error) => {
+                        let _ = close_result;
+                        return Err(normalize_sql_surface_error(error, sql));
+                    }
+                };
                 Ok(ExecuteResult::from_sql_query_result(result))
             }
         }

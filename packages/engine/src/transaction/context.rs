@@ -11,18 +11,19 @@ use crate::commit_store::CommitStoreContext;
 use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::live_state::overlay_scan_rows;
 use crate::live_state::{
     LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
+use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
 use crate::storage::{
     InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
-use crate::live_state::overlay_scan_rows;
 use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
@@ -63,6 +64,7 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     version_ctx: Arc<VersionContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
+    staged_storage_writes: StorageWriteSet,
     storage: StorageContext<B>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
@@ -143,6 +145,7 @@ where
                 version_ctx,
                 schema_resolver,
                 staged_writes,
+                staged_storage_writes: StorageWriteSet::new(),
                 storage,
                 visible_schemas,
                 functions,
@@ -173,7 +176,7 @@ where
             return Err(error);
         }
         let read = self.storage.begin_read(StorageReadOptions::default())?;
-        let writes = match commit::commit_prepared_writes(
+        let mut writes = match commit::commit_prepared_writes(
             &self.binary_cas,
             &self.commit_store,
             self.version_ctx.as_ref(),
@@ -186,6 +189,7 @@ where
             Ok(writes) => writes,
             Err(error) => return Err(error),
         };
+        writes.extend(self.staged_storage_writes);
         self.storage
             .commit_write_set(writes, StorageWriteOptions::default())?;
         Ok(TransactionCommitOutcome::default())
@@ -480,6 +484,24 @@ where
         self.functions.clone()
     }
 
+    pub(crate) fn sql_read_execution_context(
+        &self,
+    ) -> Result<TransactionSqlReadExecutionContext<B::Read<'_>>, LixError> {
+        let read_store = self.storage.begin_read(StorageReadOptions::default())?;
+        let staged = self.staged_writes.staging_overlay()?;
+        Ok(TransactionSqlReadExecutionContext {
+            active_version_id: self.active_version_id.clone(),
+            read_store,
+            live_state: Arc::clone(&self.live_state),
+            binary_cas: Arc::clone(&self.binary_cas),
+            commit_store: Arc::clone(&self.commit_store),
+            version_ctx: Arc::clone(&self.version_ctx),
+            visible_schemas: self.visible_schemas.clone(),
+            functions: self.functions.clone(),
+            staged,
+        })
+    }
+
     /// Adds an extra parent to the commit generated for `version_id`.
     ///
     /// Merge uses this to preserve source-branch ancestry. Ordinary writes do
@@ -504,14 +526,9 @@ where
         commit_id: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp();
-        let mut writes = StorageWriteSet::new();
         let canonical_row = prepare_version_ref_row(version_id, commit_id, &timestamp)?;
         self.version_ctx
-            .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
-        self.storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .map(|_| ())
-            .map_err(Into::into)
+            .stage_canonical_ref_rows(&mut self.staged_storage_writes, &[canonical_row.row])
     }
 
     /// Returns the commit id currently staged for `version_id`, if tracked rows
@@ -554,6 +571,111 @@ where
             .begin_read(StorageReadOptions::default())
             .expect("open transaction read scope");
         CommitGraphContext::new().reader(read)
+    }
+}
+
+pub(crate) struct TransactionSqlReadExecutionContext<R> {
+    active_version_id: String,
+    read_store: StorageReadScope<R>,
+    live_state: Arc<LiveStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    commit_store: Arc<CommitStoreContext>,
+    version_ctx: Arc<VersionContext>,
+    visible_schemas: Vec<JsonValue>,
+    functions: FunctionProviderHandle,
+    staged: crate::transaction::staging::PreparedStateRowOverlay,
+}
+
+impl<R> TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage::StorageBackendRead,
+{
+    pub(crate) fn close(self) -> Result<(), LixError> {
+        self.read_store.close().map_err(Into::into)
+    }
+}
+
+impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage::StorageBackendRead + Clone + Send + Sync + 'static,
+{
+    type ReadStore = StorageReadScope<R>;
+
+    fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    fn live_state(&self) -> Arc<dyn crate::live_state::LiveStateReader> {
+        Arc::new(TransactionReadLiveStateReader {
+            base: self.live_state.reader(self.read_store.clone()),
+            staged: self.staged.clone(),
+        })
+    }
+
+    fn functions(&self) -> FunctionProviderHandle {
+        self.functions.clone()
+    }
+
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
+        CommitStoreQuerySource {
+            commit_store_reader: Arc::new(self.commit_store.reader(self.read_store.store())),
+            json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.store()),
+        }
+    }
+
+    fn commit_graph(&self) -> Box<dyn crate::commit_graph::CommitGraphReader> {
+        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
+    }
+
+    fn version_ref(&self) -> Arc<dyn VersionRefReader> {
+        Arc::new(self.version_ctx.ref_reader(self.read_store.clone()))
+    }
+
+    fn blob_reader(&self) -> Arc<dyn crate::binary_cas::BlobDataReader> {
+        Arc::new(self.binary_cas.reader(self.read_store.clone()))
+    }
+
+    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        Ok(self.visible_schemas.clone())
+    }
+}
+
+struct TransactionReadLiveStateReader<R> {
+    base: crate::live_state::LiveStateStoreReader<StorageReadScope<R>>,
+    staged: crate::transaction::staging::PreparedStateRowOverlay,
+}
+
+#[async_trait]
+impl<R> crate::live_state::LiveStateReader for TransactionReadLiveStateReader<R>
+where
+    R: crate::storage::StorageBackendRead + Clone + Send + Sync,
+{
+    async fn scan_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        overlay_scan_rows(&self.base, &self.staged, request).await
+    }
+
+    async fn load_row(
+        &self,
+        request: &LiveStateRowRequest,
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+        Ok(self
+            .scan_rows(&LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec![request.schema_key.clone()],
+                    entity_ids: vec![request.entity_id.clone()],
+                    version_ids: vec![request.version_id.clone()],
+                    file_ids: vec![request.file_id.clone()],
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .next())
     }
 }
 

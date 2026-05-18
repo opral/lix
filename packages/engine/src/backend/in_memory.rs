@@ -355,25 +355,28 @@ impl BackendWrite for InMemoryWrite {
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
-        let entries = if self.overlay.puts.is_empty() && self.overlay.deletes.is_empty() {
+        let mut parent = self
+            .parent
+            .lock()
+            .map_err(|_| BackendError::Io("in-memory backend lock poisoned".to_string()))?;
+        let base = if Arc::ptr_eq(&parent, &self.base) {
             self.base
-        } else if matches!(self.base.as_ref(), EntriesState::Empty)
-            && self.overlay.deletes.is_empty()
-        {
+        } else {
+            Arc::clone(&parent)
+        };
+        let entries = if self.overlay.puts.is_empty() && self.overlay.deletes.is_empty() {
+            base
+        } else if matches!(base.as_ref(), EntriesState::Empty) && self.overlay.deletes.is_empty() {
             Arc::new(EntriesState::Flat(self.overlay.puts))
         } else {
             Arc::new(EntriesState::Layered {
-                base: self.base,
+                base,
                 puts: self.overlay.puts,
                 deletes: self.overlay.deletes,
             })
         };
 
-        *self
-            .parent
-            .lock()
-            .map_err(|_| BackendError::Io("in-memory backend lock poisoned".to_string()))? =
-            entries;
+        *parent = entries;
         Ok(CommitResult {
             commit_id: None,
             stats: self.stats,

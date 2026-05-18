@@ -4,9 +4,8 @@ use tokio::sync::Mutex;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::{
-    expanded_version_ids,
-    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    VisibilityRequest, VisibilityVersionScope, resolve_visible_rows,
+    expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest, VisibilityVersionScope,
 };
 use crate::storage::StorageRead;
 use crate::tracked_state::{

@@ -51,6 +51,7 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
     closed: Arc<AtomicBool>,
     active_transaction: Arc<AtomicBool>,
 }
@@ -69,6 +70,7 @@ where
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -79,6 +81,7 @@ where
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
         );
         session.active_version_id().await?;
         Ok(session)
@@ -93,6 +96,7 @@ where
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -105,6 +109,7 @@ where
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
         ))
     }
 
@@ -117,6 +122,7 @@ where
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self::new_with_closed(
             mode,
@@ -127,6 +133,7 @@ where
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -141,6 +148,7 @@ where
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
         closed: Arc<AtomicBool>,
         active_transaction: Arc<AtomicBool>,
     ) -> Self {
@@ -153,6 +161,7 @@ where
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
             closed,
             active_transaction,
         }
@@ -290,6 +299,7 @@ where
             &'tx mut Transaction<B>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        let _write_guard = Arc::clone(&self.write_lock).lock_owned().await;
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),

@@ -60,11 +60,18 @@ pub(crate) fn encode_physical_range(
     range: KeyRange,
     resume_after: Option<&Key>,
 ) -> KeyRange {
-    let lower = match (range.lower, resume_after) {
-        (_, Some(resume_after)) => Bound::Excluded(encode_physical_key(space, resume_after)),
-        (Bound::Included(key), None) => Bound::Included(encode_physical_key(space, &key)),
-        (Bound::Excluded(key), None) => Bound::Excluded(encode_physical_key(space, &key)),
-        (Bound::Unbounded, None) => Bound::Included(space_lower_bound(space)),
+    let range_lower = match range.lower {
+        Bound::Included(key) => Bound::Included(encode_physical_key(space, &key)),
+        Bound::Excluded(key) => Bound::Excluded(encode_physical_key(space, &key)),
+        Bound::Unbounded => Bound::Included(space_lower_bound(space)),
+    };
+
+    let lower = match resume_after {
+        Some(resume_after) => max_lower_bound(
+            range_lower,
+            Bound::Excluded(encode_physical_key(space, resume_after)),
+        ),
+        None => range_lower,
     };
 
     let upper = match range.upper {
@@ -74,6 +81,40 @@ pub(crate) fn encode_physical_range(
     };
 
     KeyRange { lower, upper }
+}
+
+fn max_lower_bound(left: Bound<Key>, right: Bound<Key>) -> Bound<Key> {
+    match (left, right) {
+        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
+        (Bound::Included(left), Bound::Included(right)) => {
+            if left >= right {
+                Bound::Included(left)
+            } else {
+                Bound::Included(right)
+            }
+        }
+        (Bound::Included(left), Bound::Excluded(right)) => {
+            if left > right {
+                Bound::Included(left)
+            } else {
+                Bound::Excluded(right)
+            }
+        }
+        (Bound::Excluded(left), Bound::Included(right)) => {
+            if left >= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Included(right)
+            }
+        }
+        (Bound::Excluded(left), Bound::Excluded(right)) => {
+            if left >= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Excluded(right)
+            }
+        }
+    }
 }
 
 fn space_lower_bound(space: SpaceId) -> Key {
@@ -111,6 +152,52 @@ mod tests {
         assert_eq!(
             super::decode_logical_key(&physical).expect("decode key"),
             Key(bytes::Bytes::from_static(b"abc"))
+        );
+    }
+
+    #[test]
+    fn resume_after_before_lower_keeps_lower_bound() {
+        use std::ops::Bound;
+
+        let range = crate::backend::KeyRange {
+            lower: Bound::Included(Key(bytes::Bytes::from_static(b"m"))),
+            upper: Bound::Unbounded,
+        };
+        let encoded = super::encode_physical_range(
+            SpaceId(7),
+            range,
+            Some(&Key(bytes::Bytes::from_static(b"a"))),
+        );
+
+        assert_eq!(
+            encoded.lower,
+            Bound::Included(super::encode_physical_key(
+                SpaceId(7),
+                &Key(bytes::Bytes::from_static(b"m"))
+            ))
+        );
+    }
+
+    #[test]
+    fn resume_after_inside_range_becomes_exclusive_lower_bound() {
+        use std::ops::Bound;
+
+        let range = crate::backend::KeyRange {
+            lower: Bound::Included(Key(bytes::Bytes::from_static(b"m"))),
+            upper: Bound::Unbounded,
+        };
+        let encoded = super::encode_physical_range(
+            SpaceId(7),
+            range,
+            Some(&Key(bytes::Bytes::from_static(b"r"))),
+        );
+
+        assert_eq!(
+            encoded.lower,
+            Bound::Excluded(super::encode_physical_key(
+                SpaceId(7),
+                &Key(bytes::Bytes::from_static(b"r"))
+            ))
         );
     }
 }

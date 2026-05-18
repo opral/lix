@@ -160,19 +160,34 @@ async fn scan_all_values(
     space: StorageSpace,
     prefix: Vec<u8>,
 ) -> Result<Vec<Vec<u8>>, LixError> {
-    let page = ScanPlan::prefix(
+    let plan = ScanPlan::prefix(
         space,
         StoragePrefix {
             bytes: Bytes::from(prefix),
         },
-    )
-    .collect(store, StorageScanOptions::default())?;
-    Ok(page
-        .value
-        .entries
-        .into_iter()
-        .filter_map(|entry| full_value(entry.value))
-        .collect())
+    );
+    let mut values = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan.collect(
+            store,
+            StorageScanOptions {
+                resume_after: resume_after.as_ref(),
+                ..StorageScanOptions::default()
+            },
+        )?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        values.extend(
+            page.value
+                .entries
+                .into_iter()
+                .filter_map(|entry| full_value(entry.value)),
+        );
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(values)
 }
 
 pub(crate) async fn load_metadata_many(

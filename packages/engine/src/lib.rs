@@ -47,8 +47,6 @@ pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteRecei
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;
 pub use init::InitReceipt;
-#[cfg(feature = "storage-benches")]
-pub use session::optimization9_sql2_bench;
 pub use session::{
     CreateVersionOptions, CreateVersionReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MergeVersionOptions,

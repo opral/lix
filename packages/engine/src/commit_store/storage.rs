@@ -124,19 +124,36 @@ pub(crate) async fn load_commit(
 pub(crate) async fn scan_commits(
     store: &(impl StorageRead + ?Sized),
 ) -> Result<Vec<Commit>, LixError> {
-    let page = ScanPlan::prefix(
+    let plan = ScanPlan::prefix(
         COMMIT_SPACE,
         StoragePrefix {
             bytes: Bytes::new(),
         },
-    )
-    .collect(store, StorageScanOptions::default())?;
-    page.value
-        .entries
-        .into_iter()
-        .filter_map(|entry| full_value(entry.value))
-        .map(|bytes| crate::commit_store::codec::decode_commit(bytes.as_ref()))
-        .collect()
+    );
+    let mut commits = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan.collect(
+            store,
+            StorageScanOptions {
+                resume_after: resume_after.as_ref(),
+                ..StorageScanOptions::default()
+            },
+        )?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        commits.extend(
+            page.value
+                .entries
+                .into_iter()
+                .filter_map(|entry| full_value(entry.value))
+                .map(|bytes| crate::commit_store::codec::decode_commit(bytes.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(commits)
 }
 
 pub(crate) async fn load_change_pack(

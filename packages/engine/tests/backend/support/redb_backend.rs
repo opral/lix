@@ -350,11 +350,16 @@ fn initialize_database(db: &Database) -> Result<(), BackendError> {
 }
 
 fn encoded_bounds(range: KeyRange, resume_after: Option<&Key>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
-    let lower = match (range.lower, resume_after) {
-        (_, Some(resume_after)) => Bound::Excluded(resume_after.0.to_vec()),
-        (Bound::Included(key), None) => Bound::Included(key.0.to_vec()),
-        (Bound::Excluded(key), None) => Bound::Excluded(key.0.to_vec()),
-        (Bound::Unbounded, None) => Bound::Unbounded,
+    let range_lower = match range.lower {
+        Bound::Included(key) => Bound::Included(key.0.to_vec()),
+        Bound::Excluded(key) => Bound::Excluded(key.0.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let lower = match resume_after {
+        Some(resume_after) => {
+            max_lower_bound(range_lower, Bound::Excluded(resume_after.0.to_vec()))
+        }
+        None => range_lower,
     };
 
     let upper = match range.upper {
@@ -364,6 +369,32 @@ fn encoded_bounds(range: KeyRange, resume_after: Option<&Key>) -> (Bound<Vec<u8>
     };
 
     (lower, upper)
+}
+
+fn max_lower_bound(left: Bound<Vec<u8>>, right: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
+    match (left, right) {
+        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
+        (Bound::Included(left), Bound::Included(right)) => {
+            Bound::Included(if left >= right { left } else { right })
+        }
+        (Bound::Included(left), Bound::Excluded(right)) => {
+            if left > right {
+                Bound::Included(left)
+            } else {
+                Bound::Excluded(right)
+            }
+        }
+        (Bound::Excluded(left), Bound::Included(right)) => {
+            if left >= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Included(right)
+            }
+        }
+        (Bound::Excluded(left), Bound::Excluded(right)) => {
+            Bound::Excluded(if left >= right { left } else { right })
+        }
+    }
 }
 
 fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
