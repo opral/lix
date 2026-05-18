@@ -13,15 +13,15 @@ use super::codec::{
 };
 use super::context::ChangelogContext;
 use super::segment::{
-    DecodedSegmentIndex, canonicalize_segment, directory_change_location,
-    directory_commit_location, validate_change_checksum, validate_commit_checksum,
-    validate_segment_shape,
+    canonicalize_segment, directory_change_location, directory_commit_location,
+    validate_change_checksum, validate_commit_checksum, validate_segment_shape,
+    DecodedSegmentIndex,
 };
 use super::store::{
+    by_change_key, by_change_membership_commit_id_from_key, by_change_membership_key,
+    by_change_membership_prefix, by_commit_key, segment_key, segment_value,
     BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    SEGMENT_NAMESPACE, by_change_key, by_change_membership_commit_id_from_key,
-    by_change_membership_key, by_change_membership_prefix, by_commit_key, segment_key,
-    segment_value,
+    SEGMENT_NAMESPACE,
 };
 use super::types::{
     ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, CommitLoadRequest, CommitProjection,
@@ -29,8 +29,8 @@ use super::types::{
     SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
     SegmentInlinePayload, StateRowIdentity,
 };
-use crate::LixError;
 use crate::backend::Backend;
+use crate::LixError;
 
 pub trait BenchBackend: Backend + Clone {}
 impl<T> BenchBackend for T where T: Backend + Clone {}

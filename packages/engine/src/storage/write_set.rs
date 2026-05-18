@@ -6,7 +6,7 @@ use crate::backend::{
     StoredValue, WriteOptions,
 };
 use crate::storage::legacy::{
-    KvWriteStats, StorageWriter, key as legacy_key, legacy_space_from_namespace, stored_value,
+    key as legacy_key, legacy_space_from_namespace, stored_value, KvWriteStats, StorageWriter,
 };
 use crate::storage::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
@@ -437,11 +437,9 @@ mod tests {
                 key: ref duplicate_key
             } if duplicate_space == space(1) && *duplicate_key == key("a")
         ));
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate storage mutation for test.space.one")
-        );
+        assert!(error
+            .to_string()
+            .contains("duplicate storage mutation for test.space.one"));
     }
 
     #[test]
