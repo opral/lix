@@ -3686,52 +3686,52 @@ Smoke timing scoreboard:
 
 Storage-plan read4 scoreboard:
 
-| backend              | operation                         |          time 95% CI |
-| -------------------- | --------------------------------- | -------------------: |
-| lix_sqlite           | `read4_span_header/1k`            | 3.9859 ms..4.1296 ms |
-| lix_sqlite           | `read4_span_header_payload/1k`    | 4.1161 ms..4.2445 ms |
-| lix_sqlite           | `read4_span_full/1k`              | 4.0951 ms..4.3016 ms |
-| lix_rocksdb          | `read4_span_header/1k`            | 900.81 us..934.57 us |
-| lix_rocksdb          | `read4_span_header_payload/1k`    | 1.0239 ms..1.0518 ms |
-| lix_rocksdb          | `read4_span_full/1k`              | 921.62 us..936.47 us |
-| lix_redb             | `read4_span_header/1k`            | 2.1153 ms..2.2535 ms |
-| lix_redb             | `read4_span_header_payload/1k`    | 2.2150 ms..2.3908 ms |
-| lix_redb             | `read4_span_full/1k`              | 2.1921 ms..2.3669 ms |
-| raw_sqlite_projected | `scan_keys/1k`                    | 4.0738 ms..4.1925 ms |
-| raw_sqlite_projected | `scan_header/1k`                  | 3.8343 ms..3.9384 ms |
-| raw_sqlite_projected | `scan_full/1k`                    | 4.0588 ms..4.1244 ms |
+| backend              | operation                      |          time 95% CI |
+| -------------------- | ------------------------------ | -------------------: |
+| lix_sqlite           | `read4_span_header/1k`         | 3.9859 ms..4.1296 ms |
+| lix_sqlite           | `read4_span_header_payload/1k` | 4.1161 ms..4.2445 ms |
+| lix_sqlite           | `read4_span_full/1k`           | 4.0951 ms..4.3016 ms |
+| lix_rocksdb          | `read4_span_header/1k`         | 900.81 us..934.57 us |
+| lix_rocksdb          | `read4_span_header_payload/1k` | 1.0239 ms..1.0518 ms |
+| lix_rocksdb          | `read4_span_full/1k`           | 921.62 us..936.47 us |
+| lix_redb             | `read4_span_header/1k`         | 2.1153 ms..2.2535 ms |
+| lix_redb             | `read4_span_header_payload/1k` | 2.2150 ms..2.3908 ms |
+| lix_redb             | `read4_span_full/1k`           | 2.1921 ms..2.3669 ms |
+| raw_sqlite_projected | `scan_keys/1k`                 | 4.0738 ms..4.1925 ms |
+| raw_sqlite_projected | `scan_header/1k`               | 3.8343 ms..3.9384 ms |
+| raw_sqlite_projected | `scan_full/1k`                 | 4.0588 ms..4.1244 ms |
 
 Representative read4 density scoreboard, 100% sorted/key-order:
 
-| backend     | shape    | projection |          time 95% CI |
-| ----------- | -------- | ---------- | -------------------: |
-| lix_sqlite  | points   | keys       | 4.2507 ms..4.4441 ms |
-| lix_sqlite  | points   | header     | 5.0973 ms..5.1559 ms |
-| lix_sqlite  | points   | full       | 5.0189 ms..5.0739 ms |
-| lix_sqlite  | run      | keys       | 4.2715 ms..4.3971 ms |
-| lix_sqlite  | run      | header     | 5.1906 ms..5.3609 ms |
-| lix_sqlite  | run      | full       | 5.1739 ms..5.2597 ms |
-| lix_sqlite  | span     | keys       | 4.0149 ms..4.0932 ms |
-| lix_sqlite  | span     | header     | 3.9989 ms..4.1038 ms |
-| lix_sqlite  | span     | full       | 4.2653 ms..4.6410 ms |
-| lix_rocksdb | points   | keys       | 837.92 us..880.87 us |
-| lix_rocksdb | points   | header     | 1.3181 ms..1.3686 ms |
-| lix_rocksdb | points   | full       | 1.3256 ms..1.3598 ms |
-| lix_rocksdb | run      | keys       | 873.02 us..895.84 us |
-| lix_rocksdb | run      | header     | 1.3573 ms..1.3705 ms |
-| lix_rocksdb | run      | full       | 1.3757 ms..1.3925 ms |
-| lix_rocksdb | span     | keys       | 750.29 us..780.11 us |
-| lix_rocksdb | span     | header     | 892.75 us..968.85 us |
-| lix_rocksdb | span     | full       | 904.00 us..913.62 us |
-| lix_redb    | points   | keys       | 2.2210 ms..2.3418 ms |
-| lix_redb    | points   | header     | 2.3790 ms..2.4861 ms |
-| lix_redb    | points   | full       | 2.3025 ms..2.3791 ms |
-| lix_redb    | run      | keys       | 2.1401 ms..2.2761 ms |
-| lix_redb    | run      | header     | 2.3888 ms..2.4507 ms |
-| lix_redb    | run      | full       | 2.3222 ms..2.4302 ms |
-| lix_redb    | span     | keys       | 2.0343 ms..2.1936 ms |
-| lix_redb    | span     | header     | 2.1726 ms..2.2599 ms |
-| lix_redb    | span     | full       | 2.1484 ms..2.2201 ms |
+| backend     | shape  | projection |          time 95% CI |
+| ----------- | ------ | ---------- | -------------------: |
+| lix_sqlite  | points | keys       | 4.2507 ms..4.4441 ms |
+| lix_sqlite  | points | header     | 5.0973 ms..5.1559 ms |
+| lix_sqlite  | points | full       | 5.0189 ms..5.0739 ms |
+| lix_sqlite  | run    | keys       | 4.2715 ms..4.3971 ms |
+| lix_sqlite  | run    | header     | 5.1906 ms..5.3609 ms |
+| lix_sqlite  | run    | full       | 5.1739 ms..5.2597 ms |
+| lix_sqlite  | span   | keys       | 4.0149 ms..4.0932 ms |
+| lix_sqlite  | span   | header     | 3.9989 ms..4.1038 ms |
+| lix_sqlite  | span   | full       | 4.2653 ms..4.6410 ms |
+| lix_rocksdb | points | keys       | 837.92 us..880.87 us |
+| lix_rocksdb | points | header     | 1.3181 ms..1.3686 ms |
+| lix_rocksdb | points | full       | 1.3256 ms..1.3598 ms |
+| lix_rocksdb | run    | keys       | 873.02 us..895.84 us |
+| lix_rocksdb | run    | header     | 1.3573 ms..1.3705 ms |
+| lix_rocksdb | run    | full       | 1.3757 ms..1.3925 ms |
+| lix_rocksdb | span   | keys       | 750.29 us..780.11 us |
+| lix_rocksdb | span   | header     | 892.75 us..968.85 us |
+| lix_rocksdb | span   | full       | 904.00 us..913.62 us |
+| lix_redb    | points | keys       | 2.2210 ms..2.3418 ms |
+| lix_redb    | points | header     | 2.3790 ms..2.4861 ms |
+| lix_redb    | points | full       | 2.3025 ms..2.3791 ms |
+| lix_redb    | run    | keys       | 2.1401 ms..2.2761 ms |
+| lix_redb    | run    | header     | 2.3888 ms..2.4507 ms |
+| lix_redb    | run    | full       | 2.3222 ms..2.4302 ms |
+| lix_redb    | span   | keys       | 2.0343 ms..2.1936 ms |
+| lix_redb    | span   | header     | 2.1726 ms..2.2599 ms |
+| lix_redb    | span   | full       | 2.1484 ms..2.2201 ms |
 
 Result:
 
@@ -3776,14 +3776,14 @@ LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-b
 
 Targeted smoke timing scoreboard:
 
-| backend     | operation              |          time 95% CI | Criterion change              |
-| ----------- | ---------------------- | -------------------: | ----------------------------- |
-| lix_sqlite  | `select_one_by_pk/1k`  | 3.7340 ms..3.8815 ms | no change                     |
-| lix_sqlite  | `select_all_by_pk/1k`  | 5.5339 ms..5.7322 ms | -16.599%..-13.257%, improved  |
-| lix_rocksdb | `select_one_by_pk/1k`  | 738.94 us..758.48 us | no change                     |
-| lix_rocksdb | `select_all_by_pk/1k`  | 2.3339 ms..2.3857 ms | no change                     |
-| lix_redb    | `select_one_by_pk/1k`  | 1.8551 ms..1.9052 ms | -6.8747%..-3.0904%, improved  |
-| lix_redb    | `select_all_by_pk/1k`  | 3.5972 ms..3.7912 ms | no change                     |
+| backend     | operation             |          time 95% CI | Criterion change             |
+| ----------- | --------------------- | -------------------: | ---------------------------- |
+| lix_sqlite  | `select_one_by_pk/1k` | 3.7340 ms..3.8815 ms | no change                    |
+| lix_sqlite  | `select_all_by_pk/1k` | 5.5339 ms..5.7322 ms | -16.599%..-13.257%, improved |
+| lix_rocksdb | `select_one_by_pk/1k` | 738.94 us..758.48 us | no change                    |
+| lix_rocksdb | `select_all_by_pk/1k` | 2.3339 ms..2.3857 ms | no change                    |
+| lix_redb    | `select_one_by_pk/1k` | 1.8551 ms..1.9052 ms | -6.8747%..-3.0904%, improved |
+| lix_redb    | `select_all_by_pk/1k` | 3.5972 ms..3.7912 ms | no change                    |
 
 Smoke I/O result:
 
@@ -3838,46 +3838,46 @@ logical recorder buckets inside record_read4, not legacy API calls.
 
 Smoke timing scoreboard:
 
-| backend     | operation                |          time 95% CI | Criterion change       |
-| ----------- | ------------------------ | -------------------: | ---------------------- |
-| lix_sqlite  | `insert_all_rows/1k`     | 6.2739 ms..6.5908 ms | no change              |
-| lix_sqlite  | `select_all_rows/1k`     | 4.7111 ms..4.8424 ms | regressed              |
-| lix_sqlite  | `select_keys_only/1k`    | 4.1488 ms..4.2243 ms | noise threshold        |
-| lix_sqlite  | `select_headers_only/1k` | 4.4478 ms..4.5633 ms | improved               |
-| lix_sqlite  | `select_one_by_pk/1k`    | 3.9476 ms..4.2760 ms | no change              |
-| lix_sqlite  | `select_all_by_pk/1k`    | 5.5535 ms..5.8664 ms | no change              |
-| lix_sqlite  | `update_all_rows/1k`     | 5.3803 ms..5.4809 ms | no change              |
-| lix_sqlite  | `update_one_by_pk/1k`    | 3.7272 ms..3.8993 ms | no change              |
-| lix_sqlite  | `delete_all_rows/1k`     | 3.9508 ms..4.1895 ms | improved               |
-| lix_sqlite  | `delete_one_by_pk/1k`    | 3.7880 ms..3.9211 ms | noise threshold        |
-| lix_rocksdb | `insert_all_rows/1k`     | 2.9471 ms..2.9783 ms | noise threshold        |
-| lix_rocksdb | `select_all_rows/1k`     | 1.6478 ms..1.6852 ms | no change              |
-| lix_rocksdb | `select_keys_only/1k`    | 1.2235 ms..1.2575 ms | no change              |
-| lix_rocksdb | `select_headers_only/1k` | 1.4341 ms..1.4909 ms | no change              |
-| lix_rocksdb | `select_one_by_pk/1k`    | 736.64 us..769.96 us | no change              |
-| lix_rocksdb | `select_all_by_pk/1k`    | 2.1807 ms..2.2295 ms | regressed              |
-| lix_rocksdb | `update_all_rows/1k`     | 2.1865 ms..2.2394 ms | no change              |
-| lix_rocksdb | `update_one_by_pk/1k`    | 621.44 us..640.95 us | no change              |
-| lix_rocksdb | `delete_all_rows/1k`     | 786.62 us..805.20 us | improved               |
-| lix_rocksdb | `delete_one_by_pk/1k`    | 643.31 us..672.08 us | no change              |
-| lix_redb    | `insert_all_rows/1k`     | 4.4527 ms..4.5735 ms | no change              |
-| lix_redb    | `select_all_rows/1k`     | 2.9346 ms..2.9734 ms | no change              |
-| lix_redb    | `select_keys_only/1k`    | 2.5933 ms..2.7669 ms | no change              |
-| lix_redb    | `select_headers_only/1k` | 2.6065 ms..2.7071 ms | noise threshold        |
-| lix_redb    | `select_one_by_pk/1k`    | 1.9023 ms..1.9447 ms | regressed              |
-| lix_redb    | `select_all_by_pk/1k`    | 3.5902 ms..3.6687 ms | no change              |
-| lix_redb    | `update_all_rows/1k`     | 3.9354 ms..4.0726 ms | improved               |
-| lix_redb    | `update_one_by_pk/1k`    | 1.8383 ms..1.9028 ms | no change              |
-| lix_redb    | `delete_all_rows/1k`     | 3.1006 ms..3.1686 ms | no change              |
-| lix_redb    | `delete_one_by_pk/1k`    | 2.0933 ms..2.2080 ms | no change              |
+| backend     | operation                |          time 95% CI | Criterion change |
+| ----------- | ------------------------ | -------------------: | ---------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.2739 ms..6.5908 ms | no change        |
+| lix_sqlite  | `select_all_rows/1k`     | 4.7111 ms..4.8424 ms | regressed        |
+| lix_sqlite  | `select_keys_only/1k`    | 4.1488 ms..4.2243 ms | noise threshold  |
+| lix_sqlite  | `select_headers_only/1k` | 4.4478 ms..4.5633 ms | improved         |
+| lix_sqlite  | `select_one_by_pk/1k`    | 3.9476 ms..4.2760 ms | no change        |
+| lix_sqlite  | `select_all_by_pk/1k`    | 5.5535 ms..5.8664 ms | no change        |
+| lix_sqlite  | `update_all_rows/1k`     | 5.3803 ms..5.4809 ms | no change        |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.7272 ms..3.8993 ms | no change        |
+| lix_sqlite  | `delete_all_rows/1k`     | 3.9508 ms..4.1895 ms | improved         |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 3.7880 ms..3.9211 ms | noise threshold  |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9471 ms..2.9783 ms | noise threshold  |
+| lix_rocksdb | `select_all_rows/1k`     | 1.6478 ms..1.6852 ms | no change        |
+| lix_rocksdb | `select_keys_only/1k`    | 1.2235 ms..1.2575 ms | no change        |
+| lix_rocksdb | `select_headers_only/1k` | 1.4341 ms..1.4909 ms | no change        |
+| lix_rocksdb | `select_one_by_pk/1k`    | 736.64 us..769.96 us | no change        |
+| lix_rocksdb | `select_all_by_pk/1k`    | 2.1807 ms..2.2295 ms | regressed        |
+| lix_rocksdb | `update_all_rows/1k`     | 2.1865 ms..2.2394 ms | no change        |
+| lix_rocksdb | `update_one_by_pk/1k`    | 621.44 us..640.95 us | no change        |
+| lix_rocksdb | `delete_all_rows/1k`     | 786.62 us..805.20 us | improved         |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 643.31 us..672.08 us | no change        |
+| lix_redb    | `insert_all_rows/1k`     | 4.4527 ms..4.5735 ms | no change        |
+| lix_redb    | `select_all_rows/1k`     | 2.9346 ms..2.9734 ms | no change        |
+| lix_redb    | `select_keys_only/1k`    | 2.5933 ms..2.7669 ms | no change        |
+| lix_redb    | `select_headers_only/1k` | 2.6065 ms..2.7071 ms | noise threshold  |
+| lix_redb    | `select_one_by_pk/1k`    | 1.9023 ms..1.9447 ms | regressed        |
+| lix_redb    | `select_all_by_pk/1k`    | 3.5902 ms..3.6687 ms | no change        |
+| lix_redb    | `update_all_rows/1k`     | 3.9354 ms..4.0726 ms | improved         |
+| lix_redb    | `update_one_by_pk/1k`    | 1.8383 ms..1.9028 ms | no change        |
+| lix_redb    | `delete_all_rows/1k`     | 3.1006 ms..3.1686 ms | no change        |
+| lix_redb    | `delete_one_by_pk/1k`    | 2.0933 ms..2.2080 ms | no change        |
 
 Comparison to Optimization 42:
 
-| backend     | operation              | Optimization 42 | Optimization 43 | Result |
-| ----------- | ---------------------- | --------------: | --------------: | ------ |
-| lix_sqlite  | `select_all_by_pk/1k`  | 5.5339 ms..5.7322 ms | 5.5535 ms..5.8664 ms | roughly same |
-| lix_rocksdb | `select_all_by_pk/1k`  | 2.3339 ms..2.3857 ms | 2.1807 ms..2.2295 ms | ~5-9% faster than log entry |
-| lix_redb    | `select_all_by_pk/1k`  | 3.5972 ms..3.7912 ms | 3.5902 ms..3.6687 ms | same/slightly better |
+| backend     | operation             |      Optimization 42 |      Optimization 43 | Result                      |
+| ----------- | --------------------- | -------------------: | -------------------: | --------------------------- |
+| lix_sqlite  | `select_all_by_pk/1k` | 5.5339 ms..5.7322 ms | 5.5535 ms..5.8664 ms | roughly same                |
+| lix_rocksdb | `select_all_by_pk/1k` | 2.3339 ms..2.3857 ms | 2.1807 ms..2.2295 ms | ~5-9% faster than log entry |
+| lix_redb    | `select_all_by_pk/1k` | 3.5972 ms..3.7912 ms | 3.5902 ms..3.6687 ms | same/slightly better        |
 
 Result:
 
@@ -3888,4 +3888,96 @@ immediate local baseline after the targeted run moved that baseline forward.
 The dedicated keys-only Run split is cleaner structurally, but did not produce a
 separate measurable win; RocksDB key iteration and output page construction now
 appear to dominate the smoke key-only path.
+```
+
+## Pre-Merge Baseline: before dropping backend/storage API updates
+
+Context:
+
+```text
+branch: untracked-speedup
+date: 2026-05-18
+worktree: clean before running
+purpose: capture the current untracked-state scorecard before rebasing/merging
+         back onto main's backend and storage API surface
+```
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb|lix_redb)/smoke/.*/1k'
+```
+
+Build result:
+
+```text
+bench target built cleanly in 1m 16s
+```
+
+Smoke I/O scorecard:
+
+```text
+The logical I/O shape is identical for lix_sqlite, lix_rocksdb, and lix_redb.
+Public reads still show two read4 calls: one format-marker read plus one row
+read. Point reads are accounted as get-style access, and full scans are
+accounted as scan-style access inside record_read4.
+```
+
+| operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         2 |        2 |          0 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
+| `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         2 |     1001 |          0 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| `update_all_rows`     |         1000 |      1 |       316.49 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          316.49 |
+| `update_one_by_pk`    |            1 |      1 |       179.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    2 |       0 |             0 |          179.00 |
+| `delete_all_rows`     |         1000 |      1 |         0.02 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       0 |             3 |            0.02 |
+| `delete_one_by_pk`    |            1 |      1 |        47.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       1 |             0 |           47.00 |
+
+Smoke timing scorecard:
+
+| backend     | operation                |          time 95% CI | Criterion result        |
+| ----------- | ------------------------ | -------------------: | ----------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.2080 ms..6.2688 ms | no change               |
+| lix_sqlite  | `select_all_rows/1k`     | 4.5759 ms..4.7143 ms | noise threshold         |
+| lix_sqlite  | `select_keys_only/1k`    | 4.0963 ms..4.1838 ms | no change               |
+| lix_sqlite  | `select_headers_only/1k` | 4.4564 ms..4.5851 ms | no change               |
+| lix_sqlite  | `select_one_by_pk/1k`    | 3.7995 ms..3.9047 ms | no change               |
+| lix_sqlite  | `select_all_by_pk/1k`    | 5.6121 ms..5.6804 ms | no change               |
+| lix_sqlite  | `update_all_rows/1k`     | 5.3595 ms..5.4319 ms | no change               |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.7382 ms..3.8036 ms | no change               |
+| lix_sqlite  | `delete_all_rows/1k`     | 4.1271 ms..5.6607 ms | no change; high outlier |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 3.8576 ms..4.0800 ms | no change               |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9662 ms..3.0521 ms | no change               |
+| lix_rocksdb | `select_all_rows/1k`     | 1.6602 ms..1.6783 ms | no change               |
+| lix_rocksdb | `select_keys_only/1k`    | 1.2429 ms..1.2612 ms | noise threshold         |
+| lix_rocksdb | `select_headers_only/1k` | 1.4310 ms..1.4695 ms | no change               |
+| lix_rocksdb | `select_one_by_pk/1k`    | 744.85 us..769.94 us | no change               |
+| lix_rocksdb | `select_all_by_pk/1k`    | 2.1576 ms..2.1961 ms | no change               |
+| lix_rocksdb | `update_all_rows/1k`     | 2.2002 ms..2.2605 ms | noise threshold         |
+| lix_rocksdb | `update_one_by_pk/1k`    | 636.81 us..661.23 us | regressed               |
+| lix_rocksdb | `delete_all_rows/1k`     | 779.79 us..809.09 us | no change               |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 652.55 us..677.41 us | no change               |
+| lix_redb    | `insert_all_rows/1k`     | 4.2250 ms..4.3533 ms | improved                |
+| lix_redb    | `select_all_rows/1k`     | 2.8796 ms..3.0144 ms | no change               |
+| lix_redb    | `select_keys_only/1k`    | 2.4534 ms..2.6202 ms | improved                |
+| lix_redb    | `select_headers_only/1k` | 2.7402 ms..2.8642 ms | regressed               |
+| lix_redb    | `select_one_by_pk/1k`    | 1.9614 ms..2.1538 ms | regressed               |
+| lix_redb    | `select_all_by_pk/1k`    | 3.5677 ms..3.7160 ms | no change               |
+| lix_redb    | `update_all_rows/1k`     | 4.1028 ms..4.1595 ms | regressed               |
+| lix_redb    | `update_one_by_pk/1k`    | 1.9353 ms..2.0277 ms | regressed               |
+| lix_redb    | `delete_all_rows/1k`     | 3.0534 ms..3.1898 ms | no change               |
+| lix_redb    | `delete_one_by_pk/1k`    | 1.9248 ms..2.0866 ms | no change               |
+
+Result:
+
+```text
+This is the baseline to compare against after dropping the branch's
+backend/storage API updates and reconnecting untracked-state work to main's
+backend/storage surface. The I/O table is stable and should be the primary
+shape comparison; several timing rows are normal Criterion window movement.
 ```
