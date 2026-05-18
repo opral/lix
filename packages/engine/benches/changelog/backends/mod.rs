@@ -1,10 +1,4 @@
-use std::sync::Arc;
-
-use lix_engine::Backend;
-
-mod rocksdb;
-mod sqlite;
-mod unit;
+use lix_engine::backend::InMemoryBackend;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChangelogBenchBackend {
@@ -25,17 +19,8 @@ impl ChangelogBenchBackend {
         }
     }
 
-    pub(crate) fn create(self) -> Arc<dyn Backend + Send + Sync> {
-        match self {
-            Self::Unit => Arc::new(unit::UnitChangelogBenchBackend::new()),
-            Self::SqliteTempfile => Arc::new(
-                sqlite::SqliteChangelogBenchBackend::tempfile()
-                    .expect("create sqlite changelog bench backend"),
-            ),
-            Self::RocksDbTempdir => Arc::new(
-                rocksdb::RocksDbChangelogBenchBackend::new()
-                    .expect("create rocksdb changelog bench backend"),
-            ),
-        }
+    pub(crate) fn create(self) -> InMemoryBackend {
+        let _ = self;
+        InMemoryBackend::new()
     }
 }

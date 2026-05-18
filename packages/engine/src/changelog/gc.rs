@@ -2,20 +2,20 @@ use std::collections::{HashMap, HashSet};
 
 use super::segment::validate_segment_shape;
 use super::store::{
-    by_change_index_value, by_change_key, by_change_membership_ids_from_key,
-    by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
-    by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
     BY_CHANGE_INDEX_NAMESPACE, BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE, BY_COMMIT_INDEX_NAMESPACE,
-    COMMIT_VISIBILITY_NAMESPACE, SEGMENT_NAMESPACE,
+    COMMIT_VISIBILITY_NAMESPACE, SEGMENT_NAMESPACE, by_change_index_value, by_change_key,
+    by_change_membership_ids_from_key, by_change_membership_index_value, by_change_membership_key,
+    by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
+    segment_key,
 };
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet, Segment,
     SegmentChange, SegmentCommit, SegmentObjectLocation,
 };
+use crate::LixError;
 use crate::changelog::decode_segment;
 use crate::json_store::{self, JsonRef};
 use crate::storage::{KvScanRange, KvScanRequest, StorageReader, StorageWriteSet};
-use crate::LixError;
 
 pub(super) async fn plan_gc<S>(store: &mut S, roots: &[GcRoot]) -> Result<GcPlan, LixError>
 where
@@ -378,16 +378,14 @@ fn mark_change_payloads(payloads: &mut Vec<JsonRef>, change: &SegmentChange) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend};
+    use crate::backend::InMemoryBackend;
     use crate::changelog::segment::canonicalize_segment;
     use crate::changelog::{
-        encode_segment, ChangelogContext, CommitBody, CommitHeader, MembershipRecord,
-        MembershipRole, RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory,
-        SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
-        SegmentInlinePayload, SegmentPayloadLocation,
+        ChangelogContext, CommitBody, CommitHeader, MembershipRecord, MembershipRole,
+        RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
+        SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentInlinePayload,
+        SegmentPayloadLocation, encode_segment,
     };
     use crate::common::{CanonicalSchemaKey, EntityId, FileId};
     use crate::entity_identity::EntityIdentity;
@@ -427,14 +425,16 @@ mod tests {
 
         assert_eq!(plan.live.commits, vec!["commit-1"]);
         assert_eq!(plan.live.changes, vec!["change-1"]);
-        assert!(plan
-            .live
-            .payloads
-            .contains(&JsonRef::from_hash_bytes([7; 32])));
-        assert!(plan
-            .live
-            .payloads
-            .contains(&JsonRef::from_hash_bytes([8; 32])));
+        assert!(
+            plan.live
+                .payloads
+                .contains(&JsonRef::from_hash_bytes([7; 32]))
+        );
+        assert!(
+            plan.live
+                .payloads
+                .contains(&JsonRef::from_hash_bytes([8; 32]))
+        );
         assert_eq!(plan.live.segments, vec!["segment-1"]);
         assert_eq!(plan.sweep.segments, vec!["segment-dead"]);
         assert_eq!(plan.sweep.by_commit, vec!["commit-dead"]);
@@ -930,9 +930,11 @@ mod tests {
             .plan_gc(&[GcRoot::VersionHead("commit-1".to_string())])
             .await
             .expect_err("missing membership change must be corruption");
-        assert!(error
-            .message
-            .contains("references missing change 'change-1'"));
+        assert!(
+            error
+                .message
+                .contains("references missing change 'change-1'")
+        );
     }
 
     #[tokio::test]
@@ -1021,9 +1023,11 @@ mod tests {
                 .await
                 .expect_err("missing membership change must abort collect_garbage")
         };
-        assert!(error
-            .message
-            .contains("references missing change 'change-1'"));
+        assert!(
+            error
+                .message
+                .contains("references missing change 'change-1'")
+        );
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -1066,9 +1070,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("duplicate commit ids must be invalid segment input");
-        assert!(error
-            .message
-            .contains("contains duplicate commit 'commit-1'"));
+        assert!(
+            error
+                .message
+                .contains("contains duplicate commit 'commit-1'")
+        );
     }
 
     #[tokio::test]
@@ -1090,9 +1096,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("duplicate change ids must be invalid segment input");
-        assert!(error
-            .message
-            .contains("contains duplicate change 'change-1'"));
+        assert!(
+            error
+                .message
+                .contains("contains duplicate change 'change-1'")
+        );
     }
 
     #[tokio::test]
@@ -1113,9 +1121,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership_count drift must be invalid segment input");
-        assert!(error
-            .message
-            .contains("membership_count 0 does not match 1"));
+        assert!(
+            error
+                .message
+                .contains("membership_count 0 does not match 1")
+        );
     }
 
     #[tokio::test]
@@ -1136,9 +1146,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership directory drift must be invalid segment input");
-        assert!(error
-            .message
-            .contains("is missing membership ordinal for change 'change-1'"));
+        assert!(
+            error
+                .message
+                .contains("is missing membership ordinal for change 'change-1'")
+        );
     }
 
     #[tokio::test]
@@ -1166,9 +1178,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("payload directory drift must be invalid segment input");
-        assert!(error
-            .message
-            .contains("payload directory entry does not match inline payload"));
+        assert!(
+            error
+                .message
+                .contains("payload directory entry does not match inline payload")
+        );
     }
 
     #[tokio::test]
@@ -1261,8 +1275,7 @@ mod tests {
     }
 
     fn test_storage() -> StorageContext {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        StorageContext::new(backend)
+        StorageContext::new(InMemoryBackend::new())
     }
 
     async fn write_segments(
