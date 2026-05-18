@@ -1,5 +1,5 @@
 use crate::commit_store::{Change, ChangeLocator, Commit, CommitStoreContext};
-use crate::storage::StorageReader;
+use crate::storage::StorageRead;
 use crate::tracked_state::context::{TrackedStateMaterializer, TrackedStateWriteReport};
 use crate::tracked_state::types::TrackedStateKey;
 use crate::tracked_state::TrackedStateDeltaRef;
@@ -54,7 +54,7 @@ pub(crate) async fn materialize_root_at<S>(
     commit_id: &str,
 ) -> Result<TrackedStateWriteReport, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + Send + Sync + ?Sized,
 {
     let input =
         build_materialization_input(materializer.store, materializer.commit_store, commit_id)
@@ -76,12 +76,12 @@ where
 }
 
 async fn build_materialization_input<S>(
-    store: &mut S,
+    store: &S,
     commit_store: &CommitStoreContext,
     commit_id: &str,
 ) -> Result<MaterializationInput, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + Send + Sync + ?Sized,
 {
     let lineage = load_first_parent_lineage(store, commit_store, commit_id).await?;
     let mut located_changes = Vec::new();
@@ -99,12 +99,12 @@ where
 }
 
 async fn load_first_parent_lineage<S>(
-    store: &mut S,
+    store: &S,
     commit_store: &CommitStoreContext,
     commit_id: &str,
 ) -> Result<Vec<Commit>, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + Send + Sync + ?Sized,
 {
     let mut lineage = Vec::new();
     let mut seen = BTreeSet::new();
@@ -130,12 +130,12 @@ where
 }
 
 async fn load_commit_located_changes<S>(
-    store: &mut S,
+    store: &S,
     commit_store: &CommitStoreContext,
     commit: &Commit,
 ) -> Result<Vec<LocatedChange>, LixError>
 where
-    S: StorageReader + ?Sized,
+    S: StorageRead + Send + Sync + ?Sized,
 {
     let mut located_changes = Vec::new();
     for pack_id in 0..commit.change_pack_count {
@@ -206,7 +206,7 @@ fn project_materialization_deltas(
 }
 
 async fn load_changes_by_locators(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_store: &CommitStoreContext,
     locators: &[ChangeLocator],
 ) -> Result<Vec<Change>, LixError> {

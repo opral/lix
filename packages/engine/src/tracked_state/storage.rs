@@ -1,45 +1,58 @@
 use std::collections::HashMap;
 
 use crate::json_store::JsonStoreContext;
-use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
+use crate::storage::{PointReadPlan, StorageRead, StorageSpace, StorageWriteSet};
+use crate::storage::{
+    StorageCoreProjection, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId,
+    StorageValue,
+};
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
     TrackedStateDeltaEntry, TrackedStateDeltaRef, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
+use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree.chunk";
 pub(crate) const TRACKED_STATE_ROOT_NAMESPACE: &'static str = "tracked_state.tree.root";
 pub(crate) const TRACKED_STATE_BY_FILE_ROOT_NAMESPACE: &'static str =
     "tracked_state.tree.root.by_file";
 pub(crate) const TRACKED_STATE_DELTA_PACK_NAMESPACE: &'static str = "tracked_state.delta_pack";
+const TRACKED_STATE_CHUNK_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0004_0001), TRACKED_STATE_CHUNK_NAMESPACE);
+const TRACKED_STATE_ROOT_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0004_0002), TRACKED_STATE_ROOT_NAMESPACE);
+const TRACKED_STATE_BY_FILE_ROOT_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0003),
+    TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
+);
+const TRACKED_STATE_DELTA_PACK_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0004),
+    TRACKED_STATE_DELTA_PACK_NAMESPACE,
+);
 
 async fn get_one(
-    store: &mut (impl StorageReader + ?Sized),
-    namespace: &str,
+    store: &(impl StorageRead + ?Sized),
+    space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    Ok(store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: namespace.to_string(),
-                keys: vec![key],
-            }],
-        })
-        .await?
-        .groups
+    let result = PointReadPlan::new(space, &[StorageKey(Bytes::from(key))])
+        .materialize(store, StorageGetOptions::default())?;
+    Ok(result
+        .value
         .into_iter()
         .next()
-        .and_then(|group| group.single_value_owned()))
+        .flatten()
+        .and_then(full_value))
 }
 
 pub(crate) async fn load_root(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
     let Some(bytes) = get_one(
         store,
-        TRACKED_STATE_ROOT_NAMESPACE,
+        TRACKED_STATE_ROOT_SPACE,
         commit_id.as_bytes().to_vec(),
     )
     .await?
@@ -55,19 +68,19 @@ pub(crate) fn stage_root(
     root_id: &TrackedStateRootId,
 ) {
     writes.put(
-        TRACKED_STATE_ROOT_NAMESPACE,
-        commit_id.as_bytes().to_vec(),
-        root_id.as_bytes().to_vec(),
+        TRACKED_STATE_ROOT_SPACE,
+        key(commit_id.as_bytes().to_vec()),
+        value(root_id.as_bytes().to_vec()),
     );
 }
 
 pub(crate) async fn load_by_file_root(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
     let Some(bytes) = get_one(
         store,
-        TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
+        TRACKED_STATE_BY_FILE_ROOT_SPACE,
         commit_id.as_bytes().to_vec(),
     )
     .await?
@@ -83,48 +96,30 @@ pub(crate) fn stage_by_file_root(
     root_id: &TrackedStateRootId,
 ) {
     writes.put(
-        TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
-        commit_id.as_bytes().to_vec(),
-        root_id.as_bytes().to_vec(),
+        TRACKED_STATE_BY_FILE_ROOT_SPACE,
+        key(commit_id.as_bytes().to_vec()),
+        value(root_id.as_bytes().to_vec()),
     );
 }
 
 pub(crate) async fn load_delta_pack(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<Vec<TrackedStateDeltaEntry>>, LixError> {
     let json_store = JsonStoreContext::new();
-    let result = store
-        .get_values(KvGetRequest {
-            groups: vec![
-                KvGetGroup {
-                    namespace: TRACKED_STATE_DELTA_PACK_NAMESPACE.to_string(),
-                    keys: vec![commit_id.as_bytes().to_vec()],
-                },
-                json_store.commit_pack_get_group(commit_id, 0),
-            ],
-        })
-        .await?;
-    let mut groups = result.groups.into_iter();
-    let delta_group = groups.next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-state delta pack load returned no delta result group",
-        )
-    })?;
-    let json_pack_group = groups.next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-state delta pack load returned no JSON pack result group",
-        )
-    })?;
-    let Some(bytes) = delta_group.single_value_owned() else {
+    let delta = get_one(
+        store,
+        TRACKED_STATE_DELTA_PACK_SPACE,
+        commit_id.as_bytes().to_vec(),
+    )
+    .await?;
+    let json_pack = json_store.load_commit_pack_bytes(store, commit_id, 0)?;
+    let Some(bytes) = delta else {
         return Ok(None);
     };
     let pack_refs = if crate::tracked_state::codec::delta_pack_uses_json_pack_indexes(&bytes)? {
-        json_pack_group
-            .single_value_owned()
-            .map(|bytes| json_store.decode_pack_refs(&bytes))
+        json_pack
+            .map(|bytes| json_store.decode_pack_refs(bytes.as_ref()))
             .transpose()?
     } else {
         None
@@ -143,29 +138,21 @@ pub(crate) async fn load_delta_pack(
 }
 
 pub(crate) async fn delta_pack_exists(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<bool, LixError> {
-    let result = store
-        .exists_many(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: TRACKED_STATE_DELTA_PACK_NAMESPACE.to_string(),
-                keys: vec![commit_id.as_bytes().to_vec()],
-            }],
-        })
-        .await?;
-    let group = result.groups.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-state delta pack existence check returned no result group",
-        )
-    })?;
-    group.exists.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-state delta pack existence check returned no result",
-        )
-    })
+    let result = PointReadPlan::new(
+        TRACKED_STATE_DELTA_PACK_SPACE,
+        &[StorageKey(Bytes::copy_from_slice(commit_id.as_bytes()))],
+    )
+    .materialize(
+        store,
+        StorageGetOptions {
+            projection: StorageCoreProjection::KeyOnly,
+            ..StorageGetOptions::default()
+        },
+    )?;
+    Ok(result.value.into_iter().next().flatten().is_some())
 }
 
 pub(crate) fn stage_delta_pack_refs(
@@ -174,9 +161,11 @@ pub(crate) fn stage_delta_pack_refs(
     deltas: &[TrackedStateDeltaRef<'_>],
 ) -> Result<(), LixError> {
     writes.put(
-        TRACKED_STATE_DELTA_PACK_NAMESPACE,
-        commit_id.as_bytes().to_vec(),
-        crate::tracked_state::codec::encode_delta_pack_refs(commit_id, deltas)?,
+        TRACKED_STATE_DELTA_PACK_SPACE,
+        key(commit_id.as_bytes().to_vec()),
+        value(crate::tracked_state::codec::encode_delta_pack_refs(
+            commit_id, deltas,
+        )?),
     );
     Ok(())
 }
@@ -215,22 +204,24 @@ pub(crate) fn stage_delta_pack_refs_with_json_pack_indexes(
         return stage_delta_pack_refs(writes, commit_id, deltas);
     }
     writes.put(
-        TRACKED_STATE_DELTA_PACK_NAMESPACE,
-        commit_id.as_bytes().to_vec(),
-        crate::tracked_state::codec::encode_delta_pack_refs_with_json_pack_indexes(
-            commit_id,
-            deltas,
-            Some(json_pack_indexes.indexes),
-        )?,
+        TRACKED_STATE_DELTA_PACK_SPACE,
+        key(commit_id.as_bytes().to_vec()),
+        value(
+            crate::tracked_state::codec::encode_delta_pack_refs_with_json_pack_indexes(
+                commit_id,
+                deltas,
+                Some(json_pack_indexes.indexes),
+            )?,
+        ),
     );
     Ok(())
 }
 
 pub(crate) async fn read_chunk(
-    store: &mut (impl StorageReader + ?Sized),
+    store: &(impl StorageRead + ?Sized),
     hash: &[u8; TRACKED_STATE_HASH_BYTES],
 ) -> Result<Option<Vec<u8>>, LixError> {
-    get_one(store, TRACKED_STATE_CHUNK_NAMESPACE, hash.to_vec()).await
+    get_one(store, TRACKED_STATE_CHUNK_SPACE, hash.to_vec()).await
 }
 
 pub(crate) fn verify_chunk_hash(
@@ -250,9 +241,9 @@ pub(crate) fn verify_chunk_hash(
 pub(crate) fn stage_chunks(writes: &mut StorageWriteSet, chunks: &[PendingChunkWrite]) {
     for chunk in chunks {
         writes.put(
-            TRACKED_STATE_CHUNK_NAMESPACE,
-            chunk.hash.to_vec(),
-            chunk.data.clone(),
+            TRACKED_STATE_CHUNK_SPACE,
+            key(chunk.hash.to_vec()),
+            value(chunk.data.clone()),
         );
     }
 }
@@ -270,7 +261,7 @@ impl TrackedStateChunkOverlay {
 
     pub(crate) async fn read_chunk(
         &self,
-        store: &mut (impl StorageReader + ?Sized),
+        store: &(impl StorageRead + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Option<Vec<u8>>, LixError> {
         if let Some(bytes) = self.chunks.get(hash) {
@@ -288,6 +279,23 @@ impl TrackedStateChunkOverlay {
             self.chunks.insert(chunk.hash, chunk.data.clone());
         }
         stage_chunks(writes, chunks);
+    }
+}
+
+fn key(bytes: Vec<u8>) -> StorageKey {
+    StorageKey(Bytes::from(bytes))
+}
+
+fn value(bytes: Vec<u8>) -> StorageValue {
+    StorageValue {
+        bytes: Bytes::from(bytes),
+    }
+}
+
+fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+    match value {
+        StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
+        StorageProjectedValue::KeyOnly => None,
     }
 }
 

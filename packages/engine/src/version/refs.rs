@@ -3,11 +3,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::entity_identity::EntityIdentity;
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
-    UntrackedStateGetManyRequest, UntrackedStateIdentity, UntrackedStateProjection,
-    UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::version::{VersionHead, VersionRefReader};
@@ -32,7 +31,7 @@ impl VersionRefContext {
     /// Creates a version-ref reader over a caller-provided KV store.
     pub(super) fn reader<S>(&self, store: S) -> VersionRefStoreReader<S>
     where
-        S: StorageReader,
+        S: StorageRead + Send + Sync,
     {
         VersionRefStoreReader {
             untracked_state: Arc::clone(&self.untracked_state),
@@ -52,7 +51,7 @@ impl VersionRefContext {
 /// Read side for version heads.
 pub(super) struct VersionRefStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     untracked_state: Arc<UntrackedStateContext>,
     store: Mutex<S>,
@@ -60,40 +59,23 @@ where
 
 impl<S> VersionRefStoreReader<S>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     pub(crate) async fn load_head(
         &self,
         version_id: &str,
     ) -> Result<Option<VersionHead>, LixError> {
-        let mut store = self.store.lock().await;
-        let request = UntrackedStateRowRequest {
-            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: EntityIdentity::single(version_id),
-            file_id: NullableKeyFilter::Null,
-        };
-        let identity =
-            UntrackedStateIdentity::from_exact_row_request(&request).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "version-ref lookup must be an exact untracked identity",
-                )
-            })?;
-        let mut rows = self
+        let store = self.store.lock().await;
+        let Some(row) = self
             .untracked_state
-            .reader(&mut *store as &mut dyn StorageReader)
-            .get_many(UntrackedStateGetManyRequest {
-                identities: vec![identity],
-                projection: UntrackedStateProjection::Full,
+            .reader(&*store)
+            .load_row(&UntrackedStateRowRequest {
+                schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: EntityIdentity::single(version_id),
+                file_id: NullableKeyFilter::Null,
             })
             .await?
-            .rows;
-        let Some(row) = rows
-            .pop()
-            .flatten()
-            .map(|row| row.into_materialized_full())
-            .transpose()?
         else {
             return Ok(None);
         };
@@ -109,25 +91,19 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
-        let mut store = self.store.lock().await;
+        let store = self.store.lock().await;
         let rows = self
             .untracked_state
-            .reader(&mut *store as &mut dyn StorageReader)
-            .scan(UntrackedStateScanRequest {
+            .reader(&*store)
+            .scan_rows(&UntrackedStateScanRequest {
                 filter: UntrackedStateFilter {
                     schema_keys: vec![VERSION_REF_SCHEMA_KEY.to_string()],
                     version_ids: vec![GLOBAL_VERSION_ID.to_string()],
                     ..UntrackedStateFilter::default()
                 },
-                projection: UntrackedStateProjection::Full,
-                limit: None,
-                ..Default::default()
+                ..UntrackedStateScanRequest::default()
             })
-            .await?
-            .rows
-            .into_iter()
-            .map(|row| row.into_materialized_full())
-            .collect::<Result<Vec<_>, _>>()?;
+            .await?;
         let mut heads = rows
             .iter()
             .map(|row| {
@@ -146,7 +122,7 @@ where
 #[async_trait::async_trait]
 impl<S> VersionRefReader for VersionRefStoreReader<S>
 where
-    S: StorageReader + Send,
+    S: StorageRead + Send + Sync,
 {
     async fn load_head(&self, version_id: &str) -> Result<Option<VersionHead>, LixError> {
         VersionRefStoreReader::load_head(self, version_id).await
@@ -208,7 +184,7 @@ fn decode_version_head(
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::testing::UnitTestBackend;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::transaction::prepare_version_ref_row;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
@@ -217,11 +193,14 @@ mod tests {
 
     #[tokio::test]
     async fn load_head_returns_none_when_missing() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ref = test_version_ref();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
 
         let head = version_ref
-            .reader(storage)
+            .reader(read)
             .load_head("missing-version")
             .await
             .expect("missing version ref should load cleanly");
@@ -231,14 +210,10 @@ mod tests {
 
     #[tokio::test]
     async fn advance_head_writes_untracked_global_ref() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         stage_version_head(
             &version_ref,
             &mut writes,
@@ -247,17 +222,15 @@ mod tests {
             "2026-01-01T00:00:00Z",
         )
         .expect("version head should advance");
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("version head should apply");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("version head should commit");
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let head = version_ref
-            .reader(storage.clone())
+            .reader(read)
             .load_head("version-a")
             .await
             .expect("version head should load")
@@ -265,28 +238,19 @@ mod tests {
         assert_eq!(head.version_id, "version-a");
         assert_eq!(head.commit_id, "commit-a");
 
-        let mut reader = UntrackedStateContext::new().reader(storage);
-        let request = UntrackedStateRowRequest {
-            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("version-a"),
-            file_id: NullableKeyFilter::Null,
-        };
-        let identity = UntrackedStateIdentity::from_exact_row_request(&request)
-            .expect("version-ref request should be exact");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut reader = UntrackedStateContext::new().reader(read);
         let row = reader
-            .get_many(UntrackedStateGetManyRequest {
-                identities: vec![identity],
-                projection: UntrackedStateProjection::Full,
+            .load_row(&UntrackedStateRowRequest {
+                schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("version-a"),
+                file_id: NullableKeyFilter::Null,
             })
             .await
             .expect("version-ref row should load")
-            .rows
-            .pop()
-            .flatten()
-            .map(|row| row.into_materialized_full())
-            .transpose()
-            .expect("version-ref row should materialize")
             .expect("version-ref row should exist");
         assert!(row.global);
         assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
@@ -295,14 +259,10 @@ mod tests {
 
     #[tokio::test]
     async fn scan_heads_returns_sorted_version_heads() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let version_ref = test_version_ref();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         stage_version_head(
             &version_ref,
             &mut writes,
@@ -319,17 +279,15 @@ mod tests {
             "2026-01-01T00:00:00Z",
         )
         .expect("version-a should advance");
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("version heads should apply");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("version heads should commit");
 
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let heads = version_ref
-            .reader(storage)
+            .reader(read)
             .scan_heads()
             .await
             .expect("heads should scan");

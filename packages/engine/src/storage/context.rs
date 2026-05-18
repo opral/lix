@@ -1,889 +1,525 @@
-use std::sync::Arc;
+use std::ops::Bound;
 
-use async_trait::async_trait;
-
-use crate::backend::{Backend, BackendReadTransaction, BackendWriteTransaction};
-use crate::storage::types::{KvWriteBatch, StorageWriter};
-use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvRead4Page, KvReadV3Page,
-    KvReadV3Request, KvScan2Page, KvScan2Request, KvScanRequest, KvTableReadRequest, KvValueBatch,
-    KvValuePage, KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
+use crate::backend::{
+    Backend, BackendError, BackendWrite, CommitResult, InMemoryBackend, KeyRange, Prefix,
+    ReadOptions, WriteOptions,
 };
-use crate::LixError;
+use crate::storage::{
+    StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError, StorageWriteSetStats,
+};
 
-#[derive(Clone)]
-pub(crate) struct StorageContext {
-    backend: Arc<dyn Backend + Send + Sync>,
+#[derive(Clone, Debug)]
+pub struct StorageContext<B = InMemoryBackend> {
+    backend: B,
 }
 
-impl StorageContext {
-    pub(crate) fn new(backend: Arc<dyn Backend + Send + Sync>) -> Self {
+impl<B> StorageContext<B>
+where
+    B: Backend,
+{
+    pub fn new(backend: B) -> Self {
         Self { backend }
     }
 
-    pub(crate) async fn begin_read_transaction(
+    pub fn begin_read(
         &self,
-    ) -> Result<Box<dyn StorageReadTransaction + Send + Sync + 'static>, LixError> {
-        let transaction = self.backend.begin_read_transaction().await?;
-        Ok(Box::new(StorageContextReadTransaction { transaction }))
+        opts: ReadOptions,
+    ) -> Result<StorageReadScope<B::Read<'_>>, BackendError> {
+        self.backend.begin_read(opts).map(StorageReadScope::new)
     }
 
-    pub(crate) async fn begin_write_transaction(
+    pub fn new_write_set(&self) -> StorageWriteSet {
+        StorageWriteSet::new()
+    }
+
+    pub fn commit_write_set(
         &self,
-    ) -> Result<Box<dyn StorageWriteTransaction + Send + Sync + 'static>, LixError> {
-        let transaction = self.backend.begin_write_transaction().await?;
-        Ok(Box::new(StorageContextWriteTransaction { transaction }))
+        write_set: StorageWriteSet,
+        opts: WriteOptions,
+    ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
+        write_set.commit(&self.backend, opts)
     }
 
-    pub(crate) async fn close(&self) -> Result<(), LixError> {
-        self.backend.close().await
-    }
-
-    pub(crate) async fn destroy(&self) -> Result<(), LixError> {
-        self.backend.destroy().await
-    }
-}
-
-#[cfg(any(test, feature = "storage-benches"))]
-#[async_trait]
-impl StorageReader for StorageContext {
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.get_values(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+    pub fn delete_range(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, BackendError> {
+        let mut write = self.backend.begin_write(opts)?;
+        let physical_range = space.encode_range(range, None);
+        if let Err(error) = write.delete_range(physical_range) {
+            let _ = write.rollback();
+            return Err(error);
         }
+        write.commit()
     }
 
-    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.exists_many(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+    pub fn delete_prefix(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, BackendError> {
+        self.delete_range(space, prefix.to_range()?, opts)
     }
 
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.scan_keys(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.scan_values(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.scan_entries(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn scan2(&mut self, request: KvScan2Request) -> Result<KvScan2Page, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.scan2(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.read_v3(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
-        let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.read4(request).await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-}
-
-struct StorageContextReadTransaction {
-    transaction: Box<dyn BackendReadTransaction + Send + Sync + 'static>,
-}
-
-struct StorageContextWriteTransaction {
-    transaction: Box<dyn BackendWriteTransaction + Send + Sync + 'static>,
-}
-
-#[async_trait]
-impl StorageReader for StorageContextReadTransaction {
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        self.transaction
-            .get_values(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        self.transaction
-            .exists_many(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        self.transaction
-            .scan_keys(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        self.transaction
-            .scan_values(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        self.transaction
-            .scan_entries(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan2(&mut self, request: KvScan2Request) -> Result<KvScan2Page, LixError> {
-        self.transaction.scan2(request.into()).await.map(Into::into)
-    }
-
-    async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
-        self.transaction
-            .read_v3(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
-        self.transaction.read4(request.into()).await.map(Into::into)
-    }
-}
-
-#[async_trait]
-impl StorageReadTransaction for StorageContextReadTransaction {
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        self.transaction.rollback().await
-    }
-}
-
-#[async_trait]
-impl StorageReader for StorageContextWriteTransaction {
-    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-        self.transaction
-            .get_values(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-        self.transaction
-            .exists_many(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-        self.transaction
-            .scan_keys(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-        self.transaction
-            .scan_values(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-        self.transaction
-            .scan_entries(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn scan2(&mut self, request: KvScan2Request) -> Result<KvScan2Page, LixError> {
-        self.transaction.scan2(request.into()).await.map(Into::into)
-    }
-
-    async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
-        self.transaction
-            .read_v3(request.into())
-            .await
-            .map(Into::into)
-    }
-
-    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
-        self.transaction.read4(request.into()).await.map(Into::into)
-    }
-}
-
-#[async_trait]
-impl StorageWriter for StorageContextWriteTransaction {
-    async fn write_kv_batch(&mut self, batch: KvWriteBatch) -> Result<KvWriteStats, LixError> {
-        self.transaction
-            .write_kv_batch(batch.into())
-            .await
-            .map(Into::into)
-    }
-}
-
-#[async_trait]
-impl StorageReadTransaction for StorageContextWriteTransaction {
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        self.transaction.rollback().await
-    }
-}
-
-#[async_trait]
-impl StorageWriteTransaction for StorageContextWriteTransaction {
-    async fn commit(self: Box<Self>) -> Result<(), LixError> {
-        self.transaction.commit().await
+    pub fn clear_space(
+        &self,
+        space: StorageSpace,
+        opts: WriteOptions,
+    ) -> Result<CommitResult, BackendError> {
+        self.delete_range(
+            space,
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            opts,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use bytes::Bytes;
 
-    use crate::backend::testing::UnitTestBackend;
-    use crate::storage::types::KvWriteBatch;
-    use crate::storage::{
-        KvGetGroup, KvHeaderPayloadFramePart, KvKeySpan, KvReadV3Order, KvReadV3Projection,
-        KvReadV3Request, KvReadV3Source, KvReadV3Strategy, KvReadV3ValuePart, KvScan2Projection,
-        KvScanRange, KvValuePart, StorageWriteSet,
+    use crate::backend::{
+        GetOptions, InMemoryBackend, Key, ProjectedValue, ReadOptions, SpaceId, StoredValue,
+        WriteOptions,
     };
+    use crate::storage::{PointReadPlan, StorageContext, StorageSpace};
 
-    use super::*;
-
-    #[tokio::test]
-    async fn storage_context_roundtrips_batched_writes_and_reads() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend);
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction opens");
-
-        let mut batch = KvWriteBatch::new();
-        batch.put("ns", b"a".to_vec(), b"1".to_vec());
-        batch.put("ns", b"b".to_vec(), b"2".to_vec());
-        let stats = tx.write_kv_batch(batch).await.expect("batch writes");
-        assert_eq!(stats.puts, 2);
-        tx.commit().await.expect("commit succeeds");
-
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-        let result = tx
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: "ns".to_string(),
-                    keys: vec![b"a".to_vec(), b"b".to_vec()],
-                }],
-            })
-            .await
-            .expect("batch reads");
-        assert_eq!(result.groups[0].value(0), Some(Some(b"1".as_slice())));
-        assert_eq!(result.groups[0].value(1), Some(Some(b"2".as_slice())));
-
-        let exists = tx
-            .exists_many(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: "ns".to_string(),
-                    keys: vec![b"a".to_vec(), b"missing".to_vec()],
-                }],
-            })
-            .await
-            .expect("existence reads");
-        assert_eq!(exists.groups[0].exists, vec![true, false]);
-
-        let result = tx
-            .scan_entries(KvScanRequest {
-                namespace: "ns".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: Some(b"a".to_vec()),
-                limit: 1,
-            })
-            .await
-            .expect("scan reads");
-        assert_eq!(result.key(0).expect("key exists"), b"b");
-        assert_eq!(result.value(0).expect("value exists"), b"2");
-
-        let key_only = tx
-            .scan_keys(KvScanRequest {
-                namespace: "ns".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                limit: 2,
-            })
-            .await
-            .expect("key-only scan reads");
-        assert_eq!(key_only.keys.iter().collect::<Vec<_>>(), vec![b"a", b"b"]);
-        tx.rollback().await.expect("rollback succeeds");
+    fn key(bytes: &'static str) -> Key {
+        Key(Bytes::from_static(bytes.as_bytes()))
     }
 
-    #[tokio::test]
-    async fn storage_write_set_applies_as_one_batch() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend);
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction opens");
-
-        let mut writes = StorageWriteSet::new();
-        assert!(writes.is_empty());
-        writes.put("ns", b"a".to_vec(), b"1".to_vec());
-        writes.put("ns", b"b".to_vec(), b"2".to_vec());
-        writes.delete("ns", b"missing".to_vec());
-        assert!(!writes.is_empty());
-
-        let stats = writes.apply(tx.as_mut()).await.expect("write set applies");
-        assert_eq!(stats.puts, 2);
-        assert_eq!(stats.deletes, 1);
-        tx.commit().await.expect("commit succeeds");
-
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-        let result = tx
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: "ns".to_string(),
-                    keys: vec![b"a".to_vec(), b"b".to_vec()],
-                }],
-            })
-            .await
-            .expect("batch reads");
-        assert_eq!(result.groups[0].value(0), Some(Some(&b"1"[..])));
-        assert_eq!(result.groups[0].value(1), Some(Some(&b"2"[..])));
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    #[tokio::test]
-    async fn scan2_keys_only_prefix_scan_returns_ordered_keys_and_cursor() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-
-        let page = tx
-            .scan2(KvScan2Request {
-                namespace: "primary".to_string(),
-                range: KvScanRange::prefix(b"a/"),
-                after: None,
-                page_size: 1,
-                projection: KvScan2Projection::KeysOnly,
-            })
-            .await
-            .expect("scan2 reads");
-
-        assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"a/1"]);
-        assert_eq!(page.values, None);
-        assert_eq!(page.resume_after, Some(b"a/1".to_vec()));
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    #[tokio::test]
-    async fn scan2_full_values_match_scan_entries() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-
-        let entries = tx
-            .scan_entries(KvScanRequest {
-                namespace: "primary".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                limit: 3,
-            })
-            .await
-            .expect("scan entries reads");
-        let page = tx
-            .scan2(KvScan2Request {
-                namespace: "primary".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                page_size: 3,
-                projection: KvScan2Projection::FullValue,
-            })
-            .await
-            .expect("scan2 reads");
-
-        assert_eq!(page.keys, entries.keys);
-        let values = page.values.as_ref().expect("values should be projected");
-        for index in 0..entries.len() {
-            assert_eq!(
-                values.get(index),
-                Some(entries.value(index).expect("entry value exists"))
-            );
+    fn value(bytes: &'static str) -> StoredValue {
+        StoredValue {
+            bytes: Bytes::from_static(bytes.as_bytes()),
         }
-        assert_eq!(page.resume_after, entries.resume_after);
-        tx.rollback().await.expect("rollback succeeds");
     }
 
-    #[tokio::test]
-    async fn scan2_value_part_projection_returns_framed_slices() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-
-        let page = tx
-            .scan2(KvScan2Request {
-                namespace: "packed".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                page_size: 2,
-                projection: KvScan2Projection::ValuePart(KvValuePart::HeaderPayloadFrame(
-                    KvHeaderPayloadFramePart::Header,
-                )),
-            })
-            .await
-            .expect("scan2 reads");
-
-        assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"k1", b"k2"]);
-        let values = page.values.as_ref().expect("values should be projected");
-        assert_eq!(values.get(0), Some(b"h1".as_slice()));
-        assert_eq!(values.get(1), Some(b"h2".as_slice()));
-
-        let payload_page = tx
-            .scan2(KvScan2Request {
-                namespace: "packed".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                page_size: 2,
-                projection: KvScan2Projection::ValuePart(KvValuePart::HeaderPayloadFrame(
-                    KvHeaderPayloadFramePart::Payload,
-                )),
-            })
-            .await
-            .expect("scan2 payload reads");
-        let values = payload_page
-            .values
-            .as_ref()
-            .expect("values should be projected");
-        assert_eq!(values.get(0), Some(b"payload-1".as_slice()));
-        assert_eq!(values.get(1), Some(b"payload-2".as_slice()));
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    #[tokio::test]
-    async fn scan2_malformed_framed_projection_returns_error() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend);
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction opens");
-        let mut writes = StorageWriteSet::new();
-        writes.put("packed", b"k".to_vec(), b"short".to_vec());
-        writes.apply(tx.as_mut()).await.expect("writes");
-        tx.commit().await.expect("commit succeeds");
-
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-        let error = tx
-            .scan2(KvScan2Request {
-                namespace: "packed".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                page_size: 1,
-                projection: KvScan2Projection::ValuePart(KvValuePart::HeaderPayloadFrame(
-                    KvHeaderPayloadFramePart::Header,
-                )),
-            })
-            .await
-            .expect_err("malformed frame should fail");
-        assert!(error.message.contains("frame"));
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    #[tokio::test]
-    async fn scan2_paging_with_after_resumes_after_previous_key() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-
-        let first = tx
-            .scan2(KvScan2Request {
-                namespace: "primary".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                page_size: 2,
-                projection: KvScan2Projection::KeysOnly,
-            })
-            .await
-            .expect("first page reads");
-        let second = tx
-            .scan2(KvScan2Request {
-                namespace: "primary".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: first.resume_after.clone(),
-                page_size: 2,
-                projection: KvScan2Projection::KeysOnly,
-            })
-            .await
-            .expect("second page reads");
-
-        assert_eq!(first.keys.iter().collect::<Vec<_>>(), vec![b"a/1", b"a/2"]);
-        assert_eq!(first.resume_after, Some(b"a/2".to_vec()));
-        assert_eq!(second.keys.iter().collect::<Vec<_>>(), vec![b"b/1"]);
-        assert_eq!(second.resume_after, None);
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    #[tokio::test]
-    async fn read_v3_keys_only_multi_span_returns_global_order_and_cursor() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-
-        let first = tx
-            .read_v3(KvReadV3Request {
-                namespace: "primary".to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: vec![span_prefix(b"a/"), span_prefix(b"b/")],
-                    after: None,
-                },
-                projection: KvReadV3Projection::KeysOnly,
-                order: KvReadV3Order::KeyOrder,
-                page_size: Some(2),
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await
-            .expect("first read_v3 page reads");
-        let second = tx
-            .read_v3(KvReadV3Request {
-                namespace: "primary".to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: vec![span_prefix(b"a/"), span_prefix(b"b/")],
-                    after: first.resume_after.clone(),
-                },
-                projection: KvReadV3Projection::KeysOnly,
-                order: KvReadV3Order::KeyOrder,
-                page_size: Some(2),
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await
-            .expect("second read_v3 page reads");
-
-        assert_eq!(first.keys.iter().collect::<Vec<_>>(), vec![b"a/1", b"a/2"]);
-        assert_eq!(first.resume_after, Some(b"a/2".to_vec()));
-        assert_eq!(second.keys.iter().collect::<Vec<_>>(), vec![b"b/1"]);
-        assert_eq!(second.resume_after, None);
-        assert!(first.values.is_empty());
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    #[tokio::test]
-    async fn read_v3_full_values_match_scan_entries() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
-
-        let entries = tx
-            .scan_entries(KvScanRequest {
-                namespace: "primary".to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after: None,
-                limit: 3,
-            })
-            .await
-            .expect("scan entries reads");
-        let page = tx
-            .read_v3(KvReadV3Request {
-                namespace: "primary".to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: vec![KvKeySpan::all()],
-                    after: None,
-                },
-                projection: KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::FullValue]),
-                order: KvReadV3Order::KeyOrder,
-                page_size: Some(3),
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await
-            .expect("read_v3 reads");
-
-        assert_eq!(page.keys, entries.keys);
-        assert_eq!(page.values.len(), 1);
-        for index in 0..entries.len() {
-            assert_eq!(
-                page.values[0].get(index),
-                Some(entries.value(index).expect("entry value exists"))
-            );
+    fn space(id: u32) -> StorageSpace {
+        match id {
+            1 => StorageSpace::new(SpaceId(1), "test.space.one"),
+            2 => StorageSpace::new(SpaceId(2), "test.space.two"),
+            _ => StorageSpace::new(SpaceId(id), "test.space.other"),
         }
-        assert_eq!(page.resume_after, entries.resume_after);
-        tx.rollback().await.expect("rollback succeeds");
     }
 
-    #[tokio::test]
-    async fn read_v3_multiple_value_parts_return_aligned_pages() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
+    #[test]
+    fn context_commits_write_set_and_reads_through_storage_contract() {
+        let storage = StorageContext::new(InMemoryBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(1), key("b"), value("B"));
+        writes.put(space(2), key("a"), value("other"));
+        writes.delete(space(2), key("missing"));
 
-        let page = tx
-            .read_v3(KvReadV3Request {
-                namespace: "packed".to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: vec![KvKeySpan::all()],
-                    after: None,
-                },
-                projection: KvReadV3Projection::ValueParts(vec![
-                    KvReadV3ValuePart::Header,
-                    KvReadV3ValuePart::Payload,
-                ]),
-                order: KvReadV3Order::KeyOrder,
-                page_size: Some(2),
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await
-            .expect("read_v3 reads");
+        let (_commit, stats) = storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("commit write set");
 
-        assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"k1", b"k2"]);
-        assert_eq!(page.values.len(), 2);
-        assert_eq!(page.values[0].get(0), Some(b"h1".as_slice()));
-        assert_eq!(page.values[0].get(1), Some(b"h2".as_slice()));
-        assert_eq!(page.values[1].get(0), Some(b"payload-1".as_slice()));
-        assert_eq!(page.values[1].get(1), Some(b"payload-2".as_slice()));
-        tx.rollback().await.expect("rollback succeeds");
+        assert_eq!(stats.staged_puts, 3);
+        assert_eq!(stats.staged_deletes, 1);
+        assert_eq!(stats.touched_spaces, 2);
+        assert_eq!(stats.put_batches, 2);
+        assert_eq!(stats.delete_batches, 1);
+        assert_eq!(stats.backend_calls, 3);
+
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let result = PointReadPlan::new(space(1), &[key("a"), key("b")])
+            .materialize(&read, GetOptions::default())
+            .expect("read back values");
+        assert_eq!(
+            result.value,
+            vec![
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+            ]
+        );
     }
 
-    #[tokio::test]
-    async fn read_v3_projected_points_preserve_request_order_and_misses() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
+    #[test]
+    fn context_read_scope_pins_snapshot_across_later_commits() {
+        let storage = StorageContext::new(InMemoryBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.put(space(1), key("a"), value("A"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
 
-        let page = tx
-            .read_v3(KvReadV3Request {
-                namespace: "packed".to_string(),
-                source: KvReadV3Source::Keys {
-                    keys: vec![b"k2".to_vec(), b"missing".to_vec(), b"k1".to_vec()],
-                },
-                projection: KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::Header]),
-                order: KvReadV3Order::RequestOrder,
-                page_size: None,
-                strategy: KvReadV3Strategy::Auto,
-            })
-            .await
-            .expect("read_v3 reads");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+
+        let mut later = storage.new_write_set();
+        later.put(space(1), key("a"), value("B"));
+        storage
+            .commit_write_set(later, WriteOptions::default())
+            .expect("later commit");
+
+        let result = PointReadPlan::new(space(1), &[key("a")])
+            .materialize(&read, GetOptions::default())
+            .expect("read old scope");
 
         assert_eq!(
-            page.keys.iter().collect::<Vec<_>>(),
-            vec![b"k2".as_slice(), b"missing".as_slice(), b"k1".as_slice()]
+            result.value[0],
+            Some(ProjectedValue::FullValue(Bytes::from_static(b"A")))
         );
-        assert_eq!(page.presence_vec(), vec![true, false, true]);
-        assert_eq!(page.values.len(), 1);
-        assert_eq!(page.values[0].get(0), Some(b"h2".as_slice()));
-        assert_eq!(page.values[0].get(1), Some(b"".as_slice()));
-        assert_eq!(page.values[0].get(2), Some(b"h1".as_slice()));
-        tx.rollback().await.expect("rollback succeeds");
     }
+}
 
-    #[tokio::test]
-    async fn read_v3_span_scan_uses_key_order_and_cursor() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
+#[cfg(test)]
+mod shape_tests {
+    use std::cell::{Cell, RefCell};
+    use std::ops::Bound;
+    use std::rc::Rc;
 
-        let page = tx
-            .read_v3(KvReadV3Request {
-                namespace: "primary".to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: vec![KvKeySpan::new(b"a/".to_vec(), b"a0".to_vec())],
-                    after: None,
-                },
-                projection: KvReadV3Projection::KeysOnly,
-                order: KvReadV3Order::KeyOrder,
-                page_size: Some(1),
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await
-            .expect("read_v3 scans");
+    use bytes::Bytes;
 
-        assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"a/1"]);
-        assert_eq!(page.presence_vec(), vec![true]);
-        assert_eq!(page.resume_after, Some(b"a/1".to_vec()));
-        tx.rollback().await.expect("rollback succeeds");
-    }
+    use crate::backend::{
+        Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
+        BufferedRangeScan, CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
+        ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+        StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    };
+    use crate::storage::{PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
-    #[tokio::test]
-    async fn read_v3_overlapping_spans_do_not_duplicate_keys() {
-        let storage = seeded_scan2_storage().await;
-        let mut tx = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction opens");
+    #[test]
+    fn write_set_across_g_spaces_lowers_to_g_put_many_calls_and_one_commit() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+        let mut writes = storage.new_write_set();
+        writes.put(space(1), key("a"), value("A"));
+        writes.put(space(2), key("a"), value("B"));
+        writes.put(space(3), key("a"), value("C"));
 
-        let page = tx
-            .read_v3(KvReadV3Request {
-                namespace: "primary".to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: vec![span_prefix(b"a/"), span_exact(b"a/1")],
-                    after: None,
-                },
-                projection: KvReadV3Projection::KeysOnly,
-                order: KvReadV3Order::KeyOrder,
-                page_size: Some(10),
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await
-            .expect("read_v3 reads");
-
-        assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"a/1", b"a/2"]);
-        assert_eq!(page.resume_after, None);
-        tx.rollback().await.expect("rollback succeeds");
-    }
-
-    async fn seeded_scan2_storage() -> StorageContext {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend);
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("write transaction opens");
-        let mut batch = KvWriteBatch::new();
-        batch.put("primary", b"a/1".to_vec(), b"p1".to_vec());
-        batch.put("primary", b"a/2".to_vec(), b"p2".to_vec());
-        batch.put("primary", b"b/1".to_vec(), b"p3".to_vec());
-        batch.put("joined", b"a/1".to_vec(), b"j1".to_vec());
-        batch.put("joined", b"b/1".to_vec(), b"j3".to_vec());
-        batch.put("other", b"a/2".to_vec(), b"other".to_vec());
-        batch.put("packed", b"k1".to_vec(), framed_value(b"h1", b"payload-1"));
-        batch.put("packed", b"k2".to_vec(), framed_value(b"h2", b"payload-2"));
-        tx.write_kv_batch(batch).await.expect("seed writes");
-        tx.commit().await.expect("seed commit succeeds");
         storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("commit write set");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.put_batches.borrow().len(), 3);
+        assert_eq!(
+            backend
+                .state
+                .put_batches
+                .borrow()
+                .iter()
+                .map(|(space, keys)| (*space, keys.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SpaceId(1), vec![key("a")]),
+                (SpaceId(2), vec![key("a")]),
+                (SpaceId(3), vec![key("a")]),
+            ]
+        );
     }
 
-    fn framed_value(header: &[u8], payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"LXU2");
-        out.push(0);
-        out.extend_from_slice(format!("{:010}", header.len()).as_bytes());
-        out.extend_from_slice(format!("{:010}", payload.len()).as_bytes());
-        out.extend_from_slice(header);
-        out.extend_from_slice(payload);
-        out
-    }
+    #[test]
+    fn point_read_m_requested_u_unique_sends_u_backend_keys() {
+        let read = SpyRead::default();
+        let scope = StorageReadScope::new(read.clone());
 
-    fn span_exact(key: &[u8]) -> KvKeySpan {
-        let mut end = key.to_vec();
-        end.push(0);
-        KvKeySpan::new(key.to_vec(), end)
-    }
-
-    fn span_prefix(prefix: &[u8]) -> KvKeySpan {
-        KvKeySpan::new(
-            prefix.to_vec(),
-            prefix_upper_bound(prefix).expect("test prefix has an upper bound"),
+        let result = PointReadPlan::new(
+            space(1),
+            &[key("b"), key("a"), key("b"), key("missing"), key("a")],
         )
+        .materialize(&scope, GetOptions::default())
+        .expect("point read");
+
+        assert_eq!(
+            read.get_many_keys.borrow().clone(),
+            vec![key("b"), key("a"), key("missing")]
+                .into_iter()
+                .map(|key| space(1).encode_key(&key))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.value,
+            vec![
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
+                Some(ProjectedValue::FullValue(
+                    space(1).encode_key(&key("missing")).0
+                )),
+                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
+            ]
+        );
     }
 
-    fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-        let mut upper = prefix.to_vec();
-        for index in (0..upper.len()).rev() {
-            if upper[index] != 0xFF {
-                upper[index] += 1;
-                upper.truncate(index + 1);
-                return Some(upper);
-            }
+    #[test]
+    fn prefix_scan_calls_scan_range_once() {
+        let read = SpyRead::default();
+        let scope = StorageReadScope::new(read.clone());
+
+        ScanPlan::prefix(
+            space(1),
+            crate::backend::Prefix {
+                bytes: Bytes::from_static(b"a"),
+            },
+        )
+        .collect(&scope, ScanOptions::default())
+        .expect("prefix scan");
+
+        assert_eq!(read.scan_range_calls.get(), 1);
+        assert_eq!(
+            read.scan_range.borrow().clone(),
+            Some(KeyRange {
+                lower: Bound::Included(space(1).encode_key(&key("a"))),
+                upper: Bound::Excluded(space(1).encode_key(&key("b"))),
+            })
+        );
+    }
+
+    #[test]
+    fn delete_range_lowers_to_one_backend_delete_range() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+
+        storage
+            .delete_range(
+                space(7),
+                KeyRange {
+                    lower: Bound::Included(key("a")),
+                    upper: Bound::Excluded(key("c")),
+                },
+                WriteOptions::default(),
+            )
+            .expect("delete range");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.delete_many_calls.get(), 0);
+        assert_eq!(
+            backend.state.delete_ranges.borrow().as_slice(),
+            &[KeyRange {
+                lower: Bound::Included(space(7).encode_key(&key("a"))),
+                upper: Bound::Excluded(space(7).encode_key(&key("c"))),
+            }]
+        );
+    }
+
+    #[test]
+    fn delete_prefix_lowers_to_one_backend_delete_range() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+
+        storage
+            .delete_prefix(
+                space(7),
+                crate::backend::Prefix {
+                    bytes: Bytes::from_static(b"ab"),
+                },
+                WriteOptions::default(),
+            )
+            .expect("delete prefix");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.delete_many_calls.get(), 0);
+        assert_eq!(
+            backend.state.delete_ranges.borrow().as_slice(),
+            &[KeyRange {
+                lower: Bound::Included(space(7).encode_key(&key("ab"))),
+                upper: Bound::Excluded(space(7).encode_key(&key("ac"))),
+            }]
+        );
+    }
+
+    #[test]
+    fn clear_space_lowers_to_one_backend_delete_range() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+
+        storage
+            .clear_space(space(7), WriteOptions::default())
+            .expect("clear space");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.delete_many_calls.get(), 0);
+        assert_eq!(
+            backend.state.delete_ranges.borrow().as_slice(),
+            &[KeyRange {
+                lower: Bound::Included(Key(Bytes::from_static(b"\0\0\0\x07"))),
+                upper: Bound::Excluded(Key(Bytes::from_static(b"\0\0\0\x08"))),
+            }]
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingBackend {
+        state: Rc<CountingState>,
+    }
+
+    #[derive(Default)]
+    struct CountingState {
+        begin_write_calls: Cell<u64>,
+        commit_calls: Cell<u64>,
+        delete_many_calls: Cell<u64>,
+        put_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
+        delete_ranges: RefCell<Vec<KeyRange>>,
+    }
+
+    struct CountingWrite {
+        state: Rc<CountingState>,
+        put_batches: Vec<(SpaceId, Vec<Key>)>,
+        delete_ranges: Vec<KeyRange>,
+    }
+
+    impl Backend for CountingBackend {
+        type Read<'a>
+            = SpyRead
+        where
+            Self: 'a;
+
+        type Write<'a>
+            = CountingWrite
+        where
+            Self: 'a;
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::v0(WriteConcurrency::SingleWriter)
         }
-        None
+
+        fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+            Ok(SpyRead::default())
+        }
+
+        fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+            self.state
+                .begin_write_calls
+                .set(self.state.begin_write_calls.get() + 1);
+            Ok(CountingWrite {
+                state: Rc::clone(&self.state),
+                put_batches: Vec::new(),
+                delete_ranges: Vec::new(),
+            })
+        }
+    }
+
+    impl BackendWrite for CountingWrite {
+        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+            let space = entries
+                .entries
+                .first()
+                .map(|entry| physical_space(&entry.key))
+                .unwrap_or(SpaceId(0));
+            self.put_batches.push((
+                space,
+                entries
+                    .entries
+                    .into_iter()
+                    .map(|entry| logical_key(entry.key))
+                    .collect(),
+            ));
+            Ok(())
+        }
+
+        fn delete_many(&mut self, _keys: &[Key]) -> Result<(), BackendError> {
+            self.state
+                .delete_many_calls
+                .set(self.state.delete_many_calls.get() + 1);
+            Ok(())
+        }
+
+        fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+            self.delete_ranges.push(range);
+            Ok(())
+        }
+
+        fn commit(self) -> Result<CommitResult, BackendError> {
+            self.state
+                .commit_calls
+                .set(self.state.commit_calls.get() + 1);
+            self.state.put_batches.borrow_mut().extend(self.put_batches);
+            self.state
+                .delete_ranges
+                .borrow_mut()
+                .extend(self.delete_ranges);
+            Ok(CommitResult {
+                commit_id: None,
+                stats: WriteStats::default(),
+            })
+        }
+
+        fn rollback(self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SpyRead {
+        get_many_keys: Rc<RefCell<Vec<Key>>>,
+        scan_range_calls: Rc<Cell<u64>>,
+        scan_range: Rc<RefCell<Option<KeyRange>>>,
+    }
+
+    impl BackendRead for SpyRead {
+        type RangeScan<'a> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            self.get_many_keys.replace(keys.to_vec());
+            for (index, key) in keys.iter().enumerate() {
+                let value = (key.0.as_ref() != b"missing")
+                    .then_some(ProjectedValueRef::FullValue(key.0.as_ref()));
+                visitor.visit(index, key, value)?;
+            }
+            Ok(())
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            range: KeyRange,
+            _opts: ScanOptions<'_>,
+            f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            self.scan_range_calls.set(self.scan_range_calls.get() + 1);
+            self.scan_range.replace(Some(range));
+            let mut cursor = BufferedRangeScan::default();
+            f(&mut cursor)
+        }
+    }
+
+    fn space(id: u32) -> StorageSpace {
+        StorageSpace::new(SpaceId(id), "shape.test.space")
+    }
+
+    fn physical_space(key: &Key) -> SpaceId {
+        SpaceId(u32::from_be_bytes(
+            key.0[..4].try_into().expect("space prefix"),
+        ))
+    }
+
+    fn logical_key(key: Key) -> Key {
+        Key(key.0.slice(4..))
+    }
+
+    fn key(bytes: &'static str) -> Key {
+        Key(Bytes::from_static(bytes.as_bytes()))
+    }
+
+    fn value(bytes: &'static str) -> StoredValue {
+        StoredValue {
+            bytes: Bytes::from_static(bytes.as_bytes()),
+        }
     }
 }

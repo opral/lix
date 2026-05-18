@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.6.0-preview.2",
+	"version": "0.6.0-preview.4",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"files": [
@@ -20,6 +20,9 @@
 		}
 	},
 	"description": "WASM-backed JS SDK wrapper for Lix",
+	"engines": {
+		"node": ">=22"
+	},
 	"scripts": {
 		"build": "node ./scripts/build.js",
 		"sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",

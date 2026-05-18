@@ -1,6 +1,6 @@
 use crate::commit_store::{LocatedChange, MaterializedChange};
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
-use crate::storage::StorageReader;
+use crate::storage::StorageRead;
 use crate::{parse_row_metadata, LixError};
 
 pub(crate) async fn materialize_change<S>(
@@ -8,7 +8,7 @@ pub(crate) async fn materialize_change<S>(
     located: LocatedChange,
 ) -> Result<MaterializedChange, LixError>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     let change = located.record;
     let pack_ids = [located.source_pack_id];
@@ -55,7 +55,7 @@ async fn load_optional_json_text<S>(
     field: &str,
 ) -> Result<Option<String>, LixError>
 where
-    S: StorageReader,
+    S: StorageRead,
 {
     let Some(json_ref) = json_ref else {
         return Ok(None);

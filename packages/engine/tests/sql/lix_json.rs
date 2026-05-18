@@ -114,6 +114,56 @@ simulation_test!(
 );
 
 simulation_test!(
+    json_identity_read_predicates_reject_parseable_bare_text_literals,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for sql in [
+            "SELECT entity_id FROM lix_state WHERE entity_id = '[ \"state-latest\" ]'",
+            "SELECT id FROM lix_file WHERE lixcol_entity_id = '[ \"file-readme\" ]'",
+            "SELECT id FROM lix_directory WHERE lixcol_entity_id = '[ \"directory-root\" ]'",
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("read predicates should not silently compare raw identity JSON text");
+
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+            assert!(
+                error.hint().is_some_and(|hint| hint.contains("lix_json")),
+                "expected lix_json hint: {error}"
+            );
+        }
+
+        for sql in [
+            "SELECT entity_id FROM lix_state WHERE entity_id = $1",
+            "SELECT id FROM lix_file WHERE lixcol_entity_id = $1",
+            "SELECT id FROM lix_directory WHERE lixcol_entity_id = $1",
+        ] {
+            let error = session
+                .execute(sql, &[Value::Text("[\"state-latest\"]".to_string())])
+                .await
+                .expect_err("read predicates should reject bare text identity JSON parameters");
+
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+            assert!(
+                error
+                    .hint()
+                    .is_some_and(|hint| hint.contains("JSON parameter")),
+                "expected JSON parameter hint: {error}"
+            );
+        }
+    }
+);
+
+simulation_test!(
     json_column_predicates_accept_lix_json_expressions,
     |sim| async move {
         let engine = sim.boot_engine().await;

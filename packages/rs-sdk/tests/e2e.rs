@@ -222,6 +222,157 @@ async fn failed_write_validation_does_not_poison_backend_transaction() {
     lix.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn transaction_commits_multiple_statements_together() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    register_crm_task_schema(&lix).await;
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        &[
+            Value::Text("tx-task-1".to_string()),
+            Value::Text("First".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        &[
+            Value::Text("tx-task-2".to_string()),
+            Value::Text("Second".to_string()),
+            Value::Boolean(true),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let staged = tx
+        .execute(
+            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+            &[
+                Value::Text("tx-task-1".to_string()),
+                Value::Text("tx-task-2".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.len(), 2);
+
+    tx.commit().await.unwrap();
+
+    let committed = lix
+        .execute(
+            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+            &[
+                Value::Text("tx-task-1".to_string()),
+                Value::Text("tx-task-2".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 2);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_rollback_discards_staged_writes() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    register_crm_task_schema(&lix).await;
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        &[
+            Value::Text("rolled-back-task".to_string()),
+            Value::Text("Rollback".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+
+    let result = lix
+        .execute(
+            "SELECT id FROM crm_task WHERE id = $1",
+            &[Value::Text("rolled-back-task".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 0);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_blocks_session_execute_on_same_handle() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    register_crm_task_schema(&lix).await;
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+        &[
+            Value::Text("tx-only-task".to_string()),
+            Value::Text("Inside tx".to_string()),
+            Value::Boolean(false),
+            Value::Text(r#"{"batch":1}"#.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let error = lix
+        .execute(
+            "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+            &[
+                Value::Text("outside-task".to_string()),
+                Value::Text("Outside tx".to_string()),
+                Value::Boolean(false),
+                Value::Text(r#"{"batch":1}"#.to_string()),
+            ],
+        )
+        .await
+        .expect_err("session writes should be blocked while explicit transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let error = lix
+        .execute("SELECT 1 AS ok", &[])
+        .await
+        .expect_err("session reads should be blocked while explicit transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let tx_read = tx
+        .execute("SELECT 1 AS ok", &[])
+        .await
+        .expect("transaction reads should remain available");
+    assert_eq!(tx_read.rows()[0].get::<i64>("ok").unwrap(), 1);
+
+    tx.commit().await.unwrap();
+
+    let committed = lix
+        .execute(
+            "SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+            &[
+                Value::Text("outside-task".to_string()),
+                Value::Text("tx-only-task".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(
+        committed.rows()[0].values(),
+        &[Value::Text("tx-only-task".to_string())]
+    );
+    lix.close().await.unwrap();
+}
+
 async fn register_crm_task_schema(lix: &lix_rs_sdk::Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -7,7 +7,7 @@
 mod in_memory_backend;
 mod lix;
 
-pub use lix::{open_lix, Lix, OpenLixOptions};
+pub use lix::{open_lix, Lix, LixTransaction, OpenLixOptions};
 pub use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
     BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,

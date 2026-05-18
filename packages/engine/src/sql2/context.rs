@@ -14,20 +14,18 @@ use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
     MaterializedLiveStateRow,
 };
-use crate::storage::{ScopedStorageReader, StorageReadTransaction};
+use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::version::{VersionHead, VersionRefReader};
 use crate::LixError;
 
-pub(crate) type SqlReadStore =
-    ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>;
-pub(crate) type SqlCommitStoreQuerySource = CommitStoreQuerySource<SqlReadStore>;
-pub(crate) type SqlJsonReader = JsonStoreReader<ScopedStorageReader<SqlReadStore>>;
+pub(crate) type SqlCommitStoreQuerySource<S> = CommitStoreQuerySource<S>;
+pub(crate) type SqlJsonReader<S> = JsonStoreReader<S>;
 
 #[derive(Clone)]
 pub(crate) struct CommitStoreQuerySource<S> {
-    pub(crate) commit_store_reader: Arc<CommitStoreReader<ScopedStorageReader<S>>>,
-    pub(crate) json_reader: JsonStoreReader<ScopedStorageReader<S>>,
+    pub(crate) commit_store_reader: Arc<CommitStoreReader<S>>,
+    pub(crate) json_reader: JsonStoreReader<S>,
 }
 
 /// Read-only execution boundary for `sql2::execute_sql(...)`.
@@ -41,10 +39,12 @@ pub(crate) struct CommitStoreQuerySource<S> {
 /// sources.
 #[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
+    type ReadStore: StorageRead + Clone + Send + Sync + 'static;
+
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
-    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource;
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn version_ref(&self) -> Arc<dyn VersionRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;

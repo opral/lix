@@ -6,10 +6,10 @@ mod wasm {
         open_lix as open_lix_rs, Backend, BackendKvEntryPage, BackendKvExistsBatch,
         BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange,
         BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage,
-        BackendKvWriteBatch, BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction,
-        BackendWriteTransaction, BytePageBuilder, CreateVersionOptions, ExecuteResult,
-        Lix as RsLix, LixError, MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions,
-        SwitchVersionOptions, Value,
+        BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+        BytePageBuilder, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
+        LixTransaction as RsLixTransaction, MergeVersionOptions, MergeVersionPreviewOptions,
+        OpenLixOptions, SwitchVersionOptions, Value,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -102,10 +102,10 @@ export type BackendKvEntryPage = {
   resumeAfter?: Uint8Array | null;
 };
 
-export type BackendKvWriteOp =
-  | { kind: "put"; key: Uint8Array; value: Uint8Array }
-  | { kind: "delete"; key: Uint8Array }
-  | { kind: "deleteRange"; range: BackendKvScanRange };
+export type BackendKvPut = {
+  key: Uint8Array;
+  value: Uint8Array;
+};
 
 export type BackendKvWriteBatch = {
   groups: BackendKvWriteGroup[];
@@ -113,13 +113,13 @@ export type BackendKvWriteBatch = {
 
 export type BackendKvWriteGroup = {
   namespace: string;
-  ops: BackendKvWriteOp[];
+  puts: BackendKvPut[];
+  deletes: Uint8Array[];
 };
 
 export type BackendKvWriteStats = {
   puts: number;
   deletes: number;
-  deleteRanges: number;
   bytesWritten: number;
 };
 
@@ -229,11 +229,16 @@ export type MergeConflictSide = {
     }
 
     #[wasm_bindgen]
+    pub struct LixTransaction {
+        inner: Option<RsLixTransaction>,
+    }
+
+    #[wasm_bindgen]
     impl Lix {
         /// Executes one DataFusion SQL statement against this Lix session.
         ///
         /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-        /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog
+        /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog
         /// tables and transaction statements such as `sqlite_master`, `BEGIN`,
         /// and `COMMIT` are not part of this contract; use
         /// `information_schema` for catalog inspection.
@@ -256,6 +261,12 @@ export type MergeConflictSide = {
                 .map_err(js_error)?;
             let result = self.inner.execute(&sql, &values).await.map_err(js_error)?;
             execute_result_to_js(result).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = beginTransaction)]
+        pub async fn begin_transaction(&self) -> Result<LixTransaction, JsValue> {
+            let inner = self.inner.begin_transaction().await.map_err(js_error)?;
+            Ok(LixTransaction { inner: Some(inner) })
         }
 
         #[wasm_bindgen(js_name = activeVersionId)]
@@ -350,6 +361,55 @@ export type MergeConflictSide = {
         #[wasm_bindgen(js_name = close)]
         pub async fn close(&self) -> Result<(), JsValue> {
             self.inner.close().await.map_err(js_error)
+        }
+    }
+
+    #[wasm_bindgen]
+    impl LixTransaction {
+        #[wasm_bindgen(js_name = execute)]
+        pub async fn execute(&mut self, sql: JsValue, params: JsValue) -> Result<JsValue, JsValue> {
+            let sql = sql
+                .as_string()
+                .ok_or_else(|| invalid_argument_error("execute", "sql", "string", &sql))
+                .map_err(js_error)?;
+            if !Array::is_array(&params) {
+                return Err(js_error(invalid_argument_error(
+                    "execute", "params", "array", &params,
+                )));
+            }
+            let params = Array::from(&params);
+            let values = params
+                .iter()
+                .map(value_from_js)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(js_error)?;
+            let inner = self
+                .inner
+                .as_mut()
+                .ok_or_else(transaction_closed_error)
+                .map_err(js_error)?;
+            let result = inner.execute(&sql, &values).await.map_err(js_error)?;
+            execute_result_to_js(result).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = commit)]
+        pub async fn commit(&mut self) -> Result<(), JsValue> {
+            let inner = self
+                .inner
+                .take()
+                .ok_or_else(transaction_closed_error)
+                .map_err(js_error)?;
+            inner.commit().await.map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = rollback)]
+        pub async fn rollback(&mut self) -> Result<(), JsValue> {
+            let inner = self
+                .inner
+                .take()
+                .ok_or_else(transaction_closed_error)
+                .map_err(js_error)?;
+            inner.rollback().await.map_err(js_error)
         }
     }
 
@@ -654,36 +714,36 @@ export type MergeConflictSide = {
             let group_object = Object::new();
             set_string(&group_object, "namespace", group.namespace())?;
 
-            let ops = Array::new();
-            for op in group.ops() {
-                let op_object = Object::new();
-                match op {
-                    BackendKvWriteOp::Put { key, value } => {
-                        set_string(&op_object, "kind", "put")?;
-                        Reflect::set(&op_object, &JsValue::from_str("key"), &bytes_to_js(key))
-                            .map_err(|_| js_sdk_error("could not set write put key"))?;
-                        Reflect::set(&op_object, &JsValue::from_str("value"), &bytes_to_js(value))
-                            .map_err(|_| js_sdk_error("could not set write put value"))?;
-                    }
-                    BackendKvWriteOp::Delete { key } => {
-                        set_string(&op_object, "kind", "delete")?;
-                        Reflect::set(&op_object, &JsValue::from_str("key"), &bytes_to_js(key))
-                            .map_err(|_| js_sdk_error("could not set write delete key"))?;
-                    }
-                    BackendKvWriteOp::DeleteRange { range } => {
-                        set_string(&op_object, "kind", "deleteRange")?;
-                        Reflect::set(
-                            &op_object,
-                            &JsValue::from_str("range"),
-                            &kv_scan_range_to_js(range)?,
-                        )
-                        .map_err(|_| js_sdk_error("could not set write delete range"))?;
-                    }
-                }
-                ops.push(&op_object);
+            let puts = Array::new();
+            for index in 0..group.put_count() {
+                let key = group.put_key(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
+                })?;
+                let value = group.put_value(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
+                })?;
+                let put = Object::new();
+                Reflect::set(&put, &JsValue::from_str("key"), &bytes_to_js(key))
+                    .map_err(|_| js_sdk_error("could not set write put key"))?;
+                Reflect::set(&put, &JsValue::from_str("value"), &bytes_to_js(value))
+                    .map_err(|_| js_sdk_error("could not set write put value"))?;
+                puts.push(&put);
             }
-            Reflect::set(&group_object, &JsValue::from_str("ops"), &ops)
-                .map_err(|_| js_sdk_error("could not set write ops"))?;
+            Reflect::set(&group_object, &JsValue::from_str("puts"), &puts)
+                .map_err(|_| js_sdk_error("could not set write puts"))?;
+
+            let deletes = Array::new();
+            for index in 0..group.delete_count() {
+                let key = group.delete_key(index).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "backend write batch missing delete key",
+                    )
+                })?;
+                deletes.push(&bytes_to_js(key));
+            }
+            Reflect::set(&group_object, &JsValue::from_str("deletes"), &deletes)
+                .map_err(|_| js_sdk_error("could not set write deletes"))?;
             groups.push(&group_object);
         }
         Reflect::set(&object, &JsValue::from_str("groups"), &groups)
@@ -791,7 +851,6 @@ export type MergeConflictSide = {
         Ok(BackendKvWriteStats {
             puts: required_usize(&object, "puts", context)?,
             deletes: required_usize(&object, "deletes", context)?,
-            delete_ranges: required_usize(&object, "deleteRanges", context)?,
             bytes_written: required_usize(&object, "bytesWritten", context)?,
         })
     }
@@ -1320,6 +1379,10 @@ export type MergeConflictSide = {
 
     fn js_sdk_error(message: impl Into<String>) -> LixError {
         LixError::new("LIX_ERROR_JS_SDK", message.into())
+    }
+
+    fn transaction_closed_error() -> LixError {
+        LixError::new("LIX_INVALID_TRANSACTION_STATE", "Lix transaction is closed")
     }
 
     fn js_error(error: LixError) -> JsValue {
