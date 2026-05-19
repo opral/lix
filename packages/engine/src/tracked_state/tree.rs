@@ -140,11 +140,13 @@ impl TrackedStateTree {
     ) -> Result<usize, LixError> {
         match self.load_node(store, root_id.as_bytes()).await? {
             DecodedNode::Leaf(leaf) => Ok(leaf.entries().len()),
-            DecodedNode::Internal(internal) => Ok(internal
-                .children()
-                .iter()
-                .map(|child| child.subtree_count as usize)
-                .sum()),
+            DecodedNode::Internal(internal) => {
+                let mut total = 0usize;
+                for child in internal.children() {
+                    total = checked_add_subtree_count(total, child.subtree_count)?;
+                }
+                Ok(total)
+            }
         }
     }
 
@@ -708,10 +710,8 @@ impl TrackedStateTree {
             ));
         };
 
-        let base_row_count = leaves
-            .iter()
-            .map(|leaf| leaf.subtree_count as usize)
-            .sum::<usize>();
+        let base_row_count =
+            checked_sum_subtree_counts(leaves.iter().map(|leaf| leaf.subtree_count))?;
         let first_mutation_key = mutation_map
             .keys()
             .next()
@@ -985,14 +985,15 @@ impl TrackedStateTree {
                 child_index..child_index + old_child_count,
                 replacement_children,
             );
-            replacement_children = self.build_internal_level(children, parent_level, &mut chunks);
+            replacement_children =
+                self.build_internal_level(children, parent_level, &mut chunks)?;
             old_child_count = 1;
 
             let Some(frame) = path.pop() else {
                 let mut summaries = replacement_children;
                 let mut tree_height = parent_level + 1;
                 while summaries.len() > 1 {
-                    summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
+                    summaries = self.build_internal_level(summaries, tree_height, &mut chunks)?;
                     tree_height += 1;
                 }
                 let root = summaries.pop().ok_or_else(|| {
@@ -1006,7 +1007,7 @@ impl TrackedStateTree {
                 let built = BuiltTree {
                     root_id: TrackedStateRootId::new(root.child_hash),
                     chunks,
-                    row_count: root.subtree_count as usize,
+                    row_count: subtree_count_to_usize(root.subtree_count)?,
                     tree_height,
                     chunk_bytes,
                 };
@@ -1048,7 +1049,7 @@ impl TrackedStateTree {
         let mut summaries = self.build_leaf_level(entries, &mut chunks);
         let mut tree_height = 1usize;
         while summaries.len() > 1 {
-            summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
+            summaries = self.build_internal_level(summaries, tree_height, &mut chunks)?;
             tree_height += 1;
         }
         let root = summaries.pop().ok_or_else(|| {
@@ -1073,14 +1074,12 @@ impl TrackedStateTree {
         leaf_summaries: Vec<ChildSummary>,
         mut chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
     ) -> Result<BuiltTree, LixError> {
-        let row_count = leaf_summaries
-            .iter()
-            .map(|summary| summary.subtree_count as usize)
-            .sum();
+        let row_count =
+            checked_sum_subtree_counts(leaf_summaries.iter().map(|summary| summary.subtree_count))?;
         let mut summaries = leaf_summaries;
         let mut tree_height = 1usize;
         while summaries.len() > 1 {
-            summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
+            summaries = self.build_internal_level(summaries, tree_height, &mut chunks)?;
             tree_height += 1;
         }
         let root = summaries.pop().ok_or_else(|| {
@@ -1138,7 +1137,7 @@ impl TrackedStateTree {
         let mut summaries = replacement_children;
         let mut tree_height = levels.len();
         while summaries.len() > 1 {
-            summaries = self.build_internal_level(summaries, tree_height, &mut chunks);
+            summaries = self.build_internal_level(summaries, tree_height, &mut chunks)?;
             tree_height += 1;
         }
         let root = summaries.pop().ok_or_else(|| {
@@ -1152,7 +1151,7 @@ impl TrackedStateTree {
         Ok(BuiltTree {
             root_id: TrackedStateRootId::new(root.child_hash),
             chunks,
-            row_count: root.subtree_count as usize,
+            row_count: subtree_count_to_usize(root.subtree_count)?,
             tree_height,
             chunk_bytes,
         })
@@ -1177,7 +1176,7 @@ impl TrackedStateTree {
                     replacement_children,
                     parent_level,
                     chunks,
-                ),
+                )?,
             });
         }
 
@@ -1211,7 +1210,7 @@ impl TrackedStateTree {
                 window_children.iter().copied(),
                 parent_level,
                 &mut candidate_chunks,
-            );
+            )?;
 
             if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
                 &candidate_parents,
@@ -1311,12 +1310,14 @@ impl TrackedStateTree {
         children: Vec<ChildSummary>,
         level: usize,
         chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
-    ) -> Vec<ChildSummary> {
+    ) -> Result<Vec<ChildSummary>, LixError> {
         let groups = chunk_internal_entries(children, &self.options, level);
         groups
             .into_iter()
             .map(|group| {
-                let subtree_count = group.children.iter().map(|child| child.subtree_count).sum();
+                let subtree_count = checked_sum_subtree_counts_u64(
+                    group.children.iter().map(|child| child.subtree_count),
+                )?;
                 let first_key = group
                     .children
                     .first()
@@ -1331,7 +1332,7 @@ impl TrackedStateTree {
                 let (chunk, summary) =
                     child_summary_from_node(node, first_key, last_key, subtree_count);
                 chunks.entry(chunk.hash).or_insert(chunk);
-                summary
+                Ok(summary)
             })
             .collect()
     }
@@ -1341,12 +1342,14 @@ impl TrackedStateTree {
         children: impl IntoIterator<Item = ChildSummaryRef<'a>>,
         level: usize,
         chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
-    ) -> Vec<ChildSummary> {
+    ) -> Result<Vec<ChildSummary>, LixError> {
         let groups = chunk_internal_entry_refs(children, &self.options, level);
         groups
             .into_iter()
             .map(|group| {
-                let subtree_count = group.children.iter().map(|child| child.subtree_count).sum();
+                let subtree_count = checked_sum_subtree_counts_u64(
+                    group.children.iter().map(|child| child.subtree_count),
+                )?;
                 let first_key = group
                     .children
                     .first()
@@ -1361,7 +1364,7 @@ impl TrackedStateTree {
                 let (chunk, summary) =
                     child_summary_from_node(node, first_key, last_key, subtree_count);
                 chunks.entry(chunk.hash).or_insert(chunk);
-                summary
+                Ok(summary)
             })
             .collect()
     }
@@ -1577,11 +1580,24 @@ impl TrackedStateTree {
                         if child_summary_contained_by_scan_ranges(child, ranges)
                             && request.entity_ids.is_empty()
                         {
-                            count += child.subtree_count as usize;
+                            count = checked_add_subtree_count(count, child.subtree_count)?;
                         } else if child_summary_overlaps_scan_ranges(child, ranges) {
-                            count += self
-                                .count_matching_keys_node(store, child.child_hash, request, ranges)
-                                .await?;
+                            count = count
+                                .checked_add(
+                                    self.count_matching_keys_node(
+                                        store,
+                                        child.child_hash,
+                                        request,
+                                        ranges,
+                                    )
+                                    .await?,
+                                )
+                                .ok_or_else(|| {
+                                    LixError::new(
+                                        "LIX_ERROR_UNKNOWN",
+                                        "tracked-state matching row count overflows usize",
+                                    )
+                                })?;
                         }
                     }
                 }
@@ -2206,6 +2222,48 @@ fn parent_index_for_child_index(
         .unwrap_or_else(|| old_parents.len().saturating_sub(1))
 }
 
+fn checked_add_subtree_count(total: usize, subtree_count: u64) -> Result<usize, LixError> {
+    let subtree_count = subtree_count_to_usize(subtree_count)?;
+    total.checked_add(subtree_count).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state internal child subtree_count sum overflows usize",
+        )
+    })
+}
+
+fn subtree_count_to_usize(subtree_count: u64) -> Result<usize, LixError> {
+    usize::try_from(subtree_count).map_err(|_| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state internal child subtree_count does not fit usize",
+        )
+    })
+}
+
+fn checked_sum_subtree_counts(counts: impl IntoIterator<Item = u64>) -> Result<usize, LixError> {
+    let mut total = 0usize;
+    for count in counts {
+        total = checked_add_subtree_count(total, count)?;
+    }
+    Ok(total)
+}
+
+fn checked_sum_subtree_counts_u64(counts: impl IntoIterator<Item = u64>) -> Result<u64, LixError> {
+    counts.into_iter().try_fold(0u64, |total, count| {
+        total.checked_add(count).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal child subtree_count sum overflows u64",
+            )
+        })
+    })
+}
+
+fn checked_sum_subtree_summaries(children: &[ChildSummary]) -> Result<u64, LixError> {
+    checked_sum_subtree_counts_u64(children.iter().map(|child| child.subtree_count))
+}
+
 fn child_range_for_parent(
     old_children: &[ChildSummary],
     parent: &ChildSummary,
@@ -2276,7 +2334,7 @@ fn internal_summary(
         first_key,
         last_key,
         child_hash: hash,
-        subtree_count: children.iter().map(|child| child.subtree_count).sum(),
+        subtree_count: checked_sum_subtree_summaries(children)?,
     })
 }
 
@@ -2695,6 +2753,79 @@ mod tests {
             error
                 .message
                 .contains("internal child ranges must be strictly increasing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_count_rejects_persisted_internal_subtree_count_overflow() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tree = TrackedStateTree::new();
+        let root_id = stage_raw_root_chunk(&storage, oversized_subtree_count_internal_node());
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = tree
+            .row_count(&store, &root_id)
+            .await
+            .expect_err("corrupt persisted subtree counts must reject");
+
+        assert!(
+            error.message.contains("internal child subtree_count")
+                || error.message.contains("row count overflows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_matching_keys_rejects_persisted_internal_subtree_count_overflow() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tree = TrackedStateTree::new();
+        let root_id = stage_raw_root_chunk(&storage, oversized_subtree_count_internal_node());
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = tree
+            .count_matching_keys(&store, &root_id, &TrackedStateTreeScanRequest::default())
+            .await
+            .expect_err("corrupt persisted subtree counts must reject");
+
+        assert!(
+            error.message.contains("internal child subtree_count")
+                || error.message.contains("matching row count overflows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_mutations_rejects_persisted_internal_subtree_count_overflow() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tree = TrackedStateTree::new();
+        let root_id = stage_oversized_subtree_count_tree(&storage);
+
+        let error = apply_mutations_for_test(
+            &tree,
+            &storage,
+            Some(&root_id),
+            vec![
+                mutation_owned(
+                    key("schema", None, "echo"),
+                    value("change-echo", Some("{}")),
+                ),
+                mutation_owned(
+                    key("schema", None, "foxtrot"),
+                    value("change-foxtrot", Some("{}")),
+                ),
+            ],
+            None,
+        )
+        .await
+        .expect_err("mutating corrupt persisted subtree counts must reject");
+
+        assert!(
+            error.message.contains("internal child subtree_count"),
             "unexpected error: {error}"
         );
     }
@@ -3175,6 +3306,13 @@ mod tests {
         storage: &StorageContext<InMemoryStorageBackend>,
         node: Vec<u8>,
     ) -> TrackedStateRootId {
+        TrackedStateRootId::new(stage_raw_chunk(storage, node))
+    }
+
+    fn stage_raw_chunk(
+        storage: &StorageContext<InMemoryStorageBackend>,
+        node: Vec<u8>,
+    ) -> [u8; TRACKED_STATE_HASH_BYTES] {
         let hash = hash_bytes(&node);
         let chunk = PendingChunkWrite { hash, data: node };
         let mut writes = storage.new_write_set();
@@ -3182,7 +3320,68 @@ mod tests {
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("raw chunk should commit");
-        TrackedStateRootId::new(hash)
+        hash
+    }
+
+    fn stage_oversized_subtree_count_tree(
+        storage: &StorageContext<InMemoryStorageBackend>,
+    ) -> TrackedStateRootId {
+        let keys = oversized_subtree_count_keys();
+        let left_hash = stage_raw_chunk(
+            storage,
+            encode_leaf_node(&[EncodedLeafEntry {
+                key: keys[0].clone(),
+                value: encode_value(&value("change-alpha", Some("{}"))),
+            }]),
+        );
+        let right_hash = stage_raw_chunk(
+            storage,
+            encode_leaf_node(&[EncodedLeafEntry {
+                key: keys[2].clone(),
+                value: encode_value(&value("change-charlie", Some("{}"))),
+            }]),
+        );
+        stage_raw_root_chunk(
+            storage,
+            oversized_subtree_count_internal_node_with_hashes(left_hash, right_hash),
+        )
+    }
+
+    fn oversized_subtree_count_internal_node() -> Vec<u8> {
+        oversized_subtree_count_internal_node_with_hashes(
+            [1; TRACKED_STATE_HASH_BYTES],
+            [2; TRACKED_STATE_HASH_BYTES],
+        )
+    }
+
+    fn oversized_subtree_count_internal_node_with_hashes(
+        left_hash: [u8; TRACKED_STATE_HASH_BYTES],
+        right_hash: [u8; TRACKED_STATE_HASH_BYTES],
+    ) -> Vec<u8> {
+        let keys = oversized_subtree_count_keys();
+        encode_internal_node(&[
+            ChildSummary {
+                first_key: keys[0].clone(),
+                last_key: keys[1].clone(),
+                child_hash: left_hash,
+                subtree_count: u64::MAX,
+            },
+            ChildSummary {
+                first_key: keys[2].clone(),
+                last_key: keys[3].clone(),
+                child_hash: right_hash,
+                subtree_count: 1,
+            },
+        ])
+    }
+
+    fn oversized_subtree_count_keys() -> Vec<Vec<u8>> {
+        let mut keys = ["alpha", "bravo", "charlie", "delta"]
+            .into_iter()
+            .map(|entity_id| encode_key(&key("schema", None, entity_id)))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     fn encoded_entries_with_change_id(change_id: &str) -> Vec<EncodedLeafEntry> {
