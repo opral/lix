@@ -65,7 +65,8 @@ pub(crate) async fn load_row(
         .into_iter()
         .next()
         .flatten()
-        .and_then(full_value);
+        .map(|value| full_value(value))
+        .transpose()?;
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -197,9 +198,7 @@ fn scan_matching_rows(
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
 
         for entry in page.value.entries {
-            let Some(bytes) = full_value(entry.value) else {
-                continue;
-            };
+            let bytes = full_value(entry.value)?;
             let identity = decode_untracked_state_row_key_ref(entry.key.0.as_ref())?;
             let row = crate::untracked_state::codec::decode_payload_with_identity(
                 identity,
@@ -308,10 +307,13 @@ fn append_file_prefixes(
     Ok(())
 }
 
-fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
+fn full_value(value: StorageProjectedValue) -> Result<Bytes, LixError> {
     match value {
-        StorageProjectedValue::FullValue(bytes) => Some(bytes),
-        StorageProjectedValue::KeyOnly => None,
+        StorageProjectedValue::FullValue(bytes) => Ok(bytes),
+        StorageProjectedValue::KeyOnly => Err(LixError::unknown(format!(
+            "untracked_state read over namespace '{}' requested full value but storage returned key-only entry",
+            UNTRACKED_STATE_ROW_SPACE.name
+        ))),
     }
 }
 
@@ -560,9 +562,137 @@ fn push_bytes_component(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{
+        BackendError, BackendRead, BufferedRangeScan, GetOptions, Key, KeyRange, PointVisitor,
+        ProjectedValue, ProjectedValueRef, ReadEntry, ScanOptions,
+    };
     use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage::{
+        InMemoryStorageBackend, StorageReadOptions, StorageReadScope, StorageWriteOptions,
+    };
     use crate::untracked_state::UntrackedStateContext;
+
+    struct KeyOnlyPointRead;
+
+    impl BackendRead for KeyOnlyPointRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            for (index, key) in keys.iter().enumerate() {
+                visitor.visit(index, key, Some(ProjectedValueRef::KeyOnly))?;
+            }
+            Ok(())
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            _f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            unreachable!("untracked_state point-read test does not scan")
+        }
+    }
+
+    struct KeyOnlyScanRead;
+
+    impl BackendRead for KeyOnlyScanRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            _keys: &[Key],
+            _opts: GetOptions<'_>,
+            _visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            unreachable!("untracked_state scan test does not point read")
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            let identity = test_identity();
+            let logical_key =
+                encode_untracked_state_row_key(&identity).expect("test key should encode");
+            let key = UNTRACKED_STATE_ROW_SPACE.encode_key(&Key(Bytes::from(logical_key)));
+            let mut cursor = BufferedRangeScan::new(vec![ReadEntry {
+                key,
+                value: ProjectedValue::KeyOnly,
+            }]);
+            f(&mut cursor)
+        }
+    }
+
+    #[tokio::test]
+    async fn load_row_rejects_key_only_point_read() {
+        let read = StorageReadScope::new(KeyOnlyPointRead);
+
+        let error = load_row(&read, &test_request())
+            .await
+            .expect_err("key-only untracked point read must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_rows_rejects_key_only_value() {
+        let read = StorageReadScope::new(KeyOnlyScanRead);
+
+        let error = scan_rows(&read, &UntrackedStateScanRequest::default())
+            .await
+            .expect_err("key-only untracked scan must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn test_identity() -> UntrackedStateIdentity {
+        UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: None,
+        }
+    }
+
+    fn test_request() -> UntrackedStateRowRequest {
+        let identity = test_identity();
+        UntrackedStateRowRequest {
+            schema_key: identity.schema_key,
+            version_id: identity.version_id,
+            entity_id: identity.entity_id,
+            file_id: NullableKeyFilter::Null,
+        }
+    }
 
     #[test]
     fn key_v1_roundtrips_null_file_id() {
