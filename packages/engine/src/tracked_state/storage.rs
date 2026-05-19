@@ -47,7 +47,8 @@ async fn get_one(
         .into_iter()
         .next()
         .flatten()
-        .and_then(full_value))
+        .map(|value| full_value(space, value))
+        .transpose()?)
 }
 
 pub(crate) async fn load_root(
@@ -200,10 +201,13 @@ fn value(bytes: Vec<u8>) -> StorageValue {
     }
 }
 
-fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+fn full_value(space: StorageSpace, value: StorageProjectedValue) -> Result<Vec<u8>, LixError> {
     match value {
-        StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
-        StorageProjectedValue::KeyOnly => None,
+        StorageProjectedValue::FullValue(bytes) => Ok(bytes.to_vec()),
+        StorageProjectedValue::KeyOnly => Err(LixError::unknown(format!(
+            "tracked-state point read over namespace '{}' requested full value but storage returned key-only entry",
+            space.name
+        ))),
     }
 }
 
@@ -408,15 +412,21 @@ mod tests {
         BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
         COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
     };
+    use crate::backend::{
+        BackendError, BackendRead, BufferedRangeScan, GetOptions, Key, KeyRange, PointVisitor,
+        ProjectedValueRef, ScanOptions,
+    };
     use crate::json_store::store::JSON_SPACE;
-    use crate::storage::{InMemoryStorageBackend, StorageContext, StorageWriteOptions};
+    use crate::storage::{
+        InMemoryStorageBackend, StorageContext, StorageReadScope, StorageWriteOptions,
+    };
     use crate::tracked_state::types::TrackedStateRootId;
     use crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE;
 
     use super::{
         PROJECTION_METADATA_MAGIC, TRACKED_STATE_BY_FILE_ROOT_SPACE, TRACKED_STATE_CHUNK_SPACE,
         TRACKED_STATE_HASH_BYTES, TRACKED_STATE_PROJECTION_SPACE, decode_projection_metadata, key,
-        load_projection_metadata, value, write_string,
+        load_by_file_root, load_projection_metadata, value, write_string,
     };
 
     #[test]
@@ -561,6 +571,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn load_by_file_root_rejects_key_only_point_read() {
+        let read = StorageReadScope::new(KeyOnlyPointRead);
+
+        let error = load_by_file_root(&read, "commit-1")
+            .await
+            .expect_err("key-only point read must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn production_tracked_state_sources_do_not_call_storage_batch_writer() {
         let tracked_state_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tracked_state");
@@ -653,5 +679,38 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
+    }
+
+    struct KeyOnlyPointRead;
+
+    impl BackendRead for KeyOnlyPointRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            for (index, key) in keys.iter().enumerate() {
+                visitor.visit(index, key, Some(ProjectedValueRef::KeyOnly))?;
+            }
+            Ok(())
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            _f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            unreachable!("tracked-state point-read test does not scan")
+        }
     }
 }
