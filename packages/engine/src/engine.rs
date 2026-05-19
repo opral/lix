@@ -9,34 +9,38 @@ use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::session::SessionContext;
+use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{Backend, LixError, NullableKeyFilter};
+use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
-pub struct Engine {
-    storage: StorageContext,
+pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
+    storage: StorageContext<B>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     catalog_context: Arc<CatalogContext>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-impl Engine {
+impl<B> Engine<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Seeds an empty backend with the engine repository bootstrap facts.
     ///
     /// Initialization is a storage lifecycle operation, separate from runtime
     /// construction. Call this before `Engine::new(...)` for a brand-new
     /// backend.
-    pub async fn initialize(
-        backend: Box<dyn Backend + Send + Sync>,
-    ) -> Result<InitReceipt, LixError> {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
+    pub async fn initialize(backend: B) -> Result<InitReceipt, LixError> {
         let storage = StorageContext::new(backend);
         let commit_store = CommitStoreContext::new();
 
@@ -53,8 +57,7 @@ impl Engine {
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
     /// instance instead of being hidden behind a legacy boot path.
-    pub async fn new(backend: Box<dyn Backend + Send + Sync>) -> Result<Self, LixError> {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
+    pub async fn new(backend: B) -> Result<Self, LixError> {
         let storage = StorageContext::new(backend);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
@@ -81,10 +84,11 @@ impl Engine {
             live_state,
             version_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
-    pub(crate) fn storage(&self) -> StorageContext {
+    pub(crate) fn storage(&self) -> StorageContext<B> {
         self.storage.clone()
     }
 
@@ -97,28 +101,19 @@ impl Engine {
         &self,
         version_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let mut transaction = self.storage.begin_read_transaction().await?;
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
         let result = self
             .version_ctx
-            .ref_reader(transaction.as_mut())
+            .ref_reader(&read)
             .load_head_commit_id(version_id)
             .await;
-        match result {
-            Ok(result) => {
-                transaction.rollback().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        result
     }
 
     pub async fn open_session(
         &self,
         active_version_id: impl Into<String>,
-    ) -> Result<SessionContext, LixError> {
+    ) -> Result<SessionContext<B>, LixError> {
         SessionContext::open(
             active_version_id.into(),
             self.storage(),
@@ -128,11 +123,12 @@ impl Engine {
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.write_lock),
         )
         .await
     }
 
-    pub async fn open_workspace_session(&self) -> Result<SessionContext, LixError> {
+    pub async fn open_workspace_session(&self) -> Result<SessionContext<B>, LixError> {
         SessionContext::open_workspace(
             self.storage(),
             Arc::clone(&self.live_state),
@@ -141,6 +137,7 @@ impl Engine {
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.write_lock),
         )
         .await
     }
@@ -166,53 +163,43 @@ impl Engine {
                 )
             })?;
         let storage = self.storage();
-        let mut transaction = storage.begin_write_transaction().await?;
+        let read = storage.begin_read(StorageReadOptions::default())?;
         let mut writes = StorageWriteSet::new();
         let materialize_result = self
             .tracked_state
-            .materializer(
-                transaction.as_mut(),
-                &mut writes,
-                self.commit_store.as_ref(),
-            )
+            .materializer(&read, &mut writes, self.commit_store.as_ref())
             .materialize_root_at(&head_commit_id)
             .await;
         if let Err(error) = materialize_result {
-            let _ = transaction.rollback().await;
             return Err(error);
         }
-        if let Err(error) = writes.apply(&mut transaction.as_mut()).await {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-        transaction.commit().await
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
 
-async fn assert_initialized(
-    storage: StorageContext,
+async fn assert_initialized<B>(
+    storage: StorageContext<B>,
     live_state: &LiveStateContext,
-) -> Result<(), LixError> {
-    let mut transaction = storage.begin_read_transaction().await?;
-    let reader = live_state.reader(transaction.as_mut());
-    let result = reader
+) -> Result<(), LixError>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let read = storage.begin_read(StorageReadOptions::default())?;
+    let reader = live_state.reader(&read);
+    let initialized = reader
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: EntityIdentity::single("lix_id"),
             file_id: NullableKeyFilter::Null,
         })
-        .await;
-    let initialized = match result {
-        Ok(row) => {
-            transaction.rollback().await?;
-            row.is_some()
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-    };
+        .await?
+        .is_some();
 
     if initialized {
         return Ok(());

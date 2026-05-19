@@ -14,9 +14,8 @@ use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
-use crate::storage::{
-    ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
-};
+use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
+use crate::storage::{StorageContext, StorageRead, StorageReadScope};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
 use crate::version::{
@@ -43,28 +42,35 @@ pub(crate) enum SessionMode {
 /// commit or rollback, so all SQL during that window must run through the
 /// transaction handle.
 #[derive(Clone)]
-pub struct SessionContext {
+pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) mode: SessionMode,
-    pub(super) storage: StorageContext,
+    pub(super) storage: StorageContext<B>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
     closed: Arc<AtomicBool>,
     active_transaction: Arc<AtomicBool>,
 }
 
-impl SessionContext {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     pub(crate) async fn open_workspace(
-        storage: StorageContext,
+        storage: StorageContext<B>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -75,6 +81,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
         );
         session.active_version_id().await?;
         Ok(session)
@@ -82,13 +89,14 @@ impl SessionContext {
 
     pub(crate) async fn open(
         active_version_id: String,
-        storage: StorageContext,
+        storage: StorageContext<B>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -101,18 +109,20 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
         ))
     }
 
     pub(super) fn new(
         mode: SessionMode,
-        storage: StorageContext,
+        storage: StorageContext<B>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self::new_with_closed(
             mode,
@@ -123,6 +133,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -130,13 +141,14 @@ impl SessionContext {
 
     pub(super) fn new_with_closed(
         mode: SessionMode,
-        storage: StorageContext,
+        storage: StorageContext<B>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
         closed: Arc<AtomicBool>,
         active_transaction: Arc<AtomicBool>,
     ) -> Self {
@@ -149,6 +161,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            write_lock,
             closed,
             active_transaction,
         }
@@ -191,28 +204,20 @@ impl SessionContext {
     /// `lix_key_value` state so multiple open app sessions can observe the same
     /// active workspace version.
     pub async fn active_version_id(&self) -> Result<String, LixError> {
-        let mut transaction = self.storage.begin_read_transaction().await?;
-        let result = self
-            .active_version_id_from_reader(transaction.as_mut())
-            .await;
+        let transaction = self.storage.begin_read(StorageReadOptions::default())?;
+        let result = self.active_version_id_from_reader(&transaction).await;
         match result {
-            Ok(version_id) => {
-                transaction.rollback().await?;
-                Ok(version_id)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Ok(version_id) => Ok(version_id),
+            Err(error) => Err(error),
         }
     }
 
     pub(super) async fn active_version_id_from_reader<S>(
         &self,
-        reader: &mut S,
+        reader: &S,
     ) -> Result<String, LixError>
     where
-        S: StorageReader + ?Sized,
+        S: StorageRead + Send + Sync + ?Sized,
     {
         self.ensure_open()?;
         match &self.mode {
@@ -221,13 +226,13 @@ impl SessionContext {
         }
     }
 
-    async fn load_workspace_version_id<S>(&self, reader: &mut S) -> Result<String, LixError>
+    async fn load_workspace_version_id<S>(&self, reader: &S) -> Result<String, LixError>
     where
-        S: StorageReader + ?Sized,
+        S: StorageRead + Send + Sync + ?Sized,
     {
         let row = self
             .live_state
-            .reader(&mut *reader)
+            .reader(reader)
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -265,7 +270,7 @@ impl SessionContext {
             })?
             .to_string();
 
-        let version_ref = self.version_ctx.ref_reader(&mut *reader);
+        let version_ref = self.version_ctx.ref_reader(reader);
         VersionLifecycle::new(&version_ref)
             .require_existing_ref(
                 &version_id,
@@ -280,7 +285,7 @@ impl SessionContext {
     pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>
     where
         F: for<'tx> FnOnce(
-            &'tx mut Transaction,
+            &'tx mut Transaction<B>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
@@ -291,9 +296,10 @@ impl SessionContext {
     pub(crate) async fn with_write_transaction_reserved<T, F>(&self, f: F) -> Result<T, LixError>
     where
         F: for<'tx> FnOnce(
-            &'tx mut Transaction,
+            &'tx mut Transaction<B>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        let _write_guard = Arc::clone(&self.write_lock).lock_owned().await;
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -313,10 +319,7 @@ impl SessionContext {
                 transaction.commit(&runtime_functions).await?;
                 Ok(value)
             }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -353,10 +356,9 @@ impl Drop for SessionTransactionGuard {
 ///
 /// Write statements re-plan against `Transaction`; this context intentionally
 /// has no write stager.
-pub(super) struct SessionSqlExecutionContext<'a> {
+pub(super) struct SessionSqlExecutionContext<'a, R> {
     pub(super) active_version_id: &'a str,
-    pub(super) read_store:
-        ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>,
+    pub(super) read_store: StorageReadScope<R>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) commit_store: Arc<CommitStoreContext>,
@@ -365,7 +367,12 @@ pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) functions: FunctionProviderHandle,
 }
 
-impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
+impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
+where
+    R: crate::storage::StorageBackendRead + Clone + Send + Sync + 'static,
+{
+    type ReadStore = StorageReadScope<R>;
+
     fn active_version_id(&self) -> &str {
         self.active_version_id
     }
@@ -374,11 +381,10 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
     }
 
-    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
-        let read_scope = StorageReadScope::new(self.read_store.clone());
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
         CommitStoreQuerySource {
-            commit_store_reader: Arc::new(self.commit_store.reader(read_scope.store())),
-            json_reader: JsonStoreContext::new().reader(read_scope.store()),
+            commit_store_reader: Arc::new(self.commit_store.reader(self.read_store.store())),
+            json_reader: JsonStoreContext::new().reader(self.read_store.store()),
         }
     }
 

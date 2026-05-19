@@ -1,5 +1,6 @@
 use serde_json::{json, Value as JsonValue};
 
+use crate::storage::StorageBackend;
 use crate::transaction::types::TransactionWrite;
 use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
@@ -99,7 +100,12 @@ pub enum MergeVersionOutcome {
     MergeCommitted,
 }
 
-impl SessionContext {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Previews merging `source_version_id` into this session's active version
     /// without advancing refs, staging changes, or creating commits.
     pub async fn merge_version_preview(

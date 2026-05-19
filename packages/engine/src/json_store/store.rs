@@ -1,13 +1,19 @@
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::{JsonReadScopeRef, JsonRef};
-use crate::storage::{KvGetGroup, KvGetRequest, StorageReader};
+use crate::storage::{PointReadPlan, StorageRead, StorageSpace};
+use crate::storage::{StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId};
 use crate::LixError;
+use bytes::Bytes;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
 pub(crate) const JSON_PACK_NAMESPACE: &str = "json_store.pack";
+pub(crate) const JSON_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0002_0001), JSON_NAMESPACE);
+pub(crate) const JSON_PACK_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0002_0002), JSON_PACK_NAMESPACE);
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
 const STORED_JSON_HEADER_LEN: usize = STORED_JSON_MAGIC.len() + 1 + 8;
 const STORED_JSON_PACK_MAGIC: &[u8] = b"lix-json-pack:v2";
@@ -198,21 +204,13 @@ pub(crate) fn encode_json_str_for_storage_with_ref(
 }
 
 async fn load_json_bytes_direct(
-    store: &mut impl StorageReader,
+    store: &(impl StorageRead + ?Sized),
     json_ref: &JsonRef,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let result = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: JSON_NAMESPACE.to_string(),
-                keys: vec![json_ref.as_hash_bytes().to_vec()],
-            }],
-        })
-        .await?
-        .groups
+    let result = load_values(store, JSON_SPACE, vec![json_ref.as_hash_bytes().to_vec()])?
         .into_iter()
         .next()
-        .and_then(|group| group.single_value_owned());
+        .flatten();
     let Some(bytes) = result else {
         return Ok(None);
     };
@@ -222,7 +220,7 @@ async fn load_json_bytes_direct(
 }
 
 pub(crate) async fn load_json_bytes_many_in_scope(
-    store: &mut impl StorageReader,
+    store: &(impl StorageRead + ?Sized),
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef<'_>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
@@ -236,7 +234,7 @@ pub(crate) async fn load_json_bytes_many_in_scope(
 }
 
 pub(crate) async fn verify_json_bytes_many_in_scope(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef<'_>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
@@ -245,7 +243,7 @@ pub(crate) async fn verify_json_bytes_many_in_scope(
 }
 
 async fn load_json_bytes_many_in_scope_with_hash_check(
-    store: &mut impl StorageReader,
+    store: &(impl StorageRead + ?Sized),
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef<'_>,
     hash_check: JsonHashCheck,
@@ -326,40 +324,31 @@ async fn load_json_bytes_many_in_scope_with_hash_check(
         ));
     }
 
-    let result = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: JSON_NAMESPACE.to_string(),
-                keys: missing
-                    .iter()
-                    .map(|&index| unique_keys[index].clone())
-                    .collect(),
-            }],
-        })
-        .await?;
-    let group = result.groups.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "json_store batch load returned no result group",
-        )
-    })?;
-    if group.len() != missing.len() {
+    let loaded = load_values(
+        store,
+        JSON_SPACE,
+        missing
+            .iter()
+            .map(|&index| unique_keys[index].clone())
+            .collect(),
+    )?;
+    if loaded.len() != missing.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "json_store batch load returned {} values for {} requested refs",
-                group.len(),
+                loaded.len(),
                 missing.len()
             ),
         ));
     }
 
-    for (index, stored_bytes) in group.values_iter().enumerate() {
+    for (index, stored_bytes) in loaded.into_iter().enumerate() {
         let unique_index = missing[index];
         let Some(stored_bytes) = stored_bytes else {
             continue;
         };
-        let stored_payload = decode_stored_json_payload(stored_bytes)?;
+        let stored_payload = decode_stored_json_payload(&stored_bytes)?;
         let _ = store;
         unique_values[unique_index] = Some(decode_json_payload(
             &unique_refs[unique_index],
@@ -396,44 +385,35 @@ fn json_values_in_request_order(
 }
 
 async fn load_ordered_single_pack(
-    store: &mut impl StorageReader,
+    store: &(impl StorageRead + ?Sized),
     requested_refs: &[JsonRef],
     commit_id: &str,
     pack_id: u32,
     hash_check: JsonHashCheck,
 ) -> Result<OrderedSinglePackProbe, LixError> {
-    let result = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: JSON_PACK_NAMESPACE.to_string(),
-                keys: vec![pack_key(commit_id, pack_id)],
-            }],
-        })
-        .await?;
-    let group = result.groups.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "json_store ordered pack load returned no result group",
-        )
-    })?;
-    if group.len() != 1 {
+    let loaded = load_values(store, JSON_PACK_SPACE, vec![pack_key(commit_id, pack_id)])?;
+    if loaded.len() != 1 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "json_store ordered pack load returned {} values for 1 requested pack",
-                group.len()
+                loaded.len()
             ),
         ));
     }
-    let Some(stored_pack) = group.value(0).flatten() else {
+    let Some(stored_pack) = loaded.into_iter().next().flatten() else {
         return Ok(OrderedSinglePackProbe::MissAbsent);
     };
     let mut values = vec![None; requested_refs.len()];
-    if load_json_pack_values_in_request_order(stored_pack, hash_check, requested_refs, &mut values)?
-    {
+    if load_json_pack_values_in_request_order(
+        &stored_pack,
+        hash_check,
+        requested_refs,
+        &mut values,
+    )? {
         Ok(OrderedSinglePackProbe::Hit(values))
     } else {
-        Ok(OrderedSinglePackProbe::MissPresent(stored_pack.to_vec()))
+        Ok(OrderedSinglePackProbe::MissPresent(stored_pack))
     }
 }
 
@@ -456,7 +436,7 @@ fn load_from_single_pack_bytes(
 }
 
 async fn load_from_packs(
-    store: &mut impl StorageReader,
+    store: &(impl StorageRead + ?Sized),
     unique_refs: &[JsonRef],
     commit_id: &str,
     pack_ids: &[u32],
@@ -470,22 +450,9 @@ async fn load_from_packs(
         .iter()
         .map(|&pack_id| pack_key(commit_id, pack_id))
         .collect::<Vec<_>>();
-    let result = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: JSON_PACK_NAMESPACE.to_string(),
-                keys,
-            }],
-        })
-        .await?;
-    let group = result.groups.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "json_store pack load returned no result group",
-        )
-    })?;
-    if pack_ids.len() == 1 && group.len() == 1 {
-        if let Some(stored_pack) = group.value(0).flatten() {
+    let loaded = load_values(store, JSON_PACK_SPACE, keys)?;
+    if pack_ids.len() == 1 && loaded.len() == 1 {
+        if let Some(stored_pack) = loaded[0].as_deref() {
             if load_json_pack_values_in_request_order(
                 stored_pack,
                 hash_check,
@@ -502,10 +469,49 @@ async fn load_from_packs(
         .enumerate()
         .map(|(index, json_ref)| (*json_ref.as_hash_array(), index))
         .collect::<HashMap<_, _>>();
-    for stored_pack in group.values_iter().flatten() {
-        load_json_pack_values(stored_pack, hash_check, &wanted, &mut values)?;
+    for stored_pack in loaded.iter().flatten() {
+        load_json_pack_values(stored_pack.as_ref(), hash_check, &wanted, &mut values)?;
     }
     Ok(values)
+}
+
+fn load_values(
+    store: &(impl StorageRead + ?Sized),
+    space: StorageSpace,
+    keys: Vec<Vec<u8>>,
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    let keys = keys
+        .into_iter()
+        .map(|key| StorageKey(Bytes::from(key)))
+        .collect::<Vec<_>>();
+    let result =
+        PointReadPlan::new(space, &keys).materialize(store, StorageGetOptions::default())?;
+    Ok(result
+        .value
+        .into_iter()
+        .map(|value| match value {
+            Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+            Some(StorageProjectedValue::KeyOnly) | None => None,
+        })
+        .collect())
+}
+
+pub(crate) fn load_commit_pack_bytes(
+    store: &(impl StorageRead + ?Sized),
+    commit_id: &str,
+    pack_id: u32,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let mut values = load_values(store, JSON_PACK_SPACE, vec![pack_key(commit_id, pack_id)])?;
+    if values.len() != 1 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "json_store commit pack load returned {} values for 1 requested pack",
+                values.len()
+            ),
+        ));
+    }
+    Ok(values.pop().flatten())
 }
 
 fn encode_stored_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
@@ -760,41 +766,36 @@ fn json_pack_entry<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{StorageContext, StorageWriteSet};
+    use crate::storage::StorageContext;
+    use crate::storage::{
+        InMemoryStorageBackend, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
+    };
 
     #[tokio::test]
     async fn json_roundtrips_raw_payload() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let json = "{\"value\":\"small\"}";
         let encoded = encode_json(json).expect("json should encode");
         assert_eq!(encoded.codec, JsonCodec::Raw);
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         writes.put(
-            JSON_NAMESPACE,
-            encoded.json_ref.as_hash_bytes().to_vec(),
-            encode_stored_json_payload(&encoded),
+            JSON_SPACE,
+            StorageKey(Bytes::copy_from_slice(encoded.json_ref.as_hash_bytes())),
+            StorageValue {
+                bytes: Bytes::from(encode_stored_json_payload(&encoded)),
+            },
         );
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("json should store");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut store = storage.clone();
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_json_bytes_direct(&mut store, &encoded.json_ref)
+            load_json_bytes_direct(&store, &encoded.json_ref)
                 .await
                 .expect("json should load"),
             Some(json.as_bytes().to_vec())
@@ -803,37 +804,34 @@ mod tests {
 
     #[tokio::test]
     async fn json_batch_load_roundtrips_in_request_order() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
         let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         writes.put(
-            JSON_NAMESPACE,
-            first.json_ref.as_hash_bytes().to_vec(),
-            encode_stored_json_payload(&first),
+            JSON_SPACE,
+            StorageKey(Bytes::copy_from_slice(first.json_ref.as_hash_bytes())),
+            StorageValue {
+                bytes: Bytes::from(encode_stored_json_payload(&first)),
+            },
         );
         writes.put(
-            JSON_NAMESPACE,
-            second.json_ref.as_hash_bytes().to_vec(),
-            encode_stored_json_payload(&second),
+            JSON_SPACE,
+            StorageKey(Bytes::copy_from_slice(second.json_ref.as_hash_bytes())),
+            StorageValue {
+                bytes: Bytes::from(encode_stored_json_payload(&second)),
+            },
         );
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("json should store");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut store = storage.clone();
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let values = load_json_bytes_many_in_scope(
-            &mut store,
+            &store,
             &[second.json_ref, first.json_ref, second.json_ref],
             JsonReadScopeRef::OutOfBand,
         )
@@ -852,47 +850,35 @@ mod tests {
 
     #[tokio::test]
     async fn verified_batch_load_rejects_hash_mismatch() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let requested_ref = JsonRef::for_content(br#"{"value":"requested"}"#);
         let stored = encode_json("{\"value\":\"different\"}").expect("stored json should encode");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         writes.put(
-            JSON_NAMESPACE,
-            requested_ref.as_hash_bytes().to_vec(),
-            encode_stored_json_payload(&stored),
+            JSON_SPACE,
+            StorageKey(Bytes::copy_from_slice(requested_ref.as_hash_bytes())),
+            StorageValue {
+                bytes: Bytes::from(encode_stored_json_payload(&stored)),
+            },
         );
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("json should store");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
-        let mut store = storage.clone();
-        let trusted = load_json_bytes_many_in_scope(
-            &mut store,
-            &[requested_ref],
-            JsonReadScopeRef::OutOfBand,
-        )
-        .await
-        .expect("trusted hot read should not hash-check");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let trusted =
+            load_json_bytes_many_in_scope(&store, &[requested_ref], JsonReadScopeRef::OutOfBand)
+                .await
+                .expect("trusted hot read should not hash-check");
         assert_eq!(trusted, vec![Some(stored.data.as_ref().to_vec())]);
 
-        let mut store = storage.clone();
-        let error = verify_json_bytes_many_in_scope(
-            &mut store,
-            &[requested_ref],
-            JsonReadScopeRef::OutOfBand,
-        )
-        .await
-        .expect_err("verified read should reject mismatched content address");
+        let error =
+            verify_json_bytes_many_in_scope(&store, &[requested_ref], JsonReadScopeRef::OutOfBand)
+                .await
+                .expect_err("verified read should reject mismatched content address");
         assert!(
             error.to_string().contains("hash mismatch"),
             "error should mention hash mismatch: {error}"
@@ -901,35 +887,30 @@ mod tests {
 
     #[tokio::test]
     async fn verified_pack_load_checks_only_requested_entries() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let good = encode_json("{\"value\":\"good\"}").expect("good json should encode");
         let bad_ref = JsonRef::for_content(br#"{"value":"expected"}"#);
         let bad = encode_json_for_storage_with_ref("{\"value\":\"wrong\"}", bad_ref)
             .expect("bad json should encode with mismatched ref");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         writes.put(
-            JSON_PACK_NAMESPACE,
-            pack_key("commit-a", 0),
-            encode_json_pack(&[&good, &bad]).expect("pack should encode"),
+            JSON_PACK_SPACE,
+            StorageKey(Bytes::from(pack_key("commit-a", 0))),
+            StorageValue {
+                bytes: Bytes::from(encode_json_pack(&[&good, &bad]).expect("pack should encode")),
+            },
         );
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("json pack should store");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
         let pack_ids = [0];
-        let mut store = storage.clone();
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let good_values = verify_json_bytes_many_in_scope(
-            &mut store,
+            &store,
             &[good.json_ref],
             JsonReadScopeRef::CommitPacks {
                 commit_id: "commit-a",
@@ -940,9 +921,8 @@ mod tests {
         .expect("unrequested bad pack entry should not be decoded");
         assert_eq!(good_values, vec![Some(good.data.as_ref().to_vec())]);
 
-        let mut store = storage.clone();
         let error = verify_json_bytes_many_in_scope(
-            &mut store,
+            &store,
             &[bad_ref],
             JsonReadScopeRef::CommitPacks {
                 commit_id: "commit-a",
@@ -1018,33 +998,30 @@ mod tests {
 
     #[tokio::test]
     async fn pack_batch_load_falls_back_for_unordered_refs() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
         let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         writes.put(
-            JSON_PACK_NAMESPACE,
-            pack_key("commit-a", 0),
-            encode_json_pack(&[&first, &second]).expect("pack should encode"),
+            JSON_PACK_SPACE,
+            StorageKey(Bytes::from(pack_key("commit-a", 0))),
+            StorageValue {
+                bytes: Bytes::from(
+                    encode_json_pack(&[&first, &second]).expect("pack should encode"),
+                ),
+            },
         );
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("json pack should store");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
         let pack_ids = [0];
-        let mut store = storage.clone();
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let values = load_json_bytes_many_in_scope(
-            &mut store,
+            &store,
             &[second.json_ref, first.json_ref],
             JsonReadScopeRef::CommitPacks {
                 commit_id: "commit-a",
@@ -1064,38 +1041,35 @@ mod tests {
 
     #[tokio::test]
     async fn ordered_pack_probe_falls_back_to_direct_rows() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let packed = encode_json("{\"value\":\"packed\"}").expect("packed json should encode");
         let direct = encode_json("{\"value\":\"direct\"}").expect("direct json should encode");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         writes.put(
-            JSON_PACK_NAMESPACE,
-            pack_key("commit-a", 0),
-            encode_json_pack(&[&packed]).expect("pack should encode"),
+            JSON_PACK_SPACE,
+            StorageKey(Bytes::from(pack_key("commit-a", 0))),
+            StorageValue {
+                bytes: Bytes::from(encode_json_pack(&[&packed]).expect("pack should encode")),
+            },
         );
         writes.put(
-            JSON_NAMESPACE,
-            direct.json_ref.as_hash_bytes().to_vec(),
-            encode_stored_json_payload(&direct),
+            JSON_SPACE,
+            StorageKey(Bytes::copy_from_slice(direct.json_ref.as_hash_bytes())),
+            StorageValue {
+                bytes: Bytes::from(encode_stored_json_payload(&direct)),
+            },
         );
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("json rows should store");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("writes should commit");
 
         let pack_ids = [0];
-        let mut store = storage.clone();
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         let values = load_json_bytes_many_in_scope(
-            &mut store,
+            &store,
             &[direct.json_ref],
             JsonReadScopeRef::CommitPacks {
                 commit_id: "commit-a",

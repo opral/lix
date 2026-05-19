@@ -168,11 +168,9 @@ fn deterministic_key_value_row(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::backend::testing::UnitTestBackend;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
 
@@ -186,10 +184,13 @@ mod tests {
 
     #[tokio::test]
     async fn missing_mode_is_disabled() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        let reader = live_state.reader(storage.clone());
+        let reader = live_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
 
         let mode = load_mode(&reader)
             .await
@@ -200,8 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_mode_decodes_flags() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_version_head(storage.clone()).await;
         write_test_key_value(
@@ -214,7 +214,11 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(storage.clone());
+        let reader = live_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let mode = load_mode(&reader).await.expect("valid mode should decode");
 
         assert_eq!(
@@ -228,10 +232,13 @@ mod tests {
 
     #[tokio::test]
     async fn missing_sequence_is_uninitialized() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        let reader = live_state.reader(storage.clone());
+        let reader = live_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
 
         let sequence = load_sequence(&reader)
             .await
@@ -242,8 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_sequence_decodes_highest_seen() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_version_head(storage.clone()).await;
         write_test_key_value(
@@ -253,7 +259,11 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(storage.clone());
+        let reader = live_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let sequence = load_sequence(&reader)
             .await
             .expect("valid sequence should decode");
@@ -264,16 +274,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_sequence_persists_untracked_global_key_value() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
         crate::test_support::seed_global_version_head(storage.clone()).await;
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         stage_sequence(
             &mut writes,
             DeterministicSequence { highest_seen: 7 },
@@ -281,13 +286,15 @@ mod tests {
         )
         .await
         .expect("sequence should stage");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("sequence should apply");
-        tx.commit().await.expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("sequence should commit");
 
-        let reader = live_state.reader(storage.clone());
+        let reader = live_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
         let row = reader
             .load_row(&LiveStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
@@ -311,26 +318,20 @@ mod tests {
     }
 
     async fn write_test_key_value(storage: StorageContext, key: &str, value: JsonValue) {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         let snapshot_content = serde_json::to_string(&serde_json::json!({
             "key": key,
             "value": value,
         }))
         .expect("snapshot should serialize");
-        let mut writes = StorageWriteSet::new();
+        let mut writes = storage.new_write_set();
         let row = deterministic_key_value_row(key, &snapshot_content, "1970-01-01T00:00:00.000Z")
             .expect("test key-value should canonicalize");
         UntrackedStateContext::new()
             .writer(&mut writes)
             .stage_rows(std::iter::once(row.as_ref()))
             .expect("test key-value should stage");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("test key-value should apply");
-        tx.commit().await.expect("transaction should commit");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("test key-value should commit");
     }
 }
