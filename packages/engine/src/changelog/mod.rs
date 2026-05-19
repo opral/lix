@@ -16,6 +16,7 @@ mod segment;
 mod store;
 #[cfg(test)]
 mod test_support;
+mod truth;
 mod types;
 mod visibility;
 
