@@ -15,8 +15,9 @@ use super::types::{
     SegmentObjectLocationRef, StateRowIdentity,
 };
 use crate::changelog::{
-    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
-    decode_segment_change, decode_segment_commit, view_segment_directory,
+    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility,
+    decode_empty_index_value, decode_segment, decode_segment_change, decode_segment_commit,
+    view_segment_directory,
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::json_store::{self, JsonRef};
@@ -869,13 +870,19 @@ where
                 Vec::new(),
                 after,
                 256,
-                StorageCoreProjection::KeyOnly,
+                StorageCoreProjection::FullValue,
             )
             .await?;
         for index in 0..page.keys.len() {
             let Some(key) = page.keys.get(index) else {
                 continue;
             };
+            let Some(value) = page.value(index) else {
+                return Err(LixError::unknown(
+                    "changelog GC by_change_membership scan returned a key without a value",
+                ));
+            };
+            decode_empty_index_value(value)?;
             out.push(by_change_membership_ids_from_key(key)?);
         }
         let Some(next_after) = page.resume_after else {
@@ -1423,6 +1430,43 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn gc_errors_when_by_change_membership_value_is_corrupt() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+            by_change_membership_key("change-1", "commit-1"),
+            b"not empty".to_vec(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .collect_garbage(&[])
+                .await
+                .expect_err("GC must reject corrupt membership index values")
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("changelog empty index value must be zero bytes"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            writes.is_empty(),
+            "collect_garbage must stage no writes after index corruption"
+        );
     }
 
     #[tokio::test]
