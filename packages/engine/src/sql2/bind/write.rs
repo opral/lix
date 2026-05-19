@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
-
 use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef};
 use super::read::BoundRead;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::sql2::plan::version_scope::VersionScope;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundWrite {
@@ -53,7 +52,7 @@ pub(crate) enum BoundWriteOp {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundWriteInput {
-    Values(Vec<BoundInsertRow>),
+    Values(BoundInsertValues),
     Query {
         query: Box<BoundRead>,
         columns: Vec<BoundColumnRef>,
@@ -62,8 +61,17 @@ pub(crate) enum BoundWriteInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundInsertRow {
-    pub(crate) values: BTreeMap<BoundColumnRef, BoundExpr>,
+pub(crate) struct BoundInsertValues {
+    pub(crate) columns: Vec<BoundColumnRef>,
+    pub(crate) rows: Vec<Vec<BoundExpr>>,
+}
+
+impl BoundInsertValues {
+    pub(crate) fn column_index(&self, column_name: &str) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| column.name == column_name)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

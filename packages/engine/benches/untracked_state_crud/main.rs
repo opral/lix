@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -381,7 +382,6 @@ fn maybe_print_io_report(all_rows: &[PointerRow]) {
                 "insert_all_rows",
                 "select_all_rows",
                 "select_keys_only",
-                "select_headers_only",
                 "select_one_by_pk",
                 "select_all_by_pk",
                 "update_all_rows",
@@ -431,6 +431,32 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             BatchSize::LargeInput,
         )
     });
+    group.bench_function(
+        format!(
+            "insert_all_rows_unprepared_per_row/{}",
+            row_label(row_count)
+        ),
+        |b| {
+            b.iter_batched(
+                prepare_raw_sqlite_empty,
+                |fixture| black_box(raw_sqlite_insert_all_unprepared_per_row(fixture, &rows)),
+                BatchSize::LargeInput,
+            )
+        },
+    );
+    group.bench_function(
+        format!(
+            "insert_all_rows_unprepared_chunked/{}",
+            row_label(row_count)
+        ),
+        |b| {
+            b.iter_batched(
+                prepare_raw_sqlite_empty,
+                |fixture| black_box(raw_sqlite_insert_all_unprepared_chunked(fixture, &rows)),
+                BatchSize::LargeInput,
+            )
+        },
+    );
     group.bench_function(format!("select_all_rows/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
@@ -514,18 +540,6 @@ fn bench_lix_profile(
             BatchSize::LargeInput,
         )
     });
-    group.bench_function(
-        format!("select_headers_only/{}", row_label(rows.len())),
-        |b| {
-            b.iter_batched(
-                || prepare_lix_seeded(profile, rows),
-                |storage| {
-                    black_box(storage.select_all(rows.len(), StorageCoreProjection::FullValue))
-                },
-                BatchSize::LargeInput,
-            )
-        },
-    );
     group.bench_function(format!("select_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
@@ -621,7 +635,7 @@ where
         "insert_all_rows" => {
             lix_insert_all(&storage, rows);
         }
-        "select_all_rows" | "select_headers_only" => {
+        "select_all_rows" => {
             lix_select_all(&storage, rows.len(), StorageCoreProjection::FullValue);
             record_scan_result(&stats, rows, true);
         }
@@ -1047,6 +1061,13 @@ fn sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn optional_sql_string(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("'{}'", sql_string(value)),
+        None => "NULL".to_string(),
+    }
+}
+
 fn prepare_raw_sqlite_empty() -> RawSqliteFixture {
     let dir = TempDir::new().expect("create raw sqlite tempdir");
     let conn =
@@ -1116,6 +1137,85 @@ fn raw_sqlite_insert_all(
     fixture
 }
 
+fn raw_sqlite_insert_all_unprepared_per_row(
+    mut fixture: RawSqliteFixture,
+    rows: &[RawUntrackedRow],
+) -> RawSqliteFixture {
+    let tx = fixture
+        .conn
+        .transaction()
+        .expect("begin raw sqlite unprepared insert");
+    let mut affected = 0usize;
+    for row in rows {
+        let mut sql = String::from(
+            "
+            INSERT INTO untracked_state (
+                version_id, schema_key, entity_id, file_id, snapshot_content,
+                metadata, created_at, updated_at, global
+            )
+            VALUES ",
+        );
+        append_raw_sqlite_insert_values_tuple(&mut sql, row);
+        affected += tx
+            .execute(&sql, [])
+            .expect("execute raw sqlite unprepared insert");
+    }
+    assert_eq!(affected, rows.len());
+    tx.commit().expect("commit raw sqlite unprepared insert");
+    fixture
+}
+
+fn raw_sqlite_insert_all_unprepared_chunked(
+    mut fixture: RawSqliteFixture,
+    rows: &[RawUntrackedRow],
+) -> RawSqliteFixture {
+    let tx = fixture
+        .conn
+        .transaction()
+        .expect("begin raw sqlite chunked unprepared insert");
+    let mut affected = 0usize;
+    for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
+        let mut sql = String::from(
+            "
+            INSERT INTO untracked_state (
+                version_id, schema_key, entity_id, file_id, snapshot_content,
+                metadata, created_at, updated_at, global
+            )
+            VALUES ",
+        );
+        for (index, row) in chunk.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            append_raw_sqlite_insert_values_tuple(&mut sql, row);
+        }
+        affected += tx
+            .execute(&sql, [])
+            .expect("execute raw sqlite chunked unprepared insert");
+    }
+    assert_eq!(affected, rows.len());
+    tx.commit()
+        .expect("commit raw sqlite chunked unprepared insert");
+    fixture
+}
+
+fn append_raw_sqlite_insert_values_tuple(sql: &mut String, row: &RawUntrackedRow) {
+    write!(
+        sql,
+        "('{}', '{}', '{}', '{}', '{}', {}, '{}', '{}', {})",
+        sql_string(row.version_id.as_str()),
+        sql_string(row.schema_key.as_str()),
+        sql_string(row.entity_id.as_str()),
+        sql_string(row.file_id.as_str()),
+        sql_string(row.snapshot_content.as_str()),
+        optional_sql_string(row.metadata.as_deref()),
+        sql_string(row.created_at.as_str()),
+        sql_string(row.updated_at.as_str()),
+        row.global as i64,
+    )
+    .expect("write raw sqlite insert tuple SQL");
+}
+
 fn raw_sqlite_select_all(fixture: RawSqliteFixture, expected_rows: usize) -> usize {
     let mut statement = fixture
         .conn
@@ -1128,11 +1228,32 @@ fn raw_sqlite_select_all(fixture: RawSqliteFixture, expected_rows: usize) -> usi
             ",
         )
         .expect("prepare raw sqlite select all");
-    let count = statement
-        .query_map([], |_| Ok(()))
-        .expect("execute raw sqlite select all")
-        .count();
+    let mut rows = statement.query([]).expect("execute raw sqlite select all");
+    let mut count = 0;
+    let mut materialized_bytes = 0usize;
+    while let Some(row) = rows.next().expect("read raw sqlite row") {
+        let version_id: String = row.get(0).expect("read version_id");
+        let schema_key: String = row.get(1).expect("read schema_key");
+        let entity_id: String = row.get(2).expect("read entity_id");
+        let file_id: String = row.get(3).expect("read file_id");
+        let snapshot_content: String = row.get(4).expect("read snapshot_content");
+        let metadata: Option<String> = row.get(5).expect("read metadata");
+        let created_at: String = row.get(6).expect("read created_at");
+        let updated_at: String = row.get(7).expect("read updated_at");
+        let global: i64 = row.get(8).expect("read global");
+        materialized_bytes += version_id.len()
+            + schema_key.len()
+            + entity_id.len()
+            + file_id.len()
+            + snapshot_content.len()
+            + metadata.as_ref().map_or(0, String::len)
+            + created_at.len()
+            + updated_at.len()
+            + usize::from(global != 0);
+        count += 1;
+    }
     assert_eq!(count, expected_rows);
+    assert!(expected_rows == 0 || materialized_bytes > 0);
     count
 }
 
