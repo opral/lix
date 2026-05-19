@@ -13,14 +13,14 @@ use super::codec::{
 };
 use super::context::ChangelogContext;
 use super::segment::{
-    DecodedSegmentIndex, canonicalize_segment, directory_change_location,
-    directory_commit_location, validate_change_checksum, validate_commit_checksum,
-    validate_segment_shape,
+    canonicalize_segment, directory_change_location, directory_commit_location,
+    validate_change_checksum, validate_commit_checksum, validate_segment_shape,
+    DecodedSegmentIndex,
 };
 use super::store::{
-    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
     by_change_key, by_change_membership_commit_id_from_key, by_change_membership_key,
-    by_change_membership_prefix, by_commit_key, segment_key, segment_value,
+    by_change_membership_prefix, by_commit_key, segment_key, segment_value, BY_CHANGE_INDEX_SPACE,
+    BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
 };
 use super::types::{
     ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, CommitLoadRequest, CommitProjection,

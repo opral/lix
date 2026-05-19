@@ -12,8 +12,8 @@ use super::types::{
     MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentDirectory, SegmentObjectLocation,
     SegmentPayloadLocation, StateRowIdentity,
 };
-use crate::LixError;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
+use crate::LixError;
 
 pub(super) fn directory_commit_location(
     segment: &Segment,

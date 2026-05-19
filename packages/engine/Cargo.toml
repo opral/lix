@@ -35,6 +35,12 @@ path = "benches/untracked_state_crud/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "tracked_state_crud"
+path = "benches/tracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"
