@@ -12,7 +12,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
-use crate::sql2::bind::write::{BoundInsertRow, FileWriteSurface};
+use crate::sql2::bind::write::{BoundInsertValues, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
@@ -334,8 +334,8 @@ async fn insert_input_plan(
     params: &[Value],
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
     match &plan.bound.input {
-        BoundWriteInput::Values(rows) => {
-            insert_values_input_plan(session, schema, plan, params, rows).await
+        BoundWriteInput::Values(values) => {
+            insert_values_input_plan(session, schema, plan, params, values).await
         }
         BoundWriteInput::Query { query, columns } => {
             insert_query_input_plan(session, schema, query, columns, params).await
@@ -352,9 +352,9 @@ async fn insert_values_input_plan(
     schema: SchemaRef,
     plan: &LogicalWritePlan,
     params: &[Value],
-    rows: &[BoundInsertRow],
+    values: &BoundInsertValues,
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
-    if rows.is_empty() {
+    if values.rows.is_empty() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer cannot execute empty INSERT",
@@ -370,14 +370,29 @@ async fn insert_values_input_plan(
     let df_schema = std::sync::Arc::new(
         DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
     );
-    let values = rows
+    let field_source_indexes = schema
+        .fields()
+        .iter()
+        .map(|field| values.column_index(field.name()))
+        .collect::<Vec<_>>();
+    let rows = values
+        .rows
         .iter()
         .map(|row| {
             schema
                 .fields()
                 .iter()
-                .map(|field| {
-                    insert_field_expr(session, row, field.name(), field.data_type(), plan, params)
+                .zip(field_source_indexes.iter())
+                .map(|(field, source_index)| {
+                    insert_field_expr(
+                        session,
+                        row,
+                        *source_index,
+                        field.name(),
+                        field.data_type(),
+                        plan,
+                        params,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -385,9 +400,10 @@ async fn insert_values_input_plan(
     let projection = schema
         .fields()
         .iter()
+        .zip(field_source_indexes.iter())
         .enumerate()
-        .map(|(index, field)| {
-            let metadata = if insert_column_is_omitted(rows, field.name()) {
+        .map(|(index, (field, source_index))| {
+            let metadata = if source_index.is_none() {
                 Some(FieldMetadata::new(BTreeMap::from([(
                     LIX_INSERT_COLUMN_OMITTED_METADATA_KEY.to_string(),
                     "true".to_string(),
@@ -399,7 +415,7 @@ async fn insert_values_input_plan(
                 .alias_with_metadata(field.name(), metadata)
         })
         .collect::<Vec<_>>();
-    let logical_plan = LogicalPlanBuilder::values_with_schema(values, &df_schema)
+    let logical_plan = LogicalPlanBuilder::values_with_schema(rows, &df_schema)
         .map_err(datafusion_error_to_lix_error)?
         .project(projection)
         .map_err(datafusion_error_to_lix_error)?
@@ -490,9 +506,8 @@ async fn insert_query_input_plan(
         .map_err(datafusion_error_to_lix_error)
 }
 
-fn insert_column_is_omitted(rows: &[BoundInsertRow], field_name: &str) -> bool {
-    rows.iter()
-        .all(|row| row.values.keys().all(|column| column.name != field_name))
+fn insert_column_is_omitted(values: &BoundInsertValues, field_name: &str) -> bool {
+    values.column_index(field_name).is_none()
 }
 
 fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Result<(), LixError> {
@@ -505,13 +520,11 @@ fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Resu
     }
 
     match &plan.bound.input {
-        BoundWriteInput::Values(rows) => {
-            for row in rows {
-                let Some((_, expr)) = row.values.iter().find(|(column, _)| column.name == "data")
-                else {
-                    continue;
-                };
-                validate_lix_file_data_insert_expr(expr, params)?;
+        BoundWriteInput::Values(values) => {
+            if let Some(column_index) = values.column_index("data") {
+                for row in &values.rows {
+                    validate_lix_file_data_insert_expr(&row[column_index], params)?;
+                }
             }
             Ok(())
         }
@@ -540,8 +553,8 @@ fn validate_lix_file_data_insert_expr(expr: &BoundExpr, params: &[Value]) -> Res
 
 fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
     let mut omitted_insert_columns = BTreeSet::new();
-    if let BoundWriteInput::Values(rows) = &plan.bound.input {
-        if insert_column_is_omitted(rows, "data") {
+    if let BoundWriteInput::Values(values) = &plan.bound.input {
+        if insert_column_is_omitted(values, "data") {
             omitted_insert_columns.insert("data".to_string());
         }
     }
@@ -552,23 +565,22 @@ fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
 
 fn insert_field_expr(
     session: &SessionContext,
-    row: &BoundInsertRow,
+    row: &[BoundExpr],
+    source_index: Option<usize>,
     field_name: &str,
     data_type: &DataType,
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Expr, LixError> {
     if plan.bound.version_scope == VersionScope::Global && field_name == "global" {
-        let has_explicit_global = row.values.keys().any(|column| column.name == "global");
+        let has_explicit_global = source_index.is_some();
         if !has_explicit_global {
             return Ok(Expr::Literal(ScalarValue::Boolean(Some(true)), None));
         }
     }
 
-    row.values
-        .iter()
-        .find(|(column, _)| column.name == field_name)
-        .map(|(_, expr)| datafusion_expr_from_bound_expr(session, expr, params))
+    source_index
+        .map(|column_index| datafusion_expr_from_bound_expr(session, &row[column_index], params))
         .unwrap_or_else(|| {
             ScalarValue::try_new_null(data_type)
                 .map(|value| Expr::Literal(value, None))
@@ -2646,6 +2658,506 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_parameterized_global_version_defaults_global_true(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id\
+             ) VALUES (\
+             lix_json('[\"entity-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param\"}', $1\
+             )",
+            &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+        )
+        .await
+        .expect("parameterized global version should stage global row");
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-global-param\"]");
+        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert!(rows[0].global);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_parameterized_version_stays_non_global() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id\
+             ) VALUES (\
+             lix_json('[\"entity-version-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param\"}', $1\
+             )",
+            &[Value::Text("version-b".to_string())],
+        )
+        .await
+        .expect("parameterized non-global version should stage non-global row");
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-version-param\"]");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_parameterized_multi_version_global_false()
+    {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, global\
+             ) VALUES (\
+             lix_json('[\"entity-version-param-b\"]'), 'lix_key_value', '{\"key\":\"hello-b\",\"value\":\"version-b\"}', $1, false\
+             ), (\
+             lix_json('[\"entity-version-param-c\"]'), 'lix_key_value', '{\"key\":\"hello-c\",\"value\":\"version-c\"}', $2, false\
+             )",
+            &[
+                Value::Text("version-b".to_string()),
+                Value::Text("version-c".to_string()),
+            ],
+        )
+        .await
+        .expect("all-non-global parameterized versions should be accepted");
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.version_id == "version-b"));
+        assert!(rows.iter().any(|row| row.version_id == "version-c"));
+        assert!(rows.iter().all(|row| !row.global));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_parameterized_global_selector() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, global\
+             ) VALUES (\
+             lix_json('[\"entity-version-param-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param\"}', $1, $2\
+             )",
+            &[Value::Text("version-b".to_string()), Value::Boolean(false)],
+        )
+        .await
+        .expect("parameterized global=false selector should stage non-global row");
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_rejects_parameterized_global_null_global_version(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, global\
+             ) VALUES (\
+             lix_json('[\"entity-global-param-null\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param-null\"}', $1, $2\
+             )",
+            &[Value::Text(GLOBAL_VERSION_ID.to_string()), Value::Null],
+        )
+        .await
+        .expect_err("explicit parameterized NULL global selector should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error
+            .message
+            .contains("global selectors must be boolean parameters"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_rejects_parameterized_global_false_global_version(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, global\
+             ) VALUES (\
+             lix_json('[\"entity-global-param-false\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param-false\"}', $1, false\
+             )",
+            &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+        )
+        .await
+        .expect_err("global=false cannot target parameterized global version");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot combine global = false with global version_id"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_rejects_parameterized_global_true_non_global_version(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, global\
+             ) VALUES (\
+             lix_json('[\"entity-version-param-true\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param-true\"}', $1, true\
+             )",
+            &[Value::Text("version-b".to_string())],
+        )
+        .await
+        .expect_err("global=true cannot target parameterized non-global version");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot combine global = true with non-global version_id"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_by_version_rejects_parameterized_global_mixed_versions() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
+        version_b_row.version_id = "version-b".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
+                version_b_row,
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state_by_version \
+             SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
+             WHERE version_id IN ($1, $2) AND schema_key = 'lix_key_value'",
+            &[
+                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text("version-b".to_string()),
+            ],
+        )
+        .await
+        .expect_err("parameterized UPDATE should reject mixed global/non-global scopes");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot mix global and version-specific rows"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_by_version_rejects_parameterized_global_mixed_versions() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
+        version_b_row.version_id = "version-b".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
+                version_b_row,
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state_by_version \
+             WHERE version_id IN ($1, $2) AND schema_key = 'lix_key_value'",
+            &[
+                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text("version-b".to_string()),
+            ],
+        )
+        .await
+        .expect_err("parameterized DELETE should reject mixed global/non-global scopes");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot mix global and version-specific rows"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_by_version_parameterized_conjunctive_mismatch_is_noop() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
+        version_b_row.version_id = "version-b".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
+                version_b_row,
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state_by_version \
+             WHERE version_id = $1 AND version_id = $2 AND schema_key = 'lix_key_value'",
+            &[
+                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text("version-b".to_string()),
+            ],
+        )
+        .await
+        .expect("conjunctive parameterized version mismatch should be a no-op");
+
+        assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+        assert!(staged_writes
+            .lock()
+            .expect("staged writes lock")
+            .deltas
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_by_version_parameterized_null_version_is_noop() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![global_lix_state_row(
+                "entity-global",
+                Some("{\"source\":\"global\"}"),
+            )],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state_by_version \
+             WHERE version_id = $1 AND schema_key = 'lix_key_value'",
+            &[Value::Null],
+        )
+        .await
+        .expect("NULL parameterized version predicate should be a no-op");
+
+        assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+        assert!(staged_writes
+            .lock()
+            .expect("staged writes lock")
+            .deltas
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_by_version_rejects_parameterized_global_true_non_global_predicate(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
+        version_b_row.version_id = "version-b".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![version_b_row],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state_by_version \
+             SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
+             WHERE version_id = $1 AND global = true AND schema_key = 'lix_key_value'",
+            &[Value::Text("version-b".to_string())],
+        )
+        .await
+        .expect_err("global=true predicate cannot target parameterized non-global version");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot combine global = true with non-global version_id"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_by_version_rejects_parameterized_global_predicate_true_non_global_version(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
+        version_b_row.version_id = "version-b".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![version_b_row],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state_by_version \
+             SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
+             WHERE version_id = $1 AND global = $2 AND schema_key = 'lix_key_value'",
+            &[Value::Text("version-b".to_string()), Value::Boolean(true)],
+        )
+        .await
+        .expect_err("global=true parameter cannot target parameterized non-global version");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot combine global = true with non-global version_id"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_by_version_rejects_parameterized_global_false_global_predicate(
+    ) {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![global_lix_state_row(
+                "entity-global",
+                Some("{\"source\":\"global\"}"),
+            )],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state_by_version \
+             WHERE version_id = $1 AND global = false AND schema_key = 'lix_key_value'",
+            &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+        )
+        .await
+        .expect_err("global=false predicate cannot target parameterized global version");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error
+            .message
+            .contains("cannot combine global = false with global version_id"));
+    }
+
+    #[tokio::test]
     async fn execute_sql_insert_into_lix_state_defaults_global_and_untracked_to_false() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
@@ -3891,6 +4403,47 @@ mod tests {
                 .deltas
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_public_write_supports_only_supported_entity_shapes() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let supported_plan = create_write_logical_plan(
+            &mut ctx,
+            "UPDATE test_state_schema SET value = 'updated' WHERE value = 'A'",
+        )
+        .await
+        .expect("supported entity update should plan");
+        let crate::sql2::exec::SqlLogicalPlan::Write(supported_plan) = supported_plan else {
+            panic!("expected write plan");
+        };
+        assert!(
+            crate::sql2::exec::bound_public_write::supports_bound_public_write(
+                &supported_plan.plan
+            )
+        );
+
+        let mut unsupported_plan = supported_plan.plan.clone();
+        unsupported_plan.bound.op = crate::sql2::bind::write::BoundWriteOp::Insert;
+        assert!(
+            !crate::sql2::exec::bound_public_write::supports_bound_public_write(&unsupported_plan)
         );
     }
 

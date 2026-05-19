@@ -77,6 +77,7 @@ function initializeDatabase(db: Database): void {
 class BetterSqlite3Backend implements LixBackend {
 	readonly #db: Database;
 	readonly #registryKey: string | null;
+	#transactionMode: "read" | "write" | null = null;
 	#closed = false;
 
 	constructor(db: Database, registryKey: string | null) {
@@ -86,20 +87,29 @@ class BetterSqlite3Backend implements LixBackend {
 
 	beginReadTransaction(): LixBackendReadTransaction {
 		this.#ensureOpen();
-		if (this.#db.inTransaction) {
-			throw new Error("cannot open nested Lix backend transaction");
-		}
-		this.#db.exec("BEGIN DEFERRED");
-		return new BetterSqlite3Transaction(this.#db);
+		return new BetterSqlite3Transaction(this.#db, {
+			ownsTransaction: false,
+			writable: false,
+		});
 	}
 
 	beginWriteTransaction(): LixBackendWriteTransaction {
 		this.#ensureOpen();
 		if (this.#db.inTransaction) {
-			throw new Error("cannot open nested Lix backend transaction");
+			return new BetterSqlite3Transaction(this.#db, {
+				ownsTransaction: false,
+				writable: true,
+			});
 		}
 		this.#db.exec("BEGIN IMMEDIATE");
-		return new BetterSqlite3Transaction(this.#db);
+		this.#transactionMode = "write";
+		return new BetterSqlite3Transaction(this.#db, {
+			ownsTransaction: true,
+			writable: true,
+			onClose: () => {
+				this.#transactionMode = null;
+			},
+		});
 	}
 
 	close(): void {
@@ -123,10 +133,23 @@ class BetterSqlite3Backend implements LixBackend {
 
 class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 	readonly #db: Database;
+	readonly #ownsTransaction: boolean;
+	readonly #writable: boolean;
+	readonly #onClose: (() => void) | undefined;
 	#closed = false;
 
-	constructor(db: Database) {
+	constructor(
+		db: Database,
+		options: {
+			ownsTransaction: boolean;
+			writable: boolean;
+			onClose?: () => void;
+		},
+	) {
 		this.#db = db;
+		this.#ownsTransaction = options.ownsTransaction;
+		this.#writable = options.writable;
+		this.#onClose = options.onClose;
 	}
 
 	getValues(request: BackendKvGetRequest): BackendKvValueBatch {
@@ -169,21 +192,30 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 
 	writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats {
 		this.#ensureOpen();
+		if (!this.#writable) {
+			throw new Error("Lix backend transaction is read-only");
+		}
 		const stats: BackendKvWriteStats = {
 			puts: 0,
 			deletes: 0,
+			deleteRanges: 0,
 			bytesWritten: 0,
 		};
 		for (const group of batch.groups) {
-			for (const put of group.puts) {
-				stats.puts += 1;
-				stats.bytesWritten += put.key.length + put.value.length;
-				kvPut(this.#db, group.namespace, put.key, put.value);
-			}
-			for (const key of group.deletes) {
-				stats.deletes += 1;
-				stats.bytesWritten += key.length;
-				kvDelete(this.#db, group.namespace, key);
+			for (const op of group.ops) {
+				if (op.kind === "put") {
+					stats.puts += 1;
+					stats.bytesWritten += op.key.length + op.value.length;
+					kvPut(this.#db, group.namespace, op.key, op.value);
+				} else if (op.kind === "delete") {
+					stats.deletes += 1;
+					stats.bytesWritten += op.key.length;
+					kvDelete(this.#db, group.namespace, op.key);
+				} else {
+					stats.deleteRanges += 1;
+					stats.bytesWritten += deleteRangeBytes(op.range);
+					kvDeleteRange(this.#db, group.namespace, op.range);
+				}
 			}
 		}
 		return stats;
@@ -191,14 +223,26 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 
 	commit(): void {
 		this.#ensureOpen();
-		this.#db.exec("COMMIT");
-		this.#closed = true;
+		try {
+			if (this.#ownsTransaction) {
+				this.#db.exec("COMMIT");
+			}
+		} finally {
+			this.#closed = true;
+			this.#onClose?.();
+		}
 	}
 
 	rollback(): void {
 		this.#ensureOpen();
-		this.#db.exec("ROLLBACK");
-		this.#closed = true;
+		try {
+			if (this.#ownsTransaction) {
+				this.#db.exec("ROLLBACK");
+			}
+		} finally {
+			this.#closed = true;
+			this.#onClose?.();
+		}
 	}
 
 	#ensureOpen(): void {
@@ -296,6 +340,15 @@ function kvDelete(db: Database, namespace: string, key: Uint8Array): void {
 	);
 }
 
+function kvDeleteRange(
+	db: Database,
+	namespace: string,
+	range: BackendKvScanRange,
+): void {
+	const { clauses, params } = rangeClauses(namespace, range);
+	db.prepare(`DELETE FROM lix_kv WHERE ${clauses.join(" AND ")}`).run(...params);
+}
+
 function kvScan(
 	db: Database,
 	namespace: string,
@@ -319,6 +372,21 @@ function scanQuery(
 	range: BackendKvScanRange,
 	limit?: number | null,
 ): { sql: string; params: unknown[] } {
+	const { clauses, params } = rangeClauses(namespace, range);
+	let sql = `SELECT key, value FROM lix_kv WHERE ${clauses.join(
+		" AND ",
+	)} ORDER BY key`;
+	if (limit != null) {
+		sql += " LIMIT ?";
+		params.push(limit);
+	}
+	return { sql, params };
+}
+
+function rangeClauses(
+	namespace: string,
+	range: BackendKvScanRange,
+): { clauses: string[]; params: unknown[] } {
 	const params: unknown[] = [namespace];
 	const clauses = ["namespace = ?"];
 
@@ -335,14 +403,14 @@ function scanQuery(
 		params.push(sqliteBytes(range.start), sqliteBytes(range.end));
 	}
 
-	let sql = `SELECT key, value FROM lix_kv WHERE ${clauses.join(
-		" AND ",
-	)} ORDER BY key`;
-	if (limit != null) {
-		sql += " LIMIT ?";
-		params.push(limit);
+	return { clauses, params };
+}
+
+function deleteRangeBytes(range: BackendKvScanRange): number {
+	if (range.kind === "prefix") {
+		return range.prefix.length;
 	}
-	return { sql, params };
+	return range.start.length + range.end.length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
