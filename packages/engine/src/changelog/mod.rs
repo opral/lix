@@ -12,6 +12,7 @@ mod codec;
 mod commit;
 mod context;
 mod gc;
+mod graph;
 mod segment;
 mod store;
 #[cfg(test)]

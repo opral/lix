@@ -11,6 +11,7 @@ use super::by_change_membership_index::{
 use super::by_commit_index::{
     by_commit_entries_for_segment, by_commit_entries_for_segments, by_commit_entries_for_truth,
 };
+use super::graph::{CommitGraphLoader, SourceParentFacts};
 use super::segment::{
     DecodedSegmentIndex, canonicalize_segment, directory_change_location,
     directory_commit_location, segment_change, segment_commit, validate_change_checksum,
@@ -365,12 +366,6 @@ impl SegmentByteIndex {
             ))
         })
     }
-}
-
-#[derive(Default)]
-struct SourceParentFacts {
-    reachable_memberships: HashSet<String>,
-    first_parent_winners: HashMap<StateRowIdentity, String>,
 }
 
 impl<S> ChangelogStoreReader<S>
@@ -1423,6 +1418,39 @@ pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
     staged_visible_change_proofs: HashSet<String>,
 }
 
+struct ChangelogCommitGraphLoader<'writer, 'store, S: ?Sized> {
+    writer: &'writer mut ChangelogStoreWriter<'store, S>,
+    segment_commits: Option<&'writer HashMap<String, SegmentCommit>>,
+    allow_segment_truth_fallback: bool,
+}
+
+#[async_trait(?Send)]
+impl<S> CommitGraphLoader for ChangelogCommitGraphLoader<'_, '_, S>
+where
+    S: ChangelogStorageRead + ?Sized,
+{
+    async fn load_commit(&mut self, commit_id: &str) -> Result<Option<SegmentCommit>, LixError> {
+        if let Some(commit) = self
+            .segment_commits
+            .and_then(|commits| commits.get(commit_id))
+        {
+            return Ok(Some(commit.clone()));
+        }
+        if let Some(commit) = self
+            .writer
+            .load_published_or_staged_commit(commit_id)
+            .await?
+        {
+            return Ok(Some(commit));
+        }
+        if self.allow_segment_truth_fallback {
+            self.writer.find_segment_commit(commit_id).await
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl<S> ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + ?Sized,
@@ -1881,46 +1909,12 @@ where
         &mut self,
         root_commit_id: &str,
     ) -> Result<SourceParentFacts, LixError> {
-        let mut facts = SourceParentFacts::default();
-        let mut stack = vec![root_commit_id.to_string()];
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = stack.pop() {
-            if !visited.insert(commit_id.clone()) {
-                continue;
-            }
-            let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
-                continue;
-            };
-            facts.reachable_memberships.extend(
-                commit
-                    .body
-                    .membership
-                    .iter()
-                    .map(|membership| membership.member_change_id.clone()),
-            );
-            stack.extend(commit.header.parent_commit_ids);
-        }
-
-        let mut next_commit_id = Some(root_commit_id.to_string());
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = next_commit_id.take() {
-            if !visited.insert(commit_id.clone()) {
-                return Err(LixError::unknown(format!(
-                    "cannot resolve source parent facts because first-parent history contains parent cycle at commit '{commit_id}'"
-                )));
-            }
-            let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
-                break;
-            };
-            for (identity, change_id) in &commit.directory.state_row_identities {
-                facts
-                    .first_parent_winners
-                    .entry(identity.clone())
-                    .or_insert_with(|| change_id.clone());
-            }
-            next_commit_id = commit.header.parent_commit_ids.first().cloned();
-        }
-        Ok(facts)
+        let mut loader = ChangelogCommitGraphLoader {
+            writer: self,
+            segment_commits: None,
+            allow_segment_truth_fallback: false,
+        };
+        super::graph::source_parent_facts(&mut loader, root_commit_id).await
     }
 
     async fn source_parent_facts_in_segment(
@@ -1928,52 +1922,12 @@ where
         root_commit_id: &str,
         segment_commits: &HashMap<String, SegmentCommit>,
     ) -> Result<SourceParentFacts, LixError> {
-        let mut facts = SourceParentFacts::default();
-        let mut stack = vec![root_commit_id.to_string()];
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = stack.pop() {
-            if !visited.insert(commit_id.clone()) {
-                continue;
-            }
-            let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, Some(segment_commits))
-                .await?
-            else {
-                continue;
-            };
-            facts.reachable_memberships.extend(
-                commit
-                    .body
-                    .membership
-                    .iter()
-                    .map(|membership| membership.member_change_id.clone()),
-            );
-            stack.extend(commit.header.parent_commit_ids);
-        }
-
-        let mut next_commit_id = Some(root_commit_id.to_string());
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = next_commit_id.take() {
-            if !visited.insert(commit_id.clone()) {
-                return Err(LixError::unknown(format!(
-                    "cannot resolve source parent facts because first-parent history contains parent cycle at commit '{commit_id}'"
-                )));
-            }
-            let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, Some(segment_commits))
-                .await?
-            else {
-                break;
-            };
-            for (identity, change_id) in &commit.directory.state_row_identities {
-                facts
-                    .first_parent_winners
-                    .entry(identity.clone())
-                    .or_insert_with(|| change_id.clone());
-            }
-            next_commit_id = commit.header.parent_commit_ids.first().cloned();
-        }
-        Ok(facts)
+        let mut loader = ChangelogCommitGraphLoader {
+            writer: self,
+            segment_commits: Some(segment_commits),
+            allow_segment_truth_fallback: true,
+        };
+        super::graph::source_parent_facts(&mut loader, root_commit_id).await
     }
 
     async fn commit_history_contains_membership(
@@ -1981,7 +1935,12 @@ where
         root_commit_id: &str,
         change_id: &str,
     ) -> Result<bool, LixError> {
-        self.commit_history_contains_membership_with_loader(root_commit_id, change_id, None)
+        let mut loader = ChangelogCommitGraphLoader {
+            writer: self,
+            segment_commits: None,
+            allow_segment_truth_fallback: true,
+        };
+        super::graph::commit_history_contains_membership(&mut loader, root_commit_id, change_id)
             .await
     }
 
@@ -1996,43 +1955,13 @@ where
             .iter()
             .map(|commit| (commit.header.id.clone(), commit.clone()))
             .collect::<HashMap<_, _>>();
-        self.commit_history_contains_membership_with_loader(
-            root_commit_id,
-            change_id,
-            Some(&segment_commits),
-        )
-        .await
-    }
-
-    async fn commit_history_contains_membership_with_loader(
-        &mut self,
-        root_commit_id: &str,
-        change_id: &str,
-        segment_commits: Option<&HashMap<String, SegmentCommit>>,
-    ) -> Result<bool, LixError> {
-        let mut stack = vec![root_commit_id.to_string()];
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = stack.pop() {
-            if !visited.insert(commit_id.clone()) {
-                continue;
-            }
-            let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, segment_commits)
-                .await?
-            else {
-                continue;
-            };
-            if commit
-                .body
-                .membership
-                .iter()
-                .any(|membership| membership.member_change_id == change_id)
-            {
-                return Ok(true);
-            }
-            stack.extend(commit.header.parent_commit_ids);
-        }
-        Ok(false)
+        let mut loader = ChangelogCommitGraphLoader {
+            writer: self,
+            segment_commits: Some(&segment_commits),
+            allow_segment_truth_fallback: true,
+        };
+        super::graph::commit_history_contains_membership(&mut loader, root_commit_id, change_id)
+            .await
     }
 
     async fn commit_history_projects_state_row(
@@ -2041,11 +1970,16 @@ where
         identity: &StateRowIdentity,
         change_id: &str,
     ) -> Result<bool, LixError> {
-        self.commit_history_projects_state_row_with_loader(
+        let mut loader = ChangelogCommitGraphLoader {
+            writer: self,
+            segment_commits: None,
+            allow_segment_truth_fallback: true,
+        };
+        super::graph::commit_history_projects_state_row(
+            &mut loader,
             root_commit_id,
             identity,
             change_id,
-            None,
         )
         .await
     }
@@ -2062,62 +1996,18 @@ where
             .iter()
             .map(|commit| (commit.header.id.clone(), commit.clone()))
             .collect::<HashMap<_, _>>();
-        self.commit_history_projects_state_row_with_loader(
+        let mut loader = ChangelogCommitGraphLoader {
+            writer: self,
+            segment_commits: Some(&segment_commits),
+            allow_segment_truth_fallback: true,
+        };
+        super::graph::commit_history_projects_state_row(
+            &mut loader,
             root_commit_id,
             identity,
             change_id,
-            Some(&segment_commits),
         )
         .await
-    }
-
-    async fn commit_history_projects_state_row_with_loader(
-        &mut self,
-        root_commit_id: &str,
-        identity: &StateRowIdentity,
-        change_id: &str,
-        segment_commits: Option<&HashMap<String, SegmentCommit>>,
-    ) -> Result<bool, LixError> {
-        let mut next_commit_id = Some(root_commit_id.to_string());
-        let mut visited = HashSet::new();
-        while let Some(commit_id) = next_commit_id.take() {
-            if !visited.insert(commit_id.clone()) {
-                return Err(LixError::unknown(format!(
-                    "cannot resolve StateRowIdentity winner for {:?} because first-parent history contains cycle at commit '{}'",
-                    identity, commit_id
-                )));
-            }
-            let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, segment_commits)
-                .await?
-            else {
-                return Ok(false);
-            };
-            if let Some((_, winner_change_id)) = commit
-                .directory
-                .state_row_identities
-                .iter()
-                .find(|(candidate, _)| candidate == identity)
-            {
-                return Ok(winner_change_id == change_id);
-            }
-            next_commit_id = commit.header.parent_commit_ids.first().cloned();
-        }
-        Ok(false)
-    }
-
-    async fn load_published_staged_or_segment_commit(
-        &mut self,
-        commit_id: &str,
-        segment_commits: Option<&HashMap<String, SegmentCommit>>,
-    ) -> Result<Option<SegmentCommit>, LixError> {
-        if let Some(commit) = segment_commits.and_then(|commits| commits.get(commit_id)) {
-            return Ok(Some(commit.clone()));
-        }
-        if let Some(commit) = self.load_published_or_staged_commit(commit_id).await? {
-            return Ok(Some(commit));
-        }
-        self.find_segment_commit(commit_id).await
     }
 
     async fn load_published_or_staged_commit(
