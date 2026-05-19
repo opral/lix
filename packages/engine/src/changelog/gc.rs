@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::context::ChangelogStorageRead;
-use super::segment::{validate_change_checksum, validate_commit_checksum, validate_segment_shape};
+use super::segment::{
+    directory_change_location, directory_commit_location, validate_change_checksum,
+    validate_commit_checksum, validate_segment_shape,
+};
 use super::store::{
     BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
     COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE, by_change_index_value,
@@ -11,13 +14,12 @@ use super::store::{
 };
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet,
-    MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
-    SegmentObjectLocationRef, StateRowIdentity,
+    MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation, StateRowIdentity,
 };
 use crate::LixError;
 use crate::changelog::{
-    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
-    decode_segment_change, decode_segment_commit, view_segment_directory,
+    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility,
+    decode_empty_index_value, decode_segment,
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::json_store::{self, JsonRef};
@@ -27,16 +29,13 @@ pub(super) async fn plan_gc<S>(store: &mut S, roots: &[GcRoot]) -> Result<GcPlan
 where
     S: ChangelogStorageRead + ?Sized,
 {
-    let all_segment_ids = scan_segment_ids(store).await?;
+    let truth = load_segment_truth_index(store).await?;
     let all_commit_visibility = scan_utf8_keys(store, COMMIT_VISIBILITY_SPACE).await?;
     let all_by_commit = scan_utf8_keys(store, BY_COMMIT_INDEX_SPACE).await?;
     let all_by_change = scan_utf8_keys(store, BY_CHANGE_INDEX_SPACE).await?;
-    let all_by_change_membership = scan_by_change_membership_keys(store).await?;
+    let all_by_change_membership = scan_by_change_membership_entries(store).await?;
     let all_visible_change_proof = scan_utf8_keys(store, VISIBLE_CHANGE_PROOF_SPACE).await?;
     let all_json_payloads = scan_json_payload_keys(store).await?;
-    if roots.is_empty() {
-        validate_all_segments(store).await?;
-    }
 
     let mut live = GcLiveSet::default();
     let mut pending_commits = Vec::new();
@@ -44,7 +43,6 @@ where
         pending_commits.push(gc_root_commit_id(root).to_string());
     }
 
-    let mut segment_bytes = HashMap::<String, Vec<u8>>::new();
     let mut commit_index: HashMap<String, (SegmentObjectLocation, SegmentCommit)> = HashMap::new();
     let mut change_index: HashMap<String, (SegmentObjectLocation, SegmentChange)> = HashMap::new();
     let mut source_parent_facts = HashMap::<String, GcSourceParentFacts>::new();
@@ -54,9 +52,7 @@ where
         if live.commits.contains(&commit_id) {
             continue;
         }
-        let Some((commit_location, commit)) =
-            load_gc_commit(store, &all_segment_ids, &mut segment_bytes, &commit_id).await?
-        else {
+        let Some((commit_location, commit)) = truth.commits.get(&commit_id).cloned() else {
             return Err(LixError::unknown(format!(
                 "changelog GC root/ancestor commit '{commit_id}' was not found in changelog segments"
             )));
@@ -81,9 +77,7 @@ where
 
         for membership in &commit.body.membership {
             let change_id = &membership.member_change_id;
-            let Some((change_location, change)) =
-                load_gc_change(store, &all_segment_ids, &mut segment_bytes, change_id).await?
-            else {
+            let Some((change_location, change)) = truth.changes.get(change_id).cloned() else {
                 return Err(LixError::unknown(format!(
                     "changelog GC live commit '{}' references missing change '{}'",
                     commit.header.id, change_id
@@ -114,7 +108,6 @@ where
             &mut checked_commits,
         )?;
     }
-    validate_live_segments(&segment_bytes, &live.segments)?;
     validate_gc_adopted_memberships(&commit_index, &change_index, &mut source_parent_facts)?;
 
     let live_commits: HashSet<_> = live.commits.iter().cloned().collect();
@@ -187,8 +180,21 @@ where
         }
     }
 
+    for membership in &live_memberships {
+        let Some(value) = all_by_change_membership.get(membership) else {
+            continue;
+        };
+        decode_empty_index_value(value).map_err(|error| {
+            LixError::unknown(format!(
+                "changelog GC live by_change_membership entry for change '{}' commit '{}' is corrupt: {error}",
+                membership.0, membership.1
+            ))
+        })?;
+    }
+
     let sweep = GcSweepSet {
-        segments: all_segment_ids
+        segments: truth
+            .segment_ids
             .into_iter()
             .filter(|segment_id| !live.segments.contains(segment_id))
             .collect(),
@@ -209,8 +215,9 @@ where
             .filter(|change_id| !live_changes.contains(change_id))
             .collect(),
         by_change_membership: all_by_change_membership
-            .into_iter()
-            .filter(|membership| !live_memberships.contains(membership))
+            .keys()
+            .filter(|membership| !live_memberships.contains(*membership))
+            .cloned()
             .collect(),
         visible_change_proof: all_visible_change_proof
             .into_iter()
@@ -242,6 +249,94 @@ where
         roots: roots.to_vec(),
         live,
         sweep,
+    })
+}
+
+struct SegmentTruthIndex {
+    segment_ids: Vec<String>,
+    commits: HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
+    changes: HashMap<String, (SegmentObjectLocation, SegmentChange)>,
+}
+
+async fn load_segment_truth_index<S>(store: &mut S) -> Result<SegmentTruthIndex, LixError>
+where
+    S: ChangelogStorageRead + ?Sized,
+{
+    let mut after = None;
+    let mut segment_ids = Vec::new();
+    let mut commits = HashMap::new();
+    let mut changes = HashMap::new();
+    loop {
+        let page = store
+            .changelog_scan(
+                SEGMENT_SPACE,
+                Vec::new(),
+                after,
+                64,
+                StorageCoreProjection::FullValue,
+            )
+            .await?;
+        for index in 0..page.len() {
+            let Some(key) = page.key(index) else {
+                continue;
+            };
+            let segment_id = std::str::from_utf8(key)
+                .map_err(|error| {
+                    LixError::unknown(format!(
+                        "changelog GC found invalid UTF-8 segment key: {error}"
+                    ))
+                })?
+                .to_string();
+            let Some(bytes) = page.value(index) else {
+                return Err(LixError::unknown(format!(
+                    "changelog GC segment '{segment_id}' scan returned key without value"
+                )));
+            };
+            let segment = decode_segment(bytes)?;
+            validate_segment_shape(&segment)?;
+            if segment.header.segment_id != segment_id {
+                return Err(LixError::unknown(format!(
+                    "changelog GC segment key '{segment_id}' contains segment '{}'",
+                    segment.header.segment_id
+                )));
+            }
+            push_unique(&mut segment_ids, segment_id);
+            for commit in &segment.commits {
+                let location = directory_commit_location(&segment, &commit.header.id)?;
+                validate_commit_checksum(&location.checksum, &commit.header.id, commit)?;
+                if commits
+                    .insert(commit.header.id.clone(), (location, commit.clone()))
+                    .is_some()
+                {
+                    return Err(LixError::unknown(format!(
+                        "changelog GC found duplicate commit id '{}'",
+                        commit.header.id
+                    )));
+                }
+            }
+            for change in &segment.changes {
+                let location = directory_change_location(&segment, &change.id)?;
+                validate_change_checksum(&location.checksum, &change.id, change)?;
+                if changes
+                    .insert(change.id.clone(), (location, change.clone()))
+                    .is_some()
+                {
+                    return Err(LixError::unknown(format!(
+                        "changelog GC found duplicate change id '{}'",
+                        change.id
+                    )));
+                }
+            }
+        }
+        let Some(next_after) = page.resume_after else {
+            break;
+        };
+        after = Some(next_after);
+    }
+    Ok(SegmentTruthIndex {
+        segment_ids,
+        commits,
+        changes,
     })
 }
 
@@ -382,364 +477,6 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
     Ok(())
 }
 
-async fn scan_segment_ids<S>(store: &mut S) -> Result<Vec<String>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let mut after = None;
-    let mut segment_ids = Vec::new();
-    loop {
-        let page = store
-            .changelog_scan(
-                SEGMENT_SPACE,
-                Vec::new(),
-                after,
-                64,
-                StorageCoreProjection::KeyOnly,
-            )
-            .await?;
-        for key in &page.keys {
-            let segment_id = std::str::from_utf8(key)
-                .map_err(|error| {
-                    LixError::unknown(format!(
-                        "changelog GC found invalid UTF-8 segment key: {error}"
-                    ))
-                })?
-                .to_string();
-            if !segment_ids.iter().any(|existing| existing == &segment_id) {
-                segment_ids.push(segment_id);
-            }
-        }
-        let Some(next_after) = page.resume_after else {
-            break;
-        };
-        after = Some(next_after);
-    }
-    Ok(segment_ids)
-}
-
-async fn validate_all_segments<S>(store: &mut S) -> Result<(), LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let mut after = None;
-    loop {
-        let page = store
-            .changelog_scan(
-                SEGMENT_SPACE,
-                Vec::new(),
-                after,
-                64,
-                StorageCoreProjection::FullValue,
-            )
-            .await?;
-        for index in 0..page.len() {
-            let Some(bytes) = page.value(index) else {
-                continue;
-            };
-            let segment = decode_segment(bytes)?;
-            validate_segment_shape(&segment)?;
-        }
-        let Some(next_after) = page.resume_after else {
-            break;
-        };
-        after = Some(next_after);
-    }
-    Ok(())
-}
-
-fn validate_live_segments(
-    segment_bytes: &HashMap<String, Vec<u8>>,
-    live_segment_ids: &[String],
-) -> Result<(), LixError> {
-    for segment_id in live_segment_ids {
-        let Some(bytes) = segment_bytes.get(segment_id) else {
-            return Err(LixError::unknown(format!(
-                "changelog GC live segment '{segment_id}' was not loaded"
-            )));
-        };
-        let segment = decode_segment(bytes)?;
-        validate_segment_shape(&segment)?;
-    }
-    Ok(())
-}
-
-async fn load_gc_commit<S>(
-    store: &mut S,
-    all_segment_ids: &[String],
-    segment_bytes: &mut HashMap<String, Vec<u8>>,
-    commit_id: &str,
-) -> Result<Option<(SegmentObjectLocation, SegmentCommit)>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    scan_segments_for_commit(store, all_segment_ids, segment_bytes, commit_id).await
-}
-
-async fn load_gc_change<S>(
-    store: &mut S,
-    all_segment_ids: &[String],
-    segment_bytes: &mut HashMap<String, Vec<u8>>,
-    change_id: &str,
-) -> Result<Option<(SegmentObjectLocation, SegmentChange)>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    scan_segments_for_change(store, all_segment_ids, segment_bytes, change_id).await
-}
-
-async fn load_by_commit_entry<S>(
-    store: &mut S,
-    commit_id: &str,
-) -> Result<Option<ByCommitEntry>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let Some(bytes) = store
-        .changelog_get_many(BY_COMMIT_INDEX_SPACE, vec![by_commit_key(commit_id)])
-        .await?
-        .into_iter()
-        .next()
-        .flatten()
-    else {
-        return Ok(None);
-    };
-    let entry = decode_by_commit_entry(&bytes)?;
-    if entry.commit_id != commit_id {
-        return Err(LixError::unknown(format!(
-            "by_commit key for '{commit_id}' contains commit_id '{}'",
-            entry.commit_id
-        )));
-    }
-    Ok(Some(entry))
-}
-
-async fn load_by_change_entry<S>(
-    store: &mut S,
-    change_id: &str,
-) -> Result<Option<ByChangeEntry>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let Some(bytes) = store
-        .changelog_get_many(BY_CHANGE_INDEX_SPACE, vec![by_change_key(change_id)])
-        .await?
-        .into_iter()
-        .next()
-        .flatten()
-    else {
-        return Ok(None);
-    };
-    let entry = decode_by_change_entry(&bytes)?;
-    if entry.change_id != change_id {
-        return Err(LixError::unknown(format!(
-            "by_change key for '{change_id}' contains change_id '{}'",
-            entry.change_id
-        )));
-    }
-    Ok(Some(entry))
-}
-
-async fn ensure_segment_bytes<S>(
-    store: &mut S,
-    segment_bytes: &mut HashMap<String, Vec<u8>>,
-    segment_id: &str,
-) -> Result<bool, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    if segment_bytes.contains_key(segment_id) {
-        return Ok(true);
-    }
-    let Some(bytes) = store
-        .changelog_get_many(SEGMENT_SPACE, vec![segment_key(segment_id)])
-        .await?
-        .into_iter()
-        .next()
-        .flatten()
-    else {
-        return Ok(false);
-    };
-    segment_bytes.insert(segment_id.to_string(), bytes);
-    Ok(true)
-}
-
-async fn scan_segments_for_commit<S>(
-    store: &mut S,
-    all_segment_ids: &[String],
-    segment_bytes: &mut HashMap<String, Vec<u8>>,
-    commit_id: &str,
-) -> Result<Option<(SegmentObjectLocation, SegmentCommit)>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let mut found = None;
-    for segment_id in all_segment_ids {
-        if !ensure_segment_bytes(store, segment_bytes, segment_id).await? {
-            continue;
-        }
-        let bytes = &segment_bytes[segment_id];
-        let view = view_segment_directory(bytes)?;
-        let Some(entry) = view
-            .directory_commits
-            .iter()
-            .find(|entry| entry.id == commit_id)
-        else {
-            continue;
-        };
-        let location = location_from_ref(entry.location);
-        let commit =
-            decode_commit_from_segment_bytes(bytes, &location, commit_id)?.ok_or_else(|| {
-                LixError::unknown(format!(
-                    "changelog GC commit '{commit_id}' disappeared from segment directory"
-                ))
-            })?;
-        if found.replace((location, commit)).is_some() {
-            return Err(LixError::unknown(format!(
-                "changelog GC found duplicate commit id '{commit_id}'"
-            )));
-        }
-    }
-    Ok(found)
-}
-
-async fn scan_segments_for_change<S>(
-    store: &mut S,
-    all_segment_ids: &[String],
-    segment_bytes: &mut HashMap<String, Vec<u8>>,
-    change_id: &str,
-) -> Result<Option<(SegmentObjectLocation, SegmentChange)>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let mut found = None;
-    for segment_id in all_segment_ids {
-        if !ensure_segment_bytes(store, segment_bytes, segment_id).await? {
-            continue;
-        }
-        let bytes = &segment_bytes[segment_id];
-        let view = view_segment_directory(bytes)?;
-        let Some(entry) = view
-            .directory_changes
-            .iter()
-            .find(|entry| entry.id == change_id)
-        else {
-            continue;
-        };
-        let location = location_from_ref(entry.location);
-        let change =
-            decode_change_from_segment_bytes(bytes, &location, change_id)?.ok_or_else(|| {
-                LixError::unknown(format!(
-                    "changelog GC change '{change_id}' disappeared from segment directory"
-                ))
-            })?;
-        if found.replace((location, change)).is_some() {
-            return Err(LixError::unknown(format!(
-                "changelog GC found duplicate change id '{change_id}'"
-            )));
-        }
-    }
-    Ok(found)
-}
-
-fn decode_commit_from_segment_bytes(
-    bytes: &[u8],
-    location: &SegmentObjectLocation,
-    commit_id: &str,
-) -> Result<Option<SegmentCommit>, LixError> {
-    let view = view_segment_directory(bytes)?;
-    let Some(entry) = view
-        .directory_commits
-        .iter()
-        .find(|entry| entry.id == commit_id)
-    else {
-        return Ok(None);
-    };
-    if location_from_ref(entry.location) != *location {
-        return Ok(None);
-    }
-    let object = segment_object_bytes(bytes, view.segment_id, location, "commit", commit_id)?;
-    let commit = decode_segment_commit(object)?;
-    if commit.header.id != commit_id {
-        return Err(LixError::unknown(format!(
-            "changelog GC commit locator for '{commit_id}' decoded commit '{}'",
-            commit.header.id
-        )));
-    }
-    validate_commit_checksum(&location.checksum, commit_id, &commit)?;
-    Ok(Some(commit))
-}
-
-fn decode_change_from_segment_bytes(
-    bytes: &[u8],
-    location: &SegmentObjectLocation,
-    change_id: &str,
-) -> Result<Option<SegmentChange>, LixError> {
-    let view = view_segment_directory(bytes)?;
-    let Some(entry) = view
-        .directory_changes
-        .iter()
-        .find(|entry| entry.id == change_id)
-    else {
-        return Ok(None);
-    };
-    if location_from_ref(entry.location) != *location {
-        return Ok(None);
-    }
-    let object = segment_object_bytes(bytes, view.segment_id, location, "change", change_id)?;
-    let change = decode_segment_change(object)?;
-    if change.id != change_id {
-        return Err(LixError::unknown(format!(
-            "changelog GC change locator for '{change_id}' decoded change '{}'",
-            change.id
-        )));
-    }
-    validate_change_checksum(&location.checksum, change_id, &change)?;
-    Ok(Some(change))
-}
-
-fn segment_object_bytes<'a>(
-    bytes: &'a [u8],
-    segment_id: &str,
-    location: &SegmentObjectLocation,
-    kind: &str,
-    id: &str,
-) -> Result<&'a [u8], LixError> {
-    if location.segment_id != segment_id {
-        return Err(LixError::unknown(format!(
-            "changelog GC {kind} '{id}' locator points to segment '{}' but loaded '{}'",
-            location.segment_id, segment_id
-        )));
-    }
-    let start = usize::try_from(location.offset).map_err(|_| {
-        LixError::unknown(format!(
-            "changelog GC {kind} '{id}' offset does not fit in usize"
-        ))
-    })?;
-    let len = usize::try_from(location.len).map_err(|_| {
-        LixError::unknown(format!(
-            "changelog GC {kind} '{id}' length does not fit in usize"
-        ))
-    })?;
-    let end = start.checked_add(len).ok_or_else(|| {
-        LixError::unknown(format!("changelog GC {kind} '{id}' offset/len overflows"))
-    })?;
-    bytes.get(start..end).ok_or_else(|| {
-        LixError::unknown(format!(
-            "changelog GC {kind} '{id}' locator is out of bounds"
-        ))
-    })
-}
-
-fn location_from_ref(location: SegmentObjectLocationRef<'_>) -> SegmentObjectLocation {
-    SegmentObjectLocation {
-        segment_id: location.segment_id.to_string(),
-        offset: location.offset,
-        len: location.len,
-        checksum: location.checksum.to_string(),
-    }
-}
-
 fn validate_gc_adopted_memberships(
     commit_index: &HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
     change_index: &HashMap<String, (SegmentObjectLocation, SegmentChange)>,
@@ -850,12 +587,14 @@ where
     Ok(out)
 }
 
-async fn scan_by_change_membership_keys<S>(store: &mut S) -> Result<Vec<(String, String)>, LixError>
+async fn scan_by_change_membership_entries<S>(
+    store: &mut S,
+) -> Result<HashMap<(String, String), Vec<u8>>, LixError>
 where
     S: ChangelogStorageRead + ?Sized,
 {
     let mut after = None;
-    let mut out = Vec::new();
+    let mut out = HashMap::new();
     loop {
         let page = store
             .changelog_scan(
@@ -863,14 +602,19 @@ where
                 Vec::new(),
                 after,
                 256,
-                StorageCoreProjection::KeyOnly,
+                StorageCoreProjection::FullValue,
             )
             .await?;
-        for index in 0..page.keys.len() {
-            let Some(key) = page.keys.get(index) else {
+        for index in 0..page.len() {
+            let Some(key) = page.key(index) else {
                 continue;
             };
-            out.push(by_change_membership_ids_from_key(key)?);
+            let Some(value) = page.value(index) else {
+                return Err(LixError::unknown(
+                    "changelog GC by_change_membership scan returned key without value".to_string(),
+                ));
+            };
+            out.insert(by_change_membership_ids_from_key(key)?, value.to_vec());
         }
         let Some(next_after) = page.resume_after else {
             break;
@@ -1058,9 +802,8 @@ where
         let Some(bytes) = value else {
             continue;
         };
-        if let Ok(proof) = decode_commit_visibility(&bytes) {
-            out.insert(change_id.clone(), proof);
-        }
+        let proof = decode_commit_visibility(&bytes)?;
+        out.insert(change_id.clone(), proof);
     }
     Ok(out)
 }
@@ -1086,11 +829,14 @@ where
         let Some(bytes) = value else {
             continue;
         };
-        if let Ok(visibility) = decode_commit_visibility(&bytes) {
-            if visibility.commit_id == *commit_id {
-                out.insert(commit_id.clone(), visibility);
-            }
+        let visibility = decode_commit_visibility(&bytes)?;
+        if visibility.commit_id != *commit_id {
+            return Err(LixError::unknown(format!(
+                "commit visibility key for '{commit_id}' contains commit_id '{}'",
+                visibility.commit_id
+            )));
         }
+        out.insert(commit_id.clone(), visibility);
     }
     Ok(out)
 }
@@ -1483,6 +1229,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gc_rejects_corrupt_live_membership_row() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
+
+        write_segments(&storage, &context, vec![live_segment], &["commit-live"]).await;
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+            by_change_membership_key("change-live", "commit-live"),
+            b"not empty".to_vec(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut reader = context.reader(storage);
+        let error = reader
+            .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
+            .await
+            .expect_err("corrupt live membership index must fail closed");
+
+        assert!(
+            error.message.contains("live by_change_membership entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn gc_sweeps_stale_commit_visibility_and_retains_live_visibility() {
         let storage = test_storage();
         let context = ChangelogContext::new();
@@ -1602,6 +1378,65 @@ mod tests {
             error.message.contains("does not match segment truth"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn collect_garbage_rejects_stale_live_locator_indexes_without_sweeping() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
+        let dead_segment = canonicalize_segment(single_commit_segment(
+            "segment-dead",
+            "commit-dead",
+            "change-dead",
+        ))
+        .unwrap();
+        let stale_location = SegmentObjectLocation {
+            segment_id: "missing-segment".to_string(),
+            offset: 0,
+            len: 0,
+            checksum: "stale-checksum".to_string(),
+        };
+
+        write_segments(&storage, &context, vec![live_segment], &["commit-live"]).await;
+        write_raw_segment(&storage, &dead_segment).await;
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            COMMIT_VISIBILITY_SPACE,
+            commit_visibility_key("commit-live"),
+            commit_visibility_value(&CommitVisibility {
+                commit_id: "commit-live".to_string(),
+                location: stale_location.clone(),
+                checksum: stale_location.checksum.clone(),
+            })
+            .unwrap(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .collect_garbage(&[GcRoot::VersionHead("commit-live".to_string())])
+                .await
+                .expect_err("live locator drift must abort GC before sweeping")
+        };
+        assert!(
+            error.message.contains("does not match segment truth"),
+            "unexpected error: {error}"
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(SEGMENT_SPACE, vec![segment_key("segment-dead")])],
+        );
+        assert!(result[0][0].is_some());
     }
 
     #[tokio::test]
@@ -1806,6 +1641,38 @@ mod tests {
 
         assert!(
             error.message.contains("does not match segment truth"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_rejects_corrupt_live_visible_change_proof() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
+
+        write_segments(&storage, &context, vec![live_segment], &["commit-live"]).await;
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            VISIBLE_CHANGE_PROOF_SPACE,
+            visible_change_proof_key("change-live"),
+            b"not a commit visibility".to_vec(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut reader = context.reader(storage);
+        let error = reader
+            .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
+            .await
+            .expect_err("corrupt live visible change proof must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode changelog commit visibility"),
             "unexpected error: {error}"
         );
     }
