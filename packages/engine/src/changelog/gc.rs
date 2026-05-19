@@ -112,6 +112,44 @@ where
 
     let live_commits: HashSet<_> = live.commits.iter().cloned().collect();
     let live_changes: HashSet<_> = live.changes.iter().cloned().collect();
+    let retained_segments: HashSet<_> = live.segments.iter().cloned().collect();
+    let retained_commit_ids = truth
+        .commits
+        .iter()
+        .filter_map(|(commit_id, (location, _))| {
+            retained_segments
+                .contains(&location.segment_id)
+                .then(|| commit_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let retained_change_ids = truth
+        .changes
+        .iter()
+        .filter_map(|(change_id, (location, _))| {
+            retained_segments
+                .contains(&location.segment_id)
+                .then(|| change_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut retained_memberships = HashSet::new();
+    for (commit_id, (_, commit)) in &truth.commits {
+        if !retained_commit_ids.contains(commit_id) {
+            continue;
+        }
+        for membership in &commit.body.membership {
+            retained_memberships.insert((membership.member_change_id.clone(), commit_id.clone()));
+        }
+    }
+    let mut retained_payloads = Vec::new();
+    for (change_id, (_, change)) in &truth.changes {
+        if retained_change_ids.contains(change_id) {
+            mark_change_payloads(&mut retained_payloads, change);
+        }
+    }
+    let retained_payload_hashes = retained_payloads
+        .iter()
+        .map(|json_ref| *json_ref.as_hash_array())
+        .collect::<HashSet<_>>();
     let expected_by_commit = expected_live_by_commit_entries(&commit_index, &live.commits)?;
     let expected_by_change = expected_live_by_change_entries(&change_index, &live.changes);
     let expected_commit_visibility = expected_commit_visibilities(&commit_index, &live_commits);
@@ -208,15 +246,15 @@ where
             .collect(),
         by_commit: all_by_commit
             .into_iter()
-            .filter(|commit_id| !live_commits.contains(commit_id))
+            .filter(|commit_id| !retained_commit_ids.contains(commit_id))
             .collect(),
         by_change: all_by_change
             .into_iter()
-            .filter(|change_id| !live_changes.contains(change_id))
+            .filter(|change_id| !retained_change_ids.contains(change_id))
             .collect(),
         by_change_membership: all_by_change_membership
             .keys()
-            .filter(|membership| !live_memberships.contains(*membership))
+            .filter(|membership| !retained_memberships.contains(*membership))
             .cloned()
             .collect(),
         visible_change_proof: all_visible_change_proof
@@ -241,7 +279,7 @@ where
             .collect(),
         json_payloads: all_json_payloads
             .into_iter()
-            .filter(|json_ref| !live.payloads.contains(json_ref))
+            .filter(|json_ref| !retained_payload_hashes.contains(json_ref.as_hash_array()))
             .collect(),
     };
 
@@ -2213,7 +2251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_retains_mixed_live_dead_segment_whole_but_sweeps_dead_indexes() {
+    async fn gc_retains_mixed_live_dead_segment_whole_and_its_indexes() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let segment = mixed_segment();
@@ -2228,8 +2266,60 @@ mod tests {
 
         assert_eq!(plan.live.segments, vec!["segment-mixed"]);
         assert!(plan.sweep.segments.is_empty());
-        assert_eq!(plan.sweep.by_commit, vec!["commit-dead"]);
-        assert_eq!(plan.sweep.by_change, vec!["change-dead"]);
+        assert!(plan.sweep.by_commit.is_empty());
+        assert!(plan.sweep.by_change.is_empty());
+        assert!(plan.sweep.by_change_membership.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_retains_payloads_for_dead_changes_in_retained_segments() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let dead_ref = JsonRef::from_hash_bytes([9; 32]);
+        let mut segment = single_commit_segment("segment-mixed", "commit-live", "change-live");
+        let dead = single_commit_segment_with_payloads(
+            "segment-mixed",
+            "commit-dead",
+            "change-dead",
+            Some(dead_ref),
+            None,
+        );
+        segment.commits.push(dead.commits[0].clone());
+        segment.changes.push(dead.changes[0].clone());
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-live").await.unwrap();
+        }
+        json_store::stage_direct_json_payload_put(&mut writes, &dead_ref, b"dead".to_vec());
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let plan = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .collect_garbage(&[GcRoot::VersionHead("commit-live".to_string())])
+                .await
+                .unwrap()
+        };
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        assert!(plan.sweep.segments.is_empty());
+        assert!(plan.sweep.json_payloads.is_empty());
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(
+                json_store::store::JSON_SPACE,
+                vec![dead_ref.as_hash_bytes().to_vec()],
+            )],
+        );
+        assert_eq!(result[0][0].as_deref(), Some(&b"dead"[..]));
     }
 
     #[tokio::test]
