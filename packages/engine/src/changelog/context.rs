@@ -2958,7 +2958,17 @@ async fn get_many(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    store.changelog_get_many(space, keys).await
+    let expected_len = keys.len();
+    let values = store.changelog_get_many(space, keys).await?;
+    if values.len() != expected_len {
+        return Err(LixError::unknown(format!(
+            "changelog point read over namespace '{}' returned {} values for {} requested keys",
+            space.name,
+            values.len(),
+            expected_len
+        )));
+    }
+    Ok(values)
 }
 
 fn native_get_many<R>(
@@ -3094,6 +3104,34 @@ mod tests {
         }
     }
 
+    struct ShortGetManyStore;
+
+    #[async_trait]
+    impl ChangelogStorageRead for ShortGetManyStore {
+        async fn changelog_get_many(
+            &mut self,
+            _space: StorageSpace,
+            _keys: Vec<Vec<u8>>,
+        ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn changelog_scan(
+            &mut self,
+            _space: StorageSpace,
+            _prefix: Vec<u8>,
+            _after: Option<Vec<u8>>,
+            _limit: usize,
+            _projection: StorageCoreProjection,
+        ) -> Result<ChangelogScanPage, LixError> {
+            Ok(ChangelogScanPage {
+                keys: Vec::new(),
+                values: Vec::new(),
+                resume_after: None,
+            })
+        }
+    }
+
     struct KeyOnlyPointRead;
 
     impl BackendRead for KeyOnlyPointRead {
@@ -3138,6 +3176,23 @@ mod tests {
             error
                 .message
                 .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_segment_rejects_short_get_many_result() {
+        let mut reader = ChangelogContext::new().reader(ShortGetManyStore);
+
+        let error = reader
+            .load_segment("segment-1")
+            .await
+            .expect_err("short get-many result must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("returned 0 values for 1 requested keys"),
             "unexpected error: {error}"
         );
     }
