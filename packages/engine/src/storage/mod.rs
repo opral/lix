@@ -21,12 +21,13 @@ pub trait StorageBackend: crate::backend::Backend {}
 impl<T> StorageBackend for T where T: crate::backend::Backend {}
 pub trait StorageBackendRead: crate::backend::BackendRead {}
 impl<T> StorageBackendRead for T where T: crate::backend::BackendRead {}
+pub type StorageBackendReadOf<'a, B> = <B as crate::backend::Backend>::Read<'a>;
 
 pub use crate::backend::{
     BackendError as StorageBackendError, CoreProjection as StorageCoreProjection,
     GetOptions as StorageGetOptions, InMemoryBackend as InMemoryStorageBackend,
     InMemoryRead as InMemoryStorageRead, InMemoryWrite as InMemoryStorageWrite, Key as StorageKey,
-    Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
+    KeyRange as StorageKeyRange, Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
     ReadOptions as StorageReadOptions, ScanOptions as StorageScanOptions,
     SpaceId as StorageSpaceId, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
 };

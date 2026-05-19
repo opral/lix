@@ -104,30 +104,25 @@ impl<'a> From<&'a NormalizedJson> for NormalizedJsonRef<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JsonWritePlacementRef<'a> {
-    CommitPack { commit_id: &'a str, pack_id: u32 },
+pub(crate) enum JsonWritePlacementRef {
     OutOfBand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JsonReadScopeRef<'a> {
+pub(crate) enum JsonReadScopeRef {
     OutOfBand,
-    CommitPacks {
-        commit_id: &'a str,
-        pack_ids: &'a [u32],
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JsonLoadRequestRef<'a> {
     pub(crate) refs: &'a [JsonRef],
-    pub(crate) scope: JsonReadScopeRef<'a>,
+    pub(crate) scope: JsonReadScopeRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JsonProjectionLoadRequestRef<'a> {
     pub(crate) refs: &'a [JsonRef],
-    pub(crate) scope: JsonReadScopeRef<'a>,
+    pub(crate) scope: JsonReadScopeRef,
     pub(crate) paths: &'a [JsonProjectionPath],
 }
 

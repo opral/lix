@@ -1305,7 +1305,6 @@ mod tests {
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
     };
-    use crate::commit_store::CommitStoreContext;
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -1317,7 +1316,9 @@ mod tests {
         bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
         plan_write,
     };
-    use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
+    use crate::sql2::{
+        ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
+    };
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
         StorageReadScope,
@@ -1457,11 +1458,19 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
+        fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
             let storage = StorageContext::new(InMemoryStorageBackend::new());
             let read_scope = test_read_scope(&storage);
-            CommitStoreQuerySource {
-                commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
+            HistoryQuerySource {
+                json_reader: JsonStoreContext::new().reader(read_scope.store()),
+            }
+        }
+
+        fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
+            let storage = StorageContext::new(InMemoryStorageBackend::new());
+            let read_scope = test_read_scope(&storage);
+            ChangelogQuerySource {
+                store: read_scope.clone(),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
             }
         }
@@ -5016,10 +5025,17 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
+        fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
             let read_scope = test_read_scope(&self.storage);
-            CommitStoreQuerySource {
-                commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
+            HistoryQuerySource {
+                json_reader: JsonStoreContext::new().reader(read_scope.store()),
+            }
+        }
+
+        fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
+            let read_scope = test_read_scope(&self.storage);
+            ChangelogQuerySource {
+                store: read_scope.clone(),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
             }
         }

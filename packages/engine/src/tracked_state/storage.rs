@@ -1,35 +1,33 @@
 use std::collections::HashMap;
 
-use crate::json_store::JsonStoreContext;
 use crate::storage::{PointReadPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
-    StorageCoreProjection, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId,
-    StorageValue,
+    StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId, StorageValue,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
-    TrackedStateDeltaEntry, TrackedStateDeltaRef, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
+    TrackedStateProjectionMetadata, TrackedStateProjectionParent, TrackedStateRootId,
+    TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree.chunk";
-pub(crate) const TRACKED_STATE_ROOT_NAMESPACE: &'static str = "tracked_state.tree.root";
+pub(crate) const TRACKED_STATE_PROJECTION_NAMESPACE: &'static str = "tracked_state.projection";
 pub(crate) const TRACKED_STATE_BY_FILE_ROOT_NAMESPACE: &'static str =
     "tracked_state.tree.root.by_file";
-pub(crate) const TRACKED_STATE_DELTA_PACK_NAMESPACE: &'static str = "tracked_state.delta_pack";
-const TRACKED_STATE_CHUNK_SPACE: StorageSpace =
+pub(crate) const TRACKED_STATE_CHUNK_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0001), TRACKED_STATE_CHUNK_NAMESPACE);
-const TRACKED_STATE_ROOT_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0002), TRACKED_STATE_ROOT_NAMESPACE);
-const TRACKED_STATE_BY_FILE_ROOT_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_BY_FILE_ROOT_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0003),
     TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
 );
-const TRACKED_STATE_DELTA_PACK_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const TRACKED_STATE_PROJECTION_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0004),
-    TRACKED_STATE_DELTA_PACK_NAMESPACE,
+    TRACKED_STATE_PROJECTION_NAMESPACE,
 );
+
+const PROJECTION_METADATA_MAGIC: &[u8; 5] = b"LXTP1";
 
 async fn get_one(
     store: &(impl StorageRead + ?Sized),
@@ -50,28 +48,47 @@ pub(crate) async fn load_root(
     store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
+    Ok(load_projection_metadata(store, commit_id)
+        .await?
+        .map(|metadata| metadata.root_id))
+}
+
+pub(crate) async fn load_projection_metadata(
+    store: &(impl StorageRead + ?Sized),
+    commit_id: &str,
+) -> Result<Option<TrackedStateProjectionMetadata>, LixError> {
     let Some(bytes) = get_one(
         store,
-        TRACKED_STATE_ROOT_SPACE,
+        TRACKED_STATE_PROJECTION_SPACE,
         commit_id.as_bytes().to_vec(),
     )
     .await?
     else {
         return Ok(None);
     };
-    TrackedStateRootId::from_slice(&bytes).map(Some)
+    let metadata = decode_projection_metadata(&bytes)?;
+    if metadata.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state projection key for commit '{commit_id}' contains metadata for commit '{}'",
+                metadata.commit_id
+            ),
+        ));
+    }
+    Ok(Some(metadata))
 }
 
-pub(crate) fn stage_root(
+pub(crate) fn stage_projection_metadata(
     writes: &mut StorageWriteSet,
-    commit_id: &str,
-    root_id: &TrackedStateRootId,
-) {
+    metadata: &TrackedStateProjectionMetadata,
+) -> Result<(), LixError> {
     writes.put(
-        TRACKED_STATE_ROOT_SPACE,
-        key(commit_id.as_bytes().to_vec()),
-        value(root_id.as_bytes().to_vec()),
+        TRACKED_STATE_PROJECTION_SPACE,
+        key(metadata.commit_id.as_bytes().to_vec()),
+        value(encode_projection_metadata(metadata)?),
     );
+    Ok(())
 }
 
 pub(crate) async fn load_by_file_root(
@@ -100,121 +117,6 @@ pub(crate) fn stage_by_file_root(
         key(commit_id.as_bytes().to_vec()),
         value(root_id.as_bytes().to_vec()),
     );
-}
-
-pub(crate) async fn load_delta_pack(
-    store: &(impl StorageRead + ?Sized),
-    commit_id: &str,
-) -> Result<Option<Vec<TrackedStateDeltaEntry>>, LixError> {
-    let json_store = JsonStoreContext::new();
-    let delta = get_one(
-        store,
-        TRACKED_STATE_DELTA_PACK_SPACE,
-        commit_id.as_bytes().to_vec(),
-    )
-    .await?;
-    let json_pack = json_store.load_commit_pack_bytes(store, commit_id, 0)?;
-    let Some(bytes) = delta else {
-        return Ok(None);
-    };
-    let pack_refs = if crate::tracked_state::codec::delta_pack_uses_json_pack_indexes(&bytes)? {
-        json_pack
-            .map(|bytes| json_store.decode_pack_refs(bytes.as_ref()))
-            .transpose()?
-    } else {
-        None
-    };
-    let (stored_commit_id, entries) =
-        crate::tracked_state::codec::decode_delta_pack(&bytes, pack_refs.as_deref())?;
-    if stored_commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked-state delta pack identity mismatch: expected '{commit_id}', got '{stored_commit_id}'"
-            ),
-        ));
-    }
-    Ok(Some(entries))
-}
-
-pub(crate) async fn delta_pack_exists(
-    store: &(impl StorageRead + ?Sized),
-    commit_id: &str,
-) -> Result<bool, LixError> {
-    let result = PointReadPlan::new(
-        TRACKED_STATE_DELTA_PACK_SPACE,
-        &[StorageKey(Bytes::copy_from_slice(commit_id.as_bytes()))],
-    )
-    .materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::KeyOnly,
-            ..StorageGetOptions::default()
-        },
-    )?;
-    Ok(result.value.into_iter().next().flatten().is_some())
-}
-
-pub(crate) fn stage_delta_pack_refs(
-    writes: &mut StorageWriteSet,
-    commit_id: &str,
-    deltas: &[TrackedStateDeltaRef<'_>],
-) -> Result<(), LixError> {
-    writes.put(
-        TRACKED_STATE_DELTA_PACK_SPACE,
-        key(commit_id.as_bytes().to_vec()),
-        value(crate::tracked_state::codec::encode_delta_pack_refs(
-            commit_id, deltas,
-        )?),
-    );
-    Ok(())
-}
-
-pub(crate) struct DeltaJsonPackIndexesRef<'a> {
-    pub(crate) commit_id: &'a str,
-    pub(crate) pack_id: u32,
-    pub(crate) indexes: &'a std::collections::HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>,
-}
-
-pub(crate) fn stage_delta_pack_refs_with_json_pack_indexes(
-    writes: &mut StorageWriteSet,
-    commit_id: &str,
-    deltas: &[TrackedStateDeltaRef<'_>],
-    json_pack_indexes: DeltaJsonPackIndexesRef<'_>,
-) -> Result<(), LixError> {
-    if json_pack_indexes.commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked-state delta JSON pack indexes for '{}' cannot encode delta pack '{}'",
-                json_pack_indexes.commit_id, commit_id
-            ),
-        ));
-    }
-    if json_pack_indexes.pack_id != 0 {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked-state delta JSON pack indexes only support pack 0, got pack {}",
-                json_pack_indexes.pack_id
-            ),
-        ));
-    }
-    if json_pack_indexes.indexes.is_empty() {
-        return stage_delta_pack_refs(writes, commit_id, deltas);
-    }
-    writes.put(
-        TRACKED_STATE_DELTA_PACK_SPACE,
-        key(commit_id.as_bytes().to_vec()),
-        value(
-            crate::tracked_state::codec::encode_delta_pack_refs_with_json_pack_indexes(
-                commit_id,
-                deltas,
-                Some(json_pack_indexes.indexes),
-            )?,
-        ),
-    );
-    Ok(())
 }
 
 pub(crate) async fn read_chunk(
@@ -299,10 +201,200 @@ fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
     }
 }
 
+fn encode_projection_metadata(
+    metadata: &TrackedStateProjectionMetadata,
+) -> Result<Vec<u8>, LixError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(PROJECTION_METADATA_MAGIC);
+    write_string(&mut out, &metadata.commit_id)?;
+    out.extend_from_slice(metadata.root_id.as_bytes());
+    write_u32(
+        &mut out,
+        metadata.parent_roots.len(),
+        "parent projection count",
+    )?;
+    for parent in &metadata.parent_roots {
+        write_string(&mut out, &parent.commit_id)?;
+        out.extend_from_slice(parent.root_id.as_bytes());
+    }
+    out.extend_from_slice(&metadata.changed_key_count.to_le_bytes());
+    out.extend_from_slice(&metadata.row_count_estimate.to_le_bytes());
+    out.extend_from_slice(&metadata.tree_height.to_le_bytes());
+    out.extend_from_slice(&metadata.primary_chunk_count.to_le_bytes());
+    out.extend_from_slice(&metadata.primary_chunk_bytes.to_le_bytes());
+    Ok(out)
+}
+
+fn decode_projection_metadata(bytes: &[u8]) -> Result<TrackedStateProjectionMetadata, LixError> {
+    let mut cursor = ProjectionMetadataCursor { bytes, offset: 0 };
+    cursor.expect_magic()?;
+    let commit_id = cursor.read_string("commit_id")?;
+    let root_id = cursor.read_root_id("root_id")?;
+    let parent_count = cursor.read_u32("parent projection count")? as usize;
+    let mut parent_roots = Vec::with_capacity(parent_count);
+    for _ in 0..parent_count {
+        parent_roots.push(TrackedStateProjectionParent {
+            commit_id: cursor.read_string("parent commit_id")?,
+            root_id: cursor.read_root_id("parent root_id")?,
+        });
+    }
+    let changed_key_count = cursor.read_u64("changed_key_count")?;
+    let row_count_estimate = cursor.read_u64("row_count_estimate")?;
+    let tree_height = cursor.read_u32("tree_height")?;
+    let primary_chunk_count = cursor.read_u64("primary_chunk_count")?;
+    let primary_chunk_bytes = cursor.read_u64("primary_chunk_bytes")?;
+    cursor.expect_end()?;
+    Ok(TrackedStateProjectionMetadata {
+        commit_id,
+        root_id,
+        parent_roots,
+        changed_key_count,
+        row_count_estimate,
+        tree_height,
+        primary_chunk_count,
+        primary_chunk_bytes,
+    })
+}
+
+fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
+    write_u32(out, value.len(), "string length")?;
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_u32(out: &mut Vec<u8>, value: usize, field: &str) -> Result<(), LixError> {
+    let value = u32::try_from(value).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state projection metadata {field} exceeds u32"),
+        )
+    })?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+struct ProjectionMetadataCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl ProjectionMetadataCursor<'_> {
+    fn expect_magic(&mut self) -> Result<(), LixError> {
+        let magic = self.read_exact(PROJECTION_METADATA_MAGIC.len(), "magic")?;
+        if magic != PROJECTION_METADATA_MAGIC {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to decode tracked_state projection metadata: bad magic",
+            ));
+        }
+        Ok(())
+    }
+
+    fn expect_end(&self) -> Result<(), LixError> {
+        if self.offset != self.bytes.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to decode tracked_state projection metadata: trailing bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_string(&mut self, field: &str) -> Result<String, LixError> {
+        let len = self.read_u32(field)? as usize;
+        let bytes = self.read_exact(len, field)?;
+        String::from_utf8(bytes.to_vec()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode tracked_state projection metadata {field}: {error}"),
+            )
+        })
+    }
+
+    fn read_root_id(&mut self, field: &str) -> Result<TrackedStateRootId, LixError> {
+        let bytes = self.read_exact(TRACKED_STATE_HASH_BYTES, field)?;
+        TrackedStateRootId::from_slice(bytes)
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, LixError> {
+        let bytes = self.read_exact(std::mem::size_of::<u32>(), field)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("fixed u32")))
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64, LixError> {
+        let bytes = self.read_exact(std::mem::size_of::<u64>(), field)?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("fixed u64")))
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> Result<&[u8], LixError> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode tracked_state projection metadata {field}: overflow"),
+            )
+        })?;
+        if end > self.bytes.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode tracked_state projection metadata {field}: truncated"),
+            ));
+        }
+        let out = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    use crate::binary_cas::kv::{
+        BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
+    };
+    use crate::changelog::{
+        BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
+        COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    };
+    use crate::json_store::store::JSON_SPACE;
+    use crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE;
+
+    use super::{
+        TRACKED_STATE_BY_FILE_ROOT_SPACE, TRACKED_STATE_CHUNK_SPACE, TRACKED_STATE_PROJECTION_SPACE,
+    };
+
+    #[test]
+    fn native_storage_space_ids_are_unique_across_owner_layouts() {
+        let spaces = [
+            UNTRACKED_STATE_ROW_SPACE,
+            JSON_SPACE,
+            TRACKED_STATE_CHUNK_SPACE,
+            TRACKED_STATE_PROJECTION_SPACE,
+            TRACKED_STATE_BY_FILE_ROOT_SPACE,
+            BINARY_CAS_MANIFEST_SPACE,
+            BINARY_CAS_MANIFEST_CHUNK_SPACE,
+            BINARY_CAS_CHUNK_SPACE,
+            SEGMENT_SPACE,
+            COMMIT_VISIBILITY_SPACE,
+            BY_COMMIT_INDEX_SPACE,
+            BY_CHANGE_INDEX_SPACE,
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+            VISIBLE_CHANGE_PROOF_SPACE,
+        ];
+        let mut seen = BTreeMap::new();
+        for space in spaces {
+            assert_eq!(
+                seen.insert(space.id, space.name),
+                None,
+                "storage space id {:?} is reused by {} and {}",
+                space.id,
+                seen.get(&space.id).copied().unwrap_or(space.name),
+                space.name
+            );
+        }
+    }
 
     #[test]
     fn production_tracked_state_sources_do_not_call_storage_batch_writer() {

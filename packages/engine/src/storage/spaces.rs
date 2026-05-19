@@ -15,6 +15,10 @@ impl StorageSpace {
         Self { id, name }
     }
 
+    pub const fn physical_prefix(&self) -> [u8; 4] {
+        self.id.0.to_be_bytes()
+    }
+
     pub fn encode_key(&self, key: &Key) -> Key {
         encode_physical_key(self.id, key)
     }

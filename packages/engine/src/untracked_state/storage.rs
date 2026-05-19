@@ -14,7 +14,7 @@ use crate::untracked_state::{
 use crate::{LixError, NullableKeyFilter};
 
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row.v1";
-const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
+pub(crate) const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0001_0002), UNTRACKED_STATE_ROW_NAMESPACE);
 // Durable key bytes:
 //   b"LXUK" | version:u8 |

@@ -66,15 +66,14 @@ impl EntityIdentity {
         }
     }
 
+    pub(crate) fn from_parts(parts: Vec<String>) -> Result<Self, EntityIdentityError> {
+        validate_parts(&parts)?;
+        Ok(Self { parts })
+    }
+
     #[cfg(test)]
     pub(crate) fn tuple(parts: Vec<String>) -> Result<Self, EntityIdentityError> {
-        if parts.is_empty() {
-            return Err(EntityIdentityError::EmptyPrimaryKey);
-        }
-        if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| part.is_empty()) {
-            return Err(EntityIdentityError::EmptyPrimaryKeyValue { index });
-        }
-        Ok(Self { parts })
+        Self::from_parts(parts)
     }
 
     pub(crate) fn from_primary_key_paths(
@@ -162,6 +161,16 @@ impl EntityIdentity {
         }
         Ok(Self { parts })
     }
+}
+
+fn validate_parts(parts: &[String]) -> Result<(), EntityIdentityError> {
+    if parts.is_empty() {
+        return Err(EntityIdentityError::EmptyPrimaryKey);
+    }
+    if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| part.is_empty()) {
+        return Err(EntityIdentityError::EmptyPrimaryKeyValue { index });
+    }
+    Ok(())
 }
 
 fn string_part_from_json_value(

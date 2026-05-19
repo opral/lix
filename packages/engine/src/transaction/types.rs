@@ -4,7 +4,7 @@ use crate::catalog::SchemaPlanId;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::tracked_state::MaterializedTrackedStateRow;
+use crate::tracked_state::TrackedStateDiffRow;
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::LixError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -189,7 +189,8 @@ pub(crate) struct TransactionFileData {
 pub(crate) struct TransactionAdoptedChange {
     pub(crate) version_id: String,
     pub(crate) change_id: String,
-    pub(crate) projected_row: MaterializedTrackedStateRow,
+    pub(crate) source_parent_commit_id: String,
+    pub(crate) projected_row: TrackedStateDiffRow,
 }
 
 /// One decoded write batch accepted by the transaction boundary.
@@ -309,10 +310,14 @@ pub(crate) struct PreparedAdoptedStateRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: Option<StageJson>,
     pub(crate) metadata: Option<StageJson>,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
     pub(crate) change_id: String,
+    pub(crate) source_commit_id: String,
+    pub(crate) source_parent_commit_id: String,
     pub(crate) commit_id: String,
     pub(crate) version_id: String,
 }
@@ -360,7 +365,7 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
 
 impl From<PreparedAdoptedStateRow> for MaterializedLiveStateRow {
     fn from(row: PreparedAdoptedStateRow) -> Self {
-        let deleted = row.snapshot.is_none();
+        let deleted = row.snapshot_ref.is_none();
         MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
@@ -387,7 +392,7 @@ impl From<&PreparedAdoptedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
-            deleted: row.snapshot.is_none(),
+            deleted: row.snapshot_ref.is_none(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,

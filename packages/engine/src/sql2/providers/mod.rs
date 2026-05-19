@@ -24,7 +24,8 @@ where
     C: SqlExecutionContext + ?Sized,
 {
     let version_ref = ctx.version_ref();
-    let commit_store_query_source = ctx.commit_store_query_source();
+    let history_query_source = ctx.history_query_source();
+    let changelog_query_source = ctx.changelog_query_source();
     let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
     for surface in catalog.surfaces() {
         match &surface.kind {
@@ -60,7 +61,7 @@ where
                 change::register_lix_change_read_provider(
                     session,
                     &surface.name,
-                    commit_store_query_source.clone(),
+                    changelog_query_source.clone(),
                 )
                 .await?;
             }
@@ -69,7 +70,7 @@ where
                     session,
                     &surface.name,
                     ctx.commit_graph(),
-                    commit_store_query_source.clone(),
+                    history_query_source.clone(),
                 )
                 .await?;
             }
@@ -101,7 +102,7 @@ where
                     session,
                     &surface.name,
                     ctx.commit_graph(),
-                    commit_store_query_source.clone(),
+                    history_query_source.clone(),
                     ctx.blob_reader(),
                 )
                 .await?;
@@ -132,7 +133,7 @@ where
                     session,
                     &surface.name,
                     ctx.commit_graph(),
-                    commit_store_query_source.clone(),
+                    history_query_source.clone(),
                 )
                 .await?;
             }
@@ -147,7 +148,7 @@ where
         ctx.live_state(),
         Arc::clone(&version_ref),
         Arc::new(tokio::sync::Mutex::new(ctx.commit_graph())),
-        commit_store_query_source,
+        history_query_source,
         &catalog,
     )
     .await?;
@@ -269,13 +270,12 @@ mod tests {
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
     };
-    use crate::commit_store::CommitStoreContext;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::catalog::{derive_entity_surface_spec_from_schema, PublicCatalog};
-    use crate::sql2::CommitStoreQuerySource;
+    use crate::sql2::HistoryQuerySource;
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
         StorageReadScope,
@@ -371,7 +371,7 @@ mod tests {
             Arc::new(EmptyLiveStateReader),
             Arc::new(EmptyVersionRefReader),
             Arc::new(tokio::sync::Mutex::new(Box::new(EmptyCommitGraphReader))),
-            empty_commit_store_query_source().await,
+            empty_history_query_source().await,
             &catalog,
         )
         .await
@@ -433,14 +433,13 @@ mod tests {
         );
     }
 
-    async fn empty_commit_store_query_source(
-    ) -> crate::sql2::SqlCommitStoreQuerySource<StorageReadScope<InMemoryStorageRead>> {
+    async fn empty_history_query_source(
+    ) -> crate::sql2::SqlHistoryQuerySource<StorageReadScope<InMemoryStorageRead>> {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        CommitStoreQuerySource {
-            commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
+        HistoryQuerySource {
             json_reader: JsonStoreContext::new().reader(read_scope.store()),
         }
     }

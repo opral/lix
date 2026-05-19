@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::binary_cas::BinaryCasContext;
 use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
-use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
@@ -24,7 +23,6 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     live_state: Arc<LiveStateContext>,
     version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
-    commit_store: Arc<CommitStoreContext>,
     catalog_context: Arc<CatalogContext>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -42,11 +40,9 @@ where
     /// backend.
     pub async fn initialize(backend: B) -> Result<InitReceipt, LixError> {
         let storage = StorageContext::new(backend);
-        let commit_store = CommitStoreContext::new();
 
         crate::init::initialize(
             storage,
-            &commit_store,
             &TrackedStateContext::new(),
             &UntrackedStateContext::new(),
         )
@@ -62,7 +58,6 @@ where
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let untracked_state = Arc::new(UntrackedStateContext::new());
-        let commit_store = Arc::new(CommitStoreContext::new());
         let commit_graph = CommitGraphContext::new();
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
@@ -78,7 +73,6 @@ where
 
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
-            commit_store,
             storage,
             tracked_state,
             live_state,
@@ -120,7 +114,6 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.write_lock),
@@ -134,7 +127,6 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.write_lock),
@@ -142,12 +134,12 @@ where
         .await
     }
 
-    /// Materializes the tracked serving projection root for one version from commit_store.
+    /// Rebuilds the tracked serving projection root for one version from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
     /// state. The current version head is read from the live-state facade so
-    /// materialization uses the same moving-ref visibility as normal execution.
+    /// rebuild uses the same moving-ref visibility as normal execution.
     pub async fn rebuild_tracked_state_for_version(
         &self,
         version_id: &str,
@@ -165,12 +157,12 @@ where
         let storage = self.storage();
         let read = storage.begin_read(StorageReadOptions::default())?;
         let mut writes = StorageWriteSet::new();
-        let materialize_result = self
+        let rebuild_result = self
             .tracked_state
-            .materializer(&read, &mut writes, self.commit_store.as_ref())
-            .materialize_root_at(&head_commit_id)
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_projection_root_at(&head_commit_id)
             .await;
-        if let Err(error) = materialize_result {
+        if let Err(error) = rebuild_result {
             return Err(error);
         }
         storage

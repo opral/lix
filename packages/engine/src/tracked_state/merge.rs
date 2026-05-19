@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity,
+    TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRow,
 };
 use crate::LixError;
 
@@ -34,7 +34,7 @@ pub(crate) enum TrackedStateMergePatch {
     Adopt {
         identity: TrackedStateDiffIdentity,
         change_id: String,
-        projected_row: MaterializedTrackedStateRow,
+        projected_row: TrackedStateDiffRow,
     },
 }
 
@@ -52,7 +52,7 @@ impl TrackedStateMergePatch {
         }
     }
 
-    pub(crate) fn projected_row(&self) -> &MaterializedTrackedStateRow {
+    pub(crate) fn projected_row(&self) -> &TrackedStateDiffRow {
         match self {
             Self::Adopt { projected_row, .. } => projected_row,
         }
@@ -168,21 +168,19 @@ fn same_final_state(target: &TrackedStateDiffEntry, source: &TrackedStateDiffEnt
     }
 }
 
-fn row_is_live(row: &MaterializedTrackedStateRow) -> bool {
-    row.snapshot_content.is_some()
+fn row_is_live(row: &TrackedStateDiffRow) -> bool {
+    !row.deleted
 }
 
-fn tracked_row_payload_eq(
-    left: &MaterializedTrackedStateRow,
-    right: &MaterializedTrackedStateRow,
-) -> bool {
-    left.snapshot_content == right.snapshot_content && left.metadata == right.metadata
+fn tracked_row_payload_eq(left: &TrackedStateDiffRow, right: &TrackedStateDiffRow) -> bool {
+    left.snapshot_ref == right.snapshot_ref && left.metadata_ref == right.metadata_ref
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entity_identity::EntityIdentity;
+    use crate::json_store::JsonRef;
     use crate::tracked_state::TrackedStateDiffKind;
 
     #[test]
@@ -216,10 +214,7 @@ mod tests {
         .expect("merge should plan");
 
         assert_eq!(patch_ids(&plan), vec!["entity-a"]);
-        assert_eq!(
-            plan.patches[0].projected_row().snapshot_content.as_deref(),
-            Some("{\"value\":\"source\"}")
-        );
+        assert!(plan.patches[0].projected_row().snapshot_ref.is_some());
         assert_eq!(plan.patches[0].change_id(), "source");
     }
 
@@ -237,7 +232,7 @@ mod tests {
         .expect("merge should plan");
 
         assert_eq!(patch_ids(&plan), vec!["entity-a"]);
-        assert_eq!(plan.patches[0].projected_row().snapshot_content, None);
+        assert!(plan.patches[0].projected_row().deleted);
         assert_eq!(plan.patches[0].change_id(), "source-delete");
     }
 
@@ -419,8 +414,8 @@ mod tests {
     fn entry(
         entity_id: &str,
         kind: TrackedStateDiffKind,
-        before: Option<MaterializedTrackedStateRow>,
-        after: Option<MaterializedTrackedStateRow>,
+        before: Option<TrackedStateDiffRow>,
+        after: Option<TrackedStateDiffRow>,
     ) -> TrackedStateDiffEntry {
         TrackedStateDiffEntry {
             identity: TrackedStateDiffIdentity {
@@ -460,33 +455,36 @@ mod tests {
             .collect()
     }
 
-    fn tombstone(entity_id: &str, change_id: &str) -> MaterializedTrackedStateRow {
+    fn tombstone(entity_id: &str, change_id: &str) -> TrackedStateDiffRow {
         let mut row = row(entity_id, change_id);
-        row.snapshot_content = None;
+        row.snapshot_ref = None;
         row.deleted = true;
         row
     }
 
-    fn row(entity_id: &str, change_id: &str) -> MaterializedTrackedStateRow {
+    fn row(entity_id: &str, change_id: &str) -> TrackedStateDiffRow {
         row_with_value(entity_id, change_id, "value")
     }
 
-    fn row_with_value(
-        entity_id: &str,
-        change_id: &str,
-        value: &str,
-    ) -> MaterializedTrackedStateRow {
-        MaterializedTrackedStateRow {
+    fn row_with_value(entity_id: &str, change_id: &str, value: &str) -> TrackedStateDiffRow {
+        let snapshot = format!("{{\"value\":\"{value}\"}}");
+        TrackedStateDiffRow {
             entity_id: EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
-            metadata: None,
             deleted: false,
+            snapshot_ref: Some(JsonRef::for_content(snapshot.as_bytes())),
+            metadata_ref: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: change_id.to_string(),
             commit_id: change_id.replace("change", "commit"),
+            change_location: crate::changelog::SegmentObjectLocation {
+                segment_id: "test-segment".to_string(),
+                offset: 0,
+                len: 0,
+                checksum: "test-checksum".to_string(),
+            },
         }
     }
 }

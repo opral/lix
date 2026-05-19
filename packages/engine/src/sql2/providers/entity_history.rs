@@ -21,8 +21,8 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphReader;
-use crate::commit_store::MaterializedChange;
 use crate::serialize_row_metadata;
+use crate::sql2::change_materialization::MaterializedChange;
 use crate::LixError;
 
 use crate::sql2::catalog::{
@@ -36,7 +36,7 @@ use crate::sql2::history_route::{
 use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot, string_array,
 };
-use crate::sql2::SqlCommitStoreQuerySource;
+use crate::sql2::SqlHistoryQuerySource;
 use crate::storage::StorageRead;
 
 /// Schema-specific history surface backed directly by the commit graph.
@@ -48,7 +48,7 @@ pub(crate) struct EntityHistoryProvider<S> {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
 }
 
 impl<S> std::fmt::Debug for EntityHistoryProvider<S> {
@@ -63,7 +63,7 @@ impl<S> EntityHistoryProvider<S> {
     pub(crate) fn new(
         spec: Arc<EntitySurfaceSpec>,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlHistoryQuerySource<S>,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntitySurfaceShape::History),
@@ -130,7 +130,7 @@ where
 struct EntityHistoryScanExec<S> {
     spec: Arc<EntitySurfaceSpec>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     schema: SchemaRef,
     route: HistoryRoute,
     limit: Option<usize>,
@@ -151,7 +151,7 @@ impl<S> EntityHistoryScanExec<S> {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlHistoryQuerySource<S>,
         schema: SchemaRef,
         route: HistoryRoute,
         limit: Option<usize>,
@@ -263,7 +263,7 @@ struct EntityHistoryRow {
 async fn load_entity_history_rows<S>(
     spec: &EntitySurfaceSpec,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     route: &HistoryRoute,
     limit: Option<usize>,
 ) -> Result<Vec<EntityHistoryRow>, LixError>

@@ -1,0 +1,925 @@
+# Physical Layout
+
+This document is the 80% physical layout target for tracked Lix state. It keeps
+the core storage model theoretically sound while leaving codec, compaction, and
+backend details for implementation.
+
+## Implemented Layout
+
+```text
+┌──────────────────────────────┐
+│ changelog.segment            │
+├──────────────────────────────┤
+│ SegmentHeader                │
+│ SegmentDirectory             │
+│   commit_id/change_id        │
+│   -> offset/len/checksum     │
+│ segment.commits[]            │
+│   CommitHeader + CommitBody  │
+│ segment.changes[]            │
+│   row/entity change facts    │
+│   SegmentInlinePayloads      │
+└──────────────┬───────────────┘
+               │ publishes last
+               ▼
+┌──────────────────────────────┐
+│ changelog.commit_visibility  │
+│ key: commit_id               │
+│ -> segment object locator    │
+└──────────────┬───────────────┘
+               │ derived serving projection
+               ▼
+┌──────────────────────────────┐
+│ tracked_state.root           │
+│ key: commit_id               │
+│ rebuildable prolly root      │
+│ leaf -> change_locator       │
+│      -> snapshot/metadata ref│
+└──────────────────────────────┘
+
+Large or deduplicated payloads live in `json_store.json`. Small tracked
+payloads are read from `SegmentChange.inline_payloads`; the compatibility
+commit-pack path is not part of the tracked/changelog hot path.
+```
+
+Remaining layout pressure:
+
+```text
+tracked_state.root is still a derived serving projection and must remain
+rebuildable from changelog.segment plus commit_visibility.
+```
+
+## Model
+
+Core rules:
+
+```text
+changelog.commit is canonical for one logical commit's header and membership
+facts.
+changelog.change is canonical for one row/entity change and its payload refs.
+A row's durable truth is the changelog.change plus referenced payload objects.
+changelog.segment is the physical container for changelog.commit and
+changelog.change objects.
+tracked_state is a derived, rebuildable index over changelog facts.
+```
+
+Dependency direction:
+
+```text
+transaction coordinator
+  ├─ writes changelog.commit into changelog.segment
+  ├─ writes changelog.change objects into changelog.segment
+  ├─ writes rebuildable changelog indexes
+  └─ writes tracked_state.projection -> tracked_state.root
+
+changelog.commit / changelog.change / changelog.segment ──► tracked_state is forbidden
+```
+
+Mental model:
+
+```text
+changelog.commit
+  catalog object for one Lix Commit
+  not just the commit header
+  decodes to Commit: commit header and membership records
+
+changelog.change
+  catalog object for one row/entity Change
+  decodes logically to Change: id, entity_id, schema_key, file_id,
+  snapshot/metadata refs, and authored_commit_id provenance
+
+changelog.segment
+  physical append/container object
+  stores SegmentCommit[] and SegmentChange[] encoded entries
+
+tracked_state.root
+  derived Dolt-like/prolly root per commit
+  key -> latest change_id + cached row refs
+  optimized for exact reads, scans, and branch diffs
+
+json_store.json
+  direct large/deduplicated JSON payloads by json_ref
+```
+
+Naming note:
+
+```text
+changelog.commit is the catalog object for one logical Commit:
+  CommitHeader. CommitBody carries membership when the caller needs the
+  state-transition body.
+
+changelog.change is the catalog object for one logical Change:
+  id, entity_id, schema_key, file_id, snapshot_ref, metadata_ref,
+  authored_commit_id, and created_at.
+
+changelog.segment is the physical append/container object:
+  SegmentHeader, SegmentDirectory, SegmentCommit[], and SegmentChange[].
+
+SegmentCommit is the encoded segment member for a Commit.
+SegmentChange is the encoded segment member for a Change. It is a physical
+superset of Change: it owns inline payload bytes and a
+SegmentChangeDirectory, and can lower to a borrowed logical ChangeRef without
+copying.
+
+The dotted names are catalog/object-type names, not filesystem paths.
+```
+
+## 80% Invariants
+
+Atomic visibility:
+
+```text
+Publish order:
+  1. stage/write json_store.json payloads
+  2. stage changelog.segment
+  3. stage optional rebuildable indexes/projections/roots
+  4. stage commit_visibility last
+  5. commit the storage transaction atomically
+
+A commit is visible only after its non-derived commit_visibility record is
+published.
+The changelog writer stages publication by commit_id and derives the
+commit_visibility locator/checksum from staged or stored changelog.segment
+metadata; callers do not supply arbitrary physical publication metadata.
+A version ref names a visible commit_id. Moving a version ref to a commit must
+atomically ensure commit_visibility exists for that commit.
+changelog.index.by_commit is rebuildable and is not the visibility source.
+Any index/projection/root object for an unpublished commit can be ignored or rebuilt.
+```
+
+Publication closure:
+
+```text
+Staging commit_visibility for commit C is valid only if:
+  - C's SegmentCommit exists and checksum-validates.
+  - every parent_commit_id already has valid commit_visibility, or has
+    commit_visibility staged earlier in the same atomic write set.
+  - every CommitBody.membership.member_change_id resolves to an existing
+    changelog.change in staged or stored changelog truth.
+  - every SegmentCommitDirectory StateRowIdentity winner points to a membership
+    change_id whose changelog.change has the same StateRowIdentity.
+
+by_commit, by_change, and by_change_membership may help find those objects, but
+they are not proof of existence if known stale. Publication validation may scan
+segment directories or require a rebuilt-index barrier.
+```
+
+Logical ID uniqueness:
+
+```text
+commit_id and change_id uniqueness is a changelog truth invariant.
+A writer must not rely solely on rebuildable indexes to prove uniqueness unless
+the write transaction first establishes that mandatory indexes are current.
+The MVP writer may scan segment directories before staging a segment.
+```
+
+Visibility and physical relocation:
+
+```text
+commit_visibility is the canonical publication record for commit_id.
+It may include segment_id + offset/len/checksum for recovery/direct lookup.
+Those locator fields are relocatable physical placement, not commit identity.
+
+Segment scavenge may update commit_visibility locator fields, but must not
+change commit_id, parent_commit_ids, membership change_ids, or commit
+checksum/hash. Old segment bytes remain retained until new physical locations
+are durably published.
+```
+
+Truth closure:
+
+```text
+CommitHeader
+  -> CommitBody.membership
+  -> changelog.change
+  -> SegmentInlinePayloads or json_store.json
+
+tracked_state.root is not in the truth closure.
+Physical pack/segment placement is not logical identity.
+```
+
+State row identity:
+
+```text
+StateRowIdentity = schema_key + file_id + entity_id
+```
+
+Commit and change identity:
+
+```text
+CommitHeader.derivable_change_id is the commit's own derived change id for
+the lix_commit projection.
+changelog.change objects are first-class row/entity changes.
+CommitBody membership records reference change_id.
+tracked_state.root leaves reference change_id.
+by_change maps change_id -> physical changelog.change location.
+by_change_membership maps change_id -> candidate commit_ids whose membership
+references that change_id.
+change_id is logical identity, not physical placement.
+```
+
+Change visibility:
+
+```text
+by_change is a physical locator index only.
+by_change_membership is a membership-candidate index only.
+A changelog.change is visible to normal readers only when its change_id is
+reachable from a visible changelog.commit membership record.
+A raw by_change or by_change_membership hit does not imply visibility.
+```
+
+Directories and indexes:
+
+```text
+SegmentDirectory makes each physical segment self-describing.
+SegmentCommitDirectory makes each physical SegmentCommit self-describing.
+Both directories are enough to rebuild global indexes.
+changelog.index.* accelerates cross-segment lookup.
+by_commit, by_change, and by_change_membership are mandatory rebuildable indexes.
+Rebuilding a mandatory index means reconciling its namespace to segment truth:
+derive the complete expected key/value set from validated changelog.segment
+directories, delete stale extra keys, and write the expected rows. A rebuild is
+not merely a missing-row repair.
+Rebuild APIs report `RebuildIndexStats { expected, put, deleted, unchanged }`
+so repair and maintenance jobs can observe index drift without inspecting write
+batches. `expected` is the canonical row count derived from segment truth,
+`put` is the number of missing/corrupt/wrong expected rows staged for overwrite,
+`deleted` is stale extra rows staged for deletion, and `unchanged` is expected
+rows that already matched canonical bytes.
+No key/entity history accelerator is implemented in the current hard cut.
+Key-history product paths may add a rebuildable index later; until then,
+key-history queries scan changelog.change objects.
+by_commit stores parent edges and generation numbers; skip/closure indexes are
+needed for bounded ancestry/merge-base queries.
+```
+
+Membership index:
+
+```text
+by_change_membership:
+  change_id -> candidate commit_ids whose CommitBody.membership references change_id
+  answers "which commits could prove this change is visible?"
+
+The index is rebuildable and not a visibility source. Readers still validate:
+  candidate commit_id -> commit_visibility -> CommitBody.membership contains change_id
+```
+
+Future key indexes:
+
+```text
+key_value optional:
+  StateRowIdentity -> candidate change_ids
+  answers "which row versions existed for this key?"
+
+key_commit optional:
+  StateRowIdentity -> candidate commit_id + member_change_id pairs
+  answers "which commits included/touched this key?"
+
+Merge commits can include an existing change_id without authoring a new
+changelog.change, so value history and commit-touch history are distinct.
+The writer omits these optional indexes today. Correctness must not depend on
+them.
+```
+
+Logical and physical segmenting:
+
+```text
+One `changelog.commit` represents exactly one logical commit.
+A physical changelog.segment may contain many changelog commits and changes.
+commit_visibility publishes individual changelog commits, not whole physical segments.
+Physical segments have hard byte/record caps to bound directory memory and GC
+retention amplification.
+```
+
+Commit membership coalescing:
+
+```text
+Within one logical changelog.commit, membership is coalesced to at most one
+winning member_change_id per StateRowIdentity.
+
+Multiple writes to the same StateRowIdentity within one transaction produce one net
+durable changelog.change for the tracked state model.
+
+If an operation log is later needed for audit, it is a separate object and not
+part of tracked_state.root semantics.
+```
+
+## Proposed Catalog
+
+```text
+                         ┌──────────────────────────────┐
+                         │ transaction coordinator       │
+                         │ builds one atomic write set   │
+                         └───────────────┬──────────────┘
+                                         │
+        ┌────────────────────────────────┼────────────────────────────────┐
+        ▼                                ▼                                ▼
+┌──────────────────────────────┐ ┌──────────────────────────────┐ ┌──────────────────────────────┐
+│ changelog.segment            │ │ changelog indexes            │ │ tracked_state.projection     │
+│ PHYSICAL CONTAINER           │ │ rebuildable accelerators     │ │ commit -> root_ref           │
+├──────────────────────────────┤ ├──────────────────────────────┤ ├──────────────────────────────┤
+│ key: segment_id              │ │ by_commit                    │ │ key: commit_id               │
+│                              │ │   commit_id                  │ │ root_ref                     │
+│ SegmentHeader                │ │   -> segment_id              │ │ parent projection refs       │
+│ SegmentDirectory             │ │    + offset/len/checksum     │ │ changed_key_count            │
+│   commit_id/change_id        │ │                              │ │ row_count estimate           │
+│   -> offset/len/checksum     │ │ by_change                    │ └──────────────┬───────────────┘
+│                              │ │   change_id                  │                │
+│ segment.commits[]            │ │   -> segment_id              │                ▼
+│   SOURCE OF COMMIT FACTS     │ │    + offset/len/checksum     │ ┌──────────────────────────────┐
+│                              │ │ by_change_membership         │ │ tracked_state.root           │
+│ segment.changes[]            │ │   change_id                  │ │ derived prolly tree          │
+│   SOURCE OF ROW FACTS        │ │   -> candidate commit_ids    │ ├──────────────────────────────┤
+│                              │ │                              │ │ key ranges                   │
+│ SegmentCommit decodes to:    │ │ future key index optional    │ │ subtree hashes               │
+│ - CommitHeader              │ │   state row identity         │ │ leaf: state row identity     │
+│ - CommitBody                │ │   -> candidate history       │ │   -> change_id               │  │
+│ - SegmentCommitDirectory     │ └──────────────────────────────┘ │   -> deleted                 │  │
+│                              │                                  │   -> snapshot_ref cache      │  │
+│                              │                                  │   -> metadata_ref cache      │  │
+│ SegmentChange contains:      │                                  └──────────────────────────────┘  │
+│ - Change fields             │                                                                    │
+│ - SegmentInlinePayloads     │                                                                    │
+│ - SegmentChangeDirectory    │                                                                    │
+└──────────────┬───────────────┘                                  └──────────────────────────────┘  │
+               │ tracked_state and memberships point to changelog.change by change_id                │
+               └────────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────┐
+│ commit_visibility            │
+│ NON-DERIVED PUBLISH EDGE     │
+├──────────────────────────────┤
+│ commit_id                    │
+│ -> segment_id + offset/len   │
+│    + checksum                │
+│ readers trust this for       │
+│ commit visibility            │
+└──────────────────────────────┘
+
+Large payloads:
+
+changelog.change / SegmentInlinePayloads
+  └─ json_ref ──► json_store.json
+```
+
+## Segment Shape
+
+```text
+changelog.segment/<segment_id>
+  SegmentHeader
+    segment_id
+    format_version
+    commit_count
+    change_count
+    byte_count
+    payload_count
+    checksum / hash
+
+  SegmentDirectory
+    commit_id -> offset / len / checksum
+    change_id -> offset / len / checksum
+
+  segment.commits[]   // SegmentCommit[]
+  segment.changes[]   // SegmentChange[]
+```
+
+```text
+Commit
+  CommitHeader
+    id
+    parent_commit_ids
+    derivable_change_id
+    author_account_ids
+    created_at
+    membership_count
+
+CommitBody
+  membership records
+    member_change_id: change_id
+    member_role: authored/adopted
+    source_parent_ordinal optional
+
+SegmentCommit
+  physical encoded superset of Commit + CommitBody
+
+  SegmentCommitDirectory
+    state_row_identity -> member_change_id
+    member_change_id -> membership_record_ordinal
+    checksum / hash
+```
+
+```text
+Change
+  id
+  authored_commit_id optional provenance
+  schema_key
+  entity_id
+  file_id
+  StateRowIdentity = schema_key + file_id + entity_id
+  snapshot_ref
+  metadata_ref
+  created_at
+
+ChangeRef
+  borrowed zero-copy logical view over Change or SegmentChange
+
+SegmentChange
+  physical encoded superset of Change
+
+  SegmentInlinePayloads
+    packed small JSON payloads
+    json_ref -> offset/len
+
+  SegmentChangeDirectory
+    payload_ref -> offset/len, indexed
+```
+
+## Addressing
+
+Lix separates authored change identity from payload identity:
+
+```text
+change_id
+  addresses the exact authored row/entity change
+  optimized for merge membership, projection rebuild, GC, and physical repacking
+
+by_change
+  maps change_id to the current physical changelog.change location
+  rebuildable from changelog.segment directories
+
+json_ref
+  addresses JSON payload bytes
+  optimized for payload dedup, verification, and large payload reuse
+```
+
+`changelog.change` stores `snapshot_ref` / `metadata_ref` as logical `json_ref`
+values, not physical payload locations. `SegmentChange` owns inline placement:
+`SegmentChangeDirectory.payload_ref -> offset/len`. If a ref is not local to the
+encoded segment change, readers load it from `json_store.json`.
+
+This differs from systems that content-address most objects. The tradeoff is
+intentional: two identical payloads can still be different authored changes with
+different commits, metadata, membership, and history. Lix dedups payload bytes;
+it does not collapse authored change identity.
+
+Logical `Change` objects are pure row facts. They do not store `op`,
+`tombstone`, inline payload bytes, directories, or physical segment placement.
+
+```text
+delete
+  = snapshot_ref is null
+
+insert/update/delete
+  = interpretation from tracked_state.diff before/after refs
+
+commit ownership
+  = changelog.commit membership records reference change_id
+  = authored_commit_id is provenance on changelog.change, not ownership required
+    for reachability
+
+payload placement
+  = snapshot_ref / metadata_ref are json_ref values
+  = SegmentChangeDirectory.payload_ref -> offset/len finds inline payloads
+  = missing local payload_ref resolves through json_store.json
+```
+
+Inline payload scope:
+
+```text
+Inline payloads are local to one SegmentChange object in the MVP.
+SegmentChangeDirectory.payload_ref -> offset/len resolves only local inline
+payloads. If the json_ref is not present in the local
+SegmentChangeDirectory, readers resolve it through json_store.json.
+Cross-change or segment-level inline payload dedup is a later physical
+optimization.
+```
+
+## Tracked State Root
+
+Every durable commit gets one logical `tracked_state.root`.
+
+That root is the derived state index for all tracked rows at the commit. This
+matches the current Lix shape more than "one root per schema": current
+`tracked_state.tree.root` is keyed by `commit_id`, and its tree keys are
+`schema_key + file_id + entity_id`.
+
+Dolt's analogous shape is:
+
+```text
+commit
+  -> RootValue
+       table_name -> table/root ref
+         -> row prolly map
+```
+
+Unchanged Dolt tables keep the same table refs. Lix should preserve the same
+property through prolly subtree sharing: a commit updates only the key ranges
+touched by its row changes; unchanged schema/file/key ranges keep the same child
+refs.
+
+```text
+commit_id
+  -> tracked_state.projection
+  -> tracked_state.root
+  -> StateRowIdentity lookup / diff / scan
+  -> change_id + deleted/snapshot_ref/metadata_ref cache
+  -> changelog.change only for truth hydration
+```
+
+`tracked_state.root` is a real prolly-style tree, but derived. It is also a
+covering state index for the hot path:
+
+```text
+StateRowIdentity ->
+  change_id
+  deleted
+  snapshot_ref cache
+  metadata_ref cache
+  optional scalar/header cache
+```
+
+The cache values are copies of changelog truth. If they are missing, stale, or
+discarded, they are rebuilt from `changelog.commit` membership and
+`changelog.change` facts. The primary key space is ordered by:
+
+```text
+StateRowIdentity = schema_key + file_id + entity_id
+```
+
+Schema reads are prefix/range reads over that key space. If schema count or
+schema-level churn later makes a single composite-key tree too broad, the same
+logical model can evolve to a Dolt-style root-of-roots:
+
+```text
+tracked_state.root
+  schema_key -> schema_root_ref
+    -> file_id + entity_id -> change_id + cached refs
+```
+
+That is an internal physical optimization. The visible read model remains
+`commit -> tracked root -> StateRowIdentity -> cached row refs`.
+
+```text
+root-covered read: O(log_B N)
+truth hydration:   O(log_B N + by_change lookup)
+write:       naive O(K log_B N), batched expected O(T + K)
+branch diff: target O(D), precise expected O(T + D), pathological O(N)
+full scan:   O(N)
+
+N = tracked rows in the commit root
+K = changed rows in one commit
+D = emitted changed keys between two roots
+T = changed/visited prolly nodes whose hashes differ
+B = prolly fanout / leaf capacity
+```
+
+Every durable commit persists its `tracked_state.root`. Mutations into the root
+are sorted by `StateRowIdentity` and applied as one batch per commit. Tree bytes written
+are `O(T * node_bytes)`; scattered keys can make `T` approach
+`K * tree_height`. This is the write-amplification tradeoff for `O(log_B N)`
+reads and Dolt-style `O(D)` target diffs. The precise implementation accounting
+is `O(T + D)` because the diff must visit changed internal/leaf nodes before
+emitting changed keys.
+
+A visible commit remains readable if its `tracked_state.projection` or
+`tracked_state.root` is missing. The slow path rebuilds from the nearest
+available ancestor root plus visible commit membership records. If no ancestor
+root exists, rebuild starts from the initial root through reachable ancestry.
+Normal hot-path read bounds do not apply until the derived root is rebuilt.
+
+Prolly chunk boundaries are a function of `StateRowIdentity` only, not `change_id`,
+`snapshot_ref`, `metadata_ref`, or cached leaf values.
+Re-pointing an existing key to a new change_id must not move chunk boundaries.
+That is the Dolt keys-only chunking rule that keeps ordinary updates from
+inflating `T`.
+
+No MVP delta layers, checkpoint policy, or slice-replay read path. Later
+optimizations should happen inside prolly node encoding, segment packing,
+payload colocation, and optional secondary indexes without changing the read
+model. A later write-amplification escape hatch may let persisted roots lag the
+newest commits and derive the tail in memory, Sapling IndexedLog-style. A later
+Neon-style alternative is delta layers plus periodic full roots, trading direct
+root lookup for bounded replay.
+
+## Workflow Cases
+
+```text
+insert rows
+  changelog: +1 CommitHeader, +N CommitBody.membership records,
+             +N changelog.change objects
+  tracked: update parent root with inserted keys -> change_id
+  json_store.json: only large payloads
+
+update rows
+  changelog: +1 CommitHeader, +N CommitBody.membership records,
+             +N changelog.change objects
+  tracked: update parent root with updated keys -> change_id
+  json_store.json: only large payloads
+
+delete rows
+  changelog: +1 CommitHeader, +N CommitBody.membership records,
+             +N changelog.change objects with snapshot_ref = null
+  tracked: update parent root with deleted keys -> change_id
+  json_store.json: none
+
+version from commit
+  changelog: no row facts
+  tracked: reuse existing root
+  metadata: version/ref -> commit_id
+
+write on version
+  changelog: new commit has parent = previous version head
+  tracked: derive new root from previous version head root
+  metadata: move version/ref -> new_commit_id
+
+merge commit
+  changelog: merge CommitHeader + CommitBody.membership for adopted change_ids
+  tracked: derive merge root by applying adopted and authored change_ids
+  copied: no adopted changelog.change objects, no adopted payload bytes
+```
+
+Merge membership is deterministic net state after planning:
+
+```text
+CommitBody membership records contain adopted change_ids that survive conflict checks.
+For a state row identity, the merge result has one visible winning change_id.
+If the merge authors a row change for the same key, that authored row wins.
+CommitBody membership records are for changed/adopted keys, not all keys in the result.
+Merge storage is O(M + A), never O(N).
+```
+
+Merge adoption path:
+
+```text
+merge_commit
+  -> commit_visibility / by_commit
+  -> segment_id + offset/len/checksum
+  -> changelog.commit bytes
+  -> CommitBody.membership.member_change_id
+  -> by_change
+  -> changelog.change
+  -> state row identity / snapshot_ref / metadata_ref
+  -> payload hydration only if needed
+```
+
+Conflicts are not a storage concept in the MVP. The merge planner can throw on
+divergent same-key changes and write no unresolved-conflict records.
+
+## Read Paths
+
+Exact row at version:
+
+```text
+tracked_state.projection(commit_id)
+  -> root_ref
+  -> tracked_state.root.lookup(state row identity)
+  -> change_id + deleted/snapshot_ref/metadata_ref cache
+  -> hydrate snapshot_ref / metadata_ref only if requested
+```
+
+Truth hydration for audit/rebuild:
+
+```text
+change_id
+  -> by_change physical location
+  -> changelog.change
+```
+
+Key/header scan:
+
+```text
+tracked_state.projection
+  -> tracked_state.root key ranges
+  -> state row identities, deleted bits, cached scalar refs
+  -> no payload hydration
+```
+
+Full scan:
+
+```text
+tracked_state.projection
+  -> tracked_state.root leaves
+  -> change_id + cached row refs
+  -> batch hydrate inline payloads and json_store.json
+```
+
+Changed keys / branch diff:
+
+```text
+tracked_state.root(base_commit)
+tracked_state.root(head_commit)
+  -> compare subtree hashes by key range
+  -> descend changed ranges
+  -> return old/new change_id values
+  -> do not materialize JSON strings
+```
+
+Commit/change lookup:
+
+```text
+commit_id -> commit_visibility/by_commit -> segment_id + offset/len/checksum
+change_id -> changelog.index.by_change -> segment_id + offset/len/checksum
+change_id visibility proof candidates -> changelog.index.by_change_membership
+```
+
+Reader contract:
+
+```text
+Visible commit reads trust commit_visibility. They do not require by_commit.
+
+Visible change reads prove visibility through visible commit membership. They
+may use by_change_membership and by_change as accelerators, and may scan
+segments when locator indexes are missing. A corrupt locator index value is an
+integrity error, not a cache miss.
+
+PhysicalOnly reads are physical/debug/repair reads. They require the physical
+locator index for the requested object: missing by_commit/by_change returns
+None, while corrupt locator values or locators pointing at missing/wrong segment
+truth return errors.
+```
+
+## Complexity Contract
+
+Notation:
+
+```text
+N = tracked rows visible at a commit
+K = changed rows in one write
+A = authored merge rows
+M = adopted merge change_ids
+D = emitted changed keys between two roots
+T = changed/visited prolly nodes whose hashes differ
+B = prolly fanout / leaf capacity
+C = commits
+R = changelog.change objects
+P = payload bytes read/written
+I(k) = cost to resolve k change_ids through by_change
+S_change = distinct segments touched while hydrating changelog.change
+S_payload = distinct payload blobs/segments touched while hydrating payloads
+Q = membership records or root entries emitted by an operation
+```
+
+Target bounds:
+
+```text
+version from commit
+  O(1)
+
+exact row at commit
+  root-covered refs/header: O(log_B N)
+  external payload by cached ref: add P + S_payload
+  inline payload / truth hydration: add I(1) + S_change + P
+
+get_many(m keys)
+  arbitrary refs/header:   O(m log_B N)
+  sorted/clustered refs:   O(log_B N + m)
+  external payloads:       add P + S_payload
+  inline/truth hydration:  add I(m) + S_change + P
+
+insert/update/delete K rows
+  segment:      O(K + P)
+  tracked root: naive O(K log_B N), batched expected O(T + K)
+  indexes:      O(K) by_change + by_change_membership writes,
+                O(1) by_commit write per commit
+  membership:   O(K) change_id refs in changelog.commit
+
+commit -> changed change_ids
+  O(1 + Q)
+
+commit -> full changed row facts
+  O(Q + I(Q) + S_change + P + S_payload)
+
+commit -> inserts/updates/deletes classification
+  root-covered classification: O(T + D)
+  truth hydration:             add I(D) + S_change
+  optional later op cache may lower constants
+
+change_id lookup
+  O(1) expected via by_change
+
+entity/key history
+  with future key index: O(log R + H)
+  today:                 O(R)
+
+schema/file range scan
+  root-covered refs/header: O(log_B N + Q)
+  external payloads:        add P + S_payload
+  inline/truth hydration:   add I(Q) + S_change + P
+
+full scan
+  root-covered refs/header: O(N)
+  external payloads:        add P + S_payload
+  inline/truth hydration:   add I(N) + S_change + P
+
+branch diff
+  target O(D) in Dolt/prolly terms
+  precise expected O(T + D)
+  pathological O(N) if chunk/hash sharing fails broadly
+
+merge
+  conflict planning: precise expected O(T + D), pathological O(N)
+  truth hydration:   add I(D) + S_change if planner needs Change facts
+  write result:      naive O((M + A) log_B N), batched expected O(T + M + A)
+  storage:           O(M + A), never O(N)
+
+ancestry / merge-base
+  parent edges + generation numbers: O(visited ancestors)
+  target O(log C) or better requires skip/closure index
+
+rebuild changelog indexes
+  O(R + C + membership_records)
+
+rebuild tracked root for one commit
+  from existing parent root: O(Q log_B N) naive, batched expected O(T + Q)
+  if cached refs must be rebuilt from Change facts: add I(Q) + S_change
+  if ancestor roots are missing: sum this over missing commits from nearest root
+
+GC mark/sweep
+  O(reachable commits + reachable membership records + reachable changes
+    + reachable payload refs + segment objects)
+  retained bytes are whole reachable segments until segment scavenge
+```
+
+## GC / Compaction
+
+Keep this small for the first implementation:
+
+```text
+MVP:
+  immutable segments
+  mark/sweep whole objects only
+  no segment rewrite
+  no changelog reference rewrite
+
+Reachability roots:
+  version heads
+  pinned commits
+  sync/remote refs
+
+Reachability edges:
+  commit -> parent commits
+  commit -> membership change_ids
+  change_id -> changelog.change
+  changelog.change -> json_store.json, for large payloads
+
+Provenance:
+  changelog.change.authored_commit_id is provenance only
+  an adopted change does not keep its authoring commit or parents alive unless
+  that commit is also reachable through refs, pins, or commit ancestry
+
+Derived retention:
+  tracked_state objects are retained only for reachable commits
+  tracked_state never keeps changelog or payload facts alive
+
+Later:
+  MVP segments are L0-like: time-partitioned, all-key segments.
+  Segment scavenge is L1-like key/range compaction.
+  segment scavenge may copy live changelog commits and changes into new physical segments
+  and update commit_visibility / by_commit / by_change physical locations
+  change_id values do not change during physical repacking
+```
+
+## GC Cases
+
+GC marks from publication roots, not from derived indexes:
+
+```text
+version/ref/pin/remote root
+  -> visible commit_id
+  -> changelog.commit
+  -> parent commits
+  -> membership change_ids
+  -> changelog.change
+  -> json_store.json, for large payloads
+```
+
+`tracked_state.*`, `changelog.index.*`, and cached projections keep nothing
+alive. They are retained only when attached to reachable commits and may be
+deleted/rebuilt.
+
+| Case                                                   | Keep                                                                           | Sweep                                             | Note                                                               |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------ |
+| Reachable normal commit                                | `changelog.commit`, membership `changelog.change` objects, referenced payloads | unrelated objects                                 | Standard mark path.                                                |
+| Unreachable commit with no referenced changes          | nothing after retention horizon                                                | commit, changes, payloads                         | Retention horizon is policy, not layout.                           |
+| Unreachable authoring commit, adopted change reachable | adopted `changelog.change` and payloads                                        | authoring commit if otherwise unreachable         | `authored_commit_id` is provenance only.                           |
+| Reachable commit, missing `tracked_state.root`         | commit/change/payload truth                                                    | missing root stays missing until rebuilt          | Reader rebuilds derived root from changelog facts.                 |
+| Reachable `tracked_state.root`, unreachable commit     | nothing solely because of root                                                 | root/projection may be swept                      | Derived state is not a retention root.                             |
+| Large JSON referenced by reachable change              | `json_store.json` payload                                                      | none                                              | Payload is in truth closure through `changelog.change`.            |
+| Large JSON referenced only by unreachable change       | none after retention horizon                                                   | payload                                           | Sweep after no reachable change references it.                     |
+| Inline payload in mixed live/dead segment              | whole segment in MVP                                                           | none until scavenge                               | Whole-segment retention causes byte amplification.                 |
+| Mixed live/dead physical segment                       | whole segment in MVP                                                           | old segment after scavenge                        | Scavenge copies live commits/changes and updates physical indexes. |
+| Stale/missing `by_commit` / `by_change`                 | visible truth objects                                                          | stale index records                               | Rebuild from segment directories and visible commits.              |
+| Missing `commit_visibility`                            | nothing is published by that edge                                              | unpublished commit/change objects if unreferenced | Segment bytes alone do not publish commits.                        |
+| Pinned commit or remote/sync ref                       | same closure as version head                                                   | unrelated objects                                 | Pins and remote refs are GC roots.                                 |
+
+## Clean Cuts
+
+```text
+1. Changelog segment is the source of commit and change truth.
+2. Make tracked_state only a derived prolly root plus projection refs.
+3. Move small JSON payloads into SegmentChange SegmentInlinePayloads.
+4. Keep large/deduplicated payloads in json_store.json.
+5. Make change_id the logical identity for row/entity changes.
+6. Keep changelog indexes rebuildable.
+7. Keep tracked-state repair flowing from changelog to derived roots.
+```

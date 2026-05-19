@@ -2,9 +2,9 @@ pub mod backend;
 mod binary_cas;
 pub(crate) mod catalog;
 pub(crate) mod cel;
-pub(crate) mod commit_graph;
 #[allow(dead_code, unused_imports)]
-pub(crate) mod commit_store;
+pub mod changelog;
+pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod domain;
 pub mod engine;

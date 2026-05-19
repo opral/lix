@@ -1,30 +1,18 @@
-use std::collections::HashMap;
-
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::commit_store::ChangeLocator;
+use crate::changelog::{ChangeLocator, SegmentObjectLocation};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
-    TrackedStateDeltaEntry, TrackedStateDeltaRef, TrackedStateIndexValue,
-    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
+    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
+    TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
 const NODE_VERSION: u8 = 2;
-const VALUE_VERSION: u8 = 7;
+const VALUE_VERSION: u8 = 8;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
-const DELTA_PACK_VERSION: u8 = 7;
-const DELTA_LOCATOR_SAME_COMMIT: u8 = 0;
-const DELTA_LOCATOR_FULL: u8 = 1;
-const DELTA_JSON_REFS_INLINE: u8 = 0;
-const DELTA_JSON_REFS_MIXED_PACK_INDEX: u8 = 1;
-const DELTA_JSON_REF_NONE: u8 = 0;
-const DELTA_JSON_REF_PACK_INDEX: u8 = 1;
-const DELTA_JSON_REF_INLINE: u8 = 2;
-const DELTA_CHANGE_ID_FULL: u8 = 0;
-const DELTA_CHANGE_ID_COMMIT_SUFFIX: u8 = 1;
 const TIMESTAMP_UPDATED_SAME: u8 = 0;
 const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
@@ -32,18 +20,6 @@ const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
 const ENTITY_IDENTITY_END: u8 = 0;
 const ENTITY_IDENTITY_STRING: u8 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeltaKeyPrefixRef<'a> {
-    schema_key: &'a str,
-    file_id: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DeltaKeyPrefix {
-    schema_key: String,
-    file_id: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -297,10 +273,9 @@ pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> 
 
 fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
     out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
-    push_sized_bytes(out, value.change_locator.source_commit_id.as_bytes());
-    out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
-    out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
     push_sized_bytes(out, value.change_locator.change_id.as_bytes());
+    push_sized_bytes(out, value.change_locator.commit_id.as_bytes());
+    append_segment_location_ref(out, value.change_locator.location);
     push_timestamp_pair(out, value.created_at, value.updated_at);
     push_optional_json_ref(out, value.snapshot_ref);
     push_optional_json_ref(out, value.metadata_ref);
@@ -308,10 +283,9 @@ fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
 
 #[cfg(test)]
 pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
-    1 + sized_bytes_len(value.change_locator.source_commit_id.as_bytes())
-        + 4
-        + 4
-        + sized_bytes_len(value.change_locator.change_id.as_bytes())
+    1 + sized_bytes_len(value.change_locator.change_id.as_bytes())
+        + sized_bytes_len(value.change_locator.commit_id.as_bytes())
+        + segment_location_len(&value.change_locator.location)
         + timestamp_pair_len(&value.created_at, &value.updated_at)
         + optional_json_ref_len(value.snapshot_ref.as_ref())
         + optional_json_ref_len(value.metadata_ref.as_ref())
@@ -354,22 +328,9 @@ fn decode_value_after_header(
     mut cursor: usize,
     deleted: bool,
 ) -> Result<TrackedStateIndexValue, LixError> {
-    let source_commit_id = read_sized_string(bytes, &mut cursor, "source_commit_id")?;
-    let source_pack_id =
-        u32::try_from(read_u32(bytes, &mut cursor, "source_pack_id")?).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state source_pack_id exceeds u32",
-            )
-        })?;
-    let source_ordinal =
-        u32::try_from(read_u32(bytes, &mut cursor, "source_ordinal")?).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state source_ordinal exceeds u32",
-            )
-        })?;
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
+    let commit_id = read_sized_string(bytes, &mut cursor, "commit_id")?;
+    let location = read_segment_location(bytes, &mut cursor)?;
     let (created_at, updated_at) = read_timestamp_pair(bytes, &mut cursor)?;
     let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
     let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
@@ -381,391 +342,49 @@ fn decode_value_after_header(
     }
     Ok(TrackedStateIndexValue {
         change_locator: ChangeLocator {
-            source_commit_id,
-            source_pack_id,
-            source_ordinal,
             change_id,
-        },
-        deleted,
-        snapshot_ref,
-        metadata_ref,
-        created_at,
-        updated_at,
-    })
-}
-
-pub(crate) fn encode_delta_pack_refs(
-    commit_id: &str,
-    deltas: &[TrackedStateDeltaRef<'_>],
-) -> Result<Vec<u8>, LixError> {
-    encode_delta_pack_refs_with_json_pack_indexes(commit_id, deltas, None)
-}
-
-pub(crate) fn encode_delta_pack_refs_with_json_pack_indexes(
-    commit_id: &str,
-    deltas: &[TrackedStateDeltaRef<'_>],
-    json_pack_indexes: Option<&HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>>,
-) -> Result<Vec<u8>, LixError> {
-    let json_pack_indexes = json_pack_indexes.filter(|indexes| !indexes.is_empty());
-    let mut out = Vec::new();
-    out.extend_from_slice(b"LXTD");
-    out.push(DELTA_PACK_VERSION);
-    push_var_sized_bytes(&mut out, commit_id.as_bytes(), "delta pack commit_id")?;
-    let (key_prefixes, delta_prefix_indexes) = delta_key_prefixes(deltas);
-    push_var_u32(&mut out, key_prefixes.len(), "delta key prefix count")?;
-    for prefix in &key_prefixes {
-        append_delta_key_prefix_ref(&mut out, *prefix)?;
-    }
-    push_var_u32(&mut out, deltas.len(), "delta pack entry count")?;
-    out.push(if json_pack_indexes.is_some() {
-        DELTA_JSON_REFS_MIXED_PACK_INDEX
-    } else {
-        DELTA_JSON_REFS_INLINE
-    });
-    for (delta, prefix_index) in deltas.iter().zip(delta_prefix_indexes) {
-        append_delta_key_ref(
-            &mut out,
-            &key_prefixes,
-            prefix_index,
-            TrackedStateKeyRef {
-                schema_key: delta.change.schema_key,
-                file_id: delta.change.file_id,
-                entity_id: delta.change.entity_id,
-            },
-        )?;
-        append_delta_value_ref(
-            &mut out,
             commit_id,
-            json_pack_indexes,
-            TrackedStateIndexValueRef {
-                change_locator: delta.locator,
-                deleted: delta.change.snapshot_ref.is_none(),
-                snapshot_ref: delta.change.snapshot_ref,
-                metadata_ref: delta.change.metadata_ref,
-                created_at: delta.created_at,
-                updated_at: delta.updated_at,
-            },
-        )?;
-    }
-    Ok(out)
-}
-
-fn delta_key_prefixes<'a>(
-    deltas: &'a [TrackedStateDeltaRef<'a>],
-) -> (Vec<DeltaKeyPrefixRef<'a>>, Vec<usize>) {
-    let mut prefixes = Vec::new();
-    let mut delta_prefix_indexes = Vec::with_capacity(deltas.len());
-    for delta in deltas {
-        let prefix = DeltaKeyPrefixRef {
-            schema_key: delta.change.schema_key,
-            file_id: delta.change.file_id,
-        };
-        let prefix_index = match prefixes.iter().position(|candidate| *candidate == prefix) {
-            Some(prefix_index) => prefix_index,
-            None => {
-                let prefix_index = prefixes.len();
-                prefixes.push(prefix);
-                prefix_index
-            }
-        };
-        delta_prefix_indexes.push(prefix_index);
-    }
-    (prefixes, delta_prefix_indexes)
-}
-
-fn append_delta_key_prefix_ref(
-    out: &mut Vec<u8>,
-    prefix: DeltaKeyPrefixRef<'_>,
-) -> Result<(), LixError> {
-    push_var_sized_bytes(
-        out,
-        prefix.schema_key.as_bytes(),
-        "delta key prefix schema_key",
-    )?;
-    match prefix.file_id {
-        Some(file_id) => {
-            out.push(1);
-            push_var_sized_bytes(out, file_id.as_bytes(), "delta key prefix file_id")?;
-        }
-        None => out.push(0),
-    }
-    Ok(())
-}
-
-fn decode_delta_key_prefix(bytes: &[u8], cursor: &mut usize) -> Result<DeltaKeyPrefix, LixError> {
-    let schema_key = read_var_sized_string(bytes, cursor, "delta key prefix schema_key")?;
-    let file_id = match read_u8(bytes, cursor, "delta key prefix file_id presence")? {
-        0 => None,
-        1 => Some(read_var_sized_string(
-            bytes,
-            cursor,
-            "delta key prefix file_id",
-        )?),
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state delta key prefix has invalid file_id presence byte {other}"),
-            ))
-        }
-    };
-    Ok(DeltaKeyPrefix {
-        schema_key,
-        file_id,
-    })
-}
-
-fn append_delta_key_ref(
-    out: &mut Vec<u8>,
-    prefixes: &[DeltaKeyPrefixRef<'_>],
-    prefix_index: usize,
-    key: TrackedStateKeyRef<'_>,
-) -> Result<(), LixError> {
-    let prefix = DeltaKeyPrefixRef {
-        schema_key: key.schema_key,
-        file_id: key.file_id,
-    };
-    debug_assert_eq!(prefixes.get(prefix_index), Some(&prefix));
-    push_var_u32(out, prefix_index, "delta key prefix index")?;
-    push_var_entity_identity(out, key.entity_id)?;
-    Ok(())
-}
-
-fn append_delta_value_ref(
-    out: &mut Vec<u8>,
-    pack_commit_id: &str,
-    json_pack_indexes: Option<&HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>>,
-    value: TrackedStateIndexValueRef<'_>,
-) -> Result<(), LixError> {
-    out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
-    if value.change_locator.source_commit_id == pack_commit_id {
-        out.push(DELTA_LOCATOR_SAME_COMMIT);
-    } else {
-        out.push(DELTA_LOCATOR_FULL);
-        push_var_sized_bytes(
-            out,
-            value.change_locator.source_commit_id.as_bytes(),
-            "source_commit_id",
-        )?;
-    }
-    push_var_u32(
-        out,
-        value.change_locator.source_pack_id as usize,
-        "source_pack_id",
-    )?;
-    push_var_u32(
-        out,
-        value.change_locator.source_ordinal as usize,
-        "source_ordinal",
-    )?;
-    push_var_delta_change_id(
-        out,
-        value.change_locator.source_commit_id,
-        value.change_locator.change_id,
-    )?;
-    push_var_timestamp_pair(out, value.created_at, value.updated_at)?;
-    match json_pack_indexes {
-        Some(indexes) => {
-            push_mixed_optional_json_ref(out, indexes, value.snapshot_ref)?;
-            push_mixed_optional_json_ref(out, indexes, value.metadata_ref)?;
-        }
-        None => {
-            push_optional_json_ref(out, value.snapshot_ref);
-            push_optional_json_ref(out, value.metadata_ref);
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn decode_delta_pack(
-    bytes: &[u8],
-    pack_json_refs: Option<&[JsonRef]>,
-) -> Result<(String, Vec<TrackedStateDeltaEntry>), LixError> {
-    let mut cursor = 0usize;
-    let magic = bytes.get(0..4).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state delta pack is truncated before magic",
-        )
-    })?;
-    if magic != b"LXTD" {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state delta pack has invalid magic",
-        ));
-    }
-    cursor += 4;
-    let version = read_u8(bytes, &mut cursor, "delta pack version")?;
-    if version != DELTA_PACK_VERSION {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("unsupported tracked-state delta pack version {version}"),
-        ));
-    }
-    let commit_id = read_var_sized_string(bytes, &mut cursor, "delta pack commit_id")?;
-    let prefix_count = read_var_u32(bytes, &mut cursor, "delta key prefix count")?;
-    let mut key_prefixes = Vec::new();
-    for _ in 0..prefix_count {
-        key_prefixes.push(decode_delta_key_prefix(bytes, &mut cursor)?);
-    }
-    let count = read_var_u32(bytes, &mut cursor, "delta pack entry count")?;
-    let json_ref_mode = decode_delta_json_ref_mode(bytes, &mut cursor, pack_json_refs)?;
-    let mut entries = Vec::new();
-    for _ in 0..count {
-        let key = decode_delta_key(bytes, &mut cursor, &key_prefixes)?;
-        let value = decode_delta_value(bytes, &mut cursor, &commit_id, &json_ref_mode)?;
-        entries.push(TrackedStateDeltaEntry { key, value });
-    }
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state delta pack decode found trailing bytes",
-        ));
-    }
-    Ok((commit_id, entries))
-}
-
-pub(crate) fn delta_pack_uses_json_pack_indexes(bytes: &[u8]) -> Result<bool, LixError> {
-    let mut cursor = 0usize;
-    let magic = bytes.get(0..4).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state delta pack is truncated before magic",
-        )
-    })?;
-    if magic != b"LXTD" {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state delta pack has invalid magic",
-        ));
-    }
-    cursor += 4;
-    let version = read_u8(bytes, &mut cursor, "delta pack version")?;
-    if version != DELTA_PACK_VERSION {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("unsupported tracked-state delta pack version {version}"),
-        ));
-    }
-    let _commit_id = read_var_sized_string(bytes, &mut cursor, "delta pack commit_id")?;
-    let prefix_count = read_var_u32(bytes, &mut cursor, "delta key prefix count")?;
-    for _ in 0..prefix_count {
-        let _ = decode_delta_key_prefix(bytes, &mut cursor)?;
-    }
-    let _count = read_var_u32(bytes, &mut cursor, "delta pack entry count")?;
-    match read_u8(bytes, &mut cursor, "delta JSON ref mode")? {
-        DELTA_JSON_REFS_INLINE => Ok(false),
-        DELTA_JSON_REFS_MIXED_PACK_INDEX => Ok(true),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta pack has invalid JSON ref mode {other}"),
-        )),
-    }
-}
-
-fn decode_delta_key(
-    bytes: &[u8],
-    cursor: &mut usize,
-    prefixes: &[DeltaKeyPrefix],
-) -> Result<TrackedStateKey, LixError> {
-    let prefix_index = read_var_u32(bytes, cursor, "delta key prefix index")?;
-    let prefix = prefixes.get(prefix_index).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta key prefix index {prefix_index} is out of bounds"),
-        )
-    })?;
-    let entity_id = read_var_entity_identity(bytes, cursor)?;
-    Ok(TrackedStateKey {
-        schema_key: prefix.schema_key.clone(),
-        file_id: prefix.file_id.clone(),
-        entity_id,
-    })
-}
-
-enum DeltaJsonRefDecodeMode<'a> {
-    Inline,
-    MixedPackIndex(&'a [JsonRef]),
-}
-
-fn decode_delta_json_ref_mode<'a>(
-    bytes: &[u8],
-    cursor: &mut usize,
-    pack_json_refs: Option<&'a [JsonRef]>,
-) -> Result<DeltaJsonRefDecodeMode<'a>, LixError> {
-    match read_u8(bytes, cursor, "delta JSON ref mode")? {
-        DELTA_JSON_REFS_INLINE => Ok(DeltaJsonRefDecodeMode::Inline),
-        DELTA_JSON_REFS_MIXED_PACK_INDEX => {
-            let refs = pack_json_refs.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked-state delta pack needs JSON pack refs but none were provided",
-                )
-            })?;
-            Ok(DeltaJsonRefDecodeMode::MixedPackIndex(refs))
-        }
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta pack has invalid JSON ref mode {other}"),
-        )),
-    }
-}
-
-fn decode_delta_value(
-    bytes: &[u8],
-    cursor: &mut usize,
-    pack_commit_id: &str,
-    json_ref_mode: &DeltaJsonRefDecodeMode<'_>,
-) -> Result<TrackedStateIndexValue, LixError> {
-    let value_header = read_u8(bytes, cursor, "delta value header")?;
-    let deleted = decode_value_header(value_header)?;
-    let source_commit_id = match read_u8(bytes, cursor, "delta locator tag")? {
-        DELTA_LOCATOR_SAME_COMMIT => pack_commit_id.to_string(),
-        DELTA_LOCATOR_FULL => read_var_sized_string(bytes, cursor, "source_commit_id")?,
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state delta value has invalid locator tag {other}"),
-            ))
-        }
-    };
-    let source_pack_id =
-        u32::try_from(read_var_u32(bytes, cursor, "source_pack_id")?).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state source_pack_id exceeds u32",
-            )
-        })?;
-    let source_ordinal =
-        u32::try_from(read_var_u32(bytes, cursor, "source_ordinal")?).map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-state source_ordinal exceeds u32",
-            )
-        })?;
-    let change_id = read_var_delta_change_id(bytes, cursor, &source_commit_id)?;
-    let (created_at, updated_at) = read_var_timestamp_pair(bytes, cursor)?;
-    let (snapshot_ref, metadata_ref) = match json_ref_mode {
-        DeltaJsonRefDecodeMode::Inline => (
-            read_optional_json_ref(bytes, cursor, "snapshot_ref")?,
-            read_optional_json_ref(bytes, cursor, "metadata_ref")?,
-        ),
-        DeltaJsonRefDecodeMode::MixedPackIndex(refs) => (
-            read_mixed_optional_json_ref(bytes, cursor, refs, "snapshot_ref")?,
-            read_mixed_optional_json_ref(bytes, cursor, refs, "metadata_ref")?,
-        ),
-    };
-    Ok(TrackedStateIndexValue {
-        change_locator: ChangeLocator {
-            source_commit_id,
-            source_pack_id,
-            source_ordinal,
-            change_id,
+            location,
         },
         deleted,
         snapshot_ref,
         metadata_ref,
         created_at,
         updated_at,
+    })
+}
+
+fn append_segment_location_ref(
+    out: &mut Vec<u8>,
+    location: crate::changelog::SegmentObjectLocationRef<'_>,
+) {
+    push_sized_bytes(out, location.segment_id.as_bytes());
+    out.extend_from_slice(&location.offset.to_be_bytes());
+    out.extend_from_slice(&location.len.to_be_bytes());
+    push_sized_bytes(out, location.checksum.as_bytes());
+}
+
+#[cfg(test)]
+fn segment_location_len(location: &SegmentObjectLocation) -> usize {
+    sized_bytes_len(location.segment_id.as_bytes())
+        + 8
+        + 8
+        + sized_bytes_len(location.checksum.as_bytes())
+}
+
+fn read_segment_location(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<SegmentObjectLocation, LixError> {
+    let segment_id = read_sized_string(bytes, cursor, "segment_id")?;
+    let offset = read_u64(bytes, cursor, "segment_offset")?;
+    let len = read_u64(bytes, cursor, "segment_len")?;
+    let checksum = read_sized_string(bytes, cursor, "segment_checksum")?;
+    Ok(SegmentObjectLocation {
+        segment_id,
+        offset,
+        len,
+        checksum,
     })
 }
 
@@ -1045,49 +664,6 @@ fn push_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn push_var_u32(out: &mut Vec<u8>, value: usize, field_name: &str) -> Result<(), LixError> {
-    let (encoded, len) = var_u32_bytes(value, field_name)?;
-    out.extend_from_slice(&encoded[..len]);
-    Ok(())
-}
-
-fn var_u32_bytes(value: usize, field_name: &str) -> Result<([u8; 5], usize), LixError> {
-    let mut value = u32::try_from(value).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("tracked-state delta pack field '{field_name}' exceeds u32"),
-        )
-    })?;
-    let mut encoded = [0_u8; 5];
-    let mut len = 0usize;
-    while value >= 0x80 {
-        encoded[len] = (value as u8 & 0x7f) | 0x80;
-        len += 1;
-        value >>= 7;
-    }
-    encoded[len] = value as u8;
-    len += 1;
-    Ok((encoded, len))
-}
-
-fn push_var_sized_bytes(out: &mut Vec<u8>, bytes: &[u8], field_name: &str) -> Result<(), LixError> {
-    push_var_u32(out, bytes.len(), field_name)?;
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn push_var_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) -> Result<(), LixError> {
-    assert!(
-        !identity.parts.is_empty(),
-        "tracked-state delta key entity identity must contain at least one part"
-    );
-    push_var_u32(out, identity.parts.len(), "entity identity part count")?;
-    for part in &identity.parts {
-        push_var_sized_bytes(out, part.as_bytes(), "entity identity string part")?;
-    }
-    Ok(())
-}
-
 fn push_optional_json_ref(out: &mut Vec<u8>, json_ref: Option<&JsonRef>) {
     match json_ref {
         Some(json_ref) => {
@@ -1095,56 +671,6 @@ fn push_optional_json_ref(out: &mut Vec<u8>, json_ref: Option<&JsonRef>) {
             out.extend_from_slice(json_ref.as_hash_bytes());
         }
         None => out.push(0),
-    }
-}
-
-fn push_mixed_optional_json_ref(
-    out: &mut Vec<u8>,
-    indexes: &HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>,
-    json_ref: Option<&JsonRef>,
-) -> Result<(), LixError> {
-    let Some(json_ref) = json_ref else {
-        out.push(DELTA_JSON_REF_NONE);
-        return Ok(());
-    };
-    if let Some(index) = indexes.get(json_ref.as_hash_array()).copied() {
-        out.push(DELTA_JSON_REF_PACK_INDEX);
-        push_var_u32(out, index, "json ref pack index")
-    } else {
-        out.push(DELTA_JSON_REF_INLINE);
-        out.extend_from_slice(json_ref.as_hash_bytes());
-        Ok(())
-    }
-}
-
-fn push_var_delta_change_id(
-    out: &mut Vec<u8>,
-    source_commit_id: &str,
-    change_id: &str,
-) -> Result<(), LixError> {
-    if let Some(suffix) = change_id.strip_prefix(source_commit_id) {
-        out.push(DELTA_CHANGE_ID_COMMIT_SUFFIX);
-        push_var_sized_bytes(out, suffix.as_bytes(), "change_id")
-    } else {
-        out.push(DELTA_CHANGE_ID_FULL);
-        push_var_sized_bytes(out, change_id.as_bytes(), "change_id")
-    }
-}
-
-fn read_var_delta_change_id(
-    bytes: &[u8],
-    cursor: &mut usize,
-    source_commit_id: &str,
-) -> Result<String, LixError> {
-    let tag = read_u8(bytes, cursor, "delta change_id tag")?;
-    let value = read_var_sized_string(bytes, cursor, "change_id")?;
-    match tag {
-        DELTA_CHANGE_ID_FULL => Ok(value),
-        DELTA_CHANGE_ID_COMMIT_SUFFIX => Ok(format!("{source_commit_id}{value}")),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta value has invalid change_id tag {other}"),
-        )),
     }
 }
 
@@ -1163,21 +689,6 @@ fn push_timestamp_pair(out: &mut Vec<u8>, created_at: &str, updated_at: &str) {
     }
 }
 
-fn push_var_timestamp_pair(
-    out: &mut Vec<u8>,
-    created_at: &str,
-    updated_at: &str,
-) -> Result<(), LixError> {
-    push_var_sized_bytes(out, created_at.as_bytes(), "created_at")?;
-    if updated_at == created_at {
-        out.push(TIMESTAMP_UPDATED_SAME);
-    } else {
-        out.push(TIMESTAMP_UPDATED_DISTINCT);
-        push_var_sized_bytes(out, updated_at.as_bytes(), "updated_at")?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn timestamp_pair_len(created_at: &str, updated_at: &str) -> usize {
     sized_bytes_len(created_at.as_bytes())
@@ -1194,21 +705,6 @@ fn read_timestamp_pair(bytes: &[u8], cursor: &mut usize) -> Result<(String, Stri
     let updated_at = match read_u8(bytes, cursor, "updated_at tag")? {
         TIMESTAMP_UPDATED_SAME => created_at.clone(),
         TIMESTAMP_UPDATED_DISTINCT => read_sized_string(bytes, cursor, "updated_at")?,
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state timestamp pair has invalid updated_at tag {other}"),
-            ))
-        }
-    };
-    Ok((created_at, updated_at))
-}
-
-fn read_var_timestamp_pair(bytes: &[u8], cursor: &mut usize) -> Result<(String, String), LixError> {
-    let created_at = read_var_sized_string(bytes, cursor, "created_at")?;
-    let updated_at = match read_u8(bytes, cursor, "updated_at tag")? {
-        TIMESTAMP_UPDATED_SAME => created_at.clone(),
-        TIMESTAMP_UPDATED_DISTINCT => read_var_sized_string(bytes, cursor, "updated_at")?,
         other => {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1266,60 +762,6 @@ fn read_sized_slice<'a>(
     Ok(slice)
 }
 
-fn read_var_sized_string(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<String, LixError> {
-    String::from_utf8(read_var_sized_slice(bytes, cursor, field_name)?.to_vec()).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta pack field '{field_name}' is invalid UTF-8: {error}"),
-        )
-    })
-}
-
-fn read_var_sized_slice<'a>(
-    bytes: &'a [u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<&'a [u8], LixError> {
-    let len = read_var_u32(bytes, cursor, field_name)?;
-    let end = cursor.checked_add(len).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta pack field '{field_name}' length overflow"),
-        )
-    })?;
-    let slice = bytes.get(*cursor..end).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state delta pack field '{field_name}' is truncated"),
-        )
-    })?;
-    *cursor = end;
-    Ok(slice)
-}
-
-fn read_var_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity, LixError> {
-    let count = read_var_u32(bytes, cursor, "entity identity part count")?;
-    let mut parts = Vec::new();
-    for _ in 0..count {
-        parts.push(read_var_sized_string(
-            bytes,
-            cursor,
-            "entity identity string part",
-        )?);
-    }
-    if parts.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state delta key entity identity must contain at least one part",
-        ));
-    }
-    Ok(EntityIdentity { parts })
-}
-
 fn read_fixed_hash(
     bytes: &[u8],
     cursor: &mut usize,
@@ -1355,34 +797,6 @@ fn read_optional_json_ref(
     }
 }
 
-fn read_mixed_optional_json_ref(
-    bytes: &[u8],
-    cursor: &mut usize,
-    refs: &[JsonRef],
-    field_name: &str,
-) -> Result<Option<JsonRef>, LixError> {
-    match read_u8(bytes, cursor, field_name)? {
-        DELTA_JSON_REF_NONE => Ok(None),
-        DELTA_JSON_REF_PACK_INDEX => {
-            let index = read_var_u32(bytes, cursor, field_name)?;
-            refs.get(index).copied().map(Some).ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("tracked-state delta JSON ref index {index} is out of bounds"),
-                )
-            })
-        }
-        DELTA_JSON_REF_INLINE => {
-            let hash = read_fixed_hash(bytes, cursor, field_name)?;
-            Ok(Some(JsonRef::from_hash_bytes(hash)))
-        }
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' has invalid JSON ref tag {other}"),
-        )),
-    }
-}
-
 fn read_u8(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u8, LixError> {
     let value = *bytes.get(*cursor).ok_or_else(|| {
         LixError::new(
@@ -1392,35 +806,6 @@ fn read_u8(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u8, Lix
     })?;
     *cursor += 1;
     Ok(value)
-}
-
-fn read_var_u32(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<usize, LixError> {
-    let mut value = 0u32;
-    let mut shift = 0u32;
-    for byte_index in 0..5 {
-        let byte = read_u8(bytes, cursor, field_name)?;
-        if shift == 28 && (byte & 0x80 != 0 || byte & 0x70 != 0) {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state delta pack field '{field_name}' varint exceeds u32"),
-            ));
-        }
-        if byte_index > 0 && byte & 0x80 == 0 && byte == 0 {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state delta pack field '{field_name}' has non-canonical varint"),
-            ));
-        }
-        value |= ((byte & 0x7f) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value as usize);
-        }
-        shift += 7;
-    }
-    Err(LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("tracked-state delta pack field '{field_name}' varint exceeds u32"),
-    ))
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<usize, LixError> {
@@ -1454,6 +839,28 @@ fn read_u64(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u64, L
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_location(
+        commit_id: &str,
+        pack_id: u32,
+        ordinal: u32,
+        checksum: &str,
+    ) -> SegmentObjectLocation {
+        SegmentObjectLocation {
+            segment_id: commit_id.to_string(),
+            offset: u64::from(pack_id),
+            len: u64::from(ordinal),
+            checksum: checksum.to_string(),
+        }
+    }
+
+    fn test_locator(commit_id: &str, pack_id: u32, ordinal: u32, change_id: &str) -> ChangeLocator {
+        ChangeLocator {
+            change_id: change_id.to_string(),
+            commit_id: commit_id.to_string(),
+            location: test_location(commit_id, pack_id, ordinal, change_id),
+        }
+    }
 
     #[test]
     fn key_codec_distinguishes_null_and_value_file_id() {
@@ -1568,12 +975,7 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_locator_value() {
         let value = TrackedStateIndexValue {
-            change_locator: ChangeLocator {
-                source_commit_id: "commit".to_string(),
-                source_pack_id: 7,
-                source_ordinal: 11,
-                change_id: "change".to_string(),
-            },
+            change_locator: test_locator("commit", 7, 11, "change"),
             deleted: false,
             snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
             metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
@@ -1588,12 +990,7 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_second_locator_value() {
         let value = TrackedStateIndexValue {
-            change_locator: ChangeLocator {
-                source_commit_id: "other-commit".to_string(),
-                source_pack_id: 0,
-                source_ordinal: 1,
-                change_id: "other-change".to_string(),
-            },
+            change_locator: test_locator("other-commit", 0, 1, "other-change"),
             deleted: true,
             snapshot_ref: None,
             metadata_ref: None,
@@ -1608,12 +1005,7 @@ mod tests {
     #[test]
     fn value_codec_compacts_matching_timestamps() {
         let mut compact = TrackedStateIndexValue {
-            change_locator: ChangeLocator {
-                source_commit_id: "commit".to_string(),
-                source_pack_id: 0,
-                source_ordinal: 1,
-                change_id: "change".to_string(),
-            },
+            change_locator: test_locator("commit", 0, 1, "change"),
             deleted: false,
             snapshot_ref: None,
             metadata_ref: None,
@@ -1637,315 +1029,10 @@ mod tests {
     }
 
     #[test]
-    fn delta_pack_ref_encoder_roundtrips_entries() {
-        let entity_id = EntityIdentity {
-            parts: vec!["entity-a".to_string()],
-        };
-        let snapshot_ref = JsonRef::from_hash_bytes([1; 32]);
-        let metadata_ref = JsonRef::from_hash_bytes([2; 32]);
-        let live_change = crate::commit_store::ChangeRef {
-            id: "commit-a:change-live",
-            entity_id: &entity_id,
-            schema_key: "schema",
-            file_id: Some("file-a"),
-            snapshot_ref: Some(&snapshot_ref),
-            metadata_ref: Some(&metadata_ref),
-            created_at: "2026-01-01T00:00:00Z",
-        };
-        let tombstone_change = crate::commit_store::ChangeRef {
-            id: "change-deleted",
-            entity_id: &entity_id,
-            schema_key: "schema",
-            file_id: None,
-            snapshot_ref: None,
-            metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z",
-        };
-        let live_locator = crate::commit_store::ChangeLocatorRef {
-            source_commit_id: "commit-a",
-            source_pack_id: 3,
-            source_ordinal: 5,
-            change_id: "commit-a:change-live",
-        };
-        let tombstone_locator = crate::commit_store::ChangeLocatorRef {
-            source_commit_id: "source-commit",
-            source_pack_id: 3,
-            source_ordinal: 6,
-            change_id: "commit-a:borrowed",
-        };
-        let encoded = encode_delta_pack_refs(
-            "commit-a",
-            &[
-                TrackedStateDeltaRef {
-                    change: live_change,
-                    locator: live_locator,
-                    created_at: "2026-01-01T00:00:00Z",
-                    updated_at: "2026-01-02T00:00:00Z",
-                },
-                TrackedStateDeltaRef {
-                    change: tombstone_change,
-                    locator: tombstone_locator,
-                    created_at: "2026-01-03T00:00:00Z",
-                    updated_at: "2026-01-04T00:00:00Z",
-                },
-            ],
-        )
-        .expect("delta pack should encode");
-
-        let mut cursor = 5usize;
-        assert_eq!(
-            read_var_sized_string(&encoded, &mut cursor, "delta pack commit_id")
-                .expect("commit id should decode"),
-            "commit-a"
-        );
-        assert_eq!(
-            read_var_u32(&encoded, &mut cursor, "delta key prefix count")
-                .expect("prefix count should decode"),
-            2
-        );
-
-        let (decoded_commit_id, decoded) =
-            decode_delta_pack(&encoded, None).expect("delta pack should decode");
-
-        assert_eq!(decoded_commit_id, "commit-a");
-        assert_eq!(
-            decoded,
-            vec![
-                TrackedStateDeltaEntry {
-                    key: TrackedStateKey {
-                        schema_key: "schema".to_string(),
-                        file_id: Some("file-a".to_string()),
-                        entity_id: entity_id.clone(),
-                    },
-                    value: TrackedStateIndexValue {
-                        change_locator: ChangeLocator {
-                            source_commit_id: "commit-a".to_string(),
-                            source_pack_id: 3,
-                            source_ordinal: 5,
-                            change_id: "commit-a:change-live".to_string(),
-                        },
-                        deleted: false,
-                        snapshot_ref: Some(snapshot_ref),
-                        metadata_ref: Some(metadata_ref),
-                        created_at: "2026-01-01T00:00:00Z".to_string(),
-                        updated_at: "2026-01-02T00:00:00Z".to_string(),
-                    },
-                },
-                TrackedStateDeltaEntry {
-                    key: TrackedStateKey {
-                        schema_key: "schema".to_string(),
-                        file_id: None,
-                        entity_id,
-                    },
-                    value: TrackedStateIndexValue {
-                        change_locator: ChangeLocator {
-                            source_commit_id: "source-commit".to_string(),
-                            source_pack_id: 3,
-                            source_ordinal: 6,
-                            change_id: "commit-a:borrowed".to_string(),
-                        },
-                        deleted: true,
-                        snapshot_ref: None,
-                        metadata_ref: None,
-                        created_at: "2026-01-03T00:00:00Z".to_string(),
-                        updated_at: "2026-01-04T00:00:00Z".to_string(),
-                    },
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn delta_pack_ref_encoder_roundtrips_mixed_json_pack_indexes() {
-        let entity_id = EntityIdentity::single("entity-a");
-        let snapshot_ref = JsonRef::from_hash_bytes([1; 32]);
-        let metadata_ref = JsonRef::from_hash_bytes([2; 32]);
-        let change = crate::commit_store::ChangeRef {
-            id: "commit-a:change-live",
-            entity_id: &entity_id,
-            schema_key: "schema",
-            file_id: Some("file-a"),
-            snapshot_ref: Some(&snapshot_ref),
-            metadata_ref: Some(&metadata_ref),
-            created_at: "2026-01-01T00:00:00Z",
-        };
-        let locator = crate::commit_store::ChangeLocatorRef {
-            source_commit_id: "commit-a",
-            source_pack_id: 0,
-            source_ordinal: 0,
-            change_id: "commit-a:change-live",
-        };
-        let delta = TrackedStateDeltaRef {
-            change,
-            locator,
-            created_at: "2026-01-01T00:00:00Z",
-            updated_at: "2026-01-01T00:00:00Z",
-        };
-        let mut pack_indexes = HashMap::new();
-        pack_indexes.insert(*snapshot_ref.as_hash_array(), 1);
-        let pack_refs = vec![JsonRef::from_hash_bytes([9; 32]), snapshot_ref];
-
-        let inline = encode_delta_pack_refs("commit-a", &[delta]).expect("inline delta pack");
-        assert!(!delta_pack_uses_json_pack_indexes(&inline).expect("inline mode should peek"));
-        let empty_indexes = HashMap::new();
-        let empty_index_pack = encode_delta_pack_refs_with_json_pack_indexes(
-            "commit-a",
-            &[delta],
-            Some(&empty_indexes),
-        )
-        .expect("empty-index delta pack");
-        assert_eq!(empty_index_pack, inline);
-        assert!(!delta_pack_uses_json_pack_indexes(&empty_index_pack)
-            .expect("empty index mode should peek"));
-        decode_delta_pack(&empty_index_pack, None).expect("empty index pack should decode inline");
-
-        let mixed = encode_delta_pack_refs_with_json_pack_indexes(
-            "commit-a",
-            &[delta],
-            Some(&pack_indexes),
-        )
-        .expect("mixed delta pack");
-        assert!(delta_pack_uses_json_pack_indexes(&mixed).expect("mixed mode should peek"));
-
-        assert!(
-            mixed.len() < inline.len(),
-            "pack-index refs should be smaller than inline refs"
-        );
-        assert!(decode_delta_pack(&mixed, None)
-            .expect_err("mixed refs require JSON pack refs")
-            .to_string()
-            .contains("needs JSON pack refs"));
-        let (_, decoded) =
-            decode_delta_pack(&mixed, Some(&pack_refs)).expect("mixed delta pack should decode");
-        assert_eq!(decoded[0].value.snapshot_ref, Some(snapshot_ref));
-        assert_eq!(decoded[0].value.metadata_ref, Some(metadata_ref));
-    }
-
-    #[test]
-    fn delta_pack_stream_decoder_rejects_trailing_entry_bytes() {
-        let entity_id = EntityIdentity::single("entity");
-        let change = crate::commit_store::ChangeRef {
-            id: "commit-a:change-0",
-            entity_id: &entity_id,
-            schema_key: "schema",
-            file_id: None,
-            snapshot_ref: None,
-            metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z",
-        };
-        let locator = crate::commit_store::ChangeLocatorRef {
-            source_commit_id: "commit-a",
-            source_pack_id: 0,
-            source_ordinal: 0,
-            change_id: "commit-a:change-0",
-        };
-        let mut encoded = encode_delta_pack_refs(
-            "commit-a",
-            &[TrackedStateDeltaRef {
-                change,
-                locator,
-                created_at: "2026-01-01T00:00:00Z",
-                updated_at: "2026-01-01T00:00:00Z",
-            }],
-        )
-        .expect("delta pack should encode");
-
-        let mut cursor = 5usize;
-        let _ = read_var_sized_string(&encoded, &mut cursor, "delta pack commit_id")
-            .expect("commit id should decode");
-        assert_eq!(
-            read_var_u32(&encoded, &mut cursor, "delta key prefix count")
-                .expect("prefix count should decode"),
-            1
-        );
-        let _ =
-            decode_delta_key_prefix(&encoded, &mut cursor).expect("delta key prefix should decode");
-        encoded[cursor] = 0;
-
-        let error =
-            decode_delta_pack(&encoded, None).expect_err("trailing entry bytes should reject");
-        assert!(
-            error.to_string().contains("trailing bytes"),
-            "error should mention trailing bytes: {error}"
-        );
-    }
-
-    #[test]
-    fn delta_pack_rejects_overlong_varint() {
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(b"LXTD");
-        encoded.push(DELTA_PACK_VERSION);
-        encoded.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80]);
-
-        let error = decode_delta_pack(&encoded, None).expect_err("overlong varint should reject");
-        assert!(
-            error.to_string().contains("varint exceeds u32"),
-            "error should mention overlong varint: {error}"
-        );
-    }
-
-    #[test]
-    fn delta_pack_rejects_varint_above_u32() {
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(b"LXTD");
-        encoded.push(DELTA_PACK_VERSION);
-        encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x1f]);
-
-        let error = decode_delta_pack(&encoded, None).expect_err("too-large varint should reject");
-        assert!(
-            error.to_string().contains("varint exceeds u32"),
-            "error should mention oversized varint: {error}"
-        );
-    }
-
-    #[test]
-    fn delta_pack_rejects_non_canonical_varint() {
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(b"LXTD");
-        encoded.push(DELTA_PACK_VERSION);
-        encoded.extend_from_slice(&[0x80, 0x00]);
-
-        let error =
-            decode_delta_pack(&encoded, None).expect_err("non-canonical varint should reject");
-        assert!(
-            error.to_string().contains("non-canonical varint"),
-            "error should mention non-canonical varint: {error}"
-        );
-    }
-
-    #[test]
-    fn delta_key_decoder_rejects_out_of_bounds_prefix_index() {
-        let mut encoded_key = Vec::new();
-        push_var_u32(&mut encoded_key, 1, "delta key prefix index").expect("prefix index");
-        push_var_entity_identity(&mut encoded_key, &EntityIdentity::single("entity"))
-            .expect("entity identity");
-
-        let mut cursor = 0usize;
-        let err = decode_delta_key(
-            &encoded_key,
-            &mut cursor,
-            &[DeltaKeyPrefix {
-                schema_key: "schema".to_string(),
-                file_id: None,
-            }],
-        )
-        .expect_err("out-of-bounds prefix index should reject");
-
-        assert!(err
-            .to_string()
-            .contains("tracked-state delta key prefix index 1 is out of bounds"));
-    }
-
-    #[test]
     fn encoded_value_len_matches_encoded_value_bytes() {
         let values = [
             TrackedStateIndexValue {
-                change_locator: ChangeLocator {
-                    source_commit_id: "commit".to_string(),
-                    source_pack_id: 0,
-                    source_ordinal: 0,
-                    change_id: "change".to_string(),
-                },
+                change_locator: test_locator("commit", 0, 0, "change"),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: None,
@@ -1953,12 +1040,7 @@ mod tests {
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
             TrackedStateIndexValue {
-                change_locator: ChangeLocator {
-                    source_commit_id: "commit".to_string(),
-                    source_pack_id: 1,
-                    source_ordinal: 2,
-                    change_id: "change-2".to_string(),
-                },
+                change_locator: test_locator("commit", 1, 2, "change-2"),
                 deleted: true,
                 snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
                 metadata_ref: None,
@@ -1966,12 +1048,7 @@ mod tests {
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
             TrackedStateIndexValue {
-                change_locator: ChangeLocator {
-                    source_commit_id: "other".to_string(),
-                    source_pack_id: 4,
-                    source_ordinal: 8,
-                    change_id: "change-3".to_string(),
-                },
+                change_locator: test_locator("other", 4, 8, "change-3"),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),

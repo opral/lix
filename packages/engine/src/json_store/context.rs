@@ -4,13 +4,10 @@ use crate::json_store::types::{
     JsonProjectionLoadRequestRef, JsonRef, JsonValueBatch, JsonWritePlacementRef,
     NormalizedJsonRef,
 };
-use crate::storage::{StorageKey, StorageValue};
-use crate::storage::{StorageRead, StorageWriteSet};
+use crate::storage::{StorageKey, StorageRead, StorageValue, StorageWriteSet};
 use crate::LixError;
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
-
-const PACK_LOCAL_MAX_JSON_BYTES: usize = 64 * 1024;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JsonStoreContext;
@@ -39,23 +36,6 @@ impl JsonStoreContext {
         store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
             .await
             .map(JsonLoadBatch::new)
-    }
-
-    pub(crate) fn commit_pack_key(&self, commit_id: &str, pack_id: u32) -> StorageKey {
-        StorageKey(Bytes::from(store::pack_key(commit_id, pack_id)))
-    }
-
-    pub(crate) fn decode_pack_refs(&self, bytes: &[u8]) -> Result<Vec<JsonRef>, LixError> {
-        store::decode_json_pack_refs(bytes)
-    }
-
-    pub(crate) fn load_commit_pack_bytes(
-        &self,
-        store: &(impl StorageRead + ?Sized),
-        commit_id: &str,
-        pack_id: u32,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        store::load_commit_pack_bytes(store, commit_id, pack_id)
     }
 }
 
@@ -144,12 +124,6 @@ where
 
 pub(crate) struct JsonStoreWriter;
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct JsonStageBatchReport {
-    pub(crate) refs: Vec<JsonRef>,
-    pub(crate) pack_indexes: HashMap<[u8; 32], usize>,
-}
-
 impl JsonStoreWriter {
     fn new() -> Self {
         Self
@@ -158,19 +132,10 @@ impl JsonStoreWriter {
     pub(crate) fn stage_batch<'a>(
         &mut self,
         writes: &mut StorageWriteSet,
-        placement: JsonWritePlacementRef<'a>,
+        placement: JsonWritePlacementRef,
         payloads: impl IntoIterator<Item = NormalizedJsonRef<'a>>,
     ) -> Result<Vec<JsonRef>, LixError> {
-        self.stage_batch_report(writes, placement, payloads)
-            .map(|report| report.refs)
-    }
-
-    pub(crate) fn stage_batch_report<'a>(
-        &mut self,
-        writes: &mut StorageWriteSet,
-        placement: JsonWritePlacementRef<'a>,
-        payloads: impl IntoIterator<Item = NormalizedJsonRef<'a>>,
-    ) -> Result<JsonStageBatchReport, LixError> {
+        let JsonWritePlacementRef::OutOfBand = placement;
         let mut unique_encoded = Vec::new();
         let mut order = Vec::new();
         let mut seen = HashSet::new();
@@ -192,32 +157,7 @@ impl JsonStoreWriter {
             }
         }
 
-        let pack_local = matches!(placement, JsonWritePlacementRef::CommitPack { .. });
-        let mut pack_indexes = HashMap::new();
-        if let JsonWritePlacementRef::CommitPack { commit_id, pack_id } = placement {
-            let pack_entries = unique_encoded
-                .iter()
-                .filter(|encoded| encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES)
-                .collect::<Vec<_>>();
-            for (index, encoded) in pack_entries.iter().enumerate() {
-                pack_indexes.insert(*encoded.json_ref.as_hash_array(), index);
-            }
-            if !pack_entries.is_empty() {
-                let encoded_pack = store::encode_json_pack(&pack_entries)?;
-                writes.put(
-                    store::JSON_PACK_SPACE,
-                    StorageKey(Bytes::from(store::pack_key(commit_id, pack_id))),
-                    StorageValue {
-                        bytes: Bytes::from(encoded_pack),
-                    },
-                );
-            }
-        }
-
         for encoded in &unique_encoded {
-            if pack_local && encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES {
-                continue;
-            }
             writes.put(
                 store::JSON_SPACE,
                 StorageKey(Bytes::copy_from_slice(encoded.json_ref.as_hash_bytes())),
@@ -227,195 +167,6 @@ impl JsonStoreWriter {
             );
         }
 
-        Ok(JsonStageBatchReport {
-            refs: order,
-            pack_indexes,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::json_store::types::JsonReadScopeRef;
-    use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-
-    #[tokio::test]
-    async fn commit_local_batch_writes_pack_without_direct_rows() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let context = JsonStoreContext::new();
-        let first = "{\"value\":\"first\"}";
-        let second = "{\"value\":\"second\"}";
-
-        let mut writes = storage.new_write_set();
-        context
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::CommitPack {
-                    commit_id: "commit-a",
-                    pack_id: 0,
-                },
-                [
-                    NormalizedJsonRef::new(first),
-                    NormalizedJsonRef::new(second),
-                ],
-            )
-            .expect("json pack should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("json pack should commit");
-
-        let refs = [
-            JsonRef::for_content(first.as_bytes()),
-            JsonRef::for_content(second.as_bytes()),
-        ];
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let unknown = context
-            .reader(read)
-            .load_bytes_many(JsonLoadRequestRef {
-                refs: &refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            })
-            .await
-            .expect("unknown load should check direct rows");
-        assert_eq!(unknown.into_values(), vec![None, None]);
-
-        let pack_ids = [0];
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let packed = context
-            .reader(read)
-            .load_bytes_many(JsonLoadRequestRef {
-                refs: &refs,
-                scope: JsonReadScopeRef::CommitPacks {
-                    commit_id: "commit-a",
-                    pack_ids: &pack_ids,
-                },
-            })
-            .await
-            .expect("packed load should hydrate");
-        assert_eq!(
-            packed.into_values(),
-            vec![
-                Some(first.as_bytes().to_vec()),
-                Some(second.as_bytes().to_vec())
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn commit_local_batch_dedupes_pack_payloads_but_returns_request_order() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let context = JsonStoreContext::new();
-        let first = "{\"value\":\"first\"}";
-        let second = "{\"value\":\"second\"}";
-
-        let mut writes = storage.new_write_set();
-        let staged_refs = context
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::CommitPack {
-                    commit_id: "commit-a",
-                    pack_id: 0,
-                },
-                [
-                    NormalizedJsonRef::new(first),
-                    NormalizedJsonRef::new(first),
-                    NormalizedJsonRef::new(second),
-                ],
-            )
-            .expect("json pack should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("json pack should commit");
-
-        let first_ref = JsonRef::for_content(first.as_bytes());
-        let second_ref = JsonRef::for_content(second.as_bytes());
-        assert_eq!(staged_refs, vec![first_ref, first_ref, second_ref]);
-
-        let refs = [first_ref, second_ref];
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let unknown = context
-            .reader(read)
-            .load_bytes_many(JsonLoadRequestRef {
-                refs: &refs,
-                scope: JsonReadScopeRef::OutOfBand,
-            })
-            .await
-            .expect("unknown load should check direct rows");
-        assert_eq!(unknown.into_values(), vec![None, None]);
-
-        let pack_ids = [0];
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let packed = context
-            .reader(read)
-            .load_bytes_many(JsonLoadRequestRef {
-                refs: &refs,
-                scope: JsonReadScopeRef::CommitPacks {
-                    commit_id: "commit-a",
-                    pack_ids: &pack_ids,
-                },
-            })
-            .await
-            .expect("packed load should hydrate");
-        assert_eq!(
-            packed.into_values(),
-            vec![
-                Some(first.as_bytes().to_vec()),
-                Some(second.as_bytes().to_vec())
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn commit_local_batch_accepts_trusted_prehashed_payload() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let context = JsonStoreContext::new();
-        let json = "{\"value\":\"prehashed\"}";
-        let json_ref = JsonRef::for_content(json.as_bytes());
-
-        let mut writes = storage.new_write_set();
-        let refs = context
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::CommitPack {
-                    commit_id: "commit-a",
-                    pack_id: 0,
-                },
-                [NormalizedJsonRef::trusted_prehashed(json, json_ref)],
-            )
-            .expect("prehashed json should stage");
-        assert_eq!(refs, vec![json_ref]);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("json pack should commit");
-
-        let pack_ids = [0];
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let packed = context
-            .reader(read)
-            .load_bytes_many(JsonLoadRequestRef {
-                refs: &refs,
-                scope: JsonReadScopeRef::CommitPacks {
-                    commit_id: "commit-a",
-                    pack_ids: &pack_ids,
-                },
-            })
-            .await
-            .expect("prehashed payload should hydrate");
-        assert_eq!(packed.into_values(), vec![Some(json.as_bytes().to_vec())]);
+        Ok(order)
     }
 }

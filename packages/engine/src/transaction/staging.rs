@@ -147,6 +147,13 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
+    pub(crate) fn is_tombstone(&self) -> bool {
+        match self {
+            Self::State(row) => row.snapshot.is_none(),
+            Self::Adopted(row) => row.snapshot_ref.is_none(),
+        }
+    }
+
     pub(crate) fn untracked(&self) -> bool {
         match self {
             Self::State(row) => row.untracked,
@@ -193,7 +200,7 @@ impl<'a> PreparedWriteValidationIndex<'a> {
             .flat_map(|(target_scope, rows)| {
                 rows.iter().copied().filter(move |row| {
                     schema_scope.validation_scope_contains_constraint_domain(target_scope)
-                        || (row.snapshot_json().is_none()
+                        || (row.is_tombstone()
                             && target_scope.tombstone_domain_affects_validation_scope(schema_scope))
                 })
             })
@@ -690,7 +697,7 @@ impl PreparedStateRowOverlay {
             });
         }
         self.load_adopted_slot(&identity).map(|row| {
-            if row.snapshot.is_none() {
+            if row.snapshot_ref.is_none() {
                 StagedExactRow::Tombstone
             } else {
                 StagedExactRow::Row(MaterializedLiveStateRow::from(&row))

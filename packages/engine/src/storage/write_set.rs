@@ -7,8 +7,67 @@ use crate::backend::{
 };
 use crate::storage::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
+use bytes::Bytes;
 
 type FastHashBuilder = RandomState;
+
+pub trait IntoStorageSpace {
+    fn into_storage_space(self) -> StorageSpace;
+}
+
+impl IntoStorageSpace for StorageSpace {
+    fn into_storage_space(self) -> StorageSpace {
+        self
+    }
+}
+
+pub trait IntoStorageKey {
+    fn into_storage_key(self) -> Key;
+}
+
+impl IntoStorageKey for Key {
+    fn into_storage_key(self) -> Key {
+        self
+    }
+}
+
+impl IntoStorageKey for Vec<u8> {
+    fn into_storage_key(self) -> Key {
+        Key(Bytes::from(self))
+    }
+}
+
+impl IntoStorageKey for &[u8] {
+    fn into_storage_key(self) -> Key {
+        Key(Bytes::copy_from_slice(self))
+    }
+}
+
+pub trait IntoStorageValue {
+    fn into_storage_value(self) -> StoredValue;
+}
+
+impl IntoStorageValue for StoredValue {
+    fn into_storage_value(self) -> StoredValue {
+        self
+    }
+}
+
+impl IntoStorageValue for Vec<u8> {
+    fn into_storage_value(self) -> StoredValue {
+        StoredValue {
+            bytes: Bytes::from(self),
+        }
+    }
+}
+
+impl IntoStorageValue for &[u8] {
+    fn into_storage_value(self) -> StoredValue {
+        StoredValue {
+            bytes: Bytes::copy_from_slice(self),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StorageWriteSet {
@@ -66,15 +125,42 @@ impl StorageWriteSet {
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
-    pub fn put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
-        self.stats.staged_puts += 1;
-        self.stats.written_bytes += value.bytes.len() as u64;
-        self.group_mut(space).puts.push(PutEntry { key, value });
+    pub(crate) async fn apply<B>(
+        self,
+        writer: &mut crate::storage::context::StorageWriteTransaction<'_, B>,
+    ) -> Result<StorageWriteSetStats, crate::LixError>
+    where
+        B: Backend,
+    {
+        writer.write_set(self)
     }
 
-    pub fn delete(&mut self, space: StorageSpace, key: Key) {
+    pub fn put<S, K, V>(&mut self, space: S, key: K, value: V)
+    where
+        S: IntoStorageSpace,
+        K: IntoStorageKey,
+        V: IntoStorageValue,
+    {
+        let value = value.into_storage_value();
+        self.stats.staged_puts += 1;
+        self.stats.written_bytes += value.bytes.len() as u64;
+        self.group_mut(space.into_storage_space())
+            .puts
+            .push(PutEntry {
+                key: key.into_storage_key(),
+                value,
+            });
+    }
+
+    pub fn delete<S, K>(&mut self, space: S, key: K)
+    where
+        S: IntoStorageSpace,
+        K: IntoStorageKey,
+    {
         self.stats.staged_deletes += 1;
-        self.group_mut(space).deletes.push(key);
+        self.group_mut(space.into_storage_space())
+            .deletes
+            .push(key.into_storage_key());
     }
 
     /// Reserves capacity for a storage space's grouped puts and deletes.
@@ -90,6 +176,21 @@ impl StorageWriteSet {
         let group = self.group_mut(space);
         group.puts.reserve(expected_puts);
         group.deletes.reserve(expected_deletes);
+    }
+
+    pub(crate) fn move_space_to_end(&mut self, space: StorageSpace) {
+        let Some(index) = self.group_index.get(&space.id).copied() else {
+            return;
+        };
+        if index + 1 == self.groups.len() {
+            return;
+        }
+        let group = self.groups.remove(index);
+        self.groups.push(group);
+        self.group_index.clear();
+        for (index, group) in self.groups.iter().enumerate() {
+            self.group_index.insert(group.space.id, index);
+        }
     }
 
     pub fn extend(&mut self, other: StorageWriteSet) {

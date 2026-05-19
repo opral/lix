@@ -44,6 +44,39 @@ simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
     );
 });
 
+simulation_test!(lix_change_includes_commit_changes, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('commit-change-query', 'one')",
+            &[],
+        )
+        .await
+        .expect("tracked write should succeed");
+
+    let result = session
+        .execute(
+            "SELECT schema_key FROM lix_change WHERE schema_key = 'lix_commit' LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("lix_change should include commit changes");
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("lix_commit".to_string())]
+    );
+});
+
 simulation_test!(
     lix_change_entity_id_is_json_array_for_composite_primary_keys,
     |sim| async move {
