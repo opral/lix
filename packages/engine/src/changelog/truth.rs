@@ -353,7 +353,7 @@ pub(super) fn build_segment_truth_overlay<'a>(
     stored: &SegmentTruthSnapshot,
     staged: impl IntoIterator<Item = &'a Segment>,
 ) -> Result<SegmentTruthOverlay, LixError> {
-    let mut segment_ids = stored.segment_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut id_set = SegmentTruthIdSet::from_stored(stored);
     let mut commits = stored
         .commits
         .iter()
@@ -384,54 +384,96 @@ pub(super) fn build_segment_truth_overlay<'a>(
         .collect::<HashMap<_, _>>();
 
     for segment in staged {
-        validate_segment_shape(segment)?;
-        if !segment_ids.insert(segment.header.segment_id.clone()) {
-            return Err(LixError::unknown(format!(
-                "changelog segment '{}' already exists",
-                segment.header.segment_id
-            )));
-        }
-        for (commit_id, location, commit) in validated_segment_commit_entries(segment)? {
-            if commits
-                .insert(
+        validate_staged_truth_segment(
+            &mut id_set,
+            segment,
+            |commit_id, location, commit| {
+                commits.insert(
                     commit_id.to_string(),
                     SegmentCommitTruthEntry {
                         source: SegmentTruthSource::Staged,
                         location,
                         commit: commit.clone(),
                     },
-                )
-                .is_some()
-            {
-                return Err(LixError::unknown(format!(
-                    "changelog commit '{commit_id}' already exists in another segment"
-                )));
-            }
-        }
-        for (change_id, location, change) in validated_segment_change_entries(segment)? {
-            if changes
-                .insert(
+                );
+            },
+            |change_id, location, change| {
+                changes.insert(
                     change_id.to_string(),
                     SegmentChangeTruthEntry {
                         source: SegmentTruthSource::Staged,
                         location,
                         change: change.clone(),
                     },
-                )
-                .is_some()
-            {
-                return Err(LixError::unknown(format!(
-                    "changelog change '{change_id}' already exists in another segment"
-                )));
-            }
-        }
+                );
+            },
+        )?;
     }
 
     Ok(SegmentTruthOverlay {
-        segment_ids,
+        segment_ids: id_set.segment_ids,
         commits,
         changes,
     })
+}
+
+pub(super) fn validate_segment_truth_overlay<'a>(
+    stored: &SegmentTruthSnapshot,
+    staged: impl IntoIterator<Item = &'a Segment>,
+) -> Result<(), LixError> {
+    let mut id_set = SegmentTruthIdSet::from_stored(stored);
+    for segment in staged {
+        validate_staged_truth_segment(&mut id_set, segment, |_, _, _| {}, |_, _, _| {})?;
+    }
+    Ok(())
+}
+
+struct SegmentTruthIdSet {
+    segment_ids: HashSet<String>,
+    commit_ids: HashSet<String>,
+    change_ids: HashSet<String>,
+}
+
+impl SegmentTruthIdSet {
+    fn from_stored(stored: &SegmentTruthSnapshot) -> Self {
+        Self {
+            segment_ids: stored.segment_ids.iter().cloned().collect(),
+            commit_ids: stored.commits.keys().cloned().collect(),
+            change_ids: stored.changes.keys().cloned().collect(),
+        }
+    }
+}
+
+fn validate_staged_truth_segment(
+    id_set: &mut SegmentTruthIdSet,
+    segment: &Segment,
+    mut on_commit: impl FnMut(&str, SegmentObjectLocation, &SegmentCommit),
+    mut on_change: impl FnMut(&str, SegmentObjectLocation, &SegmentChange),
+) -> Result<(), LixError> {
+    validate_segment_shape(segment)?;
+    if !id_set.segment_ids.insert(segment.header.segment_id.clone()) {
+        return Err(LixError::unknown(format!(
+            "changelog segment '{}' already exists",
+            segment.header.segment_id
+        )));
+    }
+    for (commit_id, location, commit) in validated_segment_commit_entries(segment)? {
+        if !id_set.commit_ids.insert(commit_id.to_string()) {
+            return Err(LixError::unknown(format!(
+                "changelog commit '{commit_id}' already exists in another segment"
+            )));
+        }
+        on_commit(commit_id, location, commit);
+    }
+    for (change_id, location, change) in validated_segment_change_entries(segment)? {
+        if !id_set.change_ids.insert(change_id.to_string()) {
+            return Err(LixError::unknown(format!(
+                "changelog change '{change_id}' already exists in another segment"
+            )));
+        }
+        on_change(change_id, location, change);
+    }
+    Ok(())
 }
 
 async fn scan_segment_truth<S>(
