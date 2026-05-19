@@ -1,14 +1,15 @@
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, KeyRef,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use redb::{
@@ -28,12 +29,14 @@ pub struct RedbBackendFactory {
 #[derive(Clone, Debug)]
 pub struct RedbBackendFixture {
     path: PathBuf,
+    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
 pub struct RedbBackend {
     path: PathBuf,
     db: Arc<Database>,
+    durable_write_lock: DurableWriteLock,
 }
 
 pub struct RedbRead {
@@ -76,7 +79,10 @@ impl BackendFactory for RedbBackendFactory {
             .temp_dir
             .path()
             .join(format!("backend-{database_id}.redb"));
-        RedbBackendFixture { path }
+        RedbBackendFixture {
+            durable_write_lock: durable_write_lock_for_path(&path),
+            path,
+        }
     }
 
     fn config(&self) -> BackendTestConfig {
@@ -92,16 +98,30 @@ impl BackendFixture for RedbBackendFixture {
     type Backend = RedbBackend;
 
     fn open(&self) -> Self::Backend {
-        RedbBackend::open(&self.path).expect("open redb backend")
+        RedbBackend::open_with_write_lock(&self.path, self.durable_write_lock.clone())
+            .expect("open redb backend")
     }
 }
 
 impl RedbBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
+        let durable_write_lock = durable_write_lock_for_path(&path);
+        Self::open_with_write_lock(path, durable_write_lock)
+    }
+
+    fn open_with_write_lock(
+        path: impl Into<PathBuf>,
+        durable_write_lock: DurableWriteLock,
+    ) -> Result<Self, BackendError> {
+        let path = path.into();
         let db = Arc::new(Database::create(&path).map_err(redb_error)?);
         initialize_database(&db)?;
-        Ok(Self { path, db })
+        Ok(Self {
+            path,
+            db,
+            durable_write_lock,
+        })
     }
 
     #[allow(dead_code)]
@@ -136,6 +156,48 @@ impl Backend for RedbBackend {
             write: self.db.begin_write().map_err(redb_error)?,
             stats: WriteStats::default(),
         })
+    }
+
+    fn durable_write_lock(&self) -> DurableWriteLock {
+        self.durable_write_lock.clone()
+    }
+}
+
+fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
+    let key = canonical_lock_key(path);
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("redb durable write lock registry should not poison");
+    if let Some(lock) = locks.get(&key) {
+        return lock.clone();
+    }
+    let lock = DurableWriteLock::new();
+    locks.insert(key, lock.clone());
+    lock
+}
+
+fn canonical_lock_key(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .expect("current directory should be available")
+            .join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return absolute;
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return absolute;
+    };
+    match absolute.file_name() {
+        Some(file_name) => parent.join(file_name),
+        None => parent,
     }
 }
 

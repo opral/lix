@@ -2448,6 +2448,37 @@ fn current_sql2_data_sink_exec_violations() -> Vec<SqlRuntimeOwnershipViolation>
     violations.into_iter().collect()
 }
 
+fn current_session_transaction_durable_commit_boundary_violations() -> Vec<RawSqlExecutionViolation>
+{
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !(relative_path.starts_with("session/") || relative_path.starts_with("transaction/")) {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        let lines: Vec<&str> = masked_source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(".commit_write_set(") {
+                continue;
+            }
+            let start = index.saturating_sub(5);
+            let window = lines[start..=index].join("\n");
+            if !window.contains("commit_at_boundary(Some(")
+                && !window.contains("commit_at_boundary(commit_boundary.as_ref()")
+            {
+                violations.insert(RawSqlExecutionViolation {
+                    file: relative_path.clone(),
+                    pattern: ".commit_write_set(",
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
 fn current_schema_catalog_dependency_violations() -> Vec<ImportPathViolation> {
     let module_set = top_level_module_set();
     let mut violations = BTreeSet::new();
@@ -2967,6 +2998,17 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "register_lix_file_by_version_write_provider",
             "register_lix_file_write_providers",
         ],
+    );
+}
+
+#[test]
+fn session_transaction_durable_commits_go_through_commit_boundary() {
+    let violations = current_session_transaction_durable_commit_boundary_violations();
+
+    assert!(
+        violations.is_empty(),
+        "session/transaction durable writes must use `commit_at_boundary` so close cannot race the final pre-commit check. Low-level storage, init, and engine maintenance writes are the MVP escape hatches.\n\nCurrent violations:\n{}",
+        render_grouped_raw_sql_execution_violations(&violations),
     );
 }
 

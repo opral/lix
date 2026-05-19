@@ -1,6 +1,6 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::ops::Bound;
 
     use bytes::Bytes;
@@ -8,10 +8,11 @@ mod wasm {
     use lix_rs_sdk::{
         open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
         BackendRead, BackendWrite, CommitResult, CoreProjection, CreateVersionOptions,
-        ExecuteResult, GetOptions, InMemoryBackend, Key, KeyRange, Lix as RsLix, LixError,
-        LixTransaction as RsLixTransaction, MergeVersionOptions, MergeVersionPreviewOptions,
-        PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
-        ScanVisitor, StoredValue, SwitchVersionOptions, Value, WriteOptions, WriteStats,
+        DurableWriteLock, ExecuteResult, GetOptions, InMemoryBackend, Key, KeyRange, Lix as RsLix,
+        LixError, LixTransaction as RsLixTransaction, MergeVersionOptions,
+        MergeVersionPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
+        ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchVersionOptions, Value,
+        WriteOptions, WriteStats,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -602,14 +603,39 @@ export type MergeConflictSide = {
         }
     }
 
+    thread_local! {
+        static JS_BACKEND_LOCKS: RefCell<Vec<(JsValue, DurableWriteLock)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    fn durable_write_lock_for_js_backend(backend: &JsValue) -> DurableWriteLock {
+        JS_BACKEND_LOCKS.with(|locks| {
+            let mut locks = locks.borrow_mut();
+            if let Some((_, lock)) = locks
+                .iter()
+                .find(|(known_backend, _)| Object::is(known_backend, backend))
+            {
+                return lock.clone();
+            }
+            let lock = DurableWriteLock::new();
+            locks.push((backend.clone(), lock.clone()));
+            lock
+        })
+    }
+
     #[derive(Clone)]
     struct JsBackend {
         inner: JsValue,
+        durable_write_lock: DurableWriteLock,
     }
 
     impl JsBackend {
         fn new(inner: JsValue) -> Self {
-            Self { inner }
+            let durable_write_lock = durable_write_lock_for_js_backend(&inner);
+            Self {
+                inner,
+                durable_write_lock,
+            }
         }
 
         fn begin_transaction(&self, method_name: &str) -> Result<JsValue, BackendError> {
@@ -639,6 +665,10 @@ export type MergeConflictSide = {
 
         fn capabilities(&self) -> BackendCapabilities {
             InMemoryBackend::new().capabilities()
+        }
+
+        fn durable_write_lock(&self) -> DurableWriteLock {
+            self.durable_write_lock.clone()
         }
 
         fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {

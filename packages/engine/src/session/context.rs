@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -16,10 +15,11 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
-use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
+use crate::storage::{
+    DurableWriteGuard, DurableWriteLock, InMemoryStorageBackend, StorageBackend, StorageReadOptions,
+};
 use crate::storage::{StorageContext, StorageRead, StorageReadScope};
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::TransactionCommitBoundary;
 use crate::transaction::{open_transaction, Transaction};
 use crate::version::{
     VersionContext, VersionLifecycle, VersionOperation, VersionRefReader, VersionReferenceRole,
@@ -27,7 +27,7 @@ use crate::version::{
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
-use super::transaction::transaction_state_error;
+use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 
 pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 
@@ -53,13 +53,8 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
-    pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
-    closed: Arc<AtomicBool>,
-    active_transaction: Arc<AtomicBool>,
-    operation_in_progress: Arc<AtomicUsize>,
-    operation_watch: tokio::sync::watch::Sender<usize>,
-    commit_in_progress: Arc<AtomicBool>,
-    commit_watch: tokio::sync::watch::Sender<bool>,
+    pub(super) write_lock: DurableWriteLock,
+    transaction_manager: SessionTransactionManager,
 }
 
 impl<B> SessionContext<B>
@@ -75,7 +70,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: Arc<tokio::sync::Mutex<()>>,
+        write_lock: DurableWriteLock,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -99,7 +94,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: Arc<tokio::sync::Mutex<()>>,
+        write_lock: DurableWriteLock,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -123,11 +118,9 @@ where
         binary_cas: Arc<BinaryCasContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: Arc<tokio::sync::Mutex<()>>,
+        write_lock: DurableWriteLock,
     ) -> Self {
-        let (operation_watch, _) = tokio::sync::watch::channel(0);
-        let (commit_watch, _) = tokio::sync::watch::channel(false);
-        Self::new_with_closed(
+        Self::new_with_transaction_manager(
             mode,
             storage,
             live_state,
@@ -136,16 +129,11 @@ where
             version_ctx,
             catalog_context,
             write_lock,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicUsize::new(0)),
-            operation_watch,
-            Arc::new(AtomicBool::new(false)),
-            commit_watch,
+            SessionTransactionManager::new(),
         )
     }
 
-    pub(super) fn new_with_closed(
+    pub(super) fn new_with_transaction_manager(
         mode: SessionMode,
         storage: StorageContext<B>,
         live_state: Arc<LiveStateContext>,
@@ -153,13 +141,8 @@ where
         binary_cas: Arc<BinaryCasContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: Arc<tokio::sync::Mutex<()>>,
-        closed: Arc<AtomicBool>,
-        active_transaction: Arc<AtomicBool>,
-        operation_in_progress: Arc<AtomicUsize>,
-        operation_watch: tokio::sync::watch::Sender<usize>,
-        commit_in_progress: Arc<AtomicBool>,
-        commit_watch: tokio::sync::watch::Sender<bool>,
+        write_lock: DurableWriteLock,
+        transaction_manager: SessionTransactionManager,
     ) -> Self {
         Self {
             mode,
@@ -170,102 +153,80 @@ where
             version_ctx,
             catalog_context,
             write_lock,
-            closed,
-            active_transaction,
-            operation_in_progress,
-            operation_watch,
-            commit_in_progress,
-            commit_watch,
+            transaction_manager,
         }
     }
 
     /// Releases this logical session handle. This is a lifecycle boundary only:
     /// successful writes are committed before their operation returns.
     pub async fn close(&self) -> Result<(), LixError> {
-        self.closed.store(true, Ordering::SeqCst);
-        let mut operation_rx = self.operation_watch.subscribe();
-        let mut commit_rx = self.commit_watch.subscribe();
-        loop {
-            let operation_count = self.operation_in_progress.load(Ordering::SeqCst);
-            let commit_active =
-                *commit_rx.borrow_and_update() || self.commit_in_progress.load(Ordering::SeqCst);
-            if operation_count == 0 && !commit_active {
-                break;
-            }
-            tokio::select! {
-                result = operation_rx.changed() => {
-                    if result.is_err() && !commit_active {
-                        break;
-                    }
-                }
-                result = commit_rx.changed() => {
-                    if result.is_err() && operation_count == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.transaction_manager.close().await
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn closed_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.closed)
-    }
-
-    pub(crate) fn active_transaction_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.active_transaction)
-    }
-
-    pub(crate) fn operation_in_progress_flag(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.operation_in_progress)
-    }
-
-    pub(crate) fn operation_watch(&self) -> tokio::sync::watch::Sender<usize> {
-        self.operation_watch.clone()
+        self.transaction_manager.is_closed()
     }
 
     #[cfg(test)]
     pub(crate) fn operation_in_progress_count_for_test(&self) -> usize {
-        self.operation_in_progress.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn commit_in_progress_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.commit_in_progress)
-    }
-
-    pub(crate) fn commit_watch(&self) -> tokio::sync::watch::Sender<bool> {
-        self.commit_watch.clone()
+        self.transaction_manager.operation_count_for_test()
     }
 
     #[cfg(test)]
     pub(crate) fn commit_in_progress_for_test(&self) -> bool {
-        self.commit_in_progress.load(Ordering::SeqCst)
+        self.transaction_manager.commit_in_progress_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_transaction_for_test(&self) -> bool {
+        self.transaction_manager.active_transaction_for_test()
+    }
+
+    pub(super) fn transaction_manager(&self) -> SessionTransactionManager {
+        self.transaction_manager.clone()
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), LixError> {
-        if self.is_closed() {
-            return Err(closed_error());
-        }
-        Ok(())
+        self.transaction_manager.ensure_open()
     }
 
     pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
+        self.transaction_manager.begin_session_operation()
+    }
+
+    pub(super) fn begin_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
+        self.transaction_manager.begin_write_lease()
+    }
+
+    pub(super) fn begin_explicit_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
+        self.transaction_manager.begin_explicit_write_lease()
+    }
+
+    pub(super) async fn begin_session_write_access(&self) -> Result<SessionWriteAccess, LixError> {
+        let write_lease = self.begin_session_write_lease()?;
+        self.begin_session_write_access_with_lease(write_lease)
+            .await
+    }
+
+    pub(super) async fn begin_explicit_session_write_access(
+        &self,
+    ) -> Result<SessionWriteAccess, LixError> {
+        let write_lease = self.begin_explicit_session_write_lease()?;
+        self.begin_session_write_access_with_lease(write_lease)
+            .await
+    }
+
+    async fn begin_session_write_access_with_lease(
+        &self,
+        write_lease: SessionWriteLease,
+    ) -> Result<SessionWriteAccess, LixError> {
+        let write_guard = self.write_lock.lock_owned().await;
+        let write_access = SessionWriteAccess {
+            _write_lease: write_lease,
+            _write_guard: write_guard,
+        };
         self.ensure_open()?;
-        let previous = self.operation_in_progress.fetch_add(1, Ordering::SeqCst);
-        self.operation_watch.send_replace(previous + 1);
-        if let Err(error) = self.ensure_open() {
-            let remaining = self.operation_in_progress.fetch_sub(1, Ordering::SeqCst) - 1;
-            self.operation_watch.send_replace(remaining);
-            return Err(error);
-        }
-        Ok(SessionOperationGuard {
-            operation_in_progress: Arc::clone(&self.operation_in_progress),
-            operation_watch: self.operation_watch.clone(),
-        })
+        Ok(write_access)
     }
 
     /// Resolves the version this session should operate on right now.
@@ -365,18 +326,20 @@ where
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
-        let _transaction_guard = self.reserve_session_transaction()?;
-        self.with_write_transaction_reserved(f).await
+        let write_access = self.begin_session_write_access().await?;
+        self.with_write_transaction_reserved(write_access, f).await
     }
 
-    pub(crate) async fn with_write_transaction_reserved<T, F>(&self, f: F) -> Result<T, LixError>
+    pub(super) async fn with_write_transaction_reserved<T, F>(
+        &self,
+        _write_access: SessionWriteAccess,
+        f: F,
+    ) -> Result<T, LixError>
     where
         F: for<'tx> FnOnce(
             &'tx mut Transaction<B>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
-        let _write_guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let _operation_guard = self.begin_session_operation()?;
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -395,89 +358,33 @@ where
         match f(&mut transaction).await {
             Ok(value) => {
                 self.ensure_open()?;
-                transaction
-                    .commit_checked(&runtime_functions, || self.ensure_open())
-                    .await?;
+                transaction.commit(&runtime_functions).await?;
                 Ok(value)
             }
             Err(error) => Err(error),
         }
     }
 
-    pub(super) fn reserve_session_transaction(&self) -> Result<SessionTransactionGuard, LixError> {
-        let active_transaction = self.active_transaction_flag();
-        if active_transaction
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(transaction_state_error(
-                "Lix handle has an active transaction; use the transaction handle for reads and writes until it is committed or rolled back",
-            ));
-        }
-        Ok(SessionTransactionGuard { active_transaction })
+    #[cfg(test)]
+    pub(super) fn begin_commit(&self) -> crate::transaction::CommitBoundaryGuard {
+        self.transaction_manager.begin_commit()
     }
 
-    pub(super) fn begin_commit(&self) -> SessionCommitGuard {
-        self.commit_in_progress.store(true, Ordering::SeqCst);
-        self.commit_watch.send_replace(true);
-        SessionCommitGuard {
-            commit_in_progress: Arc::clone(&self.commit_in_progress),
-            commit_watch: self.commit_watch.clone(),
-        }
+    pub(super) fn transaction_commit_boundary(
+        &self,
+    ) -> crate::transaction::TransactionCommitBoundary {
+        self.transaction_manager.transaction_commit_boundary()
     }
+}
 
-    pub(super) fn transaction_commit_boundary(&self) -> TransactionCommitBoundary {
-        let closed = self.closed_flag();
-        TransactionCommitBoundary {
-            commit_in_progress: self.commit_in_progress_flag(),
-            commit_watch: self.commit_watch(),
-            pre_commit_check: Arc::new(move || {
-                if closed.load(Ordering::SeqCst) {
-                    return Err(closed_error());
-                }
-                Ok(())
-            }),
-        }
-    }
+pub(super) struct SessionWriteAccess {
+    _write_guard: DurableWriteGuard,
+    _write_lease: SessionWriteLease,
 }
 
 pub(super) fn closed_error() -> LixError {
     LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
         .with_hint("Open a new Lix handle before calling this method.")
-}
-
-pub(super) struct SessionTransactionGuard {
-    active_transaction: Arc<AtomicBool>,
-}
-
-impl Drop for SessionTransactionGuard {
-    fn drop(&mut self) {
-        self.active_transaction.store(false, Ordering::SeqCst);
-    }
-}
-
-pub(super) struct SessionOperationGuard {
-    pub(super) operation_in_progress: Arc<AtomicUsize>,
-    pub(super) operation_watch: tokio::sync::watch::Sender<usize>,
-}
-
-impl Drop for SessionOperationGuard {
-    fn drop(&mut self) {
-        let remaining = self.operation_in_progress.fetch_sub(1, Ordering::SeqCst) - 1;
-        self.operation_watch.send_replace(remaining);
-    }
-}
-
-pub(super) struct SessionCommitGuard {
-    pub(super) commit_in_progress: Arc<AtomicBool>,
-    pub(super) commit_watch: tokio::sync::watch::Sender<bool>,
-}
-
-impl Drop for SessionCommitGuard {
-    fn drop(&mut self) {
-        self.commit_in_progress.store(false, Ordering::SeqCst);
-        self.commit_watch.send_replace(false);
-    }
 }
 
 /// Read-only SQL execution context derived from a session.
@@ -549,13 +456,28 @@ mod tests {
     use std::sync::Condvar;
     use std::sync::Mutex;
     use std::task::{Context, Poll};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use crate::backend::{
-        Backend, BackendCapabilities, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite,
-        ReadOptions, WriteOptions,
+        Backend, BackendCapabilities, BackendError, DurableWriteLock, InMemoryBackend,
+        InMemoryRead, InMemoryWrite, ReadOptions, WriteOptions,
     };
     use crate::Engine;
     use futures_util::task::noop_waker_ref;
+
+    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            thread::yield_now();
+        }
+    }
 
     fn assert_close_pending<F>(mut future: Pin<&mut F>)
     where
@@ -566,6 +488,24 @@ mod tests {
             matches!(future.as_mut().poll(&mut cx), Poll::Pending),
             "close should remain pending while guarded work is in progress"
         );
+    }
+
+    async fn assert_close_finishes<F>(future: Pin<&mut F>, description: &str)
+    where
+        F: Future<Output = Result<(), crate::LixError>>,
+    {
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+            .unwrap_or_else(|error| panic!("{description} failed: {error:?}"));
+    }
+
+    fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
+        wait_until(description, || handle.is_finished());
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => panic!("{description} panicked"),
+        }
     }
 
     async fn open_session() -> std::sync::Arc<super::SessionContext<InMemoryBackend>> {
@@ -640,9 +580,7 @@ mod tests {
         assert_close_pending(close.as_mut());
 
         drop(guard);
-        close
-            .await
-            .expect("close should succeed after operation guard drops");
+        assert_close_finishes(close.as_mut(), "close after operation guard drops").await;
     }
 
     #[tokio::test]
@@ -653,9 +591,7 @@ mod tests {
         assert_close_pending(close.as_mut());
 
         drop(guard);
-        close
-            .await
-            .expect("close should succeed after commit guard drops");
+        assert_close_finishes(close.as_mut(), "close after commit guard drops").await;
     }
 
     #[tokio::test]
@@ -676,16 +612,121 @@ mod tests {
             .begin_transaction()
             .await
             .expect("transaction should begin");
+        assert!(session.active_transaction_for_test());
         let result = transaction
             .execute("SELECT 1", &[])
             .await
             .expect("transaction read should succeed");
         assert_eq!(result.len(), 1);
-        assert_eq!(session.operation_in_progress_count_for_test(), 0);
+        assert_eq!(session.operation_in_progress_count_for_test(), 1);
+        assert!(session.active_transaction_for_test());
         transaction
             .rollback()
             .await
             .expect("transaction rollback should succeed");
+        assert_eq!(session.operation_in_progress_count_for_test(), 0);
+        assert!(!session.active_transaction_for_test());
+    }
+
+    #[tokio::test]
+    async fn close_rejects_idle_explicit_transaction_without_waiting() {
+        let session = open_session().await;
+        let transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        let error = session
+            .close()
+            .await
+            .expect_err("close should reject an idle explicit transaction");
+        assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+        transaction
+            .rollback()
+            .await
+            .expect("rollback should remain available after rejected close");
+    }
+
+    #[tokio::test]
+    async fn transaction_open_waits_for_write_lock() {
+        let session = open_session().await;
+        let write_guard = session.write_lock.lock_owned().await;
+
+        let opener_session = std::sync::Arc::clone(&session);
+        let opener = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move { opener_session.begin_transaction().await })
+        });
+        wait_until("explicit transaction open to reserve the session", || {
+            session.operation_in_progress_count_for_test() > 0
+                && session.active_transaction_for_test()
+                && !opener.is_finished()
+        });
+
+        assert!(
+            !opener.is_finished(),
+            "transaction open should wait for the write lock"
+        );
+        assert!(session.active_transaction_for_test());
+
+        drop(write_guard);
+        let transaction = join_thread(opener, "queued transaction opener")
+            .expect("transaction should begin after write lock is released");
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_session_write_queued_on_write_lock() {
+        let session = open_session().await;
+        let write_guard = session.write_lock.lock_owned().await;
+
+        let writer_session = std::sync::Arc::clone(&session);
+        let writer = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                writer_session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('queued-write-close', 'value')",
+                        &[],
+                    )
+                    .await
+            })
+        });
+        wait_until("queued session write to reserve the session", || {
+            session.operation_in_progress_count_for_test() > 0
+                && session.active_transaction_for_test()
+        });
+
+        let mut close = Box::pin(session.close());
+        assert_close_pending(close.as_mut());
+
+        drop(write_guard);
+        let write_error =
+            join_thread(writer, "queued writer").expect_err("queued write should observe close");
+        assert_eq!(write_error.code, crate::LixError::CODE_CLOSED);
+        assert_close_finishes(close.as_mut(), "close after queued write exits").await;
+    }
+
+    #[tokio::test]
+    async fn session_read_does_not_wait_for_write_lock() {
+        let session = open_session().await;
+        let write_guard = session.write_lock.lock_owned().await;
+
+        let result = tokio::time::timeout(TEST_WAIT_TIMEOUT, session.execute("SELECT 1", &[]))
+            .await
+            .expect("read should not wait for the write lock")
+            .expect("read should succeed");
+
+        assert_eq!(result.len(), 1);
+        drop(write_guard);
     }
 
     #[tokio::test]
@@ -710,6 +751,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_waits_for_explicit_transaction_open_queued_on_write_lock() {
+        let session = open_session().await;
+        let write_guard = session.write_lock.lock_owned().await;
+
+        let opener_session = std::sync::Arc::clone(&session);
+        let opener = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move { opener_session.begin_transaction().await })
+        });
+        wait_until("explicit transaction open to queue on write lock", || {
+            session.operation_in_progress_count_for_test() > 0
+                && session.active_transaction_for_test()
+                && !opener.is_finished()
+        });
+        assert!(
+            !opener.is_finished(),
+            "transaction open should still be queued on write lock"
+        );
+
+        let mut close = Box::pin(session.close());
+        assert_close_pending(close.as_mut());
+
+        drop(write_guard);
+        let open_error = match join_thread(opener, "queued explicit transaction opener") {
+            Ok(_) => panic!("queued explicit transaction open should observe close"),
+            Err(error) => error,
+        };
+        assert_eq!(open_error.code, crate::LixError::CODE_CLOSED);
+        assert_close_finishes(close.as_mut(), "close after queued explicit open exits").await;
+    }
+
+    #[tokio::test]
     async fn close_waits_for_session_read_blocked_in_backend_read() {
         let (session, gate) = open_blocking_read_session().await;
 
@@ -727,16 +802,14 @@ mod tests {
         assert_close_pending(close.as_mut());
 
         gate.release();
-        let error = reader
-            .join()
-            .expect("reader thread should not panic")
+        let error = join_thread(reader, "blocked reader")
             .expect_err("read should observe close after backend read resumes");
         assert_eq!(error.code, crate::LixError::CODE_CLOSED);
-        close.await.expect("close should succeed after read exits");
+        assert_close_finishes(close.as_mut(), "close after blocked read exits").await;
     }
 
     #[tokio::test]
-    async fn close_waits_for_active_transaction_read_blocked_in_backend_read() {
+    async fn close_rejects_active_transaction_read_blocked_in_backend_read() {
         let (session, gate) = open_blocking_read_session().await;
         let mut transaction = session
             .begin_transaction()
@@ -752,18 +825,16 @@ mod tests {
         });
         gate.wait_until_blocked();
 
-        let mut close = Box::pin(session.close());
-        assert_close_pending(close.as_mut());
+        let close_error = session
+            .close()
+            .await
+            .expect_err("close should reject an active explicit transaction read");
+        assert_eq!(close_error.code, "LIX_INVALID_TRANSACTION_STATE");
 
         gate.release();
-        let result = reader
-            .join()
-            .expect("reader thread should not panic")
-            .expect("in-flight transaction read should finish before close returns");
+        let result = join_thread(reader, "blocked transaction reader")
+            .expect("in-flight transaction read should finish after rejected close");
         assert_eq!(result.len(), 1);
-        close
-            .await
-            .expect("close should succeed after transaction read exits");
     }
 
     #[tokio::test]
@@ -789,18 +860,22 @@ mod tests {
             runtime.block_on(async move { transaction.commit().await })
         });
         gate.wait_until_blocked();
+        assert!(
+            session.commit_in_progress_for_test(),
+            "blocked explicit transaction commit should set the commit guard"
+        );
 
         let mut close = Box::pin(session.close());
         assert_close_pending(close.as_mut());
 
         gate.release();
-        committer
-            .join()
-            .expect("committer thread should not panic")
+        join_thread(committer, "blocked committer")
             .expect("commit already at durable boundary should finish");
-        close
-            .await
-            .expect("close should succeed after commit exits");
+        assert_close_finishes(close.as_mut(), "close after commit exits").await;
+        assert!(
+            !session.commit_in_progress_for_test(),
+            "commit guard should clear after the blocked commit exits"
+        );
     }
 
     #[derive(Clone)]
@@ -844,6 +919,10 @@ mod tests {
 
         fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
             self.inner.begin_write(opts)
+        }
+
+        fn durable_write_lock(&self) -> DurableWriteLock {
+            self.inner.durable_write_lock()
         }
     }
 
@@ -889,6 +968,10 @@ mod tests {
             self.gate.maybe_block();
             self.inner.begin_write(opts)
         }
+
+        fn durable_write_lock(&self) -> DurableWriteLock {
+            self.inner.durable_write_lock()
+        }
     }
 
     #[derive(Clone)]
@@ -923,20 +1006,39 @@ mod tests {
             state.block_next = false;
             state.blocked = true;
             condvar.notify_all();
+            let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
             while !state.released {
-                state = condvar
-                    .wait(state)
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "timed out waiting for blocking gate release"
+                );
+                let (next_state, wait_result) = condvar
+                    .wait_timeout(state, remaining)
                     .expect("blocking gate lock should not poison after wait");
+                state = next_state;
+                assert!(
+                    !wait_result.timed_out() || state.released,
+                    "timed out waiting for blocking gate release"
+                );
             }
         }
 
         fn wait_until_blocked(&self) {
             let (lock, condvar) = &*self.state;
             let mut state = lock.lock().expect("blocking gate lock should not poison");
+            let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
             while !state.blocked {
-                state = condvar
-                    .wait(state)
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "timed out waiting for blocking gate");
+                let (next_state, wait_result) = condvar
+                    .wait_timeout(state, remaining)
                     .expect("blocking gate lock should not poison after wait");
+                state = next_state;
+                assert!(
+                    !wait_result.timed_out() || state.blocked,
+                    "timed out waiting for blocking gate"
+                );
             }
         }
 

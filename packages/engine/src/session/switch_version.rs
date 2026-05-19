@@ -71,7 +71,7 @@ where
             })
             .await?;
 
-        let session = SessionContext::new_with_closed(
+        let session = SessionContext::new_with_transaction_manager(
             next_mode,
             self.storage.clone(),
             Arc::clone(&self.live_state),
@@ -79,13 +79,8 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
-            Arc::clone(&self.write_lock),
-            self.closed_flag(),
-            self.active_transaction_flag(),
-            self.operation_in_progress_flag(),
-            self.operation_watch(),
-            self.commit_in_progress_flag(),
-            self.commit_watch(),
+            self.write_lock.clone(),
+            self.transaction_manager(),
         );
         Ok((
             session,

@@ -3,9 +3,10 @@ use std::sync::Arc;
 use crate::functions::FunctionContext;
 use crate::sql2;
 use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSet};
+use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
-use super::context::{SessionContext, SessionSqlExecutionContext};
+use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
 use super::transaction::SessionTransaction;
 
 /// Result of executing one SQL statement through engine.
@@ -301,15 +302,14 @@ where
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        let operation_guard = self.begin_session_operation()?;
-        let _transaction_guard = self.reserve_session_transaction()?;
+        self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
-            drop(operation_guard);
+            let write_access = self.begin_session_write_access().await?;
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved(|transaction| {
+                .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
@@ -326,8 +326,16 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
-        let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
-        self.ensure_open()?;
+        let runtime_write_access = if sql2::statement_has_durable_runtime_function(&statement) {
+            Some(self.begin_session_write_access().await?)
+        } else {
+            None
+        };
+        let _operation_guard = if runtime_write_access.is_some() {
+            None
+        } else {
+            Some(self.begin_session_operation()?)
+        };
         let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result = async {
             let mut read_store = read_scope.store();
@@ -366,9 +374,8 @@ where
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
-        self.persist_runtime_functions_if_needed(&runtime_functions)
+        self.persist_runtime_functions_if_needed(&runtime_functions, runtime_write_access.as_ref())
             .await?;
-        drop(write_guard);
         Ok(ExecuteResult::from_sql_query_result(result))
     }
 
@@ -382,11 +389,11 @@ where
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
-            let _transaction_guard = self.reserve_session_transaction()?;
+            let write_access = self.begin_session_write_access().await?;
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
             return self
-                .with_write_transaction_reserved(|transaction| {
+                .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
                         let tx_plan =
                             sql2::create_write_logical_plan_from_parsed(transaction, statement)
@@ -416,6 +423,7 @@ where
     async fn persist_runtime_functions_if_needed(
         &self,
         runtime_functions: &FunctionContext,
+        runtime_write_access: Option<&SessionWriteAccess>,
     ) -> Result<(), LixError> {
         let mut writes = StorageWriteSet::new();
         runtime_functions
@@ -424,10 +432,19 @@ where
         if writes.is_empty() {
             return Ok(());
         }
-        let _commit_guard = self.begin_commit();
-        self.ensure_open()?;
-        self.storage
-            .commit_write_set(writes, StorageWriteOptions::default())?;
+        if runtime_write_access.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "runtime function state changed without reserved write access",
+            ));
+        }
+        let commit_boundary = self.transaction_commit_boundary();
+        let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
+        commit_at_boundary(Some(&commit_boundary), || {
+            self.storage
+                .commit_write_set(writes, StorageWriteOptions::default())?;
+            Ok(())
+        })?;
         Ok(())
     }
 }

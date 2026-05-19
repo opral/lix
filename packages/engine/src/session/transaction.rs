@@ -1,23 +1,23 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::functions::FunctionContext;
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
-use crate::transaction::{open_transaction, Transaction};
-use crate::LixError;
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::Notify;
 
-use super::context::{closed_error, SessionOperationGuard, SessionTransactionGuard};
+use crate::transaction::{
+    open_transaction, CommitBoundaryGuard, CommitBoundaryState, Transaction,
+    TransactionCommitBoundary,
+};
+use crate::LixError;
+
+use super::context::{closed_error, SessionWriteAccess};
 use super::SessionContext;
 
 pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) transaction: Option<Transaction<B>>,
     pub(super) runtime_functions: FunctionContext,
-    closed: Arc<AtomicBool>,
-    operation_in_progress: Arc<AtomicUsize>,
-    operation_watch: tokio::sync::watch::Sender<usize>,
-    _transaction_guard: SessionTransactionGuard,
-    _write_guard: OwnedMutexGuard<()>,
+    transaction_manager: SessionTransactionManager,
+    _write_access: SessionWriteAccess,
 }
 
 impl<B> SessionContext<B>
@@ -28,9 +28,7 @@ where
 {
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
         self.ensure_open()?;
-        let transaction_guard = self.reserve_session_transaction()?;
-        let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
-        let _operation_guard = self.begin_session_operation()?;
+        let write_access = self.begin_explicit_session_write_access().await?;
         let mut opened = match open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -51,14 +49,13 @@ where
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
+        self.transaction_manager()
+            .mark_explicit_transaction_open()?;
         Ok(SessionTransaction {
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
-            closed: self.closed_flag(),
-            operation_in_progress: self.operation_in_progress_flag(),
-            operation_watch: self.operation_watch(),
-            _transaction_guard: transaction_guard,
-            _write_guard: write_guard,
+            transaction_manager: self.transaction_manager(),
+            _write_access: write_access,
         })
     }
 }
@@ -76,22 +73,27 @@ where
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 
-    pub async fn commit(mut self) -> Result<(), LixError> {
+    pub fn active_version_id(&self) -> Result<&str, LixError> {
         self.ensure_session_open()?;
-        let closed = Arc::clone(&self.closed);
+        self.transaction
+            .as_ref()
+            .map(|transaction| transaction.active_version_id())
+            .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
+    }
+
+    pub async fn commit(mut self) -> Result<(), LixError> {
+        let operation_guard = self.begin_session_commit_operation()?;
         let transaction = self
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
+        let queued_commit_guard = self.transaction_manager.begin_commit();
         let result = transaction
-            .commit_checked(&self.runtime_functions, || {
-                if closed.load(Ordering::SeqCst) {
-                    return Err(closed_error());
-                }
-                Ok(())
-            })
+            .commit(&self.runtime_functions)
             .await
             .map(|_| ());
+        drop(queued_commit_guard);
+        drop(operation_guard);
         result
     }
 
@@ -105,28 +107,451 @@ where
     }
 
     pub(super) fn ensure_session_open(&self) -> Result<(), LixError> {
-        if self.closed.load(Ordering::SeqCst) {
+        self.transaction_manager.ensure_open()
+    }
+
+    pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
+        self.transaction_manager.begin_transaction_operation()
+    }
+
+    fn begin_session_commit_operation(&self) -> Result<SessionOperationGuard, LixError> {
+        self.transaction_manager
+            .begin_transaction_commit_operation()
+    }
+}
+
+pub(crate) fn transaction_state_error(message: impl Into<String>) -> LixError {
+    LixError::new("LIX_INVALID_TRANSACTION_STATE", message)
+}
+
+#[derive(Clone)]
+pub(super) struct SessionTransactionManager {
+    inner: Arc<SessionTransactionManagerInner>,
+}
+
+struct SessionTransactionManagerInner {
+    state: std::sync::Mutex<SessionTransactionState>,
+    state_changed: Notify,
+    commit_boundary: CommitBoundaryState,
+}
+
+#[derive(Debug, Default)]
+enum SessionTransactionState {
+    #[default]
+    OpenIdle,
+    OpenOperation {
+        active_operations: usize,
+    },
+    OpenTransaction {
+        active_operations: usize,
+        owner: TransactionOwner,
+    },
+    Closing {
+        active_operations: usize,
+    },
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionOwner {
+    Automatic,
+    ExplicitOpening,
+    Explicit,
+    ExplicitCommitting,
+}
+
+impl SessionTransactionManager {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(SessionTransactionManagerInner {
+                state: std::sync::Mutex::new(SessionTransactionState::default()),
+                state_changed: Notify::new(),
+                commit_boundary: CommitBoundaryState::new(),
+            }),
+        }
+    }
+
+    pub(super) async fn close(&self) -> Result<(), LixError> {
+        let mut commit_rx = self.inner.commit_boundary.subscribe();
+        loop {
+            if let Some(_commit_gate) = self.inner.commit_boundary.try_lock_durable_commit() {
+                {
+                    let mut state = self.lock_state();
+                    if state.has_explicit_transaction() {
+                        return Err(active_transaction_error());
+                    }
+                    let active_operations = state.active_operations();
+                    *state = if active_operations == 0 {
+                        SessionTransactionState::Closed
+                    } else {
+                        SessionTransactionState::Closing { active_operations }
+                    };
+                }
+                self.inner.state_changed.notify_waiters();
+                break;
+            }
+
+            let notified = self.inner.state_changed.notified();
+            tokio::select! {
+                _ = notified => {}
+                result = commit_rx.changed() => {
+                    if result.is_err() {
+                        self.inner.state_changed.notify_waiters();
+                    }
+                }
+            }
+        }
+
+        loop {
+            let notified = self.inner.state_changed.notified();
+            {
+                let mut state = self.lock_state();
+                let commit_count = *commit_rx.borrow_and_update();
+                if state.active_operations() == 0
+                    && commit_count == 0
+                    && !self.inner.commit_boundary.is_active()
+                {
+                    *state = SessionTransactionState::Closed;
+                    break;
+                }
+            }
+            tokio::select! {
+                _ = notified => {}
+                result = commit_rx.changed() => {
+                    if result.is_err() {
+                        self.inner.state_changed.notify_waiters();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.lock_state().is_closed()
+    }
+
+    pub(super) fn ensure_open(&self) -> Result<(), LixError> {
+        if self.is_closed() {
             return Err(closed_error());
         }
         Ok(())
     }
 
     pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
-        self.ensure_session_open()?;
-        let previous = self.operation_in_progress.fetch_add(1, Ordering::SeqCst);
-        self.operation_watch.send_replace(previous + 1);
-        if let Err(error) = self.ensure_session_open() {
-            let remaining = self.operation_in_progress.fetch_sub(1, Ordering::SeqCst) - 1;
-            self.operation_watch.send_replace(remaining);
+        self.begin_operation(SessionOperationScope::Session)
+    }
+
+    pub(super) fn begin_transaction_operation(&self) -> Result<SessionOperationGuard, LixError> {
+        self.begin_operation(SessionOperationScope::Transaction)
+    }
+
+    pub(super) fn begin_transaction_commit_operation(
+        &self,
+    ) -> Result<SessionOperationGuard, LixError> {
+        self.begin_operation(SessionOperationScope::TransactionCommit)
+    }
+
+    fn begin_operation(
+        &self,
+        scope: SessionOperationScope,
+    ) -> Result<SessionOperationGuard, LixError> {
+        {
+            let mut state = self.lock_state();
+            state.begin_operation(scope)?;
+        }
+        self.inner.state_changed.notify_waiters();
+
+        if let Err(error) = self.ensure_open() {
+            self.finish_operation();
             return Err(error);
         }
+
         Ok(SessionOperationGuard {
-            operation_in_progress: Arc::clone(&self.operation_in_progress),
-            operation_watch: self.operation_watch.clone(),
+            manager: self.clone(),
         })
+    }
+
+    pub(super) fn begin_write_lease(&self) -> Result<SessionWriteLease, LixError> {
+        self.begin_write_lease_for(TransactionOwner::Automatic)
+    }
+
+    pub(super) fn begin_explicit_write_lease(&self) -> Result<SessionWriteLease, LixError> {
+        self.begin_write_lease_for(TransactionOwner::ExplicitOpening)
+    }
+
+    fn begin_write_lease_for(
+        &self,
+        owner: TransactionOwner,
+    ) -> Result<SessionWriteLease, LixError> {
+        {
+            let mut state = self.lock_state();
+            state.begin_write_lease(owner)?;
+        }
+        self.inner.state_changed.notify_waiters();
+
+        let operation_guard = SessionOperationGuard {
+            manager: self.clone(),
+        };
+        if let Err(error) = self.ensure_open() {
+            drop(operation_guard);
+            self.finish_transaction();
+            return Err(error);
+        }
+        let transaction_guard = SessionTransactionGuard {
+            manager: self.clone(),
+        };
+        Ok(SessionWriteLease {
+            _transaction_guard: transaction_guard,
+            _operation_guard: operation_guard,
+        })
+    }
+
+    pub(super) fn begin_commit(&self) -> CommitBoundaryGuard {
+        self.inner.commit_boundary.begin()
+    }
+
+    pub(super) fn mark_explicit_transaction_open(&self) -> Result<(), LixError> {
+        {
+            let mut state = self.lock_state();
+            state.mark_explicit_transaction_open()?;
+        }
+        self.inner.state_changed.notify_waiters();
+        Ok(())
+    }
+
+    pub(super) fn transaction_commit_boundary(&self) -> TransactionCommitBoundary {
+        let manager = self.clone();
+        TransactionCommitBoundary::new(
+            self.inner.commit_boundary.clone(),
+            Arc::new(move || manager.ensure_open()),
+        )
+    }
+
+    fn finish_operation(&self) {
+        {
+            let mut state = self.lock_state();
+            state.finish_operation();
+        }
+        self.inner.state_changed.notify_waiters();
+    }
+
+    fn finish_transaction(&self) {
+        {
+            let mut state = self.lock_state();
+            state.finish_transaction();
+        }
+        self.inner.state_changed.notify_waiters();
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SessionTransactionState> {
+        self.inner
+            .state
+            .lock()
+            .expect("session transaction manager lock should not poison")
+    }
+
+    #[cfg(test)]
+    pub(super) fn operation_count_for_test(&self) -> usize {
+        self.lock_state().active_operations()
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_in_progress_for_test(&self) -> bool {
+        self.inner.commit_boundary.is_active()
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_transaction_for_test(&self) -> bool {
+        matches!(
+            *self.lock_state(),
+            SessionTransactionState::OpenTransaction { .. }
+        )
     }
 }
 
-pub(crate) fn transaction_state_error(message: impl Into<String>) -> LixError {
-    LixError::new("LIX_INVALID_TRANSACTION_STATE", message)
+impl SessionTransactionState {
+    fn is_closed(&self) -> bool {
+        matches!(self, Self::Closing { .. } | Self::Closed)
+    }
+
+    fn active_operations(&self) -> usize {
+        match self {
+            Self::OpenIdle | Self::Closed => 0,
+            Self::OpenOperation { active_operations }
+            | Self::OpenTransaction {
+                active_operations, ..
+            }
+            | Self::Closing { active_operations } => *active_operations,
+        }
+    }
+
+    fn has_explicit_transaction(&self) -> bool {
+        matches!(
+            self,
+            Self::OpenTransaction {
+                owner: TransactionOwner::Explicit,
+                ..
+            }
+        )
+    }
+
+    fn begin_operation(&mut self, scope: SessionOperationScope) -> Result<(), LixError> {
+        match self {
+            Self::OpenIdle => {
+                if matches!(scope, SessionOperationScope::Session) {
+                    *self = Self::OpenOperation {
+                        active_operations: 1,
+                    };
+                    Ok(())
+                } else {
+                    Err(active_transaction_error())
+                }
+            }
+            Self::OpenOperation { active_operations } => {
+                if matches!(scope, SessionOperationScope::Session) {
+                    *active_operations += 1;
+                    Ok(())
+                } else {
+                    Err(active_transaction_error())
+                }
+            }
+            Self::OpenTransaction {
+                active_operations,
+                owner,
+            } => match scope {
+                SessionOperationScope::Session => Err(active_transaction_error()),
+                SessionOperationScope::Transaction => {
+                    *active_operations += 1;
+                    Ok(())
+                }
+                SessionOperationScope::TransactionCommit => {
+                    if *owner != TransactionOwner::Explicit {
+                        return Err(active_transaction_error());
+                    }
+                    *owner = TransactionOwner::ExplicitCommitting;
+                    *active_operations += 1;
+                    Ok(())
+                }
+            },
+            Self::Closing { .. } | Self::Closed => Err(closed_error()),
+        }
+    }
+
+    fn begin_write_lease(&mut self, owner: TransactionOwner) -> Result<(), LixError> {
+        match self {
+            Self::OpenIdle => {
+                *self = Self::OpenTransaction {
+                    active_operations: 1,
+                    owner,
+                };
+                Ok(())
+            }
+            Self::OpenOperation { .. } | Self::OpenTransaction { .. } => {
+                Err(active_transaction_error())
+            }
+            Self::Closing { .. } | Self::Closed => Err(closed_error()),
+        }
+    }
+
+    fn mark_explicit_transaction_open(&mut self) -> Result<(), LixError> {
+        match self {
+            Self::OpenTransaction {
+                active_operations: 1,
+                owner,
+            } if *owner == TransactionOwner::ExplicitOpening => {
+                *owner = TransactionOwner::Explicit;
+                Ok(())
+            }
+            Self::Closing { .. } | Self::Closed => Err(closed_error()),
+            _ => {
+                panic!("explicit transaction should be opening before it is marked open");
+            }
+        }
+    }
+
+    fn finish_operation(&mut self) {
+        match self {
+            Self::OpenOperation { active_operations } => {
+                *active_operations = active_operations
+                    .checked_sub(1)
+                    .expect("session operation count should not underflow");
+                if *active_operations == 0 {
+                    *self = Self::OpenIdle;
+                }
+            }
+            Self::OpenTransaction {
+                active_operations, ..
+            } => {
+                *active_operations = active_operations
+                    .checked_sub(1)
+                    .expect("session operation count should not underflow");
+            }
+            Self::Closing { active_operations } => {
+                *active_operations = active_operations
+                    .checked_sub(1)
+                    .expect("session operation count should not underflow");
+                if *active_operations == 0 {
+                    *self = Self::Closed;
+                }
+            }
+            Self::OpenIdle | Self::Closed => {
+                panic!("session operation count should not underflow");
+            }
+        }
+    }
+
+    fn finish_transaction(&mut self) {
+        match self {
+            Self::OpenTransaction {
+                active_operations: 0,
+                ..
+            } => {
+                *self = Self::OpenIdle;
+            }
+            Self::OpenTransaction { .. } => {}
+            Self::Closing { .. } | Self::Closed => {}
+            Self::OpenIdle | Self::OpenOperation { .. } => {
+                panic!("session transaction should be active before it is finished");
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SessionOperationScope {
+    Session,
+    Transaction,
+    TransactionCommit,
+}
+
+fn active_transaction_error() -> LixError {
+    transaction_state_error(
+        "Lix handle has an active transaction; use the transaction handle for reads and writes until it is committed or rolled back",
+    )
+}
+
+pub(super) struct SessionWriteLease {
+    _operation_guard: SessionOperationGuard,
+    _transaction_guard: SessionTransactionGuard,
+}
+
+pub(super) struct SessionTransactionGuard {
+    manager: SessionTransactionManager,
+}
+
+impl Drop for SessionTransactionGuard {
+    fn drop(&mut self) {
+        self.manager.finish_transaction();
+    }
+}
+
+pub(super) struct SessionOperationGuard {
+    manager: SessionTransactionManager,
+}
+
+impl Drop for SessionOperationGuard {
+    fn drop(&mut self) {
+        self.manager.finish_operation();
+    }
 }

@@ -1058,7 +1058,8 @@ mod tests {
 
     use super::*;
     use crate::backend::{
-        Backend, BackendCapabilities, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch,
+        Backend, BackendCapabilities, BackendError, BackendWrite, CommitResult, DurableWriteLock,
+        KeyRange, PutBatch,
     };
     use crate::catalog::SchemaPlanId;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
@@ -2021,6 +2022,10 @@ mod tests {
                 inner: self.inner.begin_write(opts)?,
                 write_batches: Arc::clone(&self.write_batches),
             })
+        }
+
+        fn durable_write_lock(&self) -> DurableWriteLock {
+            self.inner.durable_write_lock()
         }
     }
 

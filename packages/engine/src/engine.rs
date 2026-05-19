@@ -8,7 +8,7 @@ use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::session::SessionContext;
-use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions};
+use crate::storage::{DurableWriteLock, StorageBackend, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
@@ -24,7 +24,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
-    write_lock: Arc<tokio::sync::Mutex<()>>,
+    write_lock: DurableWriteLock,
 }
 
 impl<B> Engine<B>
@@ -40,6 +40,7 @@ where
     /// backend.
     pub async fn initialize(backend: B) -> Result<InitReceipt, LixError> {
         let storage = StorageContext::new(backend);
+        let _write_guard = storage.durable_write_lock().lock_owned().await;
 
         crate::init::initialize(
             storage,
@@ -73,12 +74,12 @@ where
 
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
+            write_lock: storage.durable_write_lock(),
             storage,
             tracked_state,
             live_state,
             version_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -116,7 +117,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
-            Arc::clone(&self.write_lock),
+            self.write_lock.clone(),
         )
         .await
     }
@@ -129,7 +130,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
-            Arc::clone(&self.write_lock),
+            self.write_lock.clone(),
         )
         .await
     }
@@ -144,6 +145,7 @@ where
         &self,
         version_id: &str,
     ) -> Result<(), LixError> {
+        let _write_guard = self.write_lock.lock_owned().await;
         let head_commit_id = self
             .load_version_head_commit_id(version_id)
             .await?
