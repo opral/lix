@@ -13,26 +13,29 @@ use super::by_commit_index::{
 };
 use super::graph::{CommitGraphLoader, SourceParentFacts};
 use super::segment::{
-    DecodedSegmentIndex, canonicalize_segment, directory_change_location,
-    directory_commit_location, segment_change, segment_commit, validate_change_checksum,
-    validate_change_location, validate_commit_checksum, validate_commit_location,
-    validate_segment_shape, validate_stage_segment_shape,
+    canonicalize_segment, directory_change_location, directory_commit_location, segment_change,
+    segment_commit, validate_change_checksum, validate_change_location, validate_commit_checksum,
+    validate_commit_location, validate_segment_shape, validate_stage_segment_shape,
+    DecodedSegmentIndex,
 };
 use super::store::{
+    by_change_index_value, by_change_key, by_change_membership_commit_id_from_key,
+    by_change_membership_index_value, by_change_membership_key, by_change_membership_prefix,
+    by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
+    segment_key, segment_value, visible_change_proof_key, visible_change_proof_value,
     BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE, by_change_index_value,
-    by_change_key, by_change_membership_commit_id_from_key, by_change_membership_index_value,
-    by_change_membership_key, by_change_membership_prefix, by_commit_index_value, by_commit_key,
-    commit_visibility_key, commit_visibility_value, segment_key, segment_value,
-    visible_change_proof_key, visible_change_proof_value,
+    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::truth::{
-    SegmentTruthSnapshot, find_change_by_exhaustive_segment_scan,
-    find_changes_by_exhaustive_segment_scan, find_commit_by_exhaustive_segment_scan,
-    find_commits_by_exhaustive_segment_scan, load_segment_truth_index,
-    validate_segment_truth_overlay,
+    find_change_by_exhaustive_segment_scan, find_changes_by_exhaustive_segment_scan,
+    find_commit_by_exhaustive_segment_scan, find_commits_by_exhaustive_segment_scan,
+    load_segment_truth_index, validate_segment_truth_overlay, SegmentTruthSnapshot,
 };
-use crate::LixError;
+use crate::changelog::{
+    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
+    decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
+    view_segment,
+};
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
     ChangeProjection, ChangeVisibilityMode, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest,
@@ -40,17 +43,13 @@ use crate::changelog::{
     RebuildIndexStats, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
     SegmentStageReport, StateRowIdentity,
 };
-use crate::changelog::{
-    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
-    decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
-    view_segment,
-};
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
     StorageGetOptions, StorageKey, StorageKeyRange, StoragePrefix, StorageProjectedValue,
     StorageRead, StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
 };
+use crate::LixError;
 
 /// Factory for changelog readers and writers.
 ///
@@ -366,12 +365,6 @@ impl SegmentByteIndex {
             ))
         })
     }
-}
-
-#[derive(Default)]
-struct SourceParentFacts {
-    reachable_memberships: HashSet<String>,
-    first_parent_winners: HashMap<StateRowIdentity, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2880,9 +2873,9 @@ where
 mod tests {
     use crate::changelog::test_support::*;
     use crate::changelog::{
+        decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
         CommitBody, CommitHeader, MembershipRecord, MembershipRole, SegmentCommit,
-        SegmentCommitDirectory, decode_by_change_entry, decode_by_commit_entry,
-        decode_commit_visibility, decode_segment,
+        SegmentCommitDirectory,
     };
     use crate::entity_identity::EntityIdentity;
     use crate::storage::StorageWriteSet;
@@ -3154,8 +3147,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_commits_physical_only_falls_back_when_locator_index_is_missing_for_existing_commit()
-     {
+    async fn load_commits_physical_only_falls_back_when_locator_index_is_missing_for_existing_commit(
+    ) {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -3347,8 +3340,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_changes_physical_only_falls_back_when_locator_index_is_missing_for_existing_change()
-     {
+    async fn load_changes_physical_only_falls_back_when_locator_index_is_missing_for_existing_change(
+    ) {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -4855,8 +4848,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_publish_commit_accepts_adopted_membership_reachable_through_source_parent_history()
-     {
+    async fn stage_publish_commit_accepts_adopted_membership_reachable_through_source_parent_history(
+    ) {
         let (context, storage) = changelog_test_context();
         let mut segment = two_commit_segment();
         segment.commits.push(SegmentCommit {

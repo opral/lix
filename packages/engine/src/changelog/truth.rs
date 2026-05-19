@@ -10,9 +10,9 @@ use super::store::{
     COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::types::{Segment, SegmentChange, SegmentCommit, SegmentObjectLocation};
-use crate::LixError;
 use crate::changelog::decode_segment;
 use crate::storage::{StorageCoreProjection, StorageSpace};
+use crate::LixError;
 
 pub(super) struct SegmentTruthIndex {
     pub(super) segment_ids: Vec<String>,

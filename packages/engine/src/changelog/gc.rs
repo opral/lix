@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use super::context::ChangelogStorageRead;
 use super::store::{
-    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE, by_change_index_value,
-    by_change_key, by_change_membership_ids_from_key, by_change_membership_index_value,
-    by_change_membership_key, by_commit_index_value, by_commit_key, commit_visibility_key,
-    commit_visibility_value, segment_key, visible_change_proof_key,
+    by_change_index_value, by_change_key, by_change_membership_ids_from_key,
+    by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
+    by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
+    visible_change_proof_key, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+    BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::truth::{compute_retained_primary_closure, load_segment_truth_index};
 use super::types::{
@@ -14,11 +14,11 @@ use super::types::{
     GcSweepSet, MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
     StateRowIdentity,
 };
-use crate::LixError;
 use crate::changelog::decode_commit_visibility;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::json_store::{self, JsonRef};
 use crate::storage::{StorageCoreProjection, StorageSpace, StorageWriteSet};
+use crate::LixError;
 
 pub(super) async fn plan_gc<S>(store: &mut S, roots: &[GcRoot]) -> Result<GcPlan, LixError>
 where
@@ -772,10 +772,10 @@ mod tests {
     use crate::changelog::segment::canonicalize_segment;
     use crate::changelog::test_support::commit_visibility_from_segment;
     use crate::changelog::{
-        ChangelogContext, CommitBody, CommitHeader, MembershipRecord, MembershipRole,
-        RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
-        SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentInlinePayload,
-        SegmentPayloadLocation, decode_segment, encode_segment,
+        decode_segment, encode_segment, ChangelogContext, CommitBody, CommitHeader,
+        MembershipRecord, MembershipRole, RebuildIndexStats, Segment, SegmentChange,
+        SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory,
+        SegmentHeader, SegmentInlinePayload, SegmentPayloadLocation,
     };
     use crate::common::{CanonicalSchemaKey, EntityId, FileId};
     use crate::entity_identity::EntityIdentity;
@@ -814,16 +814,14 @@ mod tests {
 
         assert_eq!(plan.live.commits, vec!["commit-1"]);
         assert_eq!(plan.live.changes, vec!["change-1"]);
-        assert!(
-            plan.live
-                .payloads
-                .contains(&JsonRef::from_hash_bytes([7; 32]))
-        );
-        assert!(
-            plan.live
-                .payloads
-                .contains(&JsonRef::from_hash_bytes([8; 32]))
-        );
+        assert!(plan
+            .live
+            .payloads
+            .contains(&JsonRef::from_hash_bytes([7; 32])));
+        assert!(plan
+            .live
+            .payloads
+            .contains(&JsonRef::from_hash_bytes([8; 32])));
         assert_eq!(plan.live.segments, vec!["segment-1"]);
         assert_eq!(plan.sweep.segments, vec!["segment-dead"]);
         assert_eq!(plan.sweep.by_commit, vec!["commit-dead"]);
@@ -1433,12 +1431,11 @@ mod tests {
         transaction.commit().await.unwrap();
 
         assert!(plan.sweep.visible_change_proof.is_empty());
-        assert!(
-            plan.repair
-                .visible_change_proof
-                .iter()
-                .any(|(change_id, _)| change_id == "change-live")
-        );
+        assert!(plan
+            .repair
+            .visible_change_proof
+            .iter()
+            .any(|(change_id, _)| change_id == "change-live"));
         let result = crate::changelog::test_support::read_test_value_groups(
             &storage,
             vec![(
@@ -1759,17 +1756,15 @@ mod tests {
         assert!(plan.live.segments.contains(&"segment-retained".to_string()));
         assert!(!plan.live.segments.contains(&"segment-author".to_string()));
         assert!(plan.sweep.segments.is_empty());
-        assert!(
-            plan.repair
-                .by_change
-                .iter()
-                .any(|entry| entry.change_id == "change-adopted")
-        );
-        assert!(
-            plan.repair
-                .by_change_membership
-                .contains(&("change-adopted".to_string(), "commit-adopter".to_string()))
-        );
+        assert!(plan
+            .repair
+            .by_change
+            .iter()
+            .any(|entry| entry.change_id == "change-adopted"));
+        assert!(plan
+            .repair
+            .by_change_membership
+            .contains(&("change-adopted".to_string(), "commit-adopter".to_string())));
     }
 
     #[tokio::test]
@@ -2089,11 +2084,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership_count drift must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("membership_count 0 does not match 1")
-        );
+        assert!(error
+            .message
+            .contains("membership_count 0 does not match 1"));
     }
 
     #[tokio::test]
@@ -2114,11 +2107,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership directory drift must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("is missing membership ordinal for change 'change-1'")
-        );
+        assert!(error
+            .message
+            .contains("is missing membership ordinal for change 'change-1'"));
     }
 
     #[tokio::test]
@@ -2146,11 +2137,9 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("payload directory drift must be invalid segment input");
-        assert!(
-            error
-                .message
-                .contains("payload directory entry does not match inline payload")
-        );
+        assert!(error
+            .message
+            .contains("payload directory entry does not match inline payload"));
     }
 
     #[tokio::test]

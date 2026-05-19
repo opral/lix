@@ -33,8 +33,8 @@ pub(crate) use codec::{
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 #[allow(unused_imports)]
 pub(crate) use store::{
-    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    ChangelogReader, ChangelogWriter, VISIBLE_CHANGE_PROOF_SPACE,
+    ChangelogReader, ChangelogWriter, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+    BY_COMMIT_INDEX_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 pub use store::{COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE};
 #[allow(unused_imports)]

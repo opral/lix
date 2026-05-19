@@ -3807,8 +3807,8 @@ mod tests {
     }
 
     #[test]
-    fn segment_object_slices_rejects_inline_payloads_exceeding_header_payload_count_before_scanning()
-     {
+    fn segment_object_slices_rejects_inline_payloads_exceeding_header_payload_count_before_scanning(
+    ) {
         let mut segment = sample_segment();
         segment.header.payload_count = 0;
         let bytes = encode_segment(&segment).unwrap();
