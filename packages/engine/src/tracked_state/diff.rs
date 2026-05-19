@@ -1412,6 +1412,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diff_commits_rejects_adopted_created_at_from_corrupt_source_parent_metadata() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
+            .await
+            .expect("target root should write");
+        write_root_committed_for_test(
+            &storage,
+            &tracked_state,
+            "source-add",
+            None,
+            &[row_with_times(
+                "entity-a",
+                None,
+                "source-add-a",
+                "old",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            )],
+        )
+        .await
+        .expect("source add root should write");
+        let source_update = row_with_times(
+            "entity-a",
+            None,
+            "source-update-a",
+            "new",
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        write_root_committed_for_test(
+            &storage,
+            &tracked_state,
+            "source-update",
+            Some("source-add"),
+            std::slice::from_ref(&source_update),
+        )
+        .await
+        .expect("source update root should write");
+
+        let original_source_update_root = tracked_state_root_id(&storage, "source-update").await;
+        let mut forged_parent_row = row_with_times(
+            "entity-a",
+            None,
+            "source-add-a",
+            "old",
+            "1999-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        forged_parent_row.commit_id = "source-add".to_string();
+        let (forged_key, forged_value) = TrackedStateDiffRow {
+            entity_id: forged_parent_row.entity_id,
+            schema_key: forged_parent_row.schema_key,
+            file_id: forged_parent_row.file_id,
+            deleted: forged_parent_row.snapshot_content.is_none(),
+            snapshot_ref: forged_parent_row
+                .snapshot_content
+                .as_deref()
+                .map(|value| JsonRef::for_content(value.as_bytes())),
+            metadata_ref: forged_parent_row
+                .metadata
+                .as_deref()
+                .map(|value| JsonRef::for_content(value.as_bytes())),
+            created_at: forged_parent_row.created_at,
+            updated_at: forged_parent_row.updated_at,
+            change_id: forged_parent_row.change_id,
+            commit_id: forged_parent_row.commit_id,
+            change_location: SegmentObjectLocation {
+                segment_id: "forged".to_string(),
+                offset: 0,
+                len: 0,
+                checksum: String::new(),
+            },
+        }
+        .into_index_entry();
+        stage_corrupt_projection_root(
+            &storage,
+            "forged-source-parent",
+            vec![(forged_key, forged_value)],
+            Vec::new(),
+        )
+        .await;
+        let forged_source_parent_root =
+            tracked_state_root_id(&storage, "forged-source-parent").await;
+        {
+            let mut writes = storage.new_write_set();
+            crate::tracked_state::storage::stage_projection_metadata(
+                &mut writes,
+                &TrackedStateProjectionMetadata {
+                    commit_id: "source-update".to_string(),
+                    root_id: original_source_update_root,
+                    parent_roots: vec![TrackedStateProjectionParent {
+                        commit_id: "source-add".to_string(),
+                        root_id: forged_source_parent_root,
+                    }],
+                    changed_key_count: 1,
+                    row_count_estimate: 1,
+                    tree_height: 1,
+                    primary_chunk_count: 1,
+                    primary_chunk_bytes: 1,
+                },
+            )
+            .expect("corrupt metadata should encode");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("corrupt source metadata should commit");
+        }
+
+        let mut forged_adopted_row = source_update.clone();
+        forged_adopted_row.created_at = "1999-01-01T00:00:00Z".to_string();
+        {
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let mut writes = storage.new_write_set();
+            crate::test_support::stage_tracked_root_from_materialized_with_parents(
+                &mut read,
+                &mut writes,
+                &tracked_state,
+                "merge",
+                &["target".to_string(), "source-update".to_string()],
+                Some("target"),
+                std::slice::from_ref(&forged_adopted_row),
+            )
+            .await
+            .expect("merge root should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("merge root should commit");
+        }
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let diff = tracked_state
+            .reader(&mut read)
+            .diff_commits_with_validation(
+                "target",
+                "merge",
+                &TrackedStateDiffRequest::default(),
+                false,
+                false,
+            )
+            .await
+            .expect("raw diff should expose forged adopted row");
+        let forged_row = diff.entries[0].after.as_ref().expect("after row");
+        let error = tracked_state
+            .reader(read)
+            .validate_diff_rows_for_commits_against_changelog(&[(forged_row, "merge")])
+            .await
+            .expect_err("forged source parent metadata must not validate created_at");
+
+        assert!(
+            error
+                .message
+                .contains("references stale root for projection parent 'source-add'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn diff_commits_rejects_omitted_inherited_row_even_when_diff_is_non_empty() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();

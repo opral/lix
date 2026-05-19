@@ -425,8 +425,14 @@ where
                         row.change_id, root_commit_id, identity
                     )));
                 }
-                self.validate_diff_row_created_at(row, &key, &current_commit_id, change_created_at)
-                    .await?;
+                self.validate_diff_row_created_at(
+                    row,
+                    &key,
+                    &current_commit_id,
+                    change_created_at,
+                    cache,
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -556,16 +562,27 @@ where
         commit_id: &str,
         cache: &mut DiffProjectionValidationCache,
     ) -> Result<TrackedStateProjectionMetadata, LixError> {
-        if let Some(metadata) = cache.projection_metadata.get(commit_id) {
-            return Ok(metadata.clone());
-        }
-        let metadata = storage::load_projection_metadata(&mut self.store, commit_id)
+        self.load_cached_projection_metadata_optional(commit_id, cache)
             .await?
-            .ok_or_else(|| missing_projection_root_error(commit_id))?;
+            .ok_or_else(|| missing_projection_root_error(commit_id))
+    }
+
+    async fn load_cached_projection_metadata_optional(
+        &mut self,
+        commit_id: &str,
+        cache: &mut DiffProjectionValidationCache,
+    ) -> Result<Option<TrackedStateProjectionMetadata>, LixError> {
+        if let Some(metadata) = cache.projection_metadata.get(commit_id) {
+            return Ok(Some(metadata.clone()));
+        }
+        let Some(metadata) = storage::load_projection_metadata(&mut self.store, commit_id).await?
+        else {
+            return Ok(None);
+        };
         cache
             .projection_metadata
             .insert(commit_id.to_string(), metadata.clone());
-        Ok(metadata)
+        Ok(Some(metadata))
     }
 
     async fn load_cached_projection_root_optional(
@@ -647,14 +664,16 @@ where
         key: &TrackedStateKey,
         commit_id: &str,
         change_created_at: &str,
+        cache: &mut DiffProjectionValidationCache,
     ) -> Result<(), LixError> {
         if row.created_at == change_created_at {
             return Ok(());
         }
-        let Some(metadata) = storage::load_projection_metadata(&mut self.store, commit_id).await?
-        else {
-            return Err(missing_projection_root_error(commit_id));
-        };
+        let metadata = self
+            .load_cached_projection_metadata(commit_id, cache)
+            .await?;
+        self.validate_projection_parent_matches_changelog(commit_id, &metadata, cache)
+            .await?;
         let Some(parent) = metadata.parent_roots.first() else {
             return Err(LixError::unknown(format!(
                 "tracked-state diff row for change '{}' created_at '{}' does not match changelog change '{}'",
@@ -662,12 +681,8 @@ where
             )));
         };
         let parent_value = self
-            .tree
-            .get_many(&mut self.store, &parent.root_id, std::slice::from_ref(key))
-            .await?
-            .into_iter()
-            .next()
-            .flatten();
+            .load_cached_tree_value(&parent.root_id, key, cache)
+            .await?;
         if parent_value
             .as_ref()
             .is_some_and(|value| value.created_at == row.created_at)
@@ -676,7 +691,8 @@ where
         }
         if row.commit_id != commit_id {
             if let Some(source_created_at) =
-                self.load_parent_created_at_for_row_commit(row, key).await?
+                self.load_parent_created_at_for_row_commit(row, key, cache)
+                    .await?
             {
                 if source_created_at == row.created_at {
                     return Ok(());
@@ -693,22 +709,22 @@ where
         &mut self,
         row: &TrackedStateDiffRow,
         key: &TrackedStateKey,
+        cache: &mut DiffProjectionValidationCache,
     ) -> Result<Option<String>, LixError> {
-        let Some(metadata) =
-            storage::load_projection_metadata(&mut self.store, &row.commit_id).await?
+        let Some(metadata) = self
+            .load_cached_projection_metadata_optional(&row.commit_id, cache)
+            .await?
         else {
             return Ok(None);
         };
+        self.validate_projection_parent_matches_changelog(&row.commit_id, &metadata, cache)
+            .await?;
         let Some(parent) = metadata.parent_roots.first() else {
             return Ok(None);
         };
         let parent_value = self
-            .tree
-            .get_many(&mut self.store, &parent.root_id, std::slice::from_ref(key))
-            .await?
-            .into_iter()
-            .next()
-            .flatten();
+            .load_cached_tree_value(&parent.root_id, key, cache)
+            .await?;
         Ok(parent_value.map(|value| value.created_at))
     }
 
@@ -762,8 +778,14 @@ where
             }
             if fact.created_at != row.created_at && fact.updated_at != row.created_at {
                 let (key, _) = row.clone().into_index_entry();
-                self.validate_diff_row_created_at(row, &key, &fact.commit_id, &fact.created_at)
-                    .await
+                self.validate_diff_row_created_at(
+                    row,
+                    &key,
+                    &fact.commit_id,
+                    &fact.created_at,
+                    &mut validation_cache,
+                )
+                .await
                     .map_err(|_| {
                         LixError::unknown(format!(
                             "tracked-state projection root for commit '{}' has created_at '{}' for change '{}' but changelog first-parent created_at is '{}'",
