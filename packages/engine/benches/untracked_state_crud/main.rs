@@ -15,6 +15,7 @@ use lix_engine::storage::{
     StorageGetOptions, StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace,
     StorageValue, StorageWriteOptions,
 };
+use lix_engine::storage_bench;
 use lix_engine::{Engine, SessionContext};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
@@ -41,7 +42,7 @@ const PNPM_LOCK_JSON: &str = include_str!("../fixtures/pnpm-lock.fixture.json");
 const JSON_POINTER_SCHEMA_JSON: &str =
     include_str!("../optimization9_sql2/json_pointer.schema.json");
 const SESSION_INSERT_CHUNK_SIZE: usize = 500;
-const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0001_0001), "untracked_state.row");
+const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0001_0002), "untracked_state.row.v1");
 
 #[derive(Clone)]
 struct PointerRow {
@@ -69,6 +70,21 @@ struct RawUntrackedRow {
     created_at: String,
     updated_at: String,
     global: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PhysicalLayout {
+    FullRowValue,
+    PayloadOnlyValue,
+}
+
+impl PhysicalLayout {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FullRowValue => "full_row_value",
+            Self::PayloadOnlyValue => "payload_only_value",
+        }
+    }
 }
 
 struct RawSqliteFixture {
@@ -354,6 +370,7 @@ fn untracked_state_crud_benches(c: &mut Criterion) {
     bench_session_execute_untracked_insert(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_lix(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
+    bench_lix_physical_layout(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
     bench_session_execute_untracked_insert(c, &runtime, &rows, REAL_WORKLOAD_ROWS, "real_workload");
 }
 
@@ -582,6 +599,40 @@ fn bench_lix_profile(
             BatchSize::LargeInput,
         )
     });
+}
+
+fn bench_lix_physical_layout(
+    c: &mut Criterion,
+    all_rows: &[PointerRow],
+    row_count: usize,
+    label: &str,
+) {
+    let rows = &all_rows[..row_count];
+    for profile in LIX_BACKEND_PROFILES {
+        let mut group = c.benchmark_group(format!(
+            "untracked_state_crud/physical_layout/{}/{label}",
+            profile.name()
+        ));
+        configure_group(&mut group, row_count);
+
+        for layout in [
+            PhysicalLayout::FullRowValue,
+            PhysicalLayout::PayloadOnlyValue,
+        ] {
+            group.bench_function(
+                format!("insert_all_rows/{}/{}", layout.name(), row_label(row_count)),
+                |b| {
+                    b.iter_batched(
+                        || (profile_storage(profile), physical_layout_rows(rows, layout)),
+                        |(storage, rows)| black_box(storage.insert_all(&rows)),
+                        BatchSize::LargeInput,
+                    )
+                },
+            );
+        }
+
+        group.finish();
+    }
 }
 
 fn bench_session_execute_untracked_insert(
@@ -990,6 +1041,37 @@ fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
                 updated_value: StorageValue {
                     bytes: Bytes::from(updated_value),
                 },
+            }
+        })
+        .collect()
+}
+
+fn physical_layout_rows(rows: &[PointerRow], layout: PhysicalLayout) -> Vec<BenchRow> {
+    rows.iter()
+        .map(|row| {
+            let entity_id = entity_id(row);
+            let value = snapshot_value(row.path.as_str(), row.value_json.as_str());
+            let updated_value = snapshot_value(row.path.as_str(), row.updated_value_json.as_str());
+            let (key, value) = match layout {
+                PhysicalLayout::FullRowValue => {
+                    storage_bench::untracked_state_full_row_key_value(&entity_id, &value)
+                }
+                PhysicalLayout::PayloadOnlyValue => {
+                    storage_bench::untracked_state_row_key_value(&entity_id, &value)
+                }
+            };
+            let (_, updated_value) = match layout {
+                PhysicalLayout::FullRowValue => {
+                    storage_bench::untracked_state_full_row_key_value(&entity_id, &updated_value)
+                }
+                PhysicalLayout::PayloadOnlyValue => {
+                    storage_bench::untracked_state_row_key_value(&entity_id, &updated_value)
+                }
+            };
+            BenchRow {
+                key,
+                value,
+                updated_value,
             }
         })
         .collect()

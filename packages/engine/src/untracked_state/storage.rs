@@ -13,9 +13,17 @@ use crate::untracked_state::{
 };
 use crate::{LixError, NullableKeyFilter};
 
-pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
+pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row.v1";
 const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0001_0001), UNTRACKED_STATE_ROW_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0001_0002), UNTRACKED_STATE_ROW_NAMESPACE);
+// Durable key bytes:
+//   b"LXUK" | version:u8 |
+//   version_id_len:u32be | version_id:utf8 |
+//   schema_key_len:u32be | schema_key:utf8 |
+//   entity_part_count:u32be | {entity_part_len:u32be | entity_part:utf8}* |
+//   file_id_tag:u8 | [file_id_len:u32be | file_id:utf8]
+const UNTRACKED_STATE_ROW_KEY_IDENTIFIER: &[u8; 4] = b"LXUK";
+const UNTRACKED_STATE_ROW_KEY_VERSION_V1: u8 = 1;
 
 pub(crate) async fn scan_rows(
     store: &impl StorageRead,
@@ -49,7 +57,7 @@ pub(crate) async fn load_row(
         UNTRACKED_STATE_ROW_SPACE,
         &[StorageKey(Bytes::from(encode_untracked_state_row_key(
             &identity,
-        )))],
+        )?))],
     )
     .materialize(store, StorageGetOptions::default())?;
     let bytes = result
@@ -61,7 +69,7 @@ pub(crate) async fn load_row(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
-    let row = crate::untracked_state::codec::decode_row(&bytes)?;
+    let row = crate::untracked_state::codec::decode_payload_with_identity(identity, &bytes)?;
     crate::untracked_state::materialize_row(row, &UntrackedMaterializationProjection::full())
         .map(Some)
 }
@@ -79,10 +87,10 @@ pub(super) async fn existing_identities<'a>(
                 entity_id: identity.entity_id.clone(),
                 file_id: identity.file_id.map(str::to_string),
             };
-            let key = encode_untracked_state_row_key_ref(owned.as_ref());
-            (key, owned)
+            let key = encode_untracked_state_row_key_ref(owned.as_ref())?;
+            Ok((key, owned))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
     candidates.dedup_by(|(left, _), (right, _)| left == right);
     if candidates.is_empty() {
@@ -131,14 +139,14 @@ where
         if row.snapshot_content.is_none() {
             writes.delete(
                 UNTRACKED_STATE_ROW_SPACE,
-                StorageKey(Bytes::from(encode_untracked_state_row_key_ref(row.into()))),
+                StorageKey(Bytes::from(encode_untracked_state_row_key_ref(row.into())?)),
             );
         } else {
             writes.put(
                 UNTRACKED_STATE_ROW_SPACE,
-                StorageKey(Bytes::from(encode_untracked_state_row_key_ref(row.into()))),
+                StorageKey(Bytes::from(encode_untracked_state_row_key_ref(row.into())?)),
                 StorageValue {
-                    bytes: Bytes::from(crate::untracked_state::codec::encode_row_ref(row)?),
+                    bytes: Bytes::from(crate::untracked_state::codec::encode_payload_ref(row)?),
                 },
             );
         }
@@ -146,16 +154,20 @@ where
     Ok(())
 }
 
-pub(crate) fn stage_delete_rows<'a, I>(writes: &mut StorageWriteSet, identities: I)
+pub(crate) fn stage_delete_rows<'a, I>(
+    writes: &mut StorageWriteSet,
+    identities: I,
+) -> Result<(), LixError>
 where
     I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 {
     for identity in identities {
         writes.delete(
             UNTRACKED_STATE_ROW_SPACE,
-            StorageKey(Bytes::from(encode_untracked_state_row_key_ref(identity))),
+            StorageKey(Bytes::from(encode_untracked_state_row_key_ref(identity)?)),
         );
     }
+    Ok(())
 }
 
 fn scan_matching_rows(
@@ -188,7 +200,11 @@ fn scan_matching_rows(
             let Some(bytes) = full_value(entry.value) else {
                 continue;
             };
-            let row = crate::untracked_state::codec::decode_row(bytes.as_ref())?;
+            let identity = decode_untracked_state_row_key_ref(entry.key.0.as_ref())?;
+            let row = crate::untracked_state::codec::decode_payload_with_identity(
+                identity,
+                bytes.as_ref(),
+            )?;
             if !row_matches_scan(&row, request) {
                 continue;
             }
@@ -234,8 +250,8 @@ fn scan_prefixes_for_filter(
 
     let mut prefixes = Vec::new();
     for version_id in &filter.version_ids {
-        let mut version_prefix = Vec::new();
-        push_component(&mut version_prefix, version_id);
+        let mut version_prefix = key_header();
+        push_component(&mut version_prefix, version_id)?;
         if filter.schema_keys.is_empty() {
             prefixes.push(version_prefix);
             continue;
@@ -243,7 +259,7 @@ fn scan_prefixes_for_filter(
 
         for schema_key in &filter.schema_keys {
             let mut schema_prefix = version_prefix.clone();
-            push_component(&mut schema_prefix, schema_key);
+            push_component(&mut schema_prefix, schema_key)?;
             if filter.entity_ids.is_empty() {
                 prefixes.push(schema_prefix);
                 continue;
@@ -252,7 +268,7 @@ fn scan_prefixes_for_filter(
             for entity_id in &filter.entity_ids {
                 let mut entity_prefix = schema_prefix.clone();
                 push_entity_component(&mut entity_prefix, entity_id)?;
-                append_file_prefixes(&mut prefixes, entity_prefix, &filter.file_ids);
+                append_file_prefixes(&mut prefixes, entity_prefix, &filter.file_ids)?;
             }
         }
     }
@@ -260,23 +276,21 @@ fn scan_prefixes_for_filter(
 }
 
 fn push_entity_component(out: &mut Vec<u8>, entity_id: &EntityIdentity) -> Result<(), LixError> {
-    let entity_id = entity_id.as_json_array_text()?;
-    push_component(out, &entity_id);
-    Ok(())
+    push_entity_tuple(out, entity_id)
 }
 
 fn append_file_prefixes(
     prefixes: &mut Vec<Vec<u8>>,
     entity_prefix: Vec<u8>,
     file_filters: &[NullableKeyFilter<String>],
-) {
+) -> Result<(), LixError> {
     if file_filters.is_empty()
         || file_filters
             .iter()
             .any(|filter| matches!(filter, NullableKeyFilter::Any))
     {
         prefixes.push(entity_prefix);
-        return;
+        return Ok(());
     }
 
     for filter in file_filters {
@@ -285,12 +299,13 @@ fn append_file_prefixes(
             NullableKeyFilter::Null => prefix.push(0),
             NullableKeyFilter::Value(file_id) => {
                 prefix.push(1);
-                push_component(&mut prefix, file_id);
+                push_component(&mut prefix, file_id)?;
             }
             NullableKeyFilter::Any => unreachable!("Any handled before exact file prefixes"),
         }
         prefixes.push(prefix);
     }
+    Ok(())
 }
 
 fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
@@ -332,35 +347,214 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
     })
 }
 
-fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> {
+fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Result<Vec<u8>, LixError> {
     encode_untracked_state_row_key_ref(identity.as_ref())
 }
 
-pub(super) fn encode_untracked_state_row_key_ref(
+pub(crate) fn encode_untracked_state_row_key_ref(
     identity: UntrackedStateIdentityRef<'_>,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_component(&mut out, identity.version_id);
-    push_component(&mut out, identity.schema_key);
-    let entity_id = identity
-        .entity_id
-        .as_json_array_text()
-        .expect("untracked-state identity should project");
-    push_component(&mut out, &entity_id);
+) -> Result<Vec<u8>, LixError> {
+    let mut out = key_header();
+    push_component(&mut out, identity.version_id)?;
+    push_component(&mut out, identity.schema_key)?;
+    push_entity_tuple(&mut out, identity.entity_id)?;
     match identity.file_id {
         Some(file_id) => {
             out.push(1);
-            push_component(&mut out, file_id);
+            push_component(&mut out, file_id)?;
         }
         None => out.push(0),
     }
+    Ok(out)
+}
+
+fn decode_untracked_state_row_key_ref(bytes: &[u8]) -> Result<UntrackedStateIdentity, LixError> {
+    if !bytes.starts_with(UNTRACKED_STATE_ROW_KEY_IDENTIFIER) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to decode untracked-state key: invalid key identifier",
+        ));
+    }
+    let mut cursor = UNTRACKED_STATE_ROW_KEY_IDENTIFIER.len();
+    let version = bytes.get(cursor).copied().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to decode untracked-state key: missing version",
+        )
+    })?;
+    cursor += 1;
+    if version != UNTRACKED_STATE_ROW_KEY_VERSION_V1 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: unsupported version {version}"),
+        ));
+    }
+    let version_id = read_key_component(bytes, &mut cursor, "version_id")?;
+    let schema_key = read_key_component(bytes, &mut cursor, "schema_key")?;
+    let entity_id = read_entity_tuple(bytes, &mut cursor)?;
+    let file_tag = bytes.get(cursor).copied().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to decode untracked-state key: missing file_id tag",
+        )
+    })?;
+    cursor += 1;
+    let file_id = match file_tag {
+        0 => None,
+        1 => Some(read_key_component(bytes, &mut cursor, "file_id")?),
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to decode untracked-state key: invalid file_id tag",
+            ));
+        }
+    };
+    if cursor != bytes.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to decode untracked-state key: trailing bytes",
+        ));
+    }
+    Ok(UntrackedStateIdentity {
+        version_id,
+        schema_key,
+        entity_id,
+        file_id,
+    })
+}
+
+fn read_key_component(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<String, LixError> {
+    let len_end = cursor.checked_add(4).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: `{field}` cursor overflow"),
+        )
+    })?;
+    let len_bytes = bytes.get(*cursor..len_end).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: truncated `{field}` length"),
+        )
+    })?;
+    *cursor = len_end;
+    let len = u32::from_be_bytes(len_bytes.try_into().expect("slice length checked")) as usize;
+    let value_end = cursor.checked_add(len).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: `{field}` length overflow"),
+        )
+    })?;
+    let value = bytes.get(*cursor..value_end).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: truncated `{field}`"),
+        )
+    })?;
+    *cursor = value_end;
+    std::str::from_utf8(value)
+        .map(str::to_string)
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "failed to decode untracked-state key: invalid utf-8 for `{field}`: {error}"
+                ),
+            )
+        })
+}
+
+fn read_entity_tuple(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity, LixError> {
+    let part_count = read_key_u32(bytes, cursor, "entity_part_count")? as usize;
+    if part_count == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to decode untracked-state key: entity identity has no parts",
+        ));
+    }
+
+    let mut parts = Vec::with_capacity(part_count);
+    for index in 0..part_count {
+        let part = read_key_component(bytes, cursor, "entity_part")?;
+        if part.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "failed to decode untracked-state key: entity identity part {index} is empty"
+                ),
+            ));
+        }
+        parts.push(part);
+    }
+    Ok(EntityIdentity { parts })
+}
+
+fn read_key_u32(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u32, LixError> {
+    let len_end = cursor.checked_add(4).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: `{field}` cursor overflow"),
+        )
+    })?;
+    let len_bytes = bytes.get(*cursor..len_end).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to decode untracked-state key: truncated `{field}`"),
+        )
+    })?;
+    *cursor = len_end;
+    Ok(u32::from_be_bytes(
+        len_bytes.try_into().expect("slice length checked"),
+    ))
+}
+
+fn key_header() -> Vec<u8> {
+    let mut out = Vec::with_capacity(UNTRACKED_STATE_ROW_KEY_IDENTIFIER.len() + 1);
+    out.extend_from_slice(UNTRACKED_STATE_ROW_KEY_IDENTIFIER);
+    out.push(UNTRACKED_STATE_ROW_KEY_VERSION_V1);
     out
 }
 
-fn push_component(out: &mut Vec<u8>, value: &str) {
+fn push_component(out: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
     let bytes = value.as_bytes();
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    push_bytes_component(out, bytes)
+}
+
+fn push_entity_tuple(out: &mut Vec<u8>, entity_id: &EntityIdentity) -> Result<(), LixError> {
+    let part_count = u32::try_from(entity_id.parts.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to encode untracked-state key: entity identity part count exceeds u32",
+        )
+    })?;
+    if part_count == 0 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to encode untracked-state key: entity identity has no parts",
+        ));
+    }
+    out.extend_from_slice(&part_count.to_be_bytes());
+    for part in &entity_id.parts {
+        if part.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to encode untracked-state key: entity identity part is empty",
+            ));
+        }
+        push_bytes_component(out, part.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn push_bytes_component(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "failed to encode untracked-state key: component length exceeds u32",
+        )
+    })?;
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -369,6 +563,138 @@ mod tests {
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::untracked_state::UntrackedStateContext;
+
+    #[test]
+    fn key_v1_roundtrips_null_file_id() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: None,
+        };
+        let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+
+        assert_eq!(&key[..4], b"LXUK");
+        assert_eq!(key[4], 1);
+        assert_eq!(
+            decode_untracked_state_row_key_ref(&key).expect("key should decode"),
+            identity
+        );
+    }
+
+    #[test]
+    fn key_v1_roundtrips_empty_file_id() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: Some(String::new()),
+        };
+        let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+
+        assert_eq!(
+            decode_untracked_state_row_key_ref(&key).expect("key should decode"),
+            identity
+        );
+    }
+
+    #[test]
+    fn key_v1_roundtrips_tuple_and_unicode_identity() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-東京".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::tuple(vec![
+                "entity-1".to_string(),
+                "ключ".to_string(),
+            ])
+            .expect("entity identity should build"),
+            file_id: Some("file-δ".to_string()),
+        };
+        let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+
+        assert_eq!(
+            decode_untracked_state_row_key_ref(&key).expect("key should decode"),
+            identity
+        );
+    }
+
+    #[test]
+    fn key_v1_encodes_entity_as_binary_tuple_not_json_text() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::tuple(vec![
+                "entity/1".to_string(),
+                "quote\"part".to_string(),
+            ])
+            .expect("entity identity should build"),
+            file_id: None,
+        };
+        let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+
+        assert!(!key
+            .windows(2)
+            .any(|window| window == br#"[""# || window == br#""]"#));
+        assert_eq!(
+            decode_untracked_state_row_key_ref(&key).expect("key should decode"),
+            identity
+        );
+    }
+
+    #[test]
+    fn key_decode_rejects_invalid_identifier() {
+        let error = decode_untracked_state_row_key_ref(b"LXUQ\x01")
+            .expect_err("invalid key identifier should fail");
+        assert!(error.to_string().contains("invalid key identifier"));
+    }
+
+    #[test]
+    fn key_decode_rejects_unknown_version() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: None,
+        };
+        let mut key =
+            encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+        key[4] = 2;
+        let error =
+            decode_untracked_state_row_key_ref(&key).expect_err("unknown key version should fail");
+        assert!(error.to_string().contains("unsupported version 2"));
+    }
+
+    #[test]
+    fn key_decode_rejects_trailing_bytes() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: None,
+        };
+        let mut key =
+            encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+        key.push(0);
+        let error =
+            decode_untracked_state_row_key_ref(&key).expect_err("trailing key bytes should fail");
+        assert!(error.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn key_decode_rejects_truncated_component() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: None,
+        };
+        let mut key =
+            encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+        key.truncate(key.len() - 2);
+        let error =
+            decode_untracked_state_row_key_ref(&key).expect_err("truncated key should fail");
+        assert!(error.to_string().contains("truncated"));
+    }
 
     async fn write_materialized_rows_to_store(
         context: &UntrackedStateContext,
@@ -471,7 +797,9 @@ mod tests {
 
         let mut writes = storage.new_write_set();
         let mut writer = context.writer(&mut writes);
-        writer.stage_delete_rows(std::iter::once(identity.as_ref()));
+        writer
+            .stage_delete_rows(std::iter::once(identity.as_ref()))
+            .expect("delete should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should commit");
