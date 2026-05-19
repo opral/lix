@@ -409,9 +409,9 @@ mod tests {
 
     use crate::backend::{
         Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor,
-        PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-        WriteConcurrency, WriteOptions, WriteStats,
+        BufferedRangeScan, CommitResult, DurableWriteLock, GetOptions, InMemoryBackend, Key,
+        KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+        SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
     };
     use crate::storage::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -852,6 +852,10 @@ mod tests {
                 put_batches: RefCell::new(Vec::new()),
                 delete_batches: RefCell::new(Vec::new()),
             })
+        }
+
+        fn durable_write_lock(&self) -> DurableWriteLock {
+            DurableWriteLock::new()
         }
     }
 

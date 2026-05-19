@@ -29,7 +29,7 @@ pub use predicate::{
 };
 pub use traits::{
     get_many, visit_range, Backend, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
-    PointVisitor, ScanVisitor,
+    DurableWriteGuard, DurableWriteLock, PointVisitor, ScanVisitor,
 };
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,

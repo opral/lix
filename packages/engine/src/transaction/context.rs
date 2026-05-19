@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -72,6 +73,128 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     storage: StorageContext<B>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
+    commit_boundary: Option<TransactionCommitBoundary>,
+}
+
+#[derive(Clone)]
+pub(crate) struct TransactionCommitBoundary {
+    state: CommitBoundaryState,
+    pre_commit_check: Arc<dyn Fn() -> Result<(), LixError> + Send + Sync>,
+}
+
+impl TransactionCommitBoundary {
+    pub(crate) fn new(
+        state: CommitBoundaryState,
+        pre_commit_check: Arc<dyn Fn() -> Result<(), LixError> + Send + Sync>,
+    ) -> Self {
+        Self {
+            state,
+            pre_commit_check,
+        }
+    }
+
+    fn begin(&self) -> CommitBoundaryGuard {
+        self.state.begin()
+    }
+
+    fn check(&self) -> Result<(), LixError> {
+        (self.pre_commit_check)()
+    }
+
+    fn commit<T>(&self, commit: impl FnOnce() -> Result<T, LixError>) -> Result<T, LixError> {
+        let _gate = self.state.lock_durable_commit();
+        self.check()?;
+        commit()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CommitBoundaryState {
+    active_count: Arc<AtomicUsize>,
+    durable_commit_gate: Arc<std::sync::Mutex<()>>,
+    watch: tokio::sync::watch::Sender<usize>,
+}
+
+impl CommitBoundaryState {
+    pub(crate) fn new() -> Self {
+        let (watch, _) = tokio::sync::watch::channel(0);
+        Self {
+            active_count: Arc::new(AtomicUsize::new(0)),
+            durable_commit_gate: Arc::new(std::sync::Mutex::new(())),
+            watch,
+        }
+    }
+
+    pub(crate) fn begin(&self) -> CommitBoundaryGuard {
+        let previous = self.active_count.fetch_add(1, Ordering::SeqCst);
+        self.watch.send_replace(previous + 1);
+        CommitBoundaryGuard {
+            state: self.clone(),
+        }
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_count() > 0
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.watch.subscribe()
+    }
+
+    pub(crate) fn lock_durable_commit(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.durable_commit_gate
+            .lock()
+            .expect("commit boundary durable commit gate should not poison")
+    }
+
+    pub(crate) fn try_lock_durable_commit(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.durable_commit_gate.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("commit boundary durable commit gate should not poison")
+            }
+        }
+    }
+}
+
+pub(crate) struct CommitBoundaryGuard {
+    state: CommitBoundaryState,
+}
+
+impl Drop for CommitBoundaryGuard {
+    fn drop(&mut self) {
+        let remaining = self.state.active_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        self.state.watch.send_replace(remaining);
+    }
+}
+
+pub(crate) fn begin_commit_boundary(
+    boundary: Option<&TransactionCommitBoundary>,
+) -> Option<CommitBoundaryGuard> {
+    let boundary = boundary?;
+    Some(boundary.begin())
+}
+
+fn check_commit_boundary(boundary: Option<&TransactionCommitBoundary>) -> Result<(), LixError> {
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn commit_at_boundary<T>(
+    boundary: Option<&TransactionCommitBoundary>,
+    commit: impl FnOnce() -> Result<T, LixError>,
+) -> Result<T, LixError> {
+    match boundary {
+        Some(boundary) => boundary.commit(commit),
+        None => commit(),
+    }
 }
 
 impl<B> Transaction<B>
@@ -151,6 +274,7 @@ where
                 storage,
                 visible_schemas,
                 functions,
+                commit_boundary: None,
             },
             runtime_functions,
         })
@@ -161,26 +285,33 @@ where
     /// Commit owns the execution boundary: prepared rows become changelog
     /// facts, version-ref updates, and visible live_state rows before the
     /// backend transaction is committed.
+    #[allow(dead_code)]
     pub(crate) async fn commit(
-        mut self,
+        self,
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        let prepared_writes = match self.staged_writes.drain() {
+        let mut transaction = self;
+        let commit_boundary = transaction.commit_boundary.clone();
+        let prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 return Err(error);
             }
         };
-        if let Err(error) = self
+        let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
+        check_commit_boundary(commit_boundary.as_ref())?;
+        if let Err(error) = transaction
             .validate_prepared_writes_by_version(&prepared_writes)
             .await
         {
             return Err(error);
         }
-        let mut read = self.storage.begin_read(StorageReadOptions::default())?;
+        let mut read = transaction
+            .storage
+            .begin_read(StorageReadOptions::default())?;
         let mut writes = match commit::commit_prepared_writes(
-            &self.binary_cas,
-            self.version_ctx.as_ref(),
+            &transaction.binary_cas,
+            transaction.version_ctx.as_ref(),
             Some(runtime_functions),
             &mut read,
             prepared_writes,
@@ -190,10 +321,18 @@ where
             Ok(writes) => writes,
             Err(error) => return Err(error),
         };
-        writes.extend(self.staged_storage_writes);
-        self.storage
-            .commit_write_set(writes, StorageWriteOptions::default())?;
+        writes.extend(transaction.staged_storage_writes);
+        commit_at_boundary(commit_boundary.as_ref(), || {
+            transaction
+                .storage
+                .commit_write_set(writes, StorageWriteOptions::default())?;
+            Ok(())
+        })?;
         Ok(TransactionCommitOutcome::default())
+    }
+
+    pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
+        self.commit_boundary = Some(boundary);
     }
 
     /// Rolls back the backend transaction.
@@ -581,6 +720,9 @@ where
             return Ok(());
         }
 
+        let commit_boundary = self.commit_boundary.clone();
+        let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
+        check_commit_boundary(commit_boundary.as_ref())?;
         let mut writes = self.storage.new_write_set();
         {
             let read = self.storage.begin_read(StorageReadOptions::default())?;
@@ -590,8 +732,11 @@ where
             }
         }
         if !writes.is_empty() {
-            self.storage
-                .commit_write_set(writes, StorageWriteOptions::default())?;
+            commit_at_boundary(commit_boundary.as_ref(), || {
+                self.storage
+                    .commit_write_set(writes, StorageWriteOptions::default())?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1128,6 +1273,7 @@ async fn load_workspace_version_id(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use serde_json::json;
@@ -1543,6 +1689,56 @@ mod tests {
             "schema-mismatch",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn projection_root_repair_uses_attached_commit_boundary() {
+        let backend = InMemoryStorageBackend::new();
+        let storage = StorageContext::new(backend.clone());
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
+
+        let projection_space = crate::storage::StorageSpace::new(
+            crate::storage::StorageSpaceId(0x0004_0004),
+            "tracked_state.projection",
+        );
+        let mut deletes = storage.new_write_set();
+        deletes.delete(
+            projection_space,
+            crate::storage::StorageKey(bytes::Bytes::copy_from_slice(
+                SCHEMA_FIXTURE_COMMIT_ID.as_bytes(),
+            )),
+        );
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .expect("projection root delete should commit");
+
+        let check_count = Arc::new(AtomicUsize::new(0));
+        let commit_boundary = CommitBoundaryState::new();
+        let check_count_for_boundary = Arc::clone(&check_count);
+        let commit_boundary_for_assert = commit_boundary.clone();
+        transaction.attach_commit_boundary(TransactionCommitBoundary::new(
+            commit_boundary,
+            Arc::new(move || {
+                assert!(
+                    commit_boundary_for_assert.is_active(),
+                    "direct projection-root commit checks should run while the commit guard is visible"
+                );
+                check_count_for_boundary.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        ));
+
+        transaction
+            .ensure_tracked_state_projection_roots(&[SCHEMA_FIXTURE_COMMIT_ID.to_string()])
+            .await
+            .expect("projection root should repair through guarded direct commit");
+
+        assert_eq!(
+            check_count.load(Ordering::SeqCst),
+            2,
+            "direct projection-root commit should use the attached commit boundary"
+        );
     }
 
     #[tokio::test]

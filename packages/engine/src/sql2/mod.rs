@@ -28,7 +28,8 @@ mod version_scope;
 mod write_normalization;
 
 pub(crate) use bind::{
-    bind_read_statement, bind_statement, bind_statement_route, BoundStatementRoute,
+    bind_read_statement, bind_statement, bind_statement_route,
+    statement_has_durable_runtime_function, BoundStatementRoute,
 };
 pub(crate) use context::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,

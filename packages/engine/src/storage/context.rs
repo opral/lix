@@ -58,6 +58,10 @@ where
         write_set.commit(&self.backend, opts)
     }
 
+    pub fn durable_write_lock(&self) -> crate::backend::DurableWriteLock {
+        self.backend.durable_write_lock()
+    }
+
     pub fn delete_range(
         &self,
         space: StorageSpace,
@@ -172,8 +176,8 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend::{
-        GetOptions, InMemoryBackend, Key, ProjectedValue, ReadOptions, SpaceId, StoredValue,
-        WriteOptions,
+        DurableWriteLock, GetOptions, InMemoryBackend, Key, ProjectedValue, ReadOptions, SpaceId,
+        StoredValue, WriteOptions,
     };
     use crate::storage::{PointReadPlan, StorageContext, StorageSpace};
 
@@ -270,9 +274,9 @@ mod shape_tests {
 
     use crate::backend::{
         Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
-        ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-        StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+        BufferedRangeScan, CommitResult, DurableWriteLock, GetOptions, Key, KeyRange, PointVisitor,
+        ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
+        ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
     };
     use crate::storage::{PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
@@ -489,6 +493,10 @@ mod shape_tests {
                 put_batches: Vec::new(),
                 delete_ranges: Vec::new(),
             })
+        }
+
+        fn durable_write_lock(&self) -> DurableWriteLock {
+            DurableWriteLock::new()
         }
     }
 
