@@ -133,7 +133,7 @@ where
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
         let rows = if let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? {
-            if ByFileIndex::should_use(request) {
+            if ByFileIndex::should_use(request) && !request.filter.schema_keys.is_empty() {
                 if let Some(by_file_root_id) =
                     storage::load_by_file_root(&mut self.store, commit_id).await?
                 {
@@ -807,6 +807,18 @@ where
         by_file_root_id: &crate::tracked_state::types::TrackedStateRootId,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        if request.filter.schema_keys.is_empty() {
+            let rows = self
+                .tree
+                .scan(
+                    &mut self.store,
+                    primary_root_id,
+                    &tree_scan_request_from_tracked(request),
+                )
+                .await?;
+            return Ok(rows);
+        }
+
         let by_file_request = ByFileIndex::scan_request_from_tracked(request);
         let index_match_count = self
             .tree
@@ -827,44 +839,51 @@ where
                 .await?;
             return Ok(rows);
         }
+        let primary_rows = self
+            .tree
+            .scan(
+                &mut self.store,
+                primary_root_id,
+                &tree_scan_request_from_tracked(request),
+            )
+            .await?;
         let index_rows = self
             .tree
             .scan(&mut self.store, by_file_root_id, &by_file_request)
             .await?;
-        let mut rows = Vec::new();
-        let tree_request = tree_scan_request_from_tracked(request);
-        let needs_payloads = scan_needs_json_payloads(request);
-        if needs_payloads {
-            let mut primary_keys = Vec::with_capacity(index_rows.len());
-            for (index_key, _) in index_rows {
-                if let Some(primary_key) = ByFileIndex::primary_key_from_index_key(index_key) {
-                    primary_keys.push(primary_key);
-                }
-            }
-            let primary_values = self
-                .tree
-                .get_many(&mut self.store, primary_root_id, &primary_keys)
-                .await?;
-            for (primary_key, value) in primary_keys.into_iter().zip(primary_values) {
-                let Some(value) = value else {
-                    continue;
-                };
-                if !tree_request.matches(&primary_key, &value) {
-                    continue;
-                }
-                rows.push((primary_key, value));
-            }
-            return Ok(rows);
+        if primary_rows.len() != index_rows.len() {
+            return Err(LixError::unknown(format!(
+                "tracked-state by-file index row count {} does not match primary projection row count {}",
+                index_rows.len(),
+                primary_rows.len()
+            )));
         }
 
+        let mut primary_by_key =
+            HashMap::<TrackedStateKey, TrackedStateIndexValue>::with_capacity(primary_rows.len());
+        for (key, value) in primary_rows {
+            primary_by_key.insert(key, value);
+        }
+        let mut rows = Vec::new();
         for (index_key, index_value) in index_rows {
             let Some(primary_key) = ByFileIndex::primary_key_from_index_key(index_key) else {
-                continue;
+                return Err(LixError::unknown(format!(
+                    "tracked-state by-file index contains malformed primary key mapping"
+                )));
             };
-            let value = index_value;
-            if tree_request.matches(&primary_key, &value) {
-                rows.push((primary_key, value));
-            }
+            let Some(value) = primary_by_key.remove(&primary_key) else {
+                return Err(LixError::unknown(format!(
+                    "tracked-state by-file index references row {:?} outside primary projection",
+                    primary_key
+                )));
+            };
+            validate_by_file_index_value_matches_primary(&primary_key, &index_value, &value)?;
+            rows.push((primary_key, value));
+        }
+        if !primary_by_key.is_empty() {
+            return Err(LixError::unknown(
+                "tracked-state by-file index is missing primary projection rows",
+            ));
         }
         Ok(rows)
     }
@@ -1198,15 +1217,28 @@ fn tree_scan_request_from_tracked(
     }
 }
 
-fn scan_needs_json_payloads(request: &TrackedStateScanRequest) -> bool {
-    if request.projection.columns.is_empty() {
-        return true;
+fn validate_by_file_index_value_matches_primary(
+    key: &TrackedStateKey,
+    index_value: &TrackedStateIndexValue,
+    primary_value: &TrackedStateIndexValue,
+) -> Result<(), LixError> {
+    if index_value.snapshot_ref.is_some() || index_value.metadata_ref.is_some() {
+        return Err(LixError::unknown(format!(
+            "tracked-state by-file index value contains payload refs for {:?}",
+            key
+        )));
     }
-    request
-        .projection
-        .columns
-        .iter()
-        .any(|column| column == "snapshot_content" || column == "metadata")
+    if index_value.change_locator != primary_value.change_locator
+        || index_value.deleted != primary_value.deleted
+        || index_value.created_at != primary_value.created_at
+        || index_value.updated_at != primary_value.updated_at
+    {
+        return Err(LixError::unknown(format!(
+            "tracked-state by-file index value does not match primary projection for {:?}",
+            key
+        )));
+    }
+    Ok(())
 }
 
 fn validate_diff_row_against_changelog(
@@ -1737,15 +1769,19 @@ mod tests {
         file_a.file_id = Some("file-a.json".to_string());
         let mut file_b = row("entity-b", "change-b", "commit-1");
         file_b.file_id = Some("file-b.json".to_string());
-        write_root_for_test(
-            &storage,
-            &tracked_state,
-            "commit-1",
-            None,
-            &[file_a, file_b],
-        )
-        .await
-        .expect("root should write");
+        let mut rows = vec![file_a, file_b];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &rows)
+            .await
+            .expect("root should write");
 
         let rows = tracked_state
             .reader(
@@ -1757,6 +1793,7 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
                         ..Default::default()
                     },
@@ -1778,21 +1815,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn by_file_header_index_fetches_primary_payload_only_when_requested() {
+    async fn file_only_by_file_scan_falls_back_to_primary_even_with_existing_by_file_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let mut row = row("entity-a", "change-a", "commit-1");
-        row.file_id = Some("file-a.json".to_string());
-        let expected_snapshot = row.snapshot_content.clone();
+        let mut primary_row = row("entity-a", "change-a", "commit-1");
+        primary_row.file_id = Some("file-a.json".to_string());
+        let mut other_row = row("entity-b", "change-b", "commit-1");
+        other_row.file_id = Some("file-b.json".to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
             "commit-1",
             None,
-            std::slice::from_ref(&row),
+            &[primary_row.clone(), other_row],
         )
         .await
         .expect("root should write");
+
+        let key = TrackedStateKey {
+            schema_key: primary_row.schema_key.clone(),
+            file_id: primary_row.file_id.clone(),
+            entity_id: primary_row.entity_id.clone(),
+        };
+        let primary_root = storage::load_root(
+            &storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+            "commit-1",
+        )
+        .await
+        .expect("primary root should load")
+        .expect("primary root should exist");
+        let index_value = TrackedStateTree::new()
+            .get(
+                &storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+                &primary_root,
+                &key,
+            )
+            .await
+            .expect("primary value should load")
+            .expect("primary value should exist");
+        assert!(
+            index_value.snapshot_ref.is_some(),
+            "test setup needs a payload ref to prove the by-file root is bypassed"
+        );
+        write_by_file_entries_for_test(&storage, "commit-1", &[(key, index_value)])
+            .await
+            .expect("payload-bearing by-file root should write");
+
+        let rows = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file-only scan should use the primary fallback");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
+            "entity-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn by_file_header_index_fetches_primary_payload_only_when_requested() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut primary_row = row("entity-a", "change-a", "commit-1");
+        primary_row.file_id = Some("file-a.json".to_string());
+        let expected_snapshot = primary_row.snapshot_content.clone();
+        let mut rows = vec![primary_row];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &rows)
+            .await
+            .expect("root should write");
 
         let mut reader = tracked_state.reader(
             storage
@@ -1804,6 +1928,7 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
                         ..Default::default()
                     },
@@ -1820,6 +1945,7 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
                         ..Default::default()
                     },
@@ -1831,6 +1957,223 @@ mod tests {
 
         assert_eq!(header_rows[0].snapshot_content, None);
         assert_eq!(full_rows[0].snapshot_content, expected_snapshot);
+    }
+
+    #[tokio::test]
+    async fn by_file_header_index_rejects_value_corruption_against_primary_root() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut primary_row = row("entity-a", "change-a", "commit-1");
+        primary_row.file_id = Some("file-a.json".to_string());
+        let mut corrupt_index_row = row("entity-a", "change-bad", "commit-bad");
+        corrupt_index_row.file_id = Some("file-a.json".to_string());
+        let mut primary_rows = vec![primary_row.clone()];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            primary_rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &primary_rows)
+            .await
+            .expect("primary root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "commit-bad",
+            None,
+            std::slice::from_ref(&corrupt_index_row),
+        )
+        .await
+        .expect("corrupt by-file donor root should write");
+
+        let corrupt_by_file_root = storage::load_by_file_root(
+            &storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+            "commit-bad",
+        )
+        .await
+        .expect("corrupt by-file root should load")
+        .expect("corrupt by-file root should exist");
+        let mut writes = storage.new_write_set();
+        storage::stage_by_file_root(&mut writes, "commit-1", &corrupt_by_file_root);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("corrupt by-file root should commit");
+
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("by-file value corruption should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("by-file index value does not match primary projection"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn by_file_header_index_rejects_missing_primary_projection_rows() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut indexed_row = row("entity-indexed", "change-indexed", "commit-1");
+        indexed_row.file_id = Some("file-a.json".to_string());
+        let mut omitted_row = row("entity-omitted", "change-omitted", "commit-1");
+        omitted_row.file_id = Some("file-a.json".to_string());
+        let mut primary_rows = vec![indexed_row.clone(), omitted_row];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            primary_rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &primary_rows)
+            .await
+            .expect("primary root should write");
+        write_by_file_root_for_test(&storage, "commit-1", &[indexed_row])
+            .await
+            .expect("partial by-file root should write");
+
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("by-file omission should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "by-file index row count 1 does not match primary projection row count 2"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn by_file_header_index_rejects_payload_refs_in_index_values() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut primary_row = row("entity-a", "change-a", "commit-1");
+        primary_row.file_id = Some("file-a.json".to_string());
+        let mut primary_rows = vec![primary_row.clone()];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            primary_rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &primary_rows)
+            .await
+            .expect("primary root should write");
+
+        let key = TrackedStateKey {
+            schema_key: primary_row.schema_key.clone(),
+            file_id: primary_row.file_id.clone(),
+            entity_id: primary_row.entity_id.clone(),
+        };
+        let primary_root = storage::load_root(
+            &storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+            "commit-1",
+        )
+        .await
+        .expect("primary root should load")
+        .expect("primary root should exist");
+        let index_value = TrackedStateTree::new()
+            .get(
+                &storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+                &primary_root,
+                &key,
+            )
+            .await
+            .expect("primary value should load")
+            .expect("primary value should exist");
+        assert!(
+            index_value.snapshot_ref.is_some(),
+            "test setup needs a payload ref to forge into the by-file index"
+        );
+        write_by_file_entries_for_test(&storage, "commit-1", &[(key, index_value)])
+            .await
+            .expect("payload-bearing by-file root should write");
+
+        let error = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("payload-bearing by-file value should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("by-file index value contains payload refs"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1951,7 +2294,17 @@ mod tests {
         live.file_id = Some("file-a.json".to_string());
         let mut deleted = tombstone("entity-deleted", "change-delete", "commit-1");
         deleted.file_id = Some("file-a.json".to_string());
-        write_root_for_test(&storage, &tracked_state, "commit-1", None, &[live, deleted])
+        let mut rows = vec![live, deleted];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &rows)
             .await
             .expect("root should write");
 
@@ -1965,6 +2318,7 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
                         ..Default::default()
                     },
@@ -2208,7 +2562,17 @@ mod tests {
         deleted.file_id = Some("file-a.json".to_string());
         let mut live = row("entity-b", "change-live", "commit-1");
         live.file_id = Some("file-a.json".to_string());
-        write_root_for_test(&storage, &tracked_state, "commit-1", None, &[deleted, live])
+        let mut rows = vec![deleted, live];
+        for index in 0..25 {
+            let mut row = row(
+                &format!("entity-padding-{index}"),
+                &format!("change-padding-{index}"),
+                "commit-1",
+            );
+            row.file_id = Some("file-b.json".to_string());
+            rows.push(row);
+        }
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &rows)
             .await
             .expect("root should write");
 
@@ -2222,6 +2586,7 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
                         ..Default::default()
                     },
@@ -2444,6 +2809,69 @@ mod tests {
             rows,
         )
         .await?;
+        storage.commit_write_set(writes, StorageWriteOptions::default())?;
+        Ok(())
+    }
+
+    async fn write_by_file_root_for_test(
+        storage: &StorageContext,
+        commit_id: &str,
+        rows: &[MaterializedTrackedStateRow],
+    ) -> Result<(), LixError> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let primary_root = storage::load_root(&read, commit_id)
+            .await?
+            .ok_or_else(|| missing_projection_root_error(commit_id))?;
+        let tree = TrackedStateTree::new();
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key = TrackedStateKey {
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                entity_id: row.entity_id.clone(),
+            };
+            let mut value = tree
+                .get(&read, &primary_root, &key)
+                .await?
+                .ok_or_else(|| LixError::unknown("test row is missing from primary root"))?;
+            value.snapshot_ref = None;
+            value.metadata_ref = None;
+            entries.push((key, value));
+        }
+        write_by_file_entries_for_test(storage, commit_id, &entries).await
+    }
+
+    async fn write_by_file_entries_for_test(
+        storage: &StorageContext,
+        commit_id: &str,
+        entries: &[(TrackedStateKey, TrackedStateIndexValue)],
+    ) -> Result<(), LixError> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut mutations = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if key.file_id.is_none() {
+                return Err(LixError::unknown(
+                    "test by-file index entry requires a concrete file_id",
+                ));
+            }
+            mutations.push(TrackedStateMutation::put_encoded(
+                ByFileIndex::encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_id: &key.entity_id,
+                }),
+                crate::tracked_state::codec::encode_value(value),
+            ));
+        }
+        let mut writes = storage.new_write_set();
+        let result = TrackedStateTree::new()
+            .apply_mutations(&read, &mut writes, None, mutations, None)
+            .await?;
+        storage::stage_by_file_root(&mut writes, commit_id, &result.root_id);
         storage.commit_write_set(writes, StorageWriteOptions::default())?;
         Ok(())
     }
