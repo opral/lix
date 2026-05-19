@@ -2979,11 +2979,14 @@ where
         .value
         .into_iter()
         .map(|value| match value {
-            Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
-            Some(StorageProjectedValue::KeyOnly) => Some(Vec::new()),
-            None => None,
+            Some(StorageProjectedValue::FullValue(bytes)) => Ok(Some(bytes.to_vec())),
+            Some(StorageProjectedValue::KeyOnly) => Err(LixError::unknown(format!(
+                "changelog point read over namespace '{}' requested full value but storage returned key-only entry",
+                space.name
+            ))),
+            None => Ok(None),
         })
-        .collect())
+        .collect::<Result<Vec<_>, LixError>>()?)
 }
 
 fn native_scan<R>(
@@ -3037,6 +3040,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::{
+        BackendError, BackendRead, BufferedRangeScan, GetOptions, Key, KeyRange, PointVisitor,
+        ProjectedValueRef, ScanOptions,
+    };
     use crate::changelog::test_support::*;
     use crate::changelog::{
         decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
@@ -3044,7 +3051,7 @@ mod tests {
         SegmentCommitDirectory,
     };
     use crate::entity_identity::EntityIdentity;
-    use crate::storage::StorageWriteSet;
+    use crate::storage::{StorageReadScope, StorageWriteSet};
 
     use super::*;
 
@@ -3085,6 +3092,54 @@ mod tests {
                 resume_after: None,
             })
         }
+    }
+
+    struct KeyOnlyPointRead;
+
+    impl BackendRead for KeyOnlyPointRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            for (index, key) in keys.iter().enumerate() {
+                visitor.visit(index, key, Some(ProjectedValueRef::KeyOnly))?;
+            }
+            Ok(())
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            _f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            unreachable!("changelog point-read test does not scan")
+        }
+    }
+
+    #[test]
+    fn native_get_many_rejects_key_only_point_read() {
+        let mut read = StorageReadScope::new(KeyOnlyPointRead);
+
+        let error = native_get_many(&mut read, SEGMENT_SPACE, vec![b"segment-1".to_vec()])
+            .expect_err("key-only point read must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
