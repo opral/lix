@@ -29,6 +29,7 @@ use super::truth::{
     SegmentTruthSnapshot, find_change_by_exhaustive_segment_scan,
     find_changes_by_exhaustive_segment_scan, find_commit_by_exhaustive_segment_scan,
     find_commits_by_exhaustive_segment_scan, load_segment_truth_index,
+    validate_segment_truth_overlay,
 };
 use crate::LixError;
 use crate::changelog::{
@@ -1484,58 +1485,12 @@ where
     }
 
     async fn reject_duplicate_logical_ids(&mut self, segment: &Segment) -> Result<(), LixError> {
-        let commit_ids = segment
-            .commits
-            .iter()
-            .map(|commit| commit.header.id.as_str())
-            .collect::<HashSet<_>>();
-        let change_ids = segment
-            .changes
-            .iter()
-            .map(|change| change.id.as_str())
-            .collect::<HashSet<_>>();
-
-        for commit in &segment.commits {
-            if self.staged_commits.contains_key(&commit.header.id) {
-                return Err(LixError::unknown(format!(
-                    "changelog commit '{}' already exists in another segment",
-                    commit.header.id
-                )));
-            }
-        }
-        for change in &segment.changes {
-            if self.staged_changes.contains(&change.id) {
-                return Err(LixError::unknown(format!(
-                    "changelog change '{}' already exists in another segment",
-                    change.id
-                )));
-            }
-        }
-
-        for existing_segment in self.scan_all_segments().await? {
-            if existing_segment.header.segment_id == segment.header.segment_id {
-                return Err(LixError::unknown(format!(
-                    "changelog segment '{}' already exists",
-                    segment.header.segment_id
-                )));
-            }
-            for commit in &existing_segment.commits {
-                if commit_ids.contains(commit.header.id.as_str()) {
-                    return Err(LixError::unknown(format!(
-                        "changelog commit '{}' already exists in another segment",
-                        commit.header.id
-                    )));
-                }
-            }
-            for change in &existing_segment.changes {
-                if change_ids.contains(change.id.as_str()) {
-                    return Err(LixError::unknown(format!(
-                        "changelog change '{}' already exists in another segment",
-                        change.id
-                    )));
-                }
-            }
-        }
+        let stored = load_segment_truth_index(&mut *self.store).await?;
+        let staged = self
+            .staged_segments
+            .values()
+            .chain(std::iter::once(segment));
+        validate_segment_truth_overlay(&stored, staged)?;
         Ok(())
     }
 
