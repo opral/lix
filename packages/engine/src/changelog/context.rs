@@ -32,7 +32,7 @@ use crate::changelog::{
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
     decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
-    view_segment_directory,
+    view_segment,
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::{
@@ -192,7 +192,7 @@ struct SegmentByteIndex {
 
 impl SegmentByteIndex {
     fn decode(bytes: Vec<u8>) -> Result<Self, LixError> {
-        let view = view_segment_directory(&bytes)?;
+        let view = view_segment(&bytes)?;
         let segment_id = view.segment_id.to_string();
         let commit_locations = view
             .directory_commits
@@ -967,10 +967,16 @@ where
                 continue;
             };
             let Some(segment) = segments.get(&visibility.location.segment_id) else {
-                continue;
+                return Err(LixError::unknown(format!(
+                    "visible changelog commit '{}' points to missing segment '{}'",
+                    visibility.commit_id, visibility.location.segment_id
+                )));
             };
             if visibility.checksum != visibility.location.checksum {
-                continue;
+                return Err(LixError::unknown(format!(
+                    "visible changelog commit '{}' checksum '{}' does not match locator checksum '{}'",
+                    visibility.commit_id, visibility.checksum, visibility.location.checksum
+                )));
             }
             for change_id in segment.prove_commit_membership(
                 &visibility.location,
@@ -1134,16 +1140,42 @@ where
         change_id: &str,
     ) -> Result<Option<(SegmentObjectLocation, SegmentChange)>, LixError> {
         match self.load_physical_segment_change(change_id).await {
-            Ok(Some(found)) => Ok(Some(found)),
+            Ok(Some(found)) => {
+                self.ensure_unique_stored_change(change_id, &found.0)
+                    .await?;
+                Ok(Some(found))
+            }
             Ok(None) => self.scan_segments_for_change(change_id).await,
             Err(error) => Err(error),
         }
+    }
+
+    async fn ensure_unique_stored_change(
+        &mut self,
+        change_id: &str,
+        expected_location: &SegmentObjectLocation,
+    ) -> Result<(), LixError> {
+        for segment in self.scan_all_segments().await? {
+            let Some(change) = segment_change(&segment, change_id) else {
+                continue;
+            };
+            let location = directory_change_location(&segment, change_id)?;
+            validate_change_checksum(&location.checksum, change_id, change)?;
+            if &location != expected_location {
+                return Err(LixError::unknown(format!(
+                    "changelog change '{change_id}' appears in multiple segments: '{}' and '{}'",
+                    expected_location.segment_id, location.segment_id
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn scan_segments_for_change(
         &mut self,
         change_id: &str,
     ) -> Result<Option<(SegmentObjectLocation, SegmentChange)>, LixError> {
+        let mut found = None::<(SegmentObjectLocation, SegmentChange)>;
         let mut after = None;
         loop {
             let page = self
@@ -1165,7 +1197,13 @@ where
                 if let Some(change) = segment_change(&segment, change_id) {
                     let location = directory_change_location(&segment, change_id)?;
                     validate_change_checksum(&location.checksum, change_id, change)?;
-                    return Ok(Some((location, change.clone())));
+                    if let Some((existing, _)) = &found {
+                        return Err(LixError::unknown(format!(
+                            "changelog change '{change_id}' appears in multiple segments: '{}' and '{}'",
+                            existing.segment_id, location.segment_id
+                        )));
+                    }
+                    found = Some((location, change.clone()));
                 }
             }
             let Some(next_after) = page.resume_after else {
@@ -1173,7 +1211,7 @@ where
             };
             after = Some(next_after);
         }
-        Ok(None)
+        Ok(found)
     }
 
     async fn visible_membership_contains_change(
@@ -1781,6 +1819,11 @@ where
             changes.extend(self.resolve_publish_changes(&missing).await?);
         }
 
+        let segment_commits = segment
+            .commits
+            .iter()
+            .map(|commit| (commit.header.id.clone(), commit.clone()))
+            .collect::<HashMap<_, _>>();
         let mut source_parent_facts = HashMap::<String, SourceParentFacts>::new();
 
         for commit in &segment.commits {
@@ -1819,7 +1862,7 @@ where
                 }
                 if !source_parent_facts.contains_key(parent_id) {
                     let facts = self
-                        .source_parent_facts_in_segment(parent_id, segment)
+                        .source_parent_facts_in_segment(parent_id, &segment_commits)
                         .await?;
                     source_parent_facts.insert(parent_id.clone(), facts);
                 }
@@ -1896,7 +1939,7 @@ where
     async fn source_parent_facts_in_segment(
         &mut self,
         root_commit_id: &str,
-        segment: &Segment,
+        segment_commits: &HashMap<String, SegmentCommit>,
     ) -> Result<SourceParentFacts, LixError> {
         let mut facts = SourceParentFacts::default();
         let mut stack = vec![root_commit_id.to_string()];
@@ -1906,7 +1949,7 @@ where
                 continue;
             }
             let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, Some(segment))
+                .load_published_staged_or_segment_commit(&commit_id, Some(segment_commits))
                 .await?
             else {
                 continue;
@@ -1930,7 +1973,7 @@ where
                 )));
             }
             let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, Some(segment))
+                .load_published_staged_or_segment_commit(&commit_id, Some(segment_commits))
                 .await?
             else {
                 break;
@@ -1961,10 +2004,15 @@ where
         change_id: &str,
         segment: &Segment,
     ) -> Result<bool, LixError> {
+        let segment_commits = segment
+            .commits
+            .iter()
+            .map(|commit| (commit.header.id.clone(), commit.clone()))
+            .collect::<HashMap<_, _>>();
         self.commit_history_contains_membership_with_loader(
             root_commit_id,
             change_id,
-            Some(segment),
+            Some(&segment_commits),
         )
         .await
     }
@@ -1973,7 +2021,7 @@ where
         &mut self,
         root_commit_id: &str,
         change_id: &str,
-        segment: Option<&Segment>,
+        segment_commits: Option<&HashMap<String, SegmentCommit>>,
     ) -> Result<bool, LixError> {
         let mut stack = vec![root_commit_id.to_string()];
         let mut visited = HashSet::new();
@@ -1982,7 +2030,7 @@ where
                 continue;
             }
             let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, segment)
+                .load_published_staged_or_segment_commit(&commit_id, segment_commits)
                 .await?
             else {
                 continue;
@@ -2022,11 +2070,16 @@ where
         change_id: &str,
         segment: &Segment,
     ) -> Result<bool, LixError> {
+        let segment_commits = segment
+            .commits
+            .iter()
+            .map(|commit| (commit.header.id.clone(), commit.clone()))
+            .collect::<HashMap<_, _>>();
         self.commit_history_projects_state_row_with_loader(
             root_commit_id,
             identity,
             change_id,
-            Some(segment),
+            Some(&segment_commits),
         )
         .await
     }
@@ -2036,7 +2089,7 @@ where
         root_commit_id: &str,
         identity: &StateRowIdentity,
         change_id: &str,
-        segment: Option<&Segment>,
+        segment_commits: Option<&HashMap<String, SegmentCommit>>,
     ) -> Result<bool, LixError> {
         let mut next_commit_id = Some(root_commit_id.to_string());
         let mut visited = HashSet::new();
@@ -2048,7 +2101,7 @@ where
                 )));
             }
             let Some(commit) = self
-                .load_published_staged_or_segment_commit(&commit_id, segment)
+                .load_published_staged_or_segment_commit(&commit_id, segment_commits)
                 .await?
             else {
                 return Ok(false);
@@ -2069,14 +2122,9 @@ where
     async fn load_published_staged_or_segment_commit(
         &mut self,
         commit_id: &str,
-        segment: Option<&Segment>,
+        segment_commits: Option<&HashMap<String, SegmentCommit>>,
     ) -> Result<Option<SegmentCommit>, LixError> {
-        if let Some(commit) = segment.and_then(|segment| {
-            segment
-                .commits
-                .iter()
-                .find(|commit| commit.header.id == commit_id)
-        }) {
+        if let Some(commit) = segment_commits.and_then(|commits| commits.get(commit_id)) {
             return Ok(Some(commit.clone()));
         }
         if let Some(commit) = self.load_published_or_staged_commit(commit_id).await? {
@@ -2136,18 +2184,14 @@ where
             .load_segment_byte_index_for_writer(&entry.location.segment_id)
             .await?
         else {
-            return self.scan_segments_for_commit(commit_id).await;
+            return Err(LixError::unknown(format!(
+                "by_commit entry for '{commit_id}' points to missing segment '{}'",
+                entry.location.segment_id
+            )));
         };
-        match segment.load_commit(&entry.location, commit_id) {
-            Ok(commit) => {
-                if validate_commit_checksum(&entry.location.checksum, commit_id, &commit).is_ok() {
-                    Ok(Some(commit))
-                } else {
-                    self.scan_segments_for_commit(commit_id).await
-                }
-            }
-            Err(_) => self.scan_segments_for_commit(commit_id).await,
-        }
+        let commit = segment.load_commit(&entry.location, commit_id)?;
+        validate_commit_checksum(&entry.location.checksum, commit_id, &commit)?;
+        Ok(Some(commit))
     }
 
     async fn load_segment_byte_index_for_writer(
@@ -2201,15 +2245,10 @@ where
             }
         }
 
-        let mut remaining = change_ids
+        let remaining = change_ids
             .difference(&found.keys().cloned().collect::<HashSet<_>>())
             .cloned()
             .collect::<Vec<_>>();
-        if !remaining.is_empty() {
-            self.resolve_publish_changes_from_by_change(&remaining, &mut found)
-                .await?;
-            remaining.retain(|change_id| !found.contains_key(change_id));
-        }
         if !remaining.is_empty() {
             self.resolve_publish_changes_by_segment_scan(&remaining, &mut found)
                 .await?;
@@ -2223,69 +2262,6 @@ where
             }
         }
         Ok(found)
-    }
-
-    async fn resolve_publish_changes_from_by_change(
-        &mut self,
-        change_ids: &[String],
-        found: &mut HashMap<String, SegmentChange>,
-    ) -> Result<(), LixError> {
-        let values = get_many(
-            &mut *self.store,
-            BY_CHANGE_INDEX_SPACE,
-            change_ids
-                .iter()
-                .map(|change_id| by_change_key(change_id))
-                .collect(),
-        )
-        .await?;
-        let mut entries = Vec::new();
-        let mut segment_ids = Vec::new();
-        for (change_id, value) in change_ids.iter().zip(values.into_iter()) {
-            let Some(bytes) = value else {
-                continue;
-            };
-            let entry = decode_by_change_entry(&bytes)?;
-            if entry.change_id != *change_id {
-                return Err(LixError::unknown(format!(
-                    "by_change key for '{change_id}' contains change_id '{}'",
-                    entry.change_id
-                )));
-            }
-            push_unique(&mut segment_ids, entry.location.segment_id.clone());
-            entries.push(entry);
-        }
-
-        let segment_values = get_many(
-            &mut *self.store,
-            SEGMENT_SPACE,
-            segment_ids
-                .iter()
-                .map(|segment_id| segment_key(segment_id))
-                .collect(),
-        )
-        .await?;
-        let mut segments = HashMap::new();
-        for (segment_id, value) in segment_ids.iter().zip(segment_values.into_iter()) {
-            if let Some(bytes) = value {
-                segments.insert(segment_id.clone(), SegmentByteIndex::decode(bytes)?);
-            }
-        }
-
-        for entry in entries {
-            let Some(segment) = segments.get(&entry.location.segment_id) else {
-                continue;
-            };
-            let change = segment.load_change(&entry.location, &entry.change_id)?;
-            validate_change_checksum(&entry.location.checksum, &entry.change_id, &change)?;
-            if found.insert(entry.change_id.clone(), change).is_some() {
-                return Err(LixError::unknown(format!(
-                    "cannot publish changelog change '{}' because it appears in multiple staged/stored segments",
-                    entry.change_id
-                )));
-            }
-        }
-        Ok(())
     }
 
     async fn resolve_publish_changes_by_segment_scan(
@@ -4081,6 +4057,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_publish_changes_rejects_duplicate_stored_change_even_when_by_change_exists() {
+        let (context, storage) = changelog_test_context();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(test_segment()).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut duplicate = test_segment();
+        duplicate.header.segment_id = "segment-2".to_string();
+        duplicate.commits[0].header.id = "commit-2".to_string();
+        duplicate.commits[0].header.derivable_change_id = "derived-change-2".to_string();
+        duplicate.changes[0].authored_commit_id = Some("commit-2".to_string());
+        let duplicate = canonicalize_segment(duplicate).unwrap();
+        write_raw_segment(&storage, &duplicate).await;
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .resolve_publish_changes(&HashSet::from(["change-1".to_string()]))
+                .await
+                .expect_err("primary duplicate change must reject despite by_change index")
+        };
+
+        assert!(
+            error.message.contains("appears in multiple"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_segment_change_rejects_duplicate_primary_change_even_when_by_change_exists() {
+        let (context, storage) = changelog_test_context();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(test_segment()).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut duplicate = test_segment();
+        duplicate.header.segment_id = "segment-2".to_string();
+        duplicate.commits[0].header.id = "commit-2".to_string();
+        duplicate.commits[0].header.derivable_change_id = "derived-change-2".to_string();
+        duplicate.changes[0].authored_commit_id = Some("commit-2".to_string());
+        let duplicate = canonicalize_segment(duplicate).unwrap();
+        write_raw_segment(&storage, &duplicate).await;
+
+        let mut reader = context.reader(storage);
+        let error = reader
+            .find_segment_change("change-1")
+            .await
+            .expect_err("duplicate primary change must reject despite by_change index");
+
+        assert!(
+            error.message.contains("appears in multiple"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn stage_segment_computes_by_commit_generations_from_parent_edges() {
         let (context, storage) = changelog_test_context();
         let segment = two_commit_segment();
@@ -4540,8 +4586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_segment_accepts_adopted_membership_from_physical_parent_when_by_commit_is_stale()
-    {
+    async fn stage_segment_rejects_adopted_membership_when_by_commit_is_corrupt() {
         let (context, storage) = changelog_test_context();
         let parent_segment = test_segment();
 
@@ -4587,10 +4632,20 @@ mod tests {
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
-        {
+        let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(adopt_segment).await.unwrap();
-        }
+            writer
+                .stage_segment(adopt_segment)
+                .await
+                .expect_err("present corrupt by_commit row should fail closed")
+        };
+
+        assert!(
+            error
+                .message
+                .contains("points to missing segment 'missing-segment'"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

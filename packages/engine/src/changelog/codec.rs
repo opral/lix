@@ -3627,6 +3627,27 @@ mod tests {
     }
 
     #[test]
+    fn segment_decode_rejects_mutated_object_body_with_stale_checksums() {
+        let mut segment = sample_segment();
+        let encoded = encode_segment(&segment).unwrap();
+        segment.changes[0].created_at = "2026-05-12T00:00:01Z".to_string();
+        let stale_bytes = encode_segment(&segment).unwrap();
+        assert_eq!(
+            encoded.len(),
+            stale_bytes.len(),
+            "test mutation should preserve encoded layout"
+        );
+
+        let error = decode_segment(&stale_bytes)
+            .expect_err("mutated body with stale checksums must reject");
+
+        assert!(
+            error.message.contains("canonical checksum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn segment_decode_rejects_inline_payload_ref_mismatch() {
         let mut segment = sample_segment();
         let bogus_ref = JsonRef::from_hash_bytes([9; 32]);
