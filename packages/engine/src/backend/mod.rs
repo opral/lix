@@ -20,8 +20,8 @@ pub use error::{
     PreconditionSupportReport,
 };
 pub use in_memory::{
-    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRead,
-    InMemoryScanVisitResult, InMemoryWrite,
+    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRangeScan,
+    InMemoryRead, InMemoryScanVisitResult, InMemoryWrite,
 };
 pub use predicate::{
     BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,

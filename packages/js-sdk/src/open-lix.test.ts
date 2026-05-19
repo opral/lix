@@ -159,6 +159,42 @@ test("openLix accepts an explicit backend", async () => {
 	await second.close();
 });
 
+test("openLix paginates explicit backend scans", async () => {
+	const backend = createMemoryBackend({ scanPageSize: 1 });
+	const lix = await openLix({ backend });
+
+	await registerCrmTaskSchema(lix);
+	await lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4)), ($5, $6, $7, lix_json($8)), ($9, $10, $11, lix_json($12))",
+		[
+			"paged-task-1",
+			"First paged task",
+			false,
+			JSON.stringify({ page: 1 }),
+			"paged-task-2",
+			"Second paged task",
+			true,
+			JSON.stringify({ page: 2 }),
+			"paged-task-3",
+			"Third paged task",
+			false,
+			JSON.stringify({ page: 3 }),
+		],
+	);
+
+	const result = await lix.execute(
+		"SELECT id FROM crm_task WHERE id LIKE $1 ORDER BY id",
+		["paged-task-%"],
+	);
+
+	expect(result.rows.map((row) => row.get("id"))).toEqual([
+		"paged-task-1",
+		"paged-task-2",
+		"paged-task-3",
+	]);
+	await lix.close();
+});
+
 test("custom backend applies ordered deleteRange write ops", () => {
 	const backend = createMemoryBackend();
 	const tx = backend.beginWriteTransaction();
@@ -726,7 +762,11 @@ type StoredKvPair = {
 	value: Uint8Array;
 };
 
-function createMemoryBackend(): LixBackend {
+type MemoryBackendOptions = {
+	scanPageSize?: number;
+};
+
+function createMemoryBackend(options: MemoryBackendOptions = {}): LixBackend {
 	let rows: StoredKvPair[] = [];
 
 	function createTransaction(): LixBackendWriteTransaction {
@@ -773,7 +813,10 @@ function createMemoryBackend(): LixBackend {
 				},
 				scanKeys(request): BackendKvKeyPage {
 					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					const { pairs, resumeAfter } = scanPage(
+						transactionRows,
+						limitScanRequest(request, options.scanPageSize),
+					);
 					return {
 						keys: pairs.map((row) => new Uint8Array(row.key)),
 						resumeAfter,
@@ -781,7 +824,10 @@ function createMemoryBackend(): LixBackend {
 				},
 				scanValues(request): BackendKvValuePage {
 					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					const { pairs, resumeAfter } = scanPage(
+						transactionRows,
+						limitScanRequest(request, options.scanPageSize),
+					);
 					return {
 						values: pairs.map((row) => new Uint8Array(row.value)),
 						resumeAfter,
@@ -789,7 +835,10 @@ function createMemoryBackend(): LixBackend {
 				},
 				scanEntries(request): BackendKvEntryPage {
 					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					const { pairs, resumeAfter } = scanPage(
+						transactionRows,
+						limitScanRequest(request, options.scanPageSize),
+					);
 					return {
 						keys: pairs.map((row) => new Uint8Array(row.key)),
 						values: pairs.map((row) => new Uint8Array(row.value)),
@@ -859,6 +908,17 @@ function createMemoryBackend(): LixBackend {
 		beginWriteTransaction(): LixBackendWriteTransaction {
 			return createTransaction();
 		},
+	};
+}
+
+function limitScanRequest(
+	request: BackendKvScanRequest,
+	scanPageSize: number | undefined,
+): BackendKvScanRequest {
+	if (scanPageSize === undefined) return request;
+	return {
+		...request,
+		limit: Math.min(request.limit, scanPageSize),
 	};
 }
 

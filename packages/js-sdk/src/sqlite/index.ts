@@ -77,6 +77,7 @@ function initializeDatabase(db: Database): void {
 class BetterSqlite3Backend implements LixBackend {
 	readonly #db: Database;
 	readonly #registryKey: string | null;
+	#transactionMode: "read" | "write" | null = null;
 	#closed = false;
 
 	constructor(db: Database, registryKey: string | null) {
@@ -86,20 +87,29 @@ class BetterSqlite3Backend implements LixBackend {
 
 	beginReadTransaction(): LixBackendReadTransaction {
 		this.#ensureOpen();
-		if (this.#db.inTransaction) {
-			throw new Error("cannot open nested Lix backend transaction");
-		}
-		this.#db.exec("BEGIN DEFERRED");
-		return new BetterSqlite3Transaction(this.#db);
+		return new BetterSqlite3Transaction(this.#db, {
+			ownsTransaction: false,
+			writable: false,
+		});
 	}
 
 	beginWriteTransaction(): LixBackendWriteTransaction {
 		this.#ensureOpen();
 		if (this.#db.inTransaction) {
-			throw new Error("cannot open nested Lix backend transaction");
+			return new BetterSqlite3Transaction(this.#db, {
+				ownsTransaction: false,
+				writable: true,
+			});
 		}
 		this.#db.exec("BEGIN IMMEDIATE");
-		return new BetterSqlite3Transaction(this.#db);
+		this.#transactionMode = "write";
+		return new BetterSqlite3Transaction(this.#db, {
+			ownsTransaction: true,
+			writable: true,
+			onClose: () => {
+				this.#transactionMode = null;
+			},
+		});
 	}
 
 	close(): void {
@@ -123,10 +133,23 @@ class BetterSqlite3Backend implements LixBackend {
 
 class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 	readonly #db: Database;
+	readonly #ownsTransaction: boolean;
+	readonly #writable: boolean;
+	readonly #onClose: (() => void) | undefined;
 	#closed = false;
 
-	constructor(db: Database) {
+	constructor(
+		db: Database,
+		options: {
+			ownsTransaction: boolean;
+			writable: boolean;
+			onClose?: () => void;
+		},
+	) {
 		this.#db = db;
+		this.#ownsTransaction = options.ownsTransaction;
+		this.#writable = options.writable;
+		this.#onClose = options.onClose;
 	}
 
 	getValues(request: BackendKvGetRequest): BackendKvValueBatch {
@@ -169,6 +192,9 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 
 	writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats {
 		this.#ensureOpen();
+		if (!this.#writable) {
+			throw new Error("Lix backend transaction is read-only");
+		}
 		const stats: BackendKvWriteStats = {
 			puts: 0,
 			deletes: 0,
@@ -197,14 +223,26 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 
 	commit(): void {
 		this.#ensureOpen();
-		this.#db.exec("COMMIT");
-		this.#closed = true;
+		try {
+			if (this.#ownsTransaction) {
+				this.#db.exec("COMMIT");
+			}
+		} finally {
+			this.#closed = true;
+			this.#onClose?.();
+		}
 	}
 
 	rollback(): void {
 		this.#ensureOpen();
-		this.#db.exec("ROLLBACK");
-		this.#closed = true;
+		try {
+			if (this.#ownsTransaction) {
+				this.#db.exec("ROLLBACK");
+			}
+		} finally {
+			this.#closed = true;
+			this.#onClose?.();
+		}
 	}
 
 	#ensureOpen(): void {
