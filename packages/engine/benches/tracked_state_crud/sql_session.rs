@@ -1,115 +1,119 @@
 use lix_engine::storage::InMemoryStorageBackend;
 use lix_engine::{Engine, ExecuteResult, SessionContext, Value};
-use tokio::runtime::Runtime;
 
 use crate::workload::{sql_string, WorkloadRow};
 
 const SQL_CHUNK_SIZE: usize = 500;
 
-pub(crate) fn insert_all(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_session(runtime, |runtime, session| {
-        runtime.block_on(insert_rows(session, rows));
-        rows.len()
-    })
+pub(crate) struct SqlFixture {
+    session: SessionContext<InMemoryStorageBackend>,
+    row_count: usize,
+    insert_sql_chunks: Vec<String>,
+    select_all_sql: String,
+    select_by_pk_sql_chunks: Vec<String>,
+    select_one_by_pk_sql: String,
+    update_one_by_pk_sql: String,
+    update_all_sql_rows: Vec<String>,
+    delete_all_sql: String,
+    delete_one_by_pk_sql: String,
 }
 
-pub(crate) fn read_all(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
-        let result = runtime.block_on(execute(
-            session,
-            "SELECT path, value FROM json_pointer ORDER BY path",
-        ));
-        assert_eq!(result.len(), rows.len());
-        result.len()
-    })
+pub(crate) async fn empty_fixture(rows: &[WorkloadRow]) -> SqlFixture {
+    let session = prepare_session(InMemoryStorageBackend::new()).await;
+    fixture_for_session(session, rows)
 }
 
-pub(crate) fn read_all_by_pk(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
-        let mut total = 0;
-        for chunk in rows.chunks(SQL_CHUNK_SIZE) {
-            let result = runtime.block_on(execute(session, &select_by_pk_sql(chunk)));
-            total += result.len();
+pub(crate) async fn seeded_fixture(rows: &[WorkloadRow]) -> SqlFixture {
+    let fixture = empty_fixture(rows).await;
+    fixture.insert_all().await;
+    fixture
+}
+
+impl SqlFixture {
+    pub(crate) async fn insert_all(&self) -> usize {
+        let mut affected = 0;
+        for sql in &self.insert_sql_chunks {
+            affected += execute(&self.session, sql).await.rows_affected();
         }
-        assert_eq!(total, rows.len());
-        total
-    })
-}
+        assert_eq!(affected as usize, self.row_count);
+        affected as usize
+    }
 
-pub(crate) fn read_one_by_pk(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
-        let result = runtime.block_on(execute(
-            session,
-            &select_by_pk_sql(&rows[rows.len() / 2..][..1]),
-        ));
+    pub(crate) async fn read_all(&self) -> usize {
+        let result = execute(&self.session, &self.select_all_sql).await;
+        assert_eq!(result.len(), self.row_count);
+        result.len()
+    }
+
+    pub(crate) async fn read_all_by_pk(&self) -> usize {
+        let mut total = 0;
+        for sql in &self.select_by_pk_sql_chunks {
+            total += execute(&self.session, sql).await.len();
+        }
+        assert_eq!(total, self.row_count);
+        total
+    }
+
+    pub(crate) async fn read_one_by_pk(&self) -> usize {
+        let result = execute(&self.session, &self.select_one_by_pk_sql).await;
         assert_eq!(result.len(), 1);
         result.len()
-    })
-}
+    }
 
-pub(crate) fn update_all(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
+    pub(crate) async fn update_all(&self) -> usize {
         let mut affected = 0;
-        for chunk in rows.chunks(SQL_CHUNK_SIZE) {
-            affected += runtime.block_on(update_rows(session, chunk));
+        for sql in &self.update_all_sql_rows {
+            affected += execute(&self.session, sql).await.rows_affected();
         }
-        assert_eq!(affected as usize, rows.len());
+        assert_eq!(affected as usize, self.row_count);
         affected as usize
-    })
-}
+    }
 
-pub(crate) fn update_one_by_pk(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
-        let affected = runtime.block_on(update_rows(session, &rows[rows.len() / 2..][..1]));
-        assert_eq!(affected, 1);
-        affected as usize
-    })
-}
-
-pub(crate) fn delete_all(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
-        let affected = runtime
-            .block_on(execute(session, "DELETE FROM json_pointer"))
-            .rows_affected();
-        assert_eq!(affected as usize, rows.len());
-        affected as usize
-    })
-}
-
-pub(crate) fn delete_one_by_pk(runtime: &Runtime, rows: &[WorkloadRow]) -> usize {
-    with_seeded_session(runtime, rows, |runtime, session| {
-        let row = &rows[rows.len() / 2];
-        let affected = runtime
-            .block_on(execute(
-                session,
-                &format!(
-                    "DELETE FROM json_pointer WHERE path = '{}'",
-                    sql_string(row.path.as_str())
-                ),
-            ))
+    pub(crate) async fn update_one_by_pk(&self) -> usize {
+        let affected = execute(&self.session, &self.update_one_by_pk_sql)
+            .await
             .rows_affected();
         assert_eq!(affected, 1);
         affected as usize
-    })
+    }
+
+    pub(crate) async fn delete_all(&self) -> usize {
+        let affected = execute(&self.session, &self.delete_all_sql)
+            .await
+            .rows_affected();
+        assert_eq!(affected as usize, self.row_count);
+        affected as usize
+    }
+
+    pub(crate) async fn delete_one_by_pk(&self) -> usize {
+        let affected = execute(&self.session, &self.delete_one_by_pk_sql)
+            .await
+            .rows_affected();
+        assert_eq!(affected, 1);
+        affected as usize
+    }
 }
 
-fn with_seeded_session<T>(
-    runtime: &Runtime,
+fn fixture_for_session(
+    session: SessionContext<InMemoryStorageBackend>,
     rows: &[WorkloadRow],
-    f: impl FnOnce(&Runtime, &SessionContext<InMemoryStorageBackend>) -> T,
-) -> T {
-    with_session(runtime, |runtime, session| {
-        runtime.block_on(insert_rows(session, rows));
-        f(runtime, session)
-    })
-}
-
-fn with_session<T>(
-    runtime: &Runtime,
-    f: impl FnOnce(&Runtime, &SessionContext<InMemoryStorageBackend>) -> T,
-) -> T {
-    let session = runtime.block_on(prepare_session(InMemoryStorageBackend::new()));
-    f(runtime, &session)
+) -> SqlFixture {
+    let mid = rows.len() / 2;
+    SqlFixture {
+        session,
+        row_count: rows.len(),
+        insert_sql_chunks: rows.chunks(SQL_CHUNK_SIZE).map(insert_rows_sql).collect(),
+        select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
+        select_by_pk_sql_chunks: rows.chunks(SQL_CHUNK_SIZE).map(select_by_pk_sql).collect(),
+        select_one_by_pk_sql: select_by_pk_sql(&rows[mid..][..1]),
+        update_one_by_pk_sql: update_row_sql(&rows[mid]),
+        update_all_sql_rows: rows.iter().map(update_row_sql).collect(),
+        delete_all_sql: "DELETE FROM json_pointer".to_string(),
+        delete_one_by_pk_sql: format!(
+            "DELETE FROM json_pointer WHERE path = '{}'",
+            sql_string(rows[mid].path.as_str())
+        ),
+    }
 }
 
 async fn prepare_session(
@@ -152,26 +156,6 @@ async fn register_json_pointer_schema(session: &SessionContext<InMemoryStorageBa
         .expect("register json_pointer schema")
         .rows_affected();
     assert_eq!(affected, 1);
-}
-
-async fn insert_rows(session: &SessionContext<InMemoryStorageBackend>, rows: &[WorkloadRow]) {
-    for chunk in rows.chunks(SQL_CHUNK_SIZE) {
-        let affected = execute(session, &insert_rows_sql(chunk))
-            .await
-            .rows_affected();
-        assert_eq!(affected as usize, chunk.len());
-    }
-}
-
-async fn update_rows(
-    session: &SessionContext<InMemoryStorageBackend>,
-    rows: &[WorkloadRow],
-) -> u64 {
-    let mut affected = 0;
-    for row in rows {
-        affected += execute(session, &update_row_sql(row)).await.rows_affected();
-    }
-    affected
 }
 
 async fn execute(session: &SessionContext<InMemoryStorageBackend>, sql: &str) -> ExecuteResult {

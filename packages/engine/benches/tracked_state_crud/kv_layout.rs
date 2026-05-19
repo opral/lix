@@ -25,58 +25,59 @@ enum ProfileStorage {
     Redb(StorageContext<RedbBackend>),
 }
 
-pub(crate) fn insert_all(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    profile_storage(profile).insert_all(&rows)
+pub(crate) struct KvFixture {
+    storage: ProfileStorage,
+    rows: Vec<BenchRow>,
 }
 
-pub(crate) fn read_all(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
+pub(crate) fn empty_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
     let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.read_all(rows.len(), StorageCoreProjection::FullValue)
+    KvFixture {
+        storage: profile_storage(profile),
+        rows,
+    }
 }
 
-pub(crate) fn read_all_by_pk(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.read_points(&rows)
+pub(crate) fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]) -> KvFixture {
+    let fixture = empty_fixture(profile, rows);
+    fixture.storage.insert_all(&fixture.rows);
+    fixture
 }
 
-pub(crate) fn read_one_by_pk(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.read_points(std::slice::from_ref(&rows[rows.len() / 2]))
-}
+impl KvFixture {
+    pub(crate) fn insert_all(&self) -> usize {
+        self.storage.insert_all(&self.rows)
+    }
 
-pub(crate) fn update_all(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.update_all(&rows)
-}
+    pub(crate) fn read_all(&self) -> usize {
+        self.storage
+            .read_all(self.rows.len(), StorageCoreProjection::FullValue)
+    }
 
-pub(crate) fn update_one_by_pk(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.update_all(&rows[..1])
-}
+    pub(crate) fn read_all_by_pk(&self) -> usize {
+        self.storage.read_points(&self.rows)
+    }
 
-pub(crate) fn delete_all(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.delete_all(rows.len())
-}
+    pub(crate) fn read_one_by_pk(&self) -> usize {
+        self.storage
+            .read_points(std::slice::from_ref(&self.rows[self.rows.len() / 2]))
+    }
 
-pub(crate) fn delete_one_by_pk(profile: BackendProfile, rows: &[WorkloadRow]) -> usize {
-    let rows = bench_rows(rows);
-    let storage = profile_storage(profile);
-    storage.insert_all(&rows);
-    storage.delete_one(&rows[rows.len() / 2])
+    pub(crate) fn update_all(&self) -> usize {
+        self.storage.update_all(&self.rows)
+    }
+
+    pub(crate) fn update_one_by_pk(&self) -> usize {
+        self.storage.update_all(&self.rows[..1])
+    }
+
+    pub(crate) fn delete_all(&self) -> usize {
+        self.storage.delete_all(self.rows.len())
+    }
+
+    pub(crate) fn delete_one_by_pk(&self) -> usize {
+        self.storage.delete_one(&self.rows[self.rows.len() / 2])
+    }
 }
 
 impl ProfileStorage {
