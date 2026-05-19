@@ -22,7 +22,6 @@ use crate::tracked_state::types::{
     TrackedStateProjectionMetadata, TrackedStateProjectionParent, TrackedStateRootId,
     TrackedStateTreeScanRequest,
 };
-#[cfg(any(test, feature = "storage-benches"))]
 use crate::tracked_state::TrackedStateRowRequest;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
@@ -223,7 +222,7 @@ where
             .map(tracked_key_from_request)
             .collect::<Result<Vec<_>, _>>()?;
         let values = self
-            .projection_values_at_commit_for_keys(commit_id, &keys)
+            .projection_values_at_commit_for_keys_allow_rebuild(commit_id, &keys)
             .await?;
         let mut entry_indices = Vec::new();
         let mut entries = Vec::new();
@@ -244,6 +243,27 @@ where
             rows[index] = Some(row);
         }
         Ok(rows)
+    }
+
+    pub(crate) async fn load_index_entries_at_commit(
+        &mut self,
+        commit_id: &str,
+        requests: &[TrackedStateRowRequest],
+    ) -> Result<Vec<Option<TrackedStateDiffRow>>, LixError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = requests
+            .iter()
+            .map(tracked_key_from_request)
+            .collect::<Result<Vec<_>, _>>()?;
+        let root_id = self.load_ensured_root(commit_id).await?;
+        let values = self.tree.get_many(&mut self.store, &root_id, &keys).await?;
+        Ok(keys
+            .into_iter()
+            .zip(values)
+            .map(|(key, value)| value.map(|value| TrackedStateDiffRow::from_tree_entry(key, value)))
+            .collect())
     }
 
     pub(crate) async fn diff_commits(
@@ -860,13 +880,49 @@ where
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
-    async fn projection_values_at_commit_for_keys(
+    async fn projection_values_at_commit_for_keys_allow_rebuild(
         &mut self,
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-        let root_id = self.load_ensured_root(commit_id).await?;
-        self.tree.get_many(&mut self.store, &root_id, keys).await
+        if let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? {
+            return self.tree.get_many(&mut self.store, &root_id, keys).await;
+        }
+        let input =
+            crate::tracked_state::projection_root_rebuild::build_incremental_projection_root_rebuild_input(
+                &self.store,
+                commit_id,
+            )
+            .await?;
+        let mut values = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, None))
+            .collect::<BTreeMap<_, Option<TrackedStateIndexValue>>>();
+        for delta in input.deltas {
+            let key = TrackedStateKey {
+                schema_key: delta.change.schema_key,
+                file_id: delta.change.file_id,
+                entity_id: delta.change.entity_id,
+            };
+            if values.contains_key(&key) {
+                values.insert(
+                    key,
+                    Some(TrackedStateIndexValue {
+                        change_locator: delta.locator,
+                        deleted: delta.change.snapshot_ref.is_none(),
+                        snapshot_ref: delta.change.snapshot_ref,
+                        metadata_ref: delta.change.metadata_ref,
+                        created_at: delta.created_at,
+                        updated_at: delta.updated_at,
+                    }),
+                );
+            }
+        }
+        Ok(keys
+            .iter()
+            .map(|key| values.get(key).cloned().unwrap_or(None))
+            .collect())
     }
 
     /// Plans a three-way merge by diffing both heads against the same base.
@@ -1264,7 +1320,6 @@ fn state_row_identity_matches_tree_request(
     Ok(true)
 }
 
-#[cfg(any(test, feature = "storage-benches"))]
 fn tracked_key_from_request(request: &TrackedStateRowRequest) -> Result<TrackedStateKey, LixError> {
     let file_id = match &request.file_id {
         crate::NullableKeyFilter::Null => None,

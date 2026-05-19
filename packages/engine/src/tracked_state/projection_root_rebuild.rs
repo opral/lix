@@ -156,7 +156,7 @@ where
     })
 }
 
-async fn build_incremental_projection_root_rebuild_input<S>(
+pub(super) async fn build_incremental_projection_root_rebuild_input<S>(
     store: &S,
     commit_id: &str,
 ) -> Result<ProjectionRootRebuildInput, LixError>

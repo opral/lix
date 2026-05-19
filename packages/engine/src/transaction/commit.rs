@@ -11,7 +11,9 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageRead, StorageWriteSet};
-use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
+use crate::tracked_state::{
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateDiffRow, TrackedStateRowRequest,
+};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
@@ -182,6 +184,227 @@ fn json_payloads_from_state_row(
         .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized.as_ref(), json.json_ref))
 }
 
+async fn validate_adopted_rows_match_source_parent(
+    read: &mut (impl StorageRead + Send + Sync),
+    state_rows: &[PreparedStateRow],
+    tracked_row_indices_by_commit: &BTreeMap<String, Vec<RowIndex>>,
+    rows: &[PreparedAdoptedStateRow],
+) -> Result<(), LixError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let staged_source_rows =
+        staged_source_rows_by_commit_and_key(state_rows, tracked_row_indices_by_commit)?;
+    let mut reader = TrackedStateContext::new().reader(read);
+    let mut requests_by_source_parent =
+        BTreeMap::<String, Vec<(usize, TrackedStateRowRequest)>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        validate_adopted_row_payload_refs(row)?;
+        let key = adopted_row_tracked_key(row);
+        if let Some(source_row) =
+            staged_source_rows.get(&(row.source_parent_commit_id.clone(), key.clone()))
+        {
+            validate_adopted_row_matches_staged_source(row, source_row)?;
+            continue;
+        }
+        requests_by_source_parent
+            .entry(row.source_parent_commit_id.clone())
+            .or_default()
+            .push((
+                index,
+                TrackedStateRowRequest {
+                    schema_key: row.schema_key.clone(),
+                    entity_id: row.entity_id.clone(),
+                    file_id: match &row.file_id {
+                        Some(file_id) => crate::NullableKeyFilter::Value(file_id.clone()),
+                        None => crate::NullableKeyFilter::Null,
+                    },
+                },
+            ));
+    }
+
+    for (source_parent_commit_id, indexed_requests) in requests_by_source_parent {
+        let requests = indexed_requests
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect::<Vec<_>>();
+        let source_entries = reader
+            .load_index_entries_at_commit(&source_parent_commit_id, &requests)
+            .await?;
+        for ((row_index, _), source_entry) in indexed_requests.iter().zip(&source_entries) {
+            if source_entry.is_none() {
+                let row = &rows[*row_index];
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "adopted change '{}' is missing from source parent '{}' tracked projection",
+                        row.change_id, row.source_parent_commit_id
+                    ),
+                ));
+            }
+        }
+        let mut validation_rows = Vec::new();
+        for (source_entry, (row_index, _)) in source_entries.iter().zip(&indexed_requests) {
+            if let Some(source_row) = source_entry {
+                validation_rows.push((
+                    source_row,
+                    rows[*row_index].source_parent_commit_id.as_str(),
+                ));
+            }
+        }
+        let validation_refs = validation_rows
+            .iter()
+            .map(|(row, commit_id)| (*row, *commit_id))
+            .collect::<Vec<_>>();
+        reader
+            .validate_diff_rows_for_commits_against_changelog(&validation_refs)
+            .await?;
+        for ((row_index, _), source_entry) in indexed_requests.into_iter().zip(source_entries) {
+            let row = &rows[row_index];
+            let Some(source_row) = source_entry else { unreachable!() };
+            validate_adopted_row_matches_source_parent(row, &source_row)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_adopted_rows_are_parented_by_commits(
+    adopted_rows: &[PreparedAdoptedStateRow],
+    adopted_row_indices_by_commit: &BTreeMap<String, Vec<AdoptedRowIndex>>,
+    commit_rows: &[FinalizedCommitRow],
+) -> Result<(), LixError> {
+    let mut indexed_rows = vec![false; adopted_rows.len()];
+    let commit_rows_by_id = commit_rows
+        .iter()
+        .map(|row| (row.commit_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    for (commit_id, row_indices) in adopted_row_indices_by_commit {
+        let Some(commit_row) = commit_rows_by_id.get(commit_id.as_str()) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("adopted rows for commit '{commit_id}' have no finalized commit row"),
+            ));
+        };
+        for &row_index in row_indices {
+            let Some(row_seen) = indexed_rows.get_mut(row_index) else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("adopted row index {row_index} for commit '{commit_id}' is out of bounds"),
+                ));
+            };
+            *row_seen = true;
+            adopted_source_parent_ordinal(commit_row, &adopted_rows[row_index])?;
+        }
+    }
+    if let Some(row_index) = indexed_rows.iter().position(|seen| !seen) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("adopted row index {row_index} is not assigned to a finalized commit"),
+        ));
+    }
+    Ok(())
+}
+
+fn staged_source_rows_by_commit_and_key<'a>(
+    state_rows: &'a [PreparedStateRow],
+    tracked_row_indices_by_commit: &BTreeMap<String, Vec<RowIndex>>,
+) -> Result<BTreeMap<(String, AdoptedProjectionKey), &'a PreparedStateRow>, LixError> {
+    let mut out = BTreeMap::new();
+    for (commit_id, indices) in tracked_row_indices_by_commit {
+        for &index in indices {
+            let row = &state_rows[index];
+            out.insert((commit_id.clone(), state_row_tracked_key(row)), row);
+        }
+    }
+    Ok(out)
+}
+
+fn adopted_row_tracked_key(row: &PreparedAdoptedStateRow) -> AdoptedProjectionKey {
+    AdoptedProjectionKey {
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        entity_id: row.entity_id.clone(),
+    }
+}
+
+fn state_row_tracked_key(row: &PreparedStateRow) -> AdoptedProjectionKey {
+    AdoptedProjectionKey {
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        entity_id: row.entity_id.clone(),
+    }
+}
+
+fn validate_adopted_row_matches_staged_source(
+    row: &PreparedAdoptedStateRow,
+    source_row: &PreparedStateRow,
+) -> Result<(), LixError> {
+    if source_row.change_id.as_deref() != Some(row.change_id.as_str())
+        || source_row.commit_id.as_deref() != Some(row.source_commit_id.as_str())
+        || source_row.snapshot.as_ref().map(|json| json.json_ref) != row.snapshot_ref
+        || source_row.metadata.as_ref().map(|json| json.json_ref) != row.metadata_ref
+        || source_row.created_at != row.created_at
+        || source_row.updated_at != row.updated_at
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "adopted change '{}' projection does not match source parent '{}' tracked row",
+                row.change_id, row.source_parent_commit_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_adopted_row_matches_source_parent(
+    row: &PreparedAdoptedStateRow,
+    source_row: &TrackedStateDiffRow,
+) -> Result<(), LixError> {
+    if source_row.change_id != row.change_id
+        || source_row.commit_id != row.source_commit_id
+        || source_row.deleted != row.snapshot_ref.is_none()
+        || source_row.snapshot_ref != row.snapshot_ref
+        || source_row.metadata_ref != row.metadata_ref
+        || source_row.created_at != row.created_at
+        || source_row.updated_at != row.updated_at
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "adopted change '{}' projection does not match source parent '{}' tracked row",
+                row.change_id, row.source_parent_commit_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_adopted_row_payload_refs(row: &PreparedAdoptedStateRow) -> Result<(), LixError> {
+    let snapshot_ref = row.snapshot.as_ref().map(|json| json.json_ref);
+    if snapshot_ref != row.snapshot_ref {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "adopted change '{}' snapshot_ref does not match materialized snapshot",
+                row.change_id
+            ),
+        ));
+    }
+    let metadata_ref = row.metadata.as_ref().map(|json| json.json_ref);
+    if metadata_ref != row.metadata_ref {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "adopted change '{}' metadata_ref does not match materialized metadata",
+                row.change_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn existing_untracked_overlay_delete_identities<'a>(
     read: &(impl StorageRead + Send + Sync + ?Sized),
     identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
@@ -251,6 +474,13 @@ struct StagedChangelogCommit {
     adopted_locators: Vec<ChangelogChangeLocator>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AdoptedProjectionKey {
+    schema_key: String,
+    file_id: Option<String>,
+    entity_id: EntityIdentity,
+}
+
 async fn stage_changelog_commits(
     read: &mut (impl StorageRead + Send + Sync),
     writes: &mut StorageWriteSet,
@@ -266,9 +496,21 @@ async fn stage_changelog_commits(
     ),
     LixError,
 > {
+    validate_adopted_rows_are_parented_by_commits(
+        adopted_rows,
+        adopted_row_indices_by_commit,
+        commit_rows,
+    )?;
     if commit_rows.is_empty() {
         return Ok((BTreeMap::new(), BTreeMap::new()));
     }
+    validate_adopted_rows_match_source_parent(
+        read,
+        state_rows,
+        tracked_row_indices_by_commit,
+        adopted_rows,
+    )
+    .await?;
 
     let mut commits = Vec::with_capacity(commit_rows.len());
     let mut changes = Vec::new();
@@ -1210,6 +1452,31 @@ mod tests {
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("source commit should persist");
+        let mut root_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("root rebuild read should open");
+        let mut root_writes = StorageWriteSet::new();
+        crate::tracked_state::TrackedStateContext::new()
+            .root_rebuilder(&mut root_read, &mut root_writes)
+            .ensure_projection_root("source-commit")
+            .await
+            .expect("source-commit root should rebuild");
+        storage
+            .commit_write_set(root_writes, StorageWriteOptions::default())
+            .expect("source-commit root should persist");
+
+        let mut root_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("root rebuild read should open");
+        let mut root_writes = StorageWriteSet::new();
+        crate::tracked_state::TrackedStateContext::new()
+            .root_rebuilder(&mut root_read, &mut root_writes)
+            .ensure_projection_root("source-head")
+            .await
+            .expect("source-head root should rebuild");
+        storage
+            .commit_write_set(root_writes, StorageWriteOptions::default())
+            .expect("source-head root should persist");
 
         let mut adopted_writes = StorageWriteSet::new();
         let mut adopted_read = storage
@@ -1264,6 +1531,737 @@ mod tests {
         assert_eq!(body.membership[0].member_change_id, "source-change");
         assert_eq!(body.membership[0].role, MembershipRole::Adopted);
         assert_eq!(body.membership[0].source_parent_ordinal, Some(1));
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_projection_that_differs_from_source_parent() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let binary_cas = BinaryCasContext::new();
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+
+        let mut source_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("source read should open");
+        let mut source_row = tracked_global_row("source-change");
+        source_row.commit_id = Some("source-commit".to_string());
+        let source_writes = commit_prepared_writes(
+            &binary_cas,
+            &version_ctx,
+            None,
+            &mut source_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![source_row],
+                adopted_rows: Vec::new(),
+                commit_members_by_version: BTreeMap::from([(
+                    GLOBAL_VERSION_ID.to_string(),
+                    members_with_commit(
+                        "source-commit",
+                        "source-commit-change",
+                        ["source-change"],
+                    ),
+                )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("source commit should prepare");
+        storage
+            .commit_write_set(source_writes, StorageWriteOptions::default())
+            .expect("source commit should persist");
+
+        let forged_snapshot = crate::transaction::types::stage_json_from_value(
+            crate::transaction::types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "value": 999 }),
+            ),
+            "forged adopted row snapshot",
+        )
+        .expect("forged snapshot should stage");
+        let mut adopted_row =
+            adopted_global_row("source-change", "source-commit", "source-commit", "adopt-commit");
+        adopted_row.snapshot_ref = Some(forged_snapshot.json_ref);
+        adopted_row.snapshot = Some(forged_snapshot);
+
+        let mut adopt_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("adopt read should open");
+        let err = commit_prepared_writes(
+            &binary_cas,
+            &version_ctx,
+            None,
+            &mut adopt_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: Vec::new(),
+                adopted_rows: vec![adopted_row],
+                commit_members_by_version: BTreeMap::from([(
+                    GLOBAL_VERSION_ID.to_string(),
+                    members_with_commit("adopt-commit", "adopt-commit-change", ["source-change"]),
+                )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("forged adopted projection should be rejected");
+        assert!(
+            err.message
+                .contains("projection does not match source parent"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_projection_matching_corrupt_source_root() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let binary_cas = BinaryCasContext::new();
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+
+        let mut source_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("source read should open");
+        let mut source_row = tracked_global_row("source-change");
+        source_row.commit_id = Some("source-commit".to_string());
+        let source_writes = commit_prepared_writes(
+            &binary_cas,
+            &version_ctx,
+            None,
+            &mut source_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![source_row],
+                adopted_rows: Vec::new(),
+                commit_members_by_version: BTreeMap::from([(
+                    GLOBAL_VERSION_ID.to_string(),
+                    members_with_commit(
+                        "source-commit",
+                        "source-commit-change",
+                        ["source-change"],
+                    ),
+                )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("source commit should prepare");
+        storage
+            .commit_write_set(source_writes, StorageWriteOptions::default())
+            .expect("source commit should persist");
+
+        let request = TrackedStateRowRequest {
+            schema_key: "test_schema".to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            file_id: crate::NullableKeyFilter::Null,
+        };
+        let corrupt_row = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let entries = crate::tracked_state::TrackedStateContext::new()
+                .reader(read)
+                .load_index_entries_at_commit("source-commit", &[request])
+                .await
+                .expect("source row should load");
+            entries
+                .into_iter()
+                .next()
+                .flatten()
+                .expect("source row should exist")
+        };
+        let forged_snapshot = crate::transaction::types::stage_json_from_value(
+            crate::transaction::types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "value": 999 }),
+            ),
+            "forged adopted row snapshot",
+        )
+        .expect("forged snapshot should stage");
+        {
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("corrupt read should open");
+            let mut writes = storage.new_write_set();
+            let entity_id = crate::entity_identity::EntityIdentity::single("entity-1");
+            let source_commit_id = "source-commit".to_string();
+            let change = crate::changelog::ChangeRef {
+                id: "source-change",
+                authored_commit_id: Some(&source_commit_id),
+                entity_id: &entity_id,
+                schema_key: "test_schema",
+                file_id: None,
+                snapshot_ref: Some(&forged_snapshot.json_ref),
+                metadata_ref: None,
+                created_at: "2026-01-01T00:00:00Z",
+            };
+            let locator = crate::changelog::ChangeLocatorRef {
+                change_id: &corrupt_row.change_id,
+                commit_id: &corrupt_row.commit_id,
+                location: corrupt_row.change_location.as_ref(),
+            };
+            crate::tracked_state::TrackedStateContext::new()
+                .writer(&mut read, &mut writes)
+                .stage_projection_root(
+                    "source-commit",
+                    None,
+                    [TrackedStateDeltaRef {
+                        change,
+                        locator,
+                        created_at: "2026-01-01T00:00:00Z",
+                        updated_at: "2026-01-01T00:00:00Z",
+                    }],
+                )
+                .await
+                .expect("corrupt source root should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("corrupt source root should commit");
+        }
+        {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("corrupt verification read should open");
+            let request = TrackedStateRowRequest {
+                schema_key: "test_schema".to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+                file_id: crate::NullableKeyFilter::Null,
+            };
+            let entries = crate::tracked_state::TrackedStateContext::new()
+                .reader(read)
+                .load_index_entries_at_commit("source-commit", &[request])
+                .await
+                .expect("corrupt source row should load");
+            let stored_row = entries
+                .into_iter()
+                .next()
+                .flatten()
+                .expect("corrupt source row should exist");
+            assert_eq!(stored_row.snapshot_ref, Some(forged_snapshot.json_ref));
+        }
+
+        let mut adopted_row =
+            adopted_global_row("source-change", "source-commit", "source-commit", "adopt-commit");
+        adopted_row.snapshot_ref = Some(forged_snapshot.json_ref);
+        adopted_row.snapshot = Some(forged_snapshot);
+        let mut adopt_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("adopt read should open");
+        let err = commit_prepared_writes(
+            &binary_cas,
+            &version_ctx,
+            None,
+            &mut adopt_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: Vec::new(),
+                adopted_rows: vec![adopted_row],
+                commit_members_by_version: BTreeMap::from([(
+                    GLOBAL_VERSION_ID.to_string(),
+                    members_with_commit("adopt-commit", "adopt-commit-change", ["source-change"]),
+                )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("corrupt source projection should be rejected");
+        assert!(
+            err.message
+                .contains("payload refs do not match changelog change"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_change_that_is_not_source_parent_winner() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut writes = StorageWriteSet::new();
+        let mut source_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("source read should open");
+        let mut source_row = tracked_global_row("source-change");
+        source_row.commit_id = Some("source-commit".to_string());
+        let source_commits = vec![
+            FinalizedCommitRow {
+                commit_id: "target-commit".to_string(),
+                parent_commit_ids: Vec::new(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                change_id: "target-commit-change".to_string(),
+            },
+            FinalizedCommitRow {
+                commit_id: "source-commit".to_string(),
+                parent_commit_ids: Vec::new(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                change_id: "source-commit-change".to_string(),
+            },
+            FinalizedCommitRow {
+                commit_id: "source-head".to_string(),
+                parent_commit_ids: vec!["source-commit".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "source-head-change".to_string(),
+            },
+        ];
+        stage_changelog_commits(
+            &mut source_read,
+            &mut writes,
+            &[source_row],
+            &BTreeMap::from([("source-commit".to_string(), vec![0])]),
+            &[],
+            &BTreeMap::new(),
+            &source_commits,
+        )
+        .await
+        .expect("source history should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("source history should persist");
+        let mut root_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("root rebuild read should open");
+        let mut root_writes = StorageWriteSet::new();
+        crate::tracked_state::TrackedStateContext::new()
+            .root_rebuilder(&mut root_read, &mut root_writes)
+            .ensure_projection_root("source-head")
+            .await
+            .expect("source-head root should rebuild");
+        storage
+            .commit_write_set(root_writes, StorageWriteOptions::default())
+            .expect("source-head root should persist");
+
+        let mut adopted_writes = StorageWriteSet::new();
+        let mut adopted_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("adopted read should open");
+        let adopted_row =
+            adopted_global_row("source-change", "wrong-source", "source-head", "merge-commit");
+        let merge_commits = vec![FinalizedCommitRow {
+            commit_id: "merge-commit".to_string(),
+            parent_commit_ids: vec!["target-commit".to_string(), "source-head".to_string()],
+            created_at: "2026-01-01T00:00:02Z".to_string(),
+            change_id: "merge-commit-change".to_string(),
+        }];
+        let err = stage_changelog_commits(
+            &mut adopted_read,
+            &mut adopted_writes,
+            &[],
+            &BTreeMap::new(),
+            &[adopted_row],
+            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
+            &merge_commits,
+        )
+        .await
+        .expect_err("non-winning source change should be rejected");
+        assert!(
+            err.message.contains("not the first-parent winner"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_projection_missing_from_source_parent() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut writes = StorageWriteSet::new();
+        let mut source_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("source read should open");
+        let source_commits = vec![
+            FinalizedCommitRow {
+                commit_id: "target-commit".to_string(),
+                parent_commit_ids: Vec::new(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                change_id: "target-commit-change".to_string(),
+            },
+            FinalizedCommitRow {
+                commit_id: "empty-source-parent".to_string(),
+                parent_commit_ids: Vec::new(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                change_id: "empty-source-change".to_string(),
+            },
+        ];
+        stage_changelog_commits(
+            &mut source_read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[],
+            &BTreeMap::new(),
+            &source_commits,
+        )
+        .await
+        .expect("empty source parent should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("empty source parent should persist");
+        let mut root_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("empty root rebuild read should open");
+        let mut root_writes = StorageWriteSet::new();
+        crate::tracked_state::TrackedStateContext::new()
+            .root_rebuilder(&mut root_read, &mut root_writes)
+            .ensure_projection_root("empty-source-parent")
+            .await
+            .expect("empty source parent root should rebuild");
+        storage
+            .commit_write_set(root_writes, StorageWriteOptions::default())
+            .expect("empty source parent root should persist");
+
+        let mut adopted_writes = StorageWriteSet::new();
+        let mut adopted_read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("adopted read should open");
+        let adopted_row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "empty-source-parent",
+            "merge-commit",
+        );
+        let merge_commits = vec![FinalizedCommitRow {
+            commit_id: "merge-commit".to_string(),
+            parent_commit_ids: vec![
+                "target-commit".to_string(),
+                "empty-source-parent".to_string(),
+            ],
+            created_at: "2026-01-01T00:00:02Z".to_string(),
+            change_id: "merge-commit-change".to_string(),
+        }];
+        let err = stage_changelog_commits(
+            &mut adopted_read,
+            &mut adopted_writes,
+            &[],
+            &BTreeMap::new(),
+            &[adopted_row],
+            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
+            &merge_commits,
+        )
+        .await
+        .expect_err("missing source parent identity should be rejected");
+        assert!(
+            err.message.contains("is missing from source parent"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_row_for_non_finalized_commit() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let adopted_row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "missing-commit",
+        );
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[adopted_row],
+            &BTreeMap::from([("missing-commit".to_string(), vec![0])]),
+            &[FinalizedCommitRow {
+                commit_id: "other-commit".to_string(),
+                parent_commit_ids: vec!["source-parent".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "other-commit-change".to_string(),
+            }],
+        )
+        .await
+        .expect_err("adopted rows without finalized commit should be rejected");
+        assert!(
+            err.message.contains("have no finalized commit row"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_row_without_any_finalized_commit() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let adopted_row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "missing-commit",
+        );
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[adopted_row],
+            &BTreeMap::from([("missing-commit".to_string(), vec![0])]),
+            &[],
+        )
+        .await
+        .expect_err("adopted rows without any finalized commit should be rejected");
+        assert!(
+            err.message.contains("have no finalized commit row"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_row_whose_source_parent_is_not_parented() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let adopted_row =
+            adopted_global_row("source-change", "source-commit", "source-parent", "merge-commit");
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[adopted_row],
+            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
+            &[FinalizedCommitRow {
+                commit_id: "merge-commit".to_string(),
+                parent_commit_ids: vec!["target-parent".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "merge-commit-change".to_string(),
+            }],
+        )
+        .await
+        .expect_err("unparented adopted source parent should be rejected");
+        assert!(
+            err.message.contains("is not parented by adopting commit"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_unindexed_adopted_row_before_source_validation() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let adopted_row =
+            adopted_global_row("source-change", "source-commit", "source-parent", "merge-commit");
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[adopted_row],
+            &BTreeMap::new(),
+            &[FinalizedCommitRow {
+                commit_id: "merge-commit".to_string(),
+                parent_commit_ids: vec!["source-parent".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "merge-commit-change".to_string(),
+            }],
+        )
+        .await
+        .expect_err("unindexed adopted row should be rejected");
+        assert!(
+            err.message
+                .contains("is not assigned to a finalized commit"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn adopted_projection_rejects_metadata_ref_mismatch() {
+        let metadata = crate::transaction::types::stage_json_from_value(
+            crate::transaction::types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "meta": true }),
+            ),
+            "test adopted row metadata",
+        )
+        .expect("metadata should stage");
+        let mut row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "adopt-commit",
+        );
+        row.metadata = Some(metadata);
+        row.metadata_ref = Some(crate::json_store::JsonRef::for_content(
+            br#"{"meta":"forged-ref"}"#,
+        ));
+
+        let err = validate_adopted_row_payload_refs(&row)
+            .expect_err("metadata ref corruption should be rejected");
+        assert!(
+            err.message
+                .contains("metadata_ref does not match materialized metadata"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_metadata_ref_mismatch() {
+        let mut row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "merge-commit",
+        );
+        let metadata = crate::transaction::types::stage_json_from_value(
+            crate::transaction::types::TransactionJson::from_value_for_test(
+                serde_json::json!({ "meta": true }),
+            ),
+            "test adopted row metadata",
+        )
+        .expect("metadata should stage");
+        row.metadata = Some(metadata);
+        row.metadata_ref = Some(crate::json_store::JsonRef::for_content(
+            br#"{"meta":"forged-ref"}"#,
+        ));
+
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[row],
+            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
+            &[FinalizedCommitRow {
+                commit_id: "merge-commit".to_string(),
+                parent_commit_ids: vec!["source-parent".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "merge-commit-change".to_string(),
+            }],
+        )
+        .await
+        .expect_err("metadata ref corruption should be rejected in commit path");
+        assert!(
+            err.message
+                .contains("metadata_ref does not match materialized metadata"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn adopted_projection_rejects_tombstone_snapshot_inconsistency() {
+        let mut row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "adopt-commit",
+        );
+        row.snapshot_ref = None;
+
+        let err = validate_adopted_row_payload_refs(&row)
+            .expect_err("snapshot tombstone inconsistency should be rejected");
+        assert!(
+            err.message
+                .contains("snapshot_ref does not match materialized snapshot"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_tombstone_snapshot_inconsistency() {
+        let mut row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "merge-commit",
+        );
+        row.snapshot_ref = None;
+
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[row],
+            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
+            &[FinalizedCommitRow {
+                commit_id: "merge-commit".to_string(),
+                parent_commit_ids: vec!["source-parent".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "merge-commit-change".to_string(),
+            }],
+        )
+        .await
+        .expect_err("tombstone inconsistency should be rejected in commit path");
+        assert!(
+            err.message
+                .contains("snapshot_ref does not match materialized snapshot"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_adopted_snapshot_ref_mismatch() {
+        let mut row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "merge-commit",
+        );
+        row.snapshot_ref = Some(crate::json_store::JsonRef::for_content(
+            br#"{"value":"forged-ref"}"#,
+        ));
+
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = StorageWriteSet::new();
+        let err = stage_changelog_commits(
+            &mut read,
+            &mut writes,
+            &[],
+            &BTreeMap::new(),
+            &[row],
+            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
+            &[FinalizedCommitRow {
+                commit_id: "merge-commit".to_string(),
+                parent_commit_ids: vec!["source-parent".to_string()],
+                created_at: "2026-01-01T00:00:01Z".to_string(),
+                change_id: "merge-commit-change".to_string(),
+            }],
+        )
+        .await
+        .expect_err("snapshot ref corruption should be rejected in commit path");
+        assert!(
+            err.message
+                .contains("snapshot_ref does not match materialized snapshot"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn adopted_projection_rejects_payload_ref_mismatch() {
+        let mut row = adopted_global_row(
+            "source-change",
+            "source-commit",
+            "source-parent",
+            "adopt-commit",
+        );
+        row.snapshot_ref = Some(crate::json_store::JsonRef::for_content(
+            br#"{"value":"forged-ref"}"#,
+        ));
+
+        let err = validate_adopted_row_payload_refs(&row)
+            .expect_err("ref-only corruption should be rejected");
+        assert!(
+            err.message
+                .contains("snapshot_ref does not match materialized snapshot"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1862,9 +2860,17 @@ mod tests {
     }
 
     fn members<const N: usize>(change_ids: [&str; N]) -> StagedCommitMembers {
+        members_with_commit("test-uuid-1", "test-uuid-2", change_ids)
+    }
+
+    fn members_with_commit<const N: usize>(
+        commit_id: &str,
+        commit_change_id: &str,
+        change_ids: [&str; N],
+    ) -> StagedCommitMembers {
         let mut members = StagedCommitMembers::new(
-            "test-uuid-1".to_string(),
-            "test-uuid-2".to_string(),
+            commit_id.to_string(),
+            commit_change_id.to_string(),
             "test-timestamp-1".to_string(),
         );
         for change_id in change_ids {

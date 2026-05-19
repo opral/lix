@@ -26,6 +26,6 @@ pub(crate) use row_materialization::{materialize_rows_from_index_entries, Tracke
 #[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateProjection, TrackedStateRowRequest,
-    TrackedStateScanRequest,
+    TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateProjection,
+    TrackedStateRowRequest, TrackedStateScanRequest,
 };
