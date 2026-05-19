@@ -57,4 +57,6 @@ Always `await lix.close()` in scripts and tests. Long-lived servers can hold a s
 
 ## Other storage targets
 
-Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, RocksDB (anything transactional and key-value-shaped) are not shipped by the Lix team. The storage interface is public and small enough to implement yourself. See [Backends](./backend.md) for the contract.
+Postgres, S3, Cloudflare D1 / Durable Objects, IndexedDB, OPFS, RocksDB (anything transactional and key-value-shaped) are not shipped by the Lix team.
+
+The storage interface is public and small enough to implement yourself. The [Backends](./backend.md) page documents the full contract.

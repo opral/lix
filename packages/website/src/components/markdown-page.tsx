@@ -106,14 +106,14 @@ export function MarkdownPage({
   return (
     <article className="markdown-wc-body">
       {title && (
-        <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <h1 className="text-[28px] font-semibold leading-10 tracking-[-0.02em] text-slate-900">
+        <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <h1 className="min-w-0 text-[28px] font-semibold leading-10 tracking-[-0.02em] text-slate-900">
             {title}
           </h1>
           <button
             type="button"
             onClick={handleCopy}
-            className="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+            className="inline-flex shrink-0 items-center gap-2 self-start rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
             aria-label="Copy markdown"
           >
             {copyStatus === "copied" ? (

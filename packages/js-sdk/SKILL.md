@@ -391,7 +391,7 @@ Demo recipe:
 `lix_file` stores files as versioned bytes. Parent directories are created automatically.
 
 ```ts
-await lix.execute("INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)", [
+await lix.execute("INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)", [
   "file-readme",
   "/docs/readme.md",
   new TextEncoder().encode("# Hello\n"),
@@ -432,7 +432,8 @@ Important columns include `id`, `entity_id`, `schema_key`, `snapshot_content`, `
 await lix.execute(
   `SELECT created_at, snapshot_content
      FROM lix_change
-    WHERE schema_key = $1 AND entity_id = $2
+    WHERE schema_key = $1
+      AND lix_json_get_text(entity_id, 0) = $2
     ORDER BY created_at`,
   ["acme_note", "n1"],
 );

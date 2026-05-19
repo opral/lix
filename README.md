@@ -11,11 +11,11 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is an **embeddable version control system** you import as a library. Give agents branches, checkpoints, semantic diffs, rollback, immutable history, and SQL-queryable context without wrapping Git or managing repo internals.
+Lix is an **embeddable version control system** you import as a library. Give agents versions, checkpoints, semantic change history, rollback, immutable history, and SQL-queryable context without wrapping Git or managing repo internals.
 
 - **Runs in-process.** Import it as a library and run it inside your app. No daemon, no protocol.
 - **ACID transactions.** One transaction can cover state, blobs, and history.
-- **Semantic diffs.** Track XLSX rows, DOCX clauses, JSON properties, and more as entities.
+- **Semantic changes.** Track XLSX rows, DOCX clauses, JSON properties, and more as entities.
 - **SQL interface.** Agents can query history and changes without rereading whole files.
 - **Bring your own backend.** Start in memory, then plug into SQLite, Postgres, S3, Cloudflare, or your own adapter.
 
@@ -29,7 +29,7 @@ Lix is an **embeddable version control system** you import as a library. Give ag
 </p>
 
 ```bash
-npm install @lix-js/sdk
+npm install @lix-js/sdk better-sqlite3
 ```
 
 ```ts
@@ -40,14 +40,29 @@ const lix = await openLix({
   backend: createBetterSqlite3Backend({ path: "app.lix" }),
 });
 
-await lix.file.write("/orders.xlsx", bytes);
+const main = await lix.activeVersionId();
 
-const draft = await lix.branch("explore");
+await lix.execute(
+  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+  ["orders-file", "/orders.xlsx", bytes],
+);
 
-const changes = await lix.diff({ from: "main", to: draft });
+const draft = await lix.createVersion({ name: "Explore" });
+await lix.switchVersion({ versionId: draft.id });
 
-const rows = await lix.execute(
-  "SELECT path, count(*) FROM lix_change GROUP BY path",
+await lix.execute(
+  "UPDATE lix_file SET data = $1 WHERE path = '/orders.xlsx'",
+  [draftBytes],
+);
+
+await lix.switchVersion({ versionId: main });
+
+const merge = await lix.mergeVersion({
+  sourceVersionId: draft.id,
+});
+
+const changes = await lix.execute(
+  "SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key",
 );
 ```
 
@@ -55,7 +70,7 @@ const rows = await lix.execute(
 
 ### Git was not designed to be embedded
 
-AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, branches, reviewable changes, and rollback.
+AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, versions, reviewable changes, and rollback.
 
 Teams reach for Git, but wrapping it means managing repository directories, worktrees, locks, packfiles, garbage collection, LFS, process calls, protocol servers, and transaction coordination around a tool that expects to live outside the app.
 
@@ -83,28 +98,54 @@ const lix = await openLix({
 Write files, blobs, and history in one transaction.
 
 ```ts
-await lix.transaction(async (tx) => {
-  await tx.file.write("/spec.docx", body);
-  await tx.file.write("/spec.png", image);
-});
+const tx = await lix.beginTransaction();
+
+try {
+  await tx.execute(
+    "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+    ["spec-doc", "/spec.docx", body],
+  );
+  await tx.execute(
+    "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+    ["spec-preview", "/spec.png", image],
+  );
+  await tx.commit();
+} catch (error) {
+  await tx.rollback();
+  throw error;
+}
 ```
 
-#### Parallel sessions. No worktrees.
+#### Parallel versions. No worktrees.
 
-Give every agent its own isolated session without creating Git-style multi-checkout worktrees.
+Give every agent its own isolated version without creating Git-style multi-checkout worktrees.
 
 ```ts
-const agent1 = await lix.create_session("copy");
-const agent2 = await lix.create_session("pricing");
-const agent3 = await lix.create_session("qa");
+const main = await lix.activeVersionId();
 
-await agent1.file.write("/landing.md", copyDraft);
-await agent2.file.write("/plans.json", priceModel);
-await agent3.file.write("/checks/report.json", testRun);
+const copy = await lix.createVersion({ name: "Copy draft" });
+const pricing = await lix.createVersion({ name: "Pricing draft" });
+const qa = await lix.createVersion({ name: "QA draft" });
 
-await agent1.commit();
-await agent2.commit();
-await agent3.commit();
+await lix.switchVersion({ versionId: copy.id });
+await lix.execute(
+  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+  ["landing", "/landing.md", copyDraft],
+);
+
+await lix.switchVersion({ versionId: pricing.id });
+await lix.execute(
+  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+  ["plans", "/plans.json", priceModel],
+);
+
+await lix.switchVersion({ versionId: qa.id });
+await lix.execute(
+  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+  ["qa-report", "/checks/report.json", testRun],
+);
+
+await lix.switchVersion({ versionId: main });
 ```
 
 #### Semantic changes
@@ -112,7 +153,12 @@ await agent3.commit();
 Unlike Git's line-based diffs, Lix can track structured entities: XLSX rows, DOCX clauses, JSON properties, app records, and more.
 
 ```ts
-const changes = await lix.diff({ from: "main", to: draft });
+const changes = await lix.execute(`
+  SELECT created_at, schema_key, entity_id, snapshot_content
+  FROM lix_change
+  ORDER BY created_at DESC
+  LIMIT 20
+`);
 ```
 
 For example, an agent edits an orders spreadsheet:
@@ -181,7 +227,7 @@ const lix = await openLix({
 
 Lix runs in-process inside your app.
 
-It owns the version-control model: files, blobs, branches, versions, history, transactions, and semantic changes. You plug it into whatever backend you need: in-memory, SQLite, Postgres, S3, Cloudflare, or your own adapter.
+It owns the version-control model: files, blobs, versions, history, transactions, and semantic changes. You plug it into whatever backend you need: in-memory, SQLite, Postgres, S3, Cloudflare, or your own adapter.
 
 SQL is the query interface on top. Agents can ask what changed without rereading whole files.
 
@@ -192,7 +238,7 @@ SQL is the query interface on top. Agents can ask what changed without rereading
 │                                                 │
 │   ┌─────────────────────────────────────────┐   │
 │   │                  Lix                    │   │
-│   │  Filesystem · Branches · History · SQL  │   │
+│   │  Filesystem · Versions · History · SQL  │   │
 │   └────────────────────┬────────────────────┘   │
 │                        │                        │
 └────────────────────────┼────────────────────────┘
@@ -207,9 +253,9 @@ SQL is the query interface on top. Agents can ask what changed without rereading
 
 ## What you can build with Lix
 
-- **AI agent filesystems** - isolated workspaces, branchable explore steps, semantic change history, and rollback when a run goes sideways.
-- **Version control for Postgres & SQLite** - time-travel and branchable schemas on top of an existing database. Reviewable migrations. Diffable rows.
-- **Apps with version control** - add branches, review, rollback, and history to editors, CMSs, design tools, internal ops apps, and AI-native products.
+- **AI agent filesystems** - isolated workspaces, versioned explore steps, semantic change history, and rollback when a run goes sideways.
+- **Version control for Postgres & SQLite** - time-travel and versioned schemas on top of an existing database. Reviewable migrations. Diffable rows.
+- **Apps with version control** - add versions, review, rollback, and history to editors, CMSs, design tools, internal ops apps, and AI-native products.
 - **Review for AI-generated changes** - surface what an agent actually changed at the entity level. Approve, request edits, or revert by symbol instead of patch.
 
 ## Roadmap

@@ -19,9 +19,8 @@ Versions don't filter `lix_change` directly; `lix_change` is the raw write log, 
 | Column             | What it is                                                                                              |
 | ------------------ | ------------------------------------------------------------------------------------------------------- |
 | `id`               | Unique change id.                                                                                       |
-| `entity_id`        | Primary key of the changed row. For composite keys, an encoded form (`pk:v1:<base64-json>`).            |
+| `entity_id`        | JSON array of the changed row's primary-key values, in `x-lix-primary-key` order.                       |
 | `schema_key`       | Which schema (`x-lix-key`).                                                                             |
-| `schema_version`   | Schema contract version at the time of the change.                                                      |
 | `file_id`          | The file the change belongs to, or `null` for entity-only changes.                                      |
 | `metadata`         | JSON metadata attached to the change.                                                                   |
 | `snapshot_content` | JSON snapshot of the row after the change, or `null` for deletions (tombstones).                        |
@@ -29,11 +28,22 @@ Versions don't filter `lix_change` directly; `lix_change` is the raw write log, 
 
 Read JSON cells with `row.value("snapshot_content").asJson()` or `row.get("snapshot_content")`. Don't `JSON.parse` it as text, and handle `null` for tombstones.
 
+`entity_id` is a JSON array even for single-column primary keys. For `x-lix-primary-key: ["/id"]`, the first primary-key value is `lix_json_get_text(entity_id, 0)`. Use numeric path segments for array indexes; `'0'` is a string key, not index `0`. For composite keys, address each part by index:
+
+```sql
+SELECT created_at, snapshot_content
+FROM lix_change
+WHERE schema_key = 'line_item'
+  AND lix_json_get_text(entity_id, 0) = 'order-1'
+  AND lix_json_get_text(entity_id, 1) = 'line-2'
+ORDER BY created_at;
+```
+
 ## `lix_state_history` columns
 
 | Column               | What it is                                                                              |
 | -------------------- | --------------------------------------------------------------------------------------- |
-| `entity_id`          | Primary key of the row.                                                                 |
+| `entity_id`          | JSON array of the row's primary-key values, in `x-lix-primary-key` order.                |
 | `schema_key`         | Which schema.                                                                           |
 | `file_id`            | The file the row belongs to, or `null`.                                                 |
 | `snapshot_content`   | JSON snapshot at this depth.                                                            |
@@ -45,6 +55,8 @@ Read JSON cells with `row.value("snapshot_content").asJson()` or `row.get("snaps
 | `start_commit_id`    | The commit the walk started from (typically the version's tip, `lix_version.commit_id`). |
 | `depth`              | `0` = current state at `start_commit_id`. Higher values walk back through history.       |
 
+`schema_version` here is engine metadata on history/state projections. It is not a schema authoring field; do not put `x-lix-version` in registered schemas.
+
 ## Recipes
 
 ### Per-entity history (across all versions)
@@ -52,7 +64,8 @@ Read JSON cells with `row.value("snapshot_content").asJson()` or `row.get("snaps
 ```sql
 SELECT created_at, snapshot_content
 FROM lix_change
-WHERE schema_key = $1 AND entity_id = $2
+WHERE schema_key = $1
+  AND lix_json_get_text(entity_id, 0) = $2
 ORDER BY created_at;
 ```
 
@@ -106,7 +119,8 @@ Compare the two `snapshot_content` JSON values field-by-field in your code to re
 const prev = await lix.execute(
   `SELECT snapshot_content
      FROM lix_change
-    WHERE schema_key = $1 AND entity_id = $2
+    WHERE schema_key = $1
+      AND lix_json_get_text(entity_id, 0) = $2
       AND snapshot_content IS NOT NULL
     ORDER BY created_at DESC
     LIMIT 1 OFFSET 1`,

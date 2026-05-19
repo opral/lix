@@ -17,7 +17,7 @@
     { "path": "./backend.md", "label": "Backends" }
   ],
   "Reference": [
-    { "path": "./api-reference.md", "label": "API Reference" },
+    { "path": "./js-api-reference.md", "label": "JavaScript API" },
     { "path": "./sql-functions.md", "label": "SQL Functions" }
   ]
 }

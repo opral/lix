@@ -268,95 +268,95 @@ function LandingPage({
     <div className="font-sans text-gray-900 bg-white">
       {showHeader && (
         <header className="sticky top-0 z-50 border-b border-gray-200 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-[1440px] items-center justify-between pl-6 pr-6 py-3">
-          <a
-            href="/"
-            className="flex items-center text-[#0891B2]"
-            aria-label="lix home"
-          >
-            <LixLogo className="h-7 w-7" />
-            <span className="sr-only">lix</span>
-          </a>
-          <div className="flex items-center gap-6">
-            <nav className="hidden items-center gap-4 text-sm font-medium text-gray-700 sm:flex">
-              {navLinks.map(({ href, label, activePrefix }) => (
+          <div className="mx-auto flex w-full max-w-[1440px] items-center justify-between pl-6 pr-6 py-3">
+            <a
+              href="/"
+              className="flex items-center text-[#0891B2]"
+              aria-label="lix home"
+            >
+              <LixLogo className="h-7 w-7" />
+              <span className="sr-only">lix</span>
+            </a>
+            <div className="flex items-center gap-6">
+              <nav className="hidden items-center gap-4 text-sm font-medium text-gray-700 sm:flex">
+                {navLinks.map(({ href, label, activePrefix }) => (
+                  <a
+                    key={href}
+                    href={href}
+                    className={
+                      isActive(href, activePrefix)
+                        ? href.startsWith("/plugins")
+                          ? "px-2 py-1 text-[#0891B2] hover:text-[#0692B6]"
+                          : "px-2 py-1 text-[#0891B2]"
+                        : "px-2 py-1 transition-colors hover:text-[#0692B6]"
+                    }
+                    aria-current={
+                      isActive(href, activePrefix) ? "page" : undefined
+                    }
+                  >
+                    {label}
+                  </a>
+                ))}
+              </nav>
+              <div
+                className="hidden h-4 w-px bg-gray-200 sm:block"
+                aria-hidden="true"
+              />
+              <div className="flex items-center gap-3">
+                {socialLinks.map(({ href, label, Icon, sizeClass }) => (
+                  <a
+                    key={label}
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-gray-900 transition-colors hover:text-gray-900"
+                    aria-label={label}
+                  >
+                    <Icon className={sizeClass ?? "h-5 w-5"} />
+                  </a>
+                ))}
+                <div className="h-4 w-px bg-gray-200" aria-hidden="true" />
                 <a
-                  key={href}
-                  href={href}
-                  className={
-                    isActive(href, activePrefix)
-                      ? href.startsWith("/plugins")
-                        ? "px-2 py-1 text-[#0891B2] hover:text-[#0692B6]"
-                        : "px-2 py-1 text-[#0891B2]"
-                      : "px-2 py-1 transition-colors hover:text-[#0692B6]"
-                  }
-                  aria-current={
-                    isActive(href, activePrefix) ? "page" : undefined
-                  }
-                >
-                  {label}
-                </a>
-              ))}
-            </nav>
-            <div
-              className="hidden h-4 w-px bg-gray-200 sm:block"
-              aria-hidden="true"
-            />
-            <div className="flex items-center gap-3">
-              {socialLinks.map(({ href, label, Icon, sizeClass }) => (
-                <a
-                  key={label}
-                  href={href}
+                  href="https://github.com/opral/lix"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-gray-900 transition-colors hover:text-gray-900"
-                  aria-label={label}
+                  className="group inline-flex items-center gap-1.5 text-sm font-medium text-gray-700 transition-colors hover:text-gray-700"
                 >
-                  <Icon className={sizeClass ?? "h-5 w-5"} />
-                </a>
-              ))}
-              <div className="h-4 w-px bg-gray-200" aria-hidden="true" />
-              <a
-                href="https://github.com/opral/lix"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="group inline-flex items-center gap-1.5 text-sm font-medium text-gray-700 transition-colors hover:text-gray-700"
-              >
-                <GitHubIcon className="h-5 w-5" />
-                GitHub
-                {githubStars !== null && (
-                  <span
-                    className="inline-flex items-center gap-1 text-gray-500 transition-colors group-hover:text-gray-500"
-                    title={`${githubStars.toLocaleString()} GitHub stars`}
-                    aria-label={`${githubStars.toLocaleString()} GitHub stars`}
-                  >
-                    <span className="relative h-3.5 w-3.5" aria-hidden="true">
-                      <svg
-                        className="absolute inset-0 h-3.5 w-3.5 text-gray-400 group-hover:opacity-0 transition-opacity"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-                      </svg>
-                      <svg
-                        className="absolute inset-0 h-3.5 w-3.5 text-yellow-500 opacity-0 group-hover:opacity-100 transition-opacity"
-                        viewBox="0 0 16 16"
-                        fill="currentColor"
-                      >
-                        <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25z" />
-                      </svg>
+                  <GitHubIcon className="h-5 w-5" />
+                  GitHub
+                  {githubStars !== null && (
+                    <span
+                      className="inline-flex items-center gap-1 text-gray-500 transition-colors group-hover:text-gray-500"
+                      title={`${githubStars.toLocaleString()} GitHub stars`}
+                      aria-label={`${githubStars.toLocaleString()} GitHub stars`}
+                    >
+                      <span className="relative h-3.5 w-3.5" aria-hidden="true">
+                        <svg
+                          className="absolute inset-0 h-3.5 w-3.5 text-gray-400 group-hover:opacity-0 transition-opacity"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                        </svg>
+                        <svg
+                          className="absolute inset-0 h-3.5 w-3.5 text-yellow-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                          viewBox="0 0 16 16"
+                          fill="currentColor"
+                        >
+                          <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25z" />
+                        </svg>
+                      </span>
+                      <span>{formatStars(githubStars)}</span>
                     </span>
-                    <span>{formatStars(githubStars)}</span>
-                  </span>
-                )}
-              </a>
+                  )}
+                </a>
+              </div>
             </div>
           </div>
-        </div>
         </header>
       )}
       {/* Main content */}
@@ -743,9 +743,7 @@ export function LandingReadme({ readmeHtml }: { readmeHtml?: string }) {
               <span className="text-sm font-medium text-gray-900">
                 README.md
               </span>
-              <span className="text-sm text-gray-500 ml-2">
-                from opral/lix
-              </span>
+              <span className="text-sm text-gray-500 ml-2">from opral/lix</span>
             </div>
           </div>
           <div className="flex items-center gap-1.5 text-sm text-gray-600 group-hover:text-gray-900">
