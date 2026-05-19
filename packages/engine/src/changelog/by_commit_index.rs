@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::segment::directory_commit_location;
+use super::truth::SegmentTruthSnapshot;
 use super::types::{ByCommitEntry, Segment};
 use crate::LixError;
 
@@ -35,8 +36,15 @@ pub(super) fn by_commit_entries_for_segments(
 ) -> Result<Vec<ByCommitEntry>, LixError> {
     let generations = rebuilt_commit_generations(segments)?;
     let mut entries = Vec::new();
+    let mut seen = HashSet::new();
     for segment in segments {
         for commit in &segment.commits {
+            if !seen.insert(commit.header.id.as_str()) {
+                return Err(LixError::unknown(format!(
+                    "changelog index rebuild found duplicate commit '{}'",
+                    commit.header.id
+                )));
+            }
             entries.push(ByCommitEntry {
                 commit_id: commit.header.id.clone(),
                 location: directory_commit_location(segment, &commit.header.id)?,
@@ -49,6 +57,26 @@ pub(super) fn by_commit_entries_for_segments(
                 })?,
             });
         }
+    }
+    Ok(entries)
+}
+
+pub(super) fn by_commit_entries_for_truth(
+    truth: &SegmentTruthSnapshot,
+) -> Result<Vec<ByCommitEntry>, LixError> {
+    let generations = rebuilt_commit_generations_for_truth(truth)?;
+    let mut entries = Vec::new();
+    for (commit_id, location, commit) in truth.commits_in_segment_order() {
+        entries.push(ByCommitEntry {
+            commit_id: commit_id.to_string(),
+            location: location.clone(),
+            parent_commit_ids: commit.header.parent_commit_ids.clone(),
+            generation: *generations.get(commit_id).ok_or_else(|| {
+                LixError::unknown(format!(
+                    "changelog index rebuild did not compute generation for commit '{commit_id}'"
+                ))
+            })?,
+        });
     }
     Ok(entries)
 }
@@ -148,6 +176,33 @@ fn rebuilt_commit_generations(segments: &[Segment]) -> Result<HashMap<String, u6
             }
         }
     }
+
+    let mut generations = HashMap::new();
+    let mut visiting = HashSet::new();
+    for commit_id in parents_by_commit.keys() {
+        let generation = rebuilt_commit_generation(
+            commit_id,
+            &parents_by_commit,
+            &mut generations,
+            &mut visiting,
+        )?;
+        generations.insert(commit_id.clone(), generation);
+    }
+    Ok(generations)
+}
+
+fn rebuilt_commit_generations_for_truth(
+    truth: &SegmentTruthSnapshot,
+) -> Result<HashMap<String, u64>, LixError> {
+    let parents_by_commit = truth
+        .commits_in_segment_order()
+        .map(|(commit_id, _, commit)| {
+            (
+                commit_id.to_string(),
+                commit.header.parent_commit_ids.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut generations = HashMap::new();
     let mut visiting = HashSet::new();
