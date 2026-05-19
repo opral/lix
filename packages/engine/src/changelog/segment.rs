@@ -128,6 +128,10 @@ impl DecodedSegmentIndex {
         self.commit_ordinals.contains_key(commit_id)
     }
 
+    pub(super) fn commit_location(&self, commit_id: &str) -> Option<&SegmentObjectLocation> {
+        self.commit_locations.get(commit_id)
+    }
+
     pub(super) fn contains_change(&self, change_id: &str) -> bool {
         self.change_ordinals.contains_key(change_id)
     }

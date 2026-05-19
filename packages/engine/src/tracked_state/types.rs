@@ -81,6 +81,25 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) updated_at: &'a str,
 }
 
+/// Durable metadata for the tracked-state projection at one commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackedStateProjectionMetadata {
+    pub(crate) commit_id: String,
+    pub(crate) root_id: TrackedStateRootId,
+    pub(crate) parent_roots: Vec<TrackedStateProjectionParent>,
+    pub(crate) changed_key_count: u64,
+    pub(crate) row_count_estimate: u64,
+    pub(crate) tree_height: u32,
+    pub(crate) primary_chunk_count: u64,
+    pub(crate) primary_chunk_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackedStateProjectionParent {
+    pub(crate) commit_id: String,
+    pub(crate) root_id: TrackedStateRootId,
+}
+
 /// Materialized tracked-state projection row.
 ///
 /// Tracked rows are the projection that can be rebuilt from changelog facts.
@@ -211,7 +230,6 @@ pub(crate) struct TrackedStateApplyResult {
     pub(crate) tree_height: usize,
     pub(crate) chunk_count: usize,
     pub(crate) chunk_bytes: usize,
-    pub(crate) persisted_root: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -21,9 +21,6 @@ use super::store::{
     BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
     COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
-use crate::backend::{
-    CoreProjection, GetOptions, Key, KeyRange, Prefix, ProjectedValue, ReadOptions, ScanOptions,
-};
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
     decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
@@ -38,7 +35,9 @@ use crate::changelog::{
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::{
-    PointReadPlan, ScanPlan, StorageContext, StorageRead, StorageSpace, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
+    StorageGetOptions, StorageKey, StorageKeyRange, StoragePrefix, StorageProjectedValue,
+    StorageRead, StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
 };
 use crate::LixError;
 
@@ -128,7 +127,7 @@ pub(crate) trait ChangelogStorageRead {
         prefix: Vec<u8>,
         after: Option<Vec<u8>>,
         limit: usize,
-        projection: CoreProjection,
+        projection: StorageCoreProjection,
     ) -> Result<ChangelogScanPage, LixError>;
 }
 
@@ -151,7 +150,7 @@ where
         prefix: Vec<u8>,
         after: Option<Vec<u8>>,
         limit: usize,
-        projection: CoreProjection,
+        projection: StorageCoreProjection,
     ) -> Result<ChangelogScanPage, LixError> {
         native_scan(self, space, prefix, after, limit, projection)
     }
@@ -160,14 +159,14 @@ where
 #[async_trait]
 impl<B> ChangelogStorageRead for StorageContext<B>
 where
-    B: crate::backend::Backend + Send,
+    B: StorageBackend + Send,
 {
     async fn changelog_get_many(
         &mut self,
         space: StorageSpace,
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
+        let mut read = self.begin_read(StorageReadOptions::default())?;
         native_get_many(&mut read, space, keys)
     }
 
@@ -177,9 +176,9 @@ where
         prefix: Vec<u8>,
         after: Option<Vec<u8>>,
         limit: usize,
-        projection: CoreProjection,
+        projection: StorageCoreProjection,
     ) -> Result<ChangelogScanPage, LixError> {
-        let mut read = self.begin_read(ReadOptions::default())?;
+        let mut read = self.begin_read(StorageReadOptions::default())?;
         native_scan(&mut read, space, prefix, after, limit, projection)
     }
 }
@@ -833,7 +832,7 @@ where
                     prefix.clone(),
                     after,
                     256,
-                    CoreProjection::KeyOnly,
+                    StorageCoreProjection::KeyOnly,
                 )
                 .await?;
             for index in 0..page.keys.len() {
@@ -991,7 +990,7 @@ where
                     Vec::new(),
                     after,
                     64,
-                    CoreProjection::FullValue,
+                    StorageCoreProjection::FullValue,
                 )
                 .await?;
             for index in 0..page.len() {
@@ -1140,7 +1139,7 @@ where
                     Vec::new(),
                     after,
                     64,
-                    CoreProjection::FullValue,
+                    StorageCoreProjection::FullValue,
                 )
                 .await?;
             for index in 0..page.len() {
@@ -1244,7 +1243,7 @@ where
                     Vec::new(),
                     after,
                     256,
-                    CoreProjection::KeyOnly,
+                    StorageCoreProjection::KeyOnly,
                 )
                 .await?;
             for index in 0..page.keys.len() {
@@ -1287,7 +1286,7 @@ where
                     Vec::new(),
                     after,
                     256,
-                    CoreProjection::KeyOnly,
+                    StorageCoreProjection::KeyOnly,
                 )
                 .await?;
             for index in 0..page.keys.len() {
@@ -1466,52 +1465,82 @@ where
                 }
             }
         }
-        for parent_id in external_parent_ids {
-            if let Some(generation) = self.load_parent_generation(&parent_id).await? {
-                out.insert(parent_id, generation);
+        if external_parent_ids.is_empty() {
+            return Ok(out);
+        }
+
+        let mut segments = self.scan_all_segments().await?;
+        for staged in self.staged_segments.values() {
+            if !segments
+                .iter()
+                .any(|segment| segment.header.segment_id == staged.header.segment_id)
+            {
+                segments.push(staged.clone());
+            }
+        }
+        let entries = by_commit_entries_for_segments(&segments)?;
+        for entry in entries {
+            if external_parent_ids.contains(&entry.commit_id) {
+                out.insert(entry.commit_id, entry.generation);
             }
         }
         Ok(out)
-    }
-
-    async fn load_parent_generation(&mut self, commit_id: &str) -> Result<Option<u64>, LixError> {
-        get_one(
-            &mut *self.store,
-            BY_COMMIT_INDEX_SPACE,
-            by_commit_key(commit_id),
-        )
-        .await?
-        .map(|bytes| decode_by_commit_entry(&bytes).map(|entry| entry.generation))
-        .transpose()
     }
 
     pub(crate) async fn stage_publish_commit(&mut self, commit_id: &str) -> Result<(), LixError> {
         let location = if let Some(location) = self.staged_commits.get(commit_id).cloned() {
             location
         } else {
-            let Some(entry) = get_one(
-                &mut *self.store,
-                BY_COMMIT_INDEX_SPACE,
-                by_commit_key(commit_id),
-            )
-            .await?
-            .map(|bytes| decode_by_commit_entry(&bytes))
-            .transpose()?
-            else {
-                return Err(LixError::unknown(format!(
-                    "cannot publish changelog commit '{commit_id}' because no by_commit locator exists"
-                )));
-            };
-            if entry.commit_id != commit_id {
-                return Err(LixError::unknown(format!(
-                    "by_commit key for '{commit_id}' contains commit_id '{}'",
-                    entry.commit_id
-                )));
-            }
-            entry.location
+            self.load_stored_commit_location_from_segment_truth(commit_id)
+                .await?
         };
         self.stage_publish_commit_at_location(commit_id, location)
             .await
+    }
+
+    async fn load_stored_commit_location_from_segment_truth(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<SegmentObjectLocation, LixError> {
+        let mut after = None;
+        let mut found = None::<SegmentObjectLocation>;
+        loop {
+            let page = self
+                .store
+                .changelog_scan(
+                    SEGMENT_SPACE,
+                    Vec::new(),
+                    after,
+                    64,
+                    StorageCoreProjection::FullValue,
+                )
+                .await?;
+            for index in 0..page.len() {
+                let Some(bytes) = page.value(index) else {
+                    continue;
+                };
+                let segment = DecodedSegmentIndex::decode(bytes)?;
+                let Some(location) = segment.commit_location(commit_id) else {
+                    continue;
+                };
+                if let Some(existing) = &found {
+                    return Err(LixError::unknown(format!(
+                        "cannot publish changelog commit '{commit_id}' because multiple segments contain it: '{}' and '{}'",
+                        existing.segment_id, location.segment_id
+                    )));
+                }
+                found = Some(location.clone());
+            }
+            let Some(next_after) = page.resume_after else {
+                break;
+            };
+            after = Some(next_after);
+        }
+        found.ok_or_else(|| {
+            LixError::unknown(format!(
+                "cannot publish changelog commit '{commit_id}' because no segment contains it"
+            ))
+        })
     }
 
     pub(crate) async fn stage_publish_commit_at_location(
@@ -2018,7 +2047,7 @@ where
                     Vec::new(),
                     after,
                     64,
-                    CoreProjection::FullValue,
+                    StorageCoreProjection::FullValue,
                 )
                 .await?;
             for index in 0..page.len() {
@@ -2142,7 +2171,13 @@ where
         loop {
             let page = self
                 .store
-                .changelog_scan(space, Vec::new(), after, 256, CoreProjection::FullValue)
+                .changelog_scan(
+                    space,
+                    Vec::new(),
+                    after,
+                    256,
+                    StorageCoreProjection::FullValue,
+                )
                 .await?;
             for index in 0..page.len() {
                 let Some(key) = page.key(index) else {
@@ -2257,7 +2292,7 @@ async fn scan_commit_visibilities_from_store(
                 Vec::new(),
                 after,
                 256,
-                CoreProjection::FullValue,
+                StorageCoreProjection::FullValue,
             )
             .await?;
         for index in 0..page.len() {
@@ -2330,15 +2365,16 @@ where
 {
     let keys = keys
         .into_iter()
-        .map(|key| Key(Bytes::from(key)))
+        .map(|key| StorageKey(Bytes::from(key)))
         .collect::<Vec<_>>();
-    let result = PointReadPlan::new(space, &keys).materialize(read, GetOptions::default())?;
+    let result =
+        PointReadPlan::new(space, &keys).materialize(read, StorageGetOptions::default())?;
     Ok(result
         .value
         .into_iter()
         .map(|value| match value {
-            Some(ProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
-            Some(ProjectedValue::KeyOnly) => Some(Vec::new()),
+            Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+            Some(StorageProjectedValue::KeyOnly) => Some(Vec::new()),
             None => None,
         })
         .collect())
@@ -2350,20 +2386,20 @@ fn native_scan<R>(
     prefix: Vec<u8>,
     after: Option<Vec<u8>>,
     limit: usize,
-    projection: CoreProjection,
+    projection: StorageCoreProjection,
 ) -> Result<ChangelogScanPage, LixError>
 where
     R: StorageRead + ?Sized,
 {
-    let after_key = after.map(|key| Key(Bytes::from(key)));
-    let opts = ScanOptions {
+    let after_key = after.map(|key| StorageKey(Bytes::from(key)));
+    let opts = StorageScanOptions {
         projection,
         limit_rows: limit,
         resume_after: after_key.as_ref(),
     };
     let chunk = ScanPlan::prefix(
         space,
-        Prefix {
+        StoragePrefix {
             bytes: Bytes::from(prefix),
         },
     )
@@ -2374,7 +2410,7 @@ where
     let mut values = Vec::with_capacity(chunk.entries.len());
     for entry in chunk.entries {
         keys.push(entry.key.0.to_vec());
-        if let ProjectedValue::FullValue(bytes) = entry.value {
+        if let StorageProjectedValue::FullValue(bytes) = entry.value {
             values.push(bytes.to_vec());
         }
     }
@@ -3681,9 +3717,64 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("parent 'missing-parent' has no by_commit generation"),
+                .contains("parent commit 'missing-parent' is missing from changelog segments"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn stage_segment_derives_external_parent_generation_from_segment_truth() {
+        let (context, storage) = changelog_test_context();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(test_segment()).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.delete(BY_COMMIT_INDEX_SPACE, by_commit_key("commit-1"));
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut child = test_segment();
+        child.header.segment_id = "segment-2".to_string();
+        child.commits[0].header.id = "commit-2".to_string();
+        child.commits[0].header.parent_commit_ids = vec!["commit-1".to_string()];
+        child.commits[0].header.derivable_change_id = "derived-change-2".to_string();
+        child.commits[0].body.membership[0].member_change_id = "change-2".to_string();
+        child.commits[0].directory.state_row_identities[0].1 = "change-2".to_string();
+        child.commits[0].directory.membership_ordinals[0].0 = "change-2".to_string();
+        child.changes[0].id = "change-2".to_string();
+        child.changes[0].authored_commit_id = Some("commit-2".to_string());
+        let child = canonicalize_segment(child).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(child).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let result = read_test_value_groups(
+            &storage,
+            vec![(
+                BY_COMMIT_INDEX_SPACE,
+                vec![by_commit_key("commit-1"), by_commit_key("commit-2")],
+            )],
+        );
+        assert!(
+            result[0][0].is_none(),
+            "test setup should leave the parent by_commit index missing"
+        );
+        let commit_2 = decode_by_commit_entry(result[0][1].as_deref().unwrap()).unwrap();
+        assert_eq!(commit_2.generation, 1);
     }
 
     #[tokio::test]
@@ -3822,7 +3913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_publish_commit_rejects_by_commit_locator_that_does_not_match_segment_truth() {
+    async fn stage_publish_commit_ignores_stale_by_commit_locator() {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -3854,17 +3945,19 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer(&mut *transaction, &mut writes);
-        let error = writer
-            .stage_publish_commit("commit-1")
-            .await
-            .expect_err("publish must validate by_commit against segment truth");
+        writer.stage_publish_commit("commit-1").await.unwrap();
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
 
-        assert!(
-            error
-                .message
-                .contains("segment 'missing-segment' is missing"),
-            "unexpected error: {error}"
+        let result = read_test_value_groups(
+            &storage,
+            vec![(
+                COMMIT_VISIBILITY_SPACE,
+                vec![commit_visibility_key("commit-1")],
+            )],
         );
+        let visibility = decode_commit_visibility(result[0][0].as_deref().unwrap()).unwrap();
+        assert_eq!(visibility.location.segment_id, "segment-1");
     }
 
     #[tokio::test]

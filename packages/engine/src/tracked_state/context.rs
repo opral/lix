@@ -10,6 +10,7 @@ use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
+    TrackedStateProjectionMetadata, TrackedStateProjectionParent, TrackedStateRootId,
     TrackedStateTreeScanRequest,
 };
 #[cfg(any(test, feature = "storage-benches"))]
@@ -228,8 +229,8 @@ where
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
-        let left_root = self.load_required_root(left_commit_id).await?;
-        let right_root = self.load_required_root(right_commit_id).await?;
+        let left_root = self.load_ensured_root(left_commit_id).await?;
+        let right_root = self.load_ensured_root(right_commit_id).await?;
         self.tree
             .diff(
                 &mut self.store,
@@ -238,18 +239,6 @@ where
                 request,
             )
             .await
-    }
-
-    pub(crate) async fn materialize_tree_values(
-        &mut self,
-        entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        materialize_rows_from_index_entries(
-            &mut self.store,
-            entries,
-            &crate::tracked_state::TrackedRowProjection::full(),
-        )
-        .await
     }
 
     async fn scan_rows_at_commit_by_file_index(
@@ -320,7 +309,7 @@ where
         Ok(rows)
     }
 
-    async fn load_required_root(
+    async fn load_ensured_root(
         &mut self,
         commit_id: &str,
     ) -> Result<crate::tracked_state::types::TrackedStateRootId, LixError> {
@@ -336,7 +325,7 @@ where
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-        let root_id = self.load_required_root(commit_id).await?;
+        let root_id = self.load_ensured_root(commit_id).await?;
         self.tree.get_many(&mut self.store, &root_id, keys).await
     }
 
@@ -384,6 +373,14 @@ impl<S> TrackedStateRootRebuilder<'_, S>
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
+    pub(crate) async fn ensure_projection_root(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<crate::tracked_state::projection_root_rebuild::ProjectionRootEnsureReport, LixError>
+    {
+        crate::tracked_state::projection_root_rebuild::ensure_projection_root(self, commit_id).await
+    }
+
     pub(crate) async fn rebuild_projection_root_at(
         &mut self,
         commit_id: &str,
@@ -458,6 +455,52 @@ where
             .await?;
         self.staged_roots
             .insert(commit_id.to_string(), result.root_id.clone());
+        storage::stage_projection_metadata(
+            self.writes,
+            &TrackedStateProjectionMetadata {
+                commit_id: commit_id.to_string(),
+                root_id: result.root_id.clone(),
+                parent_roots: parent_commit_id
+                    .zip(base_root.as_ref())
+                    .map(|(parent_commit_id, root_id)| {
+                        vec![TrackedStateProjectionParent {
+                            commit_id: parent_commit_id.to_string(),
+                            root_id: root_id.clone(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                changed_key_count: u64::try_from(deltas.len()).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state projection changed key count exceeds u64",
+                    )
+                })?,
+                row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state projection row count exceeds u64",
+                    )
+                })?,
+                tree_height: u32::try_from(result.tree_height).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state projection tree height exceeds u32",
+                    )
+                })?,
+                primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state projection chunk count exceeds u64",
+                    )
+                })?,
+                primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state projection chunk bytes exceeds u64",
+                    )
+                })?,
+            },
+        )?;
 
         let by_file_base_root = match parent_commit_id {
             Some(parent_commit_id) => match self.staged_by_file_roots.get(parent_commit_id) {
@@ -518,6 +561,7 @@ where
         };
         Ok(TrackedStateWriteReport {
             commit_id: commit_id.to_string(),
+            root_id: result.root_id,
             changed_rows: deltas.len(),
             primary_chunk_puts: result.chunk_count,
             by_file_chunk_puts,
@@ -528,6 +572,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateWriteReport {
     pub(crate) commit_id: String,
+    pub(crate) root_id: TrackedStateRootId,
     pub(crate) changed_rows: usize,
     pub(crate) primary_chunk_puts: usize,
     pub(crate) by_file_chunk_puts: usize,
@@ -536,7 +581,9 @@ pub(crate) struct TrackedStateWriteReport {
 fn missing_projection_root_error(commit_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("tracked_state projection root is missing for commit '{commit_id}'"),
+        format!(
+            "tracked_state projection root is missing for commit '{commit_id}'; call ensure_projection_root before structural diff"
+        ),
     )
 }
 
@@ -623,6 +670,60 @@ mod tests {
         )
         .await
         .expect_err("root staging should require a parent projection root");
+    }
+
+    #[tokio::test]
+    async fn stage_projection_root_writes_projection_metadata() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "parent",
+            None,
+            &[row("entity-a", "change-parent", "parent")],
+        )
+        .await
+        .expect("parent root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[
+                row("entity-a", "change-child-a", "child"),
+                row("entity-b", "change-child-b", "child"),
+            ],
+        )
+        .await
+        .expect("child root should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let parent_root = storage::load_root(&read, "parent")
+            .await
+            .expect("parent root should load")
+            .expect("parent root should exist");
+        let child_root = storage::load_root(&read, "child")
+            .await
+            .expect("child root should load")
+            .expect("child root should exist");
+        let metadata = storage::load_projection_metadata(&read, "child")
+            .await
+            .expect("metadata should load")
+            .expect("metadata should exist");
+
+        assert_eq!(metadata.commit_id, "child");
+        assert_eq!(metadata.root_id, child_root);
+        assert_eq!(metadata.parent_roots.len(), 1);
+        assert_eq!(metadata.parent_roots[0].commit_id, "parent");
+        assert_eq!(metadata.parent_roots[0].root_id, parent_root);
+        assert_eq!(metadata.changed_key_count, 2);
+        assert_eq!(metadata.row_count_estimate, 2);
+        assert!(metadata.tree_height >= 1);
+        assert!(metadata.primary_chunk_count >= 1);
+        assert!(metadata.primary_chunk_bytes > 0);
     }
 
     #[tokio::test]
@@ -749,8 +850,92 @@ mod tests {
             .expect("merge should plan");
 
         assert_eq!(merge_patch_ids(&plan), vec!["entity-a"]);
-        assert_eq!(plan.patches[0].projected_row().snapshot_content, None);
+        assert!(plan.patches[0].projected_row().deleted);
         assert_eq!(plan.patches[0].change_id(), "change-source-delete");
+    }
+
+    #[tokio::test]
+    async fn ensure_projection_root_repairs_missing_child_root_from_nearest_parent() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+        )
+        .await
+        .expect("base root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("base"),
+            &[row_with_value("entity-a", "change-child", "child", "child")],
+        )
+        .await
+        .expect("child root should write");
+        {
+            let mut writes = storage.new_write_set();
+            writes.delete(
+                storage::TRACKED_STATE_PROJECTION_SPACE,
+                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"child")),
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("child projection delete should commit");
+        }
+
+        tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .diff_commits("base", "child", &TrackedStateDiffRequest::default())
+            .await
+            .expect_err("diff should require durable roots before repair");
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let report = tracked_state
+            .root_rebuilder(&mut read, &mut writes)
+            .ensure_projection_root("child")
+            .await
+            .expect("child root should repair");
+        assert!(report.repaired);
+        assert_eq!(report.parent_commit_id.as_deref(), Some("base"));
+        assert_eq!(report.replayed_commits, 1);
+        assert_eq!(report.replayed_changes, 1);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("repaired root should commit");
+
+        let diff = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .diff_commits("base", "child", &TrackedStateDiffRequest::default())
+            .await
+            .expect("diff should use repaired root");
+
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(
+            diff.entries[0].kind,
+            crate::tracked_state::TrackedStateDiffKind::Modified
+        );
+        assert_eq!(
+            diff.entries[0]
+                .after
+                .as_ref()
+                .map(|row| row.change_id.as_str()),
+            Some("change-child")
+        );
     }
 
     #[tokio::test]

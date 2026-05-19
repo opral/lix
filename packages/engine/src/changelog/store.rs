@@ -4,9 +4,8 @@ use super::types::{
     CommitLoadRequest, CommitVisibility, GcPlan, GcRoot, RebuildIndexStats, Segment,
     SegmentStageReport,
 };
-use crate::backend::SpaceId;
 use crate::common::LixError;
-use crate::storage::StorageSpace;
+use crate::storage::{StorageSpace, StorageSpaceId};
 use async_trait::async_trait;
 
 pub(crate) const SEGMENT_NAMESPACE: &str = "changelog.segment";
@@ -17,17 +16,20 @@ pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE: &str =
     "changelog.index.by_change_membership";
 pub(crate) const VISIBLE_CHANGE_PROOF_NAMESPACE: &str = "changelog.index.visible_change";
 
-pub const SEGMENT_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0006_0001), SEGMENT_NAMESPACE);
+pub const SEGMENT_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0006_0001), SEGMENT_NAMESPACE);
 pub const COMMIT_VISIBILITY_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0006_0002), COMMIT_VISIBILITY_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0006_0002), COMMIT_VISIBILITY_NAMESPACE);
 pub(crate) const BY_COMMIT_INDEX_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0006_0003), BY_COMMIT_INDEX_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0006_0003), BY_COMMIT_INDEX_NAMESPACE);
 pub(crate) const BY_CHANGE_INDEX_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0006_0004), BY_CHANGE_INDEX_NAMESPACE);
-pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0006_0005), BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0006_0004), BY_CHANGE_INDEX_NAMESPACE);
+pub(crate) const BY_CHANGE_MEMBERSHIP_INDEX_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0006_0005),
+    BY_CHANGE_MEMBERSHIP_INDEX_NAMESPACE,
+);
 pub(crate) const VISIBLE_CHANGE_PROOF_SPACE: StorageSpace =
-    StorageSpace::new(SpaceId(0x0006_0006), VISIBLE_CHANGE_PROOF_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0006_0006), VISIBLE_CHANGE_PROOF_NAMESPACE);
 
 pub(crate) fn segment_key(segment_id: &str) -> Vec<u8> {
     identity_key(segment_id)

@@ -13,10 +13,9 @@ use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet, Segment,
     SegmentChange, SegmentCommit, SegmentObjectLocation,
 };
-use crate::backend::CoreProjection;
 use crate::changelog::decode_segment;
 use crate::json_store::{self, JsonRef};
-use crate::storage::{StorageSpace, StorageWriteSet};
+use crate::storage::{StorageCoreProjection, StorageSpace, StorageWriteSet};
 use crate::LixError;
 
 pub(super) async fn plan_gc<S>(store: &mut S, roots: &[GcRoot]) -> Result<GcPlan, LixError>
@@ -243,7 +242,7 @@ where
                 Vec::new(),
                 after,
                 64,
-                CoreProjection::FullValue,
+                StorageCoreProjection::FullValue,
             )
             .await?;
         for index in 0..page.len() {
@@ -270,7 +269,13 @@ where
     let mut out = Vec::new();
     loop {
         let page = store
-            .changelog_scan(space, Vec::new(), after, 256, CoreProjection::KeyOnly)
+            .changelog_scan(
+                space,
+                Vec::new(),
+                after,
+                256,
+                StorageCoreProjection::KeyOnly,
+            )
             .await?;
         for index in 0..page.keys.len() {
             let Some(key) = page.keys.get(index) else {
@@ -308,7 +313,7 @@ where
                 Vec::new(),
                 after,
                 256,
-                CoreProjection::KeyOnly,
+                StorageCoreProjection::KeyOnly,
             )
             .await?;
         for index in 0..page.keys.len() {
@@ -338,7 +343,7 @@ where
                 Vec::new(),
                 after,
                 256,
-                CoreProjection::KeyOnly,
+                StorageCoreProjection::KeyOnly,
             )
             .await?;
         for index in 0..page.keys.len() {
@@ -393,7 +398,6 @@ fn mark_change_payloads(payloads: &mut Vec<JsonRef>, change: &SegmentChange) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::InMemoryBackend;
     use crate::changelog::segment::canonicalize_segment;
     use crate::changelog::{
         encode_segment, ChangelogContext, CommitBody, CommitHeader, MembershipRecord,
@@ -404,6 +408,7 @@ mod tests {
     use crate::common::{CanonicalSchemaKey, EntityId, FileId};
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
+    use crate::storage::InMemoryStorageBackend;
     use crate::storage::{StorageContext, StorageWriteSet};
 
     #[tokio::test]
@@ -1272,7 +1277,7 @@ mod tests {
     }
 
     fn test_storage() -> StorageContext {
-        StorageContext::new(InMemoryBackend::new())
+        StorageContext::new(InMemoryStorageBackend::new())
     }
 
     async fn write_segments(

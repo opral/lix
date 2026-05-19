@@ -112,7 +112,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn get_many(
         &self,
-        store: &(impl StorageRead + Send + Sync),
+        store: &(impl StorageRead + Send + Sync + ?Sized),
         root_id: &TrackedStateRootId,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
@@ -306,12 +306,6 @@ impl TrackedStateTree {
                 .collect(),
         )?;
         overlay.stage_chunks(writes, &built.chunks);
-        let persisted_root = if let Some(commit_id) = commit_id {
-            storage::stage_root(writes, commit_id, &built.root_id);
-            true
-        } else {
-            false
-        };
 
         Ok(TrackedStateApplyResult {
             root_id: built.root_id,
@@ -319,7 +313,6 @@ impl TrackedStateTree {
             tree_height: built.tree_height,
             chunk_count: built.chunks.len(),
             chunk_bytes: built.chunk_bytes,
-            persisted_root,
         })
     }
 
@@ -455,12 +448,6 @@ impl TrackedStateTree {
             suffix_entries[mutation_entry_index].key.as_slice(),
         )?;
         overlay.stage_chunks(writes, &built.chunks);
-        let persisted_root = if let Some(commit_id) = commit_id {
-            storage::stage_root(writes, commit_id, &built.root_id);
-            true
-        } else {
-            false
-        };
 
         Ok(MutationApply::Applied(TrackedStateApplyResult {
             root_id: built.root_id,
@@ -468,7 +455,6 @@ impl TrackedStateTree {
             tree_height: built.tree_height,
             chunk_count: built.chunks.len(),
             chunk_bytes: built.chunk_bytes,
-            persisted_root,
         }))
     }
 
@@ -1041,22 +1027,15 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         built: BuiltTree,
-        commit_id: Option<&str>,
+        _commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
         overlay.stage_chunks(writes, &built.chunks);
-        let persisted_root = if let Some(commit_id) = commit_id {
-            storage::stage_root(writes, commit_id, &built.root_id);
-            true
-        } else {
-            false
-        };
         Ok(TrackedStateApplyResult {
             root_id: built.root_id,
             row_count: built.row_count,
             tree_height: built.tree_height,
             chunk_count: built.chunks.len(),
             chunk_bytes: built.chunk_bytes,
-            persisted_root,
         })
     }
 
@@ -1511,7 +1490,7 @@ impl TrackedStateTree {
         values: &'a mut [Option<TrackedStateIndexValue>],
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
-        S: StorageRead + Send + Sync + 'a,
+        S: StorageRead + Send + Sync + ?Sized + 'a,
     {
         Box::pin(async move {
             if encoded_keys.is_empty() {
@@ -1930,14 +1909,12 @@ impl LeafSummaryCursor {
 struct LeafChunkAccumulator {
     entries: Vec<EncodedLeafEntry>,
     key_bytes: usize,
-    value_bytes: usize,
 }
 
 #[derive(Debug, Default)]
 struct LeafChunkRefAccumulator<'a> {
     entries: Vec<EncodedLeafEntryRef<'a>>,
     key_bytes: usize,
-    value_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1964,24 +1941,19 @@ fn chunk_leaf_entries(
     let mut groups = Vec::new();
     let mut current = LeafChunkAccumulator::default();
     for entry in entries {
-        let item_size = estimate_leaf_entry_size(entry.key.len(), entry.value.len());
-        let projected_size = estimate_leaf_chunk_size(
+        let item_size = estimate_leaf_boundary_entry_size(entry.key.len());
+        let projected_size = estimate_leaf_boundary_chunk_size(
             current.entries.len() + 1,
             current.key_bytes + entry.key.len(),
-            current.value_bytes + entry.value.len(),
         );
         if !current.entries.is_empty() && projected_size > options.max_chunk_bytes {
             groups.push(std::mem::take(&mut current));
         }
 
         current.key_bytes += entry.key.len();
-        current.value_bytes += entry.value.len();
         current.entries.push(entry);
-        let current_size = estimate_leaf_chunk_size(
-            current.entries.len(),
-            current.key_bytes,
-            current.value_bytes,
-        );
+        let current_size =
+            estimate_leaf_boundary_chunk_size(current.entries.len(), current.key_bytes);
         if current_size >= options.min_chunk_bytes
             && (current_size >= options.max_chunk_bytes
                 || current.entries.last().is_some_and(|entry| {
@@ -2014,24 +1986,19 @@ fn chunk_leaf_entry_refs<'a>(
     let mut groups = Vec::new();
     let mut current = LeafChunkRefAccumulator::default();
     for entry in iter {
-        let item_size = estimate_leaf_entry_size(entry.key.len(), entry.value.len());
-        let projected_size = estimate_leaf_chunk_size(
+        let item_size = estimate_leaf_boundary_entry_size(entry.key.len());
+        let projected_size = estimate_leaf_boundary_chunk_size(
             current.entries.len() + 1,
             current.key_bytes + entry.key.len(),
-            current.value_bytes + entry.value.len(),
         );
         if !current.entries.is_empty() && projected_size > options.max_chunk_bytes {
             groups.push(std::mem::take(&mut current));
         }
 
         current.key_bytes += entry.key.len();
-        current.value_bytes += entry.value.len();
         current.entries.push(entry);
-        let current_size = estimate_leaf_chunk_size(
-            current.entries.len(),
-            current.key_bytes,
-            current.value_bytes,
-        );
+        let current_size =
+            estimate_leaf_boundary_chunk_size(current.entries.len(), current.key_bytes);
         if current_size >= options.min_chunk_bytes
             && (current_size >= options.max_chunk_bytes
                 || current.entries.last().is_some_and(|entry| {
@@ -2157,8 +2124,12 @@ fn estimate_leaf_chunk_size(entry_count: usize, key_bytes: usize, value_bytes: u
     10 + entry_count * 12 + key_bytes + value_bytes
 }
 
-fn estimate_leaf_entry_size(key_bytes: usize, value_bytes: usize) -> usize {
-    12 + key_bytes + value_bytes
+fn estimate_leaf_boundary_chunk_size(entry_count: usize, key_bytes: usize) -> usize {
+    estimate_leaf_chunk_size(entry_count, key_bytes, 0)
+}
+
+fn estimate_leaf_boundary_entry_size(key_bytes: usize) -> usize {
+    12 + key_bytes
 }
 
 fn estimate_internal_chunk_size(
@@ -2485,30 +2456,19 @@ mod tests {
     use crate::tracked_state::codec::encode_value;
 
     #[tokio::test]
-    async fn exact_read_roundtrips_from_stored_root() {
+    async fn exact_read_roundtrips_from_applied_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
         let value = value("change-1", Some("{}"));
-        let result = apply_mutations_for_test(
-            &tree,
-            &storage,
-            None,
-            vec![mutation(&key, &value)],
-            Some("commit-1"),
-        )
-        .await
-        .expect("mutations should apply");
+        let result =
+            apply_mutations_for_test(&tree, &storage, None, vec![mutation(&key, &value)], None)
+                .await
+                .expect("mutations should apply");
 
         let store = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        assert_eq!(
-            tree.load_root(&store, "commit-1")
-                .await
-                .expect("root should load"),
-            Some(result.root_id.clone())
-        );
         assert_eq!(
             tree.get(&store, &result.root_id, &key)
                 .await
@@ -3091,6 +3051,22 @@ mod tests {
         assert_eq!(fast.root_id, canonical.root_id);
     }
 
+    #[test]
+    fn leaf_chunk_boundaries_ignore_value_bytes() {
+        let options = TrackedStateTreeOptions {
+            target_chunk_bytes: 64,
+            min_chunk_bytes: 32,
+            max_chunk_bytes: 96,
+        };
+        let short_entries = encoded_entries_with_change_id("c");
+        let large_entries = encoded_entries_with_change_id(&"c".repeat(4096));
+
+        assert_eq!(
+            leaf_chunk_boundary_keys(chunk_leaf_entries(short_entries, &options)),
+            leaf_chunk_boundary_keys(chunk_leaf_entries(large_entries, &options))
+        );
+    }
+
     async fn apply_mutations_for_test(
         tree: &TrackedStateTree,
         storage: &StorageContext,
@@ -3115,6 +3091,39 @@ mod tests {
 
     fn mutation_owned(key: TrackedStateKey, value: TrackedStateIndexValue) -> TrackedStateMutation {
         mutation(&key, &value)
+    }
+
+    fn encoded_entries_with_change_id(change_id: &str) -> Vec<EncodedLeafEntry> {
+        (0..64)
+            .map(|index| {
+                let key = key("schema", None, &format!("entity-{index:03}"));
+                EncodedLeafEntry {
+                    key: encode_key(&key),
+                    value: encode_value(&value(change_id, Some("{}"))),
+                }
+            })
+            .collect()
+    }
+
+    fn leaf_chunk_boundary_keys(
+        groups: Vec<LeafChunkAccumulator>,
+    ) -> Vec<(Vec<u8>, Vec<u8>, usize)> {
+        groups
+            .into_iter()
+            .map(|group| {
+                let first_key = group
+                    .entries
+                    .first()
+                    .map(|entry| entry.key.clone())
+                    .unwrap_or_default();
+                let last_key = group
+                    .entries
+                    .last()
+                    .map(|entry| entry.key.clone())
+                    .unwrap_or_default();
+                (first_key, last_key, group.entries.len())
+            })
+            .collect()
     }
 
     fn key(schema_key: &str, file_id: Option<&str>, entity_id: &str) -> TrackedStateKey {

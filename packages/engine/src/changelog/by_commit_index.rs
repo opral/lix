@@ -118,7 +118,7 @@ fn segment_commit_generation(
         } else {
             external_generations.get(parent_id).copied().ok_or_else(|| {
                 LixError::unknown(format!(
-                    "cannot compute generation for changelog commit '{commit_id}' because parent '{parent_id}' has no by_commit generation"
+                    "cannot compute generation for changelog commit '{commit_id}' because parent '{parent_id}' has no segment-derived generation"
                 ))
             })?
         };
@@ -229,7 +229,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("parent 'missing-parent' has no by_commit generation"),
+                .contains("parent 'missing-parent' has no segment-derived generation"),
             "unexpected error: {error}"
         );
     }
