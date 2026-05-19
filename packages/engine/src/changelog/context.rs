@@ -8,24 +8,20 @@ use super::by_change_index::by_change_entries_for_segments;
 use super::by_change_membership_index::by_change_membership_entries_for_segments;
 use super::by_commit_index::{by_commit_entries_for_segment, by_commit_entries_for_segments};
 use super::segment::{
-    canonicalize_segment, directory_change_location, directory_commit_location, segment_change,
-    segment_commit, validate_change_checksum, validate_change_location, validate_commit_checksum,
-    validate_commit_location, validate_segment_shape, validate_stage_segment_shape,
-    DecodedSegmentIndex,
+    DecodedSegmentIndex, canonicalize_segment, directory_change_location,
+    directory_commit_location, segment_change, segment_commit, validate_change_checksum,
+    validate_change_location, validate_commit_checksum, validate_commit_location,
+    validate_segment_shape, validate_stage_segment_shape,
 };
 use super::store::{
-    by_change_index_value, by_change_key, by_change_membership_commit_id_from_key,
-    by_change_membership_index_value, by_change_membership_key, by_change_membership_prefix,
-    by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
-    segment_key, segment_value, visible_change_proof_key, visible_change_proof_value,
     BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE, by_change_index_value,
+    by_change_key, by_change_membership_commit_id_from_key, by_change_membership_index_value,
+    by_change_membership_key, by_change_membership_prefix, by_commit_index_value, by_commit_key,
+    commit_visibility_key, commit_visibility_value, segment_key, segment_value,
+    visible_change_proof_key, visible_change_proof_value,
 };
-use crate::changelog::{
-    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
-    decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
-    view_segment_directory,
-};
+use crate::LixError;
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
     ChangeProjection, ChangeVisibilityMode, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest,
@@ -33,13 +29,17 @@ use crate::changelog::{
     RebuildIndexStats, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
     SegmentStageReport, StateRowIdentity,
 };
+use crate::changelog::{
+    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
+    decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
+    view_segment_directory,
+};
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
     StorageGetOptions, StorageKey, StorageKeyRange, StoragePrefix, StorageProjectedValue,
     StorageRead, StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
 };
-use crate::LixError;
 
 /// Factory for changelog readers and writers.
 ///
@@ -2165,15 +2165,22 @@ where
         &mut self,
         commit_id: &str,
     ) -> Result<Option<SegmentCommit>, LixError> {
+        let mut found = None::<(String, SegmentCommit)>;
         for segment in self.scan_all_segments().await? {
             let Some(commit) = segment_commit(&segment, commit_id) else {
                 continue;
             };
             let location = directory_commit_location(&segment, commit_id)?;
             validate_commit_checksum(&location.checksum, commit_id, commit)?;
-            return Ok(Some(commit.clone()));
+            if let Some((existing_segment_id, _)) = &found {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{commit_id}' appears in multiple segments: '{}' and '{}'",
+                    existing_segment_id, segment.header.segment_id
+                )));
+            }
+            found = Some((segment.header.segment_id.clone(), commit.clone()));
         }
-        Ok(None)
+        Ok(found.map(|(_, commit)| commit))
     }
 
     async fn resolve_publish_changes(
@@ -2790,9 +2797,9 @@ where
 mod tests {
     use crate::changelog::test_support::*;
     use crate::changelog::{
-        decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
         CommitBody, CommitHeader, MembershipRecord, MembershipRole, SegmentCommit,
-        SegmentCommitDirectory,
+        SegmentCommitDirectory, decode_by_change_entry, decode_by_commit_entry,
+        decode_commit_visibility, decode_segment,
     };
     use crate::entity_identity::EntityIdentity;
     use crate::storage::StorageWriteSet;
@@ -3064,8 +3071,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_commits_physical_only_returns_none_when_locator_index_is_missing_for_existing_commit(
-    ) {
+    async fn load_commits_physical_only_returns_none_when_locator_index_is_missing_for_existing_commit()
+     {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -3125,6 +3132,45 @@ mod tests {
             error
                 .to_string()
                 .contains("failed to decode changelog by_commit entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_segment_commit_rejects_duplicate_commit_id_during_fallback_scan() {
+        let (context, storage) = changelog_test_context();
+        let segment_1 = test_segment();
+        let mut segment_2 = test_segment();
+        segment_2.header.segment_id = "segment-2".to_string();
+        let segment_2 = canonicalize_segment(segment_2).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            SEGMENT_SPACE,
+            segment_key("segment-1"),
+            segment_value(&segment_1).unwrap(),
+        );
+        writes.put(
+            SEGMENT_SPACE,
+            segment_key("segment-2"),
+            segment_value(&segment_2).unwrap(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .find_segment_commit("commit-1")
+                .await
+                .expect_err("fallback scan should reject duplicate commit ids")
+        };
+
+        assert!(
+            error.to_string().contains("appears in multiple segments"),
             "unexpected error: {error}"
         );
     }
@@ -3215,8 +3261,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_changes_physical_only_returns_none_when_locator_index_is_missing_for_existing_change(
-    ) {
+    async fn load_changes_physical_only_returns_none_when_locator_index_is_missing_for_existing_change()
+     {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -4578,8 +4624,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_publish_commit_accepts_adopted_membership_reachable_through_source_parent_history(
-    ) {
+    async fn stage_publish_commit_accepts_adopted_membership_reachable_through_source_parent_history()
+     {
         let (context, storage) = changelog_test_context();
         let mut segment = two_commit_segment();
         segment.commits.push(SegmentCommit {
