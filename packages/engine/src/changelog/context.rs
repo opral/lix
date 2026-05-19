@@ -1238,9 +1238,7 @@ where
                 )
                 .await?;
             for index in 0..page.len() {
-                let Some(bytes) = page.value(index) else {
-                    continue;
-                };
+                let bytes = required_scan_value(&page, index, SEGMENT_SPACE, "scan_all_segments")?;
                 let segment = decode_segment(bytes)?;
                 validate_segment_shape(&segment)?;
                 segments.push(segment);
@@ -1387,9 +1385,8 @@ where
                 )
                 .await?;
             for index in 0..page.len() {
-                let Some(bytes) = page.value(index) else {
-                    continue;
-                };
+                let bytes =
+                    required_scan_value(&page, index, SEGMENT_SPACE, "scan_segments_for_change")?;
                 let segment = decode_segment(bytes)?;
                 validate_segment_shape(&segment)?;
                 if let Some(change) = segment_change(&segment, change_id) {
@@ -1762,9 +1759,12 @@ where
                 )
                 .await?;
             for index in 0..page.len() {
-                let Some(bytes) = page.value(index) else {
-                    continue;
-                };
+                let bytes = required_scan_value(
+                    &page,
+                    index,
+                    SEGMENT_SPACE,
+                    "load_stored_commit_location_from_segment_truth",
+                )?;
                 let segment = DecodedSegmentIndex::decode(bytes)?;
                 let Some(location) = segment.commit_location(commit_id) else {
                     continue;
@@ -2645,9 +2645,7 @@ where
                 )
                 .await?;
             for index in 0..page.len() {
-                let Some(bytes) = page.value(index) else {
-                    continue;
-                };
+                let bytes = required_scan_value(&page, index, SEGMENT_SPACE, "scan_all_segments")?;
                 let segment = decode_segment(bytes)?;
                 validate_segment_shape(&segment)?;
                 segments.push(segment);
@@ -2820,6 +2818,20 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
     }
+}
+
+fn required_scan_value<'a>(
+    page: &'a ChangelogScanPage,
+    index: usize,
+    space: StorageSpace,
+    operation: &str,
+) -> Result<&'a [u8], LixError> {
+    page.value(index).ok_or_else(|| {
+        LixError::unknown(format!(
+            "changelog {operation} scan over namespace '{}' returned a key without a value",
+            space.name
+        ))
+    })
 }
 
 fn project_segment_commit(commit: &SegmentCommit, projection: CommitProjection) -> CommitLoadEntry {
@@ -3004,8 +3016,15 @@ where
     let mut values = Vec::with_capacity(chunk.entries.len());
     for entry in chunk.entries {
         keys.push(entry.key.0.to_vec());
-        if let StorageProjectedValue::FullValue(bytes) = entry.value {
-            values.push(bytes.to_vec());
+        match entry.value {
+            StorageProjectedValue::FullValue(bytes) => values.push(bytes.to_vec()),
+            StorageProjectedValue::KeyOnly if projection == StorageCoreProjection::FullValue => {
+                return Err(LixError::unknown(format!(
+                    "changelog scan over namespace '{}' requested full values but storage returned key-only entry",
+                    space.name
+                )));
+            }
+            StorageProjectedValue::KeyOnly => {}
         }
     }
     let resume_after = has_more.then(|| keys.last().cloned()).flatten();
@@ -3028,6 +3047,45 @@ mod tests {
     use crate::storage::StorageWriteSet;
 
     use super::*;
+
+    struct MissingSegmentScanValueStore;
+
+    #[async_trait]
+    impl ChangelogStorageRead for MissingSegmentScanValueStore {
+        async fn changelog_get_many(
+            &mut self,
+            _space: StorageSpace,
+            keys: Vec<Vec<u8>>,
+        ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+            Ok(keys.into_iter().map(|_| None).collect())
+        }
+
+        async fn changelog_scan(
+            &mut self,
+            space: StorageSpace,
+            _prefix: Vec<u8>,
+            _after: Option<Vec<u8>>,
+            _limit: usize,
+            projection: StorageCoreProjection,
+        ) -> Result<ChangelogScanPage, LixError> {
+            if space != SEGMENT_SPACE {
+                return Ok(ChangelogScanPage {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                    resume_after: None,
+                });
+            }
+            let values = match projection {
+                StorageCoreProjection::KeyOnly => Vec::new(),
+                StorageCoreProjection::FullValue => Vec::new(),
+            };
+            Ok(ChangelogScanPage {
+                keys: vec![b"segment-with-missing-value".to_vec()],
+                values,
+                resume_after: None,
+            })
+        }
+    }
 
     #[tokio::test]
     async fn stage_segment_stages_segment_and_rebuildable_indexes() {
@@ -4214,6 +4272,41 @@ mod tests {
         transaction.commit().await.unwrap();
 
         assert_mandatory_index_rows_match_segment(&storage, &segment).await;
+    }
+
+    #[tokio::test]
+    async fn rebuild_mandatory_indexes_rejects_segment_scan_key_without_value() {
+        let context = ChangelogContext::new();
+        let mut store = MissingSegmentScanValueStore;
+        let mut writes = StorageWriteSet::new();
+        let mut writer = context.writer(&mut store, &mut writes);
+
+        let error = writer
+            .rebuild_mandatory_indexes()
+            .await
+            .expect_err("missing segment scan value must be corruption");
+
+        assert!(
+            error.message.contains("returned a key without a value"),
+            "unexpected error: {error}"
+        );
+        assert!(writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_gc_rejects_segment_scan_key_without_value() {
+        let context = ChangelogContext::new();
+        let mut reader = context.reader(MissingSegmentScanValueStore);
+
+        let error = reader
+            .plan_gc(&[])
+            .await
+            .expect_err("missing segment scan value must be corruption");
+
+        assert!(
+            error.message.contains("returned a key without a value"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

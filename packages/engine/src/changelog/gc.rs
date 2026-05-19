@@ -413,9 +413,8 @@ where
             )
             .await?;
         for index in 0..page.len() {
-            let Some(bytes) = page.value(index) else {
-                continue;
-            };
+            let bytes =
+                gc_required_scan_value(&page, index, SEGMENT_SPACE, "validate_all_segments")?;
             let segment = decode_segment(bytes)?;
             validate_segment_shape(&segment)?;
         }
@@ -1136,6 +1135,20 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
     }
+}
+
+fn gc_required_scan_value<'a>(
+    page: &'a super::context::ChangelogScanPage,
+    index: usize,
+    space: StorageSpace,
+    operation: &str,
+) -> Result<&'a [u8], LixError> {
+    page.value(index).ok_or_else(|| {
+        LixError::unknown(format!(
+            "changelog GC {operation} scan over namespace '{}' returned a key without a value",
+            space.name
+        ))
+    })
 }
 
 fn push_unique_json_ref(values: &mut Vec<JsonRef>, value: JsonRef) {
