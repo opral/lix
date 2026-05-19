@@ -145,6 +145,13 @@ where
                     let mut reader = transaction.commit_graph_reader();
                     reader.merge_base(&target_head, &source_head).await?
                 };
+                transaction
+                    .ensure_tracked_state_projection_roots(&[
+                        merge_base.commit_id.clone(),
+                        target_head.clone(),
+                        source_head.clone(),
+                    ])
+                    .await?;
 
                 let analysis = {
                     let mut reader = transaction.tracked_state_reader();
@@ -213,6 +220,13 @@ where
                     reader.merge_base(&target_head, &source_head).await?
                 };
                 let base_commit_id = merge_base.commit_id;
+                transaction
+                    .ensure_tracked_state_projection_roots(&[
+                        base_commit_id.clone(),
+                        target_head.clone(),
+                        source_head.clone(),
+                    ])
+                    .await?;
 
                 let analysis = {
                     let mut reader = transaction.tracked_state_reader();

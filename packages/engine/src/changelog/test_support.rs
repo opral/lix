@@ -14,19 +14,19 @@ use super::{
     SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader,
     SegmentObjectLocation, StateRowIdentity,
 };
-use crate::backend::{InMemoryBackend, Key, ProjectedValue, ReadOptions};
 use crate::changelog::ChangelogContext;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
 use crate::storage::{
-    PointReadPlan, StorageContext, StorageGetOptions, StorageSpace, StorageWriteSet,
+    InMemoryStorageBackend, PointReadPlan, StorageContext, StorageGetOptions, StorageKey,
+    StorageProjectedValue, StorageReadOptions, StorageSpace, StorageWriteSet,
 };
 use crate::LixError;
 
 pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageContext) {
     (
         ChangelogContext::new(),
-        StorageContext::new(InMemoryBackend::new()),
+        StorageContext::new(InMemoryStorageBackend::new()),
     )
 }
 
@@ -329,7 +329,7 @@ impl ChangelogStorageRead for CountingReader {
         prefix: Vec<u8>,
         after: Option<Vec<u8>>,
         limit: usize,
-        projection: crate::backend::CoreProjection,
+        projection: crate::storage::StorageCoreProjection,
     ) -> Result<super::context::ChangelogScanPage, LixError> {
         self.inner
             .changelog_scan(space, prefix, after, limit, projection)
@@ -341,13 +341,13 @@ pub(crate) fn read_test_value_groups(
     storage: &StorageContext,
     groups: Vec<(StorageSpace, Vec<Vec<u8>>)>,
 ) -> Vec<Vec<Option<Vec<u8>>>> {
-    let mut read = storage.begin_read(ReadOptions::default()).unwrap();
+    let mut read = storage.begin_read(StorageReadOptions::default()).unwrap();
     groups
         .into_iter()
         .map(|(space, keys)| {
             let keys = keys
                 .into_iter()
-                .map(|key| Key(bytes::Bytes::from(key)))
+                .map(|key| StorageKey(bytes::Bytes::from(key)))
                 .collect::<Vec<_>>();
             PointReadPlan::new(space, &keys)
                 .materialize(&mut read, StorageGetOptions::default())
@@ -355,8 +355,8 @@ pub(crate) fn read_test_value_groups(
                 .value
                 .into_iter()
                 .map(|value| match value {
-                    Some(ProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
-                    Some(ProjectedValue::KeyOnly) => Some(Vec::new()),
+                    Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+                    Some(StorageProjectedValue::KeyOnly) => Some(Vec::new()),
                     None => None,
                 })
                 .collect()

@@ -6,7 +6,9 @@ use crate::changelog::{
 };
 use crate::storage::StorageRead;
 use crate::tracked_state::context::{TrackedStateRootRebuilder, TrackedStateWriteReport};
-use crate::tracked_state::types::TrackedStateKey;
+use crate::tracked_state::storage;
+use crate::tracked_state::tree::TrackedStateTree;
+use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateRootId};
 use crate::tracked_state::TrackedStateDeltaRef;
 use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +54,17 @@ pub(crate) struct ProjectionRootRebuildInput {
     pub(crate) commit_id: String,
     pub(crate) parent_commit_id: Option<String>,
     pub(crate) deltas: Vec<ProjectionRootRebuildDelta>,
+    pub(crate) replayed_commits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionRootEnsureReport {
+    pub(crate) commit_id: String,
+    pub(crate) root_id: TrackedStateRootId,
+    pub(crate) repaired: bool,
+    pub(crate) parent_commit_id: Option<String>,
+    pub(crate) replayed_commits: usize,
+    pub(crate) replayed_changes: usize,
 }
 
 struct LocatedChange {
@@ -70,7 +83,7 @@ pub(crate) async fn rebuild_projection_root_at<S>(
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
-    let input = build_projection_root_rebuild_input(rebuilder.store, commit_id).await?;
+    let input = build_incremental_projection_root_rebuild_input(rebuilder.store, commit_id).await?;
     let delta_refs = input
         .deltas
         .iter()
@@ -87,6 +100,40 @@ where
         .await
 }
 
+pub(crate) async fn ensure_projection_root<S>(
+    rebuilder: &mut TrackedStateRootRebuilder<'_, S>,
+    commit_id: &str,
+) -> Result<ProjectionRootEnsureReport, LixError>
+where
+    S: StorageRead + Send + Sync + ?Sized,
+{
+    if let Some(root_id) = storage::load_root(rebuilder.store, commit_id).await? {
+        return Ok(ProjectionRootEnsureReport {
+            commit_id: commit_id.to_string(),
+            root_id,
+            repaired: false,
+            parent_commit_id: None,
+            replayed_commits: 0,
+            replayed_changes: 0,
+        });
+    }
+
+    let input = build_incremental_projection_root_rebuild_input(rebuilder.store, commit_id).await?;
+    let parent_commit_id = input.parent_commit_id.clone();
+    let replayed_commits = input.replayed_commits;
+    let replayed_changes = input.deltas.len();
+    let report = stage_projection_root_rebuild_input(rebuilder, input).await?;
+
+    Ok(ProjectionRootEnsureReport {
+        commit_id: commit_id.to_string(),
+        root_id: report.root_id,
+        repaired: true,
+        parent_commit_id,
+        replayed_commits,
+        replayed_changes,
+    })
+}
+
 pub(super) async fn build_projection_root_rebuild_input<S>(
     store: &S,
     commit_id: &str,
@@ -96,8 +143,8 @@ where
 {
     let lineage = load_first_parent_lineage(store, commit_id).await?;
     let mut located_changes = Vec::new();
-    for commit in lineage {
-        located_changes.append(&mut load_commit_located_changes(store, &commit).await?);
+    for commit in &lineage {
+        located_changes.append(&mut load_commit_located_changes(store, commit).await?);
     }
     let deltas = project_projection_root_rebuild_deltas(located_changes);
 
@@ -105,7 +152,88 @@ where
         commit_id: commit_id.to_string(),
         parent_commit_id: None,
         deltas,
+        replayed_commits: lineage.len(),
     })
+}
+
+async fn build_incremental_projection_root_rebuild_input<S>(
+    store: &S,
+    commit_id: &str,
+) -> Result<ProjectionRootRebuildInput, LixError>
+where
+    S: StorageRead + Send + Sync + ?Sized,
+{
+    let mut reverse_replay = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = Some(commit_id.to_string());
+    let mut parent = None;
+    while let Some(current_id) = current {
+        if !seen.insert(current_id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state materialization found first-parent cycle at commit '{current_id}'"
+                ),
+            ));
+        }
+        let commit = load_visible_commit(store, &current_id).await?;
+        let first_parent = commit.header.parent_commit_ids.first().cloned();
+        reverse_replay.push(commit);
+        let Some(parent_id) = first_parent else {
+            break;
+        };
+        if let Some(root_id) = storage::load_root(store, &parent_id).await? {
+            parent = Some((parent_id, root_id));
+            break;
+        }
+        current = Some(parent_id);
+    }
+
+    reverse_replay.reverse();
+    let mut located_changes = Vec::new();
+    for commit in &reverse_replay {
+        located_changes.append(&mut load_commit_located_changes(store, commit).await?);
+    }
+    let (parent_commit_id, parent_root_id) = match parent {
+        Some((commit_id, root_id)) => (Some(commit_id), Some(root_id)),
+        None => (None, None),
+    };
+    let deltas = project_projection_root_rebuild_deltas_with_parent(
+        store,
+        parent_root_id.as_ref(),
+        located_changes,
+    )
+    .await?;
+
+    Ok(ProjectionRootRebuildInput {
+        commit_id: commit_id.to_string(),
+        parent_commit_id,
+        deltas,
+        replayed_commits: reverse_replay.len(),
+    })
+}
+
+async fn stage_projection_root_rebuild_input<S>(
+    rebuilder: &mut TrackedStateRootRebuilder<'_, S>,
+    input: ProjectionRootRebuildInput,
+) -> Result<TrackedStateWriteReport, LixError>
+where
+    S: StorageRead + Send + Sync + ?Sized,
+{
+    let delta_refs = input
+        .deltas
+        .iter()
+        .map(ProjectionRootRebuildDelta::as_ref)
+        .collect::<Vec<_>>();
+    rebuilder
+        .tracked_state
+        .writer(rebuilder.store, rebuilder.writes)
+        .stage_projection_root(
+            &input.commit_id,
+            input.parent_commit_id.as_deref(),
+            delta_refs,
+        )
+        .await
 }
 
 async fn load_first_parent_lineage<S>(
@@ -253,6 +381,37 @@ fn project_projection_root_rebuild_deltas(
     projected.into_values().collect()
 }
 
+async fn project_projection_root_rebuild_deltas_with_parent<S>(
+    store: &S,
+    parent_root_id: Option<&TrackedStateRootId>,
+    changes: impl IntoIterator<Item = LocatedChange>,
+) -> Result<Vec<ProjectionRootRebuildDelta>, LixError>
+where
+    S: StorageRead + Send + Sync + ?Sized,
+{
+    let mut deltas = project_projection_root_rebuild_deltas(changes);
+    let Some(parent_root_id) = parent_root_id else {
+        return Ok(deltas);
+    };
+    let keys = deltas
+        .iter()
+        .map(|delta| TrackedStateKey {
+            schema_key: delta.change.schema_key.clone(),
+            file_id: delta.change.file_id.clone(),
+            entity_id: delta.change.entity_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let parent_values = TrackedStateTree::new()
+        .get_many(store, parent_root_id, &keys)
+        .await?;
+    for (delta, parent_value) in deltas.iter_mut().zip(parent_values) {
+        if let Some(TrackedStateIndexValue { created_at, .. }) = parent_value {
+            delta.created_at = created_at;
+        }
+    }
+    Ok(deltas)
+}
+
 fn missing_change_error(commit_id: &str, change_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
@@ -397,17 +556,69 @@ mod tests {
         assert_eq!(entity_b.updated_at, "2026-01-02T00:00:00Z");
     }
 
-    fn change(id: &str) -> Change {
-        Change {
-            id: id.to_string(),
-            authored_commit_id: Some("commit-1".to_string()),
+    #[tokio::test]
+    async fn incremental_projection_rebuild_preserves_parent_created_at() {
+        let storage =
+            crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let parent_row = crate::tracked_state::MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single("entity-1"),
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            snapshot_ref: None,
-            metadata_ref: None,
+            snapshot_content: Some("{\"value\":\"parent\"}".to_string()),
+            metadata: None,
+            deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
-        }
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            change_id: "change-parent".to_string(),
+            commit_id: "parent".to_string(),
+        };
+        let mut read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            &tracked_state,
+            "parent",
+            None,
+            std::slice::from_ref(&parent_row),
+        )
+        .await
+        .expect("parent root should stage");
+        storage
+            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+            .expect("parent root should commit");
+        let parent_root = storage::load_root(
+            &storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open"),
+            "parent",
+        )
+        .await
+        .expect("parent root should load")
+        .expect("parent root should exist");
+
+        let deltas = project_projection_root_rebuild_deltas_with_parent(
+            &storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open"),
+            Some(&parent_root),
+            vec![located_change(
+                "child",
+                0,
+                "change-child",
+                "entity-1",
+                "2026-02-01T00:00:00Z",
+            )],
+        )
+        .await
+        .expect("incremental projection should project");
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(deltas[0].updated_at, "2026-02-01T00:00:00Z");
     }
 
     fn located_change(

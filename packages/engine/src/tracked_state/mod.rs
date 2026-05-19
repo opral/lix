@@ -16,7 +16,7 @@ pub(crate) use context::{
 #[allow(unused_imports)]
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
-    TrackedStateDiffRequest,
+    TrackedStateDiffRequest, TrackedStateDiffRow,
 };
 #[allow(unused_imports)]
 pub(crate) use merge::{

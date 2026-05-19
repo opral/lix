@@ -1651,6 +1651,15 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         write_empty_commits_to_store(&storage, &read, &["parent-left"]).await;
+        let mut writes = StorageWriteSet::new();
+        TrackedStateContext::new()
+            .writer(&read, &mut writes)
+            .stage_projection_root("parent-left", None, [])
+            .await
+            .expect("first parent tracked root should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("first parent tracked root should commit");
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())

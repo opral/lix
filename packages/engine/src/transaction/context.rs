@@ -24,7 +24,10 @@ use crate::storage::{
     InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
 };
 use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWriteSet};
-use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
+use crate::tracked_state::{
+    materialize_rows_from_index_entries, TrackedRowProjection, TrackedStateContext,
+    TrackedStateDiffRow, TrackedStateStoreReader,
+};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
@@ -370,7 +373,9 @@ where
                 }
                 remember_adopted_registered_schema(
                     Domain::schema_catalog(change.version_id.clone(), false),
-                    row.snapshot_content.as_deref(),
+                    adopted_registered_schema_snapshot(&read, row)
+                        .await?
+                        .as_deref(),
                     catalog,
                 )?;
             }
@@ -396,14 +401,17 @@ where
                     }
                     remember_adopted_registered_schema(
                         Domain::schema_catalog(change.version_id.clone(), false),
-                        row.snapshot_content.as_deref(),
+                        adopted_registered_schema_snapshot(&read, row)
+                            .await?
+                            .as_deref(),
                         catalog,
                     )?;
                 }
                 planned_changes.push((index, change, schema_plan_id));
             }
             for (index, change, schema_plan_id) in planned_changes {
-                prepared_rows[index] = Some(prepare_adopted_state_row(change, schema_plan_id)?);
+                prepared_rows[index] =
+                    Some(prepare_adopted_state_row(&read, change, schema_plan_id).await?);
             }
         }
         Ok(prepared_rows
@@ -557,6 +565,35 @@ where
             .begin_read(StorageReadOptions::default())
             .expect("open transaction read scope");
         self.tracked_state.reader(read)
+    }
+
+    /// Ensures commit-addressed tracked-state roots exist as durable derived
+    /// cache before opening readers that require structural tree diff.
+    pub(crate) async fn ensure_tracked_state_projection_roots(
+        &mut self,
+        commit_ids: &[String],
+    ) -> Result<(), LixError> {
+        let mut unique_commit_ids = BTreeSet::new();
+        for commit_id in commit_ids {
+            unique_commit_ids.insert(commit_id.as_str());
+        }
+        if unique_commit_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut writes = self.storage.new_write_set();
+        {
+            let read = self.storage.begin_read(StorageReadOptions::default())?;
+            let mut rebuilder = self.tracked_state.root_rebuilder(&read, &mut writes);
+            for commit_id in unique_commit_ids {
+                rebuilder.ensure_projection_root(commit_id).await?;
+            }
+        }
+        if !writes.is_empty() {
+            self.storage
+                .commit_write_set(writes, StorageWriteOptions::default())?;
+        }
+        Ok(())
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
@@ -745,10 +782,14 @@ fn remember_adopted_registered_schema(
     remember_pending_registered_schema(snapshot.as_ref(), domain, catalog)
 }
 
-fn prepare_adopted_state_row(
+async fn prepare_adopted_state_row<S>(
+    read: &S,
     change: TransactionAdoptedChange,
     schema_plan_id: crate::catalog::SchemaPlanId,
-) -> Result<PreparedAdoptedStateRow, LixError> {
+) -> Result<PreparedAdoptedStateRow, LixError>
+where
+    S: StorageRead + Send + Sync,
+{
     if change.change_id != change.projected_row.change_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -759,12 +800,13 @@ fn prepare_adopted_state_row(
         ));
     }
     let row = change.projected_row;
-    let snapshot = row
+    let materialized = materialize_adopted_diff_row(read, &row).await?;
+    let snapshot = materialized
         .snapshot_content
         .as_deref()
         .map(|value| stage_materialized_json_text(value, "adopted row snapshot_content"))
         .transpose()?;
-    let metadata = row
+    let metadata = materialized
         .metadata
         .as_deref()
         .map(|value| stage_materialized_json_text(value, "adopted row metadata"))
@@ -772,11 +814,13 @@ fn prepare_adopted_state_row(
     Ok(PreparedAdoptedStateRow {
         schema_plan_id,
         facts: PreparedRowFacts::default(),
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
         snapshot,
         metadata,
+        snapshot_ref: row.snapshot_ref,
+        metadata_ref: row.metadata_ref,
         created_at: row.created_at,
         updated_at: row.updated_at,
         global: change.version_id == GLOBAL_VERSION_ID,
@@ -785,6 +829,52 @@ fn prepare_adopted_state_row(
         source_parent_commit_id: change.source_parent_commit_id,
         commit_id: String::new(),
         version_id: change.version_id,
+    })
+}
+
+async fn adopted_registered_schema_snapshot<S>(
+    read: &S,
+    row: &TrackedStateDiffRow,
+) -> Result<Option<String>, LixError>
+where
+    S: StorageRead + Send + Sync,
+{
+    if row.deleted {
+        return Ok(None);
+    }
+    let mut rows = materialize_rows_from_index_entries(
+        read,
+        vec![row.clone().into_index_entry()],
+        &TrackedRowProjection {
+            snapshot_content: true,
+            metadata: false,
+        },
+    )
+    .await?;
+    Ok(rows.pop().and_then(|row| row.snapshot_content))
+}
+
+async fn materialize_adopted_diff_row<S>(
+    read: &S,
+    row: &TrackedStateDiffRow,
+) -> Result<crate::tracked_state::MaterializedTrackedStateRow, LixError>
+where
+    S: StorageRead + Send + Sync,
+{
+    let mut rows = materialize_rows_from_index_entries(
+        read,
+        vec![row.clone().into_index_entry()],
+        &TrackedRowProjection {
+            snapshot_content: true,
+            metadata: true,
+        },
+    )
+    .await?;
+    rows.pop().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "adopted tracked-state row materialization returned no row",
+        )
     })
 }
 

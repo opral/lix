@@ -676,8 +676,8 @@ fn changelog_change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> Chang
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
-        snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
-        metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+        snapshot_ref: row.snapshot_ref.as_ref(),
+        metadata_ref: row.metadata_ref.as_ref(),
         created_at: &row.created_at,
     }
 }
@@ -1946,6 +1946,10 @@ mod tests {
                 .expect("test adopted snapshot should stage"),
             ),
             metadata: None,
+            snapshot_ref: Some(crate::json_store::JsonRef::for_content(
+                serde_json::json!({ "value": 1 }).to_string().as_bytes(),
+            )),
+            metadata_ref: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
