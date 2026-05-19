@@ -850,7 +850,7 @@ where
             .tree
             .row_count(&mut self.store, primary_root_id)
             .await?;
-        if index_match_count * 20 > primary_row_count {
+        if index_match_count > primary_row_count / 20 {
             let rows = self
                 .tree
                 .scan(
@@ -1397,6 +1397,10 @@ mod tests {
     use super::*;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::tracked_state::codec::{
+        ChildSummary, PendingChunkWrite, encode_internal_node, hash_bytes,
+    };
+    use crate::tracked_state::types::TRACKED_STATE_HASH_BYTES;
     use crate::NullableKeyFilter;
 
     #[tokio::test]
@@ -2111,6 +2115,68 @@ mod tests {
                 "by-file index row count 1 does not match primary projection row count 2"
             ),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn by_file_scan_fallback_heuristic_handles_corrupt_large_index_count() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut primary_row = row("entity-a", "change-a", "commit-1");
+        primary_row.file_id = Some("file-a.json".to_string());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&primary_row),
+        )
+        .await
+        .expect("primary root should write");
+
+        let encoded_index_key = ByFileIndex::encode_key_ref(TrackedStateKeyRef {
+            schema_key: &primary_row.schema_key,
+            file_id: primary_row.file_id.as_deref(),
+            entity_id: &primary_row.entity_id,
+        });
+        stage_corrupt_by_file_internal_root(
+            &storage,
+            "commit-1",
+            ChildSummary {
+                first_key: encoded_index_key.clone(),
+                last_key: encoded_index_key,
+                child_hash: [7; TRACKED_STATE_HASH_BYTES],
+                subtree_count: u64::MAX,
+            },
+        );
+
+        let rows = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .expect("read should open"),
+            )
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("large by-file count should choose primary fallback without overflow");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
+            "entity-a"
         );
     }
 
@@ -2896,6 +2962,21 @@ mod tests {
         storage::stage_by_file_root(&mut writes, commit_id, &result.root_id);
         storage.commit_write_set(writes, StorageWriteOptions::default())?;
         Ok(())
+    }
+
+    fn stage_corrupt_by_file_internal_root(
+        storage: &StorageContext<InMemoryStorageBackend>,
+        commit_id: &str,
+        child: ChildSummary,
+    ) {
+        let node = encode_internal_node(&[child]);
+        let hash = hash_bytes(&node);
+        let mut writes = storage.new_write_set();
+        storage::stage_chunks(&mut writes, &[PendingChunkWrite { hash, data: node }]);
+        storage::stage_by_file_root(&mut writes, commit_id, &TrackedStateRootId::new(hash));
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("corrupt by-file root should commit");
     }
 
     fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
