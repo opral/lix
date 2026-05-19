@@ -1,15 +1,16 @@
 use crate::backend::{
-    visit_range as backend_visit_range, BackendError, BackendRead, CoreProjection, Key, KeyRange,
-    KeyRef, Prefix, ProjectedValueRef, ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
-    SpaceId,
+    BackendError, BackendRead, CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef,
+    ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    visit_range as backend_visit_range,
 };
 use crate::storage::{
-    decode_logical_key_ref, StorageRead, StorageReadResult, StorageReadStats, StorageSpace,
+    StorageRead, StorageReadResult, StorageReadStats, StorageSpace, decode_logical_key_ref,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanBuffer {
     entries: Vec<ReadEntry>,
+    last_physical_key: Vec<u8>,
 }
 
 impl ScanBuffer {
@@ -20,11 +21,13 @@ impl ScanBuffer {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
+            last_physical_key: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.last_physical_key.clear();
     }
 
     pub fn entries(&self) -> &[ReadEntry] {
@@ -45,8 +48,10 @@ pub struct ScanChunkRef<'a> {
 pub struct ScanCursor<'a, C> {
     inner: &'a mut C,
     kind: ScanKind,
+    physical_range: KeyRange,
     projection: CoreProjection,
     chunks_seen: u64,
+    last_physical_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +209,9 @@ where
         V: ScanVisitor + ?Sized,
     {
         struct LogicalScanVisitor<'a, V: ?Sized> {
+            physical_range: &'a KeyRange,
+            last_physical_key: &'a mut Vec<u8>,
+            emitted: usize,
             inner: &'a mut V,
         }
 
@@ -216,13 +224,20 @@ where
                 key: KeyRef<'_>,
                 value: ProjectedValueRef<'_>,
             ) -> Result<(), BackendError> {
+                validate_scan_physical_key(self.physical_range, self.last_physical_key, key)?;
+                self.emitted += 1;
                 self.inner.visit(decode_logical_key_ref(key)?, value)
             }
         }
 
-        let result = self
-            .inner
-            .visit_next(limit_rows, &mut LogicalScanVisitor { inner: visitor })?;
+        let mut logical_visitor = LogicalScanVisitor {
+            physical_range: &self.physical_range,
+            last_physical_key: &mut self.last_physical_key,
+            emitted: 0,
+            inner: visitor,
+        };
+        let result = self.inner.visit_next(limit_rows, &mut logical_visitor)?;
+        validate_scan_result_count(result, logical_visitor.emitted, limit_rows)?;
         let mut stats = scan_trace_stats(
             self.kind,
             ScanOptions {
@@ -290,12 +305,17 @@ where
         resume_after: None,
         ..opts
     };
-    read.with_range_scan(physical_range, physical_opts, |backend_cursor| {
+    let backend_range = physical_range.clone();
+    read.with_range_scan(backend_range, physical_opts, |backend_cursor| {
         let mut cursor = ScanCursor {
             inner: backend_cursor,
             kind: ScanKind::Range,
+            physical_range,
             projection: opts.projection,
             chunks_seen: 0,
+            last_physical_key: resume_after
+                .map(|key| storage_space.encode_key(key).0.to_vec())
+                .unwrap_or_default(),
         };
         f(&mut cursor)
     })
@@ -371,12 +391,15 @@ where
         resume_after: None,
         ..opts
     };
+    let mut emitted = 0usize;
 
     let result = backend_visit_range(
         read,
-        physical_range,
+        physical_range.clone(),
         physical_opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            validate_scan_physical_key(&physical_range, &mut buffer.last_physical_key, key)?;
+            emitted += 1;
             let key = decode_logical_key_ref(key)?;
             buffer.entries.push(ReadEntry {
                 key: key.to_owned_key(),
@@ -385,6 +408,7 @@ where
             Ok(())
         },
     )?;
+    validate_scan_result_count(result, emitted, opts.limit_rows)?;
 
     Ok(ScanChunkRef {
         entries: buffer.entries(),
@@ -433,6 +457,9 @@ where
     };
 
     struct LogicalScanVisitor<'a, V: ?Sized> {
+        physical_range: &'a KeyRange,
+        last_physical_key: &'a mut Vec<u8>,
+        emitted: usize,
         inner: &'a mut V,
     }
 
@@ -445,16 +472,28 @@ where
             key: KeyRef<'_>,
             value: ProjectedValueRef<'_>,
         ) -> Result<(), BackendError> {
+            validate_scan_physical_key(self.physical_range, self.last_physical_key, key)?;
+            self.emitted += 1;
             self.inner.visit(decode_logical_key_ref(key)?, value)
         }
     }
 
+    let mut last_physical_key = resume_after
+        .map(|key| storage_space.encode_key(key).0.to_vec())
+        .unwrap_or_default();
+    let mut logical_visitor = LogicalScanVisitor {
+        physical_range: &physical_range,
+        last_physical_key: &mut last_physical_key,
+        emitted: 0,
+        inner: visitor,
+    };
     let result = backend_visit_range(
         read,
-        physical_range,
+        physical_range.clone(),
         physical_opts,
-        &mut LogicalScanVisitor { inner: visitor },
+        &mut logical_visitor,
     )?;
+    validate_scan_result_count(result, logical_visitor.emitted, opts.limit_rows)?;
     let stats = scan_trace_stats(
         ScanKind::Range,
         opts,
@@ -463,6 +502,66 @@ where
         1,
     );
     Ok(StorageReadResult::new(result, stats))
+}
+
+fn validate_scan_physical_key(
+    physical_range: &KeyRange,
+    last_physical_key: &mut Vec<u8>,
+    key: KeyRef<'_>,
+) -> Result<(), BackendError> {
+    if !range_contains_ref(physical_range, key) {
+        return Err(BackendError::Corruption(
+            "scan backend emitted key outside requested range".to_string(),
+        ));
+    }
+    if !last_physical_key.is_empty() && last_physical_key.as_slice() >= key.0 {
+        return Err(BackendError::Corruption(
+            "scan backend emitted keys out of strict ascending order".to_string(),
+        ));
+    }
+
+    last_physical_key.clear();
+    last_physical_key.extend_from_slice(key.0);
+    Ok(())
+}
+
+fn validate_scan_result_count(
+    result: ScanResult,
+    visited: usize,
+    limit_rows: usize,
+) -> Result<(), BackendError> {
+    if result.emitted != visited {
+        return Err(BackendError::Corruption(format!(
+            "scan backend reported {} emitted rows after visiting {visited} rows",
+            result.emitted
+        )));
+    }
+    if result.emitted > limit_rows {
+        return Err(BackendError::Corruption(format!(
+            "scan backend emitted {} rows for limit {limit_rows}",
+            result.emitted
+        )));
+    }
+    if limit_rows != 0 && result.emitted == 0 && result.has_more {
+        return Err(BackendError::Corruption(
+            "scan backend reported more rows after emitting no rows".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn range_contains_ref(range: &KeyRange, key: KeyRef<'_>) -> bool {
+    let lower_ok = match &range.lower {
+        std::ops::Bound::Included(lower) => key >= lower.as_ref(),
+        std::ops::Bound::Excluded(lower) => key > lower.as_ref(),
+        std::ops::Bound::Unbounded => true,
+    };
+    let upper_ok = match &range.upper {
+        std::ops::Bound::Included(upper) => key <= upper.as_ref(),
+        std::ops::Bound::Excluded(upper) => key < upper.as_ref(),
+        std::ops::Bound::Unbounded => true,
+    };
+    lower_ok && upper_ok
 }
 
 pub(crate) fn scan_range_with_stats<R>(
@@ -612,10 +711,11 @@ mod tests {
     use super::scan_prefix;
     use crate::backend::{
         BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, GetOptions,
-        InMemoryBackend, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
-        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
+        InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
+        ProjectedValueRef, ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+        StoredValue, WriteOptions,
     };
-    use crate::storage::{ScanPlan, StorageContext, StorageSpace};
+    use crate::storage::{ScanBuffer, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -629,6 +729,10 @@ mod tests {
         StoredValue {
             bytes: Bytes::from_static(bytes.as_bytes()),
         }
+    }
+
+    fn projected_value(bytes: &'static str) -> ProjectedValue {
+        ProjectedValue::FullValue(Bytes::from_static(bytes.as_bytes()))
     }
 
     fn space(id: u32) -> StorageSpace {
@@ -736,6 +840,557 @@ mod tests {
                 upper: Bound::Excluded(space(1).encode_key(&key_bytes(&[0x01]))),
             }
         );
+    }
+
+    #[test]
+    fn scan_collect_rejects_backend_row_outside_requested_range() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(2).encode_key(&key("b")),
+                value: projected_value("B"),
+            }],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect(&read, ScanOptions::default())
+        .expect_err("out-of-range backend scan row should be rejected");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("emitted key outside requested range")
+        ));
+    }
+
+    #[test]
+    fn scan_collect_rejects_unordered_backend_rows() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![
+                ReadEntry {
+                    key: space(1).encode_key(&key("b")),
+                    value: projected_value("B"),
+                },
+                ReadEntry {
+                    key: space(1).encode_key(&key("a")),
+                    value: projected_value("A"),
+                },
+            ],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect(&read, ScanOptions::default())
+        .expect_err("unordered backend scan rows should be rejected");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("out of strict ascending order")
+        ));
+    }
+
+    #[test]
+    fn scan_collect_rejects_duplicate_backend_rows() {
+        let duplicate_key = space(1).encode_key(&key("a"));
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![
+                ReadEntry {
+                    key: duplicate_key.clone(),
+                    value: projected_value("A1"),
+                },
+                ReadEntry {
+                    key: duplicate_key,
+                    value: projected_value("A2"),
+                },
+            ],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect(&read, ScanOptions::default())
+        .expect_err("duplicate backend scan rows should be rejected");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("out of strict ascending order")
+        ));
+    }
+
+    #[test]
+    fn scan_visit_rejects_backend_emitted_count_mismatch() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(1).encode_key(&key("a")),
+                value: projected_value("A"),
+            }],
+            emitted_override: Some(0),
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .visit(
+            &read,
+            ScanOptions::default(),
+            &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| Ok(()),
+        )
+        .expect_err("lying backend scan emitted count should be rejected");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("reported 0 emitted rows after visiting 1 rows")
+        ));
+    }
+
+    #[test]
+    fn scan_cursor_rejects_backend_row_outside_requested_range() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(2).encode_key(&key("b")),
+                value: projected_value("B"),
+            }],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .cursor(&read, ScanOptions::default(), |cursor| {
+            cursor.visit_next(
+                10,
+                &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| Ok(()),
+            )
+        })
+        .expect_err("cursor scan should reject out-of-range backend row");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("emitted key outside requested range")
+        ));
+    }
+
+    #[test]
+    fn scan_collect_into_rejects_unordered_backend_rows() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![
+                ReadEntry {
+                    key: space(1).encode_key(&key("b")),
+                    value: projected_value("B"),
+                },
+                ReadEntry {
+                    key: space(1).encode_key(&key("a")),
+                    value: projected_value("A"),
+                },
+            ],
+            emitted_override: None,
+            has_more_override: None,
+        });
+        let mut buffer = ScanBuffer::new();
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect_into(&read, ScanOptions::default(), &mut buffer)
+        .expect_err("collect_into should reject unordered backend rows");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("out of strict ascending order")
+        ));
+    }
+
+    #[test]
+    fn scan_visit_rejects_duplicate_backend_rows() {
+        let duplicate_key = space(1).encode_key(&key("a"));
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![
+                ReadEntry {
+                    key: duplicate_key.clone(),
+                    value: projected_value("A1"),
+                },
+                ReadEntry {
+                    key: duplicate_key,
+                    value: projected_value("A2"),
+                },
+            ],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .visit(
+            &read,
+            ScanOptions::default(),
+            &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| Ok(()),
+        )
+        .expect_err("visit should reject duplicate backend rows");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("out of strict ascending order")
+        ));
+    }
+
+    #[test]
+    fn scan_cursor_rejects_duplicate_backend_rows() {
+        let duplicate_key = space(1).encode_key(&key("a"));
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![
+                ReadEntry {
+                    key: duplicate_key.clone(),
+                    value: projected_value("A1"),
+                },
+                ReadEntry {
+                    key: duplicate_key,
+                    value: projected_value("A2"),
+                },
+            ],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .cursor(&read, ScanOptions::default(), |cursor| {
+            cursor.visit_next(
+                10,
+                &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| Ok(()),
+            )
+        })
+        .expect_err("cursor should reject duplicate backend rows");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("out of strict ascending order")
+        ));
+    }
+
+    #[test]
+    fn scan_cursor_rejects_backend_emitted_count_mismatch() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(1).encode_key(&key("a")),
+                value: projected_value("A"),
+            }],
+            emitted_override: Some(0),
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .cursor(&read, ScanOptions::default(), |cursor| {
+            cursor.visit_next(
+                10,
+                &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| Ok(()),
+            )
+        })
+        .expect_err("cursor should reject lying emitted count");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("reported 0 emitted rows after visiting 1 rows")
+        ));
+    }
+
+    #[test]
+    fn scan_rejects_backend_row_at_resume_key() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(1).encode_key(&key("m")),
+                value: projected_value("M"),
+            }],
+            emitted_override: None,
+            has_more_override: None,
+        });
+        let resume_after = key("m");
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect(
+            &read,
+            ScanOptions {
+                resume_after: Some(&resume_after),
+                ..ScanOptions::default()
+            },
+        )
+        .expect_err("backend row at resume key should be rejected");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("emitted key outside requested range")
+        ));
+    }
+
+    #[test]
+    fn scan_collect_rejects_backend_has_more_after_empty_page() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: Vec::new(),
+            emitted_override: Some(0),
+            has_more_override: Some(true),
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect(&read, ScanOptions::default())
+        .expect_err("empty page with has_more should be rejected");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("reported more rows after emitting no rows")
+        ));
+    }
+
+    #[test]
+    fn scan_collect_into_rejects_backend_emitted_count_mismatch() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(1).encode_key(&key("a")),
+                value: projected_value("A"),
+            }],
+            emitted_override: Some(0),
+            has_more_override: None,
+        });
+        let mut buffer = ScanBuffer::new();
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .collect_into(&read, ScanOptions::default(), &mut buffer)
+        .expect_err("collect_into should reject lying emitted count");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("reported 0 emitted rows after visiting 1 rows")
+        ));
+    }
+
+    #[test]
+    fn scan_cursor_rejects_duplicate_across_visit_next_calls() {
+        let duplicate_key = space(1).encode_key(&key("a"));
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![
+                ReadEntry {
+                    key: duplicate_key.clone(),
+                    value: projected_value("A1"),
+                },
+                ReadEntry {
+                    key: duplicate_key,
+                    value: projected_value("A2"),
+                },
+            ],
+            emitted_override: None,
+            has_more_override: None,
+        });
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .cursor(&read, ScanOptions::default(), |cursor| {
+            cursor.visit_next(1, &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                Ok(())
+            })?;
+            cursor.visit_next(1, &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                Ok(())
+            })
+        })
+        .expect_err("cursor should reject duplicate rows across chunks");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("out of strict ascending order")
+        ));
+    }
+
+    #[test]
+    fn scan_visit_rejects_row_between_resume_and_lower_bound() {
+        let read = StorageReadScope::new(BrokenScanRead {
+            rows: vec![ReadEntry {
+                key: space(1).encode_key(&key("b")),
+                value: projected_value("B"),
+            }],
+            emitted_override: None,
+            has_more_override: None,
+        });
+        let resume_after = key("a");
+
+        let error = ScanPlan::range(
+            space(1),
+            KeyRange {
+                lower: Bound::Included(key("m")),
+                upper: Bound::Excluded(key("z")),
+            },
+        )
+        .visit(
+            &read,
+            ScanOptions {
+                resume_after: Some(&resume_after),
+                ..ScanOptions::default()
+            },
+            &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| Ok(()),
+        )
+        .expect_err("visit should reject row below lower bound after earlier resume key");
+
+        assert!(matches!(
+            error,
+            BackendError::Corruption(message)
+                if message.contains("emitted key outside requested range")
+        ));
+    }
+
+    struct BrokenScanRead {
+        rows: Vec<ReadEntry>,
+        emitted_override: Option<usize>,
+        has_more_override: Option<bool>,
+    }
+
+    struct BrokenRangeScan {
+        rows: Vec<ReadEntry>,
+        position: usize,
+        emitted_override: Option<usize>,
+        has_more_override: Option<bool>,
+    }
+
+    impl BackendRangeScan for BrokenRangeScan {
+        fn visit_next<V>(
+            &mut self,
+            limit_rows: usize,
+            visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
+        where
+            V: ScanVisitor + ?Sized,
+        {
+            let mut emitted = 0usize;
+            while emitted < limit_rows {
+                let Some(entry) = self.rows.get(self.position) else {
+                    break;
+                };
+                visitor.visit(entry.key.as_ref(), entry.value.as_ref())?;
+                self.position += 1;
+                emitted += 1;
+            }
+
+            Ok(ScanResult {
+                emitted: self.emitted_override.unwrap_or(emitted),
+                has_more: self
+                    .has_more_override
+                    .unwrap_or(self.position < self.rows.len()),
+            })
+        }
+    }
+
+    impl BackendRead for BrokenScanRead {
+        type RangeScan<'a> = BrokenRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            _keys: &[Key],
+            _opts: GetOptions<'_>,
+            _visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            unimplemented!("not used by scan corruption tests")
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            let mut cursor = BrokenRangeScan {
+                rows: self.rows.clone(),
+                position: 0,
+                emitted_override: self.emitted_override,
+                has_more_override: self.has_more_override,
+            };
+            f(&mut cursor)
+        }
     }
 
     #[derive(Default)]

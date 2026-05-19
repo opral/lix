@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
+use crate::LixError;
 use crate::binary_cas::chunking::fastcdc_chunk_ranges;
 use crate::binary_cas::codec::{
-    decode_binary_cas_chunk, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
-    encode_binary_cas_chunk, encode_binary_cas_manifest, encode_binary_cas_manifest_chunk,
-    encode_binary_chunk_payload, BinaryCasManifest, BinaryChunkCodec,
+    BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
+    decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
+    encode_binary_cas_manifest_chunk, encode_binary_chunk_payload,
 };
 use crate::binary_cas::{
     BlobBytesBatch, BlobExistsBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
@@ -15,7 +16,6 @@ use crate::storage::{
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions,
     StorageSpaceId, StorageValue,
 };
-use crate::LixError;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 
@@ -341,11 +341,7 @@ fn point_values(
     Ok(result
         .value
         .into_iter()
-        .map(|value| {
-            value
-                .map(|value| full_value(space, value))
-                .transpose()
-        })
+        .map(|value| value.map(|value| full_value(space, value)).transpose())
         .collect::<Result<Vec<_>, LixError>>()?)
 }
 
@@ -738,7 +734,9 @@ mod tests {
         }
     }
 
-    struct KeyOnlyScanRead;
+    struct KeyOnlyScanRead {
+        blob_hash: BlobHash,
+    }
 
     impl BackendRead for KeyOnlyScanRead {
         type RangeScan<'cursor> = BufferedRangeScan;
@@ -765,7 +763,7 @@ mod tests {
             F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
         {
             let key = BINARY_CAS_MANIFEST_CHUNK_SPACE
-                .encode_key(&Key(Bytes::from_static(b"manifest-chunk")));
+                .encode_key(&Key(Bytes::from(manifest_chunk_key(self.blob_hash, 0))));
             let mut cursor = BufferedRangeScan::new(vec![ReadEntry {
                 key,
                 value: ProjectedValue::KeyOnly,
@@ -793,8 +791,8 @@ mod tests {
 
     #[tokio::test]
     async fn scan_manifest_chunks_rejects_key_only_value() {
-        let read = StorageReadScope::new(KeyOnlyScanRead);
         let blob_hash = BlobHash::from_content(b"blob");
+        let read = StorageReadScope::new(KeyOnlyScanRead { blob_hash });
 
         let error = scan_manifest_chunks(&read, blob_hash)
             .await
@@ -1021,9 +1019,11 @@ mod tests {
         let error = load_bytes_many(&store, &[blob_hash])
             .await
             .expect_err("corrupt chunk should be rejected");
-        assert!(error
-            .message
-            .contains("failed content-address verification"));
+        assert!(
+            error
+                .message
+                .contains("failed content-address verification")
+        );
     }
 
     #[tokio::test]
@@ -1074,9 +1074,11 @@ mod tests {
         let error = load_bytes_many(&store, &[expected_blob_hash])
             .await
             .expect_err("wrong assembled blob should be rejected");
-        assert!(error
-            .message
-            .contains("failed content-address verification"));
+        assert!(
+            error
+                .message
+                .contains("failed content-address verification")
+        );
     }
 
     #[tokio::test]
