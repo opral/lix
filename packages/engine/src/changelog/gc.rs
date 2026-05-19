@@ -3,17 +3,18 @@ use std::collections::{HashMap, HashSet};
 use super::context::ChangelogStorageRead;
 use super::segment::{validate_change_checksum, validate_commit_checksum, validate_segment_shape};
 use super::store::{
-    by_change_index_value, by_change_key, by_change_membership_ids_from_key,
-    by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
-    by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
-    visible_change_proof_key, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-    BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
+    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE, by_change_index_value,
+    by_change_key, by_change_membership_ids_from_key, by_change_membership_index_value,
+    by_change_membership_key, by_commit_index_value, by_commit_key, commit_visibility_key,
+    commit_visibility_value, segment_key, visible_change_proof_key,
 };
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet,
     MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
     SegmentObjectLocationRef, StateRowIdentity,
 };
+use crate::LixError;
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
     decode_segment_change, decode_segment_commit, view_segment_directory,
@@ -21,7 +22,6 @@ use crate::changelog::{
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::json_store::{self, JsonRef};
 use crate::storage::{StorageCoreProjection, StorageSpace, StorageWriteSet};
-use crate::LixError;
 
 pub(super) async fn plan_gc<S>(store: &mut S, roots: &[GcRoot]) -> Result<GcPlan, LixError>
 where
@@ -159,6 +159,34 @@ where
     )
     .await?;
 
+    for (commit_id, expected) in &expected_by_commit {
+        if let Some(actual) = live_by_commit_entries.get(commit_id) {
+            if actual != expected {
+                return Err(LixError::unknown(format!(
+                    "changelog GC live by_commit entry for '{commit_id}' does not match segment truth"
+                )));
+            }
+        }
+    }
+    for (change_id, expected) in &expected_by_change {
+        if let Some(actual) = live_by_change_entries.get(change_id) {
+            if actual != expected {
+                return Err(LixError::unknown(format!(
+                    "changelog GC live by_change entry for '{change_id}' does not match segment truth"
+                )));
+            }
+        }
+    }
+    for (commit_id, expected) in &expected_commit_visibility {
+        if let Some(actual) = live_commit_visibility_entries.get(commit_id) {
+            if actual != expected {
+                return Err(LixError::unknown(format!(
+                    "changelog GC live commit_visibility entry for '{commit_id}' does not match segment truth"
+                )));
+            }
+        }
+    }
+
     let sweep = GcSweepSet {
         segments: all_segment_ids
             .into_iter()
@@ -174,17 +202,11 @@ where
             .collect(),
         by_commit: all_by_commit
             .into_iter()
-            .filter(|commit_id| {
-                !live_commits.contains(commit_id)
-                    || live_by_commit_entries.get(commit_id) != expected_by_commit.get(commit_id)
-            })
+            .filter(|commit_id| !live_commits.contains(commit_id))
             .collect(),
         by_change: all_by_change
             .into_iter()
-            .filter(|change_id| {
-                !live_changes.contains(change_id)
-                    || live_by_change_entries.get(change_id) != expected_by_change.get(change_id)
-            })
+            .filter(|change_id| !live_changes.contains(change_id))
             .collect(),
         by_change_membership: all_by_change_membership
             .into_iter()
@@ -451,18 +473,6 @@ async fn load_gc_commit<S>(
 where
     S: ChangelogStorageRead + ?Sized,
 {
-    if let Some(entry) = load_by_commit_entry(store, commit_id).await? {
-        if ensure_segment_bytes(store, segment_bytes, &entry.location.segment_id).await? {
-            match decode_commit_from_segment_bytes(
-                &segment_bytes[&entry.location.segment_id],
-                &entry.location,
-                commit_id,
-            )? {
-                Some(commit) => return Ok(Some((entry.location, commit))),
-                None => {}
-            }
-        }
-    }
     scan_segments_for_commit(store, all_segment_ids, segment_bytes, commit_id).await
 }
 
@@ -475,18 +485,6 @@ async fn load_gc_change<S>(
 where
     S: ChangelogStorageRead + ?Sized,
 {
-    if let Some(entry) = load_by_change_entry(store, change_id).await? {
-        if ensure_segment_bytes(store, segment_bytes, &entry.location.segment_id).await? {
-            match decode_change_from_segment_bytes(
-                &segment_bytes[&entry.location.segment_id],
-                &entry.location,
-                change_id,
-            )? {
-                Some(change) => return Ok(Some((entry.location, change))),
-                None => {}
-            }
-        }
-    }
     scan_segments_for_change(store, all_segment_ids, segment_bytes, change_id).await
 }
 
@@ -581,9 +579,7 @@ where
             continue;
         }
         let bytes = &segment_bytes[segment_id];
-        let Ok(view) = view_segment_directory(bytes) else {
-            continue;
-        };
+        let view = view_segment_directory(bytes)?;
         let Some(entry) = view
             .directory_commits
             .iter()
@@ -622,9 +618,7 @@ where
             continue;
         }
         let bytes = &segment_bytes[segment_id];
-        let Ok(view) = view_segment_directory(bytes) else {
-            continue;
-        };
+        let view = view_segment_directory(bytes)?;
         let Some(entry) = view
             .directory_changes
             .iter()
@@ -998,11 +992,14 @@ where
         let Some(bytes) = value else {
             continue;
         };
-        if let Ok(entry) = decode_by_commit_entry(&bytes) {
-            if entry.commit_id == *commit_id {
-                out.insert(commit_id.clone(), entry);
-            }
+        let entry = decode_by_commit_entry(&bytes)?;
+        if entry.commit_id != *commit_id {
+            return Err(LixError::unknown(format!(
+                "by_commit key for '{commit_id}' contains commit_id '{}'",
+                entry.commit_id
+            )));
         }
+        out.insert(commit_id.clone(), entry);
     }
     Ok(out)
 }
@@ -1028,11 +1025,14 @@ where
         let Some(bytes) = value else {
             continue;
         };
-        if let Ok(entry) = decode_by_change_entry(&bytes) {
-            if entry.change_id == *change_id {
-                out.insert(change_id.clone(), entry);
-            }
+        let entry = decode_by_change_entry(&bytes)?;
+        if entry.change_id != *change_id {
+            return Err(LixError::unknown(format!(
+                "by_change key for '{change_id}' contains change_id '{}'",
+                entry.change_id
+            )));
         }
+        out.insert(change_id.clone(), entry);
     }
     Ok(out)
 }
@@ -1166,10 +1166,10 @@ mod tests {
     use crate::changelog::segment::canonicalize_segment;
     use crate::changelog::test_support::commit_visibility_from_segment;
     use crate::changelog::{
-        decode_segment, encode_segment, ChangelogContext, CommitBody, CommitHeader,
-        MembershipRecord, MembershipRole, RebuildIndexStats, Segment, SegmentChange,
-        SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory,
-        SegmentHeader, SegmentInlinePayload, SegmentPayloadLocation,
+        ChangelogContext, CommitBody, CommitHeader, MembershipRecord, MembershipRole,
+        RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
+        SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentInlinePayload,
+        SegmentPayloadLocation, decode_segment, encode_segment,
     };
     use crate::common::{CanonicalSchemaKey, EntityId, FileId};
     use crate::entity_identity::EntityIdentity;
@@ -1208,14 +1208,16 @@ mod tests {
 
         assert_eq!(plan.live.commits, vec!["commit-1"]);
         assert_eq!(plan.live.changes, vec!["change-1"]);
-        assert!(plan
-            .live
-            .payloads
-            .contains(&JsonRef::from_hash_bytes([7; 32])));
-        assert!(plan
-            .live
-            .payloads
-            .contains(&JsonRef::from_hash_bytes([8; 32])));
+        assert!(
+            plan.live
+                .payloads
+                .contains(&JsonRef::from_hash_bytes([7; 32]))
+        );
+        assert!(
+            plan.live
+                .payloads
+                .contains(&JsonRef::from_hash_bytes([8; 32]))
+        );
         assert_eq!(plan.live.segments, vec!["segment-1"]);
         assert_eq!(plan.sweep.segments, vec!["segment-dead"]);
         assert_eq!(plan.sweep.by_commit, vec!["commit-dead"]);
@@ -1542,7 +1544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_sweeps_stale_live_locator_indexes() {
+    async fn gc_rejects_stale_live_locator_indexes() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
@@ -1591,14 +1593,15 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let mut reader = context.reader(storage);
-        let plan = reader
+        let error = reader
             .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
             .await
-            .unwrap();
+            .expect_err("live locator index drift must fail closed");
 
-        assert_eq!(plan.sweep.commit_visibility, vec!["commit-live"]);
-        assert_eq!(plan.sweep.by_commit, vec!["commit-live"]);
-        assert_eq!(plan.sweep.by_change, vec!["change-live"]);
+        assert!(
+            error.message.contains("does not match segment truth"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1623,6 +1626,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.sweep.segments, vec!["segment-dead"]);
+    }
+
+    #[tokio::test]
+    async fn gc_rejects_duplicate_live_commit_even_when_by_commit_exists() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let segment_1 = single_commit_segment("segment-1", "commit-1", "change-1");
+        write_segments(&storage, &context, vec![segment_1], &["commit-1"]).await;
+
+        let segment_2 =
+            canonicalize_segment(single_commit_segment("segment-2", "commit-1", "change-2"))
+                .unwrap();
+        write_raw_segment(&storage, &segment_2).await;
+
+        let mut reader = context.reader(storage);
+        let error = reader
+            .plan_gc(&[GcRoot::VersionHead("commit-1".to_string())])
+            .await
+            .expect_err("GC must reject duplicate commit ids even when by_commit exists");
+
+        assert!(
+            error.message.contains("duplicate commit id 'commit-1'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_rejects_duplicate_live_change_even_when_by_change_exists() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let segment_1 = single_commit_segment("segment-1", "commit-1", "change-1");
+        write_segments(&storage, &context, vec![segment_1], &["commit-1"]).await;
+
+        let segment_2 =
+            canonicalize_segment(single_commit_segment("segment-2", "commit-2", "change-1"))
+                .unwrap();
+        write_raw_segment(&storage, &segment_2).await;
+
+        let mut reader = context.reader(storage);
+        let error = reader
+            .plan_gc(&[GcRoot::VersionHead("commit-1".to_string())])
+            .await
+            .expect_err("GC must reject duplicate change ids even when by_change exists");
+
+        assert!(
+            error.message.contains("duplicate change id 'change-1'"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1718,7 +1769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_sweeps_visible_change_proof_that_matches_stale_visibility() {
+    async fn gc_rejects_visible_change_proof_that_matches_stale_visibility() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = canonicalize_segment(single_commit_segment(
@@ -1748,13 +1799,15 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let mut reader = context.reader(storage.clone());
-        let plan = reader
+        let error = reader
             .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
             .await
-            .unwrap();
+            .expect_err("live visibility drift must fail closed");
 
-        assert_eq!(plan.sweep.commit_visibility, vec!["commit-live"]);
-        assert_eq!(plan.sweep.visible_change_proof, vec!["change-live"]);
+        assert!(
+            error.message.contains("does not match segment truth"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2077,17 +2130,12 @@ mod tests {
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
-        let mut reader = context.reader(storage.clone());
-        let dead_commit = reader
-            .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &["commit-dead".to_string()],
-                projection: crate::changelog::CommitProjection::Full,
-                visibility: crate::changelog::CommitVisibilityMode::PhysicalOnly,
-            })
-            .await
-            .unwrap();
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(SEGMENT_SPACE, vec![segment_key("segment-dead")])],
+        );
         assert!(
-            dead_commit.entries[0].is_some(),
+            result[0][0].is_some(),
             "collect_garbage must stage no sweep deletes after graph corruption"
         );
     }
@@ -2132,17 +2180,12 @@ mod tests {
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
-        let mut reader = context.reader(storage.clone());
-        let dead_commit = reader
-            .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &["commit-dead".to_string()],
-                projection: crate::changelog::CommitProjection::Full,
-                visibility: crate::changelog::CommitVisibilityMode::PhysicalOnly,
-            })
-            .await
-            .unwrap();
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(SEGMENT_SPACE, vec![segment_key("segment-dead")])],
+        );
         assert!(
-            dead_commit.entries[0].is_some(),
+            result[0][0].is_some(),
             "collect_garbage must stage no sweep deletes after graph corruption"
         );
     }
@@ -2238,9 +2281,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership_count drift must be invalid segment input");
-        assert!(error
-            .message
-            .contains("membership_count 0 does not match 1"));
+        assert!(
+            error
+                .message
+                .contains("membership_count 0 does not match 1")
+        );
     }
 
     #[tokio::test]
@@ -2261,9 +2306,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("membership directory drift must be invalid segment input");
-        assert!(error
-            .message
-            .contains("is missing membership ordinal for change 'change-1'"));
+        assert!(
+            error
+                .message
+                .contains("is missing membership ordinal for change 'change-1'")
+        );
     }
 
     #[tokio::test]
@@ -2291,9 +2338,11 @@ mod tests {
             .plan_gc(&[])
             .await
             .expect_err("payload directory drift must be invalid segment input");
-        assert!(error
-            .message
-            .contains("payload directory entry does not match inline payload"));
+        assert!(
+            error
+                .message
+                .contains("payload directory entry does not match inline payload")
+        );
     }
 
     #[tokio::test]

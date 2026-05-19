@@ -35,8 +35,15 @@ pub(super) fn by_commit_entries_for_segments(
 ) -> Result<Vec<ByCommitEntry>, LixError> {
     let generations = rebuilt_commit_generations(segments)?;
     let mut entries = Vec::new();
+    let mut seen = HashSet::new();
     for segment in segments {
         for commit in &segment.commits {
+            if !seen.insert(commit.header.id.as_str()) {
+                return Err(LixError::unknown(format!(
+                    "changelog index rebuild found duplicate commit '{}'",
+                    commit.header.id
+                )));
+            }
             entries.push(ByCommitEntry {
                 commit_id: commit.header.id.clone(),
                 location: directory_commit_location(segment, &commit.header.id)?,
