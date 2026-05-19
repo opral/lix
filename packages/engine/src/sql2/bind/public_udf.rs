@@ -79,6 +79,36 @@ pub(crate) fn validate_public_udf_calls_in_datafusion_statement(
     visit_datafusion_statement(statement, &mut visitor)
 }
 
+pub(crate) fn statement_has_durable_runtime_function(statement: &DataFusionStatement) -> bool {
+    let mut visitor = DurableRuntimeFunctionVisitor { found: false };
+    visit_datafusion_statement_for_durable_runtime_function(statement, &mut visitor);
+    visitor.found
+}
+
+struct DurableRuntimeFunctionVisitor {
+    found: bool,
+}
+
+impl Visitor for DurableRuntimeFunctionVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Function(function) = expr else {
+            return ControlFlow::Continue(());
+        };
+
+        if matches!(
+            public_lix_function_name(function),
+            Some("lix_timestamp" | "lix_uuid_v7")
+        ) {
+            self.found = true;
+            return ControlFlow::Break(());
+        }
+
+        ControlFlow::Continue(())
+    }
+}
+
 fn visit_datafusion_statement(
     statement: &DataFusionStatement,
     visitor: &mut PublicUdfCallVisitor,
@@ -92,6 +122,24 @@ fn visit_datafusion_statement(
             visit_datafusion_statement(explain.statement.as_ref(), visitor)
         }
         _ => Ok(()),
+    }
+}
+
+fn visit_datafusion_statement_for_durable_runtime_function(
+    statement: &DataFusionStatement,
+    visitor: &mut DurableRuntimeFunctionVisitor,
+) {
+    match statement {
+        DataFusionStatement::Statement(statement) => {
+            let _ = statement.visit(visitor);
+        }
+        DataFusionStatement::Explain(explain) => {
+            visit_datafusion_statement_for_durable_runtime_function(
+                explain.statement.as_ref(),
+                visitor,
+            );
+        }
+        _ => {}
     }
 }
 
@@ -208,7 +256,14 @@ fn invalid_param(message: impl Into<String>) -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_public_udf_calls;
+    use datafusion::sql::parser::Statement as DataFusionStatement;
+
+    use super::{statement_has_durable_runtime_function, validate_public_udf_calls};
+
+    fn parse_statement(sql: &str) -> DataFusionStatement {
+        crate::sql2::parse_statement(sql)
+            .unwrap_or_else(|error| panic!("failed to parse '{sql}': {error}"))
+    }
 
     #[test]
     fn rejects_lix_udf_wrong_arity_as_public_invalid_param() {
@@ -234,5 +289,18 @@ mod tests {
             "SELECT lix_json('{\"x\":1}'), lix_text_decode(X'416461', 'utf-8')",
         )
         .expect("valid calls should pass public validation");
+    }
+
+    #[test]
+    fn marks_durable_runtime_functions() {
+        assert!(statement_has_durable_runtime_function(&parse_statement(
+            "SELECT lix_uuid_v7()"
+        )));
+        assert!(statement_has_durable_runtime_function(&parse_statement(
+            "SELECT lix_timestamp()"
+        )));
+        assert!(!statement_has_durable_runtime_function(&parse_statement(
+            "SELECT lix_json('{\"x\":1}')"
+        )));
     }
 }

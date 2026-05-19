@@ -215,7 +215,7 @@ impl SimTransaction {
         let statement_kind = classify_statement(sql);
         match statement_kind {
             StatementKind::Read => {
-                let active_version_id = self.session.active_version_id().await?;
+                let active_version_id = self.transaction.active_version_id()?.to_string();
                 self.sim
                     .rebuild_tracked_state
                     .before_read(&self.engine, &active_version_id)

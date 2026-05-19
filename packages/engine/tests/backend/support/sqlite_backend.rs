@@ -1,14 +1,15 @@
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
 use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, KeyRef,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
@@ -24,12 +25,14 @@ pub struct SqliteBackendFactory {
 #[derive(Clone, Debug)]
 pub struct SqliteBackendFixture {
     path: PathBuf,
+    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
 pub struct SqliteBackend {
     path: PathBuf,
     read_pool: Arc<Mutex<Vec<Connection>>>,
+    durable_write_lock: DurableWriteLock,
 }
 
 pub struct SqliteRead {
@@ -73,7 +76,10 @@ impl BackendFactory for SqliteBackendFactory {
             .temp_dir
             .path()
             .join(format!("backend-{database_id}.sqlite"));
-        SqliteBackendFixture { path }
+        SqliteBackendFixture {
+            durable_write_lock: durable_write_lock_for_path(&path),
+            path,
+        }
     }
 
     fn config(&self) -> BackendTestConfig {
@@ -89,17 +95,28 @@ impl BackendFixture for SqliteBackendFixture {
     type Backend = SqliteBackend;
 
     fn open(&self) -> Self::Backend {
-        SqliteBackend::open(&self.path).expect("open sqlite backend")
+        SqliteBackend::open_with_write_lock(&self.path, self.durable_write_lock.clone())
+            .expect("open sqlite backend")
     }
 }
 
 impl SqliteBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
+        let durable_write_lock = durable_write_lock_for_path(&path);
+        Self::open_with_write_lock(path, durable_write_lock)
+    }
+
+    fn open_with_write_lock(
+        path: impl Into<PathBuf>,
+        durable_write_lock: DurableWriteLock,
+    ) -> Result<Self, BackendError> {
+        let path = path.into();
         initialize_database(&path)?;
         Ok(Self {
             path,
             read_pool: Arc::new(Mutex::new(Vec::new())),
+            durable_write_lock,
         })
     }
 
@@ -159,6 +176,48 @@ impl Backend for SqliteBackend {
             conn,
             stats: WriteStats::default(),
         })
+    }
+
+    fn durable_write_lock(&self) -> DurableWriteLock {
+        self.durable_write_lock.clone()
+    }
+}
+
+fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
+    let key = canonical_lock_key(path);
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("sqlite durable write lock registry should not poison");
+    if let Some(lock) = locks.get(&key) {
+        return lock.clone();
+    }
+    let lock = DurableWriteLock::new();
+    locks.insert(key, lock.clone());
+    lock
+}
+
+fn canonical_lock_key(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .expect("current directory should be available")
+            .join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return absolute;
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return absolute;
+    };
+    match absolute.file_name() {
+        Some(file_name) => parent.join(file_name),
+        None => parent,
     }
 }
 

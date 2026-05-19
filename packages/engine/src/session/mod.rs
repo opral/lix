@@ -2,8 +2,13 @@
 //!
 //! Transaction invariant: a session has one execution lease. Parent-handle
 //! calls use it for implicit single-statement execution; explicit transactions
-//! hold it until commit or rollback. Session APIs must not open `Transaction`
-//! directly or use session-level read helpers inside write flows.
+//! hold it until commit or rollback. Session feature submodules should enter
+//! write flows through the centralized session helpers rather than opening
+//! `Transaction` directly or using session-level read helpers inside writes.
+//!
+//! MVP boundary: session close can cancel queued or pre-boundary writes until
+//! the durable commit point-of-no-return. After that point, close waits for
+//! commit completion. Durability itself is the backend's responsibility.
 
 mod context;
 mod create_version;
