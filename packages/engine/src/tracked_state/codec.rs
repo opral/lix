@@ -483,6 +483,13 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixErr
             DecodedNodeRef::Leaf(leaf)
         }
         NODE_KIND_INTERNAL => {
+            ensure_counted_records_fit_remaining(
+                bytes,
+                cursor,
+                count,
+                internal_child_min_len(),
+                "internal children",
+            )?;
             let mut children = Vec::with_capacity(count);
             for _ in 0..count {
                 let first_key = read_sized_bytes(bytes, &mut cursor, "internal first_key")?;
@@ -519,7 +526,14 @@ fn decode_leaf_node_ref_after_count<'a>(
     cursor: &mut usize,
     count: usize,
 ) -> Result<DecodedLeafNodeRef<'a>, LixError> {
-    let mut offsets = Vec::with_capacity(count.saturating_add(1));
+    let offset_count = count.checked_add(1).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf offset count overflows",
+        )
+    })?;
+    ensure_counted_records_fit_remaining(bytes, *cursor, offset_count, 4, "leaf offsets")?;
+    let mut offsets = Vec::with_capacity(offset_count);
     for _ in 0..=count {
         offsets.push(read_u32(bytes, cursor, "leaf entry offset")?);
     }
@@ -556,6 +570,38 @@ fn decode_leaf_node_ref_after_count<'a>(
         payload_start,
         offsets,
     })
+}
+
+fn ensure_counted_records_fit_remaining(
+    bytes: &[u8],
+    cursor: usize,
+    count: usize,
+    record_min_len: usize,
+    field_name: &str,
+) -> Result<(), LixError> {
+    let required = count.checked_mul(record_min_len).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree field '{field_name}' byte count overflows"),
+        )
+    })?;
+    let remaining = bytes.len().checked_sub(cursor).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree field '{field_name}' starts past node end"),
+        )
+    })?;
+    if required > remaining {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree field '{field_name}' exceeds remaining node bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn internal_child_min_len() -> usize {
+    4 + 4 + TRACKED_STATE_HASH_BYTES + 8
 }
 
 pub(crate) fn child_summary_from_node(
@@ -1146,6 +1192,30 @@ mod tests {
             .expect_err("short offset coverage should reject")
             .to_string()
             .contains("offset table does not cover full payload"));
+    }
+
+    #[test]
+    fn leaf_node_codec_rejects_count_that_exceeds_remaining_bytes_before_allocating() {
+        let mut encoded = vec![NODE_KIND_LEAF, NODE_VERSION];
+        encoded.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode_node_ref(&encoded).expect_err("impossible leaf count should reject");
+
+        assert!(error
+            .to_string()
+            .contains("field 'leaf offsets' exceeds remaining node bytes"));
+    }
+
+    #[test]
+    fn internal_node_codec_rejects_count_that_exceeds_remaining_bytes_before_allocating() {
+        let mut encoded = vec![NODE_KIND_INTERNAL, NODE_VERSION];
+        encoded.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode_node_ref(&encoded).expect_err("impossible internal count should reject");
+
+        assert!(error
+            .to_string()
+            .contains("field 'internal children' exceeds remaining node bytes"));
     }
 
     #[test]
