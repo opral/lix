@@ -24,7 +24,7 @@ use super::store::{
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
     decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
-    view_segment,
+    view_segment_directory,
 };
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
@@ -192,7 +192,7 @@ struct SegmentByteIndex {
 
 impl SegmentByteIndex {
     fn decode(bytes: Vec<u8>) -> Result<Self, LixError> {
-        let view = view_segment(&bytes)?;
+        let view = view_segment_directory(&bytes)?;
         let segment_id = view.segment_id.to_string();
         let commit_locations = view
             .directory_commits
@@ -256,6 +256,7 @@ impl SegmentByteIndex {
                 commit.header.id
             )));
         }
+        validate_commit_checksum(&location.checksum, commit_id, &commit)?;
         Ok(commit)
     }
 
@@ -277,7 +278,12 @@ impl SegmentByteIndex {
             )));
         }
         let bytes = self.object_bytes(location, "commit", commit_id)?;
-        segment_commit_membership_contains_any(bytes, requested_change_ids)
+        segment_commit_membership_contains_any(
+            bytes,
+            commit_id,
+            &location.checksum,
+            requested_change_ids,
+        )
     }
 
     fn load_change(
@@ -349,6 +355,12 @@ impl SegmentByteIndex {
             ))
         })
     }
+}
+
+#[derive(Default)]
+struct SourceParentFacts {
+    reachable_memberships: HashSet<String>,
+    first_parent_winners: HashMap<StateRowIdentity, String>,
 }
 
 impl<S> ChangelogStoreReader<S>
@@ -500,7 +512,8 @@ where
                 )));
             };
             if projection == ChangeProjection::PhysicalLocation {
-                segment.validate_change_location(&by_change.location, change_id)?;
+                let change = segment.load_change(&by_change.location, change_id)?;
+                validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
                 entries.push(Some(ChangeLoadEntry::PhysicalLocation(
                     by_change.location.clone(),
                 )));
@@ -544,7 +557,8 @@ where
                 }
                 if let Some(segment) = segments.get(&by_change.location.segment_id) {
                     if projection == ChangeProjection::PhysicalLocation {
-                        segment.validate_change_location(&by_change.location, change_id)?;
+                        let change = segment.load_change(&by_change.location, change_id)?;
+                        validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
                         entries.push(Some(ChangeLoadEntry::PhysicalLocation(
                             by_change.location.clone(),
                         )));
@@ -1340,6 +1354,8 @@ where
     ) -> Result<SegmentStageReport, LixError> {
         let segment = canonicalize_segment(segment)?;
         validate_stage_segment_shape(&segment)?;
+        self.validate_stage_adopted_membership_provenance(&segment)
+            .await?;
         self.reject_duplicate_logical_ids(&segment).await?;
         let segment_id = segment.header.segment_id.clone();
         let report = SegmentStageReport {
@@ -1644,6 +1660,7 @@ where
             .map(|membership| membership.member_change_id.clone())
             .collect::<HashSet<_>>();
         let changes = self.resolve_publish_changes(&member_change_ids).await?;
+        let mut source_parent_facts = HashMap::<String, SourceParentFacts>::new();
 
         for membership in &commit.body.membership {
             let Some(change) = changes.get(&membership.member_change_id) else {
@@ -1683,9 +1700,16 @@ where
                             commit.header.id, membership.member_change_id, source_parent_ordinal
                         )));
                     };
-                    if !self
-                        .commit_history_contains_membership(parent_id, &membership.member_change_id)
-                        .await?
+                    if !source_parent_facts.contains_key(parent_id) {
+                        let facts = self.source_parent_facts(parent_id).await?;
+                        source_parent_facts.insert(parent_id.clone(), facts);
+                    }
+                    let facts = source_parent_facts
+                        .get(parent_id)
+                        .expect("source parent facts should be cached");
+                    if !facts
+                        .reachable_memberships
+                        .contains(&membership.member_change_id)
                     {
                         return Err(LixError::unknown(format!(
                             "cannot publish changelog commit '{}' because adopted membership change '{}' is not reachable from source parent '{}'",
@@ -1693,13 +1717,8 @@ where
                         )));
                     }
                     let identity = state_row_identity_for_change(change)?;
-                    if !self
-                        .commit_history_projects_state_row(
-                            parent_id,
-                            &identity,
-                            &membership.member_change_id,
-                        )
-                        .await?
+                    if facts.first_parent_winners.get(&identity)
+                        != Some(&membership.member_change_id)
                     {
                         return Err(LixError::unknown(format!(
                             "cannot publish changelog commit '{}' because adopted membership change '{}' is not the source parent '{}' winner for {:?}",
@@ -1728,11 +1747,111 @@ where
         Ok(())
     }
 
-    async fn commit_history_contains_membership(
+    async fn validate_stage_adopted_membership_provenance(
+        &mut self,
+        segment: &Segment,
+    ) -> Result<(), LixError> {
+        let adopted_change_ids = segment
+            .commits
+            .iter()
+            .flat_map(|commit| {
+                commit
+                    .body
+                    .membership
+                    .iter()
+                    .filter(|membership| membership.role == MembershipRole::Adopted)
+                    .map(|membership| membership.member_change_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        if adopted_change_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut changes = segment
+            .changes
+            .iter()
+            .filter(|change| adopted_change_ids.contains(&change.id))
+            .map(|change| (change.id.clone(), change.clone()))
+            .collect::<HashMap<_, _>>();
+        let missing = adopted_change_ids
+            .difference(&changes.keys().cloned().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !missing.is_empty() {
+            changes.extend(self.resolve_publish_changes(&missing).await?);
+        }
+
+        let mut source_parent_facts = HashMap::<String, SourceParentFacts>::new();
+
+        for commit in &segment.commits {
+            for membership in &commit.body.membership {
+                if membership.role != MembershipRole::Adopted {
+                    continue;
+                }
+                let source_parent_ordinal =
+                    membership.source_parent_ordinal.ok_or_else(|| {
+                        LixError::unknown(format!(
+                            "cannot stage changelog commit '{}' because adopted membership change '{}' is missing source_parent_ordinal",
+                            commit.header.id, membership.member_change_id
+                        ))
+                    })?;
+                let parent_id = commit
+                    .header
+                    .parent_commit_ids
+                    .get(source_parent_ordinal as usize)
+                    .ok_or_else(|| {
+                        LixError::unknown(format!(
+                            "cannot stage changelog commit '{}' because adopted membership change '{}' source_parent_ordinal {} is out of bounds",
+                            commit.header.id, membership.member_change_id, source_parent_ordinal
+                        ))
+                    })?;
+                let Some(change) = changes.get(&membership.member_change_id) else {
+                    return Err(LixError::unknown(format!(
+                        "cannot stage changelog commit '{}' because adopted membership change '{}' has no changelog.change",
+                        commit.header.id, membership.member_change_id
+                    )));
+                };
+                if change.authored_commit_id.as_deref() == Some(commit.header.id.as_str()) {
+                    return Err(LixError::unknown(format!(
+                        "cannot stage changelog commit '{}' because adopted membership change '{}' is authored by the same commit",
+                        commit.header.id, membership.member_change_id
+                    )));
+                }
+                if !source_parent_facts.contains_key(parent_id) {
+                    let facts = self
+                        .source_parent_facts_in_segment(parent_id, segment)
+                        .await?;
+                    source_parent_facts.insert(parent_id.clone(), facts);
+                }
+                let facts = source_parent_facts
+                    .get(parent_id)
+                    .expect("source parent facts should be cached");
+                if !facts
+                    .reachable_memberships
+                    .contains(&membership.member_change_id)
+                {
+                    return Err(LixError::unknown(format!(
+                        "cannot stage changelog commit '{}' because adopted membership change '{}' is not reachable from source parent '{}'",
+                        commit.header.id, membership.member_change_id, parent_id
+                    )));
+                }
+                let identity = state_row_identity_for_change(change)?;
+                if facts.first_parent_winners.get(&identity) != Some(&membership.member_change_id) {
+                    return Err(LixError::unknown(format!(
+                        "cannot stage changelog commit '{}' because adopted membership change '{}' is not the source parent '{}' winner for {:?}",
+                        commit.header.id, membership.member_change_id, parent_id, identity
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn source_parent_facts(
         &mut self,
         root_commit_id: &str,
-        change_id: &str,
-    ) -> Result<bool, LixError> {
+    ) -> Result<SourceParentFacts, LixError> {
+        let mut facts = SourceParentFacts::default();
         let mut stack = vec![root_commit_id.to_string()];
         let mut visited = HashSet::new();
         while let Some(commit_id) = stack.pop() {
@@ -1740,6 +1859,132 @@ where
                 continue;
             }
             let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
+                continue;
+            };
+            facts.reachable_memberships.extend(
+                commit
+                    .body
+                    .membership
+                    .iter()
+                    .map(|membership| membership.member_change_id.clone()),
+            );
+            stack.extend(commit.header.parent_commit_ids);
+        }
+
+        let mut next_commit_id = Some(root_commit_id.to_string());
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = next_commit_id.take() {
+            if !visited.insert(commit_id.clone()) {
+                return Err(LixError::unknown(format!(
+                    "cannot resolve source parent facts because first-parent history contains parent cycle at commit '{commit_id}'"
+                )));
+            }
+            let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
+                break;
+            };
+            for (identity, change_id) in &commit.directory.state_row_identities {
+                facts
+                    .first_parent_winners
+                    .entry(identity.clone())
+                    .or_insert_with(|| change_id.clone());
+            }
+            next_commit_id = commit.header.parent_commit_ids.first().cloned();
+        }
+        Ok(facts)
+    }
+
+    async fn source_parent_facts_in_segment(
+        &mut self,
+        root_commit_id: &str,
+        segment: &Segment,
+    ) -> Result<SourceParentFacts, LixError> {
+        let mut facts = SourceParentFacts::default();
+        let mut stack = vec![root_commit_id.to_string()];
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = stack.pop() {
+            if !visited.insert(commit_id.clone()) {
+                continue;
+            }
+            let Some(commit) = self
+                .load_published_staged_or_segment_commit(&commit_id, Some(segment))
+                .await?
+            else {
+                continue;
+            };
+            facts.reachable_memberships.extend(
+                commit
+                    .body
+                    .membership
+                    .iter()
+                    .map(|membership| membership.member_change_id.clone()),
+            );
+            stack.extend(commit.header.parent_commit_ids);
+        }
+
+        let mut next_commit_id = Some(root_commit_id.to_string());
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = next_commit_id.take() {
+            if !visited.insert(commit_id.clone()) {
+                return Err(LixError::unknown(format!(
+                    "cannot resolve source parent facts because first-parent history contains parent cycle at commit '{commit_id}'"
+                )));
+            }
+            let Some(commit) = self
+                .load_published_staged_or_segment_commit(&commit_id, Some(segment))
+                .await?
+            else {
+                break;
+            };
+            for (identity, change_id) in &commit.directory.state_row_identities {
+                facts
+                    .first_parent_winners
+                    .entry(identity.clone())
+                    .or_insert_with(|| change_id.clone());
+            }
+            next_commit_id = commit.header.parent_commit_ids.first().cloned();
+        }
+        Ok(facts)
+    }
+
+    async fn commit_history_contains_membership(
+        &mut self,
+        root_commit_id: &str,
+        change_id: &str,
+    ) -> Result<bool, LixError> {
+        self.commit_history_contains_membership_with_loader(root_commit_id, change_id, None)
+            .await
+    }
+
+    async fn commit_history_contains_membership_in_segment(
+        &mut self,
+        root_commit_id: &str,
+        change_id: &str,
+        segment: &Segment,
+    ) -> Result<bool, LixError> {
+        self.commit_history_contains_membership_with_loader(
+            root_commit_id,
+            change_id,
+            Some(segment),
+        )
+        .await
+    }
+
+    async fn commit_history_contains_membership_with_loader(
+        &mut self,
+        root_commit_id: &str,
+        change_id: &str,
+        segment: Option<&Segment>,
+    ) -> Result<bool, LixError> {
+        let mut stack = vec![root_commit_id.to_string()];
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = stack.pop() {
+            if !visited.insert(commit_id.clone()) {
+                continue;
+            }
+            let Some(commit) = self
+                .load_published_staged_or_segment_commit(&commit_id, segment)
+                .await?
+            else {
                 continue;
             };
             if commit
@@ -1761,6 +2006,38 @@ where
         identity: &StateRowIdentity,
         change_id: &str,
     ) -> Result<bool, LixError> {
+        self.commit_history_projects_state_row_with_loader(
+            root_commit_id,
+            identity,
+            change_id,
+            None,
+        )
+        .await
+    }
+
+    async fn commit_history_projects_state_row_in_segment(
+        &mut self,
+        root_commit_id: &str,
+        identity: &StateRowIdentity,
+        change_id: &str,
+        segment: &Segment,
+    ) -> Result<bool, LixError> {
+        self.commit_history_projects_state_row_with_loader(
+            root_commit_id,
+            identity,
+            change_id,
+            Some(segment),
+        )
+        .await
+    }
+
+    async fn commit_history_projects_state_row_with_loader(
+        &mut self,
+        root_commit_id: &str,
+        identity: &StateRowIdentity,
+        change_id: &str,
+        segment: Option<&Segment>,
+    ) -> Result<bool, LixError> {
         let mut next_commit_id = Some(root_commit_id.to_string());
         let mut visited = HashSet::new();
         while let Some(commit_id) = next_commit_id.take() {
@@ -1770,7 +2047,10 @@ where
                     identity, commit_id
                 )));
             }
-            let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
+            let Some(commit) = self
+                .load_published_staged_or_segment_commit(&commit_id, segment)
+                .await?
+            else {
                 return Ok(false);
             };
             if let Some((_, winner_change_id)) = commit
@@ -1784,6 +2064,25 @@ where
             next_commit_id = commit.header.parent_commit_ids.first().cloned();
         }
         Ok(false)
+    }
+
+    async fn load_published_staged_or_segment_commit(
+        &mut self,
+        commit_id: &str,
+        segment: Option<&Segment>,
+    ) -> Result<Option<SegmentCommit>, LixError> {
+        if let Some(commit) = segment.and_then(|segment| {
+            segment
+                .commits
+                .iter()
+                .find(|commit| commit.header.id == commit_id)
+        }) {
+            return Ok(Some(commit.clone()));
+        }
+        if let Some(commit) = self.load_published_or_staged_commit(commit_id).await? {
+            return Ok(Some(commit));
+        }
+        self.find_segment_commit(commit_id).await
     }
 
     async fn load_published_or_staged_commit(
@@ -1810,6 +2109,71 @@ where
         self.load_publish_commit(commit_id, &visibility.location)
             .await
             .map(Some)
+    }
+
+    async fn find_segment_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<Option<SegmentCommit>, LixError> {
+        let Some(entry) = get_one(
+            &mut *self.store,
+            BY_COMMIT_INDEX_SPACE,
+            by_commit_key(commit_id),
+        )
+        .await?
+        .map(|bytes| decode_by_commit_entry(&bytes))
+        .transpose()?
+        else {
+            return self.scan_segments_for_commit(commit_id).await;
+        };
+        if entry.commit_id != commit_id {
+            return Err(LixError::unknown(format!(
+                "by_commit key for '{commit_id}' contains commit_id '{}'",
+                entry.commit_id
+            )));
+        }
+        let Some(segment) = self
+            .load_segment_byte_index_for_writer(&entry.location.segment_id)
+            .await?
+        else {
+            return self.scan_segments_for_commit(commit_id).await;
+        };
+        match segment.load_commit(&entry.location, commit_id) {
+            Ok(commit) => {
+                if validate_commit_checksum(&entry.location.checksum, commit_id, &commit).is_ok() {
+                    Ok(Some(commit))
+                } else {
+                    self.scan_segments_for_commit(commit_id).await
+                }
+            }
+            Err(_) => self.scan_segments_for_commit(commit_id).await,
+        }
+    }
+
+    async fn load_segment_byte_index_for_writer(
+        &mut self,
+        segment_id: &str,
+    ) -> Result<Option<SegmentByteIndex>, LixError> {
+        let Some(bytes) = get_one(&mut *self.store, SEGMENT_SPACE, segment_key(segment_id)).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SegmentByteIndex::decode(bytes)?))
+    }
+
+    async fn scan_segments_for_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<Option<SegmentCommit>, LixError> {
+        for segment in self.scan_all_segments().await? {
+            let Some(commit) = segment_commit(&segment, commit_id) else {
+                continue;
+            };
+            let location = directory_commit_location(&segment, commit_id)?;
+            validate_commit_checksum(&location.checksum, commit_id, commit)?;
+            return Ok(Some(commit.clone()));
+        }
+        Ok(None)
     }
 
     async fn resolve_publish_changes(
@@ -3654,6 +4018,7 @@ mod tests {
         duplicate.header.segment_id = "segment-2".to_string();
         duplicate.commits[0].header.id = "commit-2".to_string();
         duplicate.commits[0].header.derivable_change_id = "derived-change-2".to_string();
+        duplicate.changes[0].authored_commit_id = Some("commit-2".to_string());
         let duplicate = canonicalize_segment(duplicate).unwrap();
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -3996,15 +4361,16 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
             writer
-                .stage_publish_commit("commit-1")
+                .stage_segment(segment)
                 .await
-                .expect_err("publication must prove membership changes exist")
+                .expect_err("staging must prove membership changes exist")
         };
 
         assert!(
-            error.message.contains("no changelog.change exists"),
+            error
+                .message
+                .contains("authored membership references missing change 'change-1'"),
             "unexpected error: {error}"
         );
     }
@@ -4020,11 +4386,10 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
             writer
-                .stage_publish_commit("commit-1")
+                .stage_segment(segment)
                 .await
-                .expect_err("publication must prove StateRowIdentity matches the change")
+                .expect_err("staging must prove StateRowIdentity matches the change")
         };
 
         assert!(
@@ -4045,20 +4410,141 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
-            writer.stage_publish_commit("commit-1").await.unwrap();
             writer
-                .stage_publish_commit("commit-2")
+                .stage_segment(segment)
                 .await
-                .expect_err("publication must prove authored membership owns its change")
+                .expect_err("staging must prove authored membership owns its change")
         };
 
         assert!(
-            error
-                .message
-                .contains("authored membership change 'change-1' belongs to"),
+            error.message.contains(
+                "authored membership change 'change-1' has mismatched authored_commit_id"
+            ),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn stage_segment_rejects_cross_segment_adopted_membership_authored_by_same_commit() {
+        let (context, storage) = changelog_test_context();
+        let mut change_segment = test_segment();
+        change_segment.header.segment_id = "change-segment".to_string();
+        change_segment.commits.clear();
+        change_segment.directory.commits.clear();
+        change_segment.changes[0].authored_commit_id = Some("commit-2".to_string());
+        let change_segment = canonicalize_segment(change_segment).unwrap();
+
+        let mut adopt_segment = test_segment();
+        adopt_segment.header.segment_id = "adopt-segment".to_string();
+        adopt_segment.changes.clear();
+        adopt_segment.directory.changes.clear();
+        adopt_segment.commits[0].header.id = "commit-2".to_string();
+        adopt_segment.commits[0].header.parent_commit_ids = vec!["missing-parent".to_string()];
+        adopt_segment.commits[0].body.membership[0].role = MembershipRole::Adopted;
+        adopt_segment.commits[0].body.membership[0].source_parent_ordinal = Some(0);
+        let adopt_segment = canonicalize_segment(adopt_segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(change_segment).await.unwrap();
+            writer
+                .stage_segment(adopt_segment)
+                .await
+                .expect_err("staging must reject self-authored adopted membership")
+        };
+
+        assert!(
+            error.message.contains("is authored by the same commit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_segment_accepts_adopted_membership_from_unpublished_stored_parent() {
+        let (context, storage) = changelog_test_context();
+        let parent_segment = test_segment();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(parent_segment).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut adopt_segment = test_segment();
+        adopt_segment.header.segment_id = "adopt-segment".to_string();
+        adopt_segment.changes.clear();
+        adopt_segment.directory.changes.clear();
+        adopt_segment.commits[0].header.id = "commit-2".to_string();
+        adopt_segment.commits[0].header.parent_commit_ids = vec!["commit-1".to_string()];
+        adopt_segment.commits[0].body.membership[0].role = MembershipRole::Adopted;
+        adopt_segment.commits[0].body.membership[0].source_parent_ordinal = Some(0);
+        let adopt_segment = canonicalize_segment(adopt_segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(adopt_segment).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_segment_accepts_adopted_membership_from_physical_parent_when_by_commit_is_stale()
+    {
+        let (context, storage) = changelog_test_context();
+        let parent_segment = test_segment();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(parent_segment).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            BY_COMMIT_INDEX_SPACE,
+            by_commit_key("commit-1"),
+            by_commit_index_value(&ByCommitEntry {
+                commit_id: "commit-1".to_string(),
+                location: SegmentObjectLocation {
+                    segment_id: "missing-segment".to_string(),
+                    offset: 0,
+                    len: 0,
+                    checksum: "stale-checksum".to_string(),
+                },
+                parent_commit_ids: Vec::new(),
+                generation: 0,
+            })
+            .unwrap(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut adopt_segment = test_segment();
+        adopt_segment.header.segment_id = "adopt-segment".to_string();
+        adopt_segment.changes.clear();
+        adopt_segment.directory.changes.clear();
+        adopt_segment.commits[0].header.id = "commit-2".to_string();
+        adopt_segment.commits[0].header.parent_commit_ids = vec!["commit-1".to_string()];
+        adopt_segment.commits[0].body.membership[0].role = MembershipRole::Adopted;
+        adopt_segment.commits[0].body.membership[0].source_parent_ordinal = Some(0);
+        let adopt_segment = canonicalize_segment(adopt_segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(adopt_segment).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4189,16 +4675,10 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
-            writer.stage_publish_commit("commit-1").await.unwrap();
             writer
-                .stage_publish_commit("commit-other-parent")
+                .stage_segment(segment)
                 .await
-                .unwrap();
-            writer
-                .stage_publish_commit("commit-3")
-                .await
-                .expect_err("publication must prove adopted change reaches through source parent")
+                .expect_err("staging must prove adopted change reaches through source parent")
         };
 
         assert!(
@@ -4278,13 +4758,10 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
-            writer.stage_publish_commit("commit-1").await.unwrap();
-            writer.stage_publish_commit("commit-2").await.unwrap();
             writer
-                .stage_publish_commit("commit-3")
+                .stage_segment(segment)
                 .await
-                .expect_err("publication must prove adopted change is the source winner")
+                .expect_err("staging must prove adopted change is the source winner")
         };
 
         assert!(
@@ -4423,15 +4900,10 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let error = {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
-            writer.stage_publish_commit("commit-1").await.unwrap();
-            writer.stage_publish_commit("target-commit").await.unwrap();
-            writer.stage_publish_commit("source-commit").await.unwrap();
-            writer.stage_publish_commit("merge-parent").await.unwrap();
             writer
-                .stage_publish_commit("adopting-commit")
+                .stage_segment(segment)
                 .await
-                .expect_err("source parent winner must use first-parent projection")
+                .expect_err("staging source parent winner must use first-parent projection")
         };
 
         assert!(
@@ -4584,7 +5056,10 @@ mod tests {
             error.message.contains("without that change")
                 || error
                     .message
-                    .contains("locator does not match segment directory"),
+                    .contains("locator does not match segment directory")
+                || error
+                    .message
+                    .contains("references missing authored change 'change-1'"),
             "unexpected error: {error}"
         );
     }
@@ -4605,7 +5080,7 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let mut corrupted = segment;
-        corrupted.changes[0].schema_key = "messagb".to_string();
+        corrupted.changes[0].created_at = "2026-05-12T00:00:01Z".to_string();
         write_raw_segment(&storage, &corrupted).await;
 
         let mut reader = context.reader(storage);

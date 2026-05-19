@@ -1718,14 +1718,20 @@ impl BenchPayloadShape {
     fn inline_payloads(self, index: usize) -> Vec<SegmentInlinePayload> {
         match self {
             Self::None | Self::ExternalRefsOnly => Vec::new(),
-            Self::SmallInline => vec![SegmentInlinePayload {
-                json_ref: json_ref(index, 1),
-                bytes: payload_bytes(index, 64),
-            }],
-            Self::LargeInline => vec![SegmentInlinePayload {
-                json_ref: json_ref(index, 1),
-                bytes: payload_bytes(index, 8 * 1024),
-            }],
+            Self::SmallInline => {
+                let bytes = payload_bytes(index, 64);
+                vec![SegmentInlinePayload {
+                    json_ref: JsonRef::for_content(&bytes),
+                    bytes,
+                }]
+            }
+            Self::LargeInline => {
+                let bytes = payload_bytes(index, 8 * 1024);
+                vec![SegmentInlinePayload {
+                    json_ref: JsonRef::for_content(&bytes),
+                    bytes,
+                }]
+            }
         }
     }
 }

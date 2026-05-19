@@ -4,13 +4,15 @@ use std::collections::{HashMap, HashSet};
 
 use super::codec::{
     decode_segment, decode_segment_change, decode_segment_commit,
-    encode_segment_with_object_locations, view_segment, view_segment_object_slices,
+    encode_segment_with_object_locations, view_segment_directory, view_segment_object_ranges,
+    view_segment_object_slices,
 };
 use super::store::segment_value;
 use super::types::{
     MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentDirectory, SegmentObjectLocation,
-    SegmentPayloadLocation,
+    SegmentPayloadLocation, StateRowIdentity,
 };
+use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::LixError;
 
 pub(super) fn directory_commit_location(
@@ -80,11 +82,19 @@ pub(super) struct DecodedSegmentIndex {
     change_ordinals: HashMap<String, usize>,
     commit_locations: HashMap<String, SegmentObjectLocation>,
     change_locations: HashMap<String, SegmentObjectLocation>,
+    commit_ranges: HashMap<String, SegmentObjectRangeMeta>,
+    change_ranges: HashMap<String, SegmentObjectRangeMeta>,
+}
+
+struct SegmentObjectRangeMeta {
+    offset: u64,
+    len: u64,
+    encoded_checksum: Option<String>,
 }
 
 impl DecodedSegmentIndex {
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, LixError> {
-        let view = view_segment(bytes)?;
+        let view = view_segment_directory(bytes)?;
         let segment_id = view.segment_id.to_string();
         let mut commit_ordinals = HashMap::new();
         let mut commit_locations = HashMap::new();
@@ -114,6 +124,33 @@ impl DecodedSegmentIndex {
                 },
             );
         }
+        let (commit_ranges, change_ranges) = view_segment_object_ranges(bytes)?;
+        let commit_ranges = commit_ranges
+            .into_iter()
+            .map(|slice| {
+                (
+                    slice.id.to_string(),
+                    SegmentObjectRangeMeta {
+                        offset: slice.offset,
+                        len: slice.len,
+                        encoded_checksum: slice.encoded_checksum.map(str::to_string),
+                    },
+                )
+            })
+            .collect();
+        let change_ranges = change_ranges
+            .into_iter()
+            .map(|slice| {
+                (
+                    slice.id.to_string(),
+                    SegmentObjectRangeMeta {
+                        offset: slice.offset,
+                        len: slice.len,
+                        encoded_checksum: slice.encoded_checksum.map(str::to_string),
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
             bytes: bytes.to_vec(),
             segment_id,
@@ -121,6 +158,8 @@ impl DecodedSegmentIndex {
             change_ordinals,
             commit_locations,
             change_locations,
+            commit_ranges,
+            change_ranges,
         })
     }
 
@@ -182,6 +221,7 @@ impl DecodedSegmentIndex {
                 "changelog commit '{commit_id}' locator does not match segment directory"
             )));
         }
+        self.validate_commit_range(location, commit_id)?;
         Ok(())
     }
 
@@ -201,6 +241,7 @@ impl DecodedSegmentIndex {
                 "changelog change '{change_id}' locator does not match segment directory"
             )));
         }
+        self.validate_change_range(location, change_id)?;
         let Some(change) = self.change(change_id)? else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' is missing change '{}'",
@@ -208,6 +249,49 @@ impl DecodedSegmentIndex {
             )));
         };
         validate_change_checksum(&location.checksum, change_id, &change)?;
+        Ok(())
+    }
+
+    fn validate_commit_range(
+        &self,
+        location: &SegmentObjectLocation,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let Some(range) = self.commit_ranges.get(commit_id) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' is missing encoded commit object '{}'",
+                self.segment_id, commit_id
+            )));
+        };
+        if location.offset != range.offset || location.len != range.len {
+            return Err(LixError::unknown(format!(
+                "changelog commit '{commit_id}' locator does not match encoded object slice"
+            )));
+        }
+        if range.encoded_checksum.as_deref() != Some(location.checksum.as_str()) {
+            return Err(LixError::unknown(format!(
+                "changelog commit '{commit_id}' locator checksum does not match encoded object checksum"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_change_range(
+        &self,
+        location: &SegmentObjectLocation,
+        change_id: &str,
+    ) -> Result<(), LixError> {
+        let Some(range) = self.change_ranges.get(change_id) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' is missing encoded change object '{}'",
+                self.segment_id, change_id
+            )));
+        };
+        if location.offset != range.offset || location.len != range.len {
+            return Err(LixError::unknown(format!(
+                "changelog change '{change_id}' locator does not match encoded object slice"
+            )));
+        }
         Ok(())
     }
 
@@ -296,6 +380,7 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
     }
 
     let mut change_locations = Vec::with_capacity(segment.changes.len());
+    let mut change_checksums = Vec::with_capacity(segment.changes.len());
     for change in &mut segment.changes {
         change.directory.payloads = change
             .inline_payloads
@@ -307,13 +392,15 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
                 len: payload.bytes.len() as u64,
             })
             .collect();
+        let change_checksum = checksum_change(change)?;
+        change_checksums.push((change.id.clone(), change_checksum.clone()));
         change_locations.push((
             change.id.clone(),
             SegmentObjectLocation {
                 segment_id: segment_id.clone(),
                 offset: 0,
                 len: 0,
-                checksum: checksum_change(change)?,
+                checksum: change_checksum,
             },
         ));
     }
@@ -326,7 +413,7 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
     segment.header.checksum = empty_checksum();
     let encoded = encode_segment_with_object_locations(&segment)?;
     segment.header.byte_count = encoded.bytes.len() as u64;
-    segment.header.checksum = checksum_segment(&segment)?;
+    segment.header.checksum = checksum_segment_with_change_checksums(&segment, &change_checksums)?;
     apply_encoded_object_locations_from_encoded(&mut segment, &encoded)?;
     Ok(segment)
 }
@@ -339,12 +426,13 @@ fn apply_encoded_object_locations_from_encoded(
     segment: &mut Segment,
     encoded: &super::codec::EncodedSegment,
 ) -> Result<(), LixError> {
+    let encoded_commits = encoded
+        .commits
+        .iter()
+        .map(|object| (object.id.as_str(), object))
+        .collect::<HashMap<_, _>>();
     for (commit_id, location) in &mut segment.directory.commits {
-        let Some(object) = encoded
-            .commits
-            .iter()
-            .find(|object| object.id == *commit_id)
-        else {
+        let Some(object) = encoded_commits.get(commit_id.as_str()) else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' could not locate encoded commit '{}'",
                 segment.header.segment_id, commit_id
@@ -354,12 +442,13 @@ fn apply_encoded_object_locations_from_encoded(
         location.len = object.len;
     }
 
+    let encoded_changes = encoded
+        .changes
+        .iter()
+        .map(|object| (object.id.as_str(), object))
+        .collect::<HashMap<_, _>>();
     for (change_id, location) in &mut segment.directory.changes {
-        let Some(object) = encoded
-            .changes
-            .iter()
-            .find(|object| object.id == *change_id)
-        else {
+        let Some(object) = encoded_changes.get(change_id.as_str()) else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' could not locate encoded change '{}'",
                 segment.header.segment_id, change_id
@@ -377,50 +466,89 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
 
     let encoded = segment_value(segment)?;
     let (encoded_commits, encoded_changes) = view_segment_object_slices(&encoded)?;
+    let commits_by_id = segment
+        .commits
+        .iter()
+        .map(|commit| (commit.header.id.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    let changes_by_id = segment
+        .changes
+        .iter()
+        .map(|change| (change.id.as_str(), change))
+        .collect::<HashMap<_, _>>();
+    let encoded_commits_by_id = encoded_commits
+        .iter()
+        .map(|slice| (slice.id, slice))
+        .collect::<HashMap<_, _>>();
+    let encoded_changes_by_id = encoded_changes
+        .iter()
+        .map(|slice| (slice.id, slice))
+        .collect::<HashMap<_, _>>();
+    let mut change_checksums = Vec::with_capacity(segment.changes.len());
+    for change in &segment.changes {
+        change_checksums.push((change.id.clone(), checksum_change(change)?));
+    }
+    let change_checksums_by_id = change_checksums
+        .iter()
+        .map(|(change_id, checksum)| (change_id.as_str(), checksum.as_str()))
+        .collect::<HashMap<_, _>>();
 
     for (commit_id, location) in &segment.directory.commits {
-        let commit = segment_commit(segment, commit_id).ok_or_else(|| {
+        let commit = commits_by_id.get(commit_id.as_str()).ok_or_else(|| {
             LixError::unknown(format!(
                 "changelog segment '{}' directory points to missing commit '{}'",
                 segment.header.segment_id, commit_id
             ))
         })?;
-        validate_commit_location(location, segment, commit_id)?;
-        validate_encoded_object_location(
+        let Some(slice) = encoded_commits_by_id.get(commit_id.as_str()) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' is missing encoded commit '{}'",
+                segment.header.segment_id, commit_id
+            )));
+        };
+        validate_encoded_object_location_from_parts(
             &segment.header.segment_id,
             "commit",
             commit_id,
             location,
-            encoded_commits.iter().map(|slice| {
-                (
-                    slice.id,
-                    slice.offset,
-                    slice.len,
-                    slice.encoded_checksum.unwrap_or_default(),
-                )
-            }),
+            slice.offset,
+            slice.len,
+            slice.encoded_checksum.unwrap_or_default(),
         )?;
         validate_commit_checksum(&location.checksum, commit_id, commit)?;
     }
 
     for (change_id, location) in &segment.directory.changes {
-        validate_change_location(location, segment, change_id)?;
-        let change = segment_change(segment, change_id).ok_or_else(|| {
+        let _change = changes_by_id.get(change_id.as_str()).ok_or_else(|| {
             LixError::unknown(format!(
                 "changelog segment '{}' directory points to missing change '{}'",
                 segment.header.segment_id, change_id
             ))
         })?;
-        validate_encoded_object_location(
+        let Some(slice) = encoded_changes_by_id.get(change_id.as_str()) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' is missing encoded change '{}'",
+                segment.header.segment_id, change_id
+            )));
+        };
+        validate_encoded_object_location_from_parts(
             &segment.header.segment_id,
             "change",
             change_id,
             location,
-            encoded_changes
-                .iter()
-                .map(|slice| (slice.id, slice.offset, slice.len, "")),
+            slice.offset,
+            slice.len,
+            "",
         )?;
-        validate_change_checksum(&location.checksum, change_id, change)?;
+        let canonical = change_checksums_by_id
+            .get(change_id.as_str())
+            .expect("validated change must have canonical checksum");
+        if location.checksum != *canonical {
+            return Err(LixError::unknown(format!(
+                "changelog change '{change_id}' checksum '{}' does not match canonical checksum '{}'",
+                location.checksum, canonical
+            )));
+        }
     }
 
     let encoded_len = encoded.len() as u64;
@@ -431,7 +559,7 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
         )));
     }
 
-    let checksum = checksum_segment(segment)?;
+    let checksum = checksum_segment_with_change_checksums(segment, &change_checksums)?;
     if segment.header.checksum != checksum {
         return Err(LixError::unknown(format!(
             "changelog segment '{}' checksum '{}' does not match canonical checksum '{}'",
@@ -497,6 +625,12 @@ pub(super) fn validate_stage_segment_shape(segment: &Segment) -> Result<(), LixE
         )));
     }
     let mut commit_ids = HashSet::new();
+    let directory_commit_ids = segment
+        .directory
+        .commits
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
     for commit in &segment.commits {
         if !commit_ids.insert(commit.header.id.as_str()) {
             return Err(LixError::unknown(format!(
@@ -504,7 +638,7 @@ pub(super) fn validate_stage_segment_shape(segment: &Segment) -> Result<(), LixE
                 segment.header.segment_id, commit.header.id
             )));
         }
-        validate_commit_shape(segment, commit)?;
+        validate_commit_shape(segment, commit, &directory_commit_ids)?;
     }
 
     let mut change_ids = HashSet::new();
@@ -541,6 +675,7 @@ pub(super) fn validate_stage_segment_shape(segment: &Segment) -> Result<(), LixE
             .iter()
             .map(|(id, location)| (id.as_str(), location)),
     )?;
+    validate_segment_cross_object_semantics(segment)?;
 
     Ok(())
 }
@@ -560,6 +695,26 @@ fn validate_encoded_object_location<'a>(
             "changelog segment '{segment_id}' is missing encoded {kind} '{object_id}'"
         )));
     };
+    validate_encoded_object_location_from_parts(
+        segment_id,
+        kind,
+        object_id,
+        location,
+        offset,
+        len,
+        encoded_checksum,
+    )
+}
+
+fn validate_encoded_object_location_from_parts(
+    _segment_id: &str,
+    kind: &str,
+    object_id: &str,
+    location: &SegmentObjectLocation,
+    offset: u64,
+    len: u64,
+    encoded_checksum: &str,
+) -> Result<(), LixError> {
     if location.offset != offset || location.len != len {
         return Err(LixError::unknown(format!(
             "changelog {kind} '{object_id}' locator offset/len does not match encoded byte range"
@@ -574,21 +729,67 @@ fn validate_encoded_object_location<'a>(
 }
 
 fn checksum_segment(segment: &Segment) -> Result<String, LixError> {
+    let change_checksums = segment
+        .changes
+        .iter()
+        .map(|change| Ok((change.id.clone(), checksum_change(change)?)))
+        .collect::<Result<Vec<_>, LixError>>()?;
+    checksum_segment_with_change_checksums(segment, &change_checksums)
+}
+
+fn checksum_segment_with_change_checksums(
+    segment: &Segment,
+    change_checksums: &[(String, String)],
+) -> Result<String, LixError> {
+    let change_checksums = change_checksums
+        .iter()
+        .map(|(change_id, checksum)| (change_id.as_str(), checksum.as_str()))
+        .collect::<HashMap<_, _>>();
     let mut hasher = blake3::Hasher::new();
     hash_part(&mut hasher, "segment");
-    hash_part(&mut hasher, &segment.header.segment_id);
-    hash_part(&mut hasher, &segment.header.format_version.to_string());
-    hash_part(&mut hasher, &segment.header.commit_count.to_string());
-    hash_part(&mut hasher, &segment.header.change_count.to_string());
-    hash_part(&mut hasher, &segment.header.byte_count.to_string());
-    hash_part(&mut hasher, &segment.header.payload_count.to_string());
+    hash_field(&mut hasher, "segment_id", &segment.header.segment_id);
+    hash_field(
+        &mut hasher,
+        "format_version",
+        &segment.header.format_version.to_string(),
+    );
+    hash_field(
+        &mut hasher,
+        "commit_count",
+        &segment.header.commit_count.to_string(),
+    );
+    hash_field(
+        &mut hasher,
+        "change_count",
+        &segment.header.change_count.to_string(),
+    );
+    hash_field(
+        &mut hasher,
+        "byte_count",
+        &segment.header.byte_count.to_string(),
+    );
+    hash_field(
+        &mut hasher,
+        "payload_count",
+        &segment.header.payload_count.to_string(),
+    );
+    hash_list_len(&mut hasher, "commits", segment.commits.len());
     for commit in &segment.commits {
-        hash_part(&mut hasher, &commit.header.id);
-        hash_part(&mut hasher, &commit.checksum);
+        hash_part(&mut hasher, "commit");
+        hash_field(&mut hasher, "id", &commit.header.id);
+        hash_field(&mut hasher, "checksum", &commit.checksum);
     }
+    hash_list_len(&mut hasher, "changes", segment.changes.len());
     for change in &segment.changes {
-        hash_part(&mut hasher, &change.id);
-        hash_part(&mut hasher, &checksum_change(change)?);
+        hash_part(&mut hasher, "change");
+        hash_field(&mut hasher, "id", &change.id);
+        let Some(checksum) = change_checksums.get(change.id.as_str()) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' is missing canonical checksum for change '{}'",
+                segment.header.segment_id, change.id
+            )));
+        };
+        hash_field(&mut hasher, "checksum", checksum);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -596,42 +797,80 @@ fn checksum_segment(segment: &Segment) -> Result<String, LixError> {
 fn checksum_commit(commit: &SegmentCommit) -> Result<String, LixError> {
     let mut hasher = blake3::Hasher::new();
     hash_part(&mut hasher, "commit");
-    hash_part(&mut hasher, &commit.header.id);
+    hash_field(&mut hasher, "id", &commit.header.id);
+    hash_list_len(
+        &mut hasher,
+        "parent_commit_ids",
+        commit.header.parent_commit_ids.len(),
+    );
     for parent in &commit.header.parent_commit_ids {
-        hash_part(&mut hasher, parent);
+        hash_field(&mut hasher, "parent_commit_id", parent);
     }
-    hash_part(&mut hasher, &commit.header.derivable_change_id);
+    hash_field(
+        &mut hasher,
+        "derivable_change_id",
+        &commit.header.derivable_change_id,
+    );
+    hash_list_len(
+        &mut hasher,
+        "author_account_ids",
+        commit.header.author_account_ids.len(),
+    );
     for account_id in &commit.header.author_account_ids {
-        hash_part(&mut hasher, account_id);
+        hash_field(&mut hasher, "author_account_id", account_id);
     }
-    hash_part(&mut hasher, &commit.header.created_at);
-    hash_part(&mut hasher, &commit.header.membership_count.to_string());
+    hash_field(&mut hasher, "created_at", &commit.header.created_at);
+    hash_field(
+        &mut hasher,
+        "membership_count",
+        &commit.header.membership_count.to_string(),
+    );
+    hash_list_len(&mut hasher, "memberships", commit.body.membership.len());
     for membership in &commit.body.membership {
-        hash_part(&mut hasher, &membership.member_change_id);
-        hash_part(
+        hash_part(&mut hasher, "membership");
+        hash_field(
             &mut hasher,
+            "member_change_id",
+            &membership.member_change_id,
+        );
+        hash_field(
+            &mut hasher,
+            "role",
             match membership.role {
                 MembershipRole::Authored => "authored",
                 MembershipRole::Adopted => "adopted",
             },
         );
-        hash_part(
+        hash_field(
             &mut hasher,
+            "source_parent_ordinal",
             &membership
                 .source_parent_ordinal
                 .map(|ordinal| ordinal.to_string())
                 .unwrap_or_default(),
         );
     }
+    hash_list_len(
+        &mut hasher,
+        "state_row_identities",
+        commit.directory.state_row_identities.len(),
+    );
     for (identity, change_id) in &commit.directory.state_row_identities {
-        hash_part(&mut hasher, identity.schema_key.as_str());
-        hash_part(&mut hasher, identity.file_id.as_str());
-        hash_part(&mut hasher, identity.entity_id.as_str());
-        hash_part(&mut hasher, change_id);
+        hash_part(&mut hasher, "state_row_identity");
+        hash_field(&mut hasher, "schema_key", identity.schema_key.as_str());
+        hash_field(&mut hasher, "file_id", identity.file_id.as_str());
+        hash_field(&mut hasher, "entity_id", identity.entity_id.as_str());
+        hash_field(&mut hasher, "change_id", change_id);
     }
+    hash_list_len(
+        &mut hasher,
+        "membership_ordinals",
+        commit.directory.membership_ordinals.len(),
+    );
     for (change_id, ordinal) in &commit.directory.membership_ordinals {
-        hash_part(&mut hasher, change_id);
-        hash_part(&mut hasher, &ordinal.to_string());
+        hash_part(&mut hasher, "membership_ordinal");
+        hash_field(&mut hasher, "change_id", change_id);
+        hash_field(&mut hasher, "ordinal", &ordinal.to_string());
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -639,28 +878,37 @@ fn checksum_commit(commit: &SegmentCommit) -> Result<String, LixError> {
 fn checksum_change(change: &SegmentChange) -> Result<String, LixError> {
     let mut hasher = blake3::Hasher::new();
     hash_part(&mut hasher, "change");
-    hash_part(&mut hasher, &change.id);
-    hash_part(
+    hash_field(&mut hasher, "id", &change.id);
+    hash_optional_str(
         &mut hasher,
-        change.authored_commit_id.as_deref().unwrap_or_default(),
+        "authored_commit_id",
+        change.authored_commit_id.as_deref(),
     );
-    hash_parts(
-        &mut hasher,
-        change.entity_id.parts.iter().map(String::as_str),
-    );
-    hash_part(&mut hasher, &change.schema_key);
-    hash_part(&mut hasher, change.file_id.as_deref().unwrap_or_default());
-    hash_optional_json_ref(&mut hasher, change.snapshot_ref.as_ref());
-    hash_optional_json_ref(&mut hasher, change.metadata_ref.as_ref());
-    hash_part(&mut hasher, &change.created_at);
-    for payload in &change.inline_payloads {
-        hash_json_ref(&mut hasher, &payload.json_ref);
-        hash_bytes_part(&mut hasher, &payload.bytes);
+    hash_list_len(&mut hasher, "entity_id", change.entity_id.parts.len());
+    for part in &change.entity_id.parts {
+        hash_field(&mut hasher, "entity_id_part", part);
     }
+    hash_field(&mut hasher, "schema_key", &change.schema_key);
+    hash_optional_str(&mut hasher, "file_id", change.file_id.as_deref());
+    hash_optional_json_ref(&mut hasher, "snapshot_ref", change.snapshot_ref.as_ref());
+    hash_optional_json_ref(&mut hasher, "metadata_ref", change.metadata_ref.as_ref());
+    hash_field(&mut hasher, "created_at", &change.created_at);
+    hash_list_len(&mut hasher, "inline_payloads", change.inline_payloads.len());
+    for payload in &change.inline_payloads {
+        hash_part(&mut hasher, "inline_payload");
+        hash_json_ref(&mut hasher, "json_ref", &payload.json_ref);
+        hash_bytes_field(&mut hasher, "bytes", &payload.bytes);
+    }
+    hash_list_len(
+        &mut hasher,
+        "directory_payloads",
+        change.directory.payloads.len(),
+    );
     for payload_location in &change.directory.payloads {
-        hash_json_ref(&mut hasher, &payload_location.json_ref);
-        hash_part(&mut hasher, &payload_location.offset.to_string());
-        hash_part(&mut hasher, &payload_location.len.to_string());
+        hash_part(&mut hasher, "payload_location");
+        hash_json_ref(&mut hasher, "json_ref", &payload_location.json_ref);
+        hash_field(&mut hasher, "offset", &payload_location.offset.to_string());
+        hash_field(&mut hasher, "len", &payload_location.len.to_string());
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -670,10 +918,14 @@ fn hash_part(hasher: &mut blake3::Hasher, value: &str) {
     hasher.update(value.as_bytes());
 }
 
-fn hash_parts<'a>(hasher: &mut blake3::Hasher, values: impl Iterator<Item = &'a str>) {
-    for value in values {
-        hash_part(hasher, value);
-    }
+fn hash_field(hasher: &mut blake3::Hasher, field: &str, value: &str) {
+    hash_part(hasher, field);
+    hash_part(hasher, value);
+}
+
+fn hash_list_len(hasher: &mut blake3::Hasher, field: &str, len: usize) {
+    hash_part(hasher, field);
+    hasher.update(&(len as u64).to_le_bytes());
 }
 
 fn hash_bytes_part(hasher: &mut blake3::Hasher, value: &[u8]) {
@@ -681,21 +933,46 @@ fn hash_bytes_part(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
-fn hash_optional_json_ref(hasher: &mut blake3::Hasher, value: Option<&crate::json_store::JsonRef>) {
+fn hash_bytes_field(hasher: &mut blake3::Hasher, field: &str, value: &[u8]) {
+    hash_part(hasher, field);
+    hash_bytes_part(hasher, value);
+}
+
+fn hash_optional_str(hasher: &mut blake3::Hasher, field: &str, value: Option<&str>) {
+    hash_part(hasher, field);
     match value {
         Some(value) => {
             hash_part(hasher, "some");
-            hash_json_ref(hasher, value);
+            hash_part(hasher, value);
         }
         None => hash_part(hasher, "none"),
     }
 }
 
-fn hash_json_ref(hasher: &mut blake3::Hasher, value: &crate::json_store::JsonRef) {
-    hash_bytes_part(hasher, value.as_hash_bytes());
+fn hash_optional_json_ref(
+    hasher: &mut blake3::Hasher,
+    field: &str,
+    value: Option<&crate::json_store::JsonRef>,
+) {
+    hash_part(hasher, field);
+    match value {
+        Some(value) => {
+            hash_part(hasher, "some");
+            hash_json_ref(hasher, "json_ref", value);
+        }
+        None => hash_part(hasher, "none"),
+    }
 }
 
-fn validate_commit_shape(segment: &Segment, commit: &SegmentCommit) -> Result<(), LixError> {
+fn hash_json_ref(hasher: &mut blake3::Hasher, field: &str, value: &crate::json_store::JsonRef) {
+    hash_bytes_field(hasher, field, value.as_hash_bytes());
+}
+
+fn validate_commit_shape(
+    segment: &Segment,
+    commit: &SegmentCommit,
+    directory_commit_ids: &HashSet<&str>,
+) -> Result<(), LixError> {
     let membership_count = u32::try_from(commit.body.membership.len()).map_err(|_| {
         LixError::unknown(format!(
             "changelog commit '{}' has too many membership records",
@@ -710,6 +987,12 @@ fn validate_commit_shape(segment: &Segment, commit: &SegmentCommit) -> Result<()
             commit.body.membership.len()
         )));
     }
+    let membership_ordinals_by_id = commit
+        .directory
+        .membership_ordinals
+        .iter()
+        .map(|(change_id, ordinal)| (change_id.as_str(), *ordinal))
+        .collect::<HashMap<_, _>>();
 
     let mut member_ids = HashSet::new();
     for (ordinal, membership) in commit.body.membership.iter().enumerate() {
@@ -746,11 +1029,8 @@ fn validate_commit_shape(segment: &Segment, commit: &SegmentCommit) -> Result<()
                 commit.header.id, membership.member_change_id
             )));
         }
-        let Some((_, directory_ordinal)) = commit
-            .directory
-            .membership_ordinals
-            .iter()
-            .find(|(change_id, _)| change_id == &membership.member_change_id)
+        let Some(directory_ordinal) =
+            membership_ordinals_by_id.get(membership.member_change_id.as_str())
         else {
             return Err(LixError::unknown(format!(
                 "changelog commit '{}' is missing membership ordinal for change '{}'",
@@ -819,12 +1099,7 @@ fn validate_commit_shape(segment: &Segment, commit: &SegmentCommit) -> Result<()
         )));
     }
 
-    if !segment
-        .directory
-        .commits
-        .iter()
-        .any(|(id, _)| id == &commit.header.id)
-    {
+    if !directory_commit_ids.contains(commit.header.id.as_str()) {
         return Err(LixError::unknown(format!(
             "changelog segment '{}' is missing directory location for commit '{}'",
             segment.header.segment_id, commit.header.id
@@ -835,23 +1110,30 @@ fn validate_commit_shape(segment: &Segment, commit: &SegmentCommit) -> Result<()
 }
 
 fn validate_change_shape(change: &SegmentChange) -> Result<(), LixError> {
-    let mut inline_payload_refs = Vec::new();
+    let directory_payloads_by_ref = change
+        .directory
+        .payloads
+        .iter()
+        .map(|location| (location.json_ref.as_hash_bytes(), location))
+        .collect::<HashMap<_, _>>();
+    let mut inline_payload_refs = HashSet::with_capacity(change.inline_payloads.len());
     for (ordinal, payload) in change.inline_payloads.iter().enumerate() {
-        if inline_payload_refs
-            .iter()
-            .any(|json_ref| json_ref == &payload.json_ref)
-        {
+        if !inline_payload_refs.insert(payload.json_ref.as_hash_bytes()) {
             return Err(LixError::unknown(format!(
                 "changelog change '{}' contains duplicate inline payload ref",
                 change.id
             )));
         }
-        inline_payload_refs.push(payload.json_ref.clone());
-        let Some(location) = change
-            .directory
-            .payloads
-            .iter()
-            .find(|location| location.json_ref == payload.json_ref)
+        let actual = crate::json_store::JsonRef::for_content(&payload.bytes);
+        if payload.json_ref != actual {
+            return Err(LixError::unknown(format!(
+                "changelog change '{}' inline payload ref '{}' does not match payload bytes '{}'",
+                change.id,
+                payload.json_ref.to_hex(),
+                actual.to_hex()
+            )));
+        }
+        let Some(location) = directory_payloads_by_ref.get(&payload.json_ref.as_hash_bytes())
         else {
             return Err(LixError::unknown(format!(
                 "changelog change '{}' is missing payload directory entry",
@@ -866,22 +1148,15 @@ fn validate_change_shape(change: &SegmentChange) -> Result<(), LixError> {
         }
     }
 
-    let mut directory_payload_refs = Vec::new();
+    let mut directory_payload_refs = HashSet::with_capacity(change.directory.payloads.len());
     for location in &change.directory.payloads {
-        if directory_payload_refs
-            .iter()
-            .any(|json_ref| json_ref == &location.json_ref)
-        {
+        if !directory_payload_refs.insert(location.json_ref.as_hash_bytes()) {
             return Err(LixError::unknown(format!(
                 "changelog change '{}' contains duplicate payload directory entry",
                 change.id
             )));
         }
-        directory_payload_refs.push(location.json_ref.clone());
-        if !inline_payload_refs
-            .iter()
-            .any(|json_ref| json_ref == &location.json_ref)
-        {
+        if !inline_payload_refs.contains(&location.json_ref.as_hash_bytes()) {
             return Err(LixError::unknown(format!(
                 "changelog change '{}' payload directory references unknown inline payload",
                 change.id
@@ -924,6 +1199,86 @@ fn validate_directory_exact_cover<'a>(
         )));
     }
     Ok(())
+}
+
+fn validate_segment_cross_object_semantics(segment: &Segment) -> Result<(), LixError> {
+    let mut changes_by_id = HashMap::with_capacity(segment.changes.len());
+    for change in &segment.changes {
+        changes_by_id.insert(change.id.as_str(), change);
+    }
+
+    for commit in &segment.commits {
+        let memberships_by_id = commit
+            .body
+            .membership
+            .iter()
+            .map(|membership| (membership.member_change_id.as_str(), membership.role))
+            .collect::<HashMap<_, _>>();
+
+        for membership in &commit.body.membership {
+            match membership.role {
+                MembershipRole::Authored => {
+                    let Some(change) = changes_by_id.get(membership.member_change_id.as_str())
+                    else {
+                        return Err(LixError::unknown(format!(
+                            "changelog commit '{}' authored membership references missing change '{}'",
+                            commit.header.id, membership.member_change_id
+                        )));
+                    };
+                    if change.authored_commit_id.as_deref() != Some(commit.header.id.as_str()) {
+                        return Err(LixError::unknown(format!(
+                            "changelog commit '{}' authored membership change '{}' has mismatched authored_commit_id",
+                            commit.header.id, membership.member_change_id
+                        )));
+                    }
+                }
+                MembershipRole::Adopted => {
+                    if let Some(change) = changes_by_id.get(membership.member_change_id.as_str()) {
+                        if change.authored_commit_id.as_deref() == Some(commit.header.id.as_str()) {
+                            return Err(LixError::unknown(format!(
+                                "changelog commit '{}' adopted membership change '{}' must not be authored by the same commit",
+                                commit.header.id, membership.member_change_id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (identity, change_id) in &commit.directory.state_row_identities {
+            let Some(change) = changes_by_id.get(change_id.as_str()) else {
+                if memberships_by_id.get(change_id.as_str()) == Some(&MembershipRole::Adopted) {
+                    continue;
+                }
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{}' StateRowIdentity winner references missing authored change '{}'",
+                    commit.header.id, change_id
+                )));
+            };
+            let actual = state_row_identity_for_change(change)?;
+            if &actual != identity {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{}' StateRowIdentity winner for change '{}' does not match changelog.change",
+                    commit.header.id, change_id
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn state_row_identity_for_change(change: &SegmentChange) -> Result<StateRowIdentity, LixError> {
+    Ok(StateRowIdentity {
+        schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
+        file_id: FileId::new(
+            change
+                .file_id
+                .clone()
+                .unwrap_or_else(|| "__global__".to_string()),
+        )?,
+        entity_id: EntityId::new(change.entity_id.as_json_array_text()?)?,
+    })
 }
 
 pub(super) fn validate_commit_location(
@@ -1150,7 +1505,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_payload_directory_drift() {
-        let payload_ref = JsonRef::from_hash_bytes([11; 32]);
+        let payload_ref = JsonRef::for_content(b"payload");
         let mut segment = test_segment_with_inline_payload(payload_ref);
         segment.changes[0].directory.payloads[0].len = 999;
 
@@ -1161,6 +1516,76 @@ mod tests {
             error
                 .message
                 .contains("payload directory entry does not match inline payload"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_inline_payload_ref_mismatch() {
+        let payload_ref = JsonRef::for_content(b"payload");
+        let mut segment = test_segment_with_inline_payload(payload_ref);
+        let bogus_ref = JsonRef::from_hash_bytes([9; 32]);
+        segment.changes[0].inline_payloads[0].json_ref = bogus_ref;
+        segment.changes[0].directory.payloads[0].json_ref = bogus_ref;
+
+        let error =
+            validate_segment_shape(&segment).expect_err("inline payload hash drift must fail");
+
+        assert!(
+            error.message.contains("does not match payload bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_authored_membership_commit_mismatch() {
+        let mut segment = test_segment();
+        segment.changes[0].authored_commit_id = Some("other-commit".to_string());
+
+        let error = validate_segment_shape(&segment)
+            .expect_err("authored membership ownership drift must fail");
+
+        assert!(
+            error.message.contains("mismatched authored_commit_id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_adopted_membership_authored_by_same_commit() {
+        let mut segment = test_segment();
+        segment.commits[0]
+            .header
+            .parent_commit_ids
+            .push("parent-1".to_string());
+        segment.commits[0].body.membership[0].role = MembershipRole::Adopted;
+        segment.commits[0].body.membership[0].source_parent_ordinal = Some(0);
+
+        let error = validate_segment_shape(&segment)
+            .expect_err("self-authored adopted membership must fail");
+
+        assert!(
+            error
+                .message
+                .contains("must not be authored by the same commit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_state_row_identity_change_mismatch() {
+        let mut segment = test_segment();
+        segment.commits[0].directory.state_row_identities[0]
+            .0
+            .schema_key = CanonicalSchemaKey::new("other").unwrap();
+
+        let error =
+            validate_segment_shape(&segment).expect_err("state-row identity drift must fail");
+
+        assert!(
+            error
+                .message
+                .contains("StateRowIdentity winner for change 'change-1' does not match"),
             "unexpected error: {error}"
         );
     }
@@ -1260,7 +1685,12 @@ mod tests {
         super::super::types::StateRowIdentity {
             schema_key: CanonicalSchemaKey::new("message").unwrap(),
             file_id: FileId::new("file-1").unwrap(),
-            entity_id: EntityId::new("entity-1").unwrap(),
+            entity_id: EntityId::new(
+                EntityIdentity::single("entity-1")
+                    .as_json_array_text()
+                    .unwrap(),
+            )
+            .unwrap(),
         }
     }
 }
