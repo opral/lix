@@ -368,6 +368,21 @@ impl SegmentByteIndex {
     }
 }
 
+#[derive(Default)]
+struct SourceParentFacts {
+    reachable_memberships: HashSet<String>,
+    first_parent_winners: HashMap<StateRowIdentity, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FirstParentWinnerFact {
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) deleted: bool,
+}
+
 impl<S> ChangelogStoreReader<S>
 where
     S: ChangelogStorageRead,
@@ -506,6 +521,221 @@ where
             }
         };
         Ok(ChangeLoadBatch { entries })
+    }
+
+    pub(crate) async fn load_physical_segment_changes(
+        &mut self,
+        change_ids: &[String],
+    ) -> Result<Vec<Option<(SegmentObjectLocation, SegmentChange)>>, LixError> {
+        let by_change_entries = self.load_by_change_many(change_ids).await?;
+        let mut segment_ids = Vec::new();
+        let mut seen_segment_ids = HashSet::new();
+        for entry in by_change_entries.iter().flatten() {
+            if seen_segment_ids.insert(entry.location.segment_id.clone()) {
+                segment_ids.push(entry.location.segment_id.clone());
+            }
+        }
+        let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
+        let mut entries = Vec::with_capacity(change_ids.len());
+        for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
+            let Some(by_change) = by_change else {
+                entries.push(None);
+                continue;
+            };
+            if by_change.change_id != *change_id {
+                return Err(LixError::unknown(format!(
+                    "by_change key for '{change_id}' contains change_id '{}'",
+                    by_change.change_id
+                )));
+            }
+            let Some(segment) = segments.get(&by_change.location.segment_id) else {
+                return Err(LixError::unknown(format!(
+                    "changelog by_change entry for '{change_id}' points to missing segment '{}'",
+                    by_change.location.segment_id
+                )));
+            };
+            let change = segment.load_change(&by_change.location, change_id)?;
+            validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
+            entries.push(Some((by_change.location.clone(), change)));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) async fn load_first_parent_winner_facts_for_visible_commit(
+        &mut self,
+        root_commit_id: &str,
+        identities: &[StateRowIdentity],
+    ) -> Result<HashMap<StateRowIdentity, FirstParentWinnerFact>, LixError> {
+        let requested = identities.iter().cloned().collect::<HashSet<_>>();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.load_first_parent_winner_facts_for_visible_commit_inner(root_commit_id, |identity| {
+            Ok(requested.contains(identity))
+        })
+        .await
+    }
+
+    pub(crate) async fn load_first_parent_winner_facts_matching_visible_commit(
+        &mut self,
+        root_commit_id: &str,
+        include_identity: impl FnMut(&StateRowIdentity) -> Result<bool, LixError>,
+    ) -> Result<HashMap<StateRowIdentity, FirstParentWinnerFact>, LixError> {
+        self.load_first_parent_winner_facts_for_visible_commit_inner(
+            root_commit_id,
+            include_identity,
+        )
+        .await
+    }
+
+    pub(crate) async fn load_visible_commit_winners(
+        &mut self,
+        commit_id: &str,
+        identities: &[StateRowIdentity],
+    ) -> Result<HashMap<StateRowIdentity, String>, LixError> {
+        let requested = identities.iter().cloned().collect::<HashSet<_>>();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let Some(visibility) = self.load_commit_visibility(commit_id).await? else {
+            return Err(LixError::unknown(format!(
+                "visible changelog commit '{commit_id}' is missing while validating tracked-state diff row"
+            )));
+        };
+        let Some(segment) = self
+            .load_segment_byte_index(&visibility.location.segment_id)
+            .await?
+        else {
+            return Err(LixError::unknown(format!(
+                "visible changelog commit '{commit_id}' points to missing segment '{}'",
+                visibility.location.segment_id
+            )));
+        };
+        if visibility.checksum != visibility.location.checksum {
+            return Err(LixError::unknown(format!(
+                "visible changelog commit '{commit_id}' checksum does not match physical locator checksum"
+            )));
+        }
+        let commit = segment.load_commit(&visibility.location, commit_id)?;
+        validate_commit_checksum(&visibility.checksum, commit_id, &commit)?;
+        let mut winners = HashMap::new();
+        for (identity, change_id) in &commit.directory.state_row_identities {
+            if requested.contains(identity) {
+                winners.insert(identity.clone(), change_id.clone());
+            }
+        }
+        Ok(winners)
+    }
+
+    pub(crate) async fn load_all_first_parent_winner_facts_for_visible_commit(
+        &mut self,
+        root_commit_id: &str,
+    ) -> Result<HashMap<StateRowIdentity, FirstParentWinnerFact>, LixError> {
+        self.load_first_parent_winner_facts_for_visible_commit_inner(root_commit_id, |_| Ok(true))
+            .await
+    }
+
+    async fn load_first_parent_winner_facts_for_visible_commit_inner(
+        &mut self,
+        root_commit_id: &str,
+        mut include_identity: impl FnMut(&StateRowIdentity) -> Result<bool, LixError>,
+    ) -> Result<HashMap<StateRowIdentity, FirstParentWinnerFact>, LixError> {
+        let mut newest_winners = HashMap::<StateRowIdentity, (String, String)>::new();
+        let mut matched_changes = Vec::<(StateRowIdentity, String)>::new();
+        let mut seen_commits = HashSet::new();
+        let mut current = Some(root_commit_id.to_string());
+        while let Some(commit_id) = current.take() {
+            if !seen_commits.insert(commit_id.clone()) {
+                return Err(LixError::unknown(format!(
+                    "visible changelog first-parent history contains cycle at commit '{commit_id}' while validating tracked-state diff row"
+                )));
+            }
+            let Some(visibility) = self.load_commit_visibility(&commit_id).await? else {
+                return Err(LixError::unknown(format!(
+                    "visible changelog commit '{commit_id}' is missing while validating tracked-state diff row"
+                )));
+            };
+            let Some(segment) = self
+                .load_segment_byte_index(&visibility.location.segment_id)
+                .await?
+            else {
+                return Err(LixError::unknown(format!(
+                    "visible changelog commit '{commit_id}' points to missing segment '{}'",
+                    visibility.location.segment_id
+                )));
+            };
+            if visibility.checksum != visibility.location.checksum {
+                return Err(LixError::unknown(format!(
+                    "visible changelog commit '{commit_id}' checksum does not match physical locator checksum"
+                )));
+            }
+            let commit = segment.load_commit(&visibility.location, &commit_id)?;
+            validate_commit_checksum(&visibility.checksum, &commit_id, &commit)?;
+            let mut commit_winners = HashMap::<StateRowIdentity, String>::new();
+            for (identity, change_id) in &commit.directory.state_row_identities {
+                if include_identity(identity)? {
+                    commit_winners.insert(identity.clone(), change_id.clone());
+                }
+            }
+            for (identity, change_id) in commit_winners {
+                newest_winners
+                    .entry(identity.clone())
+                    .or_insert_with(|| (change_id.clone(), commit_id.clone()));
+                matched_changes.push((identity, change_id));
+            }
+            current = commit.header.parent_commit_ids.first().cloned();
+        }
+
+        let mut change_ids = matched_changes
+            .iter()
+            .map(|(_, change_id)| change_id.clone())
+            .collect::<Vec<_>>();
+        change_ids.sort();
+        change_ids.dedup();
+        let loaded_changes = self.load_physical_segment_changes(&change_ids).await?;
+        let mut changes_by_id = HashMap::new();
+        for (change_id, loaded) in change_ids.into_iter().zip(loaded_changes) {
+            let Some((_, change)) = loaded else {
+                return Err(LixError::unknown(format!(
+                    "first-parent winner references missing changelog change '{change_id}'"
+                )));
+            };
+            changes_by_id.insert(change_id, change);
+        }
+
+        let mut created_at_by_identity = HashMap::new();
+        for (identity, change_id) in matched_changes {
+            let Some(change) = changes_by_id.get(&change_id) else {
+                continue;
+            };
+            created_at_by_identity.insert(identity, change.created_at.clone());
+        }
+
+        let mut facts = HashMap::new();
+        for (identity, (change_id, commit_id)) in newest_winners {
+            let Some(change) = changes_by_id.get(&change_id) else {
+                return Err(LixError::unknown(format!(
+                    "first-parent winner references missing changelog change '{change_id}'"
+                )));
+            };
+            let created_at = created_at_by_identity.get(&identity).cloned().ok_or_else(|| {
+                LixError::unknown(format!(
+                    "first-parent winner for commit '{root_commit_id}' and identity {:?} is missing created_at",
+                    identity
+                ))
+            })?;
+            facts.insert(
+                identity,
+                FirstParentWinnerFact {
+                    change_id,
+                    commit_id,
+                    created_at,
+                    updated_at: change.created_at.clone(),
+                    deleted: change.snapshot_ref.is_none(),
+                },
+            );
+        }
+        Ok(facts)
     }
 
     async fn load_physical_change_entries(
