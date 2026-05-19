@@ -1,15 +1,20 @@
 //! Write execution for bound sql2 plans.
 
+use std::collections::BTreeSet;
+
 use serde_json::json;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::SqlLogicalPlan;
+use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
+use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::predicate::BoundPredicate;
 use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::SqlWriteExecutionContext;
-use crate::{LixError, Value};
+use crate::{LixError, Value, GLOBAL_VERSION_ID};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,17 +167,422 @@ fn resolve_parameterized_version_scope(
         VersionScope::ExplicitRequiredDynamic {
             mut version_ids,
             param_indexes,
-        } => {
-            insert_version_param_values(&mut version_ids, &param_indexes, params)?;
-            if version_ids.is_empty() {
-                VersionScope::Empty
-            } else {
-                VersionScope::ExplicitRequired { version_ids }
+        } => match version_column_for_target(&plan.bound.target) {
+            Some(version_column) => {
+                match resolved_predicate_version_selector(
+                    &plan.bound.predicate,
+                    version_column,
+                    params,
+                )? {
+                    ResolvedVersionSelector::Static(version_ids) if version_ids.is_empty() => {
+                        VersionScope::Empty
+                    }
+                    ResolvedVersionSelector::Static(version_ids) => {
+                        VersionScope::ExplicitRequired { version_ids }
+                    }
+                    ResolvedVersionSelector::Missing => {
+                        insert_version_param_values(&mut version_ids, &param_indexes, params)?;
+                        if version_ids.is_empty() {
+                            VersionScope::Empty
+                        } else {
+                            VersionScope::ExplicitRequired { version_ids }
+                        }
+                    }
+                }
             }
-        }
+            None => {
+                insert_version_param_values(&mut version_ids, &param_indexes, params)?;
+                if version_ids.is_empty() {
+                    VersionScope::Empty
+                } else {
+                    VersionScope::ExplicitRequired { version_ids }
+                }
+            }
+        },
         scope => scope,
     };
+    normalize_lix_state_by_version_scope(&mut plan, params)?;
     Ok(plan)
+}
+
+fn version_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
+    match target {
+        BoundWriteTarget::LixStateByVersion => Some("version_id"),
+        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByVersion {
+            ..
+        })
+        | BoundWriteTarget::File(crate::sql2::bind::write::FileWriteSurface::ByVersion)
+        | BoundWriteTarget::Directory(crate::sql2::bind::write::DirectoryWriteSurface::ByVersion) => {
+            Some("lixcol_version_id")
+        }
+        _ => None,
+    }
+}
+
+fn normalize_lix_state_by_version_scope(
+    plan: &mut LogicalWritePlan,
+    params: &[Value],
+) -> Result<(), LixError> {
+    if !matches!(plan.bound.target, BoundWriteTarget::LixStateByVersion) {
+        return Ok(());
+    }
+    let version_ids = match &plan.bound.version_scope {
+        VersionScope::Explicit { version_ids } | VersionScope::ExplicitRequired { version_ids } => {
+            version_ids
+        }
+        _ => return Ok(()),
+    };
+    let explicit_global = explicit_lix_state_global_value(&plan.bound.input, params)?.or(
+        predicate_lix_state_global_value(&plan.bound.predicate, params)?,
+    );
+    if version_ids.len() > 1 {
+        if explicit_global == Some(true) || version_ids.contains(GLOBAL_VERSION_ID) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "lix_state_by_version writes cannot mix global and version-specific rows",
+            ));
+        }
+        return Ok(());
+    }
+    let is_global_version = version_ids.contains(GLOBAL_VERSION_ID);
+    if explicit_global == Some(true) && !is_global_version {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_state_by_version writes cannot combine global = true with non-global version_id",
+        ));
+    }
+    if !is_global_version {
+        return Ok(());
+    }
+    match explicit_global {
+        Some(false) => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_state_by_version writes cannot combine global = false with global version_id",
+        )),
+        Some(true) | None => {
+            plan.bound.version_scope = VersionScope::Global;
+            Ok(())
+        }
+    }
+}
+
+fn explicit_lix_state_global_value(
+    input: &BoundWriteInput,
+    params: &[Value],
+) -> Result<Option<bool>, LixError> {
+    let BoundWriteInput::Values(values) = input else {
+        return Ok(None);
+    };
+    let Some(global_index) = values.column_index("global") else {
+        return Ok(None);
+    };
+    let mut explicit = None;
+    for row in &values.rows {
+        let value = match &row[global_index] {
+            BoundExpr::Literal(BoundLiteral::Bool(value)) => *value,
+            BoundExpr::Literal(BoundLiteral::Null) => continue,
+            BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+                Some(Value::Boolean(value)) => *value,
+                Some(_) => {
+                    return Err(LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        "lix_state_by_version global selectors must be boolean parameters",
+                    ));
+                }
+                None => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("missing SQL parameter ${}", param.index),
+                    ));
+                }
+            },
+            _ => {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "lix_state_by_version global selectors must be static booleans",
+                ));
+            }
+        };
+        if explicit.is_some_and(|prior| prior != value) {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "lix_state_by_version writes cannot mix global and version-specific rows",
+            ));
+        }
+        explicit = Some(value);
+    }
+    Ok(explicit)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolvedVersionSelector {
+    Missing,
+    Static(BTreeSet<String>),
+}
+
+impl ResolvedVersionSelector {
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Missing, _) | (_, Self::Missing) => Self::Missing,
+            (Self::Static(mut left), Self::Static(right)) => {
+                left.extend(right);
+                Self::Static(left)
+            }
+        }
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Static(left), Self::Static(right)) => {
+                Self::Static(left.intersection(&right).cloned().collect())
+            }
+        }
+    }
+}
+
+fn resolved_predicate_version_selector(
+    predicate: &BoundPredicate,
+    version_column: &str,
+    params: &[Value],
+) -> Result<ResolvedVersionSelector, LixError> {
+    match predicate {
+        BoundPredicate::True => Ok(ResolvedVersionSelector::Missing),
+        BoundPredicate::False => Ok(ResolvedVersionSelector::Static(BTreeSet::new())),
+        BoundPredicate::And(predicates) => {
+            let mut result = ResolvedVersionSelector::Missing;
+            for predicate in predicates {
+                result = result.intersect(resolved_predicate_version_selector(
+                    predicate,
+                    version_column,
+                    params,
+                )?);
+            }
+            Ok(result)
+        }
+        BoundPredicate::Or(predicates) => {
+            let mut result = ResolvedVersionSelector::Static(BTreeSet::new());
+            for predicate in predicates {
+                result = result.union(resolved_predicate_version_selector(
+                    predicate,
+                    version_column,
+                    params,
+                )?);
+            }
+            Ok(result)
+        }
+        BoundPredicate::Eq(left, right) => {
+            resolved_version_selector_from_binary_exprs(left, right, version_column, params)
+                .or_else(|| {
+                    resolved_version_selector_from_binary_exprs(right, left, version_column, params)
+                })
+                .transpose()
+                .map(|selector| selector.unwrap_or(ResolvedVersionSelector::Missing))
+        }
+        BoundPredicate::In { expr, values } => {
+            let BoundExpr::Column(column) = expr else {
+                return Ok(ResolvedVersionSelector::Missing);
+            };
+            if column.name != version_column {
+                return Ok(ResolvedVersionSelector::Missing);
+            }
+            let mut result = ResolvedVersionSelector::Static(BTreeSet::new());
+            for value in values {
+                result = result.union(resolved_value_version_selector(value, params)?);
+            }
+            Ok(result)
+        }
+    }
+}
+
+fn resolved_version_selector_from_binary_exprs(
+    column_expr: &BoundExpr,
+    value_expr: &BoundExpr,
+    version_column: &str,
+    params: &[Value],
+) -> Option<Result<ResolvedVersionSelector, LixError>> {
+    let BoundExpr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != version_column {
+        return None;
+    }
+    Some(resolved_value_version_selector(value_expr, params))
+}
+
+fn resolved_value_version_selector(
+    expr: &BoundExpr,
+    params: &[Value],
+) -> Result<ResolvedVersionSelector, LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Text(version_id)) => {
+            Ok(ResolvedVersionSelector::Static(BTreeSet::from([
+                version_id.clone(),
+            ])))
+        }
+        BoundExpr::Literal(BoundLiteral::Null) => {
+            Ok(ResolvedVersionSelector::Static(BTreeSet::new()))
+        }
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Text(version_id)) => Ok(ResolvedVersionSelector::Static(BTreeSet::from([
+                version_id.clone(),
+            ]))),
+            Some(Value::Null) => Ok(ResolvedVersionSelector::Static(BTreeSet::new())),
+            Some(_) => Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "by-version SQL write selectors require text version-id parameters",
+            )),
+            None => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "SQL version selector parameter ${} was not provided",
+                    param.index
+                ),
+            )),
+        },
+        _ => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "by-version SQL write predicates require string version ids",
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedGlobalSelector {
+    Missing,
+    Empty,
+    Static(bool),
+    Mixed,
+}
+
+impl ResolvedGlobalSelector {
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
+            (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Empty, selector) | (selector, Self::Empty) => selector,
+            (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
+            (Self::Static(_), Self::Static(_)) => Self::Mixed,
+        }
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
+            (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Mixed, selector) | (selector, Self::Mixed) => selector,
+            (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
+            (Self::Static(_), Self::Static(_)) => Self::Empty,
+        }
+    }
+}
+
+fn predicate_lix_state_global_value(
+    predicate: &BoundPredicate,
+    params: &[Value],
+) -> Result<Option<bool>, LixError> {
+    match resolved_predicate_global_selector(predicate, params)? {
+        ResolvedGlobalSelector::Static(value) => Ok(Some(value)),
+        ResolvedGlobalSelector::Mixed => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_state_by_version writes cannot mix global and version-specific rows",
+        )),
+        ResolvedGlobalSelector::Missing | ResolvedGlobalSelector::Empty => Ok(None),
+    }
+}
+
+fn resolved_predicate_global_selector(
+    predicate: &BoundPredicate,
+    params: &[Value],
+) -> Result<ResolvedGlobalSelector, LixError> {
+    match predicate {
+        BoundPredicate::True => Ok(ResolvedGlobalSelector::Missing),
+        BoundPredicate::False => Ok(ResolvedGlobalSelector::Empty),
+        BoundPredicate::And(predicates) => {
+            let mut result = ResolvedGlobalSelector::Missing;
+            for predicate in predicates {
+                result = result.intersect(resolved_predicate_global_selector(predicate, params)?);
+            }
+            Ok(result)
+        }
+        BoundPredicate::Or(predicates) => {
+            let mut result = ResolvedGlobalSelector::Empty;
+            let mut has_missing_branch = false;
+            for predicate in predicates {
+                let selector = resolved_predicate_global_selector(predicate, params)?;
+                if selector == ResolvedGlobalSelector::Missing {
+                    has_missing_branch = true;
+                    continue;
+                }
+                result = result.union(selector);
+            }
+            if has_missing_branch {
+                if result == ResolvedGlobalSelector::Empty {
+                    Ok(ResolvedGlobalSelector::Missing)
+                } else {
+                    Ok(ResolvedGlobalSelector::Mixed)
+                }
+            } else {
+                Ok(result)
+            }
+        }
+        BoundPredicate::Eq(left, right) => global_value_from_binary_exprs(left, right)
+            .or_else(|| global_value_from_binary_exprs(right, left))
+            .map(|expr| global_selector_value(expr, params))
+            .transpose()
+            .map(|selector| selector.unwrap_or(ResolvedGlobalSelector::Missing)),
+        BoundPredicate::In { expr, values } => {
+            let BoundExpr::Column(column) = expr else {
+                return Ok(ResolvedGlobalSelector::Missing);
+            };
+            if column.name != "global" {
+                return Ok(ResolvedGlobalSelector::Missing);
+            }
+            let mut result = ResolvedGlobalSelector::Missing;
+            for value in values {
+                result = result.union(global_selector_value(value, params)?);
+            }
+            Ok(result)
+        }
+    }
+}
+
+fn global_value_from_binary_exprs<'a>(
+    column_expr: &BoundExpr,
+    value_expr: &'a BoundExpr,
+) -> Option<&'a BoundExpr> {
+    let BoundExpr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != "global" {
+        return None;
+    }
+    Some(value_expr)
+}
+
+fn global_selector_value(
+    expr: &BoundExpr,
+    params: &[Value],
+) -> Result<ResolvedGlobalSelector, LixError> {
+    match expr {
+        BoundExpr::Literal(BoundLiteral::Bool(value)) => Ok(ResolvedGlobalSelector::Static(*value)),
+        BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
+            Some(Value::Boolean(value)) => Ok(ResolvedGlobalSelector::Static(*value)),
+            Some(Value::Null) => Ok(ResolvedGlobalSelector::Missing),
+            Some(_) => Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "lix_state global predicates require boolean parameters",
+            )),
+            None => Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("missing SQL parameter ${}", param.index),
+            )),
+        },
+        _ => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "lix_state global predicates require boolean literals",
+        )),
+    }
 }
 
 fn insert_version_param_values(
@@ -185,6 +595,7 @@ fn insert_version_param_values(
             Some(Value::Text(version_id)) => {
                 version_ids.insert(version_id.clone());
             }
+            Some(Value::Null) => {}
             Some(_) => {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,

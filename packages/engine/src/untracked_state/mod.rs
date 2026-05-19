@@ -1,4 +1,4 @@
-mod codec;
+pub(crate) mod codec;
 mod context;
 mod materialization;
 pub(crate) mod storage;

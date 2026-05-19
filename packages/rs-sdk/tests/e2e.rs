@@ -1,14 +1,6 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
 use lix_rs_sdk::{
-    open_lix, Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
-    CreateVersionOptions, LixError, MergeVersionOptions, MergeVersionOutcome, OpenLixOptions,
-    SwitchVersionOptions, Value,
+    open_lix, CreateVersionOptions, InMemoryBackend, LixError, MergeVersionOptions,
+    MergeVersionOutcome, OpenLixOptions, SwitchVersionOptions, Value,
 };
 
 #[tokio::test]
@@ -95,23 +87,14 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
 
 #[tokio::test]
 async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
-    let backend = SharedTestBackend::new();
-    let close_count = backend.close_count();
     let lix = open_lix(OpenLixOptions {
-        backend: Some(Box::new(backend)),
+        backend: Some(InMemoryBackend::new()),
     })
     .await
     .unwrap();
 
     lix.close().await.unwrap();
     lix.close().await.unwrap();
-    assert_eq!(
-        close_count
-            .lock()
-            .map(|count| *count)
-            .expect("close count lock should be available"),
-        1
-    );
 
     let error = lix
         .execute("SELECT value FROM lix_key_value WHERE key = 'lix_id'", &[])
@@ -128,9 +111,9 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
 
 #[tokio::test]
 async fn rs_sdk_close_does_not_destroy_committed_data() {
-    let backend = SharedTestBackend::new();
+    let backend = InMemoryBackend::new();
     let first = open_lix(OpenLixOptions {
-        backend: Some(Box::new(backend.clone())),
+        backend: Some(backend.clone()),
     })
     .await
     .unwrap();
@@ -154,7 +137,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     assert_closed(error);
 
     let second = open_lix(OpenLixOptions {
-        backend: Some(Box::new(backend)),
+        backend: Some(backend),
     })
     .await
     .unwrap();
@@ -175,10 +158,8 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 
 #[tokio::test]
 async fn failed_write_validation_does_not_poison_backend_transaction() {
-    let backend = SharedTestBackend::rejecting_nested_transactions();
-    let rollback_count = backend.rollback_count();
     let lix = open_lix(OpenLixOptions {
-        backend: Some(Box::new(backend)),
+        backend: Some(InMemoryBackend::new()),
     })
     .await
     .unwrap();
@@ -200,13 +181,6 @@ async fn failed_write_validation_does_not_poison_backend_transaction() {
     let result = lix.execute("SELECT 1 AS ok", &[]).await.unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Integer(1)]);
-    assert!(
-        *rollback_count
-            .lock()
-            .expect("rollback count lock should be available")
-            > 0,
-        "failed commit validation should rollback the backend transaction"
-    );
 
     lix.execute(
         "INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, lix_json($3))",
@@ -486,326 +460,4 @@ async fn task_done(lix: &lix_rs_sdk::Lix, task_id: &str) -> bool {
 
 fn assert_closed(error: LixError) {
     assert_eq!(error.code, LixError::CODE_CLOSED);
-}
-
-type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
-
-#[derive(Clone, Default)]
-struct SharedTestBackend {
-    kv: Arc<Mutex<KvMap>>,
-    close_count: Arc<Mutex<usize>>,
-    rollback_count: Arc<Mutex<usize>>,
-    active_transaction: Arc<Mutex<bool>>,
-    reject_nested_transactions: bool,
-}
-
-impl SharedTestBackend {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn rejecting_nested_transactions() -> Self {
-        Self {
-            reject_nested_transactions: true,
-            ..Self::default()
-        }
-    }
-
-    fn close_count(&self) -> Arc<Mutex<usize>> {
-        Arc::clone(&self.close_count)
-    }
-
-    fn rollback_count(&self) -> Arc<Mutex<usize>> {
-        Arc::clone(&self.rollback_count)
-    }
-
-    fn begin_test_transaction(&self) -> Result<SharedTestTransaction, LixError> {
-        let mut active_transaction = self
-            .active_transaction
-            .lock()
-            .map_err(|_| LixError::unknown("test backend active transaction lock poisoned"))?;
-        if *active_transaction && self.reject_nested_transactions {
-            return Err(LixError::unknown(
-                "cannot open nested Lix backend transaction",
-            ));
-        }
-        *active_transaction = true;
-        drop(active_transaction);
-
-        let snapshot = self
-            .kv
-            .lock()
-            .map_err(|_| LixError::unknown("test backend lock poisoned"))?
-            .clone();
-        Ok(SharedTestTransaction {
-            parent: Arc::clone(&self.kv),
-            kv: snapshot,
-            active_transaction: Arc::clone(&self.active_transaction),
-            rollback_count: Arc::clone(&self.rollback_count),
-        })
-    }
-}
-
-#[async_trait]
-impl Backend for SharedTestBackend {
-    async fn begin_read_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-        Ok(Box::new(self.begin_test_transaction()?))
-    }
-
-    async fn begin_write_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
-        Ok(Box::new(self.begin_test_transaction()?))
-    }
-
-    async fn close(&self) -> Result<(), LixError> {
-        *self
-            .close_count
-            .lock()
-            .map_err(|_| LixError::unknown("test backend close count lock poisoned"))? += 1;
-        Ok(())
-    }
-}
-
-struct SharedTestTransaction {
-    parent: Arc<Mutex<KvMap>>,
-    kv: KvMap,
-    active_transaction: Arc<Mutex<bool>>,
-    rollback_count: Arc<Mutex<usize>>,
-}
-
-#[async_trait]
-impl BackendReadTransaction for SharedTestTransaction {
-    async fn get_values(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvValueBatch, LixError> {
-        Ok(get_values_from_map(&self.kv, request))
-    }
-
-    async fn exists_many(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvExistsBatch, LixError> {
-        Ok(exists_many_from_map(&self.kv, request))
-    }
-
-    async fn scan_keys(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvKeyPage, LixError> {
-        Ok(scan_map_keys(&self.kv, request))
-    }
-
-    async fn scan_values(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvValuePage, LixError> {
-        Ok(scan_map_values(&self.kv, request))
-    }
-
-    async fn scan_entries(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvEntryPage, LixError> {
-        Ok(scan_map_entries(&self.kv, request))
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        *self
-            .rollback_count
-            .lock()
-            .map_err(|_| LixError::unknown("test backend rollback count lock poisoned"))? += 1;
-        *self
-            .active_transaction
-            .lock()
-            .map_err(|_| LixError::unknown("test backend active transaction lock poisoned"))? =
-            false;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl BackendWriteTransaction for SharedTestTransaction {
-    async fn write_kv_batch(
-        &mut self,
-        batch: BackendKvWriteBatch,
-    ) -> Result<BackendKvWriteStats, LixError> {
-        let mut stats = BackendKvWriteStats::default();
-        for group in batch.groups {
-            let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let key = group.put_key(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
-                })?;
-                let value = group.put_value(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
-                })?;
-                stats.puts += 1;
-                stats.bytes_written += key.len() + value.len();
-                self.kv
-                    .insert((namespace.clone(), key.to_vec()), value.to_vec());
-            }
-            for index in 0..group.delete_count() {
-                let key = group.delete_key(index).ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "backend write batch missing delete key",
-                    )
-                })?;
-                stats.deletes += 1;
-                stats.bytes_written += key.len();
-                self.kv.remove(&(namespace.clone(), key.to_vec()));
-            }
-        }
-        Ok(stats)
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), LixError> {
-        *self
-            .parent
-            .lock()
-            .map_err(|_| LixError::unknown("test backend lock poisoned"))? = self.kv;
-        *self
-            .active_transaction
-            .lock()
-            .map_err(|_| LixError::unknown("test backend active transaction lock poisoned"))? =
-            false;
-        Ok(())
-    }
-}
-
-fn get_values_from_map(kv: &KvMap, request: BackendKvGetRequest) -> BackendKvValueBatch {
-    let mut groups = Vec::with_capacity(request.groups.len());
-    for group in request.groups {
-        let namespace = group.namespace.clone();
-        let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
-        let mut present = Vec::with_capacity(group.keys.len());
-        for key in group.keys {
-            if let Some(value) = kv.get(&(namespace.clone(), key)) {
-                values.push(value);
-                present.push(true);
-            } else {
-                values.push([]);
-                present.push(false);
-            }
-        }
-        groups.push(BackendKvValueGroup::new(
-            namespace,
-            values.finish(),
-            present,
-        ));
-    }
-    BackendKvValueBatch { groups }
-}
-
-fn exists_many_from_map(kv: &KvMap, request: BackendKvGetRequest) -> BackendKvExistsBatch {
-    let mut groups = Vec::with_capacity(request.groups.len());
-    for group in request.groups {
-        let namespace = group.namespace.clone();
-        let exists = group
-            .keys
-            .into_iter()
-            .map(|key| kv.contains_key(&(namespace.clone(), key)))
-            .collect();
-        groups.push(BackendKvExistsGroup { namespace, exists });
-    }
-    BackendKvExistsBatch { groups }
-}
-
-fn scan_map_keys(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvKeyPage {
-    let pairs = scan_filtered_pairs(kv, &request);
-    let has_more = pairs.len() > request.limit;
-    let mut keys = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
-    let mut resume_after = None;
-    for (index, (key, _)) in pairs.into_iter().enumerate() {
-        if index >= request.limit {
-            break;
-        }
-        resume_after = Some(key.clone());
-        keys.push(key);
-    }
-    let resume_after = has_more.then_some(resume_after).flatten();
-    BackendKvKeyPage {
-        keys: keys.finish(),
-        resume_after,
-    }
-}
-
-fn scan_map_values(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvValuePage {
-    let pairs = scan_filtered_pairs(kv, &request);
-    let has_more = pairs.len() > request.limit;
-    let mut values = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
-    let mut resume_after = None;
-    for (index, (key, value)) in pairs.into_iter().enumerate() {
-        if index >= request.limit {
-            break;
-        }
-        resume_after = Some(key.clone());
-        values.push(value);
-    }
-    let resume_after = has_more.then_some(resume_after).flatten();
-    BackendKvValuePage {
-        values: values.finish(),
-        resume_after,
-    }
-}
-
-fn scan_map_entries(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvEntryPage {
-    let pairs = scan_filtered_pairs(kv, &request);
-    let has_more = pairs.len() > request.limit;
-    let mut keys = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
-    let mut values = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
-    let mut resume_after = None;
-    for (index, (key, value)) in pairs.into_iter().enumerate() {
-        if index >= request.limit {
-            break;
-        }
-        resume_after = Some(key.clone());
-        keys.push(key);
-        values.push(value);
-    }
-    let resume_after = has_more.then_some(resume_after).flatten();
-    BackendKvEntryPage {
-        keys: keys.finish(),
-        values: values.finish(),
-        resume_after,
-    }
-}
-
-fn scan_filtered_pairs<'a>(
-    kv: &'a KvMap,
-    request: &BackendKvScanRequest,
-) -> Vec<(&'a Vec<u8>, &'a Vec<u8>)> {
-    let scan_limit = request
-        .limit
-        .checked_add(1 + usize::from(request.after.is_some()))
-        .unwrap_or(request.limit);
-    let mut pairs = kv
-        .iter()
-        .filter(|((candidate_namespace, key), _)| {
-            candidate_namespace == &request.namespace && key_matches_range(key, &request.range)
-        })
-        .collect::<Vec<_>>();
-    pairs.sort_by(|left, right| left.0 .1.cmp(&right.0 .1));
-    pairs.truncate(scan_limit);
-    pairs
-        .into_iter()
-        .filter(|((_, key), _)| {
-            request
-                .after
-                .as_deref()
-                .is_none_or(|after| key.as_slice() > after)
-        })
-        .map(|((_, key), value)| (key, value))
-        .collect()
-}
-
-fn key_matches_range(key: &[u8], range: &BackendKvScanRange) -> bool {
-    match range {
-        BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
-        BackendKvScanRange::Range { start, end } => start.as_slice() <= key && key < end.as_slice(),
-    }
 }

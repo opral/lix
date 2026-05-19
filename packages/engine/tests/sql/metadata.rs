@@ -117,14 +117,266 @@ simulation_test!(
                 .expect_err("invalid typed entity metadata should be rejected on INSERT"),
         );
 
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
+                     VALUES ('metadata-entity-json-null-insert', 'value', lix_json('null'))",
+                    &[],
+                )
+                .await
+                .expect_err("JSON null typed entity metadata should be rejected on INSERT"),
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
+                     VALUES ('metadata-entity-lix-json-sql-null-insert', 'value', lix_json(NULL))",
+                    &[],
+                )
+                .await
+                .expect_err("lix_json(NULL) metadata should be rejected as JSON null on INSERT"),
+        );
+
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('metadata-entity-update', 'value')",
+                 VALUES ('metadata-entity-json-null-value', lix_json(NULL))",
+                &[],
+            )
+            .await
+            .expect("lix_json(NULL) should be accepted for JSON entity columns");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT value \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-json-null-value'",
+                    &[],
+                )
+                .await
+                .expect("JSON null entity value should read"),
+            "value",
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('metadata-entity-json-string-value', lix_json('\"{\\\"source\\\":\\\"json-string\\\"}\"'))",
+                &[],
+            )
+            .await
+            .expect("JSON string entity value should be accepted");
+        assert_metadata_value(
+            session
+                .execute(
+                    "SELECT value \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-json-string-value'",
+                    &[],
+                )
+                .await
+                .expect("JSON string entity value should read"),
+            "value",
+            &json!("{\"source\":\"json-string\"}"),
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
+                 VALUES ('metadata-entity-sql-null-insert', 'value', NULL)",
+                &[],
+            )
+            .await
+            .expect("SQL NULL typed entity metadata should be accepted on INSERT");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-sql-null-insert'",
+                    &[],
+                )
+                .await
+                .expect("SQL NULL insert metadata should read as NULL"),
+            "lixcol_metadata",
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value, lixcol_metadata) \
+                     VALUES ('metadata-entity-json-null-param-insert', 'value', $1)",
+                    &[Value::Json(json!(null))],
+                )
+                .await
+                .expect_err("JSON null parameter metadata should be rejected on INSERT"),
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('metadata-entity-update', NULL)",
                 &[],
             )
             .await
             .expect("typed entity insert should succeed");
+
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = lixcol_metadata \
+                 WHERE key = 'metadata-entity-update'",
+                &[],
+            )
+            .await
+            .expect("metadata column SQL NULL should be preserved on UPDATE");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect("metadata column SQL NULL should read as NULL"),
+            "lixcol_metadata",
+        );
+
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = lix_json_get(lix_json('{}'), 'missing') \
+                 WHERE key = 'metadata-entity-update'",
+                &[],
+            )
+            .await
+            .expect("metadata expression SQL NULL should be accepted on UPDATE");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect("metadata expression SQL NULL should read as NULL"),
+            "lixcol_metadata",
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_key_value \
+                     SET lixcol_metadata = lix_json_get(lix_json('{\"m\":null}'), 'm') \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect_err("JSON null from lix_json_get should be rejected as metadata"),
+        );
+
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = lix_json_get_text(lix_json('{\"m\":null}'), 'm') \
+                 WHERE key = 'metadata-entity-update'",
+                &[],
+            )
+            .await
+            .expect("JSON null from lix_json_get_text should be accepted as SQL NULL metadata");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect("lix_json_get_text JSON null metadata assignment should read as NULL"),
+            "lixcol_metadata",
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_key_value \
+                     SET lixcol_metadata = value \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect_err("visible JSON null column should be rejected as metadata"),
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_key_value \
+                     SET lixcol_metadata = lix_json_get(lix_json('{\"m\":\"{\\\"source\\\":\\\"json-string\\\"}\"}'), 'm') \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect_err("JSON string from lix_json_get should not be reparsed as metadata text"),
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('{\"source\":\"from-key\"}', 'metadata-source')",
+                &[],
+            )
+            .await
+            .expect("typed entity insert with JSON-shaped string key should succeed");
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = key \
+                 WHERE key = '{\"source\":\"from-key\"}'",
+                &[],
+            )
+            .await
+            .expect("SQL text visible column should be parsed as metadata text");
+        assert_metadata_value(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = '{\"source\":\"from-key\"}'",
+                    &[],
+                )
+                .await
+                .expect("metadata from SQL text column should read as JSON"),
+            "lixcol_metadata",
+            &json!({"source": "from-key"}),
+        );
+
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = lix_json_get(lix_json('\"{\\\"m\\\":{\\\"source\\\":\\\"json-string-root\\\"}}\"'), 'm') \
+                 WHERE key = 'metadata-entity-update'",
+                &[],
+            )
+            .await
+            .expect("JSON string root should not be reparsed by lix_json_get");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect("metadata should remain NULL when JSON string root is not reparsed"),
+            "lixcol_metadata",
+        );
 
         assert_invalid_metadata_error(
             session
@@ -136,6 +388,64 @@ simulation_test!(
                 )
                 .await
                 .expect_err("invalid typed entity metadata should be rejected on UPDATE"),
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_key_value \
+                     SET lixcol_metadata = lix_json('null') \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect_err("JSON null typed entity metadata should be rejected on UPDATE"),
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_key_value \
+                     SET lixcol_metadata = lix_json(NULL) \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect_err("lix_json(NULL) metadata should be rejected as JSON null on UPDATE"),
+        );
+
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = $1 \
+                 WHERE key = 'metadata-entity-update'",
+                &[Value::Null],
+            )
+            .await
+            .expect("SQL NULL parameter metadata should be accepted on UPDATE");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata \
+                     FROM lix_key_value \
+                     WHERE key = 'metadata-entity-update'",
+                    &[],
+                )
+                .await
+                .expect("SQL NULL parameter update metadata should read as NULL"),
+            "lixcol_metadata",
+        );
+
+        assert_invalid_metadata_error(
+            session
+                .execute(
+                    "UPDATE lix_key_value \
+                     SET lixcol_metadata = $1 \
+                     WHERE key = 'metadata-entity-update'",
+                    &[Value::Json(json!(null))],
+                )
+                .await
+                .expect_err("JSON null parameter metadata should be rejected on UPDATE"),
         );
     }
 );
@@ -320,4 +630,12 @@ fn assert_metadata_value(
         .get::<Value>(column)
         .unwrap_or_else(|_| panic!("{column} should be present"));
     assert_eq!(value, Value::Json(expected.clone()));
+}
+
+fn assert_metadata_null(result: lix_engine::ExecuteResult, column: &str) {
+    assert_eq!(result.len(), 1, "expected one metadata row");
+    let value = result.rows()[0]
+        .get::<Value>(column)
+        .unwrap_or_else(|_| panic!("{column} should be present"));
+    assert_eq!(value, Value::Null);
 }

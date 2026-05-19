@@ -72,6 +72,23 @@ enum WriteMix {
     PutDelete80_20,
 }
 
+#[derive(Clone, Copy)]
+enum WriteOrder {
+    Sorted,
+    Reverse,
+    Shuffled,
+}
+
+impl WriteOrder {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sorted => "sorted",
+            Self::Reverse => "reverse_sorted",
+            Self::Shuffled => "shuffled",
+        }
+    }
+}
+
 #[derive(Clone)]
 enum WriteMutation {
     Put(StorageSpace, Key, StoredValue),
@@ -553,6 +570,11 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_write_set_build_and_commit(c, SqliteTempBenchBackend::new());
     bench_write_set_build_and_commit(c, RedbTempBenchBackend::new());
     bench_write_set_build_and_commit(c, RocksDbTempBenchBackend::new());
+    bench_direct_write_order(c, InMemoryBenchBackend);
+    bench_direct_write_order(c, SqliteTempBenchBackend::new());
+    bench_direct_write_order(c, RedbTempBenchBackend::new());
+    bench_direct_write_order(c, RocksDbTempBenchBackend::new());
+    bench_write_batch_seal_sort(c);
     bench_delete_range_fallback(c, InMemoryBenchBackend);
     bench_delete_range_fallback(c, SqliteTempBenchBackend::new());
     bench_delete_range_fallback(c, RedbTempBenchBackend::new());
@@ -961,6 +983,81 @@ where
                     );
                     assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
                     black_box(stats);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_direct_write_order<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!("storage_v2/direct_write_order/{}", backend_family.name());
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    const WRITES: usize = 10_000;
+    const VALUE_SIZE: usize = 32;
+    let storage_space = space(1);
+    for order in [
+        WriteOrder::Sorted,
+        WriteOrder::Reverse,
+        WriteOrder::Shuffled,
+    ] {
+        let batch = direct_ordered_put_batch(storage_space, WRITES, VALUE_SIZE, order);
+        group.throughput(Throughput::Elements(WRITES as u64));
+        group.bench_function(order.name(), |b| {
+            b.iter_batched(
+                || (backend_family.open_empty(), batch.clone()),
+                |(backend, batch)| {
+                    let mut write = backend
+                        .begin_write(WriteOptions::default())
+                        .expect("begin direct write-order write");
+                    write
+                        .put_many(PutBatch { entries: batch })
+                        .expect("put direct write-order batch");
+                    let commit = write.commit().expect("commit direct write-order batch");
+                    assert_eq!(commit.stats.put_entries, WRITES as u64);
+                    assert_eq!(commit.stats.deleted_entries, 0);
+                    assert_eq!(commit.stats.backend_calls, 1);
+                    black_box(commit);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_write_batch_seal_sort(c: &mut Criterion) {
+    let mut group = storage_benchmark_group(c, "storage_v2/write_batch_seal_sort");
+
+    const WRITES: usize = 10_000;
+    const VALUE_SIZE: usize = 32;
+    let storage_space = space(1);
+    for order in [
+        WriteOrder::Sorted,
+        WriteOrder::Reverse,
+        WriteOrder::Shuffled,
+    ] {
+        let batch = direct_ordered_put_batch(storage_space, WRITES, VALUE_SIZE, order);
+        group.throughput(Throughput::Elements(WRITES as u64));
+        group.bench_function(order.name(), |b| {
+            b.iter_batched(
+                || batch.clone(),
+                |batch| {
+                    let sealed = seal_sorted_unique_put_batch(black_box(batch));
+                    assert_eq!(sealed.len(), WRITES);
+                    black_box(sealed);
                 },
                 BatchSize::LargeInput,
             );
@@ -3831,6 +3928,40 @@ fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {
         }
     }
     mutations
+}
+
+fn direct_ordered_put_batch(
+    storage_space: StorageSpace,
+    writes: usize,
+    value_size: usize,
+    order: WriteOrder,
+) -> Vec<PutEntry> {
+    let indexes = match order {
+        WriteOrder::Sorted => (0..writes).collect::<Vec<_>>(),
+        WriteOrder::Reverse => (0..writes).rev().collect::<Vec<_>>(),
+        WriteOrder::Shuffled => (0..writes)
+            .map(|index| (index * 7_919) % writes)
+            .collect::<Vec<_>>(),
+    };
+
+    indexes
+        .into_iter()
+        .map(|index| PutEntry {
+            key: storage_space.encode_key(&key(format!("ordered-put-{index:05}"))),
+            value: value(index as u32, value_size),
+        })
+        .collect()
+}
+
+fn seal_sorted_unique_put_batch(mut entries: Vec<PutEntry>) -> Vec<PutEntry> {
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    for window in entries.windows(2) {
+        assert_ne!(
+            window[0].key, window[1].key,
+            "sealed benchmark input must be unique"
+        );
+    }
+    entries
 }
 
 fn point_request_keys(requested_keys: usize, unique_keys: usize) -> Vec<Key> {

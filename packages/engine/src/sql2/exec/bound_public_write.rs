@@ -1,11 +1,13 @@
 use serde_json::Value as JsonValue;
 
+use crate::common::validate_row_metadata;
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
-    BoundWriteInput, BoundWriteOp, BoundWriteTarget, EntityWriteSurface,
+    BoundInsertValues, BoundWriteInput, BoundWriteOp, BoundWriteTarget, EntityWriteSurface,
 };
+use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
 use crate::sql2::catalog::{
     derive_entity_surface_spec_from_schema, EntityColumnType, EntitySurfaceSpec,
 };
@@ -21,6 +23,7 @@ use crate::{parse_row_metadata_value, LixError, Value};
 
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     matches!(plan.bound.target, BoundWriteTarget::Entity(_))
+        && bound_public_write_shape_supported(plan)
 }
 
 pub(crate) async fn execute_bound_public_write(
@@ -147,35 +150,24 @@ fn entity_insert_rows(
     params: &[Value],
     active_version_commit_id: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>, LixError> {
-    let BoundWriteInput::Values(rows) = &plan.bound.input else {
+    let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "bound entity INSERT supports VALUES only",
         ));
     };
 
-    let mut write_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        let values = row
-            .values
-            .iter()
-            .map(|(column, expr)| {
-                if let Some(surface_column) = spec.visible_column(&column.name) {
-                    reject_direct_blob_json_value(expr, surface_column.column_type, params)?;
-                }
-                Ok((
-                    column.name.as_str(),
-                    eval_expr(
-                        expr,
-                        &EntityEvalContext::insert(&JsonValue::Null),
-                        ctx,
-                        params,
-                        active_version_commit_id,
-                    )?,
-                ))
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        write_rows.push(entity_insert_row(spec, plan, &values)?);
+    let layout = InsertRowLayout::from_values(spec, values)?;
+    let mut write_rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        write_rows.push(entity_insert_row(
+            ctx,
+            plan,
+            &layout,
+            row,
+            params,
+            active_version_commit_id,
+        )?);
     }
     Ok(write_rows)
 }
@@ -193,7 +185,7 @@ async fn entity_update(
         let Some(snapshot) = candidate_snapshot(&candidate)? else {
             continue;
         };
-        let original_context = EntityEvalContext::live(&snapshot, &candidate);
+        let original_context = EntityEvalContext::live(&snapshot, &candidate, spec);
         if !predicate_matches(
             &plan.bound.predicate,
             &original_context,
@@ -210,7 +202,7 @@ async fn entity_update(
         for assignment in &plan.bound.assignments {
             if let Some(column) = spec.visible_column(&assignment.column.name) {
                 reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
-                let value = eval_expr(
+                let value = eval_expr_value(
                     &assignment.value,
                     &original_context,
                     ctx,
@@ -262,7 +254,7 @@ async fn entity_delete(
         let Some(snapshot) = candidate_snapshot(&candidate)? else {
             continue;
         };
-        let context = EntityEvalContext::live(&snapshot, &candidate);
+        let context = EntityEvalContext::live(&snapshot, &candidate, spec);
         if predicate_matches(
             &plan.bound.predicate,
             &context,
@@ -318,51 +310,165 @@ async fn scan_entity_candidates(
     ctx.scan_live_state(&request).await
 }
 
+struct InsertRowLayout {
+    schema_key: String,
+    visible_columns: Vec<EntitySurfaceColumn>,
+    snapshot_context: String,
+    snapshot_capacity: usize,
+    columns: Vec<InsertColumnTarget>,
+}
+
+#[derive(Clone)]
+enum InsertColumnTarget {
+    Visible {
+        name: String,
+        column_type: EntityColumnType,
+    },
+    EntityId,
+    FileId,
+    Metadata,
+    Global,
+    Untracked,
+    VersionId,
+}
+
+impl InsertRowLayout {
+    fn from_values(spec: &EntitySurfaceSpec, values: &BoundInsertValues) -> Result<Self, LixError> {
+        let mut snapshot_capacity = 0;
+        let mut seen_columns = std::collections::BTreeSet::new();
+        let columns = values
+            .columns
+            .iter()
+            .map(|column| {
+                if !seen_columns.insert(column.name.clone()) {
+                    return Err(LixError::new(
+                        LixError::CODE_UNSUPPORTED_SQL,
+                        format!("duplicate entity INSERT column '{}'", column.name),
+                    ));
+                }
+                if let Some(surface_column) = spec.visible_column(&column.name) {
+                    snapshot_capacity += 1;
+                    return Ok(InsertColumnTarget::Visible {
+                        name: surface_column.name.clone(),
+                        column_type: surface_column.column_type,
+                    });
+                }
+                Ok(match column.name.as_str() {
+                    "lixcol_entity_id" => InsertColumnTarget::EntityId,
+                    "lixcol_file_id" => InsertColumnTarget::FileId,
+                    "lixcol_metadata" => InsertColumnTarget::Metadata,
+                    "lixcol_global" => InsertColumnTarget::Global,
+                    "lixcol_untracked" => InsertColumnTarget::Untracked,
+                    "lixcol_version_id" => InsertColumnTarget::VersionId,
+                    _ => {
+                        return Err(LixError::new(
+                            LixError::CODE_UNSUPPORTED_SQL,
+                            format!(
+                                "bound entity INSERT does not support column '{}'",
+                                column.name
+                            ),
+                        ));
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        Ok(Self {
+            schema_key: spec.schema_key.clone(),
+            visible_columns: spec.columns.clone(),
+            snapshot_context: format!("{} insert snapshot_content", spec.schema_key),
+            snapshot_capacity,
+            columns,
+        })
+    }
+}
+
 fn entity_insert_row(
-    spec: &EntitySurfaceSpec,
+    ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
-    values: &[(&str, JsonValue)],
+    layout: &InsertRowLayout,
+    row: &[BoundExpr],
+    params: &[Value],
+    active_version_commit_id: Option<&str>,
 ) -> Result<TransactionWriteRow, LixError> {
-    let mut snapshot = serde_json::Map::new();
-    for column in &spec.columns {
-        if let Some((_, value)) = values.iter().find(|(name, _)| *name == column.name) {
-            snapshot.insert(
-                column.name.clone(),
-                entity_json_value(value.clone(), column.column_type)?,
-            );
+    if row.len() != layout.columns.len() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "entity INSERT rows must have a consistent column layout",
+        ));
+    }
+
+    let mut snapshot = serde_json::Map::with_capacity(layout.snapshot_capacity);
+    let mut entity_id = None;
+    let mut file_id = None;
+    let mut metadata = None;
+    let mut global = None;
+    let mut untracked = None;
+    let mut explicit_version_id = None;
+    let context = EntityEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
+
+    for (expr, target) in row.iter().zip(layout.columns.iter()) {
+        if let InsertColumnTarget::Visible { column_type, .. } = target {
+            reject_direct_blob_json_value(expr, *column_type, params)?;
+        }
+        let eval_value = eval_expr_value(expr, &context, ctx, params, active_version_commit_id)?;
+        if matches!(target, InsertColumnTarget::Metadata) {
+            metadata = optional_metadata_from_eval_value(
+                eval_value,
+                "lixcol_metadata",
+                &layout.schema_key,
+            )?;
+            continue;
+        }
+        match target {
+            InsertColumnTarget::Visible { name, column_type } => {
+                snapshot.insert(name.clone(), entity_json_value(eval_value, *column_type)?);
+                continue;
+            }
+            _ => {}
+        }
+        let value = eval_value.into_json();
+        match target {
+            InsertColumnTarget::Visible { .. } => unreachable!("visible columns handled above"),
+            InsertColumnTarget::EntityId => {
+                entity_id = Some(entity_id_from_value(&value, "lixcol_entity_id")?);
+            }
+            InsertColumnTarget::FileId => {
+                file_id = text_value(value, "lixcol_file_id")?;
+            }
+            InsertColumnTarget::Metadata => unreachable!("metadata handled before JSON conversion"),
+            InsertColumnTarget::Global => {
+                global = bool_value(value, "lixcol_global")?;
+            }
+            InsertColumnTarget::Untracked => {
+                untracked = bool_value(value, "lixcol_untracked")?;
+            }
+            InsertColumnTarget::VersionId => {
+                explicit_version_id = text_value(value, "lixcol_version_id")?;
+            }
         }
     }
-    let snapshot = JsonValue::Object(snapshot);
-    let entity_id = explicit_entity_id(values)?;
 
-    let global = bool_value(values, "lixcol_global")?.unwrap_or(false);
-    let version_id = entity_row_version_id(plan, values, global)?;
+    let snapshot = JsonValue::Object(snapshot);
+    let global = global.unwrap_or(false);
+    let version_id = entity_row_version_id(plan, explicit_version_id, global)?;
     Ok(TransactionWriteRow {
         entity_id,
-        schema_key: spec.schema_key.clone(),
-        file_id: string_value(values, "lixcol_file_id")?,
+        schema_key: layout.schema_key.clone(),
+        file_id,
         snapshot: Some(TransactionJson::from_value(
             snapshot,
-            &format!("{} insert snapshot_content", spec.schema_key),
+            &layout.snapshot_context,
         )?),
-        metadata: metadata_value(values, "lixcol_metadata", &spec.schema_key)?,
+        metadata,
         origin: None,
         created_at: None,
         updated_at: None,
         global,
         change_id: None,
         commit_id: None,
-        untracked: bool_value(values, "lixcol_untracked")?.unwrap_or(false),
+        untracked: untracked.unwrap_or(false),
         version_id,
     })
-}
-
-fn explicit_entity_id(values: &[(&str, JsonValue)]) -> Result<Option<EntityIdentity>, LixError> {
-    let Some((_, value)) = values.iter().find(|(name, _)| *name == "lixcol_entity_id") else {
-        return Ok(None);
-    };
-    let entity_id = entity_id_from_value(value, "lixcol_entity_id")?;
-    Ok(Some(entity_id))
 }
 
 fn reject_projected_global_write(
@@ -394,24 +500,14 @@ fn entity_replace_row_from_live(
     params: &[Value],
     active_version_commit_id: Option<&str>,
 ) -> Result<TransactionWriteRow, LixError> {
-    let metadata = assignment_value(plan, "lixcol_metadata")
-        .map(|expr| {
-            let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
-            let context = EntityEvalContext::live(&snapshot_for_eval, row);
-            eval_expr(expr, &context, ctx, params, active_version_commit_id).and_then(|value| {
-                metadata_from_json_value(value, "lixcol_metadata", &spec.schema_key)
-            })
-        })
-        .transpose()?
-        .or_else(|| {
-            row.metadata
-                .as_ref()
-                .and_then(|metadata| parse_row_metadata_value(metadata, &spec.schema_key).ok())
-                .and_then(|metadata| {
-                    TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
-                        .ok()
-                })
-        });
+    let metadata = if let Some(expr) = assignment_value(plan, "lixcol_metadata") {
+        let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
+        let context = EntityEvalContext::live(&snapshot_for_eval, row, spec);
+        let value = eval_expr_value(expr, &context, ctx, params, active_version_commit_id)?;
+        optional_metadata_from_eval_value(value, "lixcol_metadata", &spec.schema_key)?
+    } else {
+        inherited_metadata(row, spec)?
+    };
 
     Ok(TransactionWriteRow {
         entity_id: Some(row.entity_id.clone()),
@@ -441,23 +537,43 @@ fn entity_replace_row_from_live(
     })
 }
 
+fn inherited_metadata(
+    row: &crate::live_state::MaterializedLiveStateRow,
+    spec: &EntitySurfaceSpec,
+) -> Result<Option<TransactionJson>, LixError> {
+    row.metadata
+        .as_ref()
+        .map(|metadata| {
+            let metadata = parse_row_metadata_value(metadata, &spec.schema_key)?;
+            TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
+        })
+        .transpose()
+}
+
 struct EntityEvalContext<'a> {
     snapshot: &'a JsonValue,
     row: Option<&'a crate::live_state::MaterializedLiveStateRow>,
+    visible_columns: &'a [EntitySurfaceColumn],
 }
 
 impl<'a> EntityEvalContext<'a> {
-    fn insert(snapshot: &'a JsonValue) -> Self {
+    fn insert(snapshot: &'a JsonValue, visible_columns: &'a [EntitySurfaceColumn]) -> Self {
         Self {
             snapshot,
             row: None,
+            visible_columns,
         }
     }
 
-    fn live(snapshot: &'a JsonValue, row: &'a crate::live_state::MaterializedLiveStateRow) -> Self {
+    fn live(
+        snapshot: &'a JsonValue,
+        row: &'a crate::live_state::MaterializedLiveStateRow,
+        spec: &'a EntitySurfaceSpec,
+    ) -> Self {
         Self {
             snapshot,
             row: Some(row),
+            visible_columns: &spec.columns,
         }
     }
 }
@@ -478,6 +594,23 @@ fn entity_spec(
         })
 }
 
+#[derive(Clone, Debug)]
+enum EntityEvalValue {
+    SqlNull,
+    SqlText(String),
+    Json(JsonValue),
+}
+
+impl EntityEvalValue {
+    fn into_json(self) -> JsonValue {
+        match self {
+            Self::SqlNull => JsonValue::Null,
+            Self::SqlText(value) => JsonValue::String(value),
+            Self::Json(value) => value,
+        }
+    }
+}
+
 fn eval_expr(
     expr: &BoundExpr,
     context: &EntityEvalContext<'_>,
@@ -485,77 +618,106 @@ fn eval_expr(
     params: &[Value],
     active_version_commit_id: Option<&str>,
 ) -> Result<JsonValue, LixError> {
+    eval_expr_value(expr, context, ctx, params, active_version_commit_id)
+        .map(EntityEvalValue::into_json)
+}
+
+fn eval_expr_value(
+    expr: &BoundExpr,
+    context: &EntityEvalContext<'_>,
+    ctx: &mut dyn SqlWriteExecutionContext,
+    params: &[Value],
+    active_version_commit_id: Option<&str>,
+) -> Result<EntityEvalValue, LixError> {
     match expr {
-        BoundExpr::Literal(literal) => Ok(literal_json(literal)),
+        BoundExpr::Literal(BoundLiteral::Null) => Ok(EntityEvalValue::SqlNull),
+        BoundExpr::Literal(BoundLiteral::Text(value)) => {
+            Ok(EntityEvalValue::SqlText(value.clone()))
+        }
+        BoundExpr::Literal(literal) => Ok(EntityEvalValue::Json(literal_json(literal))),
         BoundExpr::Param(param) => params
             .get(param.index.saturating_sub(1))
-            .map(value_json)
+            .map(value_eval)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!("missing SQL parameter ${}", param.index),
                 )
             }),
-        BoundExpr::Column(column) => column_json(context, &column.name),
+        BoundExpr::Column(column) => column_eval_value(context, &column.name),
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
-            let raw = eval_expr(&args[0], context, ctx, params, active_version_commit_id)?;
+            let raw = eval_expr_value(&args[0], context, ctx, params, active_version_commit_id)?;
+            let raw = match raw {
+                EntityEvalValue::SqlNull => return Ok(EntityEvalValue::Json(JsonValue::Null)),
+                EntityEvalValue::SqlText(value) => JsonValue::String(value),
+                EntityEvalValue::Json(value) => value,
+            };
             let JsonValue::String(raw) = raw else {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
                     "lix_json expects a text argument",
                 ));
             };
-            serde_json::from_str(&raw).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("lix_json argument is not valid JSON: {error}"),
-                )
-            })
+            serde_json::from_str(&raw)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("lix_json argument is not valid JSON: {error}"),
+                    )
+                })
+                .map(EntityEvalValue::Json)
         }
         BoundExpr::Function { name, args } if name == "lix_uuid_v7" && args.is_empty() => {
-            Ok(JsonValue::String(ctx.functions().call_uuid_v7()))
+            Ok(EntityEvalValue::SqlText(ctx.functions().call_uuid_v7()))
         }
         BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => {
-            Ok(JsonValue::String(ctx.functions().call_timestamp()))
+            Ok(EntityEvalValue::SqlText(ctx.functions().call_timestamp()))
         }
         BoundExpr::Function { name, args } if name == "lix_empty_blob" && args.is_empty() => {
-            Ok(JsonValue::Array(Vec::new()))
+            Ok(EntityEvalValue::Json(JsonValue::Array(Vec::new())))
         }
         BoundExpr::Function { name, args }
             if name == "lix_active_version_commit_id" && args.is_empty() =>
         {
             Ok(active_version_commit_id
-                .map(|commit_id| JsonValue::String(commit_id.to_string()))
-                .unwrap_or(JsonValue::Null))
+                .map(|commit_id| EntityEvalValue::SqlText(commit_id.to_string()))
+                .unwrap_or(EntityEvalValue::SqlNull))
         }
         BoundExpr::Function { name, args }
             if (name == "lix_json_get" || name == "lix_json_get_text") && args.len() >= 2 =>
         {
-            let root = eval_expr(&args[0], context, ctx, params, active_version_commit_id)?;
-            let mut current =
-                match root {
-                    JsonValue::String(raw) => {
-                        serde_json::from_str::<JsonValue>(&raw).map_err(|error| {
-                            LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        format!("{name} expected valid JSON text in its first argument: {error}"),
-                    )
-                        })?
-                    }
-                    JsonValue::Null => return Ok(JsonValue::Null),
+            let root = eval_expr_value(&args[0], context, ctx, params, active_version_commit_id)?;
+            let mut current = match root {
+                EntityEvalValue::SqlNull => return Ok(EntityEvalValue::SqlNull),
+                EntityEvalValue::SqlText(raw) => {
+                    serde_json::from_str::<JsonValue>(&raw).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!(
+                                "{name} expected valid JSON text in its first argument: {error}"
+                            ),
+                        )
+                    })?
+                }
+                EntityEvalValue::Json(root) => match root {
+                    JsonValue::Null => return Ok(EntityEvalValue::SqlNull),
                     value => value,
-                };
+                },
+            };
             for arg in &args[1..] {
                 let segment = eval_expr(arg, context, ctx, params, active_version_commit_id)?;
-                current = json_path_get(&current, &segment, name)?.unwrap_or(JsonValue::Null);
-                if current.is_null() {
-                    return Ok(JsonValue::Null);
-                }
+                let Some(next) = json_path_get(&current, &segment, name)? else {
+                    return Ok(EntityEvalValue::SqlNull);
+                };
+                current = next;
             }
             if name == "lix_json_get_text" {
-                Ok(JsonValue::String(json_text_value(&current)?))
+                if current.is_null() {
+                    return Ok(EntityEvalValue::SqlNull);
+                }
+                Ok(EntityEvalValue::SqlText(json_text_value(&current)?))
             } else {
-                Ok(current)
+                Ok(EntityEvalValue::Json(current))
             }
         }
         BoundExpr::Function { name, args }
@@ -570,22 +732,22 @@ fn eval_expr(
             }
             let value = eval_expr(&args[0], context, ctx, params, active_version_commit_id)?;
             if name == "lix_text_encode" {
-                Ok(JsonValue::Array(
+                Ok(EntityEvalValue::Json(JsonValue::Array(
                     text_like_bytes(&value, name)?
                         .into_iter()
                         .map(JsonValue::from)
                         .collect(),
-                ))
+                )))
             } else {
                 let bytes = binary_like_bytes(&value, name)?;
                 String::from_utf8(bytes)
-                    .map(JsonValue::String)
                     .map_err(|error| {
                         LixError::new(
                             LixError::CODE_TYPE_MISMATCH,
                             format!("lix_text_decode() expected valid UTF8 bytes: {error}"),
                         )
                     })
+                    .map(EntityEvalValue::SqlText)
             }
         }
         BoundExpr::Function { name, .. } => Err(LixError::new(
@@ -744,9 +906,9 @@ fn validate_bound_write_supported(
     validate_predicate_supported(&plan.bound.predicate)?;
     validate_json_predicate_types(&plan.bound.predicate, spec)?;
     match &plan.bound.input {
-        BoundWriteInput::Values(rows) => {
-            for row in rows {
-                for (_, expr) in &row.values {
+        BoundWriteInput::Values(values) => {
+            for row in &values.rows {
+                for expr in row {
                     validate_expr_supported(expr)?;
                 }
             }
@@ -757,6 +919,25 @@ fn validate_bound_write_supported(
         validate_expr_supported(&assignment.value)?;
     }
     Ok(())
+}
+
+fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
+    let input_supported = match (&plan.bound.op, &plan.bound.input) {
+        (BoundWriteOp::Insert, BoundWriteInput::Values(values)) => values
+            .rows
+            .iter()
+            .flatten()
+            .all(|expr| validate_expr_supported(expr).is_ok()),
+        (BoundWriteOp::Update | BoundWriteOp::Delete, BoundWriteInput::None) => true,
+        _ => false,
+    };
+    input_supported
+        && validate_predicate_supported(&plan.bound.predicate).is_ok()
+        && plan
+            .bound
+            .assignments
+            .iter()
+            .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
 }
 
 fn validate_predicate_supported(
@@ -948,24 +1129,32 @@ fn candidate_snapshot(
 }
 
 fn entity_json_value(
-    value: JsonValue,
+    value: EntityEvalValue,
     column_type: EntityColumnType,
 ) -> Result<JsonValue, LixError> {
     Ok(match (value, column_type) {
-        (JsonValue::String(value), EntityColumnType::Json) => {
+        (EntityEvalValue::SqlNull, _) => JsonValue::Null,
+        (EntityEvalValue::SqlText(value), EntityColumnType::Json) => {
             serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
         }
-        (value, EntityColumnType::Json) => value,
-        (JsonValue::String(value), EntityColumnType::String) => JsonValue::String(value),
-        (JsonValue::Number(value), EntityColumnType::Integer) if value.is_i64() => {
+        (EntityEvalValue::SqlText(value), _) => JsonValue::String(value),
+        (EntityEvalValue::Json(value), EntityColumnType::Json) => value,
+        (EntityEvalValue::Json(JsonValue::String(value)), EntityColumnType::String) => {
+            JsonValue::String(value)
+        }
+        (EntityEvalValue::Json(JsonValue::Number(value)), EntityColumnType::Integer)
+            if value.is_i64() =>
+        {
             JsonValue::Number(value)
         }
-        (JsonValue::Number(value), EntityColumnType::Number | EntityColumnType::Integer) => {
-            JsonValue::Number(value)
+        (
+            EntityEvalValue::Json(JsonValue::Number(value)),
+            EntityColumnType::Number | EntityColumnType::Integer,
+        ) => JsonValue::Number(value),
+        (EntityEvalValue::Json(JsonValue::Bool(value)), EntityColumnType::Boolean) => {
+            JsonValue::Bool(value)
         }
-        (JsonValue::Bool(value), EntityColumnType::Boolean) => JsonValue::Bool(value),
-        (JsonValue::Null, _) => JsonValue::Null,
-        (value, _) => value,
+        (EntityEvalValue::Json(value), _) => value,
     })
 }
 
@@ -1003,6 +1192,14 @@ fn literal_json(literal: &BoundLiteral) -> JsonValue {
         BoundLiteral::Blob(value) => {
             JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
         }
+    }
+}
+
+fn value_eval(value: &Value) -> EntityEvalValue {
+    match value {
+        Value::Null => EntityEvalValue::SqlNull,
+        Value::Text(value) => EntityEvalValue::SqlText(value.clone()),
+        _ => EntityEvalValue::Json(value_json(value)),
     }
 }
 
@@ -1138,43 +1335,79 @@ fn byte_from_json_value(value: &JsonValue) -> Result<u8, LixError> {
         })
 }
 
-fn column_json(context: &EntityEvalContext<'_>, column_name: &str) -> Result<JsonValue, LixError> {
+fn column_eval_value(
+    context: &EntityEvalContext<'_>,
+    column_name: &str,
+) -> Result<EntityEvalValue, LixError> {
     if let Some(value) = context.snapshot.get(column_name) {
-        return Ok(value.clone());
+        return Ok(visible_column_eval_value(
+            context
+                .visible_columns
+                .iter()
+                .find(|column| column.name == column_name),
+            value,
+        ));
     }
     let Some(row) = context.row else {
-        return Ok(JsonValue::Null);
+        return Ok(EntityEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_entity_id" => row.entity_id.as_json_array_value(),
-        "lixcol_schema_key" => Ok(JsonValue::String(row.schema_key.clone())),
+        "lixcol_entity_id" => row
+            .entity_id
+            .as_json_array_value()
+            .map(EntityEvalValue::Json),
+        "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.schema_key.clone(),
+        ))),
         "lixcol_file_id" => Ok(row
             .file_id
             .as_ref()
-            .map(|value| JsonValue::String(value.clone()))
-            .unwrap_or(JsonValue::Null)),
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_metadata" => row
             .metadata
             .as_ref()
             .map(|metadata| parse_row_metadata_value(metadata, &row.schema_key))
             .transpose()
-            .map(|metadata| metadata.unwrap_or(JsonValue::Null)),
+            .map(|metadata| {
+                metadata
+                    .map(EntityEvalValue::Json)
+                    .unwrap_or(EntityEvalValue::SqlNull)
+            }),
         "lixcol_change_id" => Ok(row
             .change_id
             .as_ref()
-            .map(|value| JsonValue::String(value.clone()))
-            .unwrap_or(JsonValue::Null)),
-        "lixcol_created_at" => Ok(JsonValue::String(row.created_at.clone())),
-        "lixcol_updated_at" => Ok(JsonValue::String(row.updated_at.clone())),
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .unwrap_or(EntityEvalValue::SqlNull)),
+        "lixcol_created_at" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.created_at.clone(),
+        ))),
+        "lixcol_updated_at" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.updated_at.clone(),
+        ))),
         "lixcol_commit_id" => Ok(row
             .commit_id
             .as_ref()
-            .map(|value| JsonValue::String(value.clone()))
-            .unwrap_or(JsonValue::Null)),
-        "lixcol_global" => Ok(JsonValue::Bool(row.global)),
-        "lixcol_untracked" => Ok(JsonValue::Bool(row.untracked)),
-        "lixcol_version_id" => Ok(JsonValue::String(row.version_id.clone())),
-        _ => Ok(JsonValue::Null),
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .unwrap_or(EntityEvalValue::SqlNull)),
+        "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
+        "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
+        "lixcol_version_id" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.version_id.clone(),
+        ))),
+        _ => Ok(EntityEvalValue::SqlNull),
+    }
+}
+
+fn visible_column_eval_value(
+    column: Option<&EntitySurfaceColumn>,
+    value: &JsonValue,
+) -> EntityEvalValue {
+    match (column.map(|column| column.column_type), value) {
+        (Some(EntityColumnType::String), JsonValue::String(value)) => {
+            EntityEvalValue::SqlText(value.clone())
+        }
+        _ => EntityEvalValue::Json(value.clone()),
     }
 }
 
@@ -1197,16 +1430,15 @@ fn scan_version_ids(scope: &VersionScope) -> Result<Vec<String>, LixError> {
 
 fn entity_row_version_id(
     plan: &LogicalWritePlan,
-    values: &[(&str, JsonValue)],
+    explicit_version_id: Option<String>,
     global: bool,
 ) -> Result<String, LixError> {
-    let explicit_version_id = string_value(values, "lixcol_version_id")?;
-    let target_version_ids = insert_target_version_ids(&plan.bound.version_scope);
-    let target_is_by_version = matches!(
-        &plan.bound.target,
-        BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
-    );
     if global {
+        let target_version_ids = insert_target_version_ids(&plan.bound.version_scope);
+        let target_is_by_version = matches!(
+            &plan.bound.target,
+            BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
+        );
         if explicit_version_id
             .as_deref()
             .is_some_and(|version_id| version_id != crate::GLOBAL_VERSION_ID)
@@ -1236,6 +1468,10 @@ fn entity_row_version_id(
             "entity INSERT with lixcol_version_id = 'global' must also set lixcol_global = true",
         ));
     }
+    let target_is_by_version = matches!(
+        &plan.bound.target,
+        BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
+    );
     if target_is_by_version && matches!(plan.bound.version_scope, VersionScope::Global) {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
@@ -1244,6 +1480,7 @@ fn entity_row_version_id(
     }
     if let Some(version_id) = explicit_version_id {
         if target_is_by_version {
+            let target_version_ids = insert_target_version_ids(&plan.bound.version_scope);
             if let Some(target_version_ids) = &target_version_ids {
                 if !target_version_ids.contains(&version_id) {
                     return Err(LixError::new(
@@ -1305,62 +1542,42 @@ fn assignment_value<'a>(plan: &'a LogicalWritePlan, column_name: &str) -> Option
         .map(|assignment| &assignment.value)
 }
 
-fn string_value(
-    values: &[(&str, JsonValue)],
+fn optional_metadata_from_eval_value(
+    value: EntityEvalValue,
     column_name: &str,
-) -> Result<Option<String>, LixError> {
-    match values
-        .iter()
-        .find(|(name, _)| *name == column_name)
-        .map(|(_, value)| value)
-    {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::String(value)) => Ok(Some(value.clone())),
-        Some(other) => Err(LixError::new(
+    context: &str,
+) -> Result<Option<TransactionJson>, LixError> {
+    let metadata = match value {
+        EntityEvalValue::SqlNull => return Ok(None),
+        EntityEvalValue::SqlText(value) => parse_row_metadata_value(&value, context)?,
+        EntityEvalValue::Json(value) => {
+            validate_row_metadata(&value, context)?;
+            value
+        }
+    };
+    TransactionJson::from_value(metadata, &format!("{context} {column_name}")).map(Some)
+}
+
+fn text_value(value: JsonValue, column_name: &str) -> Result<Option<String>, LixError> {
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(value) => Ok(Some(value)),
+        other => Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             format!("entity write expected text-compatible column '{column_name}', got {other}"),
         )),
     }
 }
 
-fn bool_value(values: &[(&str, JsonValue)], column_name: &str) -> Result<Option<bool>, LixError> {
-    match values
-        .iter()
-        .find(|(name, _)| *name == column_name)
-        .map(|(_, value)| value)
-    {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Bool(value)) => Ok(Some(*value)),
-        Some(other) => Err(LixError::new(
+fn bool_value(value: JsonValue, column_name: &str) -> Result<Option<bool>, LixError> {
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Bool(value) => Ok(Some(value)),
+        other => Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             format!("entity write expected boolean column '{column_name}', got {other}"),
         )),
     }
-}
-
-fn metadata_value(
-    values: &[(&str, JsonValue)],
-    column_name: &str,
-    context: &str,
-) -> Result<Option<TransactionJson>, LixError> {
-    values
-        .iter()
-        .find(|(name, _)| *name == column_name)
-        .map(|(_, value)| metadata_from_json_value(value.clone(), column_name, context))
-        .transpose()
-}
-
-fn metadata_from_json_value(
-    value: JsonValue,
-    column_name: &str,
-    context: &str,
-) -> Result<TransactionJson, LixError> {
-    let metadata = match value {
-        JsonValue::String(value) => parse_row_metadata_value(&value, context)?,
-        JsonValue::Null => JsonValue::Null,
-        other => other,
-    };
-    TransactionJson::from_value(metadata, &format!("{context} {column_name}"))
 }
 
 fn entity_id_from_value(value: &JsonValue, column_name: &str) -> Result<EntityIdentity, LixError> {

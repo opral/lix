@@ -178,10 +178,20 @@ export type BackendKvEntryPage = {
 	resumeAfter?: Uint8Array | null;
 };
 
-export type BackendKvPut = {
-	key: Uint8Array;
-	value: Uint8Array;
-};
+export type BackendKvWriteOp =
+	| {
+			kind: "put";
+			key: Uint8Array;
+			value: Uint8Array;
+	  }
+	| {
+			kind: "delete";
+			key: Uint8Array;
+	  }
+	| {
+			kind: "deleteRange";
+			range: BackendKvScanRange;
+	  };
 
 export type BackendKvWriteBatch = {
 	groups: BackendKvWriteGroup[];
@@ -189,13 +199,13 @@ export type BackendKvWriteBatch = {
 
 export type BackendKvWriteGroup = {
 	namespace: string;
-	puts: BackendKvPut[];
-	deletes: Uint8Array[];
+	ops: BackendKvWriteOp[];
 };
 
 export type BackendKvWriteStats = {
 	puts: number;
 	deletes: number;
+	deleteRanges: number;
 	bytesWritten: number;
 };
 

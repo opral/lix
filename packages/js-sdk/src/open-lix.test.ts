@@ -159,6 +159,81 @@ test("openLix accepts an explicit backend", async () => {
 	await second.close();
 });
 
+test("openLix paginates explicit backend scans", async () => {
+	const backend = createMemoryBackend({ scanPageSize: 1 });
+	const lix = await openLix({ backend });
+
+	await registerCrmTaskSchema(lix);
+	await lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4)), ($5, $6, $7, lix_json($8)), ($9, $10, $11, lix_json($12))",
+		[
+			"paged-task-1",
+			"First paged task",
+			false,
+			JSON.stringify({ page: 1 }),
+			"paged-task-2",
+			"Second paged task",
+			true,
+			JSON.stringify({ page: 2 }),
+			"paged-task-3",
+			"Third paged task",
+			false,
+			JSON.stringify({ page: 3 }),
+		],
+	);
+
+	const result = await lix.execute(
+		"SELECT id FROM crm_task WHERE id LIKE $1 ORDER BY id",
+		["paged-task-%"],
+	);
+
+	expect(result.rows.map((row) => row.get("id"))).toEqual([
+		"paged-task-1",
+		"paged-task-2",
+		"paged-task-3",
+	]);
+	await lix.close();
+});
+
+test("custom backend applies ordered deleteRange write ops", () => {
+	const backend = createMemoryBackend();
+	const tx = backend.beginWriteTransaction();
+
+	tx.writeKvBatch({
+		groups: [
+			{
+				namespace: "n",
+				ops: [
+					{ kind: "put", key: new Uint8Array([1]), value: new Uint8Array([10]) },
+					{ kind: "put", key: new Uint8Array([2]), value: new Uint8Array([20]) },
+					{
+						kind: "deleteRange",
+						range: { kind: "prefix", prefix: new Uint8Array([1]) },
+					},
+					{ kind: "put", key: new Uint8Array([1]), value: new Uint8Array([11]) },
+				],
+			},
+		],
+	});
+	expect(tx.commit()).toBeUndefined();
+
+	const read = backend.beginReadTransaction();
+	const values = read.getValues({
+		groups: [
+			{
+				namespace: "n",
+				keys: [new Uint8Array([1]), new Uint8Array([2])],
+			},
+		],
+	});
+
+	expect(values.groups[0]?.values).toEqual([
+		new Uint8Array([11]),
+		new Uint8Array([20]),
+	]);
+	expect(read.rollback()).toBeUndefined();
+});
+
 test("execute supports UNION ALL without trapping wasm", async () => {
 	const lix = await openLix();
 
@@ -687,7 +762,11 @@ type StoredKvPair = {
 	value: Uint8Array;
 };
 
-function createMemoryBackend(): LixBackend {
+type MemoryBackendOptions = {
+	scanPageSize?: number;
+};
+
+function createMemoryBackend(options: MemoryBackendOptions = {}): LixBackend {
 	let rows: StoredKvPair[] = [];
 
 	function createTransaction(): LixBackendWriteTransaction {
@@ -734,7 +813,10 @@ function createMemoryBackend(): LixBackend {
 				},
 				scanKeys(request): BackendKvKeyPage {
 					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					const { pairs, resumeAfter } = scanPage(
+						transactionRows,
+						limitScanRequest(request, options.scanPageSize),
+					);
 					return {
 						keys: pairs.map((row) => new Uint8Array(row.key)),
 						resumeAfter,
@@ -742,7 +824,10 @@ function createMemoryBackend(): LixBackend {
 				},
 				scanValues(request): BackendKvValuePage {
 					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					const { pairs, resumeAfter } = scanPage(
+						transactionRows,
+						limitScanRequest(request, options.scanPageSize),
+					);
 					return {
 						values: pairs.map((row) => new Uint8Array(row.value)),
 						resumeAfter,
@@ -750,7 +835,10 @@ function createMemoryBackend(): LixBackend {
 				},
 				scanEntries(request): BackendKvEntryPage {
 					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					const { pairs, resumeAfter } = scanPage(
+						transactionRows,
+						limitScanRequest(request, options.scanPageSize),
+					);
 					return {
 						keys: pairs.map((row) => new Uint8Array(row.key)),
 						values: pairs.map((row) => new Uint8Array(row.value)),
@@ -762,31 +850,41 @@ function createMemoryBackend(): LixBackend {
 					const stats: BackendKvWriteStats = {
 						puts: 0,
 						deletes: 0,
+						deleteRanges: 0,
 						bytesWritten: 0,
 					};
 					for (const group of batch.groups) {
-						for (const put of group.puts) {
-							stats.puts += 1;
-							stats.bytesWritten += put.key.length + put.value.length;
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									compareBytes(row.key, put.key) !== 0,
-							);
-							transactionRows.push({
-								namespace: group.namespace,
-								key: new Uint8Array(put.key),
-								value: new Uint8Array(put.value),
-							});
-						}
-						for (const key of group.deletes) {
-							stats.deletes += 1;
-							stats.bytesWritten += key.length;
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									compareBytes(row.key, key) !== 0,
-							);
+						for (const op of group.ops) {
+							if (op.kind === "put") {
+								stats.puts += 1;
+								stats.bytesWritten += op.key.length + op.value.length;
+								transactionRows = transactionRows.filter(
+									(row) =>
+										row.namespace !== group.namespace ||
+										compareBytes(row.key, op.key) !== 0,
+								);
+								transactionRows.push({
+									namespace: group.namespace,
+									key: new Uint8Array(op.key),
+									value: new Uint8Array(op.value),
+								});
+							} else if (op.kind === "delete") {
+								stats.deletes += 1;
+								stats.bytesWritten += op.key.length;
+								transactionRows = transactionRows.filter(
+									(row) =>
+										row.namespace !== group.namespace ||
+										compareBytes(row.key, op.key) !== 0,
+								);
+							} else {
+								stats.deleteRanges += 1;
+								stats.bytesWritten += deleteRangeBytes(op.range);
+								transactionRows = transactionRows.filter(
+									(row) =>
+										row.namespace !== group.namespace ||
+										!keyMatchesRange(row.key, op.range),
+								);
+							}
 						}
 					}
 					return stats;
@@ -810,6 +908,17 @@ function createMemoryBackend(): LixBackend {
 		beginWriteTransaction(): LixBackendWriteTransaction {
 			return createTransaction();
 		},
+	};
+}
+
+function limitScanRequest(
+	request: BackendKvScanRequest,
+	scanPageSize: number | undefined,
+): BackendKvScanRequest {
+	if (scanPageSize === undefined) return request;
+	return {
+		...request,
+		limit: Math.min(request.limit, scanPageSize),
 	};
 }
 
@@ -849,6 +958,13 @@ function keyMatchesRange(key: Uint8Array, range: BackendKvScanRange): boolean {
 	return (
 		compareBytes(key, range.start) >= 0 && compareBytes(key, range.end) < 0
 	);
+}
+
+function deleteRangeBytes(range: BackendKvScanRange): number {
+	if (range.kind === "prefix") {
+		return range.prefix.length;
+	}
+	return range.start.length + range.end.length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {

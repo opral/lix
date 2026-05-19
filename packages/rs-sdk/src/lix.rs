@@ -1,29 +1,25 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions,
-    CreateVersionReceipt as CreateVersionResult, Engine, ExecuteResult, LixError,
-    MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions,
-    MergeVersionReceipt as MergeVersionResult, SessionContext, SwitchVersionOptions,
-    SwitchVersionReceipt as SwitchVersionResult, Value,
+    Backend, CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, Engine,
+    ExecuteResult, InMemoryBackend, LixError, MergeVersionOptions, MergeVersionPreview,
+    MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult, SessionContext,
+    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, Value,
 };
-
-use crate::in_memory_backend::InMemoryBackend;
 
 /// Options for opening a Lix workspace session.
 #[derive(Default)]
-pub struct OpenLixOptions {
-    pub backend: Option<Box<dyn Backend + Send + Sync>>,
+pub struct OpenLixOptions<B = InMemoryBackend> {
+    pub backend: Option<B>,
 }
 
 /// Workspace-session handle for a Lix repository.
-pub struct Lix {
-    _engine: Engine,
-    session: SessionContext,
-    backend: SharedBackend,
-    backend_closed: AtomicBool,
+pub struct Lix<B = InMemoryBackend>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    _engine: Engine<B>,
+    session: SessionContext<B>,
 }
 
 /// Opens a Lix workspace session.
@@ -32,21 +28,29 @@ pub struct Lix {
 /// backend is supplied, it is opened when already initialized and initialized
 /// first when empty.
 pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
-    let backend: Box<dyn Backend + Send + Sync> = options
-        .backend
-        .unwrap_or_else(|| Box::new(InMemoryBackend::new()));
-    let backend = SharedBackend::new(backend);
-    let engine = open_or_initialize_engine(&backend).await?;
+    open_lix_with_backend(options.backend.unwrap_or_else(InMemoryBackend::new)).await
+}
+
+pub async fn open_lix_with_backend<B>(backend: B) -> Result<Lix<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let engine = open_or_initialize_engine(backend).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
         session,
-        backend,
-        backend_closed: AtomicBool::new(false),
     })
 }
 
-impl Lix {
+impl<B> Lix<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
@@ -60,7 +64,7 @@ impl Lix {
         self.session.execute(sql, params).await
     }
 
-    pub async fn begin_transaction(&self) -> Result<LixTransaction, LixError> {
+    pub async fn begin_transaction(&self) -> Result<LixTransaction<B>, LixError> {
         Ok(LixTransaction {
             inner: self.session.begin_transaction().await?,
         })
@@ -100,19 +104,25 @@ impl Lix {
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
-        self.session.close().await?;
-        if !self.backend_closed.swap(true, Ordering::SeqCst) {
-            self.backend.close().await?;
-        }
-        Ok(())
+        self.session.close().await
     }
 }
 
-pub struct LixTransaction {
-    inner: lix_engine::SessionTransaction,
+pub struct LixTransaction<B = InMemoryBackend>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    inner: lix_engine::SessionTransaction<B>,
 }
 
-impl LixTransaction {
+impl<B> LixTransaction<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
     /// Executes one SQL statement inside this transaction.
     ///
     /// Writes are staged until `commit()`. Reads use the transaction overlay,
@@ -134,49 +144,18 @@ impl LixTransaction {
     }
 }
 
-async fn open_or_initialize_engine(backend: &SharedBackend) -> Result<Engine, LixError> {
-    match Engine::new(Box::new(backend.clone())).await {
+async fn open_or_initialize_engine<B>(backend: B) -> Result<Engine<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    match Engine::new(backend.clone()).await {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
-            Engine::initialize(Box::new(backend.clone())).await?;
-            Engine::new(Box::new(backend.clone())).await
+            Engine::initialize(backend.clone()).await?;
+            Engine::new(backend).await
         }
         Err(error) => Err(error),
-    }
-}
-
-#[derive(Clone)]
-struct SharedBackend {
-    inner: Arc<dyn Backend + Send + Sync>,
-}
-
-impl SharedBackend {
-    fn new(backend: Box<dyn Backend + Send + Sync>) -> Self {
-        Self {
-            inner: Arc::from(backend),
-        }
-    }
-}
-
-#[async_trait]
-impl Backend for SharedBackend {
-    async fn begin_read_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-        self.inner.begin_read_transaction().await
-    }
-
-    async fn begin_write_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
-        self.inner.begin_write_transaction().await
-    }
-
-    async fn destroy(&self) -> Result<(), LixError> {
-        self.inner.destroy().await
-    }
-
-    async fn close(&self) -> Result<(), LixError> {
-        self.inner.close().await
     }
 }
