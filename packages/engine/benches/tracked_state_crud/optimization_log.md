@@ -16,7 +16,8 @@ This baseline supersedes the first post-rebase scorecard. That run timed
 database/session creation and `insert_all(&rows)` inside read, update, and
 delete benchmarks, which made the non-insert numbers mostly setup cost. The
 current harness creates either an empty or seeded fixture in Criterion's setup
-closure, then times only the operation under test.
+closure, then borrows that fixture with `iter_batched_ref` so fixture teardown is
+excluded from the timed window too.
 
 Workload:
 
@@ -45,9 +46,9 @@ Times below use Criterion point estimates from the corrected fixture rerun.
 
 | Backend | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
-| SQLite  |    2.35 ms |   652 us |         507 us |        1.63 ms |    2.78 ms |     688 us |    1.22 ms |     619 us |
-| RocksDB |     685 us |   375 us |         198 us |         762 us |     727 us |     200 us |     217 us |     228 us |
-| redb    |   17.90 ms | 11.31 ms |       11.32 ms |       10.77 ms |   19.64 ms |   15.02 ms |   15.66 ms |   18.92 ms |
+| SQLite  |    4.21 ms |   656 us |         510 us |        1.63 ms |    3.80 ms |     946 us |    1.96 ms |     663 us |
+| RocksDB |     537 us |   176 us |        7.27 us |         532 us |     586 us |    18.0 us |    31.8 us |    10.5 us |
+| redb    |    7.25 ms |   141 us |        11.3 us |         337 us |    8.17 ms |    4.16 ms |    4.13 ms |    3.97 ms |
 
 ### Physical API Layer
 
@@ -55,15 +56,15 @@ Currently mirrors direct KV layout.
 
 | Backend | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
-| SQLite  |    2.37 ms |   641 us |         486 us |        1.53 ms |    2.63 ms |     685 us |    1.15 ms |     595 us |
-| RocksDB |     654 us |   404 us |         202 us |         752 us |     795 us |     228 us |     219 us |     214 us |
-| redb    |   18.05 ms | 11.54 ms |       11.99 ms |       12.70 ms |   19.43 ms |   14.76 ms |   14.88 ms |   18.78 ms |
+| SQLite  |    3.69 ms |   672 us |         450 us |        1.58 ms |    3.55 ms |     795 us |    1.92 ms |     692 us |
+| RocksDB |     524 us |   180 us |        8.27 us |         543 us |     556 us |    20.9 us |    11.6 us |    8.75 us |
+| redb    |    7.06 ms |   124 us |        13.3 us |         337 us |    8.04 ms |    4.04 ms |    4.13 ms |    3.99 ms |
 
 ### SQL Session
 
 | Backend   | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | --------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
-| in-memory |   70.19 ms | 20.73 ms |        6.01 ms |       27.85 ms |   excluded |   excluded |   98.16 ms |   83.30 ms |
+| in-memory |   73.88 ms | 22.69 ms |        6.15 ms |       29.78 ms |   excluded |   excluded |  104.21 ms |   83.30 ms |
 
 ## 10k Reference Checks
 
