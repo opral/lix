@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    BufferedRangeScan, CommitResult, GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key,
-    KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanVisitor, WriteOptions,
+    BufferedRangeScan, CommitResult, DurableWriteLock, GetOptions, InMemoryBackend, InMemoryRead,
+    InMemoryWrite, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadEntry,
+    ReadOptions, ScanOptions, ScanVisitor, WriteOptions,
 };
 use tempfile::TempDir;
 
@@ -127,6 +127,15 @@ impl Backend for ChangelogScoreBackend {
             Self::Sqlite { backend, .. } => backend.capabilities(),
             Self::RocksDb { backend, .. } => backend.capabilities(),
             Self::Redb { backend, .. } => backend.capabilities(),
+        }
+    }
+
+    fn durable_write_lock(&self) -> DurableWriteLock {
+        match self {
+            Self::Unit(backend) => backend.durable_write_lock(),
+            Self::Sqlite { backend, .. } => backend.durable_write_lock(),
+            Self::RocksDb { backend, .. } => backend.durable_write_lock(),
+            Self::Redb { backend, .. } => backend.durable_write_lock(),
         }
     }
 

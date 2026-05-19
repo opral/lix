@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -78,40 +78,123 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
 
 #[derive(Clone)]
 pub(crate) struct TransactionCommitBoundary {
-    pub(crate) commit_in_progress: Arc<AtomicBool>,
-    pub(crate) commit_watch: tokio::sync::watch::Sender<bool>,
-    pub(crate) pre_commit_check: Arc<dyn Fn() -> Result<(), LixError> + Send + Sync>,
+    state: CommitBoundaryState,
+    pre_commit_check: Arc<dyn Fn() -> Result<(), LixError> + Send + Sync>,
 }
 
-struct TransactionCommitBoundaryGuard {
-    commit_in_progress: Arc<AtomicBool>,
-    commit_watch: tokio::sync::watch::Sender<bool>,
-}
+impl TransactionCommitBoundary {
+    pub(crate) fn new(
+        state: CommitBoundaryState,
+        pre_commit_check: Arc<dyn Fn() -> Result<(), LixError> + Send + Sync>,
+    ) -> Self {
+        Self {
+            state,
+            pre_commit_check,
+        }
+    }
 
-impl Drop for TransactionCommitBoundaryGuard {
-    fn drop(&mut self) {
-        self.commit_in_progress.store(false, Ordering::SeqCst);
-        self.commit_watch.send_replace(false);
+    fn begin(&self) -> CommitBoundaryGuard {
+        self.state.begin()
+    }
+
+    fn check(&self) -> Result<(), LixError> {
+        (self.pre_commit_check)()
+    }
+
+    fn commit<T>(&self, commit: impl FnOnce() -> Result<T, LixError>) -> Result<T, LixError> {
+        let _gate = self.state.lock_durable_commit();
+        self.check()?;
+        commit()
     }
 }
 
-fn begin_commit_boundary(
+#[derive(Clone)]
+pub(crate) struct CommitBoundaryState {
+    active_count: Arc<AtomicUsize>,
+    durable_commit_gate: Arc<std::sync::Mutex<()>>,
+    watch: tokio::sync::watch::Sender<usize>,
+}
+
+impl CommitBoundaryState {
+    pub(crate) fn new() -> Self {
+        let (watch, _) = tokio::sync::watch::channel(0);
+        Self {
+            active_count: Arc::new(AtomicUsize::new(0)),
+            durable_commit_gate: Arc::new(std::sync::Mutex::new(())),
+            watch,
+        }
+    }
+
+    pub(crate) fn begin(&self) -> CommitBoundaryGuard {
+        let previous = self.active_count.fetch_add(1, Ordering::SeqCst);
+        self.watch.send_replace(previous + 1);
+        CommitBoundaryGuard {
+            state: self.clone(),
+        }
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_count() > 0
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.watch.subscribe()
+    }
+
+    pub(crate) fn lock_durable_commit(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.durable_commit_gate
+            .lock()
+            .expect("commit boundary durable commit gate should not poison")
+    }
+
+    pub(crate) fn try_lock_durable_commit(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.durable_commit_gate.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("commit boundary durable commit gate should not poison")
+            }
+        }
+    }
+}
+
+pub(crate) struct CommitBoundaryGuard {
+    state: CommitBoundaryState,
+}
+
+impl Drop for CommitBoundaryGuard {
+    fn drop(&mut self) {
+        let remaining = self.state.active_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        self.state.watch.send_replace(remaining);
+    }
+}
+
+pub(crate) fn begin_commit_boundary(
     boundary: Option<&TransactionCommitBoundary>,
-) -> Option<TransactionCommitBoundaryGuard> {
+) -> Option<CommitBoundaryGuard> {
     let boundary = boundary?;
-    boundary.commit_in_progress.store(true, Ordering::SeqCst);
-    boundary.commit_watch.send_replace(true);
-    Some(TransactionCommitBoundaryGuard {
-        commit_in_progress: Arc::clone(&boundary.commit_in_progress),
-        commit_watch: boundary.commit_watch.clone(),
-    })
+    Some(boundary.begin())
 }
 
 fn check_commit_boundary(boundary: Option<&TransactionCommitBoundary>) -> Result<(), LixError> {
     if let Some(boundary) = boundary {
-        (boundary.pre_commit_check)()?;
+        boundary.check()?;
     }
     Ok(())
+}
+
+pub(crate) fn commit_at_boundary<T>(
+    boundary: Option<&TransactionCommitBoundary>,
+    commit: impl FnOnce() -> Result<T, LixError>,
+) -> Result<T, LixError> {
+    match boundary {
+        Some(boundary) => boundary.commit(commit),
+        None => commit(),
+    }
 }
 
 impl<B> Transaction<B>
@@ -207,19 +290,9 @@ where
         self,
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        self.commit_checked(runtime_functions, || Ok(())).await
-    }
-
-    pub(crate) async fn commit_checked<F>(
-        mut self,
-        runtime_functions: &FunctionContext,
-        pre_commit_check: F,
-    ) -> Result<TransactionCommitOutcome, LixError>
-    where
-        F: Fn() -> Result<(), LixError>,
-    {
-        let commit_boundary = self.commit_boundary.clone();
-        let prepared_writes = match self.staged_writes.drain() {
+        let mut transaction = self;
+        let commit_boundary = transaction.commit_boundary.clone();
+        let prepared_writes = match transaction.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 return Err(error);
@@ -227,17 +300,18 @@ where
         };
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         check_commit_boundary(commit_boundary.as_ref())?;
-        pre_commit_check()?;
-        if let Err(error) = self
+        if let Err(error) = transaction
             .validate_prepared_writes_by_version(&prepared_writes)
             .await
         {
             return Err(error);
         }
-        let mut read = self.storage.begin_read(StorageReadOptions::default())?;
+        let mut read = transaction
+            .storage
+            .begin_read(StorageReadOptions::default())?;
         let mut writes = match commit::commit_prepared_writes(
-            &self.binary_cas,
-            self.version_ctx.as_ref(),
+            &transaction.binary_cas,
+            transaction.version_ctx.as_ref(),
             Some(runtime_functions),
             &mut read,
             prepared_writes,
@@ -247,11 +321,13 @@ where
             Ok(writes) => writes,
             Err(error) => return Err(error),
         };
-        writes.extend(self.staged_storage_writes);
-        check_commit_boundary(commit_boundary.as_ref())?;
-        pre_commit_check()?;
-        self.storage
-            .commit_write_set(writes, StorageWriteOptions::default())?;
+        writes.extend(transaction.staged_storage_writes);
+        commit_at_boundary(commit_boundary.as_ref(), || {
+            transaction
+                .storage
+                .commit_write_set(writes, StorageWriteOptions::default())?;
+            Ok(())
+        })?;
         Ok(TransactionCommitOutcome::default())
     }
 
@@ -656,9 +732,11 @@ where
             }
         }
         if !writes.is_empty() {
-            check_commit_boundary(commit_boundary.as_ref())?;
-            self.storage
-                .commit_write_set(writes, StorageWriteOptions::default())?;
+            commit_at_boundary(commit_boundary.as_ref(), || {
+                self.storage
+                    .commit_write_set(writes, StorageWriteOptions::default())?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1636,16 +1714,20 @@ mod tests {
             .expect("projection root delete should commit");
 
         let check_count = Arc::new(AtomicUsize::new(0));
-        let (commit_watch, _) = tokio::sync::watch::channel(false);
+        let commit_boundary = CommitBoundaryState::new();
         let check_count_for_boundary = Arc::clone(&check_count);
-        transaction.attach_commit_boundary(TransactionCommitBoundary {
-            commit_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            commit_watch,
-            pre_commit_check: Arc::new(move || {
+        let commit_boundary_for_assert = commit_boundary.clone();
+        transaction.attach_commit_boundary(TransactionCommitBoundary::new(
+            commit_boundary,
+            Arc::new(move || {
+                assert!(
+                    commit_boundary_for_assert.is_active(),
+                    "direct projection-root commit checks should run while the commit guard is visible"
+                );
                 check_count_for_boundary.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
-        });
+        ));
 
         transaction
             .ensure_tracked_state_projection_roots(&[SCHEMA_FIXTURE_COMMIT_ID.to_string()])
