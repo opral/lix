@@ -566,11 +566,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::commit_store::{CommitDraftRef, CommitStoreContext};
     use crate::entity_identity::EntityIdentity;
-    use crate::json_store::{
-        JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
-    };
+    use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::storage::{StorageContext, StorageWriteSet};
@@ -611,27 +608,51 @@ mod tests {
 
     async fn write_empty_commits_to_store(
         storage: &StorageContext,
-        read: &(impl crate::storage::StorageRead + Send + Sync + ?Sized),
+        read: &(impl crate::storage::StorageRead + Send + Sync),
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
         for commit_id in commit_ids {
             let commit_change_id = format!("{commit_id}:commit");
-            CommitStoreContext::new()
-                .writer(read, &mut writes)
-                .stage_commit_draft(
-                    CommitDraftRef {
-                        id: commit_id,
-                        change_id: &commit_change_id,
-                        parent_ids: &[],
-                        author_account_ids: &[],
-                        created_at: "1970-01-01T00:00:00.000Z",
+            let segment = crate::changelog::Segment {
+                header: crate::changelog::SegmentHeader {
+                    segment_id: format!("test-empty-{commit_id}"),
+                    format_version: 0,
+                    commit_count: 0,
+                    change_count: 0,
+                    byte_count: 0,
+                    payload_count: 0,
+                    checksum: String::new(),
+                },
+                directory: crate::changelog::SegmentDirectory::default(),
+                commits: vec![crate::changelog::SegmentCommit {
+                    header: crate::changelog::CommitHeader {
+                        id: (*commit_id).to_string(),
+                        parent_commit_ids: Vec::new(),
+                        derivable_change_id: commit_change_id,
+                        author_account_ids: Vec::new(),
+                        created_at: "1970-01-01T00:00:00.000Z".to_string(),
+                        membership_count: 0,
                     },
-                    Vec::new(),
-                    Vec::new(),
-                )
+                    body: crate::changelog::CommitBody {
+                        membership: Vec::new(),
+                    },
+                    directory: crate::changelog::SegmentCommitDirectory::default(),
+                    checksum: String::new(),
+                }],
+                changes: Vec::new(),
+            };
+            let mut changelog_read = read;
+            let mut writer =
+                crate::changelog::ChangelogContext::new().writer(&mut changelog_read, &mut writes);
+            writer
+                .stage_segment(segment)
                 .await
-                .expect("empty commit should stage");
+                .expect("empty changelog commit should stage");
+            writer
+                .stage_publish_commit(commit_id)
+                .await
+                .expect("empty changelog commit should publish");
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -639,7 +660,7 @@ mod tests {
     }
 
     async fn stage_materialized_live_rows(
-        store: &(impl StorageRead + Send + Sync + ?Sized),
+        store: &(impl StorageRead + Send + Sync),
         writes: &mut StorageWriteSet,
         _json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
@@ -647,7 +668,12 @@ mod tests {
         let mut untracked_rows = Vec::new();
         let mut tracked_rows_by_commit = std::collections::BTreeMap::<
             String,
-            Vec<(crate::commit_store::Change, String, String)>,
+            Vec<(
+                crate::changelog::Change,
+                String,
+                String,
+                Vec<crate::changelog::SegmentInlinePayload>,
+            )>,
         >::new();
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
 
@@ -673,11 +699,12 @@ mod tests {
             }
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
-                stage_tracked_materialized_json(writes, &commit_id, &materialized)?;
+                let inline_payloads = inline_payloads_from_materialized(&materialized);
                 tracked_rows_by_commit.entry(commit_id).or_default().push((
                     change,
                     materialized.created_at,
                     materialized.updated_at,
+                    inline_payloads,
                 ));
             }
         }
@@ -691,31 +718,132 @@ mod tests {
                 .as_ref()
                 .map(|parent| vec![parent.clone()])
                 .unwrap_or_default();
-            let commit_change_id = format!("{commit_id}:commit");
-            let commit = CommitDraftRef {
-                id: &commit_id,
-                change_id: &commit_change_id,
-                parent_ids: &parent_ids,
-                author_account_ids: &[],
-                created_at: rows
-                    .first()
-                    .map(|(change, _, _)| change.created_at.as_str())
-                    .unwrap_or("1970-01-01T00:00:00.000Z"),
-            };
-            let staged = CommitStoreContext::new()
-                .writer(&*store, writes)
-                .stage_tracked_commit_draft(
-                    commit,
-                    rows.iter().map(|(change, _, _)| change.as_ref()).collect(),
-                    Vec::new(),
+            let commit_created_at = rows
+                .first()
+                .map(|(change, _, _, _)| change.created_at.as_str())
+                .unwrap_or("1970-01-01T00:00:00.000Z")
+                .to_string();
+            let membership = rows
+                .iter()
+                .map(|(change, _, _, _)| crate::changelog::MembershipRecord {
+                    member_change_id: change.id.clone(),
+                    role: crate::changelog::MembershipRole::Authored,
+                    source_parent_ordinal: None,
+                })
+                .collect::<Vec<_>>();
+            let membership_ordinals = rows
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (change, _, _, _))| (change.id.clone(), ordinal as u32))
+                .collect::<Vec<_>>();
+            let state_row_identities = rows
+                .iter()
+                .map(|(change, _, _, _)| {
+                    Ok((
+                        crate::changelog::StateRowIdentity {
+                            schema_key: crate::common::CanonicalSchemaKey::new(
+                                change.schema_key.clone(),
+                            )?,
+                            file_id: crate::common::FileId::new(
+                                change
+                                    .file_id
+                                    .clone()
+                                    .unwrap_or_else(|| "__global__".to_string()),
+                            )?,
+                            entity_id: crate::common::EntityId::new(
+                                change.entity_id.as_json_array_text()?,
+                            )?,
+                        },
+                        change.id.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            let segment_changes = rows
+                .iter()
+                .map(
+                    |(change, _, _, inline_payloads)| crate::changelog::SegmentChange {
+                        id: change.id.clone(),
+                        authored_commit_id: Some(commit_id.clone()),
+                        entity_id: change.entity_id.clone(),
+                        schema_key: change.schema_key.clone(),
+                        file_id: change.file_id.clone(),
+                        snapshot_ref: change.snapshot_ref,
+                        metadata_ref: change.metadata_ref,
+                        created_at: change.created_at.clone(),
+                        inline_payloads: inline_payloads.clone(),
+                        directory: crate::changelog::SegmentChangeDirectory::default(),
+                    },
                 )
-                .await?;
+                .collect::<Vec<_>>();
+            let segment = crate::changelog::Segment {
+                header: crate::changelog::SegmentHeader {
+                    segment_id: format!("test-{commit_id}"),
+                    format_version: 0,
+                    commit_count: 0,
+                    change_count: 0,
+                    byte_count: 0,
+                    payload_count: 0,
+                    checksum: String::new(),
+                },
+                directory: crate::changelog::SegmentDirectory::default(),
+                commits: vec![crate::changelog::SegmentCommit {
+                    header: crate::changelog::CommitHeader {
+                        id: commit_id.clone(),
+                        parent_commit_ids: parent_ids,
+                        derivable_change_id: format!("{commit_id}:commit"),
+                        author_account_ids: Vec::new(),
+                        created_at: commit_created_at,
+                        membership_count: 0,
+                    },
+                    body: crate::changelog::CommitBody { membership },
+                    directory: crate::changelog::SegmentCommitDirectory {
+                        state_row_identities,
+                        membership_ordinals,
+                    },
+                    checksum: String::new(),
+                }],
+                changes: segment_changes,
+            };
+            let mut changelog_read = store;
+            let mut writer =
+                crate::changelog::ChangelogContext::new().writer(&mut changelog_read, writes);
+            let report = writer.stage_segment(segment).await?;
+            writer.stage_publish_commit(&commit_id).await?;
+            drop(writer);
+            let locations = report
+                .change_locations
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let locators = rows
+                .iter()
+                .map(|(change, _, _, _)| {
+                    Ok(crate::changelog::ChangeLocator {
+                        change_id: change.id.clone(),
+                        commit_id: commit_id.clone(),
+                        location: locations.get(&change.id).cloned().ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!("test changelog location missing '{}'", change.id),
+                            )
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
             let deltas = rows
                 .iter()
-                .zip(&staged.authored_locators)
+                .zip(&locators)
                 .map(
-                    |((change, created_at, updated_at), locator)| TrackedStateDeltaRef {
-                        change: change.as_ref(),
+                    |((change, created_at, updated_at, _), locator)| TrackedStateDeltaRef {
+                        change: crate::changelog::ChangeRef {
+                            id: &change.id,
+                            authored_commit_id: Some(&locator.commit_id),
+                            entity_id: &change.entity_id,
+                            schema_key: &change.schema_key,
+                            file_id: change.file_id.as_deref(),
+                            snapshot_ref: change.snapshot_ref.as_ref(),
+                            metadata_ref: change.metadata_ref.as_ref(),
+                            created_at: &change.created_at,
+                        },
                         locator: locator.as_ref(),
                         created_at,
                         updated_at,
@@ -724,37 +852,30 @@ mod tests {
                 .collect::<Vec<_>>();
             TrackedStateContext::new()
                 .writer(&*store, writes)
-                .stage_delta(&commit_id, parent_commit_id.as_deref(), &deltas)
+                .stage_projection_root(&commit_id, parent_commit_id.as_deref(), deltas)
                 .await?;
         }
         Ok(())
     }
 
-    fn stage_tracked_materialized_json(
-        writes: &mut StorageWriteSet,
-        commit_id: &str,
+    fn inline_payloads_from_materialized(
         row: &MaterializedTrackedStateRow,
-    ) -> Result<(), LixError> {
+    ) -> Vec<crate::changelog::SegmentInlinePayload> {
         let mut payloads = Vec::new();
         if let Some(snapshot) = row.snapshot_content.as_deref() {
-            payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(snapshot)));
+            payloads.push(crate::changelog::SegmentInlinePayload {
+                json_ref: crate::json_store::JsonRef::for_content(snapshot.as_bytes()),
+                bytes: snapshot.as_bytes().to_vec(),
+            });
         }
         if let Some(metadata) = row.metadata.as_ref() {
-            payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(
-                crate::serialize_row_metadata(metadata),
-            )));
+            let serialized = crate::serialize_row_metadata(metadata);
+            payloads.push(crate::changelog::SegmentInlinePayload {
+                json_ref: crate::json_store::JsonRef::for_content(serialized.as_bytes()),
+                bytes: serialized.into_bytes(),
+            });
         }
-        JsonStoreContext::new().writer().stage_batch(
-            writes,
-            JsonWritePlacementRef::CommitPack {
-                commit_id,
-                pack_id: 0,
-            },
-            payloads
-                .iter()
-                .map(|payload| NormalizedJsonRef::from(payload)),
-        )?;
-        Ok(())
+        payloads
     }
 
     fn parent_commit_id_from_test_commit_row(
@@ -1527,37 +1648,21 @@ mod tests {
     #[tokio::test]
     async fn writer_uses_first_parent_as_merge_root_base() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
+        write_empty_commits_to_store(&storage, &read, &["parent-left"]).await;
         let mut writes = StorageWriteSet::new();
-        {
-            CommitStoreContext::new()
-                .writer(&read, &mut writes)
-                .stage_commit_draft(
-                    CommitDraftRef {
-                        id: "parent-left",
-                        change_id: "parent-left:commit",
-                        parent_ids: &[],
-                        author_account_ids: &[],
-                        created_at: "1970-01-01T00:00:00.000Z",
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .await
-                .expect("first parent commit should stage");
-            TrackedStateContext::new()
-                .writer(&read, &mut writes)
-                .stage_delta("parent-left", None, &[])
-                .await
-                .expect("first parent root should exist");
-        }
+        TrackedStateContext::new()
+            .writer(&read, &mut writes)
+            .stage_projection_root("parent-left", None, [])
+            .await
+            .expect("first parent tracked root should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("writes should commit");
+            .expect("first parent tracked root should commit");
 
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
 

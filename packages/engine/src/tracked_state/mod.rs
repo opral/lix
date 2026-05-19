@@ -2,28 +2,27 @@ mod by_file_index;
 mod codec;
 mod context;
 mod diff;
-mod materialization;
-mod materializer;
 mod merge;
+mod projection_root_rebuild;
+mod row_materialization;
 mod storage;
 mod tree;
 mod types;
 
 #[allow(unused_imports)]
 pub(crate) use context::{
-    TrackedStateContext, TrackedStateMaterializer, TrackedStateStoreReader, TrackedStateWriter,
+    TrackedStateContext, TrackedStateRootRebuilder, TrackedStateStoreReader, TrackedStateWriter,
 };
 #[allow(unused_imports)]
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
-    TrackedStateDiffRequest,
+    TrackedStateDiffRequest, TrackedStateDiffRow,
 };
-pub(crate) use materialization::{materialize_index_entries, TrackedMaterializationProjection};
 #[allow(unused_imports)]
 pub(crate) use merge::{
     plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
 };
-pub(crate) use storage::{load_delta_pack, DeltaJsonPackIndexesRef};
+pub(crate) use row_materialization::{materialize_rows_from_index_entries, TrackedRowProjection};
 #[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter,

@@ -5,7 +5,8 @@ use crate::backend::{
     ReadOptions, WriteOptions,
 };
 use crate::storage::{
-    StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError, StorageWriteSetStats,
+    StorageRead, StorageReadScope, StorageSpace, StorageWriteSet, StorageWriteSetError,
+    StorageWriteSetStats,
 };
 
 #[derive(Clone, Debug)]
@@ -30,6 +31,23 @@ where
 
     pub fn new_write_set(&self) -> StorageWriteSet {
         StorageWriteSet::new()
+    }
+
+    pub async fn begin_read_transaction(
+        &self,
+    ) -> Result<Box<StorageReadTransaction<B::Read<'_>>>, crate::LixError> {
+        Ok(Box::new(StorageReadTransaction {
+            read: self.begin_read(ReadOptions::default())?,
+        }))
+    }
+
+    pub async fn begin_write_transaction(
+        &self,
+    ) -> Result<Box<StorageWriteTransaction<'_, B>>, crate::LixError> {
+        Ok(Box::new(StorageWriteTransaction {
+            storage: self,
+            read: self.begin_read(ReadOptions::default())?,
+        }))
     }
 
     pub fn commit_write_set(
@@ -77,6 +95,75 @@ where
             },
             opts,
         )
+    }
+}
+
+pub struct StorageReadTransaction<R>
+where
+    R: crate::backend::BackendRead,
+{
+    read: StorageReadScope<R>,
+}
+
+impl<R> StorageReadTransaction<R>
+where
+    R: crate::backend::BackendRead,
+{
+    pub async fn rollback(self: Box<Self>) -> Result<(), crate::LixError> {
+        Ok(())
+    }
+}
+
+impl<R> StorageRead for StorageReadTransaction<R>
+where
+    R: crate::backend::BackendRead,
+{
+    type BackendRead = R;
+
+    fn backend_read(&self) -> &Self::BackendRead {
+        self.read.backend_read()
+    }
+}
+
+pub struct StorageWriteTransaction<'a, B>
+where
+    B: Backend,
+{
+    storage: &'a StorageContext<B>,
+    read: StorageReadScope<B::Read<'a>>,
+}
+
+impl<B> StorageWriteTransaction<'_, B>
+where
+    B: Backend,
+{
+    pub async fn commit(self: Box<Self>) -> Result<(), crate::LixError> {
+        Ok(())
+    }
+
+    pub async fn rollback(self: Box<Self>) -> Result<(), crate::LixError> {
+        Ok(())
+    }
+
+    pub fn write_set(
+        &mut self,
+        write_set: StorageWriteSet,
+    ) -> Result<StorageWriteSetStats, crate::LixError> {
+        let (_commit, stats) = self
+            .storage
+            .commit_write_set(write_set, WriteOptions::default())?;
+        Ok(stats)
+    }
+}
+
+impl<'a, B> StorageRead for StorageWriteTransaction<'a, B>
+where
+    B: Backend,
+{
+    type BackendRead = B::Read<'a>;
+
+    fn backend_read(&self) -> &Self::BackendRead {
+        self.read.backend_read()
     }
 }
 

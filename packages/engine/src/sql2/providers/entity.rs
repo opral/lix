@@ -38,7 +38,7 @@ use crate::version::VersionRefReader;
 use crate::{serialize_row_metadata, LixError};
 
 use crate::sql2::{
-    SqlCommitStoreQuerySource, SqlWriteContext, WriteContextLiveStateReader,
+    SqlHistoryQuerySource, SqlWriteContext, WriteContextLiveStateReader,
     WriteContextVersionRefReader,
 };
 
@@ -51,7 +51,7 @@ pub(crate) async fn register_entity_providers<S>(
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     catalog: &PublicCatalog,
 ) -> Result<(), LixError>
 where
@@ -139,7 +139,7 @@ pub(crate) async fn register_entity_write_providers(
 pub(crate) async fn register_entity_history_providers<S>(
     ctx: &SessionContext,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     catalog: &PublicCatalog,
 ) -> Result<(), LixError>
 where

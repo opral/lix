@@ -8,12 +8,14 @@ use serde_json::Value as JsonValue;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
-use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
-use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
+use crate::sql2::{
+    ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlHistoryQuerySource,
+};
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{StorageContext, StorageRead, StorageReadScope};
 use crate::tracked_state::TrackedStateContext;
@@ -48,7 +50,6 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
-    pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -67,7 +68,6 @@ where
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -78,7 +78,6 @@ where
             live_state,
             tracked_state,
             binary_cas,
-            commit_store,
             version_ctx,
             catalog_context,
             write_lock,
@@ -93,7 +92,6 @@ where
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -106,7 +104,6 @@ where
             live_state,
             tracked_state,
             binary_cas,
-            commit_store,
             version_ctx,
             catalog_context,
             write_lock,
@@ -119,7 +116,6 @@ where
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -130,7 +126,6 @@ where
             live_state,
             tracked_state,
             binary_cas,
-            commit_store,
             version_ctx,
             catalog_context,
             write_lock,
@@ -145,7 +140,6 @@ where
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -158,7 +152,6 @@ where
             live_state,
             tracked_state,
             binary_cas,
-            commit_store,
             version_ctx,
             catalog_context,
             write_lock,
@@ -306,7 +299,6 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
         )
@@ -361,7 +353,6 @@ pub(super) struct SessionSqlExecutionContext<'a, R> {
     pub(super) read_store: StorageReadScope<R>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
-    pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
@@ -381,9 +372,15 @@ where
         Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
     }
 
-    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
-        CommitStoreQuerySource {
-            commit_store_reader: Arc::new(self.commit_store.reader(self.read_store.store())),
+    fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
+        HistoryQuerySource {
+            json_reader: JsonStoreContext::new().reader(self.read_store.store()),
+        }
+    }
+
+    fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
+        ChangelogQuerySource {
+            store: self.read_store.clone(),
             json_reader: JsonStoreContext::new().reader(self.read_store.store()),
         }
     }

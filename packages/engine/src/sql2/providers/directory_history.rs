@@ -25,7 +25,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
 use crate::LixError;
 
-use crate::commit_store::MaterializedChange;
+use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
 use crate::sql2::history_route::{
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
@@ -35,7 +35,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::SqlCommitStoreQuerySource;
+use crate::sql2::SqlHistoryQuerySource;
 use crate::storage::StorageRead;
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -44,7 +44,7 @@ pub(super) async fn register_lix_directory_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
 ) -> Result<(), LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -64,7 +64,7 @@ where
 struct LixDirectoryHistoryProvider<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
 }
 
 impl<S> std::fmt::Debug for LixDirectoryHistoryProvider<S> {
@@ -76,7 +76,7 @@ impl<S> std::fmt::Debug for LixDirectoryHistoryProvider<S> {
 impl<S> LixDirectoryHistoryProvider<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlHistoryQuerySource<S>,
     ) -> Self {
         Self {
             schema: lix_directory_history_schema(),
@@ -138,7 +138,7 @@ where
 
 struct LixDirectoryHistoryScanExec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     schema: SchemaRef,
     route: HistoryRoute,
     limit: Option<usize>,
@@ -157,7 +157,7 @@ impl<S> std::fmt::Debug for LixDirectoryHistoryScanExec<S> {
 impl<S> LixDirectoryHistoryScanExec<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlHistoryQuerySource<S>,
         schema: SchemaRef,
         route: HistoryRoute,
         limit: Option<usize>,
@@ -300,7 +300,7 @@ struct DirectoryDescriptorSnapshot {
 
 async fn load_directory_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     route: &HistoryRoute,
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError>
 where

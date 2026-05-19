@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -125,12 +125,6 @@ struct PointCase {
     requested_keys: usize,
     unique_keys: usize,
     existing_unique_keys: usize,
-}
-
-#[derive(Clone, Copy)]
-struct PrefixCase {
-    name: &'static str,
-    rows: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -470,25 +464,6 @@ const POINT_CASES: &[PointCase] = &[
     },
 ];
 
-const PREFIX_CASES: &[PrefixCase] = &[
-    PrefixCase {
-        name: "q0",
-        rows: 0,
-    },
-    PrefixCase {
-        name: "q100",
-        rows: 100,
-    },
-    PrefixCase {
-        name: "q1000",
-        rows: 1_000,
-    },
-    PrefixCase {
-        name: "q10000",
-        rows: 10_000,
-    },
-];
-
 const DELETE_RANGE_CASES: &[DeleteRangeCase] = &[
     DeleteRangeCase {
         name: "delete_prefix_q100",
@@ -596,11 +571,8 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_durable_commit(c, RedbTempBenchBackend::new());
     bench_durable_commit(c, RocksDbTempBenchBackend::new());
     bench_point_request_plan(c);
-    bench_point_read_adapter(c);
-    bench_point_read_indexed_adapter(c);
     bench_point_read_indexed_lean_backend(c);
     bench_point_read_planned_lean_backend(c);
-    bench_prefix_scan_adapter(c);
     bench_storage_backend_matrix(c, InMemoryBenchBackend);
     bench_storage_backend_matrix(c, SqliteTempBenchBackend::new());
     bench_storage_backend_matrix(c, RedbTempBenchBackend::new());
@@ -1364,71 +1336,6 @@ where
     group.finish();
 }
 
-fn bench_point_read_adapter(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/point_read_adapter");
-
-    for case in POINT_CASES {
-        let keys = point_request_keys(case.requested_keys, case.unique_keys);
-        let expected_missing_slots = case.requested_missing_slots();
-        let read = StorageReadScope::new(PointReadBackend::new(case.existing_unique_keys));
-        group.throughput(Throughput::Elements(case.requested_keys as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
-            b.iter(|| {
-                let result = PointReadPlan::new(space(1), black_box(&keys))
-                    .materialize(&read, GetOptions::default())
-                    .expect("point read");
-                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
-                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.len(), case.requested_keys);
-                assert_eq!(
-                    result.value.iter().filter(|value| value.is_none()).count(),
-                    expected_missing_slots
-                );
-                black_box(result.value);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_point_read_indexed_adapter(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/point_read_indexed_adapter");
-
-    for case in POINT_CASES {
-        let keys = point_request_keys(case.requested_keys, case.unique_keys);
-        let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
-        let read = StorageReadScope::new(PointReadBackend::new(case.existing_unique_keys));
-        group.throughput(Throughput::Elements(case.requested_keys as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
-            b.iter(|| {
-                let plan = PointReadPlan::new(space(1), black_box(&keys));
-                let result = plan
-                    .collect(&read, GetOptions::default())
-                    .expect("indexed point read");
-                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
-                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.len(), case.requested_keys);
-                assert_eq!(result.value.unique_values.len(), case.unique_keys);
-                assert_eq!(
-                    result
-                        .value
-                        .unique_values
-                        .iter()
-                        .filter(|value| value.is_none())
-                        .count(),
-                    expected_unique_missing
-                );
-                black_box(result.value);
-            });
-        });
-    }
-
-    group.finish();
-}
-
 fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
     let mut group = storage_benchmark_group(c, "storage_v2/point_read_indexed_lean_backend");
 
@@ -1551,39 +1458,6 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
                 });
             },
         );
-    }
-
-    group.finish();
-}
-
-fn bench_prefix_scan_adapter(c: &mut Criterion) {
-    let mut group = storage_benchmark_group(c, "storage_v2/prefix_scan_adapter");
-
-    for case in PREFIX_CASES {
-        let read = StorageReadScope::new(PrefixReadBackend::new(case.rows));
-        group.throughput(Throughput::Elements(case.rows as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
-            b.iter(|| {
-                let result = ScanPlan::prefix(
-                    space(1),
-                    Prefix {
-                        bytes: Bytes::from_static(b"row-"),
-                    },
-                )
-                .collect(
-                    &read,
-                    ScanOptions {
-                        limit_rows: case.rows + 1,
-                        ..ScanOptions::default()
-                    },
-                )
-                .expect("prefix scan");
-                assert_eq!(result.stats.prefix_lowered, 1);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.entries.len(), case.rows);
-                black_box(result.value);
-            });
-        });
     }
 
     group.finish();
@@ -3052,67 +2926,6 @@ impl BackendWrite for CountingWrite {
 }
 
 #[derive(Clone)]
-struct PointReadBackend {
-    values: Rc<Vec<ReadEntry>>,
-    requested_keys: Rc<RefCell<Vec<Key>>>,
-}
-
-impl PointReadBackend {
-    fn new(existing_unique_keys: usize) -> Self {
-        let values = (0..existing_unique_keys)
-            .map(|index| {
-                let key = key(format!("point-{index:04}"));
-                ReadEntry {
-                    key: key.clone(),
-                    value: ProjectedValue::FullValue(key.0.clone()),
-                }
-            })
-            .collect();
-        Self {
-            values: Rc::new(values),
-            requested_keys: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-}
-
-impl BackendRead for PointReadBackend {
-    type RangeScan<'a> = BufferedRangeScan;
-
-    fn visit_keys<V>(
-        &self,
-        keys: &[Key],
-        _opts: GetOptions<'_>,
-        visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        self.requested_keys.replace(keys.to_vec());
-        for (index, key) in keys.iter().enumerate() {
-            let value = self
-                .values
-                .iter()
-                .find(|entry| entry.key == *key)
-                .map(|entry| entry.value.as_ref());
-            visitor.visit(index, key, value)?;
-        }
-        Ok(())
-    }
-
-    fn with_range_scan<T, F>(
-        &self,
-        _range: KeyRange,
-        _opts: ScanOptions<'_>,
-        _f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
-    {
-        unreachable!("point-read benchmark does not scan")
-    }
-}
-
-#[derive(Clone)]
 struct LeanPointReadBackend {
     values: Rc<Vec<ReadEntry>>,
 }
@@ -3167,63 +2980,6 @@ impl BackendRead for LeanPointReadBackend {
         F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
         unreachable!("lean point-read benchmark does not scan")
-    }
-}
-
-#[derive(Clone)]
-struct PrefixReadBackend {
-    entries: Rc<Vec<ReadEntry>>,
-}
-
-impl PrefixReadBackend {
-    fn new(rows: usize) -> Self {
-        let entries = (0..rows)
-            .map(|index| {
-                let key = key(format!("row-{index:04}"));
-                ReadEntry {
-                    key,
-                    value: ProjectedValue::KeyOnly,
-                }
-            })
-            .collect();
-        Self {
-            entries: Rc::new(entries),
-        }
-    }
-}
-
-impl BackendRead for PrefixReadBackend {
-    type RangeScan<'a> = BufferedRangeScan;
-
-    fn visit_keys<V>(
-        &self,
-        _keys: &[Key],
-        _opts: GetOptions<'_>,
-        _visitor: &mut V,
-    ) -> Result<(), BackendError>
-    where
-        V: PointVisitor + ?Sized,
-    {
-        unreachable!("prefix-scan benchmark does not point-read")
-    }
-
-    fn with_range_scan<T, F>(
-        &self,
-        range: KeyRange,
-        opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
-    {
-        assert_eq!(range.lower, Bound::Included(key("row-")));
-        assert_eq!(range.upper, Bound::Excluded(key("row.")));
-        if opts.limit_rows == 0 {
-            let mut cursor = BufferedRangeScan::default();
-            return f(&mut cursor);
-        }
-        let mut cursor = BufferedRangeScan::new((*self.entries).clone());
-        f(&mut cursor)
     }
 }
 
@@ -3282,15 +3038,6 @@ impl WriteCase {
             WriteMix::PutsOnly => 0,
             WriteMix::DeletesOnly | WriteMix::PutDelete80_20 => self.spaces,
         }
-    }
-}
-
-impl PointCase {
-    fn requested_missing_slots(&self) -> usize {
-        point_request_keys(self.requested_keys, self.unique_keys)
-            .iter()
-            .filter(|key| point_key_index(key) >= self.existing_unique_keys)
-            .count()
     }
 }
 
@@ -3985,15 +3732,6 @@ fn physical_point_request_keys(
 fn physical_point_scan_range(space_id: u32) -> KeyRange {
     let storage_space = space(space_id);
     storage_space.encode_range(point_scan_range(), None)
-}
-
-fn point_key_index(key: &Key) -> usize {
-    std::str::from_utf8(&key.0)
-        .expect("bench point keys are utf8")
-        .strip_prefix("point-")
-        .expect("bench point key prefix")
-        .parse()
-        .expect("bench point key index")
 }
 
 fn space(id: u32) -> StorageSpace {

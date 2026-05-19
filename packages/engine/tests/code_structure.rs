@@ -1388,6 +1388,8 @@ fn is_test_support_relative_path(relative_path: &str) -> bool {
     parts.iter().any(|part| {
         *part == "tests"
             || *part == "test"
+            || *part == "test_support.rs"
+            || *part == "test_support"
             || part
                 .strip_suffix(".rs")
                 .is_some_and(|stem| stem.ends_with("_tests"))

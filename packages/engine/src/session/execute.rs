@@ -343,7 +343,6 @@ where
                 read_store,
                 live_state: Arc::clone(&self.live_state),
                 binary_cas: Arc::clone(&self.binary_cas),
-                commit_store: Arc::clone(&self.commit_store),
                 version_ctx: Arc::clone(&self.version_ctx),
                 visible_schemas,
                 functions: functions.clone(),

@@ -105,12 +105,12 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
         .await
         .expect("initialized backend should create an engine");
 
-    backend.fail_read_namespace("commit_store.commit");
+    backend.fail_read_namespace("changelog.commit_visibility");
     let before = backend.stats();
     let error = engine
         .rebuild_tracked_state_for_version(&receipt.main_version_id)
         .await
-        .expect_err("forced commit-store read failure should fail rebuild");
+        .expect_err("forced changelog read failure should fail rebuild");
     assert!(
         error.message.contains("forced read failure"),
         "unexpected error: {error:?}"
@@ -122,6 +122,42 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
         "failed rebuild should not open a backend write"
     );
     assert_eq!(delta.write_committed, 0, "failed rebuild must not commit");
+}
+
+#[tokio::test]
+async fn write_segment_failure_does_not_commit_backend_write() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend.clone())
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    backend.fail_write_namespace("changelog.segment");
+    let before = backend.stats();
+    let error = session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('segment-write-failure', 'value')",
+            &[],
+        )
+        .await
+        .expect_err("forced segment write failure should fail transaction commit");
+    assert!(
+        error.message.contains("forced write failure"),
+        "unexpected error: {error:?}"
+    );
+
+    let delta = backend.stats().delta_since(&before);
+    assert_eq!(delta.write_opened, 1, "write should open a backend write");
+    assert_eq!(
+        delta.write_committed, 0,
+        "failed changelog segment write must not commit"
+    );
 }
 
 #[tokio::test]
@@ -285,6 +321,7 @@ struct RecordingBackend {
     inner: InMemoryBackend,
     stats: Arc<TransactionStats>,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
+    fail_write_namespace: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -410,6 +447,13 @@ impl RecordingBackend {
             .lock()
             .expect("fail namespace lock should not poison") = Some(namespace.to_string());
     }
+
+    fn fail_write_namespace(&self, namespace: &str) {
+        *self
+            .fail_write_namespace
+            .lock()
+            .expect("fail namespace lock should not poison") = Some(namespace.to_string());
+    }
 }
 
 impl Backend for RecordingBackend {
@@ -441,6 +485,7 @@ impl Backend for RecordingBackend {
         Ok(RecordingWrite {
             inner: self.inner.begin_write(opts)?,
             stats: Arc::clone(&self.stats),
+            fail_write_namespace: Arc::clone(&self.fail_write_namespace),
         })
     }
 }
@@ -455,6 +500,7 @@ struct RecordingRead {
 struct RecordingWrite {
     inner: InMemoryWrite,
     stats: Arc<TransactionStats>,
+    fail_write_namespace: Arc<Mutex<Option<String>>>,
 }
 
 impl BackendRead for RecordingRead {
@@ -494,6 +540,7 @@ impl BackendRead for RecordingRead {
 
 impl BackendWrite for RecordingWrite {
     fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        self.fail_if_entries_match(&entries)?;
         self.inner.put_many(entries)
     }
 
@@ -516,52 +563,95 @@ impl BackendWrite for RecordingWrite {
     }
 }
 
+impl RecordingWrite {
+    fn fail_if_entries_match(&self, entries: &PutBatch) -> Result<(), BackendError> {
+        if let Some(namespace) = self.fail_write_namespace() {
+            if let Some(prefix) = namespace_prefix(&namespace) {
+                if entries
+                    .entries
+                    .iter()
+                    .any(|entry| key_has_space_prefix(&entry.key, &prefix))
+                {
+                    return Err(forced_write_failure(&namespace));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_write_namespace(&self) -> Option<String> {
+        self.fail_write_namespace
+            .lock()
+            .expect("fail namespace lock should not poison")
+            .clone()
+    }
+}
+
 impl RecordingRead {
     fn fail_if_keys_match(&self, keys: &[Key]) -> Result<(), BackendError> {
-        if self.should_fail_read() && keys.iter().any(key_is_commit_store_commit) {
-            return Err(forced_read_failure());
+        if let Some(namespace) = self.fail_read_namespace() {
+            if let Some(prefix) = namespace_prefix(&namespace) {
+                if keys.iter().any(|key| key_has_space_prefix(key, &prefix)) {
+                    return Err(forced_read_failure(&namespace));
+                }
+            }
         }
         Ok(())
     }
 
     fn fail_if_range_matches(&self, range: &KeyRange) -> Result<(), BackendError> {
-        if self.should_fail_read() && range_may_include_commit_store_commit(range) {
-            return Err(forced_read_failure());
+        if let Some(namespace) = self.fail_read_namespace() {
+            if let Some(prefix) = namespace_prefix(&namespace) {
+                if range_may_include_space_prefix(range, &prefix) {
+                    return Err(forced_read_failure(&namespace));
+                }
+            }
         }
         Ok(())
     }
 
-    fn should_fail_read(&self) -> bool {
+    fn fail_read_namespace(&self) -> Option<String> {
         self.fail_read_namespace
             .lock()
             .expect("fail namespace lock should not poison")
-            .as_deref()
-            == Some("commit_store.commit")
+            .clone()
     }
 }
 
-const COMMIT_STORE_COMMIT_SPACE_PREFIX: [u8; 4] = 0x0003_0001u32.to_be_bytes();
-
-fn key_is_commit_store_commit(key: &Key) -> bool {
-    key.0.starts_with(&COMMIT_STORE_COMMIT_SPACE_PREFIX)
+fn namespace_prefix(namespace: &str) -> Option<[u8; 4]> {
+    match namespace {
+        "changelog.commit_visibility" => {
+            Some(lix_engine::changelog::COMMIT_VISIBILITY_SPACE.physical_prefix())
+        }
+        "changelog.segment" => Some(lix_engine::changelog::SEGMENT_SPACE.physical_prefix()),
+        _ => None,
+    }
 }
 
-fn range_may_include_commit_store_commit(range: &KeyRange) -> bool {
+fn key_has_space_prefix(key: &Key, prefix: &[u8; 4]) -> bool {
+    key.0.starts_with(prefix)
+}
+
+fn range_may_include_space_prefix(range: &KeyRange, prefix: &[u8; 4]) -> bool {
     let lower_allows = match &range.lower {
         Bound::Unbounded => true,
-        Bound::Included(key) => key.0.as_ref() <= COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
-        Bound::Excluded(key) => key.0.as_ref() < COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
+        Bound::Included(key) => key.0.as_ref() <= prefix.as_slice(),
+        Bound::Excluded(key) => key.0.as_ref() < prefix.as_slice(),
     };
     let upper_allows = match &range.upper {
         Bound::Unbounded => true,
-        Bound::Included(key) => key.0.as_ref() >= COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
-        Bound::Excluded(key) => key.0.as_ref() > COMMIT_STORE_COMMIT_SPACE_PREFIX.as_slice(),
+        Bound::Included(key) => key.0.as_ref() >= prefix.as_slice(),
+        Bound::Excluded(key) => key.0.as_ref() > prefix.as_slice(),
     };
     lower_allows && upper_allows
 }
 
-fn forced_read_failure() -> BackendError {
-    BackendError::Io("forced read failure for namespace commit_store.commit".to_string())
+fn forced_read_failure(namespace: &str) -> BackendError {
+    BackendError::Io(format!("forced read failure for namespace {namespace}"))
+}
+
+fn forced_write_failure(namespace: &str) -> BackendError {
+    BackendError::Io(format!("forced write failure for namespace {namespace}"))
 }
 
 #[derive(Default)]
