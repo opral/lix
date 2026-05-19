@@ -10,15 +10,26 @@ use crate::binary_cas::{
     BlobBytesBatch, BlobExistsBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
     BlobWrite, BlobWriteReceipt,
 };
+use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageReader, StorageWriteSet,
+    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions,
+    StorageSpaceId, StorageValue,
 };
 use crate::LixError;
+use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
+const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
+const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0005_0002),
+    BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+);
+const BINARY_CAS_CHUNK_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvBlobManifestChunk {
@@ -34,15 +45,10 @@ pub(crate) struct KvChunk {
 }
 
 pub(crate) async fn load_manifest(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     blob_hash: BlobHash,
 ) -> Result<Option<BinaryCasManifest>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        BINARY_CAS_MANIFEST_NAMESPACE,
-        manifest_key(blob_hash),
-    )
-    .await?
+    let Some(bytes) = get_one(store, BINARY_CAS_MANIFEST_SPACE, manifest_key(blob_hash)).await?
     else {
         return Ok(None);
     };
@@ -50,14 +56,12 @@ pub(crate) async fn load_manifest(
 }
 
 #[cfg(feature = "storage-benches")]
-pub(crate) async fn count_manifests(store: &mut impl StorageReader) -> Result<usize, LixError> {
-    Ok(scan_all_values(
-        store,
-        BINARY_CAS_MANIFEST_NAMESPACE,
-        KvScanRange::Prefix(Vec::new()),
+pub(crate) async fn count_manifests(store: &impl StorageRead) -> Result<usize, LixError> {
+    Ok(
+        scan_all_values(store, BINARY_CAS_MANIFEST_SPACE, Vec::new())
+            .await?
+            .len(),
     )
-    .await?
-    .len())
 }
 
 pub(crate) fn stage_manifest(
@@ -66,20 +70,20 @@ pub(crate) fn stage_manifest(
     manifest: &BinaryCasManifest,
 ) {
     writes.put(
-        BINARY_CAS_MANIFEST_NAMESPACE,
-        manifest_key(blob_hash),
-        encode_binary_cas_manifest(manifest),
+        BINARY_CAS_MANIFEST_SPACE,
+        key(manifest_key(blob_hash)),
+        value(encode_binary_cas_manifest(manifest)),
     );
 }
 
 pub(crate) async fn scan_manifest_chunks(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     blob_hash: BlobHash,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
     scan_all_values(
         store,
-        BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-        KvScanRange::Prefix(manifest_chunk_prefix(blob_hash)),
+        BINARY_CAS_MANIFEST_CHUNK_SPACE,
+        manifest_chunk_prefix(blob_hash),
     )
     .await?
     .into_iter()
@@ -100,18 +104,20 @@ pub(crate) fn stage_manifest_chunk(
     chunk: &KvBlobManifestChunk,
 ) {
     writes.put(
-        BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-        manifest_chunk_key(blob_hash, chunk_index),
-        encode_binary_cas_manifest_chunk(&chunk.chunk_hash, chunk.chunk_size),
+        BINARY_CAS_MANIFEST_CHUNK_SPACE,
+        key(manifest_chunk_key(blob_hash, chunk_index)),
+        value(encode_binary_cas_manifest_chunk(
+            &chunk.chunk_hash,
+            chunk.chunk_size,
+        )),
     );
 }
 
 pub(crate) async fn load_chunk(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     chunk_hash: BlobHash,
 ) -> Result<Option<KvChunk>, LixError> {
-    let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_NAMESPACE, chunk_key(chunk_hash)).await?
-    else {
+    let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_SPACE, chunk_key(chunk_hash)).await? else {
         return Ok(None);
     };
     let (codec, uncompressed_len, payload) = decode_binary_cas_chunk(&bytes)?;
@@ -124,73 +130,78 @@ pub(crate) async fn load_chunk(
 
 pub(crate) fn stage_chunk(writes: &mut StorageWriteSet, chunk_hash: BlobHash, chunk: &KvChunk) {
     writes.put(
-        BINARY_CAS_CHUNK_NAMESPACE,
-        chunk_key(chunk_hash),
-        encode_binary_cas_chunk(chunk.codec, chunk.uncompressed_len, &chunk.data),
+        BINARY_CAS_CHUNK_SPACE,
+        key(chunk_key(chunk_hash)),
+        value(encode_binary_cas_chunk(
+            chunk.codec,
+            chunk.uncompressed_len,
+            &chunk.data,
+        )),
     );
 }
 
 async fn get_one(
-    store: &mut impl StorageReader,
-    namespace: &str,
+    store: &impl StorageRead,
+    space: StorageSpace,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    Ok(store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: namespace.to_string(),
-                keys: vec![key],
-            }],
-        })
-        .await?
-        .groups
+    let result = PointReadPlan::new(space, &[StorageKey(Bytes::from(key))])
+        .materialize(store, StorageGetOptions::default())?;
+    Ok(result
+        .value
         .into_iter()
         .next()
-        .and_then(|group| group.single_value_owned()))
+        .flatten()
+        .and_then(full_value))
 }
 
 async fn scan_all_values(
-    store: &mut impl StorageReader,
-    namespace: &str,
-    range: KvScanRange,
+    store: &impl StorageRead,
+    space: StorageSpace,
+    prefix: Vec<u8>,
 ) -> Result<Vec<Vec<u8>>, LixError> {
-    let page = store
-        .scan_values(KvScanRequest {
-            namespace: namespace.to_string(),
-            range,
-            after: None,
-            limit: usize::MAX,
-        })
-        .await?
-        .values;
-    Ok(page.iter().map(<[u8]>::to_vec).collect())
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::from(prefix),
+        },
+    );
+    let mut values = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan.collect(
+            store,
+            StorageScanOptions {
+                resume_after: resume_after.as_ref(),
+                ..StorageScanOptions::default()
+            },
+        )?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        values.extend(
+            page.value
+                .entries
+                .into_iter()
+                .filter_map(|entry| full_value(entry.value)),
+        );
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(values)
 }
 
 pub(crate) async fn load_metadata_many(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     hashes: &[BlobHash],
 ) -> Result<BlobMetadataBatch, LixError> {
     if hashes.is_empty() {
         return Ok(BlobMetadataBatch::new(Vec::new()));
     }
-    let rows = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: BINARY_CAS_MANIFEST_NAMESPACE.to_string(),
-                keys: hashes.iter().map(|hash| manifest_key(*hash)).collect(),
-            }],
-        })
-        .await?
-        .groups
-        .into_iter()
-        .next()
-        .map(|group| {
-            group
-                .values_iter()
-                .map(|value| value.map(<[u8]>::to_vec))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let rows = point_values(
+        store,
+        BINARY_CAS_MANIFEST_SPACE,
+        hashes.iter().map(|hash| manifest_key(*hash)).collect(),
+    )?;
     if rows.len() != hashes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -216,7 +227,7 @@ pub(crate) async fn load_metadata_many(
 }
 
 pub(crate) async fn exists_many(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     hashes: &[BlobHash],
 ) -> Result<BlobExistsBatch, LixError> {
     Ok(BlobExistsBatch::new(
@@ -230,7 +241,7 @@ pub(crate) async fn exists_many(
 }
 
 pub(crate) async fn load_bytes_many(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     hashes: &[BlobHash],
 ) -> Result<BlobBytesBatch, LixError> {
     let metadata = load_metadata_many(store, hashes).await?.into_vec();
@@ -301,30 +312,52 @@ pub(crate) async fn load_bytes_many(
 }
 
 async fn load_chunk_rows(
-    store: &mut impl StorageReader,
+    store: &impl StorageRead,
     hashes: &[BlobHash],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
     if hashes.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: BINARY_CAS_CHUNK_NAMESPACE.to_string(),
-                keys: hashes.iter().map(|hash| chunk_key(*hash)).collect(),
-            }],
-        })
-        .await?
-        .groups
+    point_values(
+        store,
+        BINARY_CAS_CHUNK_SPACE,
+        hashes.iter().map(|hash| chunk_key(*hash)).collect(),
+    )
+}
+
+fn point_values(
+    store: &impl StorageRead,
+    space: StorageSpace,
+    keys: Vec<Vec<u8>>,
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    let keys = keys
         .into_iter()
-        .next()
-        .map(|group| {
-            group
-                .values_iter()
-                .map(|value| value.map(<[u8]>::to_vec))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default())
+        .map(|key| StorageKey(Bytes::from(key)))
+        .collect::<Vec<_>>();
+    let result =
+        PointReadPlan::new(space, &keys).materialize(store, StorageGetOptions::default())?;
+    Ok(result
+        .value
+        .into_iter()
+        .map(|value| value.and_then(full_value))
+        .collect())
+}
+
+fn key(bytes: Vec<u8>) -> StorageKey {
+    StorageKey(Bytes::from(bytes))
+}
+
+fn value(bytes: Vec<u8>) -> StorageValue {
+    StorageValue {
+        bytes: Bytes::from(bytes),
+    }
+}
+
+fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+    match value {
+        StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
+        StorageProjectedValue::KeyOnly => None,
+    }
 }
 
 fn assemble_blob_bytes(
@@ -653,28 +686,19 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::testing::UnitTestBackend;
     use crate::binary_cas::BinaryCasContext;
-    use crate::storage::{StorageContext, StorageWriteSet};
-
-    fn stage_blob_to_writes(writes: &mut StorageWriteSet, data: &[u8]) {
-        let mut writer = BinaryCasContext::new().writer(writes);
-        writer.stage_bytes(data).expect("blob write should persist");
-    }
+    use crate::storage::StorageContext;
+    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let blob_hash = BlobHash::from_content(b"blob-a");
         let chunk_a_hash = BlobHash::from_content(b"chunk-a").into_bytes();
         let chunk_b_hash = BlobHash::from_content(b"chunk-b").into_bytes();
 
         {
-            let mut writes = StorageWriteSet::new();
+            let mut writes = storage.new_write_set();
             stage_manifest(
                 &mut writes,
                 blob_hash,
@@ -701,19 +725,16 @@ mod tests {
                     chunk_size: 6,
                 },
             );
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("manifest writes should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("manifest writes should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_manifest(&mut store, blob_hash)
+            load_manifest(&store, blob_hash)
                 .await
                 .expect("manifest should load"),
             Some(BinaryCasManifest::Chunked {
@@ -721,12 +742,11 @@ mod tests {
                 chunk_count: 2,
             })
         );
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            scan_manifest_chunks(&mut store, blob_hash)
+            scan_manifest_chunks(&store, blob_hash)
                 .await
                 .expect("manifest chunks should scan"),
             vec![
@@ -744,11 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn stores_encoded_chunks_by_chunk_hash() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let chunk = KvChunk {
             codec: BinaryChunkCodec::Raw,
             uncompressed_len: 5,
@@ -757,21 +773,18 @@ mod tests {
         let chunk_hash = BlobHash::from_content(b"chunk-a");
 
         {
-            let mut writes = StorageWriteSet::new();
+            let mut writes = storage.new_write_set();
             stage_chunk(&mut writes, chunk_hash, &chunk);
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("chunk should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("chunk should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_chunk(&mut store, chunk_hash)
+            load_chunk(&store, chunk_hash)
                 .await
                 .expect("chunk should load"),
             Some(chunk)
@@ -796,41 +809,34 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_blob_bytes() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let data = b"hello chunked kv cas";
         let blob_hash = BlobHash::from_content(data);
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
         {
-            let mut writes = StorageWriteSet::new();
-            stage_blob_to_writes(&mut writes, data);
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("blob write should apply");
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer.stage_bytes(data).expect("blob write should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("blob write should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_bytes_many(&mut store, &[blob_hash])
+            load_bytes_many(&store, &[blob_hash])
                 .await
                 .expect("blob should load")
                 .into_vec(),
             vec![Some(data.to_vec())]
         );
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_manifest(&mut store, blob_hash)
+            load_manifest(&store, blob_hash)
                 .await
                 .expect("manifest should load"),
             Some(BinaryCasManifest::SingleChunk {
@@ -838,22 +844,20 @@ mod tests {
                 chunk_hash: BlobHash::from_content(data).into_bytes(),
             })
         );
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            scan_manifest_chunks(&mut store, blob_hash)
+            scan_manifest_chunks(&store, blob_hash)
                 .await
                 .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
         );
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            exists_many(&mut store, &[blob_hash])
+            exists_many(&store, &[blob_hash])
                 .await
                 .expect("blob exists should succeed")
                 .into_vec(),
@@ -863,48 +867,40 @@ mod tests {
 
     #[tokio::test]
     async fn read_rejects_chunk_bytes_that_do_not_match_manifest_hash() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let data = b"same length";
         let corrupted = b"SAME length";
         let blob_hash = BlobHash::from_content(data);
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         {
-            let mut writes = StorageWriteSet::new();
-            stage_blob_to_writes(&mut writes, data);
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("blob write should apply");
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer.stage_bytes(data).expect("blob write should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("blob write should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         {
-            let mut writes = StorageWriteSet::new();
+            let mut writes = storage.new_write_set();
             writes.put(
-                BINARY_CAS_CHUNK_NAMESPACE,
-                chunk_key(blob_hash),
-                encode_binary_cas_chunk(BinaryChunkCodec::Raw, corrupted.len() as u64, corrupted),
+                BINARY_CAS_CHUNK_SPACE,
+                key(chunk_key(blob_hash)),
+                value(encode_binary_cas_chunk(
+                    BinaryChunkCodec::Raw,
+                    corrupted.len() as u64,
+                    corrupted,
+                )),
             );
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
                 .expect("corrupt chunk should overwrite");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
-        let error = load_bytes_many(&mut store, &[blob_hash])
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = load_bytes_many(&store, &[blob_hash])
             .await
             .expect_err("corrupt chunk should be rejected");
         assert!(error
@@ -914,19 +910,15 @@ mod tests {
 
     #[tokio::test]
     async fn read_rejects_manifest_that_assembles_wrong_blob_hash() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let expected = b"expected bytes";
         let substituted = b"different byte";
         assert_eq!(expected.len(), substituted.len());
         let expected_blob_hash = BlobHash::from_content(expected);
         let substituted_chunk_hash = BlobHash::from_content(substituted);
 
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
         {
-            let mut writes = StorageWriteSet::new();
+            let mut writes = storage.new_write_set();
             stage_manifest(
                 &mut writes,
                 expected_blob_hash,
@@ -953,18 +945,15 @@ mod tests {
                     data: substituted.to_vec(),
                 },
             );
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("wrong manifest fixture should apply");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("wrong manifest fixture should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
-        let error = load_bytes_many(&mut store, &[expected_blob_hash])
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = load_bytes_many(&store, &[expected_blob_hash])
             .await
             .expect_err("wrong assembled blob should be rejected");
         assert!(error
@@ -974,41 +963,34 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_empty_blob() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let data = b"";
         let blob_hash = BlobHash::from_content(data);
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
         {
-            let mut writes = StorageWriteSet::new();
-            stage_blob_to_writes(&mut writes, data);
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("blob write should apply");
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer.stage_bytes(data).expect("blob write should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("blob write should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_bytes_many(&mut store, &[blob_hash])
+            load_bytes_many(&store, &[blob_hash])
                 .await
                 .expect("empty blob should load")
                 .into_vec(),
             vec![Some(Vec::new())]
         );
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            scan_manifest_chunks(&mut store, blob_hash)
+            scan_manifest_chunks(&store, blob_hash)
                 .await
                 .expect("empty blob chunks should scan"),
             Vec::<KvBlobManifestChunk>::new()
@@ -1017,43 +999,36 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_multi_chunk_blob() {
-        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
         let data = (0..600_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let blob_hash = BlobHash::from_content(&data);
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
 
         {
-            let mut writes = StorageWriteSet::new();
-            stage_blob_to_writes(&mut writes, &data);
-            writes
-                .apply(&mut transaction.as_mut())
-                .await
-                .expect("blob write should apply");
+            let mut writes = storage.new_write_set();
+            let mut writer = BinaryCasContext::new().writer(&mut writes);
+            writer.stage_bytes(&data).expect("blob write should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("blob write should commit");
         }
-        transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert_eq!(
-            load_bytes_many(&mut store, &[blob_hash])
+            load_bytes_many(&store, &[blob_hash])
                 .await
                 .expect("large blob should load")
                 .into_vec(),
             vec![Some(data.clone())]
         );
-        let mut store = storage
-            .begin_read_transaction()
-            .await
-            .expect("read transaction should open");
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
         assert!(
-            scan_manifest_chunks(&mut store, blob_hash)
+            scan_manifest_chunks(&store, blob_hash)
                 .await
                 .expect("large blob chunks should scan")
                 .len()

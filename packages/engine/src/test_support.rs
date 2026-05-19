@@ -5,8 +5,8 @@ use crate::json_store::{
     JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
 };
 use crate::storage::StorageContext;
+use crate::storage::StorageRead;
 use crate::storage::StorageWriteSet;
-use crate::storage::StorageWriteTransaction;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
 };
@@ -45,10 +45,9 @@ pub(crate) async fn seed_version_head_with_rows(
     commit_id: &str,
     rows: &[MaterializedTrackedStateRow],
 ) {
-    let mut transaction = storage
-        .begin_write_transaction()
-        .await
-        .expect("seed transaction should open");
+    let read = storage
+        .begin_read(crate::storage::StorageReadOptions::default())
+        .expect("seed read should open");
     let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
     let mut writes = StorageWriteSet::new();
     let canonical_row = prepare_version_ref_row(version_id, commit_id, TEST_TIMESTAMP)
@@ -56,12 +55,9 @@ pub(crate) async fn seed_version_head_with_rows(
     version_ctx
         .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])
         .expect("version ref should stage");
-    writes
-        .apply(&mut transaction.as_mut())
-        .await
-        .expect("version ref should write");
     stage_tracked_root_from_materialized(
-        transaction.as_mut(),
+        &read,
+        &mut writes,
         &TrackedStateContext::new(),
         commit_id,
         None,
@@ -69,24 +65,26 @@ pub(crate) async fn seed_version_head_with_rows(
     )
     .await
     .expect("tracked root should write");
-    transaction.commit().await.expect("seed should commit");
+    storage
+        .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+        .expect("seed should commit");
 }
 
 pub(crate) async fn stage_tracked_root_from_materialized(
-    transaction: &mut dyn StorageWriteTransaction,
+    read: &(impl StorageRead + Send + Sync + ?Sized),
+    writes: &mut StorageWriteSet,
     tracked_state: &TrackedStateContext,
     commit_id: &str,
     parent_commit_id: Option<&str>,
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<(), crate::LixError> {
-    let mut writes = StorageWriteSet::new();
     let changes = rows
         .iter()
         .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
     let json_payloads = materialized_tracked_json_payloads(rows);
     JsonStoreContext::new().writer().stage_batch(
-        &mut writes,
+        writes,
         JsonWritePlacementRef::CommitPack {
             commit_id,
             pack_id: 0,
@@ -116,7 +114,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         .map(|change| change.id.clone())
         .collect::<Vec<_>>();
     let existing_changes = commit_store
-        .reader(&mut *transaction)
+        .reader(read)
         .load_change_index_entries(&change_ids)
         .await?;
     let mut authored_changes = Vec::new();
@@ -137,7 +135,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         }
     }
     let staged = commit_store
-        .writer(&mut *transaction, &mut writes)
+        .writer(read, writes)
         .stage_tracked_commit_draft(commit, authored_changes.clone(), adopted_changes.clone())
         .await?;
     let mut deltas = Vec::with_capacity(changes.len());
@@ -172,10 +170,10 @@ pub(crate) async fn stage_tracked_root_from_materialized(
             ),
     );
     tracked_state
-        .writer(&mut *transaction, &mut writes)
+        .writer(read, writes)
         .stage_delta(commit_id, parent_commit_id, &deltas)
         .await?;
-    writes.apply(&mut *transaction).await.map(|_| ())
+    Ok(())
 }
 
 pub(crate) fn tracked_change_from_materialized(

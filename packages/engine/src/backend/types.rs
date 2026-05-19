@@ -1,96 +1,239 @@
-use async_trait::async_trait;
+use std::ops::Bound;
 
-use crate::backend::{
-    BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvKeyPage,
-    BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats,
-};
-use crate::LixError;
+use bytes::Bytes;
 
-#[async_trait]
-pub trait Backend: Send + Sync {
-    async fn begin_read_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError>;
+use crate::backend::BackendError;
 
-    async fn begin_write_transaction(
-        &self,
-    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SpaceId(pub u32);
 
-    /// Releases physical resources held by this backend handle.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Key(pub Bytes);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyRef<'a>(pub &'a [u8]);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Value(pub Bytes);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadEntry {
+    pub key: Key,
+    pub value: ProjectedValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PutEntry {
+    pub key: Key,
+    pub value: StoredValue,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PutBatch {
+    pub entries: Vec<PutEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredValue {
+    pub bytes: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRange {
+    pub lower: Bound<Key>,
+    pub upper: Bound<Key>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prefix {
+    pub bytes: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetOptions<'a> {
+    pub projection: CoreProjection,
+    pub _reserved: std::marker::PhantomData<&'a ()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanOptions<'a> {
+    pub projection: CoreProjection,
+    pub limit_rows: usize,
+    pub resume_after: Option<&'a Key>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanChunk {
+    pub entries: Vec<ReadEntry>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanResult {
+    pub emitted: usize,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetManyResult {
+    /// One slot per key passed to `get_many`, in caller order.
     ///
-    /// This is a resource lifecycle operation, not a durability boundary and
-    /// not a destructive operation. Successful write transactions are durable
-    /// when their commit returns; callers should not rely on `close` to save
-    /// data. Implementations that do not own external resources may keep the
-    /// default no-op behavior.
-    async fn close(&self) -> Result<(), LixError> {
-        Ok(())
+    /// Duplicates are preserved. `None` means the requested key was missing.
+    pub values: Vec<Option<ProjectedValue>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreProjection {
+    KeyOnly,
+    FullValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectedValue {
+    KeyOnly,
+    FullValue(Bytes),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectedValueRef<'a> {
+    KeyOnly,
+    FullValue(&'a [u8]),
+}
+
+impl ProjectedValueRef<'_> {
+    pub fn to_owned(self) -> ProjectedValue {
+        match self {
+            ProjectedValueRef::KeyOnly => ProjectedValue::KeyOnly,
+            ProjectedValueRef::FullValue(value) => {
+                ProjectedValue::FullValue(Bytes::copy_from_slice(value))
+            }
+        }
+    }
+}
+
+impl ProjectedValue {
+    pub fn as_ref(&self) -> ProjectedValueRef<'_> {
+        match self {
+            ProjectedValue::KeyOnly => ProjectedValueRef::KeyOnly,
+            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
+        }
+    }
+}
+
+impl<'a> KeyRef<'a> {
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.0
     }
 
-    /// Destroys the physical storage target represented by this backend.
-    ///
-    /// This is a persistence lifecycle operation, not a logical SQL operation.
-    ///
-    /// Callers should treat the backend as the authority for what constitutes
-    /// the full storage target. For example:
-    ///
-    /// - native SQLite may delete the main database file plus WAL/SHM sidecars
-    /// - wasm/opfs SQLite may clear the persisted OPFS target
-    /// - Postgres may drop or clear the configured schema/database target
-    ///
-    /// Callers must not attempt to infer or delete backend-owned physical
-    /// artifacts themselves.
-    ///
-    /// Implementations may choose not to support destroy if the backend
-    /// instance does not have enough information or authority to remove its
-    /// target.
-    async fn destroy(&self) -> Result<(), LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "destroy is not supported by this backend".to_string(),
-            hint: None,
-            details: None,
+    pub fn to_owned_key(self) -> Key {
+        Key(Bytes::copy_from_slice(self.0))
+    }
+}
+
+impl Key {
+    pub fn as_ref(&self) -> KeyRef<'_> {
+        KeyRef(self.0.as_ref())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub snapshot: Option<SnapshotRef>,
+    pub consistency: ReadConsistency,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadConsistency {
+    #[default]
+    Snapshot,
+    StaleOk,
+    Latest,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    pub base_snapshot: Option<SnapshotRef>,
+    pub durability: Durability,
+    pub idempotency_key: Option<Bytes>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotRef(pub Bytes);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    #[default]
+    Durable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteStats {
+    pub put_entries: u64,
+    pub deleted_entries: u64,
+    pub deleted_ranges: u64,
+    pub written_bytes: u64,
+    pub backend_calls: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitResult {
+    pub commit_id: Option<Bytes>,
+    pub stats: WriteStats,
+}
+
+impl Prefix {
+    pub fn to_range(&self) -> Result<KeyRange, BackendError> {
+        let lower = Key(self.bytes.clone());
+        let mut upper = self.bytes.to_vec();
+
+        while let Some(last) = upper.last_mut() {
+            if *last == u8::MAX {
+                upper.pop();
+            } else {
+                *last += 1;
+                return Ok(KeyRange {
+                    lower: Bound::Included(lower),
+                    upper: Bound::Excluded(Key(Bytes::from(upper))),
+                });
+            }
+        }
+
+        Ok(KeyRange {
+            lower: Bound::Included(lower),
+            upper: Bound::Unbounded,
         })
     }
 }
 
-#[async_trait]
-pub trait BackendReadTransaction: Send + Sync {
-    async fn get_values(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvValueBatch, LixError>;
-
-    async fn exists_many(
-        &mut self,
-        request: BackendKvGetRequest,
-    ) -> Result<BackendKvExistsBatch, LixError>;
-
-    async fn scan_keys(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvKeyPage, LixError>;
-
-    async fn scan_values(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvValuePage, LixError>;
-
-    async fn scan_entries(
-        &mut self,
-        request: BackendKvScanRequest,
-    ) -> Result<BackendKvEntryPage, LixError>;
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError>;
+impl Default for GetOptions<'_> {
+    fn default() -> Self {
+        Self {
+            projection: CoreProjection::FullValue,
+            _reserved: std::marker::PhantomData,
+        }
+    }
 }
 
-#[async_trait]
-pub trait BackendWriteTransaction: BackendReadTransaction {
-    async fn write_kv_batch(
-        &mut self,
-        batch: BackendKvWriteBatch,
-    ) -> Result<BackendKvWriteStats, LixError>;
+impl GetManyResult {
+    pub fn new(values: Vec<Option<ProjectedValue>>) -> Self {
+        Self { values }
+    }
 
-    async fn commit(self: Box<Self>) -> Result<(), LixError>;
+    pub fn entries_for_requested_keys(&self, keys: &[Key]) -> Vec<ReadEntry> {
+        keys.iter()
+            .cloned()
+            .zip(self.values.iter().cloned())
+            .filter_map(|(key, value)| value.map(|value| ReadEntry { key, value }))
+            .collect()
+    }
+}
+
+impl Default for ScanOptions<'_> {
+    fn default() -> Self {
+        Self {
+            projection: CoreProjection::FullValue,
+            limit_rows: 1024,
+            resume_after: None,
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use crate::storage::StorageReader;
+use crate::storage::StorageRead;
 use crate::tracked_state::{
     plan_merge, TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan,
     TrackedStateStoreReader,
@@ -44,7 +44,7 @@ pub(crate) async fn analyze<S>(
     commits: MergeCommits,
 ) -> Result<MergeAnalysis, LixError>
 where
-    S: StorageReader,
+    S: StorageRead + Send + Sync,
 {
     let request = TrackedStateDiffRequest::default();
     let source_diff = reader

@@ -1,22 +1,31 @@
 use std::sync::Arc;
 
 use crate::functions::FunctionContext;
+use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use crate::transaction::{open_transaction, Transaction};
 use crate::LixError;
+use tokio::sync::OwnedMutexGuard;
 
 use super::context::SessionTransactionGuard;
 use super::SessionContext;
 
-pub struct SessionTransaction {
-    pub(super) transaction: Option<Transaction>,
+pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
+    pub(super) transaction: Option<Transaction<B>>,
     pub(super) runtime_functions: FunctionContext,
     _transaction_guard: SessionTransactionGuard,
+    _write_guard: OwnedMutexGuard<()>,
 }
 
-impl SessionContext {
-    pub async fn begin_transaction(&self) -> Result<SessionTransaction, LixError> {
+impl<B> SessionContext<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
         self.ensure_open()?;
         let transaction_guard = self.reserve_session_transaction()?;
+        let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
         let opened = match open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -38,12 +47,18 @@ impl SessionContext {
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             _transaction_guard: transaction_guard,
+            _write_guard: write_guard,
         })
     }
 }
 
-impl SessionTransaction {
-    pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction, LixError> {
+impl<B> SessionTransaction<B>
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<B>, LixError> {
         self.transaction
             .as_mut()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
