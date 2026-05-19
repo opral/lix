@@ -945,7 +945,8 @@ mod tests {
             };
             UntrackedStateContext::new()
                 .writer(&mut writes)
-                .stage_delete_rows(std::iter::once(identity.as_ref()));
+                .stage_delete_rows(std::iter::once(identity.as_ref()))
+                .expect("delete identity should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .expect("writes should commit");

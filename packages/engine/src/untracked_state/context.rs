@@ -89,7 +89,7 @@ impl UntrackedStateWriter<'_> {
     }
 
     /// Removes untracked rows by exact identity.
-    pub(crate) fn stage_delete_rows<'a, I>(&mut self, identities: I)
+    pub(crate) fn stage_delete_rows<'a, I>(&mut self, identities: I) -> Result<(), LixError>
     where
         I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
     {

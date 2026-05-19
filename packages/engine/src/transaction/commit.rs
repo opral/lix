@@ -124,7 +124,7 @@ pub(crate) async fn commit_prepared_writes(
                 untracked_overlay_delete_identities
                     .iter()
                     .map(UntrackedStateIdentity::as_ref),
-            );
+            )?;
         stage_tracked_roots(
             read,
             &mut writes,
