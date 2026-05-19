@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
+use crate::LixError;
 use crate::storage::{PointReadPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
     StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId, StorageValue,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
-    TrackedStateProjectionMetadata, TrackedStateProjectionParent, TrackedStateRootId,
-    TRACKED_STATE_HASH_BYTES,
+    TRACKED_STATE_HASH_BYTES, TrackedStateProjectionMetadata, TrackedStateProjectionParent,
+    TrackedStateRootId,
 };
-use crate::LixError;
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree.chunk";
@@ -28,6 +28,12 @@ pub(crate) const TRACKED_STATE_PROJECTION_SPACE: StorageSpace = StorageSpace::ne
 );
 
 const PROJECTION_METADATA_MAGIC: &[u8; 5] = b"LXTP1";
+const MIN_PROJECTION_PARENT_BYTES: usize = std::mem::size_of::<u32>() + TRACKED_STATE_HASH_BYTES;
+const PROJECTION_METADATA_FOOTER_BYTES: usize = std::mem::size_of::<u64>()
+    + std::mem::size_of::<u64>()
+    + std::mem::size_of::<u32>()
+    + std::mem::size_of::<u64>()
+    + std::mem::size_of::<u64>();
 
 async fn get_one(
     store: &(impl StorageRead + ?Sized),
@@ -231,6 +237,12 @@ fn decode_projection_metadata(bytes: &[u8]) -> Result<TrackedStateProjectionMeta
     let commit_id = cursor.read_string("commit_id")?;
     let root_id = cursor.read_root_id("root_id")?;
     let parent_count = cursor.read_u32("parent projection count")? as usize;
+    cursor.ensure_counted_records_fit_before_footer(
+        parent_count,
+        MIN_PROJECTION_PARENT_BYTES,
+        PROJECTION_METADATA_FOOTER_BYTES,
+        "parent projections",
+    )?;
     let mut parent_roots = Vec::with_capacity(parent_count);
     for _ in 0..parent_count {
         parent_roots.push(TrackedStateProjectionParent {
@@ -326,6 +338,44 @@ impl ProjectionMetadataCursor<'_> {
         Ok(u64::from_le_bytes(bytes.try_into().expect("fixed u64")))
     }
 
+    fn ensure_counted_records_fit_before_footer(
+        &self,
+        count: usize,
+        record_min_len: usize,
+        footer_len: usize,
+        field: &str,
+    ) -> Result<(), LixError> {
+        let required = count.checked_mul(record_min_len).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode tracked_state projection metadata {field}: byte count overflow"),
+            )
+        })?;
+        let remaining = self.bytes.len().checked_sub(self.offset).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "failed to decode tracked_state projection metadata {field}: cursor overflow"
+                ),
+            )
+        })?;
+        let available = remaining.checked_sub(footer_len).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode tracked_state projection metadata {field}: truncated"),
+            )
+        })?;
+        if required > available {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "failed to decode tracked_state projection metadata {field}: count exceeds remaining bytes"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_exact(&mut self, len: usize, field: &str) -> Result<&[u8], LixError> {
         let end = self.offset.checked_add(len).ok_or_else(|| {
             LixError::new(
@@ -359,10 +409,14 @@ mod tests {
         COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
     };
     use crate::json_store::store::JSON_SPACE;
+    use crate::storage::{InMemoryStorageBackend, StorageContext, StorageWriteOptions};
+    use crate::tracked_state::types::TrackedStateRootId;
     use crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE;
 
     use super::{
-        TRACKED_STATE_BY_FILE_ROOT_SPACE, TRACKED_STATE_CHUNK_SPACE, TRACKED_STATE_PROJECTION_SPACE,
+        PROJECTION_METADATA_MAGIC, TRACKED_STATE_BY_FILE_ROOT_SPACE, TRACKED_STATE_CHUNK_SPACE,
+        TRACKED_STATE_HASH_BYTES, TRACKED_STATE_PROJECTION_SPACE, decode_projection_metadata, key,
+        load_projection_metadata, value, write_string,
     };
 
     #[test]
@@ -394,6 +448,117 @@ mod tests {
                 space.name
             );
         }
+    }
+
+    #[test]
+    fn projection_metadata_decode_rejects_parent_count_that_exceeds_remaining_before_allocating() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PROJECTION_METADATA_MAGIC);
+        write_string(&mut bytes, "commit").expect("commit_id should encode");
+        bytes.extend_from_slice(&[1; TRACKED_STATE_HASH_BYTES]);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        let error = decode_projection_metadata(&bytes)
+            .expect_err("impossible parent_count should reject before allocation");
+
+        assert!(
+            error
+                .message
+                .contains("parent projections: count exceeds remaining bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn projection_metadata_decode_rejects_small_parent_count_without_parent_bytes() {
+        let mut bytes = projection_metadata_header_with_parent_count(1);
+        append_projection_metadata_footer(&mut bytes);
+
+        let error = decode_projection_metadata(&bytes)
+            .expect_err("parent_count without parent bytes should reject before allocation");
+
+        assert!(
+            error
+                .message
+                .contains("parent projections: count exceeds remaining bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn projection_metadata_decode_rejects_parent_count_without_footer_room() {
+        let bytes = projection_metadata_header_with_parent_count(0);
+
+        let error = decode_projection_metadata(&bytes)
+            .expect_err("metadata without footer bytes should reject before allocation");
+
+        assert!(
+            error.message.contains("parent projections: truncated"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn projection_metadata_decode_accepts_minimal_parent_record_before_footer() {
+        let mut bytes = projection_metadata_header_with_parent_count(1);
+        write_string(&mut bytes, "").expect("empty parent commit_id should encode");
+        bytes.extend_from_slice(&[2; TRACKED_STATE_HASH_BYTES]);
+        append_projection_metadata_footer(&mut bytes);
+
+        let metadata =
+            decode_projection_metadata(&bytes).expect("minimal parent metadata should decode");
+
+        assert_eq!(metadata.commit_id, "commit");
+        assert_eq!(
+            metadata.root_id,
+            TrackedStateRootId::new([1; TRACKED_STATE_HASH_BYTES])
+        );
+        assert_eq!(metadata.parent_roots.len(), 1);
+        assert_eq!(metadata.parent_roots[0].commit_id, "");
+        assert_eq!(
+            metadata.parent_roots[0].root_id,
+            TrackedStateRootId::new([2; TRACKED_STATE_HASH_BYTES])
+        );
+        assert_eq!(metadata.changed_key_count, 0);
+        assert_eq!(metadata.row_count_estimate, 0);
+        assert_eq!(metadata.tree_height, 0);
+        assert_eq!(metadata.primary_chunk_count, 0);
+        assert_eq!(metadata.primary_chunk_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn load_projection_metadata_surfaces_parent_count_decode_error() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let mut bytes = projection_metadata_header_with_parent_count(1);
+        append_projection_metadata_footer(&mut bytes);
+        let mut writes = storage.new_write_set();
+        writes.put(
+            TRACKED_STATE_PROJECTION_SPACE,
+            key(b"commit".to_vec()),
+            value(bytes),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("corrupt projection metadata should commit");
+
+        let read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let error = load_projection_metadata(&read, "commit")
+            .await
+            .expect_err("stored corrupt projection metadata should surface decode error");
+
+        assert!(
+            error
+                .message
+                .contains("parent projections: count exceeds remaining bytes"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -471,5 +636,22 @@ mod tests {
         }
 
         lines
+    }
+
+    fn projection_metadata_header_with_parent_count(parent_count: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PROJECTION_METADATA_MAGIC);
+        write_string(&mut bytes, "commit").expect("commit_id should encode");
+        bytes.extend_from_slice(&[1; TRACKED_STATE_HASH_BYTES]);
+        bytes.extend_from_slice(&parent_count.to_le_bytes());
+        bytes
+    }
+
+    fn append_projection_metadata_footer(bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
     }
 }
