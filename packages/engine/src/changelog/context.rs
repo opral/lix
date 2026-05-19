@@ -25,7 +25,11 @@ use super::store::{
     commit_visibility_key, commit_visibility_value, segment_key, segment_value,
     visible_change_proof_key, visible_change_proof_value,
 };
-use super::truth::{SegmentTruthSnapshot, load_segment_truth_index};
+use super::truth::{
+    SegmentTruthSnapshot, find_change_by_exhaustive_segment_scan,
+    find_changes_by_exhaustive_segment_scan, find_commit_by_exhaustive_segment_scan,
+    find_commits_by_exhaustive_segment_scan, load_segment_truth_index,
+};
 use crate::LixError;
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
@@ -404,6 +408,9 @@ where
         commit_ids: &[String],
         projection: CommitProjection,
     ) -> Result<Vec<Option<CommitLoadEntry>>, LixError> {
+        if commit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let visibilities = self.load_commit_visibility_many(commit_ids).await?;
         let mut segment_ids = Vec::new();
         for visibility in visibilities.iter().flatten() {
@@ -440,7 +447,20 @@ where
         commit_ids: &[String],
         projection: CommitProjection,
     ) -> Result<Vec<Option<CommitLoadEntry>>, LixError> {
+        if commit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let by_commit_entries = self.load_by_commit_many(commit_ids).await?;
+        let missing_commit_ids = commit_ids
+            .iter()
+            .zip(by_commit_entries.iter())
+            .filter_map(|(commit_id, entry)| entry.is_none().then_some(commit_id.as_str()))
+            .collect::<Vec<_>>();
+        let truth_commits = if missing_commit_ids.is_empty() {
+            HashMap::new()
+        } else {
+            find_commits_by_exhaustive_segment_scan(&mut self.store, &missing_commit_ids).await?
+        };
         let mut segment_ids = Vec::new();
         for entry in by_commit_entries.iter().flatten() {
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
@@ -449,7 +469,11 @@ where
         let mut entries = Vec::with_capacity(commit_ids.len());
         for (commit_id, by_commit) in commit_ids.iter().zip(by_commit_entries.iter()) {
             let Some(by_commit) = by_commit else {
-                entries.push(None);
+                entries.push(
+                    truth_commits
+                        .get(commit_id)
+                        .map(|(_, commit)| project_segment_commit(commit, projection)),
+                );
                 continue;
             };
             if by_commit.commit_id != *commit_id {
@@ -465,6 +489,7 @@ where
                 )));
             };
             let commit = segment.load_commit(&by_commit.location, commit_id)?;
+            validate_commit_checksum(&by_commit.location.checksum, commit_id, &commit)?;
             entries.push(Some(project_segment_commit(&commit, projection)));
         }
         Ok(entries)
@@ -492,7 +517,20 @@ where
         change_ids: &[String],
         projection: ChangeProjection,
     ) -> Result<Vec<Option<ChangeLoadEntry>>, LixError> {
+        if change_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let by_change_entries = self.load_by_change_many(change_ids).await?;
+        let missing_change_ids = change_ids
+            .iter()
+            .zip(by_change_entries.iter())
+            .filter_map(|(change_id, entry)| entry.is_none().then_some(change_id.as_str()))
+            .collect::<Vec<_>>();
+        let truth_changes = if missing_change_ids.is_empty() {
+            HashMap::new()
+        } else {
+            find_changes_by_exhaustive_segment_scan(&mut self.store, &missing_change_ids).await?
+        };
         let mut segment_ids = Vec::new();
         for entry in by_change_entries.iter().flatten() {
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
@@ -501,7 +539,9 @@ where
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
             let Some(by_change) = by_change else {
-                entries.push(None);
+                entries.push(truth_changes.get(change_id).map(|(location, change)| {
+                    project_change_with_location(location.clone(), change, projection)
+                }));
                 continue;
             };
             if by_change.change_id != *change_id {
@@ -539,6 +579,9 @@ where
         change_ids: &[String],
         projection: ChangeProjection,
     ) -> Result<Vec<Option<ChangeLoadEntry>>, LixError> {
+        if change_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let by_change_entries = self.load_by_change_many(change_ids).await?;
         let mut segment_ids = Vec::new();
         for entry in by_change_entries.iter().flatten() {
@@ -546,6 +589,20 @@ where
         }
         let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
         let visible_change_ids = self.prove_visible_changes(change_ids).await?;
+        let missing_visible_change_ids = change_ids
+            .iter()
+            .zip(by_change_entries.iter())
+            .filter_map(|(change_id, entry)| {
+                (entry.is_none() && visible_change_ids.contains(change_id))
+                    .then_some(change_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let truth_changes = if missing_visible_change_ids.is_empty() {
+            HashMap::new()
+        } else {
+            find_changes_by_exhaustive_segment_scan(&mut self.store, &missing_visible_change_ids)
+                .await?
+        };
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
             if !visible_change_ids.contains(change_id) {
@@ -577,7 +634,9 @@ where
                     )));
                 }
             } else {
-                self.find_segment_change(change_id).await?
+                truth_changes
+                    .get(change_id)
+                    .map(|(location, change)| (location.clone(), change.clone()))
             };
             let Some((location, change)) = physical else {
                 return Err(LixError::unknown(format!(
@@ -1053,44 +1112,6 @@ where
         Ok(Some(project_segment_commit(commit, projection)))
     }
 
-    async fn load_physical_commit_entry(
-        &mut self,
-        commit_id: &str,
-        projection: CommitProjection,
-    ) -> Result<Option<CommitLoadEntry>, LixError> {
-        let Some(entry) = self.load_by_commit(commit_id).await? else {
-            return Ok(None);
-        };
-        let Some(segment) = self.load_segment(&entry.location.segment_id).await? else {
-            return Err(LixError::unknown(format!(
-                "changelog by_commit entry for '{commit_id}' points to missing segment '{}'",
-                entry.location.segment_id
-            )));
-        };
-        let Some(commit) = segment_commit(&segment, commit_id) else {
-            return Err(LixError::unknown(format!(
-                "changelog by_commit entry for '{commit_id}' points to segment '{}' without that commit",
-                segment.header.segment_id
-            )));
-        };
-        validate_commit_location(&entry.location, &segment, commit_id)?;
-        Ok(Some(project_segment_commit(commit, projection)))
-    }
-
-    async fn load_physical_change_entry(
-        &mut self,
-        change_id: &str,
-        projection: ChangeProjection,
-    ) -> Result<Option<ChangeLoadEntry>, LixError> {
-        let Some((location, change)) = self.load_physical_segment_change(change_id).await? else {
-            return Ok(None);
-        };
-        if projection == ChangeProjection::PhysicalLocation {
-            return Ok(Some(ChangeLoadEntry::PhysicalLocation(location)));
-        }
-        Ok(Some(project_segment_change(&change, projection)))
-    }
-
     async fn load_visible_change_entry(
         &mut self,
         change_id: &str,
@@ -1153,20 +1174,24 @@ where
         if expected_locations.is_empty() {
             return Ok(());
         }
-        let mut seen = HashSet::new();
-        for segment in self.scan_all_segments().await? {
-            for commit_id in expected_locations.keys() {
-                let Some(commit) = segment_commit(&segment, commit_id) else {
-                    continue;
-                };
-                let location = directory_commit_location(&segment, commit_id)?;
-                validate_commit_checksum(&location.checksum, commit_id, commit)?;
-                let expected_location = &expected_locations[commit_id];
-                if &location != expected_location || !seen.insert(commit_id.clone()) {
-                    return Err(LixError::unknown(format!(
-                        "changelog commit '{commit_id}' appears in multiple segments"
-                    )));
-                }
+        let found = find_commits_by_exhaustive_segment_scan(
+            &mut self.store,
+            &expected_locations
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        for (commit_id, expected_location) in expected_locations {
+            let Some((location, _)) = found.get(commit_id) else {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{commit_id}' is missing from segment truth"
+                )));
+            };
+            if location != expected_location {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{commit_id}' appears in multiple segments"
+                )));
             }
         }
         Ok(())
@@ -1182,7 +1207,7 @@ where
                     .await?;
                 Ok(Some(found))
             }
-            Ok(None) => self.scan_segments_for_change(change_id).await,
+            Ok(None) => find_change_by_exhaustive_segment_scan(&mut self.store, change_id).await,
             Err(error) => Err(error),
         }
     }
@@ -1206,66 +1231,27 @@ where
         if expected_locations.is_empty() {
             return Ok(());
         }
-        let mut seen = HashSet::new();
-        for segment in self.scan_all_segments().await? {
-            for change_id in expected_locations.keys() {
-                let Some(change) = segment_change(&segment, change_id) else {
-                    continue;
-                };
-                let location = directory_change_location(&segment, change_id)?;
-                validate_change_checksum(&location.checksum, change_id, change)?;
-                let expected_location = &expected_locations[change_id];
-                if &location != expected_location || !seen.insert(change_id.clone()) {
-                    return Err(LixError::unknown(format!(
-                        "changelog change '{change_id}' appears in multiple segments"
-                    )));
-                }
+        let found = find_changes_by_exhaustive_segment_scan(
+            &mut self.store,
+            &expected_locations
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        for (change_id, expected_location) in expected_locations {
+            let Some((location, _)) = found.get(change_id) else {
+                return Err(LixError::unknown(format!(
+                    "changelog change '{change_id}' is missing from segment truth"
+                )));
+            };
+            if location != expected_location {
+                return Err(LixError::unknown(format!(
+                    "changelog change '{change_id}' appears in multiple segments"
+                )));
             }
         }
         Ok(())
-    }
-
-    async fn scan_segments_for_change(
-        &mut self,
-        change_id: &str,
-    ) -> Result<Option<(SegmentObjectLocation, SegmentChange)>, LixError> {
-        let mut found = None::<(SegmentObjectLocation, SegmentChange)>;
-        let mut after = None;
-        loop {
-            let page = self
-                .store
-                .changelog_scan(
-                    SEGMENT_SPACE,
-                    Vec::new(),
-                    after,
-                    64,
-                    StorageCoreProjection::FullValue,
-                )
-                .await?;
-            for index in 0..page.len() {
-                let Some(bytes) = page.value(index) else {
-                    continue;
-                };
-                let segment = decode_segment(bytes)?;
-                validate_segment_shape(&segment)?;
-                if let Some(change) = segment_change(&segment, change_id) {
-                    let location = directory_change_location(&segment, change_id)?;
-                    validate_change_checksum(&location.checksum, change_id, change)?;
-                    if let Some((existing, _)) = &found {
-                        return Err(LixError::unknown(format!(
-                            "changelog change '{change_id}' appears in multiple segments: '{}' and '{}'",
-                            existing.segment_id, location.segment_id
-                        )));
-                    }
-                    found = Some((location, change.clone()));
-                }
-            }
-            let Some(next_after) = page.resume_after else {
-                break;
-            };
-            after = Some(next_after);
-        }
-        Ok(found)
     }
 
     async fn visible_membership_contains_change(
@@ -1599,8 +1585,31 @@ where
         let location = if let Some(location) = self.staged_commits.get(commit_id).cloned() {
             location
         } else {
-            self.load_stored_commit_location_from_segment_truth(commit_id)
-                .await?
+            let truth_location = self
+                .load_stored_commit_location_from_segment_truth(commit_id)
+                .await?;
+            if let Some(entry) = get_one(
+                &mut *self.store,
+                BY_COMMIT_INDEX_SPACE,
+                by_commit_key(commit_id),
+            )
+            .await?
+            .map(|bytes| decode_by_commit_entry(&bytes))
+            .transpose()?
+            {
+                if entry.commit_id != commit_id {
+                    return Err(LixError::unknown(format!(
+                        "by_commit key for '{commit_id}' contains commit_id '{}'",
+                        entry.commit_id
+                    )));
+                }
+                if entry.location != truth_location {
+                    return Err(LixError::unknown(format!(
+                        "by_commit entry for '{commit_id}' does not match segment truth"
+                    )));
+                }
+            }
+            truth_location
         };
         self.stage_publish_commit_at_location(commit_id, location)
             .await
@@ -1610,45 +1619,14 @@ where
         &mut self,
         commit_id: &str,
     ) -> Result<SegmentObjectLocation, LixError> {
-        let mut after = None;
-        let mut found = None::<SegmentObjectLocation>;
-        loop {
-            let page = self
-                .store
-                .changelog_scan(
-                    SEGMENT_SPACE,
-                    Vec::new(),
-                    after,
-                    64,
-                    StorageCoreProjection::FullValue,
-                )
-                .await?;
-            for index in 0..page.len() {
-                let Some(bytes) = page.value(index) else {
-                    continue;
-                };
-                let segment = DecodedSegmentIndex::decode(bytes)?;
-                let Some(location) = segment.commit_location(commit_id) else {
-                    continue;
-                };
-                if let Some(existing) = &found {
-                    return Err(LixError::unknown(format!(
-                        "cannot publish changelog commit '{commit_id}' because multiple segments contain it: '{}' and '{}'",
-                        existing.segment_id, location.segment_id
-                    )));
-                }
-                found = Some(location.clone());
-            }
-            let Some(next_after) = page.resume_after else {
-                break;
-            };
-            after = Some(next_after);
-        }
-        found.ok_or_else(|| {
-            LixError::unknown(format!(
-                "cannot publish changelog commit '{commit_id}' because no segment contains it"
-            ))
-        })
+        find_commit_by_exhaustive_segment_scan(&mut *self.store, commit_id)
+            .await?
+            .map(|(location, _)| location)
+            .ok_or_else(|| {
+                LixError::unknown(format!(
+                    "cannot publish changelog commit '{commit_id}' because no segment contains it"
+                ))
+            })
     }
 
     pub(crate) async fn stage_publish_commit_at_location(
@@ -2226,7 +2204,11 @@ where
         .map(|bytes| decode_by_commit_entry(&bytes))
         .transpose()?
         else {
-            return self.scan_segments_for_commit(commit_id).await;
+            return Ok(
+                find_commit_by_exhaustive_segment_scan(&mut *self.store, commit_id)
+                    .await?
+                    .map(|(_, commit)| commit),
+            );
         };
         if entry.commit_id != commit_id {
             return Err(LixError::unknown(format!(
@@ -2245,30 +2227,19 @@ where
         };
         let commit = segment.load_commit(&entry.location, commit_id)?;
         validate_commit_checksum(&entry.location.checksum, commit_id, &commit)?;
-        self.ensure_unique_stored_commit(commit_id, &entry.location)
-            .await?;
-        Ok(Some(commit))
-    }
-
-    async fn ensure_unique_stored_commit(
-        &mut self,
-        commit_id: &str,
-        expected_location: &SegmentObjectLocation,
-    ) -> Result<(), LixError> {
-        for segment in self.scan_all_segments().await? {
-            let Some(commit) = segment_commit(&segment, commit_id) else {
-                continue;
-            };
-            let location = directory_commit_location(&segment, commit_id)?;
-            validate_commit_checksum(&location.checksum, commit_id, commit)?;
-            if &location != expected_location {
-                return Err(LixError::unknown(format!(
-                    "changelog commit '{commit_id}' appears in multiple segments: '{}' and '{}'",
-                    expected_location.segment_id, location.segment_id
-                )));
-            }
+        let Some((truth_location, _)) =
+            find_commit_by_exhaustive_segment_scan(&mut *self.store, commit_id).await?
+        else {
+            return Err(LixError::unknown(format!(
+                "by_commit entry for '{commit_id}' points to object missing from segment truth"
+            )));
+        };
+        if truth_location != entry.location {
+            return Err(LixError::unknown(format!(
+                "by_commit entry for '{commit_id}' does not match segment truth"
+            )));
         }
-        Ok(())
+        Ok(Some(commit))
     }
 
     async fn load_segment_byte_index_for_writer(
@@ -2280,28 +2251,6 @@ where
             return Ok(None);
         };
         Ok(Some(SegmentByteIndex::decode(bytes)?))
-    }
-
-    async fn scan_segments_for_commit(
-        &mut self,
-        commit_id: &str,
-    ) -> Result<Option<SegmentCommit>, LixError> {
-        let mut found = None::<(String, SegmentCommit)>;
-        for segment in self.scan_all_segments().await? {
-            let Some(commit) = segment_commit(&segment, commit_id) else {
-                continue;
-            };
-            let location = directory_commit_location(&segment, commit_id)?;
-            validate_commit_checksum(&location.checksum, commit_id, commit)?;
-            if let Some((existing_segment_id, _)) = &found {
-                return Err(LixError::unknown(format!(
-                    "changelog commit '{commit_id}' appears in multiple segments: '{}' and '{}'",
-                    existing_segment_id, segment.header.segment_id
-                )));
-            }
-            found = Some((segment.header.segment_id.clone(), commit.clone()));
-        }
-        Ok(found.map(|(_, commit)| commit))
     }
 
     async fn resolve_publish_changes(
@@ -3130,7 +3079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_commits_physical_only_returns_none_when_locator_index_is_missing_for_existing_commit()
+    async fn load_commits_physical_only_falls_back_when_locator_index_is_missing_for_existing_commit()
      {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
@@ -3160,7 +3109,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(batch.entries, vec![None]);
+        assert!(matches!(
+            batch.entries.as_slice(),
+            [Some(CommitLoadEntry::Header(_))]
+        ));
     }
 
     #[tokio::test]
@@ -3320,7 +3272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_changes_physical_only_returns_none_when_locator_index_is_missing_for_existing_change()
+    async fn load_changes_physical_only_falls_back_when_locator_index_is_missing_for_existing_change()
      {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
@@ -3329,7 +3281,7 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         {
             let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(segment).await.unwrap();
+            writer.stage_segment(segment.clone()).await.unwrap();
         }
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -3350,7 +3302,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(batch.entries, vec![None]);
+        assert_eq!(
+            batch.entries,
+            vec![Some(ChangeLoadEntry::Segment(segment.changes[0].clone()))]
+        );
     }
 
     #[tokio::test]
@@ -4521,7 +4476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_publish_commit_ignores_stale_by_commit_locator() {
+    async fn stage_publish_commit_rejects_stale_by_commit_locator() {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -4553,19 +4508,14 @@ mod tests {
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer(&mut *transaction, &mut writes);
-        writer.stage_publish_commit("commit-1").await.unwrap();
-        writes.apply(&mut *transaction).await.unwrap();
-        transaction.commit().await.unwrap();
-
-        let result = read_test_value_groups(
-            &storage,
-            vec![(
-                COMMIT_VISIBILITY_SPACE,
-                vec![commit_visibility_key("commit-1")],
-            )],
+        let error = writer
+            .stage_publish_commit("commit-1")
+            .await
+            .expect_err("stale by_commit locator must fail closed");
+        assert!(
+            error.message.contains("does not match segment truth"),
+            "unexpected error: {error}"
         );
-        let visibility = decode_commit_visibility(result[0][0].as_deref().unwrap()).unwrap();
-        assert_eq!(visibility.location.segment_id, "segment-1");
     }
 
     #[tokio::test]
