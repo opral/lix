@@ -132,6 +132,60 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     Ok(())
 }
 
+pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
+    read: &mut (impl StorageRead + Send + Sync + ?Sized),
+    writes: &mut StorageWriteSet,
+    tracked_state: &TrackedStateContext,
+    commit_id: &str,
+    parent_ids: &[String],
+    projection_parent_commit_id: Option<&str>,
+    rows: &[MaterializedTrackedStateRow],
+) -> Result<(), crate::LixError> {
+    let changes = rows
+        .iter()
+        .map(tracked_change_from_materialized)
+        .collect::<Result<Vec<_>, _>>()?;
+    let commit_change_id = format!("{commit_id}:commit");
+    let staged = stage_test_changelog_commit(
+        read,
+        writes,
+        commit_id,
+        &commit_change_id,
+        parent_ids,
+        rows,
+        &changes,
+    )
+    .await?;
+    let deltas = staged
+        .locators
+        .iter()
+        .map(|(row_index, locator)| {
+            let change = &changes[*row_index];
+            let row = &rows[*row_index];
+            TrackedStateDeltaRef {
+                change: ChangelogChangeRef {
+                    id: &change.id,
+                    authored_commit_id: Some(&locator.commit_id),
+                    entity_id: &change.entity_id,
+                    schema_key: &change.schema_key,
+                    file_id: change.file_id.as_deref(),
+                    snapshot_ref: change.snapshot_ref.as_ref(),
+                    metadata_ref: change.metadata_ref.as_ref(),
+                    created_at: &change.created_at,
+                },
+                locator: locator.as_ref(),
+                created_at: &row.created_at,
+                updated_at: &row.updated_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    tracked_state
+        .writer(read, writes)
+        .stage_projection_root(commit_id, projection_parent_commit_id, deltas)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn stage_empty_changelog_commit(
     read: &mut (impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
@@ -148,6 +202,26 @@ pub(crate) async fn stage_empty_changelog_commit(
         commit_id,
         &commit_change_id,
         &parent_ids,
+        &[],
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn stage_empty_changelog_commit_with_parents(
+    read: &mut (impl StorageRead + Send + Sync + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: &str,
+    parent_ids: &[String],
+) -> Result<(), crate::LixError> {
+    let commit_change_id = format!("{commit_id}:commit");
+    stage_test_changelog_commit(
+        read,
+        writes,
+        commit_id,
+        &commit_change_id,
+        parent_ids,
         &[],
         &[],
     )
@@ -431,7 +505,7 @@ pub(crate) fn tracked_change_from_materialized(
             let serialized = crate::serialize_row_metadata(value);
             prepare_json_ref(&serialized)
         }),
-        created_at: row.created_at.clone(),
+        created_at: row.updated_at.clone(),
     })
 }
 
