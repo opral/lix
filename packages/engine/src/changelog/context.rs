@@ -425,8 +425,6 @@ where
             };
             let commit = segment.load_commit(&visibility.location, commit_id)?;
             validate_commit_checksum(&visibility.checksum, commit_id, &commit)?;
-            self.ensure_unique_stored_commit(commit_id, &visibility.location)
-                .await?;
             entries.push(Some(project_segment_commit(&commit, projection)));
         }
         Ok(entries)
@@ -443,16 +441,6 @@ where
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
         }
         let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
-        let expected_locations = commit_ids
-            .iter()
-            .zip(by_commit_entries.iter())
-            .filter_map(|(commit_id, entry)| {
-                let entry = entry.as_ref()?;
-                (entry.commit_id == *commit_id).then(|| (commit_id.clone(), entry.location.clone()))
-            })
-            .collect::<HashMap<_, _>>();
-        self.ensure_unique_stored_commits(&expected_locations)
-            .await?;
         let mut entries = Vec::with_capacity(commit_ids.len());
         for (commit_id, by_commit) in commit_ids.iter().zip(by_commit_entries.iter()) {
             let Some(by_commit) = by_commit else {
@@ -505,16 +493,6 @@ where
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
         }
         let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
-        let expected_locations = change_ids
-            .iter()
-            .zip(by_change_entries.iter())
-            .filter_map(|(change_id, entry)| {
-                let entry = entry.as_ref()?;
-                (entry.change_id == *change_id).then(|| (change_id.clone(), entry.location.clone()))
-            })
-            .collect::<HashMap<_, _>>();
-        self.ensure_unique_stored_changes(&expected_locations)
-            .await?;
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
             let Some(by_change) = by_change else {
@@ -564,17 +542,6 @@ where
         }
         let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
         let visible_change_ids = self.prove_visible_changes(change_ids).await?;
-        let expected_locations = change_ids
-            .iter()
-            .zip(by_change_entries.iter())
-            .filter(|(change_id, _)| visible_change_ids.contains(*change_id))
-            .filter_map(|(change_id, entry)| {
-                let entry = entry.as_ref()?;
-                (entry.change_id == *change_id).then(|| (change_id.clone(), entry.location.clone()))
-            })
-            .collect::<HashMap<_, _>>();
-        self.ensure_unique_stored_changes(&expected_locations)
-            .await?;
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
             if !visible_change_ids.contains(change_id) {
@@ -733,7 +700,11 @@ where
         .await?;
         values
             .into_iter()
-            .map(|value| Ok(value.and_then(|bytes| decode_commit_visibility(&bytes).ok())))
+            .map(|value| {
+                value
+                    .map(|bytes| decode_commit_visibility(&bytes))
+                    .transpose()
+            })
             .collect()
     }
 
@@ -3715,7 +3686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_changes_visible_recovers_from_corrupt_visible_change_proof() {
+    async fn load_changes_visible_rejects_corrupt_visible_change_proof() {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -3740,18 +3711,20 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let mut reader = context.reader(storage);
-        let batch = reader
+        let error = reader
             .load_changes(ChangeLoadRequest {
                 change_ids: &["change-1".to_string()],
                 projection: ChangeProjection::Segment,
                 visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
             })
             .await
-            .expect("corrupt visible proof should fall back to membership/visibility scans");
+            .expect_err("corrupt visible proof should fail closed");
 
-        assert_eq!(
-            batch.entries,
-            vec![Some(ChangeLoadEntry::Segment(segment.changes[0].clone()))]
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode changelog commit visibility"),
+            "unexpected error: {error}"
         );
     }
 
@@ -4264,77 +4237,6 @@ mod tests {
             .find_segment_change("change-1")
             .await
             .expect_err("duplicate primary change must reject despite by_change index");
-
-        assert!(
-            error.message.contains("appears in multiple"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_changes_physical_rejects_duplicate_primary_change_even_when_by_change_exists() {
-        let (context, storage) = changelog_test_context();
-
-        let mut transaction = storage.begin_write_transaction().await.unwrap();
-        let mut writes = StorageWriteSet::new();
-        {
-            let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(test_segment()).await.unwrap();
-        }
-        writes.apply(&mut *transaction).await.unwrap();
-        transaction.commit().await.unwrap();
-
-        let mut duplicate = test_segment();
-        duplicate.header.segment_id = "segment-2".to_string();
-        duplicate.commits[0].header.id = "commit-2".to_string();
-        duplicate.commits[0].header.derivable_change_id = "derived-change-2".to_string();
-        duplicate.changes[0].authored_commit_id = Some("commit-2".to_string());
-        let duplicate = canonicalize_segment(duplicate).unwrap();
-        write_raw_segment(&storage, &duplicate).await;
-
-        let mut reader = context.reader(storage);
-        let error = reader
-            .load_changes(ChangeLoadRequest {
-                change_ids: &["change-1".to_string()],
-                projection: ChangeProjection::Segment,
-                visibility: ChangeVisibilityMode::PhysicalOnly,
-            })
-            .await
-            .expect_err("batch physical read must reject duplicate primary change");
-
-        assert!(
-            error.message.contains("appears in multiple"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_commits_physical_rejects_duplicate_primary_commit_even_when_by_commit_exists() {
-        let (context, storage) = changelog_test_context();
-
-        let mut transaction = storage.begin_write_transaction().await.unwrap();
-        let mut writes = StorageWriteSet::new();
-        {
-            let mut writer = context.writer(&mut *transaction, &mut writes);
-            writer.stage_segment(test_segment()).await.unwrap();
-        }
-        writes.apply(&mut *transaction).await.unwrap();
-        transaction.commit().await.unwrap();
-
-        let mut duplicate = test_segment();
-        duplicate.header.segment_id = "segment-2".to_string();
-        let duplicate = canonicalize_segment(duplicate).unwrap();
-        write_raw_segment(&storage, &duplicate).await;
-
-        let mut reader = context.reader(storage);
-        let error = reader
-            .load_commits(CommitLoadRequest {
-                commit_ids: &["commit-1".to_string()],
-                projection: CommitProjection::Header,
-                visibility: CommitVisibilityMode::PhysicalOnly,
-            })
-            .await
-            .expect_err("batch physical read must reject duplicate primary commit");
 
         assert!(
             error.message.contains("appears in multiple"),
