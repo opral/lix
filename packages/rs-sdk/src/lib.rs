@@ -4,19 +4,18 @@
 //! session, and the returned [`Lix`] handle owns the small application-facing
 //! surface.
 
-mod in_memory_backend;
 mod lix;
 
-pub use lix::{open_lix, Lix, LixTransaction, OpenLixOptions};
+pub use lix::{open_lix, open_lix_with_backend, Lix, LixTransaction, OpenLixOptions};
 pub use lix_engine::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    BytePage, BytePageBuilder, CreateVersionOptions, CreateVersionReceipt as CreateVersionResult,
-    ExecuteResult, LixError, LixNotice, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
-    MergeConflictKind, MergeConflictSide, MergeVersionOptions, MergeVersionOutcome,
-    MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult,
-    Row, SqlQueryResult, SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult,
-    TryFromValue, Value,
+    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
+    CommitResult, CoreProjection, CreateVersionOptions,
+    CreateVersionReceipt as CreateVersionResult, ExecuteResult, GetOptions, InMemoryBackend,
+    InMemoryRangeScan, InMemoryRead, InMemoryWrite, Key, KeyRange, LixError, LixNotice,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    MergeVersionOptions, MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions,
+    MergeVersionReceipt as MergeVersionResult, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, Row, ScanOptions, ScanResult, ScanVisitor, SqlQueryResult, StoredValue,
+    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, TryFromValue, Value,
+    WriteOptions, WriteStats,
 };

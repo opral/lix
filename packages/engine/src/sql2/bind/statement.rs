@@ -22,7 +22,7 @@ use super::table::{
     bind_public_column_ref, bind_public_table, require_writable_column, BoundTable,
 };
 use super::write::{
-    BoundAssignment, BoundInsertRow, BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp,
+    BoundAssignment, BoundInsertValues, BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp,
     BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
 };
 
@@ -417,15 +417,16 @@ fn bind_insert_input(
                 row.len()
             )));
         }
-        let mut bound_values = BTreeMap::new();
-        for (column, value) in columns.iter().zip(row) {
-            bound_values.insert(column.clone(), bind_insert_value_expr(value, params)?);
-        }
-        rows.push(BoundInsertRow {
-            values: bound_values,
-        });
+        rows.push(
+            row.iter()
+                .map(|value| bind_insert_value_expr(value, params))
+                .collect::<Result<Vec<_>, LixError>>()?,
+        );
     }
-    Ok(BoundWriteInput::Values(rows))
+    Ok(BoundWriteInput::Values(BoundInsertValues {
+        columns: columns.to_vec(),
+        rows,
+    }))
 }
 
 fn bind_query_params(query: &Query, params: &mut ParamBinder) -> Result<(), LixError> {
@@ -684,9 +685,36 @@ fn bind_insert_value_function(
     function: &Function,
     params: &mut ParamBinder,
 ) -> Result<BoundExpr, LixError> {
+    if let Some(value) = bind_insert_lix_json_literal(function)? {
+        return Ok(value);
+    }
     bind_function(function, params, |expr, params| {
         bind_insert_value_expr(expr, params)
     })
+}
+
+fn bind_insert_lix_json_literal(function: &Function) -> Result<Option<BoundExpr>, LixError> {
+    reject_unsupported_function_modifiers(function)?;
+    let name = bind_lix_function_name(function)?;
+    if name != "lix_json" {
+        return Ok(None);
+    }
+    let raw_args = function_args(&function.args)?;
+    validate_bound_function_arity(&name, raw_args.len())?;
+    let Expr::Value(value) = raw_args[0] else {
+        return Ok(None);
+    };
+    let raw = match &value.value {
+        Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => value,
+        _ => return Ok(None),
+    };
+    let value = serde_json::from_str(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("lix_json argument is not valid JSON: {error}"),
+        )
+    })?;
+    Ok(Some(BoundExpr::Literal(BoundLiteral::Json(value))))
 }
 
 fn bind_function_expr(
@@ -983,14 +1011,11 @@ fn bind_write_version_scope(
         return bind_base_write_version_scope(kind, input, predicate, active_version_id);
     };
     let version_selector = match input {
-        BoundWriteInput::Values(rows) => {
+        BoundWriteInput::Values(values) => {
             let mut selector = VersionSelector::Missing;
-            for row in rows {
-                if let Some((_, value)) = row
-                    .values
-                    .iter()
-                    .find(|(column, _)| column.name == version_column)
-                {
+            if let Some(column_index) = values.column_index(version_column) {
+                for row in &values.rows {
+                    let value = &row[column_index];
                     selector = selector.union(value_version_selector(value)?);
                 }
             }
@@ -1003,10 +1028,12 @@ fn bind_write_version_scope(
     };
     if matches!(kind, PublicSurfaceKind::LixStateByVersion) {
         let global_selector = match input {
-            BoundWriteInput::Values(rows) => {
+            BoundWriteInput::Values(values) => {
                 let mut selector = GlobalSelector::Missing;
-                for row in rows {
-                    selector = selector.union(insert_row_global_selector(row)?);
+                let global_column_index = values.column_index("global");
+                for row in &values.rows {
+                    selector =
+                        selector.union(insert_row_global_selector(global_column_index, row)?);
                 }
                 selector
             }
@@ -1089,9 +1116,7 @@ fn lix_state_by_version_scope(
             VersionSelector::Static(_) => Err(super::error::unsupported(
                 "lix_state_by_version writes cannot combine global = true with non-global version_id",
             )),
-            VersionSelector::Dynamic { .. } => Err(super::error::unsupported(
-                "parameterized lix_state global scope selectors are not supported yet",
-            )),
+            VersionSelector::Dynamic { .. } => by_version_scope(input, version_column, version_selector),
         },
         GlobalSelector::Static(false) => match &version_selector {
             VersionSelector::Static(version_ids) if version_ids.contains(GLOBAL_VERSION_ID) => {
@@ -1101,6 +1126,7 @@ fn lix_state_by_version_scope(
             }
             _ => by_version_scope(input, version_column, version_selector),
         },
+        GlobalSelector::Dynamic => by_version_scope(input, version_column, version_selector),
         GlobalSelector::Missing => match &version_selector {
             VersionSelector::Static(version_ids)
                 if version_ids == &BTreeSet::from([GLOBAL_VERSION_ID.to_string()]) =>
@@ -1137,10 +1163,11 @@ fn bind_base_write_version_scope(
         return Ok(active_version_scope(active_version_id));
     }
     match input {
-        BoundWriteInput::Values(rows) => {
+        BoundWriteInput::Values(values) => {
             let mut selector = GlobalSelector::Missing;
-            for row in rows {
-                selector = selector.union(insert_row_global_selector(row)?);
+            let global_column_index = values.column_index("global");
+            for row in &values.rows {
+                selector = selector.union(insert_row_global_selector(global_column_index, row)?);
             }
             match selector {
                 GlobalSelector::Missing | GlobalSelector::Static(false) => {
@@ -1148,6 +1175,9 @@ fn bind_base_write_version_scope(
                 }
                 GlobalSelector::Static(true) => Ok(VersionScope::Global),
                 GlobalSelector::Empty => Ok(VersionScope::Empty),
+                GlobalSelector::Dynamic => Err(super::error::unsupported(
+                    "parameterized lix_state global scope selectors are not supported yet",
+                )),
                 GlobalSelector::Mixed => Err(super::error::unsupported(
                     "lix_state INSERT cannot mix global and active-version rows",
                 )),
@@ -1159,6 +1189,9 @@ fn bind_base_write_version_scope(
                 Ok(active_version_scope(active_version_id))
             }
             GlobalSelector::Empty => Ok(VersionScope::Empty),
+            GlobalSelector::Dynamic => Err(super::error::unsupported(
+                "parameterized lix_state global scope selectors are not supported yet",
+            )),
             GlobalSelector::Mixed => Err(super::error::unsupported(
                 "lix_state global predicates select mixed version scopes",
             )),
@@ -1171,6 +1204,7 @@ fn bind_base_write_version_scope(
 enum GlobalSelector {
     Missing,
     Static(bool),
+    Dynamic,
     Mixed,
     Empty,
 }
@@ -1179,6 +1213,7 @@ impl GlobalSelector {
     fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
+            (Self::Dynamic, _) | (_, Self::Dynamic) => Self::Dynamic,
             (Self::Empty, selector) | (selector, Self::Empty) => selector,
             (Self::Missing, selector) | (selector, Self::Missing) => selector,
             (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
@@ -1189,6 +1224,8 @@ impl GlobalSelector {
     fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
+            (Self::Dynamic, Self::Missing) | (Self::Missing, Self::Dynamic) => Self::Dynamic,
+            (Self::Dynamic, selector) | (selector, Self::Dynamic) => selector,
             (Self::Mixed, Self::Missing) | (Self::Missing, Self::Mixed) => Self::Mixed,
             (Self::Mixed, selector) | (selector, Self::Mixed) => selector,
             (Self::Missing, selector) | (selector, Self::Missing) => selector,
@@ -1198,15 +1235,14 @@ impl GlobalSelector {
     }
 }
 
-fn insert_row_global_selector(row: &BoundInsertRow) -> Result<GlobalSelector, LixError> {
-    let Some((_, value)) = row
-        .values
-        .iter()
-        .find(|(column, _)| column.name == "global")
-    else {
+fn insert_row_global_selector(
+    column_index: Option<usize>,
+    row: &[BoundExpr],
+) -> Result<GlobalSelector, LixError> {
+    let Some(column_index) = column_index else {
         return Ok(GlobalSelector::Missing);
     };
-    global_selector_value(value)
+    global_selector_value(&row[column_index])
 }
 
 fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelector, LixError> {
@@ -1277,9 +1313,7 @@ fn global_value_from_binary_exprs(
 fn global_selector_value(expr: &BoundExpr) -> Result<GlobalSelector, LixError> {
     match expr {
         BoundExpr::Literal(BoundLiteral::Bool(value)) => Ok(GlobalSelector::Static(*value)),
-        BoundExpr::Param(_) => Err(super::error::unsupported(
-            "parameterized lix_state global scope selectors are not supported yet",
-        )),
+        BoundExpr::Param(_) => Ok(GlobalSelector::Dynamic),
         _ => Err(super::error::unsupported(
             "lix_state global predicates require boolean literals",
         )),
@@ -1636,6 +1670,24 @@ mod tests {
     }
 
     #[test]
+    fn bind_statement_rejects_duplicate_lix_state_by_version_insert_columns() {
+        let statement = parse_statement(
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, version_id\
+             ) VALUES (\
+             '[\"entity1\"]', 'lix_key_value', '{\"key\":\"k\",\"value\":\"v\"}', 'version1', 'version2'\
+             )",
+        );
+        let error = bind_statement(&statement, &[], "version1")
+            .expect_err("duplicate lix_state_by_version insert columns should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error
+            .message
+            .contains("duplicate write target column 'version_id'"));
+    }
+
+    #[test]
     fn bind_statement_rejects_duplicate_update_columns() {
         let statement = parse_statement("UPDATE lix_file SET name = 'a', name = 'b'");
         let error = bind_statement(&statement, &[], "version1")
@@ -1721,18 +1773,24 @@ mod tests {
             write.params.params.keys().copied().collect::<Vec<_>>(),
             vec![1, 2]
         );
-        let BoundWriteInput::Values(rows) = write.input else {
+        let BoundWriteInput::Values(values) = write.input else {
             panic!("expected values input");
         };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values.len(), 2);
-        assert!(rows[0]
-            .values
-            .values()
+        assert_eq!(
+            values
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+        assert_eq!(values.rows.len(), 1);
+        assert_eq!(values.rows[0].len(), 2);
+        assert!(values.rows[0]
+            .iter()
             .any(|value| matches!(value, BoundExpr::Param(param) if param.index == 1)));
-        assert!(rows[0]
-            .values
-            .values()
+        assert!(values.rows[0]
+            .iter()
             .any(|value| matches!(value, BoundExpr::Param(param) if param.index == 2)));
     }
 
@@ -1755,34 +1813,33 @@ mod tests {
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
         let write = bound;
-        let BoundWriteInput::Values(rows) = write.input else {
+        let BoundWriteInput::Values(values) = write.input else {
             panic!("expected values input");
         };
-        assert!(rows[0]
-            .values
-            .values()
+        assert!(values.rows[0]
+            .iter()
             .any(|value| matches!(value, BoundExpr::Literal(BoundLiteral::Blob(bytes)) if bytes == &vec![0x41, 0x42])));
     }
 
     #[test]
-    fn bind_statement_binds_lix_json_values_functions() {
+    fn bind_statement_predecodes_lix_json_literal_values() {
         let statement = parse_statement(
             "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) VALUES (lix_json('[\"e1\"]'), 'app.test', lix_json('{\"id\":\"e1\"}'))",
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
         let write = bound;
-        let BoundWriteInput::Values(rows) = write.input else {
+        let BoundWriteInput::Values(values) = write.input else {
             panic!("expected values input");
         };
-        assert_eq!(rows[0].values.len(), 3);
-        assert!(rows[0].values.values().any(|value| {
-            matches!(
-                value,
-                BoundExpr::Function { name, args }
-                    if name == "lix_json" && args.len() == 1
-            )
-        }));
+        assert_eq!(values.rows[0].len(), 3);
+        assert!(
+            values.rows[0]
+                .iter()
+                .filter(|value| matches!(value, BoundExpr::Literal(BoundLiteral::Json(_))))
+                .count()
+                >= 2
+        );
     }
 
     #[test]
@@ -1793,12 +1850,11 @@ mod tests {
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
         let write = bound;
-        let BoundWriteInput::Values(rows) = write.input else {
+        let BoundWriteInput::Values(values) = write.input else {
             panic!("expected values input");
         };
-        let function_names = rows[0]
-            .values
-            .values()
+        let function_names = values.rows[0]
+            .iter()
             .filter_map(|value| match value {
                 BoundExpr::Function { name, .. } => Some(name.as_str()),
                 _ => None,
@@ -1968,6 +2024,40 @@ mod tests {
         assert!(error
             .message
             .contains("cannot combine global = false with global version_id"));
+    }
+
+    #[test]
+    fn bind_statement_binds_parameterized_lix_state_by_version_version_id() {
+        let statement = parse_statement(
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
+        );
+        let bound = bind_statement(&statement, &[], "version1")
+            .expect("parameterized lix_state_by_version version_id should bind");
+
+        assert_eq!(
+            bound.version_scope,
+            VersionScope::ExplicitDynamic {
+                version_ids: BTreeSet::new(),
+                param_indexes: BTreeSet::from([1])
+            }
+        );
+    }
+
+    #[test]
+    fn bind_statement_binds_parameterized_lix_state_by_version_global_false_version_id() {
+        let statement = parse_statement(
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1, false)",
+        );
+        let bound = bind_statement(&statement, &[], "version1")
+            .expect("parameterized lix_state_by_version non-global row should bind");
+
+        assert_eq!(
+            bound.version_scope,
+            VersionScope::ExplicitDynamic {
+                version_ids: BTreeSet::new(),
+                param_indexes: BTreeSet::from([1])
+            }
+        );
     }
 
     #[test]
