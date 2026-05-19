@@ -130,18 +130,18 @@ type BackendKvWriteBatch = {
 
 type BackendKvWriteGroup = {
   namespace: string;
-  puts: BackendKvPut[];
-  deletes: Uint8Array[];
+  ops: BackendKvWriteOp[];
 };
 
-type BackendKvPut = {
-  key: Uint8Array;
-  value: Uint8Array;
-};
+type BackendKvWriteOp =
+  | { kind: "put"; key: Uint8Array; value: Uint8Array }
+  | { kind: "delete"; key: Uint8Array }
+  | { kind: "deleteRange"; range: BackendKvScanRange };
 
 type BackendKvWriteStats = {
   puts: number;
   deletes: number;
+  deleteRanges: number;
   bytesWritten: number;
 };
 ```
@@ -153,7 +153,7 @@ type BackendKvWriteStats = {
 | `getValues`                               | Batch fetch values by exact key, grouped by namespace. Missing keys come back as `null` in the same position.                                                                                                                                                        |
 | `existsMany`                              | Same request shape as `getValues`, returns booleans. Used when Lix only needs to know whether a key is present.                                                                                                                                                      |
 | `scanKeys` / `scanValues` / `scanEntries` | Range or prefix scan within one namespace, with `limit` and a resumable `after` cursor.                                                                                                                                                                              |
-| `writeKvBatch`                            | Atomic batch of `puts` and `deletes`, grouped by namespace. Either all of it lands or none of it does. Within a single batch, Lix does not put + delete the same key; the engine never produces such a batch.                                                       |
+| `writeKvBatch`                            | Atomic batch of ordered `ops`, grouped by namespace. Apply operations in list order. Either all of it lands or none of it does. `deleteRange` removes every key matching the same half-open range or prefix shape used by scans.                                     |
 | `commit` / `rollback`                     | Transaction control. After either, the transaction object is finished; do not call further methods on it.                                                                                                                                                            |
 | `close()` / `destroy()` (on the backend)  | Lifecycle. `close()` releases handles without affecting durability. `destroy()` (optional, not in the type signature above for backends that don't own their target) removes the entire storage target: file plus WAL/SHM, the OPFS target, the schema, the bucket. |
 
@@ -166,11 +166,13 @@ type BackendKvWriteStats = {
 
 ### Namespaces
 
-Every batch operation is grouped by `namespace: string`. Treat namespaces as logical tables; implementations typically map them to separate column families, prefixes, tables, or buckets. The engine creates namespaces lazily as it writes; backends that require upfront declaration (IndexedDB) need a known namespace list (see below).
+Every batch operation is grouped by `namespace: string`. Treat namespaces as logical tables; implementations typically map them to separate column families, prefixes, tables, or buckets.
+
+The current JS/WASM engine bridge sends engine storage through one namespace, `"default"`, and encodes Lix storage-space identity into the key bytes. Backends must still implement namespace isolation because the public backend contract supports multiple namespaces and direct backend tests may exercise them, but engine traffic today does not require dynamic namespace creation.
 
 ## Required guarantees
 
-1. **Atomic write batches.** `writeKvBatch` either applies all puts/deletes across all namespaces, or none of them. A partial failure must roll back the batch.
+1. **Atomic write batches.** `writeKvBatch` either applies all ordered operations across all namespaces, or none of them. A partial failure must roll back the batch.
 2. **Read isolation within a transaction.** A read transaction sees a consistent snapshot for its lifetime; concurrent commits do not bleed in.
 3. **Read-your-writes within a write transaction.** Reads after a put in the same write transaction see the new value; reads after a delete see `null`.
 4. **Durable commits.** When `commit()` returns on a write transaction, the changes survive process restart (for persistent backends).

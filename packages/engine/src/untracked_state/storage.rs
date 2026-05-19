@@ -822,6 +822,59 @@ mod tests {
         assert_eq!(loaded, None);
     }
 
+    #[tokio::test]
+    async fn v1_layout_ignores_previous_untracked_row_space() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let context = UntrackedStateContext::new();
+        let legacy_space = StorageSpace::new(StorageSpaceId(0x0001_0001), "untracked_state.row");
+        let mut writes = storage.new_write_set();
+        writes.put(
+            legacy_space,
+            StorageKey(Bytes::from_static(b"legacy-row-key")),
+            StorageValue {
+                bytes: Bytes::from_static(b"legacy-row-value"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("legacy row should commit");
+
+        let loaded = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let mut reader = context.reader(read);
+            reader
+                .load_row(&UntrackedStateRowRequest {
+                    schema_key: "lix_key_value".to_string(),
+                    version_id: "global".to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single("legacy-row-key"),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("load should succeed");
+        assert_eq!(loaded, None);
+
+        let rows = {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open");
+            let mut reader = context.reader(read);
+            reader
+                .scan_rows(&UntrackedStateScanRequest {
+                    filter: crate::untracked_state::UntrackedStateFilter {
+                        version_ids: vec!["global".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .await
+        }
+        .expect("scan should succeed");
+        assert!(rows.is_empty());
+    }
+
     fn untracked_row(
         version_id: &str,
         schema_key: &str,
