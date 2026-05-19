@@ -1,10 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use super::context::ChangelogStorageRead;
-use super::segment::{
-    directory_change_location, directory_commit_location, validate_change_checksum,
-    validate_commit_checksum, validate_segment_shape,
-};
 use super::store::{
     BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
     COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE, by_change_index_value,
@@ -12,13 +8,14 @@ use super::store::{
     by_change_membership_key, by_commit_index_value, by_commit_key, commit_visibility_key,
     commit_visibility_value, segment_key, visible_change_proof_key,
 };
+use super::truth::{compute_retained_primary_closure, load_segment_truth_index};
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
     GcSweepSet, MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
     StateRowIdentity,
 };
 use crate::LixError;
-use crate::changelog::{decode_commit_visibility, decode_segment};
+use crate::changelog::decode_commit_visibility;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::json_store::{self, JsonRef};
 use crate::storage::{StorageCoreProjection, StorageSpace, StorageWriteSet};
@@ -244,150 +241,6 @@ where
         live,
         sweep,
         repair,
-    })
-}
-
-struct SegmentTruthIndex {
-    segment_ids: Vec<String>,
-    commits: HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
-    changes: HashMap<String, (SegmentObjectLocation, SegmentChange)>,
-}
-
-struct RetainedPrimaryClosure {
-    segments: HashSet<String>,
-    commits: HashSet<String>,
-    changes: HashSet<String>,
-}
-
-fn compute_retained_primary_closure(
-    truth: &SegmentTruthIndex,
-    mut segments: HashSet<String>,
-) -> Result<RetainedPrimaryClosure, LixError> {
-    let mut commits = HashSet::new();
-    let mut changes = HashSet::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (commit_id, (location, commit)) in &truth.commits {
-            if !segments.contains(&location.segment_id) {
-                continue;
-            }
-            commits.insert(commit_id.clone());
-            for parent_id in &commit.header.parent_commit_ids {
-                let Some((parent_location, _)) = truth.commits.get(parent_id) else {
-                    return Err(LixError::unknown(format!(
-                        "changelog GC retained commit '{commit_id}' references missing parent commit '{parent_id}'"
-                    )));
-                };
-                if segments.insert(parent_location.segment_id.clone()) {
-                    changed = true;
-                }
-            }
-            for membership in &commit.body.membership {
-                let Some((change_location, _)) = truth.changes.get(&membership.member_change_id)
-                else {
-                    return Err(LixError::unknown(format!(
-                        "changelog GC retained commit '{commit_id}' references missing change '{}'",
-                        membership.member_change_id
-                    )));
-                };
-                if segments.insert(change_location.segment_id.clone()) {
-                    changed = true;
-                }
-            }
-        }
-        for (change_id, (location, _)) in &truth.changes {
-            if segments.contains(&location.segment_id) {
-                changes.insert(change_id.clone());
-            }
-        }
-    }
-    Ok(RetainedPrimaryClosure {
-        segments,
-        commits,
-        changes,
-    })
-}
-
-async fn load_segment_truth_index<S>(store: &mut S) -> Result<SegmentTruthIndex, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let mut after = None;
-    let mut segment_ids = Vec::new();
-    let mut commits = HashMap::new();
-    let mut changes = HashMap::new();
-    loop {
-        let page = store
-            .changelog_scan(
-                SEGMENT_SPACE,
-                Vec::new(),
-                after,
-                64,
-                StorageCoreProjection::FullValue,
-            )
-            .await?;
-        for index in 0..page.len() {
-            let Some(key) = page.key(index) else {
-                continue;
-            };
-            let segment_id = std::str::from_utf8(key)
-                .map_err(|error| {
-                    LixError::unknown(format!(
-                        "changelog GC found invalid UTF-8 segment key: {error}"
-                    ))
-                })?
-                .to_string();
-            let Some(bytes) = page.value(index) else {
-                return Err(LixError::unknown(format!(
-                    "changelog GC segment '{segment_id}' scan returned key without value"
-                )));
-            };
-            let segment = decode_segment(bytes)?;
-            validate_segment_shape(&segment)?;
-            if segment.header.segment_id != segment_id {
-                return Err(LixError::unknown(format!(
-                    "changelog GC segment key '{segment_id}' contains segment '{}'",
-                    segment.header.segment_id
-                )));
-            }
-            push_unique(&mut segment_ids, segment_id);
-            for commit in &segment.commits {
-                let location = directory_commit_location(&segment, &commit.header.id)?;
-                validate_commit_checksum(&location.checksum, &commit.header.id, commit)?;
-                if commits
-                    .insert(commit.header.id.clone(), (location, commit.clone()))
-                    .is_some()
-                {
-                    return Err(LixError::unknown(format!(
-                        "changelog GC found duplicate commit id '{}'",
-                        commit.header.id
-                    )));
-                }
-            }
-            for change in &segment.changes {
-                let location = directory_change_location(&segment, &change.id)?;
-                validate_change_checksum(&location.checksum, &change.id, change)?;
-                if changes
-                    .insert(change.id.clone(), (location, change.clone()))
-                    .is_some()
-                {
-                    return Err(LixError::unknown(format!(
-                        "changelog GC found duplicate change id '{}'",
-                        change.id
-                    )));
-                }
-            }
-        }
-        let Some(next_after) = page.resume_after else {
-            break;
-        };
-        after = Some(next_after);
-    }
-    Ok(SegmentTruthIndex {
-        segment_ids,
-        commits,
-        changes,
     })
 }
 
