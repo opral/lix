@@ -396,8 +396,17 @@ pub(crate) struct GcSweepSet {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GcRepairSet {
+    pub(crate) by_commit: Vec<ByCommitEntry>,
+    pub(crate) by_change: Vec<ByChangeEntry>,
+    pub(crate) by_change_membership: Vec<(ChangeId, CommitId)>,
+    pub(crate) visible_change_proof: Vec<(ChangeId, CommitVisibility)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcPlan {
     pub(crate) roots: Vec<GcRoot>,
     pub(crate) live: GcLiveSet,
     pub(crate) sweep: GcSweepSet,
+    pub(crate) repair: GcRepairSet,
 }
