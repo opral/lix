@@ -793,6 +793,12 @@ where
                         ))
                     })?;
             }
+            if fact.updated_at != row.updated_at {
+                return Err(LixError::unknown(format!(
+                    "tracked-state projection root for commit '{}' has updated_at '{}' for change '{}' but changelog first-parent updated_at is '{}'",
+                    commit_id, row.updated_at, row.change_id, fact.updated_at
+                )));
+            }
             actual_identities.insert(identity);
         }
         if actual_identities != expected_identities {
@@ -2818,6 +2824,106 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn validate_tree_rows_rejects_corrupt_updated_at() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "parent",
+            None,
+            &[row("entity-a", "change-parent", "parent")],
+        )
+        .await
+        .expect("parent root should write");
+        let mut child_row = row_with_value("entity-a", "change-child", "child", "child");
+        child_row.updated_at = "2026-02-01T00:00:00Z".to_string();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            std::slice::from_ref(&child_row),
+        )
+        .await
+        .expect("child root should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let child_root = storage::load_root(&read, "child")
+            .await
+            .expect("child root should load")
+            .expect("child root should exist");
+        let child_metadata = storage::load_projection_metadata(&read, "child")
+            .await
+            .expect("child metadata should load")
+            .expect("child metadata should exist");
+        let key = TrackedStateKey {
+            schema_key: child_row.schema_key.clone(),
+            file_id: child_row.file_id.clone(),
+            entity_id: child_row.entity_id.clone(),
+        };
+        let mut corrupt_value = TrackedStateTree::new()
+            .get(&read, &child_root, &key)
+            .await
+            .expect("child value should load")
+            .expect("child value should exist");
+        corrupt_value.updated_at = "1999-01-01T00:00:00Z".to_string();
+        drop(read);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let result = TrackedStateTree::new()
+            .apply_mutations(
+                &read,
+                &mut writes,
+                None,
+                vec![TrackedStateMutation::put_encoded(
+                    crate::tracked_state::codec::encode_key(&key),
+                    crate::tracked_state::codec::encode_value(&corrupt_value),
+                )],
+                Some("child"),
+            )
+            .await
+            .expect("corrupt child root should write");
+        storage::stage_projection_metadata(
+            &mut writes,
+            &TrackedStateProjectionMetadata {
+                commit_id: "child".to_string(),
+                root_id: result.root_id,
+                parent_roots: child_metadata.parent_roots,
+                changed_key_count: child_metadata.changed_key_count,
+                row_count_estimate: result.row_count as u64,
+                tree_height: result.tree_height as u32,
+                primary_chunk_count: result.chunk_count as u64,
+                primary_chunk_bytes: result.chunk_bytes as u64,
+            },
+        )
+        .expect("corrupt child metadata should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("corrupt child root should commit");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
+        let error = reader
+            .validate_tree_rows_at_commit_against_changelog(
+                "child",
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await
+            .expect_err("corrupt updated_at must be rejected");
+
+        assert!(error.message.contains("has updated_at"));
     }
 
     async fn seed_merge_roots(
