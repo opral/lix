@@ -13,14 +13,14 @@ use super::codec::{
 };
 use super::context::ChangelogContext;
 use super::segment::{
-    canonicalize_segment, directory_change_location, directory_commit_location,
-    validate_change_checksum, validate_commit_checksum, validate_segment_shape,
-    DecodedSegmentIndex,
+    DecodedSegmentIndex, canonicalize_segment, directory_change_location,
+    directory_commit_location, validate_change_checksum, validate_commit_checksum,
+    validate_segment_shape,
 };
 use super::store::{
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
     by_change_key, by_change_membership_commit_id_from_key, by_change_membership_key,
-    by_change_membership_prefix, by_commit_key, segment_key, segment_value, BY_CHANGE_INDEX_SPACE,
-    BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
+    by_change_membership_prefix, by_commit_key, segment_key, segment_value,
 };
 use super::types::{
     ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, CommitLoadRequest, CommitProjection,
@@ -1718,14 +1718,20 @@ impl BenchPayloadShape {
     fn inline_payloads(self, index: usize) -> Vec<SegmentInlinePayload> {
         match self {
             Self::None | Self::ExternalRefsOnly => Vec::new(),
-            Self::SmallInline => vec![SegmentInlinePayload {
-                json_ref: json_ref(index, 1),
-                bytes: payload_bytes(index, 64),
-            }],
-            Self::LargeInline => vec![SegmentInlinePayload {
-                json_ref: json_ref(index, 1),
-                bytes: payload_bytes(index, 8 * 1024),
-            }],
+            Self::SmallInline => {
+                let bytes = payload_bytes(index, 64);
+                vec![SegmentInlinePayload {
+                    json_ref: JsonRef::for_content(&bytes),
+                    bytes,
+                }]
+            }
+            Self::LargeInline => {
+                let bytes = payload_bytes(index, 8 * 1024);
+                vec![SegmentInlinePayload {
+                    json_ref: JsonRef::for_content(&bytes),
+                    bytes,
+                }]
+            }
         }
     }
 }

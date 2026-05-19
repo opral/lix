@@ -1,5 +1,6 @@
 //! Rebuildable by_change_membership index behavior.
 
+use super::truth::SegmentTruthSnapshot;
 use super::types::{CommitId, Segment};
 
 pub(super) struct ByChangeMembershipEntry {
@@ -21,6 +22,21 @@ pub(super) fn by_change_membership_entries_for_segments(
                     commit_id: commit.header.id.clone(),
                 });
             }
+        }
+    }
+    entries
+}
+
+pub(super) fn by_change_membership_entries_for_truth(
+    truth: &SegmentTruthSnapshot,
+) -> Vec<ByChangeMembershipEntry> {
+    let mut entries = Vec::new();
+    for (commit_id, _, commit) in truth.commits_in_segment_order() {
+        for membership in &commit.body.membership {
+            entries.push(ByChangeMembershipEntry {
+                change_id: membership.member_change_id.clone(),
+                commit_id: commit_id.to_string(),
+            });
         }
     }
     entries

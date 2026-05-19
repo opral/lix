@@ -1,6 +1,7 @@
 //! Rebuildable by_change index behavior.
 
 use super::segment::directory_change_location;
+use super::truth::SegmentTruthSnapshot;
 use super::types::{ByChangeEntry, Segment};
 use crate::LixError;
 use std::collections::HashSet;
@@ -25,6 +26,16 @@ pub(super) fn by_change_entries_for_segments(
         }
     }
     Ok(entries)
+}
+
+pub(super) fn by_change_entries_for_truth(truth: &SegmentTruthSnapshot) -> Vec<ByChangeEntry> {
+    truth
+        .changes_in_segment_order()
+        .map(|(change_id, location, _)| ByChangeEntry {
+            change_id: change_id.to_string(),
+            location: location.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
