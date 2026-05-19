@@ -6,7 +6,7 @@ description: Lix is an embeddable version control system for files of any format
 
 Lix is an **embeddable version control system for files of any format**. A spreadsheet diff tells you which cells changed. A contract diff tells you which clauses moved. A CAD diff tells you which parts changed. Lix diffs files **semantically, per entity**, across DOCX, XLSX, CAD, PDF, JSON, and any format with a parser plugin.
 
-Branches, merge, and an immutable change history, exposed as SQL, all running in-process inside your program.
+Versions, merge, and an immutable change history, exposed as SQL, all running in-process inside your program.
 
 > Lix is to version control what DuckDB is to analytics: an embeddable engine with pluggable support for file formats.
 
@@ -16,12 +16,20 @@ Branches, merge, and an immutable change history, exposed as SQL, all running in
 import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
-// every change is journaled into lix_change, queryable as SQL
+
+await lix.execute(
+  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, lix_text_encode($3), false)",
+  ["hello-file", "/hello.txt", "hello"],
+);
+
+const changes = await lix.execute(
+  "SELECT created_at, schema_key, entity_id FROM lix_change",
+);
 ```
 
 ## How it works
 
-Each file format is parsed into **entities**: cells in a spreadsheet, clauses in a document, parts in a CAD drawing. Lix versions those entities. Per-row branch, merge, and history fall out for free.
+Each file format is parsed into **entities**: cells in a spreadsheet, clauses in a document, parts in a CAD drawing. Lix versions those entities. Per-row merge and history fall out for free.
 
 **Status:** the entity foundation ships today. Register a JSON Schema, write rows through SQL, version structured data end-to-end. A plugin API for file formats is on the [roadmap](https://github.com/opral/lix#roadmap); once it lands, anyone can author a plugin that turns a format (XLSX, DOCX, CAD, PDF, anything else) into entities, and the same primitives apply.
 
@@ -79,7 +87,7 @@ Available today through the entity foundation:
 
 ## Next
 
-- [Getting Started](./getting-started.md): install, register a schema, branch, merge.
+- [Getting Started](./getting-started.md): install, register a schema, version, merge.
 - [Comparison to Git](./comparison-to-git.md): when to reach for which.
 - [Lix for AI Agents](./lix-for-ai-agents.md): one shape, in depth.
-- [Schemas](./schemas.md), [Versions & Merging](./versions.md), [Change History](./history.md), [Persistence](./persistence.md), [API Reference](./api-reference.md).
+- [Schemas](./schemas.md), [Versions & Merging](./versions.md), [Change History](./history.md), [Persistence](./persistence.md), [SQL Functions](./sql-functions.md).

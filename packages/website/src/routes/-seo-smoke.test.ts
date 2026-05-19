@@ -40,6 +40,16 @@ function findMetaContent(
   return entry.content;
 }
 
+function jsonLdScripts(
+  scripts: Array<{ type?: string; children?: string }> | undefined,
+) {
+  return (
+    scripts
+      ?.filter((script) => script.type === "application/ld+json")
+      .map((script) => JSON.parse(script.children ?? "{}")) ?? []
+  );
+}
+
 describe("SEO route smoke tests", () => {
   test("docs head stays canonical and strips the rendered h1 once", async () => {
     const rawMarkdown = readFileSync(
@@ -104,6 +114,7 @@ describe("SEO route smoke tests", () => {
         title,
         description,
         date: parsed.frontmatter?.date as string | undefined,
+        dateModified: parsed.frontmatter?.date as string | undefined,
         authors: undefined,
         readingTime: 4,
         ogImage,
@@ -125,6 +136,24 @@ describe("SEO route smoke tests", () => {
     expect(findMetaContent(head.meta, "twitter:image")).toBe(
       "https://lix.dev/blog/002-modeling-a-company-as-a-repository/cover.jpg",
     );
+    const schemas = jsonLdScripts(head.scripts);
+    expect(schemas).toHaveLength(1);
+    expect(schemas[0]).toMatchObject({
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      headline: "Your Company should be a Repository for AI agents",
+      datePublished: "2026-02-23",
+      dateModified: "2026-02-23",
+      mainEntityOfPage: {
+        "@type": "WebPage",
+        "@id": `https://lix.dev/blog/${slug}`,
+      },
+      publisher: {
+        "@type": "Organization",
+        name: "Lix",
+      },
+    });
+    expect(schemas[0]["@type"]).not.toBe("Blog");
     expect(rendered.title).toBe(
       "Your Company should be a Repository for AI agents",
     );

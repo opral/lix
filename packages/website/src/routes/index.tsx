@@ -1,17 +1,25 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { parse } from "@opral/markdown-wc";
-import LandingPage from "../components/landing-page";
+import { Header } from "../components/header";
+import { LandingReadme } from "../components/landing-page";
+import { V2Footer, V2Hero } from "../components/v2-landing-page";
 import {
   buildCanonicalUrl,
   buildWebSiteJsonLd,
   resolveOgImage,
 } from "../lib/seo";
+import { normalizeMarkdownHtml } from "../lib/markdown-html";
 import markdownPageCss from "../components/markdown-page.style.css?url";
 import readmeMarkdown from "../../../../README.md?raw";
 
 async function loadReadmeContent() {
   const parsed = await parse(readmeMarkdown);
-  return { html: parsed.html };
+  return {
+    html: normalizeMarkdownHtml(parsed.html).replaceAll(
+      'src="./assets/',
+      'src="/assets/',
+    ),
+  };
 }
 
 export const Route = createFileRoute("/")({
@@ -19,10 +27,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title =
-      "Lix | Version control as a library for AI agents and structured data";
+    const title = "Lix | An embeddable version control system for AI agents";
     const description =
-      "Lix gives AI agents and applications branchable, reviewable change control for structured files, binary formats, and SQL-backed workflows.";
+      "Lix gives agents branches, checkpoints, semantic diffs, rollback, immutable history, and SQL-queryable context without wrapping Git.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
@@ -30,6 +37,22 @@ export const Route = createFileRoute("/")({
       description,
       canonicalUrl,
     });
+    const softwareJsonLd = {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      name: "Lix",
+      description,
+      url: canonicalUrl,
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "Web, Node.js",
+      programmingLanguage: "TypeScript",
+      codeRepository: "https://github.com/opral/lix",
+      offers: {
+        "@type": "Offer",
+        price: "0",
+        priceCurrency: "USD",
+      },
+    };
 
     return {
       meta: [
@@ -58,13 +81,29 @@ export const Route = createFileRoute("/")({
           type: "application/ld+json",
           children: JSON.stringify(jsonLd),
         },
+        {
+          type: "application/ld+json",
+          children: JSON.stringify(softwareJsonLd),
+        },
       ],
     };
   },
-  component: LandingPageWrapper,
+  component: HomeRoute,
 });
 
-function LandingPageWrapper() {
+function HomeRoute() {
   const { html } = Route.useLoaderData();
-  return <LandingPage readmeHtml={html} />;
+
+  return (
+    <>
+      <Header />
+      <div className="bg-[#fafaf7] text-[#0a0a0a] font-[Geist,ui-sans-serif,system-ui,sans-serif] tracking-[-0.005em] [font-feature-settings:'ss01','ss02','cv11']">
+        <main>
+          <V2Hero />
+          <LandingReadme readmeHtml={html} />
+          <V2Footer />
+        </main>
+      </div>
+    </>
+  );
 }

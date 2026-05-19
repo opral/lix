@@ -1,5 +1,6 @@
 ---
 date: "2026-02-23"
+authors: ["samuelstroschein"]
 og:description: "Modeling a company as a filesystem is promising for AI agents, but binary files break the model. Lix turns binary formats into structured data agents can read and write."
 og:image: "./cover.jpg"
 og:image:alt: "Abstract illustration for Your Company should be a Repository for AI agents"

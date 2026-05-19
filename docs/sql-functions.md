@@ -34,7 +34,8 @@ History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `
 -- Walk one entity's history from the active version's tip
 SELECT depth, observed_commit_id, snapshot_content
 FROM lix_state_history
-WHERE schema_key = 'task' AND entity_id = 't1'
+WHERE schema_key = 'task'
+  AND lix_json_get_text(entity_id, 0) = 't1'
   AND start_commit_id = lix_active_version_commit_id()
 ORDER BY depth;
 ```
@@ -52,7 +53,8 @@ await lix.execute(
   `SELECT depth, snapshot_content
      FROM lix_state_history
     WHERE start_commit_id = $1
-      AND schema_key = $2 AND entity_id = $3
+      AND schema_key = $2
+      AND lix_json_get_text(entity_id, 0) = $3
     ORDER BY depth`,
   [commitId, "task", "t1"],
 );
@@ -127,8 +129,8 @@ SELECT lix_text_decode(data) FROM lix_file WHERE path = '/notes/readme.md';
 Inverse of `lix_text_decode`. Encodes text into a `BLOB`:
 
 ```sql
-INSERT INTO lix_file (id, path, data)
-VALUES (lix_uuid_v7(), '/notes/hello.txt', lix_text_encode('hello world'));
+INSERT INTO lix_file (id, path, data, hidden)
+VALUES (lix_uuid_v7(), '/notes/hello.txt', lix_text_encode('hello world'), false);
 ```
 
 ### `lix_empty_blob()`
@@ -136,12 +138,12 @@ VALUES (lix_uuid_v7(), '/notes/hello.txt', lix_text_encode('hello world'));
 Returns a zero-length `BLOB`. Handy for creating an empty file:
 
 ```sql
-INSERT INTO lix_file (id, path, data)
-VALUES (lix_uuid_v7(), '/empty.bin', lix_empty_blob());
+INSERT INTO lix_file (id, path, data, hidden)
+VALUES (lix_uuid_v7(), '/empty.bin', lix_empty_blob(), false);
 ```
 
 ## Notes
 
 - Functions are pure scalars; they do not consume rows or take aggregates.
-- Bound parameters use `$1`, `$2`, … (not `?`); see [API Reference](./api-reference.md#executesql-params).
+- Bound parameters use `$1`, `$2`, … (not `?`).
 - `lix_active_version_commit_id()`, `lix_uuid_v7()`, and `lix_timestamp()` reflect the engine's current view at planning/execution time and are stable across the rows of a single statement.

@@ -216,7 +216,13 @@ const GoIcon = ({ className = "" }) => (
  * @example
  * <LandingPage />
  */
-function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
+function LandingPage({
+  readmeHtml,
+  showHeader = true,
+}: {
+  readmeHtml?: string;
+  showHeader?: boolean;
+}) {
   const docsPath = "/docs/what-is-lix";
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
@@ -260,97 +266,99 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
 
   return (
     <div className="font-sans text-gray-900 bg-white">
-      <header className="sticky top-0 z-50 border-b border-gray-200 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-[1440px] items-center justify-between pl-6 pr-6 py-3">
-          <a
-            href="/"
-            className="flex items-center text-[#0891B2]"
-            aria-label="lix home"
-          >
-            <LixLogo className="h-7 w-7" />
-            <span className="sr-only">lix</span>
-          </a>
-          <div className="flex items-center gap-6">
-            <nav className="hidden items-center gap-4 text-sm font-medium text-gray-700 sm:flex">
-              {navLinks.map(({ href, label, activePrefix }) => (
+      {showHeader && (
+        <header className="sticky top-0 z-50 border-b border-gray-200 bg-white/80 backdrop-blur">
+          <div className="mx-auto flex w-full max-w-[1440px] items-center justify-between pl-6 pr-6 py-3">
+            <a
+              href="/"
+              className="flex items-center text-[#0891B2]"
+              aria-label="lix home"
+            >
+              <LixLogo className="h-7 w-7" />
+              <span className="sr-only">lix</span>
+            </a>
+            <div className="flex items-center gap-6">
+              <nav className="hidden items-center gap-4 text-sm font-medium text-gray-700 sm:flex">
+                {navLinks.map(({ href, label, activePrefix }) => (
+                  <a
+                    key={href}
+                    href={href}
+                    className={
+                      isActive(href, activePrefix)
+                        ? href.startsWith("/plugins")
+                          ? "px-2 py-1 text-[#0891B2] hover:text-[#0692B6]"
+                          : "px-2 py-1 text-[#0891B2]"
+                        : "px-2 py-1 transition-colors hover:text-[#0692B6]"
+                    }
+                    aria-current={
+                      isActive(href, activePrefix) ? "page" : undefined
+                    }
+                  >
+                    {label}
+                  </a>
+                ))}
+              </nav>
+              <div
+                className="hidden h-4 w-px bg-gray-200 sm:block"
+                aria-hidden="true"
+              />
+              <div className="flex items-center gap-3">
+                {socialLinks.map(({ href, label, Icon, sizeClass }) => (
+                  <a
+                    key={label}
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-gray-900 transition-colors hover:text-gray-900"
+                    aria-label={label}
+                  >
+                    <Icon className={sizeClass ?? "h-5 w-5"} />
+                  </a>
+                ))}
+                <div className="h-4 w-px bg-gray-200" aria-hidden="true" />
                 <a
-                  key={href}
-                  href={href}
-                  className={
-                    isActive(href, activePrefix)
-                      ? href.startsWith("/plugins")
-                        ? "px-2 py-1 text-[#0891B2] hover:text-[#0692B6]"
-                        : "px-2 py-1 text-[#0891B2]"
-                      : "px-2 py-1 transition-colors hover:text-[#0692B6]"
-                  }
-                  aria-current={
-                    isActive(href, activePrefix) ? "page" : undefined
-                  }
-                >
-                  {label}
-                </a>
-              ))}
-            </nav>
-            <div
-              className="hidden h-4 w-px bg-gray-200 sm:block"
-              aria-hidden="true"
-            />
-            <div className="flex items-center gap-3">
-              {socialLinks.map(({ href, label, Icon, sizeClass }) => (
-                <a
-                  key={label}
-                  href={href}
+                  href="https://github.com/opral/lix"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-gray-900 transition-colors hover:text-gray-900"
-                  aria-label={label}
+                  className="group inline-flex items-center gap-1.5 text-sm font-medium text-gray-700 transition-colors hover:text-gray-700"
                 >
-                  <Icon className={sizeClass ?? "h-5 w-5"} />
-                </a>
-              ))}
-              <div className="h-4 w-px bg-gray-200" aria-hidden="true" />
-              <a
-                href="https://github.com/opral/lix"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="group inline-flex items-center gap-1.5 text-sm font-medium text-gray-700 transition-colors hover:text-gray-700"
-              >
-                <GitHubIcon className="h-5 w-5" />
-                GitHub
-                {githubStars !== null && (
-                  <span
-                    className="inline-flex items-center gap-1 text-gray-500 transition-colors group-hover:text-gray-500"
-                    title={`${githubStars.toLocaleString()} GitHub stars`}
-                    aria-label={`${githubStars.toLocaleString()} GitHub stars`}
-                  >
-                    <span className="relative h-3.5 w-3.5" aria-hidden="true">
-                      <svg
-                        className="absolute inset-0 h-3.5 w-3.5 text-gray-400 group-hover:opacity-0 transition-opacity"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
-                      </svg>
-                      <svg
-                        className="absolute inset-0 h-3.5 w-3.5 text-yellow-500 opacity-0 group-hover:opacity-100 transition-opacity"
-                        viewBox="0 0 16 16"
-                        fill="currentColor"
-                      >
-                        <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25z" />
-                      </svg>
+                  <GitHubIcon className="h-5 w-5" />
+                  GitHub
+                  {githubStars !== null && (
+                    <span
+                      className="inline-flex items-center gap-1 text-gray-500 transition-colors group-hover:text-gray-500"
+                      title={`${githubStars.toLocaleString()} GitHub stars`}
+                      aria-label={`${githubStars.toLocaleString()} GitHub stars`}
+                    >
+                      <span className="relative h-3.5 w-3.5" aria-hidden="true">
+                        <svg
+                          className="absolute inset-0 h-3.5 w-3.5 text-gray-400 group-hover:opacity-0 transition-opacity"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                        </svg>
+                        <svg
+                          className="absolute inset-0 h-3.5 w-3.5 text-yellow-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                          viewBox="0 0 16 16"
+                          fill="currentColor"
+                        >
+                          <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.75.75 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25z" />
+                        </svg>
+                      </span>
+                      <span>{formatStars(githubStars)}</span>
                     </span>
-                    <span>{formatStars(githubStars)}</span>
-                  </span>
-                )}
-              </a>
+                  )}
+                </a>
+              </div>
             </div>
           </div>
-        </div>
-      </header>
+        </header>
+      )}
       {/* Main content */}
       <main className="relative px-4 sm:px-6">
         {/* Hero Section - Simplified */}
@@ -703,62 +711,64 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
           </div>
         </section>
 
-        {/* README Content */}
-        {readmeHtml && (
-          <section className="py-16 px-6 sm:px-12 md:px-16 bg-white border-t border-gray-200">
-            <div className="max-w-4xl mx-auto">
-              {/* GitHub README banner */}
-              <a
-                href="https://github.com/opral/lix"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center justify-between mb-10 px-4 py-3 rounded-lg border border-gray-200 bg-gray-50 hover:bg-gray-100 transition-colors group"
-              >
-                <div className="flex items-center gap-3">
-                  <svg
-                    className="w-5 h-5 text-gray-700"
-                    viewBox="0 0 24 24"
-                    fill="currentColor"
-                  >
-                    <path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.48 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.645.35-1.087.636-1.337-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.268 2.75 1.026A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.026 2.747-1.026.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z" />
-                  </svg>
-                  <div>
-                    <span className="text-sm font-medium text-gray-900">
-                      README.md
-                    </span>
-                    <span className="text-sm text-gray-500 ml-2">
-                      from opral/lix
-                    </span>
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5 text-sm text-gray-600 group-hover:text-gray-900">
-                  View on GitHub
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      d="M14 5l7 7m0 0l-7 7m7-7H3"
-                    />
-                  </svg>
-                </div>
-              </a>
-              <article
-                className="markdown-wc-body"
-                dangerouslySetInnerHTML={{ __html: readmeHtml }}
-              />
-            </div>
-          </section>
-        )}
+        <LandingReadme readmeHtml={readmeHtml} />
 
         <Footer />
       </main>
     </div>
+  );
+}
+
+export function LandingReadme({ readmeHtml }: { readmeHtml?: string }) {
+  if (!readmeHtml) return null;
+
+  return (
+    <section className="py-16 px-6 sm:px-12 md:px-16 bg-[#fafaf7] border-t border-[#e7e6e1]">
+      <div className="max-w-4xl mx-auto">
+        <a
+          href="https://github.com/opral/lix"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center justify-between mb-10 px-4 py-3 rounded-lg border border-[#e7e6e1] bg-[#f5f4ee] hover:bg-[#efeee8] transition-colors group"
+        >
+          <div className="flex items-center gap-3">
+            <svg
+              className="w-5 h-5 text-gray-700"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+            >
+              <path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.48 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.645.35-1.087.636-1.337-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.268 2.75 1.026A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.026 2.747-1.026.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z" />
+            </svg>
+            <div>
+              <span className="text-sm font-medium text-gray-900">
+                README.md
+              </span>
+              <span className="text-sm text-gray-500 ml-2">from opral/lix</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-sm text-gray-600 group-hover:text-gray-900">
+            View on GitHub
+            <svg
+              className="w-4 h-4"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M14 5l7 7m0 0l-7 7m7-7H3"
+              />
+            </svg>
+          </div>
+        </a>
+        <article
+          className="markdown-wc-body"
+          dangerouslySetInnerHTML={{ __html: readmeHtml }}
+        />
+      </div>
+    </section>
   );
 }
 

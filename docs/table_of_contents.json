@@ -7,6 +7,7 @@
   ],
   "Concepts": [
     { "path": "./schemas.md", "label": "Schemas" },
+    { "path": "./semantic-changes.md", "label": "Semantic Changes" },
     { "path": "./versions.md", "label": "Versions & Merging" },
     { "path": "./history.md", "label": "Change History" },
     { "path": "./surfaces.md", "label": "SQL Surfaces" }
@@ -16,7 +17,7 @@
     { "path": "./backend.md", "label": "Backends" }
   ],
   "Reference": [
-    { "path": "./api-reference.md", "label": "API Reference" },
+    { "path": "./js-api-reference.md", "label": "JavaScript API" },
     { "path": "./sql-functions.md", "label": "SQL Functions" }
   ]
 }
