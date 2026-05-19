@@ -152,7 +152,8 @@ async fn get_one(
         .into_iter()
         .next()
         .flatten()
-        .and_then(full_value))
+        .map(|value| full_value(space, value))
+        .transpose()?)
 }
 
 async fn scan_all_values(
@@ -177,12 +178,13 @@ async fn scan_all_values(
             },
         )?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        values.extend(
-            page.value
-                .entries
-                .into_iter()
-                .filter_map(|entry| full_value(entry.value)),
-        );
+        let page_values = page
+            .value
+            .entries
+            .into_iter()
+            .map(|entry| full_value(space, entry.value))
+            .collect::<Result<Vec<_>, LixError>>()?;
+        values.extend(page_values);
         if !page.value.has_more || resume_after.is_none() {
             break;
         }
@@ -339,8 +341,12 @@ fn point_values(
     Ok(result
         .value
         .into_iter()
-        .map(|value| value.and_then(full_value))
-        .collect())
+        .map(|value| {
+            value
+                .map(|value| full_value(space, value))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, LixError>>()?)
 }
 
 fn key(bytes: Vec<u8>) -> StorageKey {
@@ -353,10 +359,13 @@ fn value(bytes: Vec<u8>) -> StorageValue {
     }
 }
 
-fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+fn full_value(space: StorageSpace, value: StorageProjectedValue) -> Result<Vec<u8>, LixError> {
     match value {
-        StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
-        StorageProjectedValue::KeyOnly => None,
+        StorageProjectedValue::FullValue(bytes) => Ok(bytes.to_vec()),
+        StorageProjectedValue::KeyOnly => Err(LixError::unknown(format!(
+            "binary CAS read over namespace '{}' requested full value but storage returned key-only entry",
+            space.name
+        ))),
     }
 }
 
@@ -686,9 +695,118 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{
+        BackendError, BackendRead, BufferedRangeScan, GetOptions, Key, KeyRange, PointVisitor,
+        ProjectedValue, ProjectedValueRef, ReadEntry, ScanOptions,
+    };
     use crate::binary_cas::BinaryCasContext;
     use crate::storage::StorageContext;
-    use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+    use crate::storage::{
+        InMemoryStorageBackend, StorageReadOptions, StorageReadScope, StorageWriteOptions,
+    };
+
+    struct KeyOnlyPointRead;
+
+    impl BackendRead for KeyOnlyPointRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            for (index, key) in keys.iter().enumerate() {
+                visitor.visit(index, key, Some(ProjectedValueRef::KeyOnly))?;
+            }
+            Ok(())
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            _f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            unreachable!("binary CAS point-read test does not scan")
+        }
+    }
+
+    struct KeyOnlyScanRead;
+
+    impl BackendRead for KeyOnlyScanRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            _keys: &[Key],
+            _opts: GetOptions<'_>,
+            _visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            unreachable!("binary CAS scan test does not point read")
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            let key = BINARY_CAS_MANIFEST_CHUNK_SPACE
+                .encode_key(&Key(Bytes::from_static(b"manifest-chunk")));
+            let mut cursor = BufferedRangeScan::new(vec![ReadEntry {
+                key,
+                value: ProjectedValue::KeyOnly,
+            }]);
+            f(&mut cursor)
+        }
+    }
+
+    #[tokio::test]
+    async fn load_manifest_rejects_key_only_point_read() {
+        let read = StorageReadScope::new(KeyOnlyPointRead);
+        let blob_hash = BlobHash::from_content(b"blob");
+
+        let error = load_manifest(&read, blob_hash)
+            .await
+            .expect_err("key-only manifest point read must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_manifest_chunks_rejects_key_only_value() {
+        let read = StorageReadScope::new(KeyOnlyScanRead);
+        let blob_hash = BlobHash::from_content(b"blob");
+
+        let error = scan_manifest_chunks(&read, blob_hash)
+            .await
+            .expect_err("key-only manifest chunk scan must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
