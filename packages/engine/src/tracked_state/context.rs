@@ -1,18 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use crate::commit_store::CommitStoreContext;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
-use crate::tracked_state::materialize_index_entries;
+use crate::tracked_state::materialize_rows_from_index_entries;
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
-use crate::tracked_state::storage::DeltaJsonPackIndexesRef;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
-    TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
+    TrackedStateTreeScanRequest,
 };
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::tracked_state::TrackedStateRowRequest;
@@ -21,21 +19,19 @@ use crate::tracked_state::{
 };
 use crate::LixError;
 
-/// Factory for tracked-state readers, delta writers, and projection-root materializers.
+/// Factory for tracked-state readers, root writers, and projection-root rebuilders.
 ///
 /// Tracked state is stored as content-addressed roots. Version refs
 /// choose which commit/root to read; this context only owns root operations.
 #[derive(Clone)]
 pub(crate) struct TrackedStateContext {
     tree: TrackedStateTree,
-    commit_store: CommitStoreContext,
 }
 
 impl TrackedStateContext {
     pub(crate) fn new() -> Self {
         Self {
             tree: TrackedStateTree::new(),
-            commit_store: CommitStoreContext::new(),
         }
     }
 
@@ -47,7 +43,6 @@ impl TrackedStateContext {
         TrackedStateStoreReader {
             store,
             tree: self.tree.clone(),
-            commit_store: self.commit_store,
         }
     }
 
@@ -61,30 +56,31 @@ impl TrackedStateContext {
         S: StorageRead + Send + Sync + ?Sized,
     {
         TrackedStateWriter {
+            chunk_overlay: storage::TrackedStateChunkOverlay::new(),
+            staged_by_file_roots: BTreeMap::new(),
+            staged_roots: BTreeMap::new(),
             tree: self.tree.clone(),
             store,
             writes,
         }
     }
 
-    /// Creates an explicit tracked-state projection-root materializer.
+    /// Creates an explicit tracked-state projection-root rebuilder.
     ///
-    /// Normal commits should use `writer(...).stage_delta(...)`. Materializing a
-    /// projection root is a caller-chosen maintenance/read-acceleration step.
-    pub(crate) fn materializer<'a, S>(
+    /// Normal commits stage projection roots directly. This rebuilder reconstructs
+    /// a missing root from changelog facts as an explicit maintenance path.
+    pub(crate) fn root_rebuilder<'a, S>(
         &'a self,
         store: &'a S,
         writes: &'a mut StorageWriteSet,
-        commit_store: &'a CommitStoreContext,
-    ) -> TrackedStateMaterializer<'a, S>
+    ) -> TrackedStateRootRebuilder<'a, S>
     where
         S: StorageRead + Send + Sync + ?Sized,
     {
-        TrackedStateMaterializer {
+        TrackedStateRootRebuilder {
             tracked_state: self,
             store,
             writes,
-            commit_store,
         }
     }
 }
@@ -93,7 +89,6 @@ impl TrackedStateContext {
 pub(crate) struct TrackedStateStoreReader<S> {
     store: S,
     tree: TrackedStateTree,
-    commit_store: CommitStoreContext,
 }
 
 impl<S> TrackedStateStoreReader<S>
@@ -105,8 +100,7 @@ where
         commit_id: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        let root_id = self.tree.load_root(&mut self.store, commit_id).await?;
-        let rows = if let Some(root_id) = root_id {
+        let rows = if let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? {
             if ByFileIndex::should_use(request) {
                 if let Some(by_file_root_id) =
                     storage::load_by_file_root(&mut self.store, commit_id).await?
@@ -132,18 +126,52 @@ where
                     .await?
             }
         } else {
-            self.projection_entries_at_commit(commit_id, &tree_scan_request_from_tracked(request))
+            self.scan_rows_at_commit_from_changelog(commit_id, request)
                 .await?
         };
-        let projection = crate::tracked_state::TrackedMaterializationProjection::from_columns(
-            &request.projection.columns,
-        );
-        let mut rows = materialize_index_entries(&mut self.store, rows, &projection).await?;
+        let projection =
+            crate::tracked_state::TrackedRowProjection::from_columns(&request.projection.columns);
+        let mut rows =
+            materialize_rows_from_index_entries(&mut self.store, rows, &projection).await?;
         if !request.filter.include_tombstones {
             rows.retain(|row| !row.deleted);
         }
         if let Some(limit) = request.limit {
             rows.truncate(limit);
+        }
+        Ok(rows)
+    }
+
+    async fn scan_rows_at_commit_from_changelog(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        let input =
+            crate::tracked_state::projection_root_rebuild::build_projection_root_rebuild_input(
+                &self.store,
+                commit_id,
+            )
+            .await?;
+        let tree_request = tree_scan_request_from_tracked(request);
+        let mut rows = Vec::with_capacity(input.deltas.len());
+        for delta in input.deltas {
+            let key = TrackedStateKey {
+                schema_key: delta.change.schema_key,
+                file_id: delta.change.file_id,
+                entity_id: delta.change.entity_id,
+            };
+            let value = TrackedStateIndexValue {
+                change_locator: delta.locator,
+                deleted: delta.change.snapshot_ref.is_none(),
+                snapshot_ref: delta.change.snapshot_ref,
+                metadata_ref: delta.change.metadata_ref,
+                created_at: delta.created_at,
+                updated_at: delta.updated_at,
+            };
+            if tree_request.matches(&key, &value) {
+                rows.push((key, value));
+            }
         }
         Ok(rows)
     }
@@ -172,10 +200,10 @@ where
                 entries.push((key, value));
             }
         }
-        let materialized = materialize_index_entries(
+        let materialized = materialize_rows_from_index_entries(
             &mut self.store,
             entries,
-            &crate::tracked_state::TrackedMaterializationProjection::full(),
+            &crate::tracked_state::TrackedRowProjection::full(),
         )
         .await?;
         let mut rows = vec![None; requests.len()];
@@ -200,168 +228,26 @@ where
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
-        if !self.projection_has_pending_deltas(left_commit_id).await?
-            && !self.projection_has_pending_deltas(right_commit_id).await?
-            && self.projection_root_exists(left_commit_id).await?
-            && self.projection_root_exists(right_commit_id).await?
-        {
-            let left_root = self.tree.load_root(&mut self.store, left_commit_id).await?;
-            let right_root = self
-                .tree
-                .load_root(&mut self.store, right_commit_id)
-                .await?;
-            let entries = self
-                .tree
-                .diff(
-                    &mut self.store,
-                    left_root.as_ref(),
-                    right_root.as_ref(),
-                    request,
-                )
-                .await?;
-            return Ok(entries);
-        }
-
-        if let Some(entries) = self
-            .diff_pending_delta_suffix(left_commit_id, right_commit_id, request)
-            .await?
-        {
-            return Ok(entries);
-        }
-
-        let left = self
-            .projection_entries_at_commit(left_commit_id, request)
-            .await?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        let right = self
-            .projection_entries_at_commit(right_commit_id, request)
-            .await?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        let keys = left
-            .keys()
-            .chain(right.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let entries = keys
-            .into_iter()
-            .filter_map(|key| {
-                let before = left.get(&key).cloned().map(|value| (key.clone(), value));
-                let after = right.get(&key).cloned().map(|value| (key, value));
-                if before == after {
-                    None
-                } else {
-                    Some(TrackedStateTreeDiffEntry { before, after })
-                }
-            })
-            .collect();
-        Ok(entries)
-    }
-
-    async fn diff_pending_delta_suffix(
-        &mut self,
-        left_commit_id: &str,
-        right_commit_id: &str,
-        request: &TrackedStateTreeScanRequest,
-    ) -> Result<Option<Vec<TrackedStateTreeDiffEntry>>, LixError> {
-        let left_delta_ids = self
-            .delta_commit_ids_since_projection_root(left_commit_id)
-            .await?;
-        let right_delta_ids = self
-            .delta_commit_ids_since_projection_root(right_commit_id)
-            .await?;
-        let left_base_commit_id = self
-            .projection_base_commit_id(left_commit_id, &left_delta_ids)
-            .await?;
-        let right_base_commit_id = self
-            .projection_base_commit_id(right_commit_id, &right_delta_ids)
-            .await?;
-        if left_base_commit_id != right_base_commit_id {
-            return Ok(None);
-        }
-
-        if right_delta_ids.starts_with(&left_delta_ids) {
-            let suffix = &right_delta_ids[left_delta_ids.len()..];
-            return self
-                .diff_pending_delta_suffix_from_base(left_commit_id, suffix, request, true)
-                .await
-                .map(Some);
-        }
-
-        if left_delta_ids.starts_with(&right_delta_ids) {
-            let suffix = &left_delta_ids[right_delta_ids.len()..];
-            return self
-                .diff_pending_delta_suffix_from_base(right_commit_id, suffix, request, false)
-                .await
-                .map(Some);
-        }
-
-        Ok(None)
-    }
-
-    async fn diff_pending_delta_suffix_from_base(
-        &mut self,
-        base_commit_id: &str,
-        suffix_commit_ids: &[String],
-        request: &TrackedStateTreeScanRequest,
-        suffix_is_after: bool,
-    ) -> Result<Vec<TrackedStateTreeDiffEntry>, LixError> {
-        if suffix_commit_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut changed = BTreeMap::<TrackedStateKey, TrackedStateIndexValue>::new();
-        for commit_id in suffix_commit_ids {
-            let Some(delta_entries) = storage::load_delta_pack(&mut self.store, commit_id).await?
-            else {
-                continue;
-            };
-            for delta in delta_entries {
-                if request.matches_key(&delta.key) {
-                    changed.insert(delta.key, delta.value);
-                }
-            }
-        }
-
-        if changed.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let keys = changed.keys().cloned().collect::<Vec<_>>();
-        let base_values = self
-            .projection_values_at_commit_for_keys(base_commit_id, &keys)
-            .await?;
-        let entries = keys
-            .into_iter()
-            .zip(base_values)
-            .filter_map(|(key, base_value)| {
-                let changed_value = changed.get(&key).cloned();
-                let (before_value, after_value) = if suffix_is_after {
-                    (base_value, changed_value)
-                } else {
-                    (changed_value, base_value)
-                };
-                if before_value == after_value {
-                    return None;
-                }
-                Some(TrackedStateTreeDiffEntry {
-                    before: before_value.map(|value| (key.clone(), value)),
-                    after: after_value.map(|value| (key, value)),
-                })
-            })
-            .collect();
-        Ok(entries)
+        let left_root = self.load_required_root(left_commit_id).await?;
+        let right_root = self.load_required_root(right_commit_id).await?;
+        self.tree
+            .diff(
+                &mut self.store,
+                Some(&left_root),
+                Some(&right_root),
+                request,
+            )
+            .await
     }
 
     pub(crate) async fn materialize_tree_values(
         &mut self,
         entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        materialize_index_entries(
+        materialize_rows_from_index_entries(
             &mut self.store,
             entries,
-            &crate::tracked_state::TrackedMaterializationProjection::full(),
+            &crate::tracked_state::TrackedRowProjection::full(),
         )
         .await
     }
@@ -434,252 +320,24 @@ where
         Ok(rows)
     }
 
-    async fn projection_root_exists(&mut self, commit_id: &str) -> Result<bool, LixError> {
-        Ok(self
-            .tree
+    async fn load_required_root(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<crate::tracked_state::types::TrackedStateRootId, LixError> {
+        self.tree
             .load_root(&mut self.store, commit_id)
             .await?
-            .is_some())
+            .ok_or_else(|| missing_projection_root_error(commit_id))
     }
 
-    async fn projection_has_pending_deltas(&mut self, commit_id: &str) -> Result<bool, LixError> {
-        Ok(!self
-            .delta_commit_ids_since_projection_root(commit_id)
-            .await?
-            .is_empty())
-    }
-
-    async fn projection_entries_at_commit(
-        &mut self,
-        commit_id: &str,
-        request: &TrackedStateTreeScanRequest,
-    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-        let delta_commit_ids = self
-            .delta_commit_ids_since_projection_root(commit_id)
-            .await?;
-        let base_commit_id = self
-            .projection_base_commit_id(commit_id, &delta_commit_ids)
-            .await?;
-        if base_commit_id.is_none() && delta_commit_ids.len() == 1 {
-            return self
-                .single_delta_pack_entries(&delta_commit_ids[0], request)
-                .await;
-        }
-        let mut entries = if let Some(base_commit_id) = base_commit_id {
-            let root_id = self
-                .tree
-                .load_root(&mut self.store, &base_commit_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state projection base root '{base_commit_id}' disappeared"
-                        ),
-                    )
-                })?;
-            self.tree
-                .scan(&mut self.store, &root_id, request)
-                .await?
-                .into_iter()
-                .collect::<BTreeMap<_, _>>()
-        } else {
-            BTreeMap::new()
-        };
-        self.apply_delta_packs_to_entries(&delta_commit_ids, Some(request), &mut entries)
-            .await?;
-        Ok(entries.into_iter().collect())
-    }
-
-    async fn single_delta_pack_entries(
-        &mut self,
-        commit_id: &str,
-        request: &TrackedStateTreeScanRequest,
-    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-        let Some(delta_entries) = storage::load_delta_pack(&mut self.store, commit_id).await?
-        else {
-            return Ok(Vec::new());
-        };
-        let mut rows = delta_entries
-            .into_iter()
-            .enumerate()
-            .filter_map(|(ordinal, delta)| {
-                request
-                    .matches_key(&delta.key)
-                    .then_some((ordinal, delta.key, delta.value))
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
-
-        let mut out = Vec::new();
-        let mut rows = rows.into_iter().peekable();
-        while let Some((_, key, mut value)) = rows.next() {
-            while rows.peek().is_some_and(|(_, next_key, _)| next_key == &key) {
-                let (_, _, next_value) = rows
-                    .next()
-                    .expect("peek confirmed duplicate delta entry exists");
-                value = next_value;
-            }
-            if !request.include_tombstones && value.deleted {
-                continue;
-            }
-            out.push((key, value));
-        }
-        Ok(out)
-    }
-
+    #[cfg(any(test, feature = "storage-benches"))]
     async fn projection_values_at_commit_for_keys(
         &mut self,
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-        let delta_commit_ids = self
-            .delta_commit_ids_since_projection_root(commit_id)
-            .await?;
-        let base_commit_id = self
-            .projection_base_commit_id(commit_id, &delta_commit_ids)
-            .await?;
-        let mut entries = if let Some(base_commit_id) = base_commit_id {
-            let root_id = self
-                .tree
-                .load_root(&mut self.store, &base_commit_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state projection base root '{base_commit_id}' disappeared"
-                        ),
-                    )
-                })?;
-            let values = self.tree.get_many(&mut self.store, &root_id, keys).await?;
-            keys.iter()
-                .cloned()
-                .zip(values)
-                .filter_map(|(key, value)| value.map(|value| (key, value)))
-                .collect::<BTreeMap<_, _>>()
-        } else {
-            BTreeMap::new()
-        };
-        let key_filter = keys.iter().cloned().collect::<BTreeSet<_>>();
-        self.apply_delta_packs_to_entries_for_keys(&delta_commit_ids, &key_filter, &mut entries)
-            .await?;
-        Ok(keys.iter().map(|key| entries.get(key).cloned()).collect())
-    }
-
-    async fn projection_base_commit_id(
-        &mut self,
-        commit_id: &str,
-        delta_commit_ids: &[String],
-    ) -> Result<Option<String>, LixError> {
-        if delta_commit_ids.is_empty() {
-            return Ok(if self.projection_root_exists(commit_id).await? {
-                Some(commit_id.to_string())
-            } else {
-                None
-            });
-        }
-        let Some(first_delta_commit_id) = delta_commit_ids.first() else {
-            return Ok(None);
-        };
-        let commit = self
-            .commit_store
-            .load_commit_from(&mut self.store, first_delta_commit_id)
-            .await?
-            .ok_or_else(|| missing_commit_error(first_delta_commit_id))?;
-        let Some(parent_id) = commit.parent_ids.first() else {
-            return Ok(None);
-        };
-        Ok(if self.projection_root_exists(parent_id).await? {
-            Some(parent_id.clone())
-        } else {
-            None
-        })
-    }
-
-    async fn delta_commit_ids_since_projection_root(
-        &mut self,
-        commit_id: &str,
-    ) -> Result<Vec<String>, LixError> {
-        let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut current = Some(commit_id.to_string());
-        while let Some(current_id) = current {
-            if !seen.insert(current_id.clone()) {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("tracked_state projection found first-parent cycle at '{current_id}'"),
-                ));
-            }
-            if self
-                .tree
-                .load_root(&mut self.store, &current_id)
-                .await?
-                .is_some()
-            {
-                break;
-            }
-            if storage::delta_pack_exists(&mut self.store, &current_id).await? {
-                out.push(current_id.clone());
-            }
-            let commit = self
-                .commit_store
-                .load_commit_from(&mut self.store, &current_id)
-                .await?
-                .ok_or_else(|| missing_commit_error(&current_id))?;
-            current = commit.parent_ids.first().cloned();
-        }
-        out.reverse();
-        Ok(out)
-    }
-
-    async fn apply_delta_packs_to_entries(
-        &mut self,
-        commit_ids: &[String],
-        request: Option<&TrackedStateTreeScanRequest>,
-        entries: &mut BTreeMap<TrackedStateKey, TrackedStateIndexValue>,
-    ) -> Result<(), LixError> {
-        for commit_id in commit_ids {
-            let Some(delta_entries) = storage::load_delta_pack(&mut self.store, commit_id).await?
-            else {
-                continue;
-            };
-            for delta in delta_entries {
-                if let Some(request) = request {
-                    if !request.matches_key(&delta.key) {
-                        continue;
-                    }
-                    if !request.include_tombstones && delta.value.deleted {
-                        entries.remove(&delta.key);
-                        continue;
-                    }
-                    entries.insert(delta.key, delta.value);
-                } else {
-                    entries.insert(delta.key, delta.value);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn apply_delta_packs_to_entries_for_keys(
-        &mut self,
-        commit_ids: &[String],
-        keys: &BTreeSet<TrackedStateKey>,
-        entries: &mut BTreeMap<TrackedStateKey, TrackedStateIndexValue>,
-    ) -> Result<(), LixError> {
-        for commit_id in commit_ids {
-            let Some(delta_entries) = storage::load_delta_pack(&mut self.store, commit_id).await?
-            else {
-                continue;
-            };
-            for delta in delta_entries {
-                if keys.contains(&delta.key) {
-                    entries.insert(delta.key, delta.value);
-                }
-            }
-        }
-        Ok(())
+        let root_id = self.load_required_root(commit_id).await?;
+        self.tree.get_many(&mut self.store, &root_id, keys).await
     }
 
     /// Plans a three-way merge by diffing both heads against the same base.
@@ -705,30 +363,33 @@ where
     }
 }
 
-/// Writer for commit-store-backed tracked-state projection roots.
+/// Writer for changelog-backed tracked-state projection roots.
 pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
+    chunk_overlay: storage::TrackedStateChunkOverlay,
+    staged_by_file_roots: BTreeMap<String, crate::tracked_state::types::TrackedStateRootId>,
+    staged_roots: BTreeMap<String, crate::tracked_state::types::TrackedStateRootId>,
     tree: TrackedStateTree,
     store: &'a S,
     writes: &'a mut StorageWriteSet,
 }
 
-/// Explicit projection-root materializer created by `TrackedStateContext`.
-pub(crate) struct TrackedStateMaterializer<'a, S: ?Sized> {
+/// Explicit projection-root rebuilder created by `TrackedStateContext`.
+pub(crate) struct TrackedStateRootRebuilder<'a, S: ?Sized> {
     pub(super) tracked_state: &'a TrackedStateContext,
     pub(super) store: &'a S,
     pub(super) writes: &'a mut StorageWriteSet,
-    pub(super) commit_store: &'a CommitStoreContext,
 }
 
-impl<S> TrackedStateMaterializer<'_, S>
+impl<S> TrackedStateRootRebuilder<'_, S>
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
-    pub(crate) async fn materialize_root_at(
+    pub(crate) async fn rebuild_projection_root_at(
         &mut self,
         commit_id: &str,
     ) -> Result<TrackedStateWriteReport, LixError> {
-        crate::tracked_state::materializer::materialize_root_at(self, commit_id).await
+        crate::tracked_state::projection_root_rebuild::rebuild_projection_root_at(self, commit_id)
+            .await
     }
 }
 
@@ -736,43 +397,6 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
-    /// Stages one tracked-state projection delta for `commit_id`.
-    pub(crate) async fn stage_delta(
-        &mut self,
-        commit_id: &str,
-        _parent_commit_id: Option<&str>,
-        deltas: &[TrackedStateDeltaRef<'_>],
-    ) -> Result<TrackedStateWriteReport, LixError> {
-        storage::stage_delta_pack_refs(self.writes, commit_id, deltas)?;
-        Ok(TrackedStateWriteReport {
-            commit_id: commit_id.to_string(),
-            changed_rows: deltas.len(),
-            primary_chunk_puts: 0,
-            by_file_chunk_puts: 0,
-        })
-    }
-
-    pub(crate) async fn stage_delta_with_json_pack_indexes(
-        &mut self,
-        commit_id: &str,
-        _parent_commit_id: Option<&str>,
-        deltas: &[TrackedStateDeltaRef<'_>],
-        json_pack_indexes: DeltaJsonPackIndexesRef<'_>,
-    ) -> Result<TrackedStateWriteReport, LixError> {
-        storage::stage_delta_pack_refs_with_json_pack_indexes(
-            self.writes,
-            commit_id,
-            deltas,
-            json_pack_indexes,
-        )?;
-        Ok(TrackedStateWriteReport {
-            commit_id: commit_id.to_string(),
-            changed_rows: deltas.len(),
-            primary_chunk_puts: 0,
-            by_file_chunk_puts: 0,
-        })
-    }
-
     pub(crate) async fn stage_projection_root<'a, I>(
         &mut self,
         commit_id: &str,
@@ -785,7 +409,11 @@ where
         let deltas = deltas.into_iter().collect::<Vec<_>>();
         let base_root = match parent_commit_id {
             Some(parent_commit_id) => {
-                let Some(root) = self.tree.load_root(self.store, parent_commit_id).await? else {
+                let root = match self.staged_roots.get(parent_commit_id) {
+                    Some(root) => Some(root.clone()),
+                    None => self.tree.load_root(self.store, parent_commit_id).await?,
+                };
+                let Some(root) = root else {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
@@ -819,19 +447,23 @@ where
         }
         let result = self
             .tree
-            .apply_mutations(
+            .apply_mutations_with_overlay(
                 self.store,
                 self.writes,
+                &mut self.chunk_overlay,
                 base_root.as_ref(),
                 mutations,
                 Some(commit_id),
             )
             .await?;
+        self.staged_roots
+            .insert(commit_id.to_string(), result.root_id.clone());
 
         let by_file_base_root = match parent_commit_id {
-            Some(parent_commit_id) => {
-                storage::load_by_file_root(self.store, parent_commit_id).await?
-            }
+            Some(parent_commit_id) => match self.staged_by_file_roots.get(parent_commit_id) {
+                Some(root) => Some(root.clone()),
+                None => storage::load_by_file_root(self.store, parent_commit_id).await?,
+            },
             None => None,
         };
         let concrete_file_deltas = deltas
@@ -841,7 +473,11 @@ where
         let by_file_chunk_puts = if concrete_file_deltas.is_empty() {
             if let Some(by_file_base_root) = by_file_base_root.as_ref() {
                 storage::stage_by_file_root(self.writes, commit_id, by_file_base_root);
+                self.staged_by_file_roots
+                    .insert(commit_id.to_string(), by_file_base_root.clone());
             }
+            0
+        } else if parent_commit_id.is_some() && by_file_base_root.is_none() {
             0
         } else {
             let mut by_file_mutations = Vec::with_capacity(concrete_file_deltas.len());
@@ -866,15 +502,18 @@ where
             }
             let by_file_result = self
                 .tree
-                .apply_mutations(
+                .apply_mutations_with_overlay(
                     self.store,
                     self.writes,
+                    &mut self.chunk_overlay,
                     by_file_base_root.as_ref(),
                     by_file_mutations,
                     None,
                 )
                 .await?;
             storage::stage_by_file_root(self.writes, commit_id, &by_file_result.root_id);
+            self.staged_by_file_roots
+                .insert(commit_id.to_string(), by_file_result.root_id.clone());
             by_file_result.chunk_count
         };
         Ok(TrackedStateWriteReport {
@@ -894,10 +533,10 @@ pub(crate) struct TrackedStateWriteReport {
     pub(crate) by_file_chunk_puts: usize,
 }
 
-fn missing_commit_error(commit_id: &str) -> LixError {
+fn missing_projection_root_error(commit_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("tracked_state projection references missing commit '{commit_id}'"),
+        format!("tracked_state projection root is missing for commit '{commit_id}'"),
     )
 }
 
@@ -954,9 +593,26 @@ mod tests {
     use crate::NullableKeyFilter;
 
     #[tokio::test]
-    async fn stage_delta_does_not_require_parent_projection_root() {
+    async fn stage_projection_root_requires_parent_projection_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
+        {
+            let mut read = storage
+                .begin_read(StorageReadOptions::default())
+                .expect("parent read should open");
+            let mut writes = storage.new_write_set();
+            crate::test_support::stage_empty_changelog_commit(
+                &mut read,
+                &mut writes,
+                "missing-parent",
+                None,
+            )
+            .await
+            .expect("parent changelog commit should stage");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("parent changelog commit should commit");
+        }
 
         write_root_for_test(
             &storage,
@@ -966,7 +622,7 @@ mod tests {
             &[row("entity-child", "change-child", "commit-child")],
         )
         .await
-        .expect("delta pack staging should not require a parent projection root");
+        .expect_err("root staging should require a parent projection root");
     }
 
     #[tokio::test]
@@ -1356,7 +1012,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_tombstone_delta_hides_materialized_base_row() {
+    async fn child_does_not_stage_partial_by_file_index_without_parent_by_file_root() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut base = row("entity-base", "change-base", "base");
+        base.file_id = Some("file-a.json".to_string());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "base",
+            None,
+            std::slice::from_ref(&base),
+        )
+        .await
+        .expect("base root should write");
+        {
+            let mut writes = storage.new_write_set();
+            writes.delete(
+                storage::TRACKED_STATE_BY_FILE_ROOT_SPACE,
+                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"base")),
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .expect("base root should commit");
+        }
+
+        let mut child = row("entity-child", "change-child", "child");
+        child.file_id = Some("file-b.json".to_string());
+        write_root_for_test(&storage, &tracked_state, "child", Some("base"), &[child])
+            .await
+            .expect("child root should write");
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        assert!(
+            storage::load_by_file_root(&mut read, "child")
+                .await
+                .expect("by-file root read should succeed")
+                .is_none(),
+            "child must not publish a partial by-file root"
+        );
+        let rows = tracked_state
+            .reader(read)
+            .scan_rows_at_commit(
+                "child",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file scan should fall back to primary root");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
+            "entity-base"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_root_tombstone_hides_materialized_base_row() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let base = row("entity-a", "change-base", "base");
@@ -1369,14 +1095,14 @@ mod tests {
             std::slice::from_ref(&base),
         )
         .await
-        .expect("base delta should write");
+        .expect("base root should write");
         let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
         tracked_state
-            .materializer(&read, &mut writes, &CommitStoreContext::new())
-            .materialize_root_at("base")
+            .root_rebuilder(&read, &mut writes)
+            .rebuild_projection_root_at("base")
             .await
             .expect("base projection root should materialize");
         storage
@@ -1390,7 +1116,7 @@ mod tests {
             std::slice::from_ref(&delete),
         )
         .await
-        .expect("child tombstone delta should write");
+        .expect("child tombstone root should write");
 
         let rows = tracked_state
             .reader(
@@ -1400,13 +1126,13 @@ mod tests {
             )
             .scan_rows_at_commit("child", &TrackedStateScanRequest::default())
             .await
-            .expect("child scan should apply pending tombstone over base root");
+            .expect("child scan should apply tombstone over base root");
 
         assert!(rows.is_empty(), "pending tombstone must hide base row");
     }
 
     #[tokio::test]
-    async fn single_delta_pack_scan_keeps_last_delta_for_duplicate_key() {
+    async fn root_scan_keeps_last_mutation_for_duplicate_key() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         write_root_for_test(
@@ -1422,7 +1148,7 @@ mod tests {
             ],
         )
         .await
-        .expect("delta pack should write");
+        .expect("root should write");
 
         let rows = tracked_state
             .reader(
@@ -1432,7 +1158,7 @@ mod tests {
             )
             .scan_rows_at_commit("commit-1", &TrackedStateScanRequest::default())
             .await
-            .expect("single delta pack should scan");
+            .expect("root should scan");
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -1675,12 +1401,24 @@ mod tests {
         write_root_for_test(&storage, &tracked_state, "base", None, base_rows)
             .await
             .expect("base root should write");
-        write_root_for_test(&storage, &tracked_state, "target", None, target_rows)
-            .await
-            .expect("target root should write");
-        write_root_for_test(&storage, &tracked_state, "source", None, source_rows)
-            .await
-            .expect("source root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "target",
+            Some("base"),
+            target_rows,
+        )
+        .await
+        .expect("target root should write");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "source",
+            Some("base"),
+            source_rows,
+        )
+        .await
+        .expect("source root should write");
         (storage, tracked_state)
     }
 
@@ -1717,12 +1455,12 @@ mod tests {
         parent_commit_id: Option<&str>,
         rows: &[MaterializedTrackedStateRow],
     ) -> Result<(), LixError> {
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
         crate::test_support::stage_tracked_root_from_materialized(
-            &read,
+            &mut read,
             &mut writes,
             tracked_state,
             commit_id,

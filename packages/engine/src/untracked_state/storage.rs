@@ -13,7 +13,7 @@ use crate::untracked_state::{
 use crate::{LixError, NullableKeyFilter};
 
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
-const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
+pub(crate) const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0001_0001), UNTRACKED_STATE_ROW_NAMESPACE);
 
 pub(crate) async fn scan_rows(

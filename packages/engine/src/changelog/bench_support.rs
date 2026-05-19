@@ -19,8 +19,8 @@ use super::segment::{
 };
 use super::store::{
     by_change_key, by_change_membership_commit_id_from_key, by_change_membership_key,
-    by_change_membership_prefix, by_commit_key, segment_key, segment_value,
-    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
+    by_change_membership_prefix, by_commit_key, segment_key, segment_value, BY_CHANGE_INDEX_SPACE,
+    BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, SEGMENT_SPACE,
 };
 use super::types::{
     ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, CommitLoadRequest, CommitProjection,
@@ -130,7 +130,8 @@ impl BenchCorpus {
 #[derive(Clone)]
 pub struct BenchStore<B = crate::backend::InMemoryBackend>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     context: ChangelogContext,
     storage: StorageContext<B>,
@@ -591,7 +592,8 @@ pub fn validate_publication_closure(segment: &BenchSegment) -> Result<usize, Lix
 
 pub fn new_store<B: BenchBackend>(backend: B) -> BenchStore<B>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     BenchStore {
         context: ChangelogContext::new(),
@@ -604,7 +606,8 @@ pub async fn stage_segment_once<B: BenchBackend>(
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = new_store(backend);
     stage_segment_in_store(&store, segment).await
@@ -615,7 +618,8 @@ pub async fn stage_segment_raw_once<B: BenchBackend>(
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = new_store(backend);
     write_corpus_segments_raw(&store, &BenchCorpus::from_segments(vec![segment.clone()])).await
@@ -627,7 +631,8 @@ pub async fn prepare_store<B: BenchBackend>(
     publish: bool,
 ) -> Result<BenchStore<B>, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     prepare_corpus_store(
         backend,
@@ -643,7 +648,8 @@ pub async fn prepare_corpus_store<B: BenchBackend>(
     publish: bool,
 ) -> Result<BenchStore<B>, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = new_store(backend);
     let mut transaction = store.storage.begin_write_transaction().await?;
@@ -670,7 +676,8 @@ pub async fn prepare_rebuild_store<B: BenchBackend>(
     mode: BenchRebuildMode,
 ) -> Result<BenchStore<B>, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = match mode {
         BenchRebuildMode::Noop => prepare_corpus_store(backend, corpus, false).await?,
@@ -700,7 +707,8 @@ pub async fn prepare_gc_store<B: BenchBackend>(
     changes_per_segment: usize,
 ) -> Result<(BenchStore<B>, String), LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let live_segments = live_segments.max(1);
     let changes_per_segment = changes_per_segment.max(1);
@@ -754,7 +762,8 @@ pub async fn stage_publish_first_commit_once<B: BenchBackend>(
     segment: &BenchSegment,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = prepare_store(backend, segment, false).await?;
     stage_publish_first_commit_in_store(&store, segment).await
@@ -763,7 +772,11 @@ where
 pub async fn stage_publish_first_commit_in_store<B: BenchBackend>(
     store: &BenchStore<B>,
     segment: &BenchSegment,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let first_commit = segment.commit_ids().into_iter().next().ok_or_else(|| {
         LixError::unknown("changelog bench segment has no commit to publish".to_string())
     })?;
@@ -783,7 +796,8 @@ pub async fn stage_corpus_once<B: BenchBackend>(
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = new_store(backend);
     let mut transaction = store.storage.begin_write_transaction().await?;
@@ -804,7 +818,8 @@ pub async fn stage_corpus_raw_once<B: BenchBackend>(
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = new_store(backend);
     write_corpus_segments_raw(&store, corpus).await
@@ -815,7 +830,8 @@ pub async fn stage_incremental_segment_once<B: BenchBackend>(
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = prepare_corpus_store(backend, corpus, false).await?;
     let segment = incremental_segment_for_corpus(corpus)?;
@@ -827,7 +843,8 @@ pub async fn stage_incremental_segment_raw_once<B: BenchBackend>(
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = new_store(backend);
     write_corpus_segments_raw(&store, corpus).await?;
@@ -840,7 +857,8 @@ pub async fn stage_publish_all_commits_once<B: BenchBackend>(
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
 where
-    B: BenchBackend,
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
 {
     let store = prepare_corpus_store(backend, corpus, false).await?;
     let mut transaction = store.storage.begin_write_transaction().await?;
@@ -859,7 +877,11 @@ where
 pub async fn load_commits_physical<B: BenchBackend>(
     store: &BenchStore<B>,
     commit_ids: &[String],
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     load_commits_physical_with_projection(store, commit_ids, BenchCommitProjection::Header).await
 }
 
@@ -867,7 +889,11 @@ pub async fn load_commits_physical_with_projection<B: BenchBackend>(
     store: &BenchStore<B>,
     commit_ids: &[String],
     projection: BenchCommitProjection,
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let batch = reader
@@ -883,7 +909,11 @@ pub async fn load_commits_physical_with_projection<B: BenchBackend>(
 pub async fn load_commits_visible<B: BenchBackend>(
     store: &BenchStore<B>,
     commit_ids: &[String],
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     load_commits_visible_with_projection(store, commit_ids, BenchCommitProjection::Header).await
 }
 
@@ -891,7 +921,11 @@ pub async fn load_commits_visible_with_projection<B: BenchBackend>(
     store: &BenchStore<B>,
     commit_ids: &[String],
     projection: BenchCommitProjection,
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let batch = reader
@@ -907,7 +941,11 @@ pub async fn load_commits_visible_with_projection<B: BenchBackend>(
 pub async fn load_changes_physical<B: BenchBackend>(
     store: &BenchStore<B>,
     change_ids: &[String],
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     load_changes_physical_with_projection(
         store,
         change_ids,
@@ -920,7 +958,11 @@ pub async fn load_changes_physical_with_projection<B: BenchBackend>(
     store: &BenchStore<B>,
     change_ids: &[String],
     projection: BenchChangeProjection,
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let batch = reader
@@ -936,7 +978,11 @@ pub async fn load_changes_physical_with_projection<B: BenchBackend>(
 pub async fn load_changes_visible<B: BenchBackend>(
     store: &BenchStore<B>,
     change_ids: &[String],
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     load_changes_visible_with_projection(store, change_ids, BenchChangeProjection::PhysicalLocation)
         .await
 }
@@ -945,7 +991,11 @@ pub async fn load_changes_visible_with_projection<B: BenchBackend>(
     store: &BenchStore<B>,
     change_ids: &[String],
     projection: BenchChangeProjection,
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let batch = reader
@@ -961,7 +1011,11 @@ pub async fn load_changes_visible_with_projection<B: BenchBackend>(
 pub async fn lookup_by_commit_index<B: BenchBackend>(
     store: &BenchStore<B>,
     commit_ids: &[String],
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let values = get_values(
         store,
         BY_COMMIT_INDEX_SPACE,
@@ -987,7 +1041,11 @@ pub async fn lookup_by_commit_index<B: BenchBackend>(
 pub async fn lookup_by_change_index<B: BenchBackend>(
     store: &BenchStore<B>,
     change_ids: &[String],
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let values = get_values(
         store,
         BY_CHANGE_INDEX_SPACE,
@@ -1013,13 +1071,19 @@ pub async fn lookup_by_change_index<B: BenchBackend>(
 pub async fn scan_by_change_membership_candidates<B: BenchBackend>(
     store: &BenchStore<B>,
     change_id: &str,
-) -> Result<usize, LixError> {
+) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let prefix = by_change_membership_prefix(change_id);
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut after: Option<Vec<u8>> = None;
     let mut found = 0;
     loop {
-        let after_key = after.as_ref().map(|key| Key(bytes::Bytes::from(key.clone())));
+        let after_key = after
+            .as_ref()
+            .map(|key| Key(bytes::Bytes::from(key.clone())));
         let chunk = ScanPlan::prefix(
             BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
             Prefix {
@@ -1048,14 +1112,18 @@ pub async fn scan_by_change_membership_candidates<B: BenchBackend>(
     Ok(found)
 }
 
-pub async fn scan_segments_decode<B: BenchBackend>(
-    store: &BenchStore<B>,
-) -> Result<usize, LixError> {
+pub async fn scan_segments_decode<B: BenchBackend>(store: &BenchStore<B>) -> Result<usize, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut after: Option<Vec<u8>> = None;
     let mut decoded_objects = 0;
     loop {
-        let after_key = after.as_ref().map(|key| Key(bytes::Bytes::from(key.clone())));
+        let after_key = after
+            .as_ref()
+            .map(|key| Key(bytes::Bytes::from(key.clone())));
         let chunk = ScanPlan::prefix(
             SEGMENT_SPACE,
             Prefix {
@@ -1088,7 +1156,11 @@ pub async fn scan_segments_decode<B: BenchBackend>(
 
 pub async fn rebuild_mandatory_indexes<B: BenchBackend>(
     store: &BenchStore<B>,
-) -> Result<BenchRebuildStats, LixError> {
+) -> Result<BenchRebuildStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     let stats = {
@@ -1103,7 +1175,11 @@ pub async fn rebuild_mandatory_indexes<B: BenchBackend>(
 pub async fn plan_gc<B: BenchBackend>(
     store: &BenchStore<B>,
     root_commit_id: &str,
-) -> Result<BenchGcStats, LixError> {
+) -> Result<BenchGcStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let plan = reader
@@ -1115,7 +1191,11 @@ pub async fn plan_gc<B: BenchBackend>(
 pub async fn collect_garbage<B: BenchBackend>(
     store: &BenchStore<B>,
     root_commit_id: &str,
-) -> Result<BenchGcStats, LixError> {
+) -> Result<BenchGcStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     let plan = {
@@ -1140,7 +1220,11 @@ pub enum BenchRebuildMode {
 async fn stage_segment_in_store<B: BenchBackend>(
     store: &BenchStore<B>,
     segment: &BenchSegment,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     {
@@ -1449,7 +1533,11 @@ impl BenchCorpus {
 async fn write_corpus_segments_raw<B: BenchBackend>(
     store: &BenchStore<B>,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     for segment in &corpus.segments {
@@ -1466,7 +1554,11 @@ async fn write_corpus_segments_raw<B: BenchBackend>(
 
 async fn inject_stale_index_rows<B: BenchBackend>(
     store: &BenchStore<B>,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let mut transaction = store.storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
     writes.put(
@@ -1492,7 +1584,11 @@ async fn inject_stale_index_rows<B: BenchBackend>(
 async fn inject_corrupt_index_values<B: BenchBackend>(
     store: &BenchStore<B>,
     corpus: &BenchCorpus,
-) -> Result<BenchWriteStats, LixError> {
+) -> Result<BenchWriteStats, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let first_commit = corpus.first_commit_id().ok_or_else(|| {
         LixError::unknown("changelog corrupt-index bench has no commit".to_string())
     })?;
@@ -1525,7 +1621,11 @@ async fn get_values<B: BenchBackend>(
     store: &BenchStore<B>,
     space: StorageSpace,
     keys: impl IntoIterator<Item = Vec<u8>>,
-) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+) -> Result<Vec<Option<Vec<u8>>>, LixError>
+where
+    B: BenchBackend + Sync,
+    for<'a> <B as Backend>::Read<'a>: Send,
+{
     let keys = keys
         .into_iter()
         .map(|key| Key(bytes::Bytes::from(key)))
@@ -1632,7 +1732,10 @@ fn state_row_identity_for_layout(
     Ok(StateRowIdentity {
         schema_key: CanonicalSchemaKey::new("message")?,
         file_id: FileId::new(file_id_for_layout(index, layout))?,
-        entity_id: EntityId::new(entity_id_for_layout(index, layout))?,
+        entity_id: EntityId::new(
+            crate::entity_identity::EntityIdentity::single(entity_id_for_layout(index, layout))
+                .as_json_array_text()?,
+        )?,
     })
 }
 
@@ -1646,7 +1749,7 @@ fn state_row_identity_for_change(change: &SegmentChange) -> Result<StateRowIdent
     Ok(StateRowIdentity {
         schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
         file_id: FileId::new(file_id.to_string())?,
-        entity_id: EntityId::new(change.entity_id.as_single_string_owned()?)?,
+        entity_id: EntityId::new(change.entity_id.as_json_array_text()?)?,
     })
 }
 

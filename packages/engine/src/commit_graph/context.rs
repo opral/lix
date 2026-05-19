@@ -1,32 +1,32 @@
 use std::collections::BTreeSet;
 
+use crate::changelog::{
+    Change, ChangeLoadEntry, ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode,
+    ChangelogContext, CommitBody, CommitHeader, CommitLoadEntry, CommitLoadRequest,
+    CommitProjection, CommitVisibilityMode, SegmentChange,
+};
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
     CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
-    CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
+    CommitGraphEdge, CommitGraphReader, LocatedChange, ReachableCommitGraphCommit,
 };
-use crate::commit_store::{Change, Commit, CommitStoreContext, CommitStoreReader, LocatedChange};
 use crate::entity_identity::EntityIdentity;
 use crate::storage::StorageRead;
 use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
-/// Read model for resolving commit-store commits into entity state at a head.
+/// Read model for resolving changelog commits into entity state at a head.
 ///
-/// This module does not own durable storage. It reads immutable commit-store
+/// This module does not own durable storage. It reads immutable changelog
 /// facts through a caller-provided KV store and applies commit graph rules on
 /// top.
 #[derive(Clone)]
-pub(crate) struct CommitGraphContext {
-    commit_store: CommitStoreContext,
-}
+pub(crate) struct CommitGraphContext;
 
 impl CommitGraphContext {
     pub(crate) fn new() -> Self {
-        Self {
-            commit_store: CommitStoreContext::new(),
-        }
+        Self
     }
 
     /// Creates a graph reader over a caller-provided KV store.
@@ -34,18 +34,16 @@ impl CommitGraphContext {
     where
         S: StorageRead + Send + Sync,
     {
-        CommitGraphStoreReader {
-            commit_store_reader: self.commit_store.reader(store),
-        }
+        CommitGraphStoreReader { store }
     }
 }
 
-/// Commit-graph reader that resolves commit-store entities at a commit head.
+/// Commit-graph reader that resolves changelog entities at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
     S: StorageRead + Send + Sync,
 {
-    commit_store_reader: CommitStoreReader<S>,
+    store: S,
 }
 
 impl<S> CommitGraphStoreReader<S>
@@ -57,21 +55,31 @@ where
         &mut self,
         commit_id: &str,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
-        let Some(commit) = self.commit_store_reader.load_commit(commit_id).await? else {
-            return Ok(None);
-        };
-        self.graph_commit_from_store_commit(commit).await.map(Some)
+        self.load_visible_commit(commit_id)
+            .await?
+            .map(|(header, body)| self.graph_commit_from_changelog_commit(header, body))
+            .transpose()
     }
 
-    /// Loads every commit fact from the commit store.
+    /// Loads every visible commit fact from the changelog.
     ///
     /// This is used by global commit surfaces where the caller wants the durable
     /// graph facts themselves, not reachability from a particular version head.
     pub(crate) async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
-        let stored_commits = self.commit_store_reader.scan_commits().await?;
+        let commit_ids = {
+            let mut reader = ChangelogContext::new().reader(&self.store);
+            reader
+                .scan_commit_visibilities()
+                .await?
+                .into_iter()
+                .map(|visibility| visibility.commit_id)
+                .collect::<Vec<_>>()
+        };
         let mut commits = Vec::new();
-        for commit in stored_commits {
-            commits.push(self.graph_commit_from_store_commit(commit).await?);
+        for commit_id in commit_ids {
+            if let Some((header, body)) = self.load_visible_commit(&commit_id).await? {
+                commits.push(self.graph_commit_from_changelog_commit(header, body)?);
+            }
         }
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
         Ok(commits)
@@ -208,58 +216,94 @@ where
             })
     }
 
-    async fn graph_commit_from_store_commit(
+    async fn load_visible_commit(
         &mut self,
-        commit: Commit,
-    ) -> Result<CommitGraphCommit, LixError> {
-        let change_ids = self.load_commit_change_ids(&commit).await?;
-        Ok(commit_graph_commit_from_store_commit(commit, change_ids)?)
+        commit_id: &str,
+    ) -> Result<Option<(CommitHeader, CommitBody)>, LixError> {
+        let mut reader = ChangelogContext::new().reader(&self.store);
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[commit_id.to_string()],
+                projection: CommitProjection::Full,
+                visibility: CommitVisibilityMode::RequireVisible,
+            })
+            .await?;
+        let Some(entry) = batch.entries.into_iter().next().flatten() else {
+            return Ok(None);
+        };
+        match entry {
+            CommitLoadEntry::Full { header, body } => Ok(Some((header, body))),
+            _ => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "changelog full commit projection returned non-full entry",
+            )),
+        }
     }
 
-    async fn load_commit_change_ids(&self, commit: &Commit) -> Result<Vec<String>, LixError> {
-        let mut change_ids = Vec::new();
-        for pack_id in 0..commit.change_pack_count {
-            let Some(changes) = self
-                .commit_store_reader
-                .load_change_pack(&commit.id, pack_id)
-                .await?
-            else {
-                return Err(missing_pack_error("change", &commit.id, pack_id));
-            };
-            change_ids.extend(changes.into_iter().map(|change| change.id));
-        }
-        for pack_id in 0..commit.membership_pack_count {
-            let Some(members) = self
-                .commit_store_reader
-                .load_membership_pack(&commit.id, pack_id)
-                .await?
-            else {
-                return Err(missing_pack_error("membership", &commit.id, pack_id));
-            };
-            change_ids.extend(members.into_iter().map(|locator| locator.change_id));
-        }
-        Ok(change_ids)
+    fn graph_commit_from_changelog_commit(
+        &mut self,
+        header: CommitHeader,
+        body: CommitBody,
+    ) -> Result<CommitGraphCommit, LixError> {
+        let change_ids = body
+            .membership
+            .into_iter()
+            .map(|membership| membership.member_change_id)
+            .collect::<Vec<_>>();
+        Ok(commit_graph_commit_from_changelog_commit(
+            header, change_ids,
+        ))
     }
 
     async fn load_canonical_changes(
         &self,
         change_ids: &[String],
     ) -> Result<Vec<Option<LocatedChange>>, LixError> {
-        self.commit_store_reader
-            .load_located_changes(change_ids)
-            .await
-            .map(|changes| {
-                changes
-                    .into_iter()
-                    .map(|located| {
-                        located.map(|located| LocatedChange {
-                            record: canonical_change_from_store_change(located.record),
-                            source_commit_id: located.source_commit_id,
-                            source_pack_id: located.source_pack_id,
-                        })
-                    })
-                    .collect()
+        let mut reader = ChangelogContext::new().reader(&self.store);
+        let batch = reader
+            .load_changes(ChangeLoadRequest {
+                change_ids,
+                projection: ChangeProjection::Segment,
+                visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
             })
+            .await?;
+        batch
+            .entries
+            .into_iter()
+            .map(|entry| match entry {
+                Some(ChangeLoadEntry::Segment(change)) => {
+                    let source_commit_id = change.authored_commit_id.clone().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("changelog change '{}' has no authored commit", change.id),
+                        )
+                    })?;
+                    Ok(Some(LocatedChange {
+                        record: logical_change_from_segment_change(&change),
+                        source_commit_id,
+                        inline_payloads: change.inline_payloads,
+                    }))
+                }
+                Some(_) => Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "changelog segment change projection returned non-segment entry",
+                )),
+                None => Ok(None),
+            })
+            .collect()
+    }
+}
+
+fn logical_change_from_segment_change(change: &SegmentChange) -> Change {
+    Change {
+        id: change.id.clone(),
+        authored_commit_id: change.authored_commit_id.clone(),
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        file_id: change.file_id.clone(),
+        snapshot_ref: change.snapshot_ref,
+        metadata_ref: change.metadata_ref,
+        created_at: change.created_at.clone(),
     }
 }
 
@@ -334,60 +378,45 @@ fn change_matches_history_request(
                 .is_some_and(|file_id| request.file_ids.contains(file_id)))
 }
 
-fn commit_graph_commit_from_store_commit(
-    commit: Commit,
+fn commit_graph_commit_from_changelog_commit(
+    header: CommitHeader,
     change_ids: Vec<String>,
-) -> Result<CommitGraphCommit, LixError> {
-    let change = commit_header_canonical_change(commit.clone());
-    Ok(CommitGraphCommit {
+) -> CommitGraphCommit {
+    let change = commit_header_canonical_change(&header);
+    CommitGraphCommit {
         canonical_change: change.clone(),
         change,
-        commit_id: commit.id,
+        commit_id: header.id,
         change_ids,
-        author_account_ids: commit.author_account_ids,
-        parent_commit_ids: commit.parent_ids,
-    })
+        author_account_ids: header.author_account_ids,
+        parent_commit_ids: header.parent_commit_ids,
+    }
 }
 
-fn commit_header_canonical_change(commit: Commit) -> Change {
+fn commit_header_canonical_change(header: &CommitHeader) -> Change {
     Change {
-        id: commit.change_id,
-        entity_id: EntityIdentity::single(&commit.id),
+        id: header.derivable_change_id.clone(),
+        authored_commit_id: Some(header.id.clone()),
+        entity_id: EntityIdentity::single(&header.id),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_ref: None,
         metadata_ref: None,
-        created_at: commit.created_at,
+        created_at: header.created_at.clone(),
     }
-}
-
-fn canonical_change_from_store_change(change: Change) -> Change {
-    Change {
-        id: change.id,
-        entity_id: change.entity_id,
-        schema_key: change.schema_key,
-        file_id: change.file_id,
-        snapshot_ref: change.snapshot_ref,
-        metadata_ref: change.metadata_ref,
-        created_at: change.created_at,
-    }
-}
-
-fn missing_pack_error(label: &str, commit_id: &str, pack_id: u32) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("commit_graph missing {label} pack ({commit_id}, {pack_id})"),
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
-    use crate::commit_store::{
-        Change, ChangeLocator, ChangeRef, CommitDraftRef, CommitStoreContext,
+    use crate::changelog::{
+        Change, ChangelogContext, CommitBody, CommitHeader, MembershipRecord, MembershipRole,
+        Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory,
+        SegmentDirectory, SegmentHeader, SegmentInlinePayload,
     };
+    use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
+    use crate::json_store::JsonRef;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
@@ -396,12 +425,16 @@ mod tests {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         append_changes(
             &storage,
-            &[commit_change(
-                "commit-1-change",
-                "commit-1",
-                &["change-1", "change-2"],
-                &["parent-1"],
-            )],
+            &[
+                entity_change("change-1", "entity-1", "example", "{}"),
+                entity_change("change-2", "entity-2", "example", "{}"),
+                commit_change(
+                    "commit-1-change",
+                    "commit-1",
+                    &["change-1", "change-2"],
+                    &["parent-1"],
+                ),
+            ],
         )
         .await;
 
@@ -658,6 +691,7 @@ mod tests {
     #[derive(Clone)]
     struct TestChange {
         change: Change,
+        snapshot_content: Option<String>,
         commit_change_ids: Vec<String>,
         parent_commit_ids: Vec<String>,
         author_account_ids: Vec<String>,
@@ -673,6 +707,7 @@ mod tests {
             Self {
                 change: Change {
                     id: change_id.to_string(),
+                    authored_commit_id: Some(commit_id.to_string()),
                     entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -680,6 +715,7 @@ mod tests {
                     metadata_ref: None,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                 },
+                snapshot_content: None,
                 commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
                 parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
                 author_account_ids: Vec::new(),
@@ -697,6 +733,7 @@ mod tests {
             Self {
                 change: Change {
                     id: change_id.to_string(),
+                    authored_commit_id: None,
                     entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
@@ -706,6 +743,7 @@ mod tests {
                     metadata_ref: None,
                     created_at: created_at.to_string(),
                 },
+                snapshot_content: snapshot_content.map(str::to_string),
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
                 author_account_ids: Vec::new(),
@@ -718,21 +756,35 @@ mod tests {
     }
 
     async fn append_changes(storage: &StorageContext, changes: &[TestChange]) {
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let canonical_changes = changes
             .iter()
             .filter(|change| !change.is_commit())
-            .map(|change| change.change.clone())
+            .cloned()
             .collect::<Vec<_>>();
-        let changes_by_id: BTreeMap<&str, &Change> = canonical_changes
+        let changes_by_id: BTreeMap<&str, &TestChange> = canonical_changes
             .iter()
-            .map(|change| (change.id.as_str(), change))
+            .map(|change| (change.change.id.as_str(), change))
             .collect::<BTreeMap<_, _>>();
         let mut authored_change_ids = BTreeSet::new();
-        let commit_store = CommitStoreContext::new();
+        let provided_commit_ids = changes
+            .iter()
+            .filter(|change| change.is_commit())
+            .map(|change| {
+                change
+                    .change
+                    .entity_id
+                    .as_single_string()
+                    .expect("commit fixture should use single entity id")
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        let mut staged_commit_ids = BTreeSet::new();
+        let changelog = ChangelogContext::new();
+        let mut writer = changelog.writer(&mut read, &mut writes);
         for change in changes.iter().filter(|change| change.is_commit()) {
             let commit = crate::commit_graph::CommitGraphCommit {
                 canonical_change: change.change.clone(),
@@ -747,70 +799,177 @@ mod tests {
                 author_account_ids: change.author_account_ids.clone(),
                 parent_commit_ids: change.parent_commit_ids.clone(),
             };
-            let parent_commit_ids = commit.parent_commit_ids.clone();
-            let author_account_ids = commit.author_account_ids.clone();
-            let commit_draft = CommitDraftRef {
-                id: &commit.commit_id,
-                change_id: &commit.canonical_change.id,
-                parent_ids: &parent_commit_ids,
-                author_account_ids: &author_account_ids,
-                created_at: &commit.canonical_change.created_at,
-            };
-
-            let mut authored_changes = Vec::new();
-            let mut adopted_changes = Vec::new();
-            let mut corrupt_missing_members = Vec::new();
+            for parent_commit_id in &commit.parent_commit_ids {
+                if !provided_commit_ids.contains(parent_commit_id)
+                    && staged_commit_ids.insert(parent_commit_id.clone())
+                {
+                    stage_empty_commit(&mut writer, parent_commit_id)
+                        .await
+                        .expect("implicit parent commit should stage");
+                }
+            }
+            let mut segment_changes = Vec::new();
+            let mut membership = Vec::new();
             for change_id in &commit.change_ids {
                 if let Some(change) = changes_by_id.get(change_id.as_str()) {
                     if authored_change_ids.insert(change_id.clone()) {
-                        authored_changes.push(change_ref_from_canonical(change.as_ref()));
+                        segment_changes
+                            .push(segment_change_from_test_change(change, &commit.commit_id));
+                        membership.push(MembershipRecord {
+                            member_change_id: change_id.clone(),
+                            role: MembershipRole::Authored,
+                            source_parent_ordinal: None,
+                        });
                     } else {
-                        adopted_changes.push(change_ref_from_canonical(change.as_ref()));
+                        membership.push(MembershipRecord {
+                            member_change_id: change_id.clone(),
+                            role: MembershipRole::Adopted,
+                            source_parent_ordinal: Some(0),
+                        });
                     }
-                } else {
-                    corrupt_missing_members.push(change_id.clone());
                 }
             }
 
-            if corrupt_missing_members.is_empty() {
-                commit_store
-                    .writer(&read, &mut writes)
-                    .stage_commit_draft(commit_draft, authored_changes, adopted_changes)
-                    .await
-                    .expect("commit-store append should succeed");
-            } else {
-                crate::commit_store::storage::stage_commit(
-                    &mut writes,
-                    commit_draft,
-                    authored_changes,
-                    corrupt_missing_members
-                        .into_iter()
-                        .map(|change_id| ChangeLocator {
-                            source_commit_id: "missing-source-commit".to_string(),
-                            source_pack_id: 0,
-                            source_ordinal: 0,
-                            change_id,
+            let membership_ordinals = membership
+                .iter()
+                .enumerate()
+                .map(|(index, member)| (member.member_change_id.clone(), index as u32))
+                .collect();
+            let state_row_identities = membership
+                .iter()
+                .filter_map(|member| {
+                    changes_by_id
+                        .get(member.member_change_id.as_str())
+                        .map(|change| {
+                            state_row_identity_for_test_change(change)
+                                .map(|identity| (identity, member.member_change_id.clone()))
                         })
-                        .collect(),
-                )
-                .expect("corrupt commit-store fixture should stage");
-            }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .expect("test change should have a valid state row identity");
+            let segment_id = format!("segment-{}", commit.commit_id);
+            let segment = Segment {
+                header: SegmentHeader {
+                    segment_id,
+                    format_version: 1,
+                    commit_count: 1,
+                    change_count: segment_changes.len() as u32,
+                    byte_count: 0,
+                    payload_count: segment_changes
+                        .iter()
+                        .map(|change| change.inline_payloads.len() as u32)
+                        .sum(),
+                    checksum: String::new(),
+                },
+                directory: SegmentDirectory::default(),
+                commits: vec![SegmentCommit {
+                    header: CommitHeader {
+                        id: commit.commit_id.clone(),
+                        parent_commit_ids: commit.parent_commit_ids.clone(),
+                        derivable_change_id: commit.canonical_change.id.clone(),
+                        author_account_ids: commit.author_account_ids.clone(),
+                        created_at: commit.canonical_change.created_at.clone(),
+                        membership_count: membership.len() as u32,
+                    },
+                    body: CommitBody { membership },
+                    directory: SegmentCommitDirectory {
+                        state_row_identities,
+                        membership_ordinals,
+                    },
+                    checksum: String::new(),
+                }],
+                changes: segment_changes,
+            };
+            writer
+                .stage_segment(segment)
+                .await
+                .expect("changelog segment should stage");
+            writer
+                .stage_publish_commit(&commit.commit_id)
+                .await
+                .expect("changelog commit should publish");
+            staged_commit_ids.insert(commit.commit_id.clone());
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("commit should succeed");
     }
 
-    fn change_ref_from_canonical<'a>(change: crate::commit_store::ChangeRef<'a>) -> ChangeRef<'a> {
-        ChangeRef {
-            id: change.id,
-            entity_id: change.entity_id,
-            schema_key: change.schema_key,
-            file_id: change.file_id,
-            snapshot_ref: change.snapshot_ref,
-            metadata_ref: change.metadata_ref,
-            created_at: change.created_at,
+    async fn stage_empty_commit<S>(
+        writer: &mut crate::changelog::ChangelogStoreWriter<'_, S>,
+        commit_id: &str,
+    ) -> Result<(), crate::LixError>
+    where
+        S: crate::storage::StorageRead + Send,
+    {
+        writer
+            .stage_segment(Segment {
+                header: SegmentHeader {
+                    segment_id: format!("segment-{commit_id}"),
+                    format_version: 1,
+                    commit_count: 1,
+                    change_count: 0,
+                    byte_count: 0,
+                    payload_count: 0,
+                    checksum: String::new(),
+                },
+                directory: SegmentDirectory::default(),
+                commits: vec![SegmentCommit {
+                    header: CommitHeader {
+                        id: commit_id.to_string(),
+                        parent_commit_ids: Vec::new(),
+                        derivable_change_id: format!("{commit_id}-change"),
+                        author_account_ids: Vec::new(),
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        membership_count: 0,
+                    },
+                    body: CommitBody::default(),
+                    directory: SegmentCommitDirectory::default(),
+                    checksum: String::new(),
+                }],
+                changes: Vec::new(),
+            })
+            .await?;
+        writer.stage_publish_commit(commit_id).await
+    }
+
+    fn segment_change_from_test_change(change: &TestChange, commit_id: &str) -> SegmentChange {
+        let inline_payloads = change
+            .snapshot_content
+            .iter()
+            .map(|content| SegmentInlinePayload {
+                json_ref: JsonRef::for_content(content.as_bytes()),
+                bytes: content.as_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        SegmentChange {
+            id: change.change.id.clone(),
+            authored_commit_id: Some(commit_id.to_string()),
+            entity_id: change.change.entity_id.clone(),
+            schema_key: change.change.schema_key.clone(),
+            file_id: change.change.file_id.clone(),
+            snapshot_ref: change.change.snapshot_ref,
+            metadata_ref: change.change.metadata_ref,
+            created_at: change.change.created_at.clone(),
+            inline_payloads,
+            directory: SegmentChangeDirectory::default(),
         }
+    }
+
+    fn state_row_identity_for_test_change(
+        change: &TestChange,
+    ) -> Result<crate::changelog::StateRowIdentity, crate::LixError> {
+        Ok(crate::changelog::StateRowIdentity {
+            schema_key: crate::common::CanonicalSchemaKey::new(change.change.schema_key.clone())?,
+            file_id: crate::common::FileId::new(
+                change
+                    .change
+                    .file_id
+                    .clone()
+                    .unwrap_or_else(|| "__global__".to_string()),
+            )?,
+            entity_id: crate::common::EntityId::new(change.change.entity_id.as_json_array_text()?)?,
+        })
     }
 
     fn commit_change(

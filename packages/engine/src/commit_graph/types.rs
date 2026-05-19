@@ -1,6 +1,13 @@
-use crate::commit_store::{Change, LocatedChange};
+use crate::changelog::{Change, SegmentInlinePayload};
 use crate::entity_identity::EntityIdentity;
 use crate::LixError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocatedChange {
+    pub(crate) record: Change,
+    pub(crate) source_commit_id: String,
+    pub(crate) inline_payloads: Vec<SegmentInlinePayload>,
+}
 
 /// Parsed `lix_commit` entity from the changelog.
 ///

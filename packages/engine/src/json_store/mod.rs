@@ -34,9 +34,5 @@ pub(crate) fn stage_direct_json_payload_put(
     json_ref: &JsonRef,
     bytes: Vec<u8>,
 ) {
-    writes.put(
-        store::JSON_SPACE,
-        json_ref.as_hash_bytes().to_vec(),
-        bytes,
-    );
+    writes.put(store::JSON_SPACE, json_ref.as_hash_bytes().to_vec(), bytes);
 }

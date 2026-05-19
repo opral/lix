@@ -18,20 +18,25 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream;
 
-use crate::commit_store::ChangeScanRequest;
+use crate::changelog::{
+    ChangeLoadEntry, ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, ChangelogContext,
+    CommitHeader, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitVisibilityMode,
+};
+use crate::commit_graph::LocatedChange;
+use crate::entity_identity::EntityIdentity;
 use crate::serialize_row_metadata;
 use crate::LixError;
 
-use crate::commit_store::{materialize_change, MaterializedChange};
+use crate::sql2::change_materialization::{materialize_changelog_change, MaterializedChange};
 use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::SqlCommitStoreQuerySource;
+use crate::sql2::SqlChangelogQuerySource;
 use crate::storage::StorageRead;
 
 pub(super) async fn register_lix_change_read_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
 ) -> Result<(), LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
@@ -44,7 +49,7 @@ where
 
 struct LixChangeProvider<S> {
     schema: SchemaRef,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
 }
 
 impl<S> std::fmt::Debug for LixChangeProvider<S> {
@@ -54,7 +59,7 @@ impl<S> std::fmt::Debug for LixChangeProvider<S> {
 }
 
 impl<S> LixChangeProvider<S> {
-    fn new(query_source: SqlCommitStoreQuerySource<S>) -> Self {
+    fn new(query_source: SqlChangelogQuerySource<S>) -> Self {
         Self {
             schema: lix_change_schema(),
             query_source,
@@ -106,7 +111,7 @@ where
 }
 
 struct LixChangeScanExec<S> {
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlChangelogQuerySource<S>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
@@ -121,7 +126,7 @@ impl<S> std::fmt::Debug for LixChangeScanExec<S> {
 
 impl<S> LixChangeScanExec<S> {
     fn new(
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlChangelogQuerySource<S>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -202,15 +207,13 @@ where
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
             let mut json_reader = query_source.json_reader;
-            let canonical_changes = query_source
-                .commit_store_reader
-                .scan_changes(&ChangeScanRequest { limit })
+            let canonical_changes = scan_visible_changelog_changes(query_source.store, limit)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let mut changes = Vec::with_capacity(canonical_changes.len());
             for change in canonical_changes {
                 changes.push(
-                    materialize_change(&mut json_reader, change)
+                    materialize_changelog_change(&mut json_reader, change)
                         .await
                         .map_err(lix_error_to_datafusion_error)?,
                 );
@@ -218,6 +221,123 @@ where
             change_record_batch(&projection, &changes)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+async fn scan_visible_changelog_changes<S>(
+    store: S,
+    limit: Option<usize>,
+) -> Result<Vec<LocatedChange>, LixError>
+where
+    S: StorageRead + Clone + Send + Sync + 'static,
+{
+    let mut reader = ChangelogContext::new().reader(store);
+    let mut visibilities = reader.scan_commit_visibilities().await?;
+    visibilities.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+
+    let commit_ids = visibilities
+        .into_iter()
+        .map(|visibility| visibility.commit_id)
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut change_ids = Vec::new();
+    let mut commit_headers_by_change_id = std::collections::BTreeMap::new();
+    for commit_id in commit_ids {
+        let commits = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: std::slice::from_ref(&commit_id),
+                projection: CommitProjection::Full,
+                visibility: CommitVisibilityMode::RequireVisible,
+            })
+            .await?;
+        let Some(CommitLoadEntry::Full { header, body }) =
+            commits.entries.into_iter().next().flatten()
+        else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("visible changelog commit '{commit_id}' is missing"),
+            ));
+        };
+        for membership in body.membership {
+            if seen.insert(membership.member_change_id.clone()) {
+                change_ids.push(membership.member_change_id);
+                if limit.is_some_and(|limit| change_ids.len() >= limit) {
+                    break;
+                }
+            }
+        }
+        if seen.insert(header.derivable_change_id.clone()) {
+            commit_headers_by_change_id.insert(header.derivable_change_id.clone(), header.clone());
+            change_ids.push(header.derivable_change_id);
+        }
+        if limit.is_some_and(|limit| change_ids.len() >= limit) {
+            change_ids.truncate(limit.unwrap_or(change_ids.len()));
+            break;
+        }
+    }
+
+    let changes = reader
+        .load_changes(ChangeLoadRequest {
+            change_ids: &change_ids,
+            projection: ChangeProjection::Segment,
+            visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
+        })
+        .await?;
+    let mut located_changes = Vec::with_capacity(change_ids.len());
+    for (change_id, entry) in change_ids.into_iter().zip(changes.entries) {
+        let located = match entry {
+            Some(ChangeLoadEntry::Segment(change)) => {
+                let source_commit_id = change.authored_commit_id.clone().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("changelog visible change '{change_id}' has no authored commit"),
+                    )
+                })?;
+                LocatedChange {
+                    record: crate::changelog::Change {
+                        id: change.id,
+                        authored_commit_id: Some(source_commit_id.clone()),
+                        entity_id: change.entity_id,
+                        schema_key: change.schema_key,
+                        file_id: change.file_id,
+                        snapshot_ref: change.snapshot_ref,
+                        metadata_ref: change.metadata_ref,
+                        created_at: change.created_at,
+                    },
+                    source_commit_id,
+                    inline_payloads: change.inline_payloads,
+                }
+            }
+            _ => {
+                let Some(header) = commit_headers_by_change_id.remove(&change_id) else {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("changelog visible change '{change_id}' is missing"),
+                    ));
+                };
+                located_commit_header_change(header)
+            }
+        };
+        located_changes.push(located);
+    }
+    Ok(located_changes)
+}
+
+fn located_commit_header_change(header: CommitHeader) -> LocatedChange {
+    let commit_id = header.id.clone();
+    LocatedChange {
+        record: crate::changelog::Change {
+            id: header.derivable_change_id,
+            authored_commit_id: Some(commit_id.clone()),
+            entity_id: EntityIdentity::single(&commit_id),
+            schema_key: "lix_commit".to_string(),
+            file_id: None,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: header.created_at,
+        },
+        source_commit_id: commit_id,
+        inline_payloads: Vec::new(),
     }
 }
 

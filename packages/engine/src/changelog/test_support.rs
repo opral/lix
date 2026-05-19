@@ -18,7 +18,9 @@ use crate::backend::{InMemoryBackend, Key, ProjectedValue, ReadOptions};
 use crate::changelog::ChangelogContext;
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
-use crate::storage::{PointReadPlan, StorageContext, StorageGetOptions, StorageSpace, StorageWriteSet};
+use crate::storage::{
+    PointReadPlan, StorageContext, StorageGetOptions, StorageSpace, StorageWriteSet,
+};
 use crate::LixError;
 
 pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageContext) {
@@ -282,6 +284,9 @@ pub(crate) fn state_row_identity(
     file_id: &str,
     entity_id: &str,
 ) -> StateRowIdentity {
+    let entity_id = EntityIdentity::single(entity_id)
+        .as_json_array_text()
+        .unwrap();
     StateRowIdentity {
         schema_key: CanonicalSchemaKey::new(schema_key).unwrap(),
         file_id: FileId::new(file_id).unwrap(),
@@ -305,7 +310,7 @@ pub(crate) struct CountingReader {
     segment_gets: Arc<AtomicUsize>,
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl ChangelogStorageRead for CountingReader {
     async fn changelog_get_many(
         &mut self,

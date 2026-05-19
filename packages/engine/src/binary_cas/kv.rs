@@ -22,13 +22,13 @@ use std::collections::{HashMap, HashSet};
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
 pub(crate) const BINARY_CAS_CHUNK_NAMESPACE: &str = "binary_cas.chunk";
-const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
+pub(crate) const BINARY_CAS_MANIFEST_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0005_0001), BINARY_CAS_MANIFEST_NAMESPACE);
-const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+pub(crate) const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0005_0002),
     BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
 );
-const BINARY_CAS_CHUNK_SPACE: StorageSpace =
+pub(crate) const BINARY_CAS_CHUNK_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0005_0003), BINARY_CAS_CHUNK_NAMESPACE);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
