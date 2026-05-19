@@ -1,6 +1,6 @@
 # Tracked CRUD Optimization Log
 
-## Baseline: 2026-05-19 after rebase onto `origin/main`
+## Baseline: 2026-05-19 corrected fixture setup
 
 Command used for the regular scorecard:
 
@@ -11,6 +11,12 @@ cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud 
 The regular scorecard is intentionally the 1k smoke workload. The full 10k
 matrix is too slow for iteration while the SQL path is unoptimized; use targeted
 10k filters for headline checks such as `insert_all_rows/10k`.
+
+This baseline supersedes the first post-rebase scorecard. That run timed
+database/session creation and `insert_all(&rows)` inside read, update, and
+delete benchmarks, which made the non-insert numbers mostly setup cost. The
+current harness creates either an empty or seeded fixture in Criterion's setup
+closure, then times only the operation under test.
 
 Workload:
 
@@ -33,15 +39,15 @@ Notes:
 
 ## 1k Smoke Scorecard
 
-Times below use Criterion point estimates from the rerun after the rebase.
+Times below use Criterion point estimates from the corrected fixture rerun.
 
 ### Direct KV Layout
 
 | Backend | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
-| SQLite  |    3.91 ms |  4.39 ms |        4.27 ms |        5.42 ms |    6.40 ms |    4.26 ms |    4.84 ms |    4.16 ms |
-| RocksDB |    2.70 ms |  3.12 ms |        3.08 ms |        3.24 ms |    3.25 ms |    2.93 ms |    2.79 ms |    2.68 ms |
-| redb    |   44.74 ms | 44.56 ms |       43.11 ms |       43.42 ms |   51.45 ms |   54.59 ms |   49.76 ms |   55.17 ms |
+| SQLite  |    2.35 ms |   652 us |         507 us |        1.63 ms |    2.78 ms |     688 us |    1.22 ms |     619 us |
+| RocksDB |     685 us |   375 us |         198 us |         762 us |     727 us |     200 us |     217 us |     228 us |
+| redb    |   17.90 ms | 11.31 ms |       11.32 ms |       10.77 ms |   19.64 ms |   15.02 ms |   15.66 ms |   18.92 ms |
 
 ### Physical API Layer
 
@@ -49,15 +55,15 @@ Currently mirrors direct KV layout.
 
 | Backend | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
 | ------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
-| SQLite  |    3.78 ms |  4.61 ms |        4.24 ms |        5.20 ms |    6.17 ms |    4.35 ms |    4.88 ms |    4.10 ms |
-| RocksDB |    2.98 ms |  3.05 ms |        2.71 ms |        3.34 ms |    4.31 ms |    3.47 ms |    3.06 ms |    2.80 ms |
-| redb    |   49.06 ms | 45.98 ms |       44.58 ms |       47.09 ms |   52.07 ms |   48.43 ms |   49.78 ms |   50.40 ms |
+| SQLite  |    2.37 ms |   641 us |         486 us |        1.53 ms |    2.63 ms |     685 us |    1.15 ms |     595 us |
+| RocksDB |     654 us |   404 us |         202 us |         752 us |     795 us |     228 us |     219 us |     214 us |
+| redb    |   18.05 ms | 11.54 ms |       11.99 ms |       12.70 ms |   19.43 ms |   14.76 ms |   14.88 ms |   18.78 ms |
 
 ### SQL Session
 
-| Backend   | Insert all |  Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
-| --------- | ---------: | --------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
-| in-memory |   80.01 ms | 106.37 ms |       87.60 ms |      108.99 ms |   excluded |   excluded |  180.89 ms |  164.91 ms |
+| Backend   | Insert all | Read all | Read one by PK | Read all by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | -------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   70.19 ms | 20.73 ms |        6.01 ms |       27.85 ms |   excluded |   excluded |   98.16 ms |   83.30 ms |
 
 ## 10k Reference Checks
 
