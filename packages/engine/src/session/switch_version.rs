@@ -82,6 +82,10 @@ where
             Arc::clone(&self.write_lock),
             self.closed_flag(),
             self.active_transaction_flag(),
+            self.operation_in_progress_flag(),
+            self.operation_watch(),
+            self.commit_in_progress_flag(),
+            self.commit_watch(),
         );
         Ok((
             session,

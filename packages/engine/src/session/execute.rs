@@ -301,10 +301,11 @@ where
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.ensure_open()?;
+        let operation_guard = self.begin_session_operation()?;
         let _transaction_guard = self.reserve_session_transaction()?;
         let statement = sql2::parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+            drop(operation_guard);
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
             return self
@@ -326,6 +327,7 @@ where
         }
 
         let write_guard = Arc::clone(&self.write_lock).lock_owned().await;
+        self.ensure_open()?;
         let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result = async {
             let mut read_store = read_scope.store();
@@ -422,6 +424,8 @@ where
         if writes.is_empty() {
             return Ok(());
         }
+        let _commit_guard = self.begin_commit();
+        self.ensure_open()?;
         self.storage
             .commit_write_set(writes, StorageWriteOptions::default())?;
         Ok(())
@@ -444,6 +448,7 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
+        let _operation_guard = self.begin_session_operation()?;
         let statement = sql2::parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
@@ -488,6 +493,7 @@ where
         params: &[Value],
         mode: sql2::WriteExecutorMode,
     ) -> Result<ExecuteResult, LixError> {
+        let _operation_guard = self.begin_session_operation()?;
         let statement = sql2::parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
@@ -507,6 +513,7 @@ where
         params: &[Value],
         mode: sql2::WriteExecutorMode,
     ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError> {
+        let _operation_guard = self.begin_session_operation()?;
         let statement = sql2::parse_statement(sql)?;
         let transaction = self.transaction_mut()?;
         match sql2::bind_statement_route(&statement)? {
@@ -526,6 +533,7 @@ where
         &mut self,
         request: &crate::live_state::LiveStateScanRequest,
     ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+        let _operation_guard = self.begin_session_operation()?;
         let transaction = self.transaction_mut()?;
         <crate::transaction::Transaction<B> as sql2::SqlWriteExecutionContext>::scan_live_state(
             transaction,
