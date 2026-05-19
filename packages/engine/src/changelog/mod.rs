@@ -31,8 +31,8 @@ pub(crate) use codec::{
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 #[allow(unused_imports)]
 pub(crate) use store::{
-    ChangelogReader, ChangelogWriter, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-    BY_COMMIT_INDEX_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
+    ChangelogReader, ChangelogWriter, VISIBLE_CHANGE_PROOF_SPACE,
 };
 pub use store::{COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE};
 #[allow(unused_imports)]
@@ -41,9 +41,9 @@ pub(crate) use types::{
     ChangeLoadRequest, ChangeLocator, ChangeLocatorRef, ChangeProjection, ChangeRef,
     ChangeVisibilityMode, Commit, CommitBody, CommitHeader, CommitId, CommitLoadBatch,
     CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitVisibility, CommitVisibilityMode,
-    GcLiveSet, GcPlan, GcRoot, GcSweepSet, MembershipRecord, MembershipRole, RebuildIndexStats,
-    Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory,
-    SegmentDirectory, SegmentDirectoryEntryRef, SegmentHeader, SegmentId, SegmentInlinePayload,
-    SegmentObjectLocation, SegmentObjectLocationRef, SegmentObjectSlice, SegmentOffset,
-    SegmentPayloadLocation, SegmentStageReport, SegmentView, StateRowIdentity,
+    GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, MembershipRecord, MembershipRole,
+    RebuildIndexStats, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
+    SegmentCommitDirectory, SegmentDirectory, SegmentDirectoryEntryRef, SegmentHeader, SegmentId,
+    SegmentInlinePayload, SegmentObjectLocation, SegmentObjectLocationRef, SegmentObjectSlice,
+    SegmentOffset, SegmentPayloadLocation, SegmentStageReport, SegmentView, StateRowIdentity,
 };

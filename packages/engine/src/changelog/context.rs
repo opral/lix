@@ -512,8 +512,7 @@ where
                 )));
             };
             if projection == ChangeProjection::PhysicalLocation {
-                let change = segment.load_change(&by_change.location, change_id)?;
-                validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
+                segment.validate_change_location(&by_change.location, change_id)?;
                 entries.push(Some(ChangeLoadEntry::PhysicalLocation(
                     by_change.location.clone(),
                 )));
@@ -557,8 +556,7 @@ where
                 }
                 if let Some(segment) = segments.get(&by_change.location.segment_id) {
                     if projection == ChangeProjection::PhysicalLocation {
-                        let change = segment.load_change(&by_change.location, change_id)?;
-                        validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
+                        segment.validate_change_location(&by_change.location, change_id)?;
                         entries.push(Some(ChangeLoadEntry::PhysicalLocation(
                             by_change.location.clone(),
                         )));
@@ -700,11 +698,7 @@ where
         .await?;
         values
             .into_iter()
-            .map(|value| {
-                value
-                    .map(|bytes| decode_commit_visibility(&bytes))
-                    .transpose()
-            })
+            .map(|value| Ok(value.and_then(|bytes| decode_commit_visibility(&bytes).ok())))
             .collect()
     }
 
@@ -2420,10 +2414,6 @@ where
         super::gc::collect_garbage(&mut *self.store, self.writes, roots).await
     }
 
-    pub(crate) async fn stage_gc_sweep(&mut self, plan: &GcPlan) -> Result<(), LixError> {
-        super::gc::stage_gc_sweep(self.writes, plan)
-    }
-
     pub(crate) async fn rebuild_mandatory_indexes(
         &mut self,
     ) -> Result<RebuildIndexStats, LixError> {
@@ -3686,7 +3676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_changes_visible_rejects_corrupt_visible_change_proof() {
+    async fn load_changes_visible_recovers_from_corrupt_visible_change_proof() {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -3711,20 +3701,18 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let mut reader = context.reader(storage);
-        let error = reader
+        let batch = reader
             .load_changes(ChangeLoadRequest {
                 change_ids: &["change-1".to_string()],
                 projection: ChangeProjection::Segment,
                 visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
             })
             .await
-            .expect_err("corrupt visible proof should fail closed");
+            .expect("corrupt visible proof should fall back to membership/visibility truth");
 
-        assert!(
-            error
-                .to_string()
-                .contains("failed to decode changelog commit visibility"),
-            "unexpected error: {error}"
+        assert_eq!(
+            batch.entries,
+            vec![Some(ChangeLoadEntry::Segment(segment.changes[0].clone()))]
         );
     }
 

@@ -13,14 +13,12 @@ use super::store::{
     commit_visibility_value, segment_key, visible_change_proof_key,
 };
 use super::types::{
-    ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet,
-    MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation, StateRowIdentity,
+    ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRepairSet, GcRoot,
+    GcSweepSet, MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
+    StateRowIdentity,
 };
 use crate::LixError;
-use crate::changelog::{
-    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility,
-    decode_empty_index_value, decode_segment,
-};
+use crate::changelog::{decode_commit_visibility, decode_segment};
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::json_store::{self, JsonRef};
 use crate::storage::{StorageCoreProjection, StorageSpace, StorageWriteSet};
@@ -46,7 +44,6 @@ where
     let mut commit_index: HashMap<String, (SegmentObjectLocation, SegmentCommit)> = HashMap::new();
     let mut change_index: HashMap<String, (SegmentObjectLocation, SegmentChange)> = HashMap::new();
     let mut source_parent_facts = HashMap::<String, GcSourceParentFacts>::new();
-    let mut live_memberships: HashSet<(String, String)> = HashSet::new();
 
     while let Some(commit_id) = pending_commits.pop() {
         if live.commits.contains(&commit_id) {
@@ -94,7 +91,6 @@ where
             }
             push_unique(&mut live.changes, change_id.clone());
             push_unique(&mut live.segments, change_location.segment_id.clone());
-            live_memberships.insert((change_id.clone(), commit.header.id.clone()));
             mark_change_payloads(&mut live.payloads, &change);
         }
     }
@@ -111,29 +107,11 @@ where
     validate_gc_adopted_memberships(&commit_index, &change_index, &mut source_parent_facts)?;
 
     let live_commits: HashSet<_> = live.commits.iter().cloned().collect();
-    let live_changes: HashSet<_> = live.changes.iter().cloned().collect();
-    let retained_segments: HashSet<_> = live.segments.iter().cloned().collect();
-    let retained_commit_ids = truth
-        .commits
-        .iter()
-        .filter_map(|(commit_id, (location, _))| {
-            retained_segments
-                .contains(&location.segment_id)
-                .then(|| commit_id.clone())
-        })
-        .collect::<HashSet<_>>();
-    let retained_change_ids = truth
-        .changes
-        .iter()
-        .filter_map(|(change_id, (location, _))| {
-            retained_segments
-                .contains(&location.segment_id)
-                .then(|| change_id.clone())
-        })
-        .collect::<HashSet<_>>();
+    let retained =
+        compute_retained_primary_closure(&truth, live.segments.iter().cloned().collect())?;
     let mut retained_memberships = HashSet::new();
     for (commit_id, (_, commit)) in &truth.commits {
-        if !retained_commit_ids.contains(commit_id) {
+        if !retained.commits.contains(commit_id) {
             continue;
         }
         for membership in &commit.body.membership {
@@ -142,7 +120,7 @@ where
     }
     let mut retained_payloads = Vec::new();
     for (change_id, (_, change)) in &truth.changes {
-        if retained_change_ids.contains(change_id) {
+        if retained.changes.contains(change_id) {
             mark_change_payloads(&mut retained_payloads, change);
         }
     }
@@ -150,27 +128,49 @@ where
         .iter()
         .map(|json_ref| *json_ref.as_hash_array())
         .collect::<HashSet<_>>();
-    let expected_by_commit = expected_live_by_commit_entries(&commit_index, &live.commits)?;
-    let expected_by_change = expected_live_by_change_entries(&change_index, &live.changes);
     let expected_commit_visibility = expected_commit_visibilities(&commit_index, &live_commits);
-    let live_by_commit_entries = load_by_commit_entries(
-        store,
-        &all_by_commit
-            .iter()
-            .filter(|commit_id| live_commits.contains(*commit_id))
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    let live_by_change_entries = load_by_change_entries(
-        store,
-        &all_by_change
-            .iter()
-            .filter(|change_id| live_changes.contains(*change_id))
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .await?;
+    let retained_commit_order = truth
+        .segment_ids
+        .iter()
+        .flat_map(|segment_id| {
+            truth
+                .commits
+                .iter()
+                .filter(move |(_, (location, _))| &location.segment_id == segment_id)
+                .map(|(commit_id, _)| commit_id.clone())
+        })
+        .filter(|commit_id| retained.commits.contains(commit_id))
+        .collect::<Vec<_>>();
+    let retained_change_order = truth
+        .segment_ids
+        .iter()
+        .flat_map(|segment_id| {
+            truth
+                .changes
+                .iter()
+                .filter(move |(_, (location, _))| &location.segment_id == segment_id)
+                .map(|(change_id, _)| change_id.clone())
+        })
+        .filter(|change_id| retained.changes.contains(change_id))
+        .collect::<Vec<_>>();
+    let retained_commit_index = truth
+        .commits
+        .iter()
+        .filter(|(commit_id, _)| retained.commits.contains(*commit_id))
+        .map(|(commit_id, value)| (commit_id.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    let retained_change_index = truth
+        .changes
+        .iter()
+        .filter(|(change_id, _)| retained.changes.contains(*change_id))
+        .map(|(change_id, value)| (change_id.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    let expected_retained_by_commit =
+        expected_live_by_commit_entries(&retained_commit_index, &retained_commit_order)?;
+    let expected_retained_by_change =
+        expected_live_by_change_entries(&retained_change_index, &retained_change_order);
+    let expected_visible_change_proof =
+        expected_visible_change_proofs(&commit_index, &live.commits, &live_commits);
     let live_commit_visibility_entries = load_commit_visibilities(
         store,
         &all_commit_visibility
@@ -180,34 +180,6 @@ where
             .collect::<Vec<_>>(),
     )
     .await?;
-    let live_visible_change_proofs = load_visible_change_proofs(
-        store,
-        &all_visible_change_proof
-            .iter()
-            .filter(|change_id| live_changes.contains(*change_id))
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-
-    for (commit_id, expected) in &expected_by_commit {
-        if let Some(actual) = live_by_commit_entries.get(commit_id) {
-            if actual != expected {
-                return Err(LixError::unknown(format!(
-                    "changelog GC live by_commit entry for '{commit_id}' does not match segment truth"
-                )));
-            }
-        }
-    }
-    for (change_id, expected) in &expected_by_change {
-        if let Some(actual) = live_by_change_entries.get(change_id) {
-            if actual != expected {
-                return Err(LixError::unknown(format!(
-                    "changelog GC live by_change entry for '{change_id}' does not match segment truth"
-                )));
-            }
-        }
-    }
     for (commit_id, expected) in &expected_commit_visibility {
         if let Some(actual) = live_commit_visibility_entries.get(commit_id) {
             if actual != expected {
@@ -218,23 +190,11 @@ where
         }
     }
 
-    for membership in &live_memberships {
-        let Some(value) = all_by_change_membership.get(membership) else {
-            continue;
-        };
-        decode_empty_index_value(value).map_err(|error| {
-            LixError::unknown(format!(
-                "changelog GC live by_change_membership entry for change '{}' commit '{}' is corrupt: {error}",
-                membership.0, membership.1
-            ))
-        })?;
-    }
-
     let sweep = GcSweepSet {
         segments: truth
             .segment_ids
             .into_iter()
-            .filter(|segment_id| !live.segments.contains(segment_id))
+            .filter(|segment_id| !retained.segments.contains(segment_id))
             .collect(),
         commit_visibility: all_commit_visibility
             .into_iter()
@@ -246,11 +206,11 @@ where
             .collect(),
         by_commit: all_by_commit
             .into_iter()
-            .filter(|commit_id| !retained_commit_ids.contains(commit_id))
+            .filter(|commit_id| !retained.commits.contains(commit_id))
             .collect(),
         by_change: all_by_change
             .into_iter()
-            .filter(|change_id| !retained_change_ids.contains(change_id))
+            .filter(|change_id| !retained.changes.contains(change_id))
             .collect(),
         by_change_membership: all_by_change_membership
             .keys()
@@ -259,34 +219,31 @@ where
             .collect(),
         visible_change_proof: all_visible_change_proof
             .into_iter()
-            .filter(|change_id| {
-                if !live_changes.contains(change_id) {
-                    return true;
-                };
-                let Some(proof) = live_visible_change_proofs.get(change_id) else {
-                    return true;
-                };
-                if !live_memberships.contains(&(change_id.clone(), proof.commit_id.clone())) {
-                    return true;
-                }
-                if live_commit_visibility_entries.get(&proof.commit_id)
-                    != expected_commit_visibility.get(&proof.commit_id)
-                {
-                    return true;
-                }
-                expected_commit_visibility.get(&proof.commit_id) != Some(proof)
-            })
+            .filter(|change_id| !expected_visible_change_proof.contains_key(change_id))
             .collect(),
         json_payloads: all_json_payloads
             .into_iter()
             .filter(|json_ref| !retained_payload_hashes.contains(json_ref.as_hash_array()))
             .collect(),
     };
+    let repair = GcRepairSet {
+        by_commit: retained_commit_order
+            .iter()
+            .filter_map(|commit_id| expected_retained_by_commit.get(commit_id).cloned())
+            .collect(),
+        by_change: retained_change_order
+            .iter()
+            .filter_map(|change_id| expected_retained_by_change.get(change_id).cloned())
+            .collect(),
+        by_change_membership: retained_memberships.into_iter().collect(),
+        visible_change_proof: expected_visible_change_proof.into_iter().collect(),
+    };
 
     Ok(GcPlan {
         roots: roots.to_vec(),
         live,
         sweep,
+        repair,
     })
 }
 
@@ -294,6 +251,62 @@ struct SegmentTruthIndex {
     segment_ids: Vec<String>,
     commits: HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
     changes: HashMap<String, (SegmentObjectLocation, SegmentChange)>,
+}
+
+struct RetainedPrimaryClosure {
+    segments: HashSet<String>,
+    commits: HashSet<String>,
+    changes: HashSet<String>,
+}
+
+fn compute_retained_primary_closure(
+    truth: &SegmentTruthIndex,
+    mut segments: HashSet<String>,
+) -> Result<RetainedPrimaryClosure, LixError> {
+    let mut commits = HashSet::new();
+    let mut changes = HashSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (commit_id, (location, commit)) in &truth.commits {
+            if !segments.contains(&location.segment_id) {
+                continue;
+            }
+            commits.insert(commit_id.clone());
+            for parent_id in &commit.header.parent_commit_ids {
+                let Some((parent_location, _)) = truth.commits.get(parent_id) else {
+                    return Err(LixError::unknown(format!(
+                        "changelog GC retained commit '{commit_id}' references missing parent commit '{parent_id}'"
+                    )));
+                };
+                if segments.insert(parent_location.segment_id.clone()) {
+                    changed = true;
+                }
+            }
+            for membership in &commit.body.membership {
+                let Some((change_location, _)) = truth.changes.get(&membership.member_change_id)
+                else {
+                    return Err(LixError::unknown(format!(
+                        "changelog GC retained commit '{commit_id}' references missing change '{}'",
+                        membership.member_change_id
+                    )));
+                };
+                if segments.insert(change_location.segment_id.clone()) {
+                    changed = true;
+                }
+            }
+        }
+        for (change_id, (location, _)) in &truth.changes {
+            if segments.contains(&location.segment_id) {
+                changes.insert(change_id.clone());
+            }
+        }
+    }
+    Ok(RetainedPrimaryClosure {
+        segments,
+        commits,
+        changes,
+    })
 }
 
 async fn load_segment_truth_index<S>(store: &mut S) -> Result<SegmentTruthIndex, LixError>
@@ -512,6 +525,34 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
     for json_ref in &plan.sweep.json_payloads {
         json_store::stage_direct_json_payload_delete(writes, json_ref);
     }
+    for entry in &plan.repair.by_commit {
+        writes.put(
+            BY_COMMIT_INDEX_SPACE,
+            by_commit_key(&entry.commit_id),
+            by_commit_index_value(entry)?,
+        );
+    }
+    for entry in &plan.repair.by_change {
+        writes.put(
+            BY_CHANGE_INDEX_SPACE,
+            by_change_key(&entry.change_id),
+            by_change_index_value(entry)?,
+        );
+    }
+    for (change_id, commit_id) in &plan.repair.by_change_membership {
+        writes.put(
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+            by_change_membership_key(change_id, commit_id),
+            by_change_membership_index_value(),
+        );
+    }
+    for (change_id, visibility) in &plan.repair.visible_change_proof {
+        writes.put(
+            VISIBLE_CHANGE_PROOF_SPACE,
+            visible_change_proof_key(change_id),
+            commit_visibility_value(visibility)?,
+        );
+    }
     Ok(())
 }
 
@@ -682,6 +723,27 @@ fn expected_commit_visibilities(
     out
 }
 
+fn expected_visible_change_proofs(
+    commit_index: &HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
+    live_commit_order: &[String],
+    live_commits: &HashSet<String>,
+) -> HashMap<String, CommitVisibility> {
+    let visibilities = expected_commit_visibilities(commit_index, live_commits);
+    let mut out = HashMap::new();
+    for commit_id in live_commit_order {
+        let Some((_, commit)) = commit_index.get(commit_id) else {
+            continue;
+        };
+        let Some(visibility) = visibilities.get(commit_id) else {
+            continue;
+        };
+        for membership in &commit.body.membership {
+            out.insert(membership.member_change_id.clone(), visibility.clone());
+        }
+    }
+    out
+}
+
 fn expected_live_by_commit_entries(
     commit_index: &HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
     live_commit_order: &[String],
@@ -751,99 +813,6 @@ fn expected_live_by_change_entries(
         );
     }
     out
-}
-
-async fn load_by_commit_entries<S>(
-    store: &mut S,
-    commit_ids: &[String],
-) -> Result<HashMap<String, ByCommitEntry>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let values = store
-        .changelog_get_many(
-            BY_COMMIT_INDEX_SPACE,
-            commit_ids
-                .iter()
-                .map(|commit_id| by_commit_key(commit_id))
-                .collect(),
-        )
-        .await?;
-    let mut out = HashMap::new();
-    for (commit_id, value) in commit_ids.iter().zip(values.into_iter()) {
-        let Some(bytes) = value else {
-            continue;
-        };
-        let entry = decode_by_commit_entry(&bytes)?;
-        if entry.commit_id != *commit_id {
-            return Err(LixError::unknown(format!(
-                "by_commit key for '{commit_id}' contains commit_id '{}'",
-                entry.commit_id
-            )));
-        }
-        out.insert(commit_id.clone(), entry);
-    }
-    Ok(out)
-}
-
-async fn load_by_change_entries<S>(
-    store: &mut S,
-    change_ids: &[String],
-) -> Result<HashMap<String, ByChangeEntry>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let values = store
-        .changelog_get_many(
-            BY_CHANGE_INDEX_SPACE,
-            change_ids
-                .iter()
-                .map(|change_id| by_change_key(change_id))
-                .collect(),
-        )
-        .await?;
-    let mut out = HashMap::new();
-    for (change_id, value) in change_ids.iter().zip(values.into_iter()) {
-        let Some(bytes) = value else {
-            continue;
-        };
-        let entry = decode_by_change_entry(&bytes)?;
-        if entry.change_id != *change_id {
-            return Err(LixError::unknown(format!(
-                "by_change key for '{change_id}' contains change_id '{}'",
-                entry.change_id
-            )));
-        }
-        out.insert(change_id.clone(), entry);
-    }
-    Ok(out)
-}
-
-async fn load_visible_change_proofs<S>(
-    store: &mut S,
-    change_ids: &[String],
-) -> Result<HashMap<String, CommitVisibility>, LixError>
-where
-    S: ChangelogStorageRead + ?Sized,
-{
-    let values = store
-        .changelog_get_many(
-            VISIBLE_CHANGE_PROOF_SPACE,
-            change_ids
-                .iter()
-                .map(|change_id| visible_change_proof_key(change_id))
-                .collect(),
-        )
-        .await?;
-    let mut out = HashMap::new();
-    for (change_id, value) in change_ids.iter().zip(values.into_iter()) {
-        let Some(bytes) = value else {
-            continue;
-        };
-        let proof = decode_commit_visibility(&bytes)?;
-        out.insert(change_id.clone(), proof);
-    }
-    Ok(out)
 }
 
 async fn load_commit_visibilities<S>(
@@ -1267,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_rejects_corrupt_live_membership_row() {
+    async fn gc_repairs_corrupt_live_membership_row() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
@@ -1284,16 +1253,30 @@ mod tests {
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
-        let mut reader = context.reader(storage);
-        let error = reader
-            .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
-            .await
-            .expect_err("corrupt live membership index must fail closed");
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let plan = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .collect_garbage(&[GcRoot::VersionHead("commit-live".to_string())])
+                .await
+                .unwrap()
+        };
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
 
-        assert!(
-            error.message.contains("live by_change_membership entry"),
-            "unexpected error: {error}"
+        assert_eq!(
+            plan.repair.by_change_membership,
+            vec![("change-live".to_string(), "commit-live".to_string())]
         );
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(
+                BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+                vec![by_change_membership_key("change-live", "commit-live")],
+            )],
+        );
+        assert_eq!(result[0][0].as_deref(), Some(&[][..]));
     }
 
     #[tokio::test]
@@ -1596,15 +1579,21 @@ mod tests {
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
-        assert_eq!(plan.sweep.visible_change_proof, vec!["change-live"]);
-        assert_missing(
+        assert!(plan.sweep.visible_change_proof.is_empty());
+        assert!(
+            plan.repair
+                .visible_change_proof
+                .iter()
+                .any(|(change_id, _)| change_id == "change-live")
+        );
+        let result = crate::changelog::test_support::read_test_value_groups(
             &storage,
             vec![(
                 VISIBLE_CHANGE_PROOF_SPACE,
-                visible_change_proof_key("change-live"),
+                vec![visible_change_proof_key("change-live")],
             )],
-        )
-        .await;
+        );
+        assert!(result[0][0].is_some());
     }
 
     #[tokio::test]
@@ -1638,7 +1627,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(plan.sweep.visible_change_proof, vec!["change-live"]);
+        assert!(plan.sweep.visible_change_proof.is_empty());
+        assert_eq!(plan.repair.visible_change_proof[0].0, "change-live");
     }
 
     #[tokio::test]
@@ -1684,7 +1674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_rejects_corrupt_live_visible_change_proof() {
+    async fn gc_repairs_corrupt_live_visible_change_proof() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
@@ -1701,18 +1691,28 @@ mod tests {
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
-        let mut reader = context.reader(storage);
-        let error = reader
-            .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
-            .await
-            .expect_err("corrupt live visible change proof must fail closed");
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let plan = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer
+                .collect_garbage(&[GcRoot::VersionHead("commit-live".to_string())])
+                .await
+                .unwrap()
+        };
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("failed to decode changelog commit visibility"),
-            "unexpected error: {error}"
+        assert!(plan.sweep.visible_change_proof.is_empty());
+        assert_eq!(plan.repair.visible_change_proof[0].0, "change-live");
+        let result = crate::changelog::test_support::read_test_value_groups(
+            &storage,
+            vec![(
+                VISIBLE_CHANGE_PROOF_SPACE,
+                vec![visible_change_proof_key("change-live")],
+            )],
         );
+        assert!(result[0][0].is_some());
     }
 
     #[tokio::test]
@@ -1867,6 +1867,56 @@ mod tests {
         assert!(plan.live.segments.contains(&"segment-adopter".to_string()));
         assert_eq!(plan.sweep.commit_visibility, Vec::<String>::new());
         assert!(plan.sweep.segments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_retained_segment_closure_keeps_external_adopted_change_segment() {
+        let storage = test_storage();
+        let context = ChangelogContext::new();
+        let author_segment = canonicalize_segment(single_commit_segment(
+            "segment-author",
+            "commit-author",
+            "change-adopted",
+        ))
+        .unwrap();
+        let mut retained_segment =
+            single_commit_segment("segment-retained", "commit-live", "change-live");
+        let mut adopted =
+            adopting_commit_segment("segment-retained", "commit-adopter", "change-adopted")
+                .commits
+                .remove(0);
+        adopted
+            .header
+            .parent_commit_ids
+            .push("commit-author".to_string());
+        retained_segment.commits.push(adopted);
+        let retained_segment = canonicalize_segment(retained_segment).unwrap();
+
+        write_raw_segment(&storage, &author_segment).await;
+        write_raw_segment(&storage, &retained_segment).await;
+
+        let mut reader = context.reader(storage.clone());
+        let plan = reader
+            .plan_gc(&[GcRoot::VersionHead("commit-live".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(plan.live.commits, vec!["commit-live"]);
+        assert_eq!(plan.live.changes, vec!["change-live"]);
+        assert!(plan.live.segments.contains(&"segment-retained".to_string()));
+        assert!(!plan.live.segments.contains(&"segment-author".to_string()));
+        assert!(plan.sweep.segments.is_empty());
+        assert!(
+            plan.repair
+                .by_change
+                .iter()
+                .any(|entry| entry.change_id == "change-adopted")
+        );
+        assert!(
+            plan.repair
+                .by_change_membership
+                .contains(&("change-adopted".to_string(), "commit-adopter".to_string()))
+        );
     }
 
     #[tokio::test]

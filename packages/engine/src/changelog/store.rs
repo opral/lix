@@ -187,8 +187,6 @@ pub(crate) trait ChangelogWriter {
 
     async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 
-    async fn stage_gc_sweep(&mut self, plan: &GcPlan) -> Result<(), LixError>;
-
     async fn rebuild_mandatory_indexes(&mut self) -> Result<RebuildIndexStats, LixError>;
 
     async fn rebuild_by_commit_index(&mut self) -> Result<RebuildIndexStats, LixError>;
