@@ -9,4 +9,5 @@ mod validation;
 
 pub(crate) use context::open_transaction;
 pub(crate) use context::Transaction;
+pub(crate) use context::TransactionCommitBoundary;
 pub(crate) use prep::prepare_version_ref_row;

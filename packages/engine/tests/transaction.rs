@@ -261,6 +261,263 @@ async fn transaction_read_can_query_history_surfaces() {
 }
 
 #[tokio::test]
+async fn closed_session_rejects_active_transaction_execute_and_commit() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let mut tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+    tx.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('closed-session-tx', 'value')",
+        &[],
+    )
+    .await
+    .expect("staging before close should succeed");
+
+    session.close().await.expect("session close should succeed");
+
+    let execute_error = tx
+        .execute("SELECT key FROM lix_key_value", &[])
+        .await
+        .expect_err("transaction execute should reject a closed session");
+    assert_eq!(execute_error.code, lix_engine::LixError::CODE_CLOSED);
+
+    let parse_mask_error = tx
+        .execute("this is not sql", &[])
+        .await
+        .expect_err("transaction execute should check closed before parsing SQL");
+    assert_eq!(parse_mask_error.code, lix_engine::LixError::CODE_CLOSED);
+
+    let commit_error = tx
+        .commit()
+        .await
+        .expect_err("transaction commit should reject a closed session");
+    assert_eq!(commit_error.code, lix_engine::LixError::CODE_CLOSED);
+
+    let reopened = engine
+        .open_workspace_session()
+        .await
+        .expect("new session should open after closing previous session");
+    let result = reopened
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = 'closed-session-tx'",
+            &[],
+        )
+        .await
+        .expect("read through reopened session should succeed");
+    assert_eq!(
+        result.len(),
+        0,
+        "staged transaction rows must not commit after session close"
+    );
+}
+
+#[tokio::test]
+async fn closed_session_still_allows_active_transaction_rollback() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+    session.close().await.expect("session close should succeed");
+
+    tx.rollback()
+        .await
+        .expect("rollback should remain available after close");
+}
+
+#[tokio::test]
+async fn closed_session_active_version_id_does_not_open_backend_read() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend.clone())
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session.close().await.expect("session close should succeed");
+    let before = backend.stats();
+    let error = session
+        .active_version_id()
+        .await
+        .expect_err("active_version_id should reject a closed session");
+    assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
+
+    let delta = backend.stats().delta_since(&before);
+    assert_eq!(
+        delta.read_opened, 0,
+        "closed active_version_id must reject before backend IO"
+    );
+}
+
+#[tokio::test]
+async fn close_during_transaction_open_rejects_opened_transaction() {
+    let backend = BlockingBeginReadBackend::new();
+    let gate = backend.gate();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend)
+        .await
+        .expect("initialized backend should create an engine");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+
+    gate.block_next_write();
+    let opener_session = Arc::clone(&session);
+    let opener = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { opener_session.begin_transaction().await })
+    });
+
+    gate.wait_until_blocked();
+    let closer = spawn_close_waiter(Arc::clone(&session));
+    wait_until_session_closed(&session);
+
+    gate.release();
+    let open_error = match opener.join().expect("opener thread should not panic") {
+        Ok(_) => panic!("transaction open that loses the close race should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(open_error.code, lix_engine::LixError::CODE_CLOSED);
+    closer
+        .join()
+        .expect("closer thread should not panic")
+        .expect("session close should succeed after transaction open exits");
+}
+
+#[tokio::test]
+async fn close_during_transaction_commit_aborts_before_backend_write() {
+    let backend = BlockingBeginReadBackend::new();
+    let gate = backend.gate();
+    let _receipt = Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend.clone())
+        .await
+        .expect("initialized backend should create an engine");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+
+    let mut tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+    tx.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('close-during-commit', 'value')",
+        &[],
+    )
+    .await
+    .expect("staging before close should succeed");
+
+    gate.block_next_write();
+    let before = backend.stats();
+    let committer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { tx.commit().await })
+    });
+
+    gate.wait_until_blocked();
+    let close_session = Arc::clone(&session);
+    let closer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { close_session.close().await })
+    });
+    while !session.is_closed() {
+        thread::yield_now();
+    }
+    gate.release();
+    closer
+        .join()
+        .expect("closer task should not panic")
+        .expect("session close should succeed");
+
+    let error = committer
+        .join()
+        .expect("committer thread should not panic")
+        .expect_err("commit should observe the close before durable writes");
+    assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
+
+    let delta = backend.stats().delta_since(&before);
+    assert_eq!(
+        delta.write_opened, 0,
+        "closed transaction commit must abort before opening a backend write"
+    );
+    assert_eq!(
+        delta.write_committed, 0,
+        "closed transaction commit must not commit backend writes"
+    );
+}
+
+fn spawn_close_waiter<B>(
+    session: Arc<lix_engine::SessionContext<B>>,
+) -> thread::JoinHandle<Result<(), lix_engine::LixError>>
+where
+    B: lix_engine::backend::Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { session.close().await })
+    })
+}
+
+fn wait_until_session_closed<B>(session: &lix_engine::SessionContext<B>)
+where
+    B: lix_engine::backend::Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Write<'backend>: Send,
+{
+    while !session.is_closed() {
+        thread::yield_now();
+    }
+}
+
+#[tokio::test]
 async fn begin_transaction_cannot_race_with_opening_session_write() {
     let backend = BlockingBeginWriteBackend::new();
     let gate = backend.gate();
@@ -330,6 +587,12 @@ struct BlockingBeginWriteBackend {
     gate: BlockingBeginWriteGate,
 }
 
+#[derive(Clone)]
+struct BlockingBeginReadBackend {
+    inner: RecordingBackend,
+    gate: BlockingBeginWriteGate,
+}
+
 impl BlockingBeginWriteBackend {
     fn new() -> Self {
         Self {
@@ -340,6 +603,23 @@ impl BlockingBeginWriteBackend {
 
     fn gate(&self) -> BlockingBeginWriteGate {
         self.gate.clone()
+    }
+}
+
+impl BlockingBeginReadBackend {
+    fn new() -> Self {
+        Self {
+            inner: RecordingBackend::new(),
+            gate: BlockingBeginWriteGate::new(),
+        }
+    }
+
+    fn gate(&self) -> BlockingBeginWriteGate {
+        self.gate.clone()
+    }
+
+    fn stats(&self) -> TransactionStatsSnapshot {
+        self.inner.stats()
     }
 }
 
@@ -364,6 +644,31 @@ impl Backend for BlockingBeginWriteBackend {
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.gate.maybe_block();
+        self.inner.begin_write(opts)
+    }
+}
+
+impl Backend for BlockingBeginReadBackend {
+    type Read<'a>
+        = <RecordingBackend as Backend>::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = <RecordingBackend as Backend>::Write<'a>
+    where
+        Self: 'a;
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.gate.maybe_block();
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.inner.begin_write(opts)
     }
 }
