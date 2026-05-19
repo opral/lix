@@ -1,4 +1,4 @@
-use crate::commit_store::{ChangeLocator, ChangeLocatorRef, ChangeRef};
+use crate::changelog::{ChangeLocator, ChangeLocatorRef, ChangeRef};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::{LixError, NullableKeyFilter};
@@ -50,23 +50,13 @@ pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) entity_id: &'a EntityIdentity,
 }
 
-/// Zero-copy tracked-state projection delta prepared from commit_store facts.
+/// Zero-copy tracked-state projection delta prepared from changelog facts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) change: ChangeRef<'a>,
     pub(crate) locator: ChangeLocatorRef<'a>,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
-}
-
-/// Owned per-commit projection delta entry.
-///
-/// Normal commits persist these entries in `tracked_state.delta_pack`. Full
-/// projection roots are materialized separately from these deltas.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateDeltaEntry {
-    pub(crate) key: TrackedStateKey,
-    pub(crate) value: TrackedStateIndexValue,
 }
 
 /// Projection value stored in tracked-state trees.

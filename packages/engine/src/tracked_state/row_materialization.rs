@@ -1,3 +1,7 @@
+use crate::changelog::{
+    ChangeLoadEntry, ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, ChangelogContext,
+    SegmentInlinePayload,
+};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
@@ -13,13 +17,13 @@ use std::collections::BTreeMap;
 /// fields and stores the JSON refs needed for payload projections. Snapshot and
 /// metadata bytes are hydrated from grouped json_store loads only when the
 /// requested projection needs them.
-pub(crate) async fn materialize_index_entries<S>(
+pub(crate) async fn materialize_rows_from_index_entries<S>(
     store: &S,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    projection: &TrackedMaterializationProjection,
+    projection: &TrackedRowProjection,
 ) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
-    S: StorageRead,
+    S: StorageRead + Send + Sync,
 {
     if !projection.snapshot_content && !projection.metadata {
         return Ok(entries
@@ -40,7 +44,6 @@ where
             projection.snapshot_content,
             value.snapshot_ref,
             row_index,
-            value.change_locator.source_pack_id,
             &mut json_refs,
             &mut json_ref_localities,
         );
@@ -48,11 +51,10 @@ where
             projection.metadata,
             value.metadata_ref,
             row_index,
-            value.change_locator.source_pack_id,
             &mut json_refs,
             &mut json_ref_localities,
         );
-        row_plans.push(MaterializedTrackedStateRowPlan {
+        row_plans.push(TrackedRowMaterializationPlan {
             entity_id: key.entity_id,
             schema_key: key.schema_key,
             file_id: key.file_id,
@@ -60,7 +62,7 @@ where
             created_at: value.created_at,
             updated_at: value.updated_at,
             change_id: value.change_locator.change_id,
-            commit_id: value.change_locator.source_commit_id,
+            commit_id: value.change_locator.commit_id,
             snapshot_ref_index,
             metadata_ref_index,
         });
@@ -87,11 +89,11 @@ fn materialize_entry_without_json(
         created_at: value.created_at,
         updated_at: value.updated_at,
         change_id: value.change_locator.change_id,
-        commit_id: value.change_locator.source_commit_id,
+        commit_id: value.change_locator.commit_id,
     }
 }
 
-struct MaterializedTrackedStateRowPlan {
+struct TrackedRowMaterializationPlan {
     entity_id: EntityIdentity,
     schema_key: String,
     file_id: Option<String>,
@@ -108,7 +110,6 @@ fn projected_json_ref_index(
     include: bool,
     json_ref: Option<JsonRef>,
     row_index: usize,
-    pack_id: u32,
     json_refs: &mut Vec<JsonRef>,
     json_ref_localities: &mut Vec<JsonRefLocality>,
 ) -> Option<usize> {
@@ -117,23 +118,22 @@ fn projected_json_ref_index(
     }
     let index = json_refs.len();
     json_refs.push(json_ref?);
-    json_ref_localities.push(JsonRefLocality { row_index, pack_id });
+    json_ref_localities.push(JsonRefLocality { row_index });
     Some(index)
 }
 
 struct JsonRefLocality {
     row_index: usize,
-    pack_id: u32,
 }
 
 async fn load_projection_json_values<S>(
     store: &S,
     json_refs: &[JsonRef],
     json_ref_localities: &[JsonRefLocality],
-    row_plans: &[MaterializedTrackedStateRowPlan],
+    row_plans: &[TrackedRowMaterializationPlan],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
-    S: StorageRead,
+    S: StorageRead + Send + Sync,
 {
     if json_refs.len() != json_ref_localities.len() {
         return Err(LixError::new(
@@ -142,26 +142,52 @@ where
         ));
     }
 
-    let json_store = JsonStoreContext::new();
-    if let Some((commit_id, pack_id)) = single_projection_pack(json_ref_localities, row_plans)? {
-        let pack_ids = [pack_id];
-        return json_store
-            .load_bytes_many(
-                store,
-                JsonLoadRequestRef {
-                    refs: json_refs,
-                    scope: JsonReadScopeRef::CommitPacks {
-                        commit_id,
-                        pack_ids: &pack_ids,
-                    },
-                },
+    let mut json_values = vec![None; json_refs.len()];
+    let mut change_ids = Vec::new();
+    for index in 0..json_refs.len() {
+        let locality = json_ref_localities.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost JSON locality index",
             )
-            .await
-            .map(|batch| batch.into_values());
+        })?;
+        let row_plan = row_plans.get(locality.row_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost JSON row locality index",
+            )
+        })?;
+        if !change_ids.contains(&row_plan.change_id) {
+            change_ids.push(row_plan.change_id.clone());
+        }
     }
 
-    let mut json_values = vec![None; json_refs.len()];
-    let mut refs_by_pack = BTreeMap::<(&str, u32), Vec<(usize, JsonRef)>>::new();
+    let mut inline_payloads_by_change = BTreeMap::<String, Vec<SegmentInlinePayload>>::new();
+    if !change_ids.is_empty() {
+        let mut changelog_reader = ChangelogContext::new().reader(store);
+        let changes = changelog_reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &change_ids,
+                projection: ChangeProjection::Segment,
+                visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
+            })
+            .await?;
+        for (change_id, entry) in change_ids.into_iter().zip(changes.entries) {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let ChangeLoadEntry::Segment(change) = entry else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state materialization segment projection returned non-segment entry",
+                ));
+            };
+            inline_payloads_by_change.insert(change_id, change.inline_payloads);
+        }
+    }
+
+    let mut out_of_band_indexes = Vec::new();
+    let mut out_of_band_refs = Vec::new();
     for (index, json_ref) in json_refs.iter().copied().enumerate() {
         let locality = json_ref_localities.get(index).ok_or_else(|| {
             LixError::new(
@@ -175,71 +201,45 @@ where
                 "tracked_state materialization lost JSON row locality index",
             )
         })?;
-        refs_by_pack
-            .entry((row_plan.commit_id.as_str(), locality.pack_id))
-            .or_default()
-            .push((index, json_ref));
+        if let Some(bytes) = inline_payloads_by_change
+            .get(row_plan.change_id.as_str())
+            .and_then(|payloads| {
+                payloads
+                    .iter()
+                    .find(|payload| payload.json_ref == json_ref)
+                    .map(|payload| &payload.bytes)
+            })
+        {
+            json_values[index] = Some(bytes.clone());
+        } else {
+            out_of_band_indexes.push(index);
+            out_of_band_refs.push(json_ref);
+        }
     }
 
-    for ((commit_id, pack_id), refs) in refs_by_pack {
-        let indexes = refs.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-        let refs = refs
-            .into_iter()
-            .map(|(_, json_ref)| json_ref)
-            .collect::<Vec<_>>();
-        let pack_ids = [pack_id];
-        let values = json_store
+    if !out_of_band_refs.is_empty() {
+        let values = JsonStoreContext::new()
             .load_bytes_many(
                 store,
                 JsonLoadRequestRef {
-                    refs: &refs,
-                    scope: JsonReadScopeRef::CommitPacks {
-                        commit_id: &commit_id,
-                        pack_ids: &pack_ids,
-                    },
+                    refs: &out_of_band_refs,
+                    scope: JsonReadScopeRef::OutOfBand,
                 },
             )
             .await?
             .into_values();
-        for (index, value) in indexes.into_iter().zip(values) {
-            json_values[index] = value;
+        for (index, value) in out_of_band_indexes.into_iter().zip(values) {
+            if value.is_some() {
+                json_values[index] = value;
+            }
         }
     }
+
     Ok(json_values)
 }
 
-fn single_projection_pack<'a>(
-    json_ref_localities: &[JsonRefLocality],
-    row_plans: &'a [MaterializedTrackedStateRowPlan],
-) -> Result<Option<(&'a str, u32)>, LixError> {
-    let Some(first_locality) = json_ref_localities.first() else {
-        return Ok(None);
-    };
-    let first_plan = row_plans.get(first_locality.row_index).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked_state materialization lost JSON row locality index",
-        )
-    })?;
-    let commit_id = first_plan.commit_id.as_str();
-    let pack_id = first_locality.pack_id;
-
-    for locality in &json_ref_localities[1..] {
-        let row_plan = row_plans.get(locality.row_index).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state materialization lost JSON row locality index",
-            )
-        })?;
-        if row_plan.commit_id != commit_id || locality.pack_id != pack_id {
-            return Ok(None);
-        }
-    }
-    Ok(Some((commit_id, pack_id)))
-}
-
 fn materialize_row_plan(
-    plan: MaterializedTrackedStateRowPlan,
+    plan: TrackedRowMaterializationPlan,
     json_refs: &[JsonRef],
     json_values: &mut [Option<Vec<u8>>],
 ) -> Result<MaterializedTrackedStateRow, LixError> {
@@ -305,12 +305,12 @@ fn materialized_json_string(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TrackedMaterializationProjection {
+pub(crate) struct TrackedRowProjection {
     pub(crate) snapshot_content: bool,
     pub(crate) metadata: bool,
 }
 
-impl TrackedMaterializationProjection {
+impl TrackedRowProjection {
     pub(crate) fn full() -> Self {
         Self {
             snapshot_content: true,
@@ -332,61 +332,6 @@ impl TrackedMaterializationProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn row_plan(commit_id: &str) -> MaterializedTrackedStateRowPlan {
-        MaterializedTrackedStateRowPlan {
-            entity_id: EntityIdentity::single("entity"),
-            schema_key: "schema".to_string(),
-            file_id: None,
-            deleted: false,
-            created_at: "2024-01-01T00:00:00.000Z".to_string(),
-            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
-            change_id: "change".to_string(),
-            commit_id: commit_id.to_string(),
-            snapshot_ref_index: None,
-            metadata_ref_index: None,
-        }
-    }
-
-    #[test]
-    fn single_projection_pack_accepts_duplicate_slots_from_same_pack() {
-        let row_plans = vec![row_plan("commit-a")];
-        let localities = vec![
-            JsonRefLocality {
-                row_index: 0,
-                pack_id: 7,
-            },
-            JsonRefLocality {
-                row_index: 0,
-                pack_id: 7,
-            },
-        ];
-
-        assert_eq!(
-            single_projection_pack(&localities, &row_plans).expect("pack detection should succeed"),
-            Some(("commit-a", 7))
-        );
-    }
-
-    #[test]
-    fn single_projection_pack_rejects_mixed_packs() {
-        let row_plans = vec![row_plan("commit-a")];
-        let localities = vec![
-            JsonRefLocality {
-                row_index: 0,
-                pack_id: 7,
-            },
-            JsonRefLocality {
-                row_index: 0,
-                pack_id: 8,
-            },
-        ];
-
-        assert_eq!(
-            single_projection_pack(&localities, &row_plans).expect("pack detection should succeed"),
-            None
-        );
-    }
 
     #[test]
     fn materialized_json_string_consumes_owned_payload_bytes() {

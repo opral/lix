@@ -11,7 +11,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
 use super::SqlJsonReader;
-use crate::commit_store::{materialize_change, MaterializedChange};
+use crate::sql2::change_materialization::{materialize_changelog_change, MaterializedChange};
 use crate::storage::StorageRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
@@ -256,7 +256,8 @@ where
             .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
-            let change = materialize_change(&mut json_reader, entry.located_change).await?;
+            let change =
+                materialize_changelog_change(&mut json_reader, entry.located_change).await?;
             rows.push(HistoryEntry {
                 commit_created_at: commit_created_at_by_id
                     .get(&entry.observed_commit_id)

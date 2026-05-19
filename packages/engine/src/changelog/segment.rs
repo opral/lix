@@ -709,6 +709,33 @@ fn validate_commit_shape(segment: &Segment, commit: &SegmentCommit) -> Result<()
 
     let mut member_ids = HashSet::new();
     for (ordinal, membership) in commit.body.membership.iter().enumerate() {
+        match membership.role {
+            MembershipRole::Authored => {
+                if membership.source_parent_ordinal.is_some() {
+                    return Err(LixError::unknown(format!(
+                        "changelog commit '{}' authored membership change '{}' must not record a source_parent_ordinal",
+                        commit.header.id, membership.member_change_id
+                    )));
+                }
+            }
+            MembershipRole::Adopted => {
+                let Some(source_parent_ordinal) = membership.source_parent_ordinal else {
+                    return Err(LixError::unknown(format!(
+                        "changelog commit '{}' adopted membership change '{}' is missing source_parent_ordinal",
+                        commit.header.id, membership.member_change_id
+                    )));
+                };
+                if source_parent_ordinal as usize >= commit.header.parent_commit_ids.len() {
+                    return Err(LixError::unknown(format!(
+                        "changelog commit '{}' adopted membership change '{}' source_parent_ordinal {} is out of bounds for {} parents",
+                        commit.header.id,
+                        membership.member_change_id,
+                        source_parent_ordinal,
+                        commit.header.parent_commit_ids.len()
+                    )));
+                }
+            }
+        }
         if !member_ids.insert(membership.member_change_id.as_str()) {
             return Err(LixError::unknown(format!(
                 "changelog commit '{}' contains duplicate membership change '{}'",
@@ -1060,6 +1087,59 @@ mod tests {
             error
                 .message
                 .contains("is missing membership ordinal for change 'change-1'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_authored_membership_with_source_parent_ordinal() {
+        let mut segment = test_segment();
+        segment.commits[0].body.membership[0].source_parent_ordinal = Some(0);
+
+        let error = validate_segment_shape(&segment)
+            .expect_err("authored membership must not carry source parent provenance");
+
+        assert!(
+            error
+                .message
+                .contains("authored membership change 'change-1' must not record"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_adopted_membership_without_source_parent_ordinal() {
+        let mut segment = test_segment();
+        segment.commits[0].body.membership[0].role = MembershipRole::Adopted;
+
+        let error = validate_segment_shape(&segment)
+            .expect_err("adopted membership must carry source parent provenance");
+
+        assert!(
+            error
+                .message
+                .contains("adopted membership change 'change-1' is missing source_parent_ordinal"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_adopted_membership_source_parent_ordinal_out_of_bounds() {
+        let mut segment = test_segment();
+        segment.commits[0].body.membership[0].role = MembershipRole::Adopted;
+        segment.commits[0].body.membership[0].source_parent_ordinal = Some(1);
+        segment.commits[0]
+            .header
+            .parent_commit_ids
+            .push("parent-1".to_string());
+
+        let error = validate_segment_shape(&segment)
+            .expect_err("adopted membership source parent ordinal must point at a parent");
+
+        assert!(
+            error
+                .message
+                .contains("source_parent_ordinal 1 is out of bounds for 1 parents"),
             "unexpected error: {error}"
         );
     }

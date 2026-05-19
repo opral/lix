@@ -6,9 +6,8 @@ use super::store::{
     by_change_index_value, by_change_key, by_change_membership_ids_from_key,
     by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
     by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
-    visible_change_proof_key,
-    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    visible_change_proof_key, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+    BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitVisibility, GcLiveSet, GcPlan, GcRoot, GcSweepSet, Segment,
@@ -220,7 +219,10 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
         );
     }
     for change_id in &plan.sweep.visible_change_proof {
-        writes.delete(VISIBLE_CHANGE_PROOF_SPACE, visible_change_proof_key(change_id));
+        writes.delete(
+            VISIBLE_CHANGE_PROOF_SPACE,
+            visible_change_proof_key(change_id),
+        );
     }
     for json_ref in &plan.sweep.json_payloads {
         json_store::stage_direct_json_payload_delete(writes, json_ref);
@@ -834,18 +836,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_keeps_adopted_change_without_marking_authoring_commit() {
+    async fn gc_keeps_adopted_change_and_source_parent_commit() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let author_segment = single_commit_segment("segment-author", "commit-author", "change-1");
-        let adopting_segment =
+        let mut adopting_segment =
             adopting_commit_segment("segment-adopter", "commit-adopter", "change-1");
+        adopting_segment.commits[0]
+            .header
+            .parent_commit_ids
+            .push("commit-author".to_string());
 
         write_segments(
             &storage,
             &context,
             vec![author_segment, adopting_segment],
-            &["commit-adopter"],
+            &["commit-author", "commit-adopter"],
         )
         .await;
 
@@ -855,11 +861,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(plan.live.commits, vec!["commit-adopter"]);
+        assert_eq!(plan.live.commits, vec!["commit-adopter", "commit-author"]);
         assert_eq!(plan.live.changes, vec!["change-1"]);
         assert!(plan.live.segments.contains(&"segment-author".to_string()));
         assert!(plan.live.segments.contains(&"segment-adopter".to_string()));
-        assert_eq!(plan.sweep.by_commit, vec!["commit-author"]);
         assert_eq!(plan.sweep.commit_visibility, Vec::<String>::new());
         assert!(plan.sweep.segments.is_empty());
     }
@@ -1449,7 +1454,12 @@ mod tests {
         crate::changelog::StateRowIdentity {
             schema_key: CanonicalSchemaKey::new("message").unwrap(),
             file_id: FileId::new("file-1").unwrap(),
-            entity_id: EntityId::new(entity_id).unwrap(),
+            entity_id: EntityId::new(
+                EntityIdentity::single(entity_id)
+                    .as_json_array_text()
+                    .unwrap(),
+            )
+            .unwrap(),
         }
     }
 }

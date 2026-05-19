@@ -384,7 +384,7 @@ mod tests {
             ],
         )
         .await;
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = tracked_state.reader(read);
@@ -416,12 +416,12 @@ mod tests {
     async fn diff_commits_between_delta_parent_and_child_reports_suffix_rows() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
         write_root_for_test(
-            &read,
+            &mut read,
             &mut writes,
             &tracked_state,
             "parent",
@@ -433,8 +433,15 @@ mod tests {
         )
         .await
         .expect("parent should write");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("parent writes should commit");
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("child read should open");
+        let mut writes = storage.new_write_set();
         write_root_for_test(
-            &read,
+            &mut read,
             &mut writes,
             &tracked_state,
             "child",
@@ -447,7 +454,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should commit");
 
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -487,7 +494,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -527,7 +534,7 @@ mod tests {
         )
         .await;
 
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -555,7 +562,7 @@ mod tests {
         storage: &StorageContext,
         tracked_state: &TrackedStateContext,
     ) -> TrackedStateDiff {
-        let read = storage
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         tracked_state
@@ -571,26 +578,12 @@ mod tests {
     ) -> (StorageContext, TrackedStateContext) {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        write_root_for_test(&read, &mut writes, &tracked_state, "left", None, left_rows)
+        write_root_committed_for_test(&storage, &tracked_state, "left", None, left_rows)
             .await
             .expect("left root should write");
-        write_root_for_test(
-            &read,
-            &mut writes,
-            &tracked_state,
-            "right",
-            None,
-            right_rows,
-        )
-        .await
-        .expect("right root should write");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("writes should commit");
+        write_root_committed_for_test(&storage, &tracked_state, "right", None, right_rows)
+            .await
+            .expect("right root should write");
         (storage, tracked_state)
     }
 
@@ -600,23 +593,11 @@ mod tests {
     ) -> (StorageContext, TrackedStateContext) {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        write_root_for_test(
-            &read,
-            &mut writes,
-            &tracked_state,
-            "parent",
-            None,
-            parent_rows,
-        )
-        .await
-        .expect("parent should write");
-        write_root_for_test(
-            &read,
-            &mut writes,
+        write_root_committed_for_test(&storage, &tracked_state, "parent", None, parent_rows)
+            .await
+            .expect("parent should write");
+        write_root_committed_for_test(
+            &storage,
             &tracked_state,
             "child",
             Some("parent"),
@@ -624,14 +605,35 @@ mod tests {
         )
         .await
         .expect("child should write");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("writes should commit");
         (storage, tracked_state)
     }
 
+    async fn write_root_committed_for_test(
+        storage: &StorageContext,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        rows: &[MaterializedTrackedStateRow],
+    ) -> Result<(), LixError> {
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        write_root_for_test(
+            &mut read,
+            &mut writes,
+            tracked_state,
+            commit_id,
+            parent_commit_id,
+            rows,
+        )
+        .await?;
+        storage.commit_write_set(writes, StorageWriteOptions::default())?;
+        Ok(())
+    }
+
     async fn write_root_for_test(
-        read: &(impl crate::storage::StorageRead + Send + Sync + ?Sized),
+        read: &mut (impl crate::storage::StorageRead + Send + Sync + ?Sized),
         writes: &mut crate::storage::StorageWriteSet,
         tracked_state: &TrackedStateContext,
         commit_id: &str,

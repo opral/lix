@@ -220,8 +220,12 @@ struct TraversalFrame {
 mod tests {
     use serde_json::json;
 
+    use crate::changelog::{
+        encode_commit_visibility, Change, ChangelogContext, CommitBody, CommitHeader,
+        CommitVisibility, Segment, SegmentCommit, SegmentCommitDirectory, SegmentDirectory,
+        SegmentHeader,
+    };
     use crate::commit_graph::CommitGraphContext;
-    use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::LixError;
@@ -266,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn reachable_commits_errors_on_missing_parent_commit() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        append_changes(
+        let error = append_changes_result(
             &storage,
             &[commit_change(
                 "commit-head-change",
@@ -275,17 +279,8 @@ mod tests {
                 &["missing-parent"],
             )],
         )
-        .await;
-
-        let graph = CommitGraphContext::new();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let mut reader = graph.reader(read);
-        let error = reader
-            .reachable_commits("commit-head")
-            .await
-            .expect_err("missing parent should fail");
+        .await
+        .expect_err("changelog should reject missing parent");
 
         assert!(error.message.contains("missing-parent"));
     }
@@ -293,24 +288,15 @@ mod tests {
     #[tokio::test]
     async fn reachable_commits_errors_on_cycle() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        append_changes(
+        let error = append_changes_result(
             &storage,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &["commit-b"]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
             ],
         )
-        .await;
-
-        let graph = CommitGraphContext::new();
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        let mut reader = graph.reader(read);
-        let error = reader
-            .reachable_commits("commit-a")
-            .await
-            .expect_err("cycle should fail");
+        .await
+        .expect_err("changelog should reject parent cycles");
 
         assert!(error.message.contains("cycle"));
     }
@@ -725,35 +711,78 @@ mod tests {
     }
 
     async fn append_changes(storage: &StorageContext, changes: &[TestCommitChange]) {
-        let read = storage
+        append_changes_result(storage, changes)
+            .await
+            .expect("changelog fixture should append");
+    }
+
+    async fn append_changes_result(
+        storage: &StorageContext,
+        changes: &[TestCommitChange],
+    ) -> Result<(), LixError> {
+        let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let commit_store = CommitStoreContext::new();
-        for change in changes {
-            let commit_id = change
-                .change
-                .entity_id
-                .as_single_string()
-                .expect("commit fixture should have single id")
-                .to_string();
-            let author_account_ids = Vec::new();
-            let commit = CommitDraftRef {
-                id: &commit_id,
-                change_id: &change.change.id,
-                parent_ids: &change.parent_commit_ids,
-                author_account_ids: &author_account_ids,
-                created_at: &change.change.created_at,
-            };
-            commit_store
-                .writer(&read, &mut writes)
-                .stage_commit_draft(commit, Vec::new(), Vec::new())
-                .await
-                .expect("commit-store fixture should append");
+        let segment = Segment {
+            header: SegmentHeader {
+                segment_id: format!("walker-test-{}", changes.len()),
+                format_version: 0,
+                commit_count: 0,
+                change_count: 0,
+                byte_count: 0,
+                payload_count: 0,
+                checksum: String::new(),
+            },
+            directory: SegmentDirectory::default(),
+            commits: changes
+                .iter()
+                .map(|change| {
+                    let commit_id = change
+                        .change
+                        .entity_id
+                        .as_single_string()
+                        .expect("commit fixture should have single id")
+                        .to_string();
+                    SegmentCommit {
+                        header: CommitHeader {
+                            id: commit_id,
+                            parent_commit_ids: change.parent_commit_ids.clone(),
+                            derivable_change_id: change.change.id.clone(),
+                            author_account_ids: Vec::new(),
+                            created_at: change.change.created_at.clone(),
+                            membership_count: 0,
+                        },
+                        body: CommitBody {
+                            membership: Vec::new(),
+                        },
+                        directory: SegmentCommitDirectory::default(),
+                        checksum: String::new(),
+                    }
+                })
+                .collect(),
+            changes: Vec::new(),
+        };
+        let report = ChangelogContext::new()
+            .writer(&mut read, &mut writes)
+            .stage_segment(segment)
+            .await?;
+        for (commit_id, location) in report.commit_locations {
+            writes.put(
+                crate::changelog::COMMIT_VISIBILITY_SPACE,
+                commit_id.as_bytes().to_vec(),
+                encode_commit_visibility(&CommitVisibility {
+                    commit_id,
+                    checksum: location.checksum.clone(),
+                    location,
+                })
+                .expect("commit visibility should encode"),
+            );
         }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("commit should succeed");
+        Ok(())
     }
 
     fn commit_change(
@@ -766,6 +795,7 @@ mod tests {
         TestCommitChange {
             change: Change {
                 id: change_id.to_string(),
+                authored_commit_id: Some(commit_id.to_string()),
                 entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,

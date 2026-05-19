@@ -236,22 +236,35 @@ impl TrackedStateTree {
         store: &(impl StorageRead + Send + Sync + ?Sized),
         writes: &mut StorageWriteSet,
         base_root: Option<&TrackedStateRootId>,
-        mut mutations: Vec<TrackedStateMutation>,
+        mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
         let mut overlay = storage::TrackedStateChunkOverlay::new();
+        self.apply_mutations_with_overlay(
+            store,
+            writes,
+            &mut overlay,
+            base_root,
+            mutations,
+            commit_id,
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_mutations_with_overlay(
+        &self,
+        store: &(impl StorageRead + Send + Sync + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
+        base_root: Option<&TrackedStateRootId>,
+        mut mutations: Vec<TrackedStateMutation>,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
         if let Some(root_id) = base_root {
             if mutations.len() == 1 {
                 let mutation = mutations.pop().expect("single mutation should exist");
                 match self
-                    .apply_single_mutation(
-                        store,
-                        writes,
-                        &mut overlay,
-                        root_id,
-                        mutation,
-                        commit_id,
-                    )
+                    .apply_single_mutation(store, writes, overlay, root_id, mutation, commit_id)
                     .await?
                 {
                     MutationApply::Applied(result) => return Ok(result),
@@ -260,12 +273,7 @@ impl TrackedStateTree {
             } else if mutations.len() > 1 {
                 match self
                     .apply_sorted_mutations_chunker(
-                        store,
-                        writes,
-                        &mut overlay,
-                        root_id,
-                        mutations,
-                        commit_id,
+                        store, writes, overlay, root_id, mutations, commit_id,
                     )
                     .await?
                 {
@@ -277,7 +285,7 @@ impl TrackedStateTree {
 
         let mut entries = match base_root {
             Some(root_id) => self
-                .collect_leaf_entries(store, root_id)
+                .collect_leaf_entries_with_overlay(store, overlay, root_id)
                 .await?
                 .into_iter()
                 .map(|entry| (entry.key, entry.value))
@@ -1384,12 +1392,23 @@ impl TrackedStateTree {
         store: &(impl StorageRead + Send + Sync + ?Sized),
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        self.collect_leaf_entries_with_overlay(store, &overlay, root_id)
+            .await
+    }
+
+    async fn collect_leaf_entries_with_overlay(
+        &self,
+        store: &(impl StorageRead + Send + Sync + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
+        root_id: &TrackedStateRootId,
+    ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         let mut out = Vec::new();
         let mut current = vec![*root_id.as_bytes()];
         while !current.is_empty() {
             let mut next = Vec::new();
             for hash in current {
-                match self.load_node(store, &hash).await? {
+                match self.load_node_with_overlay(store, overlay, &hash).await? {
                     DecodedNode::Leaf(leaf) => out.extend(leaf.entries().iter().cloned()),
                     DecodedNode::Internal(internal) => {
                         next.extend(internal.children().iter().map(|child| child.child_hash));
@@ -2524,7 +2543,7 @@ mod tests {
             .expect("row should load")
             .expect("row should exist");
         assert_eq!(loaded.change_locator.change_id, "change-new");
-        assert_eq!(loaded.change_locator.source_commit_id, "commit");
+        assert_eq!(loaded.change_locator.commit_id, "commit");
     }
 
     #[tokio::test]
@@ -3112,13 +3131,17 @@ mod tests {
             Some("{\"v\":2}") => 2,
             Some(_) => 3,
             None => 0,
-        };
+        } as u64;
         TrackedStateIndexValue {
-            change_locator: crate::commit_store::ChangeLocator {
-                source_commit_id: "commit".to_string(),
-                source_pack_id: 0,
-                source_ordinal,
+            change_locator: crate::changelog::ChangeLocator {
                 change_id: change_id.to_string(),
+                commit_id: "commit".to_string(),
+                location: crate::changelog::SegmentObjectLocation {
+                    segment_id: "segment".to_string(),
+                    offset: 0,
+                    len: source_ordinal,
+                    checksum: change_id.to_string(),
+                },
             },
             deleted: snapshot_content.is_none(),
             snapshot_ref: snapshot_content

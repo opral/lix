@@ -7,7 +7,6 @@ use serde_json::Value as JsonValue;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
-use crate::commit_store::CommitStoreContext;
 use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -17,7 +16,10 @@ use crate::live_state::{
 };
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
-use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
+use crate::sql2::{
+    ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlHistoryQuerySource,
+};
 use crate::storage::{
     InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
 };
@@ -60,7 +62,6 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
-    commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
@@ -84,7 +85,6 @@ where
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
     ) -> Result<OpenTransaction<B>, LixError> {
@@ -141,7 +141,6 @@ where
                 live_state,
                 tracked_state,
                 binary_cas,
-                commit_store,
                 version_ctx,
                 schema_resolver,
                 staged_writes,
@@ -156,7 +155,7 @@ where
 
     /// Commits prepared writes, runtime function state, and the backend transaction.
     ///
-    /// Commit owns the execution boundary: prepared rows become commit-store
+    /// Commit owns the execution boundary: prepared rows become changelog
     /// facts, version-ref updates, and visible live_state rows before the
     /// backend transaction is committed.
     pub(crate) async fn commit(
@@ -175,13 +174,12 @@ where
         {
             return Err(error);
         }
-        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let mut read = self.storage.begin_read(StorageReadOptions::default())?;
         let mut writes = match commit::commit_prepared_writes(
             &self.binary_cas,
-            &self.commit_store,
             self.version_ctx.as_ref(),
             Some(runtime_functions),
-            &read,
+            &mut read,
             prepared_writes,
         )
         .await
@@ -494,7 +492,6 @@ where
             read_store,
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
-            commit_store: Arc::clone(&self.commit_store),
             version_ctx: Arc::clone(&self.version_ctx),
             visible_schemas: self.visible_schemas.clone(),
             functions: self.functions.clone(),
@@ -579,7 +576,6 @@ pub(crate) struct TransactionSqlReadExecutionContext<R> {
     read_store: StorageReadScope<R>,
     live_state: Arc<LiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
-    commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
@@ -616,9 +612,15 @@ where
         self.functions.clone()
     }
 
-    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore> {
-        CommitStoreQuerySource {
-            commit_store_reader: Arc::new(self.commit_store.reader(self.read_store.store())),
+    fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
+        HistoryQuerySource {
+            json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.store()),
+        }
+    }
+
+    fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
+        ChangelogQuerySource {
+            store: self.read_store.clone(),
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.store()),
         }
     }
@@ -779,6 +781,8 @@ fn prepare_adopted_state_row(
         updated_at: row.updated_at,
         global: change.version_id == GLOBAL_VERSION_ID,
         change_id: change.change_id,
+        source_commit_id: row.commit_id,
+        source_parent_commit_id: change.source_parent_commit_id,
         commit_id: String::new(),
         version_id: change.version_id,
     })
@@ -809,7 +813,6 @@ pub(crate) async fn open_transaction<B>(
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
-    commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     catalog_context: Arc<CatalogContext>,
 ) -> Result<OpenTransaction<B>, LixError>
@@ -824,7 +827,6 @@ where
         live_state,
         tracked_state,
         binary_cas,
-        commit_store,
         version_ctx,
         catalog_context,
     )
@@ -1041,7 +1043,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::commit_store::{ChangeScanRequest, CommitStoreContext};
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
@@ -1067,8 +1068,7 @@ mod tests {
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
-        let changelog = Arc::new(CommitStoreContext::new());
-        let commit_store = Arc::new(CommitStoreContext::new());
+        let tracked_state = Arc::new(crate::tracked_state::TrackedStateContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
@@ -1077,9 +1077,8 @@ mod tests {
             },
             storage.clone(),
             Arc::clone(&live_state),
-            Arc::new(crate::tracked_state::TrackedStateContext::new()),
+            Arc::clone(&tracked_state),
             Arc::clone(&binary_cas),
-            Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             Arc::clone(&catalog_context),
         )
@@ -1100,32 +1099,48 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let changes = changelog
+        let tracked_row = live_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .scan_changes(&ChangeScanRequest::default())
+            .load_row(&LiveStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("tracked-programmatic"),
+                file_id: NullableKeyFilter::Null,
+            })
             .await
-            .expect("changelog should scan");
-        assert!(
-            changes.iter().any(|change| change
-                .record
-                .entity_id
-                .as_single_string_owned()
-                .as_deref()
-                == Ok("tracked-programmatic")),
-            "tracked staged row should be appended to changelog"
+            .expect("tracked row should load")
+            .expect("tracked row should exist");
+        let tracked_change_id = tracked_row
+            .change_id
+            .as_ref()
+            .expect("tracked row should have a change id")
+            .clone();
+        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
         );
+        let changes = changelog_reader
+            .load_changes(crate::changelog::ChangeLoadRequest {
+                change_ids: &[tracked_change_id],
+                projection: crate::changelog::ChangeProjection::Logical,
+                visibility:
+                    crate::changelog::ChangeVisibilityMode::RequireReachableFromVisibleCommit,
+            })
+            .await
+            .expect("changelog should load tracked change");
         assert!(
-            !changes.iter().any(|change| change
-                .record
-                .entity_id
-                .as_single_string_owned()
-                .as_deref()
-                == Ok("untracked-programmatic")),
-            "untracked staged row must not be appended to changelog"
+            matches!(
+                changes.entries.as_slice(),
+                [Some(crate::changelog::ChangeLoadEntry::Logical(change))]
+                    if change.entity_id.as_single_string_owned().as_deref()
+                        == Ok("tracked-programmatic")
+            ),
+            "tracked staged row should be appended to changelog"
         );
 
         let head_commit_id = version_ctx
@@ -1230,8 +1245,6 @@ mod tests {
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
-        let changelog = Arc::new(CommitStoreContext::new());
-        let commit_store = Arc::new(CommitStoreContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
@@ -1242,7 +1255,6 @@ mod tests {
             Arc::clone(&live_state),
             Arc::new(crate::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
-            Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             Arc::clone(&catalog_context),
         )
@@ -1269,24 +1281,6 @@ mod tests {
             "validation error should explain the rejected schema data: {error:?}"
         );
 
-        let changes = changelog
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .expect("read should open"),
-            )
-            .scan_changes(&ChangeScanRequest::default())
-            .await
-            .expect("changelog should scan after failed commit");
-        assert!(
-            changes.iter().all(|change| change
-                .record
-                .entity_id
-                .as_single_string_owned()
-                .as_deref()
-                != Ok("invalid-programmatic")),
-            "validation failure must happen before changelog persistence"
-        );
         let head = version_ctx
             .ref_reader(
                 storage
@@ -1307,7 +1301,7 @@ mod tests {
     async fn commit_rejects_non_object_metadata_without_sql() {
         let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend.clone());
-        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, mut transaction) =
+        let (live_state, _binary_cas, version_ref, runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-metadata", "value", false);
@@ -1330,7 +1324,6 @@ mod tests {
         assert_no_persistence_after_validation_failure(
             storage.clone(),
             &live_state,
-            &changelog,
             &version_ref,
             "invalid-metadata",
         )
@@ -1340,14 +1333,8 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_key_without_sql() {
         let backend = InMemoryStorageBackend::new();
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("unknown-schema", "value", false);
         row.schema_key = "missing_schema".to_string();
@@ -1369,14 +1356,8 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_missing_version_without_sql() {
         let backend = InMemoryStorageBackend::new();
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("ghost-version-row", "value", false);
         row.version_id = "ghost-version".to_string();
@@ -1399,14 +1380,8 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_invalid_storage_scope_without_sql() {
         let backend = InMemoryStorageBackend::new();
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-storage-scope", "value", false);
         row.version_id = GLOBAL_VERSION_ID.to_string();
@@ -1427,14 +1402,8 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
         let backend = InMemoryStorageBackend::new();
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-json", "value", false);
         row.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
@@ -1455,7 +1424,7 @@ mod tests {
     async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
         let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend.clone());
-        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, mut transaction) =
+        let (live_state, _binary_cas, version_ref, runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("schema-mismatch", "value", false);
@@ -1480,7 +1449,6 @@ mod tests {
         assert_no_persistence_after_validation_failure(
             storage.clone(),
             &live_state,
-            &changelog,
             &version_ref,
             "schema-mismatch",
         )
@@ -1490,14 +1458,8 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
         let backend = InMemoryStorageBackend::new();
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
         row.schema_key = "lix_registered_schema".to_string();
@@ -1530,14 +1492,8 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_primary_key_entity_id_mismatch_without_sql() {
         let backend = InMemoryStorageBackend::new();
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
+        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("right-id", "value", false);
         row.entity_id = Some(crate::entity_identity::EntityIdentity::single("wrong-id"));
@@ -1561,7 +1517,6 @@ mod tests {
     ) -> (
         Arc<LiveStateContext>,
         Arc<BinaryCasContext>,
-        Arc<CommitStoreContext>,
         Arc<VersionContext>,
         FunctionContext,
         Transaction,
@@ -1570,8 +1525,6 @@ mod tests {
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
-        let changelog = Arc::new(CommitStoreContext::new());
-        let commit_store = Arc::new(CommitStoreContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
@@ -1582,7 +1535,6 @@ mod tests {
             Arc::clone(&live_state),
             Arc::new(crate::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
-            Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             catalog_context,
         )
@@ -1594,7 +1546,6 @@ mod tests {
         (
             live_state,
             binary_cas,
-            changelog,
             version_ctx,
             runtime_functions,
             transaction,
@@ -1630,11 +1581,11 @@ mod tests {
             "1970-01-01T00:00:00.000Z",
         )
         .expect("schema fixture version ref should stage");
-        let read = storage
+        let mut read = storage
             .begin_read(crate::storage::StorageReadOptions::default())
             .expect("schema fixture read should open");
         crate::test_support::stage_tracked_root_from_materialized(
-            &read,
+            &mut read,
             &mut writes,
             &crate::tracked_state::TrackedStateContext::new(),
             SCHEMA_FIXTURE_COMMIT_ID,
@@ -1655,28 +1606,9 @@ mod tests {
     async fn assert_no_persistence_after_validation_failure(
         storage: StorageContext,
         live_state: &LiveStateContext,
-        changelog: &CommitStoreContext,
         version_ctx: &VersionContext,
         rejected_entity_id: &str,
     ) {
-        let changes = changelog
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .expect("read should open"),
-            )
-            .scan_changes(&ChangeScanRequest::default())
-            .await
-            .expect("changelog should scan after failed commit");
-        assert!(
-            changes.iter().all(|change| change
-                .record
-                .entity_id
-                .as_single_string_owned()
-                .as_deref()
-                != Ok(rejected_entity_id)),
-            "validation failure must happen before changelog persistence"
-        );
         let head = version_ctx
             .ref_reader(
                 storage

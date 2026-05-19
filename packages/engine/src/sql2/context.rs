@@ -7,7 +7,6 @@ use tokio::sync::Mutex;
 
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
-use crate::commit_store::CommitStoreReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
@@ -19,12 +18,18 @@ use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::version::{VersionHead, VersionRefReader};
 use crate::LixError;
 
-pub(crate) type SqlCommitStoreQuerySource<S> = CommitStoreQuerySource<S>;
+pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
+pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 pub(crate) type SqlJsonReader<S> = JsonStoreReader<S>;
 
 #[derive(Clone)]
-pub(crate) struct CommitStoreQuerySource<S> {
-    pub(crate) commit_store_reader: Arc<CommitStoreReader<S>>,
+pub(crate) struct HistoryQuerySource<S> {
+    pub(crate) json_reader: JsonStoreReader<S>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ChangelogQuerySource<S> {
+    pub(crate) store: S,
     pub(crate) json_reader: JsonStoreReader<S>,
 }
 
@@ -44,7 +49,8 @@ pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
-    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource<Self::ReadStore>;
+    fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore>;
+    fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn version_ref(&self) -> Arc<dyn VersionRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;

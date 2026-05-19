@@ -123,6 +123,30 @@ pub(crate) struct ChangeRef<'a> {
     pub(crate) created_at: &'a str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChangeLocator {
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
+    pub(crate) location: SegmentObjectLocation,
+}
+
+impl ChangeLocator {
+    pub(crate) fn as_ref(&self) -> ChangeLocatorRef<'_> {
+        ChangeLocatorRef {
+            change_id: &self.change_id,
+            commit_id: &self.commit_id,
+            location: self.location.as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChangeLocatorRef<'a> {
+    pub(crate) change_id: &'a str,
+    pub(crate) commit_id: &'a str,
+    pub(crate) location: SegmentObjectLocationRef<'a>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChangeProjection {
     Logical,
@@ -164,6 +188,13 @@ pub(crate) struct Segment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentStageReport {
+    pub(crate) segment_id: SegmentId,
+    pub(crate) commit_locations: Vec<(CommitId, SegmentObjectLocation)>,
+    pub(crate) change_locations: Vec<(ChangeId, SegmentObjectLocation)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentHeader {
     pub(crate) segment_id: SegmentId,
     pub(crate) format_version: u32,
@@ -186,6 +217,17 @@ pub(crate) struct SegmentObjectLocation {
     pub(crate) offset: SegmentOffset,
     pub(crate) len: SegmentLength,
     pub(crate) checksum: SegmentChecksum,
+}
+
+impl SegmentObjectLocation {
+    pub(crate) fn as_ref(&self) -> SegmentObjectLocationRef<'_> {
+        SegmentObjectLocationRef {
+            segment_id: &self.segment_id,
+            offset: self.offset,
+            len: self.len,
+            checksum: &self.checksum,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,19 +348,6 @@ pub(crate) struct ByCommitEntry {
 pub(crate) struct ByChangeEntry {
     pub(crate) change_id: ChangeId,
     pub(crate) location: SegmentObjectLocation,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ByKeyValueEntry {
-    pub(crate) state_row_identity: StateRowIdentity,
-    pub(crate) change_id: ChangeId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ByKeyCommitEntry {
-    pub(crate) state_row_identity: StateRowIdentity,
-    pub(crate) commit_id: CommitId,
-    pub(crate) member_change_id: ChangeId,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

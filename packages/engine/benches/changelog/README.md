@@ -5,42 +5,20 @@ Dedicated microbenchmarks for the changelog physical layout.
 Run locally:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench changelog
+cargo bench -p lix_engine --features storage-benches --bench changelog_scorecard
 ```
 
-Smoke compile/run through Criterion:
+Smoke compile all registered changelog benches:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench changelog -- --test
+cargo bench -p lix_engine --features storage-benches --no-run
 ```
 
-CodSpeed:
+Profile workloads:
 
 ```sh
-cargo codspeed build -p lix_engine --features storage-benches --bench changelog
-cargo codspeed run
-```
-
-Stable benchmark groups:
-
-```text
-changelog/cpu/<shape>/<operation>
-  includes encode/decode, validation, directory/index construction, and in-segment lookup
-changelog/storage/unit/<shape>/<operation>
-changelog/storage/unit/corpus/<corpus-shape>/<operation>
-  includes batch stage, one-segment incremental append, publish, lookup, and scan/decode
-changelog/storage/unit/by_change_membership_prefix/<fanout-shape>
-changelog/storage/unit/rebuild_mandatory_indexes_modes/<mode>
-changelog/storage/unit/gc_shapes/<operation>/<live-shape>
-changelog/cpu/payload/<payload-shape>/<operation>
-  includes payload-sized encode/decode, inline payload directory resolution, and size stats
-changelog/cpu/key_layout/<key-shape>/<operation>
-changelog/storage/unit/payload/<payload-shape>/<operation>
-changelog/storage/unit/key_layout/<key-shape>/<operation>
-changelog/storage/unit/heavy_corpus/<corpus-shape>/<operation>
-changelog/storage/unit/concurrent_read_pressure/<operation>
-changelog/storage/unit/projection/<object-kind>/<visibility>/<projection>
-changelog/storage/unit/lookup_batch_size/<operation>/<batch-shape>
+cargo bench -p lix_engine --features storage-benches --bench changelog_cpu_profile
+cargo bench -p lix_engine --features storage-benches --bench changelog_visible_profile
 ```
 
 Single-segment shapes:
@@ -117,5 +95,6 @@ benchmarks stay isolated from the broader storage benchmark harness:
 ```text
 mem_unit         in-memory ordered map
 sqlite_tempfile  SQLite temp file
+redb_tempfile    redb temp file
 rocksdb_tempdir  RocksDB temp directory
 ```

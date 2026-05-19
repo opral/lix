@@ -26,7 +26,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
 use crate::LixError;
 
-use crate::commit_store::MaterializedChange;
+use crate::sql2::change_materialization::MaterializedChange;
 use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
 use crate::sql2::history_route::{
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
@@ -36,7 +36,7 @@ use crate::sql2::history_route::{
     HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::SqlCommitStoreQuerySource;
+use crate::sql2::SqlHistoryQuerySource;
 use crate::storage::StorageRead;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -47,7 +47,7 @@ pub(super) async fn register_lix_file_history_surface<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
 ) -> Result<(), LixError>
 where
@@ -69,7 +69,7 @@ where
 struct LixFileHistoryProvider<S> {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
 }
 
@@ -82,7 +82,7 @@ impl<S> std::fmt::Debug for LixFileHistoryProvider<S> {
 impl<S> LixFileHistoryProvider<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlHistoryQuerySource<S>,
         blob_reader: Arc<dyn BlobDataReader>,
     ) -> Self {
         Self {
@@ -158,7 +158,7 @@ where
 
 struct LixFileHistoryScanExec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
     schema: SchemaRef,
     needs_data: bool,
@@ -179,7 +179,7 @@ impl<S> std::fmt::Debug for LixFileHistoryScanExec<S> {
 impl<S> LixFileHistoryScanExec<S> {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlCommitStoreQuerySource<S>,
+        query_source: SqlHistoryQuerySource<S>,
         blob_reader: Arc<dyn BlobDataReader>,
         schema: SchemaRef,
         needs_data: bool,
@@ -364,7 +364,7 @@ struct BlobRefSnapshot {
 
 async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlCommitStoreQuerySource<S>,
+    query_source: SqlHistoryQuerySource<S>,
     blob_reader: &Arc<dyn BlobDataReader>,
     route: &HistoryRoute,
     needs_data: bool,

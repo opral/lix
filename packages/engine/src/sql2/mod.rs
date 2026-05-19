@@ -1,5 +1,6 @@
 mod bind;
 mod catalog;
+mod change_materialization;
 mod context;
 mod dml;
 mod error;
@@ -30,9 +31,9 @@ pub(crate) use bind::{
     bind_read_statement, bind_statement, bind_statement_route, BoundStatementRoute,
 };
 pub(crate) use context::{
-    CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
-    WriteContextVersionRefReader,
+    ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlHistoryQuerySource, SqlJsonReader, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
+    WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
 #[allow(unused_imports)]
 pub(crate) use exec::{

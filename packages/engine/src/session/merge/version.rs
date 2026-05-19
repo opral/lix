@@ -273,8 +273,11 @@ where
                     )?);
                 }
 
-                let adopted_changes =
-                    adopted_changes_from_merge_plan(merge_plan, &active_version_id);
+                let adopted_changes = adopted_changes_from_merge_plan(
+                    merge_plan,
+                    &active_version_id,
+                    &analysis.commits.source_commit_id,
+                );
                 if adopted_changes.is_empty() {
                     let created_merge_commit_id =
                         transaction.stage_empty_commit(active_version_id.clone())?;

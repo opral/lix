@@ -4,114 +4,52 @@ This document is the 80% physical layout target for tracked Lix state. It keeps
 the core storage model theoretically sound while leaving codec, compaction, and
 backend details for implementation.
 
-## Current Layout
+## Implemented Layout
 
 ```text
-┌─────────────────────┐
-│ commit_store.commit │
-├─────────────────────┤
-│ key: commit_id      │
-│ commit header       │
-│ - change_id         │
-│ - parent_commit_ids │
-│ - change_pack_count │
-│ - membership_count  │
-└────┬─────────────┬──┘
-     │             │ optional, not written by the probe below
-     │             ▼
-     │   ┌──────────────────────────┐
-     │   │ commit_store.change_pack │
-     │   │ key: commit_id + pack_id │
-     │   │ authored changes[]       │
-     │   └──────────────────────────┘
-     │
-     ▼
-┌──────────────────────────┐
-│ tracked_state.delta_pack │
-├──────────────────────────┤
-│ key: commit_id           │
-│ tracked row deltas[]     │
-│ - schema_key             │
-│ - entity_id              │
-│ - file_id                │
-│ - deleted                │
-│ - change_locator         │
-│ - snapshot_ref ──────────┼──────┐
-│ - metadata_ref ──────────┼──┐   │
-└──────────────────────────┘  │   │
-                              │   │ json_ref
-                              ▼   ▼
-                    ┌───────────────────┐
-                    │  json_store.pack  │
-                    │ packed small JSON │
-                    └───────────────────┘
+┌──────────────────────────────┐
+│ changelog.segment            │
+├──────────────────────────────┤
+│ SegmentHeader                │
+│ SegmentDirectory             │
+│   commit_id/change_id        │
+│   -> offset/len/checksum     │
+│ segment.commits[]            │
+│   CommitHeader + CommitBody  │
+│ segment.changes[]            │
+│   row/entity change facts    │
+│   SegmentInlinePayloads      │
+└──────────────┬───────────────┘
+               │ publishes last
+               ▼
+┌──────────────────────────────┐
+│ changelog.commit_visibility  │
+│ key: commit_id               │
+│ -> segment object locator    │
+└──────────────┬───────────────┘
+               │ derived serving projection
+               ▼
+┌──────────────────────────────┐
+│ tracked_state.root           │
+│ key: commit_id               │
+│ rebuildable prolly root      │
+│ leaf -> change_locator       │
+│      -> snapshot/metadata ref│
+└──────────────────────────────┘
 
-                    ┌───────────────────┐
-                    │  json_store.json  │
-                    │ direct large JSON │
-                    └───────────────────┘
+Large or deduplicated payloads live in `json_store.json`. Small tracked
+payloads are read from `SegmentChange.inline_payloads`; the compatibility
+commit-pack path is not part of the tracked/changelog hot path.
 ```
 
-Current problem:
+Remaining layout pressure:
 
 ```text
-tracked_state.delta_pack contains row deltas and also acts as the authored
-change source for this tracked write path.
-
-That makes the lower commit/changelog layer depend on tracked_state facts.
+tracked_state.root is still a derived serving projection and must remain
+rebuildable from changelog.segment plus commit_visibility.
 ```
 
-## Current Baseline
-
-Measured with:
-
-```sh
-cargo test --manifest-path packages/engine/Cargo.toml --test log11_physical_tracked -- --ignored --nocapture
-```
-
-100 inserts in one SQL statement:
-
-```sql
-INSERT INTO json_pointer (...) VALUES (... 100 rows ...)
-```
-
-```text
-commit_store.commit       added=1 bytes=205
-tracked_state.delta_pack  added=1 bytes=13,287
-json_store.pack           added=1 bytes=34,513
-```
-
-100 updates in one SQL statement by primary key:
-
-```sql
-UPDATE json_pointer
-SET value = CASE path
-  WHEN '<pk-1>' THEN lix_json(...)
-  WHEN '<pk-2>' THEN lix_json(...)
-  ...
-END
-WHERE path IN ('<pk-1>', '<pk-2>', ...)
-```
-
-```text
-commit_store.commit       added=1 bytes=205
-tracked_state.delta_pack  added=1 bytes=13,318
-json_store.pack           added=1 bytes=20,896
-json_store.json           added=1 bytes=110,035
-```
-
-100 deletes in one SQL statement by primary key:
-
-```sql
-DELETE FROM json_pointer WHERE path IN ('<pk-1>', '<pk-2>', ...)
-```
-
-```text
-commit_store.commit       added=1 bytes=205
-tracked_state.delta_pack  added=1 bytes=13,187
-```
-
-## Proposed Model
+## Model
 
 Core rules:
 
@@ -308,8 +246,9 @@ batches. `expected` is the canonical row count derived from segment truth,
 `put` is the number of missing/corrupt/wrong expected rows staged for overwrite,
 `deleted` is stale extra rows staged for deletion, and `unchanged` is expected
 rows that already matched canonical bytes.
-by_key is mandatory if key/entity history is a product path; without it,
-key-history queries may scan changelog.change objects.
+No key/entity history accelerator is implemented in the current hard cut.
+Key-history product paths may add a rebuildable index later; until then,
+key-history queries scan changelog.change objects.
 by_commit stores parent edges and generation numbers; skip/closure indexes are
 needed for bounded ancestry/merge-base queries.
 ```
@@ -325,21 +264,21 @@ The index is rebuildable and not a visibility source. Readers still validate:
   candidate commit_id -> commit_visibility -> CommitBody.membership contains change_id
 ```
 
-Key indexes:
+Future key indexes:
 
 ```text
-by_key_value optional:
+key_value optional:
   StateRowIdentity -> candidate change_ids
   answers "which row versions existed for this key?"
 
-by_key_commit optional:
+key_commit optional:
   StateRowIdentity -> candidate commit_id + member_change_id pairs
   answers "which commits included/touched this key?"
 
 Merge commits can include an existing change_id without authoring a new
 changelog.change, so value history and commit-touch history are distinct.
-The MVP writer may omit optional by_key indexes unless a product path enables
-them; correctness must not depend on by_key.
+The writer omits these optional indexes today. Correctness must not depend on
+them.
 ```
 
 Logical and physical segmenting:
@@ -392,7 +331,7 @@ part of tracked_state.root semantics.
 │ segment.changes[]            │ │   change_id                  │ │ derived prolly tree          │
 │   SOURCE OF ROW FACTS        │ │   -> candidate commit_ids    │ ├──────────────────────────────┤
 │                              │ │                              │ │ key ranges                   │
-│ SegmentCommit decodes to:    │ │ by_key optional              │ │ subtree hashes               │
+│ SegmentCommit decodes to:    │ │ future key index optional    │ │ subtree hashes               │
 │ - CommitHeader              │ │   state row identity         │ │ leaf: state row identity     │
 │ - CommitBody                │ │   -> candidate history       │ │   -> change_id               │  │
 │ - SegmentCommitDirectory     │ └──────────────────────────────┘ │   -> deleted                 │  │
@@ -859,8 +798,8 @@ change_id lookup
   O(1) expected via by_change
 
 entity/key history
-  with by_key:    O(log R + H)
-  without by_key: O(R)
+  with future key index: O(log R + H)
+  today:                 O(R)
 
 schema/file range scan
   root-covered refs/header: O(log_B N + Q)
@@ -969,18 +908,18 @@ deleted/rebuilt.
 | Large JSON referenced only by unreachable change       | none after retention horizon                                                   | payload                                           | Sweep after no reachable change references it.                     |
 | Inline payload in mixed live/dead segment              | whole segment in MVP                                                           | none until scavenge                               | Whole-segment retention causes byte amplification.                 |
 | Mixed live/dead physical segment                       | whole segment in MVP                                                           | old segment after scavenge                        | Scavenge copies live commits/changes and updates physical indexes. |
-| Stale/missing `by_commit` / `by_change` / `by_key`     | visible truth objects                                                          | stale index records                               | Rebuild from segment directories and visible commits.              |
+| Stale/missing `by_commit` / `by_change`                 | visible truth objects                                                          | stale index records                               | Rebuild from segment directories and visible commits.              |
 | Missing `commit_visibility`                            | nothing is published by that edge                                              | unpublished commit/change objects if unreferenced | Segment bytes alone do not publish commits.                        |
 | Pinned commit or remote/sync ref                       | same closure as version head                                                   | unrelated objects                                 | Pins and remote refs are GC roots.                                 |
 
 ## Clean Cuts
 
 ```text
-1. Replace commit_store/tracked_state.delta_pack source split with changelog.segment.
+1. Changelog segment is the source of commit and change truth.
 2. Make tracked_state only a derived prolly root plus projection refs.
 3. Move small JSON payloads into SegmentChange SegmentInlinePayloads.
 4. Keep large/deduplicated payloads in json_store.json.
 5. Make change_id the logical identity for row/entity changes.
 6. Keep changelog indexes rebuildable.
-7. Delete changelog/commit_store fallback into tracked_state.
+7. Keep tracked-state repair flowing from changelog to derived roots.
 ```

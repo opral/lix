@@ -77,7 +77,6 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.write_lock),

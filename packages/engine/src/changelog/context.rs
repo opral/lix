@@ -32,8 +32,9 @@ use crate::changelog::{
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
     ChangeProjection, ChangeVisibilityMode, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest,
-    CommitProjection, CommitVisibility, CommitVisibilityMode, GcPlan, GcRoot, RebuildIndexStats,
-    Segment, SegmentChange, SegmentCommit, SegmentObjectLocation, StateRowIdentity,
+    CommitProjection, CommitVisibility, CommitVisibilityMode, GcPlan, GcRoot, MembershipRole,
+    RebuildIndexStats, Segment, SegmentChange, SegmentCommit, SegmentObjectLocation,
+    SegmentStageReport, StateRowIdentity,
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::{
@@ -113,7 +114,7 @@ impl ChangelogScanPage {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 pub(crate) trait ChangelogStorageRead {
     async fn changelog_get_many(
         &mut self,
@@ -131,10 +132,10 @@ pub(crate) trait ChangelogStorageRead {
     ) -> Result<ChangelogScanPage, LixError>;
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<T> ChangelogStorageRead for T
 where
-    T: StorageRead,
+    T: StorageRead + Send,
 {
     async fn changelog_get_many(
         &mut self,
@@ -156,10 +157,10 @@ where
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<B> ChangelogStorageRead for StorageContext<B>
 where
-    B: crate::backend::Backend,
+    B: crate::backend::Backend + Send,
 {
     async fn changelog_get_many(
         &mut self,
@@ -374,6 +375,12 @@ where
             }
         };
         Ok(CommitLoadBatch { entries })
+    }
+
+    pub(crate) async fn scan_commit_visibilities(
+        &mut self,
+    ) -> Result<Vec<CommitVisibility>, LixError> {
+        scan_commit_visibilities_from_store(&mut self.store).await
     }
 
     async fn load_visible_commit_entries(
@@ -680,7 +687,11 @@ where
         .await?;
         values
             .into_iter()
-            .map(|value| value.map(|bytes| decode_commit_visibility(&bytes)).transpose())
+            .map(|value| {
+                value
+                    .map(|bytes| decode_commit_visibility(&bytes))
+                    .transpose()
+            })
             .collect()
     }
 
@@ -850,8 +861,9 @@ where
             return Ok(HashSet::new());
         }
 
-        let (mut proven, mut checked_commits) =
-            self.prove_visible_changes_from_native_proofs(change_ids).await?;
+        let (mut proven, mut checked_commits) = self
+            .prove_visible_changes_from_native_proofs(change_ids)
+            .await?;
         if proven.len() == requested.len() {
             return Ok(proven);
         }
@@ -1323,11 +1335,19 @@ impl<S> ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + ?Sized,
 {
-    pub(crate) async fn stage_segment(&mut self, segment: Segment) -> Result<(), LixError> {
+    pub(crate) async fn stage_segment(
+        &mut self,
+        segment: Segment,
+    ) -> Result<SegmentStageReport, LixError> {
         let segment = canonicalize_segment(segment)?;
         validate_stage_segment_shape(&segment)?;
         self.reject_duplicate_logical_ids(&segment).await?;
         let segment_id = segment.header.segment_id.clone();
+        let report = SegmentStageReport {
+            segment_id: segment_id.clone(),
+            commit_locations: segment.directory.commits.clone(),
+            change_locations: segment.directory.changes.clone(),
+        };
         self.writes.put(
             SEGMENT_SPACE,
             segment_key(&segment_id),
@@ -1367,7 +1387,7 @@ where
             self.staged_changes.insert(entry.change_id.clone());
         }
 
-        Ok(())
+        Ok(report)
     }
 
     async fn reject_duplicate_logical_ids(&mut self, segment: &Segment) -> Result<(), LixError> {
@@ -1490,6 +1510,15 @@ where
             }
             entry.location
         };
+        self.stage_publish_commit_at_location(commit_id, location)
+            .await
+    }
+
+    pub(crate) async fn stage_publish_commit_at_location(
+        &mut self,
+        commit_id: &str,
+        location: SegmentObjectLocation,
+    ) -> Result<(), LixError> {
         let commit = self.load_publish_commit(commit_id, &location).await?;
         self.validate_publish_membership_closure(&commit).await?;
         self.validate_publish_parents(&commit).await?;
@@ -1587,6 +1616,71 @@ where
             .collect::<HashSet<_>>();
         let changes = self.resolve_publish_changes(&member_change_ids).await?;
 
+        for membership in &commit.body.membership {
+            let Some(change) = changes.get(&membership.member_change_id) else {
+                continue;
+            };
+            match membership.role {
+                MembershipRole::Authored => {
+                    if change.authored_commit_id.as_deref() != Some(commit.header.id.as_str()) {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog commit '{}' because authored membership change '{}' belongs to authored_commit_id {:?}",
+                            commit.header.id,
+                            membership.member_change_id,
+                            change.authored_commit_id
+                        )));
+                    }
+                }
+                MembershipRole::Adopted => {
+                    if change.authored_commit_id.as_deref() == Some(commit.header.id.as_str()) {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog commit '{}' because adopted membership change '{}' is authored by the same commit",
+                            commit.header.id, membership.member_change_id
+                        )));
+                    }
+                    let Some(source_parent_ordinal) = membership.source_parent_ordinal else {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog commit '{}' because adopted membership change '{}' is missing source_parent_ordinal",
+                            commit.header.id, membership.member_change_id
+                        )));
+                    };
+                    let Some(parent_id) = commit
+                        .header
+                        .parent_commit_ids
+                        .get(source_parent_ordinal as usize)
+                    else {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog commit '{}' because adopted membership change '{}' source_parent_ordinal {} is out of bounds",
+                            commit.header.id, membership.member_change_id, source_parent_ordinal
+                        )));
+                    };
+                    if !self
+                        .commit_history_contains_membership(parent_id, &membership.member_change_id)
+                        .await?
+                    {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog commit '{}' because adopted membership change '{}' is not reachable from source parent '{}'",
+                            commit.header.id, membership.member_change_id, parent_id
+                        )));
+                    }
+                    let identity = state_row_identity_for_change(change)?;
+                    if !self
+                        .commit_history_projects_state_row(
+                            parent_id,
+                            &identity,
+                            &membership.member_change_id,
+                        )
+                        .await?
+                    {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog commit '{}' because adopted membership change '{}' is not the source parent '{}' winner for {:?}",
+                            commit.header.id, membership.member_change_id, parent_id, identity
+                        )));
+                    }
+                }
+            }
+        }
+
         for (identity, change_id) in &commit.directory.state_row_identities {
             let Some(change) = changes.get(change_id) else {
                 return Err(LixError::unknown(format!(
@@ -1597,12 +1691,96 @@ where
             let actual = state_row_identity_for_change(change)?;
             if &actual != identity {
                 return Err(LixError::unknown(format!(
-                    "cannot publish changelog commit '{}' because StateRowIdentity winner for change '{}' does not match changelog.change",
-                    commit.header.id, change_id
+                    "cannot publish changelog commit '{}' because StateRowIdentity winner for change '{}' does not match changelog.change (expected {:?}, actual {:?})",
+                    commit.header.id, change_id, identity, actual
                 )));
             }
         }
         Ok(())
+    }
+
+    async fn commit_history_contains_membership(
+        &mut self,
+        root_commit_id: &str,
+        change_id: &str,
+    ) -> Result<bool, LixError> {
+        let mut stack = vec![root_commit_id.to_string()];
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = stack.pop() {
+            if !visited.insert(commit_id.clone()) {
+                continue;
+            }
+            let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
+                continue;
+            };
+            if commit
+                .body
+                .membership
+                .iter()
+                .any(|membership| membership.member_change_id == change_id)
+            {
+                return Ok(true);
+            }
+            stack.extend(commit.header.parent_commit_ids);
+        }
+        Ok(false)
+    }
+
+    async fn commit_history_projects_state_row(
+        &mut self,
+        root_commit_id: &str,
+        identity: &StateRowIdentity,
+        change_id: &str,
+    ) -> Result<bool, LixError> {
+        let mut next_commit_id = Some(root_commit_id.to_string());
+        let mut visited = HashSet::new();
+        while let Some(commit_id) = next_commit_id.take() {
+            if !visited.insert(commit_id.clone()) {
+                return Err(LixError::unknown(format!(
+                    "cannot resolve StateRowIdentity winner for {:?} because first-parent history contains cycle at commit '{}'",
+                    identity, commit_id
+                )));
+            }
+            let Some(commit) = self.load_published_or_staged_commit(&commit_id).await? else {
+                return Ok(false);
+            };
+            if let Some((_, winner_change_id)) = commit
+                .directory
+                .state_row_identities
+                .iter()
+                .find(|(candidate, _)| candidate == identity)
+            {
+                return Ok(winner_change_id == change_id);
+            }
+            next_commit_id = commit.header.parent_commit_ids.first().cloned();
+        }
+        Ok(false)
+    }
+
+    async fn load_published_or_staged_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<Option<SegmentCommit>, LixError> {
+        if let Some(location) = self.staged_commits.get(commit_id).cloned() {
+            return self
+                .load_publish_commit(commit_id, &location)
+                .await
+                .map(Some);
+        }
+        let Some(visibility) = get_one(
+            &mut *self.store,
+            COMMIT_VISIBILITY_SPACE,
+            commit_visibility_key(commit_id),
+        )
+        .await?
+        .map(|bytes| decode_commit_visibility(&bytes))
+        .transpose()?
+        else {
+            return Ok(None);
+        };
+        self.load_publish_commit(commit_id, &visibility.location)
+            .await
+            .map(Some)
     }
 
     async fn resolve_publish_changes(
@@ -1945,49 +2123,10 @@ where
             .await
     }
 
-    async fn scan_commit_visibilities(&mut self) -> Result<Vec<CommitVisibility>, LixError> {
-        let mut after = None;
-        let mut visibilities = Vec::new();
-        loop {
-            let page = self
-                .store
-                .changelog_scan(
-                    COMMIT_VISIBILITY_SPACE,
-                    Vec::new(),
-                    after,
-                    256,
-                    CoreProjection::FullValue,
-                )
-                .await?;
-            for index in 0..page.len() {
-                let Some(key) = page.key(index) else {
-                    continue;
-                };
-                let commit_id = std::str::from_utf8(key).map_err(|error| {
-                    LixError::unknown(format!(
-                        "changelog commit_visibility key contains invalid UTF-8: {error}"
-                    ))
-                })?;
-                let Some(value) = page.value(index) else {
-                    return Err(LixError::unknown(
-                        "changelog commit_visibility scan returned key without value".to_string(),
-                    ));
-                };
-                let visibility = decode_commit_visibility(value)?;
-                if visibility.commit_id != commit_id {
-                    return Err(LixError::unknown(format!(
-                        "commit_visibility key for '{commit_id}' contains commit_id '{}'",
-                        visibility.commit_id
-                    )));
-                }
-                visibilities.push(visibility);
-            }
-            let Some(next_after) = page.resume_after else {
-                break;
-            };
-            after = Some(next_after);
-        }
-        Ok(visibilities)
+    pub(crate) async fn scan_commit_visibilities(
+        &mut self,
+    ) -> Result<Vec<CommitVisibility>, LixError> {
+        scan_commit_visibilities_from_store(self.store).await
     }
 
     async fn stage_index_rebuild(
@@ -2098,17 +2237,58 @@ fn project_change_with_location(
 }
 
 fn state_row_identity_for_change(change: &SegmentChange) -> Result<StateRowIdentity, LixError> {
-    let file_id = change.file_id.as_deref().ok_or_else(|| {
-        LixError::unknown(format!(
-            "changelog change '{}' is missing file_id for StateRowIdentity",
-            change.id
-        ))
-    })?;
+    let file_id = change.file_id.as_deref().unwrap_or("__global__");
     Ok(StateRowIdentity {
         schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
         file_id: FileId::new(file_id.to_string())?,
-        entity_id: EntityId::new(change.entity_id.as_single_string_owned()?)?,
+        entity_id: EntityId::new(change.entity_id.as_json_array_text()?)?,
     })
+}
+
+async fn scan_commit_visibilities_from_store(
+    store: &mut (impl ChangelogStorageRead + ?Sized),
+) -> Result<Vec<CommitVisibility>, LixError> {
+    let mut after = None;
+    let mut visibilities = Vec::new();
+    loop {
+        let page = store
+            .changelog_scan(
+                COMMIT_VISIBILITY_SPACE,
+                Vec::new(),
+                after,
+                256,
+                CoreProjection::FullValue,
+            )
+            .await?;
+        for index in 0..page.len() {
+            let Some(key) = page.key(index) else {
+                continue;
+            };
+            let commit_id = std::str::from_utf8(key).map_err(|error| {
+                LixError::unknown(format!(
+                    "changelog commit_visibility key contains invalid UTF-8: {error}"
+                ))
+            })?;
+            let Some(value) = page.value(index) else {
+                return Err(LixError::unknown(
+                    "changelog commit_visibility scan returned key without value".to_string(),
+                ));
+            };
+            let visibility = decode_commit_visibility(value)?;
+            if visibility.commit_id != commit_id {
+                return Err(LixError::unknown(format!(
+                    "commit_visibility key for '{commit_id}' contains commit_id '{}'",
+                    visibility.commit_id
+                )));
+            }
+            visibilities.push(visibility);
+        }
+        let Some(next_after) = page.resume_after else {
+            break;
+        };
+        after = Some(next_after);
+    }
+    Ok(visibilities)
 }
 
 fn changelog_not_implemented(operation: &str) -> LixError {
@@ -3761,6 +3941,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_publish_commit_rejects_authored_membership_for_existing_change() {
+        let (context, storage) = changelog_test_context();
+        let mut segment = two_commit_segment();
+        segment.commits[1].body.membership[0].role = MembershipRole::Authored;
+        segment.commits[1].body.membership[0].source_parent_ordinal = None;
+        let segment = canonicalize_segment(segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-1").await.unwrap();
+            writer
+                .stage_publish_commit("commit-2")
+                .await
+                .expect_err("publication must prove authored membership owns its change")
+        };
+
+        assert!(
+            error
+                .message
+                .contains("authored membership change 'change-1' belongs to"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn stage_publish_commit_accepts_parent_staged_in_same_write_set() {
         let (context, storage) = changelog_test_context();
         let segment = two_commit_segment();
@@ -3788,6 +3996,357 @@ mod tests {
 
         assert_eq!(commits.entries.len(), 2);
         assert!(commits.entries.iter().all(Option::is_some));
+    }
+
+    #[tokio::test]
+    async fn stage_publish_commit_accepts_adopted_membership_reachable_through_source_parent_history(
+    ) {
+        let (context, storage) = changelog_test_context();
+        let mut segment = two_commit_segment();
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "commit-3".to_string(),
+                parent_commit_ids: vec!["commit-2".to_string()],
+                derivable_change_id: "derived-change-3".to_string(),
+                author_account_ids: vec!["account-3".to_string()],
+                created_at: "2026-05-12T00:02:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "change-1".to_string(),
+                    role: MembershipRole::Adopted,
+                    source_parent_ordinal: Some(0),
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "change-1".to_string(),
+                )],
+                membership_ordinals: vec![("change-1".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        let segment = canonicalize_segment(segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-1").await.unwrap();
+            writer.stage_publish_commit("commit-2").await.unwrap();
+            writer.stage_publish_commit("commit-3").await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stage_publish_commit_rejects_adopted_membership_not_reachable_from_source_parent() {
+        let (context, storage) = changelog_test_context();
+        let mut segment = test_segment();
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "commit-other-parent".to_string(),
+                parent_commit_ids: Vec::new(),
+                derivable_change_id: "derived-change-other".to_string(),
+                author_account_ids: vec!["account-2".to_string()],
+                created_at: "2026-05-12T00:01:00Z".to_string(),
+                membership_count: 0,
+            },
+            body: CommitBody {
+                membership: Vec::new(),
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: Vec::new(),
+                membership_ordinals: Vec::new(),
+            },
+            checksum: String::new(),
+        });
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "commit-3".to_string(),
+                parent_commit_ids: vec!["commit-other-parent".to_string(), "commit-1".to_string()],
+                derivable_change_id: "derived-change-3".to_string(),
+                author_account_ids: vec!["account-3".to_string()],
+                created_at: "2026-05-12T00:02:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "change-1".to_string(),
+                    role: MembershipRole::Adopted,
+                    source_parent_ordinal: Some(0),
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "change-1".to_string(),
+                )],
+                membership_ordinals: vec![("change-1".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        let segment = canonicalize_segment(segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-1").await.unwrap();
+            writer
+                .stage_publish_commit("commit-other-parent")
+                .await
+                .unwrap();
+            writer
+                .stage_publish_commit("commit-3")
+                .await
+                .expect_err("publication must prove adopted change reaches through source parent")
+        };
+
+        assert!(
+            error
+                .message
+                .contains("adopted membership change 'change-1' is not reachable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_publish_commit_rejects_adopted_membership_when_source_parent_winner_differs() {
+        let (context, storage) = changelog_test_context();
+        let mut segment = test_segment();
+        let mut change = segment.changes[0].clone();
+        change.id = "change-2".to_string();
+        change.authored_commit_id = Some("commit-2".to_string());
+        change.created_at = "2026-05-12T00:01:00Z".to_string();
+        segment.changes.push(change);
+        segment.directory.changes.push((
+            "change-2".to_string(),
+            location("segment-1", 70, 40, "change-2-checksum"),
+        ));
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "commit-2".to_string(),
+                parent_commit_ids: vec!["commit-1".to_string()],
+                derivable_change_id: "derived-change-2".to_string(),
+                author_account_ids: vec!["account-2".to_string()],
+                created_at: "2026-05-12T00:01:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "change-2".to_string(),
+                    role: MembershipRole::Authored,
+                    source_parent_ordinal: None,
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "change-2".to_string(),
+                )],
+                membership_ordinals: vec![("change-2".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "commit-3".to_string(),
+                parent_commit_ids: vec!["commit-2".to_string()],
+                derivable_change_id: "derived-change-3".to_string(),
+                author_account_ids: vec!["account-3".to_string()],
+                created_at: "2026-05-12T00:02:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "change-1".to_string(),
+                    role: MembershipRole::Adopted,
+                    source_parent_ordinal: Some(0),
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "change-1".to_string(),
+                )],
+                membership_ordinals: vec![("change-1".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        let segment = canonicalize_segment(segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-1").await.unwrap();
+            writer.stage_publish_commit("commit-2").await.unwrap();
+            writer
+                .stage_publish_commit("commit-3")
+                .await
+                .expect_err("publication must prove adopted change is the source winner")
+        };
+
+        assert!(
+            error
+                .message
+                .contains("adopted membership change 'change-1' is not the source parent"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_publish_commit_uses_first_parent_projection_for_source_parent_winner() {
+        let (context, storage) = changelog_test_context();
+        let mut segment = test_segment();
+        let mut source_change = segment.changes[0].clone();
+        source_change.id = "source-change".to_string();
+        source_change.authored_commit_id = Some("source-commit".to_string());
+        source_change.created_at = "2026-05-12T00:01:00Z".to_string();
+        segment.changes.push(source_change);
+        let mut target_change = segment.changes[0].clone();
+        target_change.id = "target-change".to_string();
+        target_change.authored_commit_id = Some("target-commit".to_string());
+        target_change.created_at = "2026-05-12T00:01:00Z".to_string();
+        segment.changes.push(target_change);
+        segment.directory.changes.push((
+            "source-change".to_string(),
+            location("segment-1", 70, 40, "source-change-checksum"),
+        ));
+        segment.directory.changes.push((
+            "target-change".to_string(),
+            location("segment-1", 110, 40, "target-change-checksum"),
+        ));
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "target-commit".to_string(),
+                parent_commit_ids: Vec::new(),
+                derivable_change_id: "derived-target".to_string(),
+                author_account_ids: vec!["account-target".to_string()],
+                created_at: "2026-05-12T00:01:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "target-change".to_string(),
+                    role: MembershipRole::Authored,
+                    source_parent_ordinal: None,
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "target-change".to_string(),
+                )],
+                membership_ordinals: vec![("target-change".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "source-commit".to_string(),
+                parent_commit_ids: Vec::new(),
+                derivable_change_id: "derived-source".to_string(),
+                author_account_ids: vec!["account-source".to_string()],
+                created_at: "2026-05-12T00:01:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "source-change".to_string(),
+                    role: MembershipRole::Authored,
+                    source_parent_ordinal: None,
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "source-change".to_string(),
+                )],
+                membership_ordinals: vec![("source-change".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "merge-parent".to_string(),
+                parent_commit_ids: vec!["target-commit".to_string(), "source-commit".to_string()],
+                derivable_change_id: "derived-merge-parent".to_string(),
+                author_account_ids: vec!["account-merge".to_string()],
+                created_at: "2026-05-12T00:02:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "target-change".to_string(),
+                    role: MembershipRole::Adopted,
+                    source_parent_ordinal: Some(0),
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "target-change".to_string(),
+                )],
+                membership_ordinals: vec![("target-change".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        segment.commits.push(SegmentCommit {
+            header: CommitHeader {
+                id: "adopting-commit".to_string(),
+                parent_commit_ids: vec!["merge-parent".to_string()],
+                derivable_change_id: "derived-adopting".to_string(),
+                author_account_ids: vec!["account-adopting".to_string()],
+                created_at: "2026-05-12T00:03:00Z".to_string(),
+                membership_count: 1,
+            },
+            body: CommitBody {
+                membership: vec![MembershipRecord {
+                    member_change_id: "source-change".to_string(),
+                    role: MembershipRole::Adopted,
+                    source_parent_ordinal: Some(0),
+                }],
+            },
+            directory: SegmentCommitDirectory {
+                state_row_identities: vec![(
+                    state_row_identity("message", "file-1", "entity-1"),
+                    "source-change".to_string(),
+                )],
+                membership_ordinals: vec![("source-change".to_string(), 0)],
+            },
+            checksum: String::new(),
+        });
+        let segment = canonicalize_segment(segment).unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        let error = {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-1").await.unwrap();
+            writer.stage_publish_commit("target-commit").await.unwrap();
+            writer.stage_publish_commit("source-commit").await.unwrap();
+            writer.stage_publish_commit("merge-parent").await.unwrap();
+            writer
+                .stage_publish_commit("adopting-commit")
+                .await
+                .expect_err("source parent winner must use first-parent projection")
+        };
+
+        assert!(
+            error
+                .message
+                .contains("adopted membership change 'source-change' is not the source parent"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

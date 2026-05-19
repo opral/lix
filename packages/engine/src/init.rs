@@ -1,9 +1,15 @@
-use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
+use crate::changelog::{
+    Change, ChangeLocator as ChangelogChangeLocator, ChangeRef as ChangelogChangeRef,
+    ChangelogContext, CommitBody, CommitHeader, MembershipRecord, MembershipRole, Segment,
+    SegmentChange, SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory, SegmentDirectory,
+    SegmentHeader, SegmentInlinePayload, StateRowIdentity,
+};
+use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
-use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::json_store::JsonRef;
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
@@ -23,7 +29,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Pure seed plan for initializing an engine repository.
 ///
-/// Tracked bootstrap facts go to the commit store. Moving refs such as
+/// Tracked bootstrap facts go to the changelog. Moving refs such as
 /// `lix_version_ref` are seeded as untracked local state so repository heads
 /// can advance without becoming commit members.
 pub(crate) struct InitSeedPlan {
@@ -169,11 +175,10 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 ///
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
-/// commit_store for tracked changes, and live_state for the serving projection
+/// changelog for tracked changes, and live_state for the serving projection
 /// plus untracked moving refs.
 pub(crate) async fn initialize<B>(
     storage: StorageContext<B>,
-    commit_store: &CommitStoreContext,
     tracked_state: &TrackedStateContext,
     untracked_state: &UntrackedStateContext,
 ) -> Result<InitReceipt, LixError>
@@ -188,42 +193,16 @@ where
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
-    let read = storage.begin_read(crate::storage::StorageReadOptions::default())?;
+    let mut read = storage.begin_read(crate::storage::StorageReadOptions::default())?;
     let mut writes = StorageWriteSet::new();
 
     let authored_changes = plan
         .changes
         .iter()
-        .map(seed_change_to_commit_store_change)
+        .map(seed_change_to_changelog_change)
         .collect::<Result<Vec<_>, _>>()?;
-    JsonStoreContext::new().writer().stage_batch(
-        &mut writes,
-        JsonWritePlacementRef::CommitPack {
-            commit_id: &plan.commit.id,
-            pack_id: 0,
-        },
-        plan.changes
-            .iter()
-            .map(|change| NormalizedJsonRef::new(change.snapshot_content.as_str())),
-    )?;
 
-    let staged_commit = {
-        let commit = CommitDraftRef {
-            id: &plan.commit.id,
-            change_id: &plan.commit.change_id,
-            parent_ids: &plan.commit.parent_ids,
-            author_account_ids: &plan.commit.author_account_ids,
-            created_at: &plan.commit.created_at,
-        };
-        let mut writer = commit_store.writer(&read, &mut writes);
-        writer
-            .stage_tracked_commit_draft(
-                commit,
-                authored_changes.iter().map(Change::as_ref).collect(),
-                Vec::new(),
-            )
-            .await?
-    };
+    let staged_commit = stage_init_changelog_commit(&mut read, &mut writes, &plan).await?;
 
     let untracked_rows = plan
         .untracked_rows
@@ -235,19 +214,24 @@ where
         untracked_state
             .writer(&mut writes)
             .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
-        let deltas = authored_changes
+        let changelog_changes = authored_changes
+            .iter()
+            .map(|change| changelog_change_ref_from_seed_change(change, &plan.commit.id))
+            .collect::<Vec<_>>();
+        let deltas = changelog_changes
             .iter()
             .zip(&staged_commit.authored_locators)
-            .map(|(change, locator)| TrackedStateDeltaRef {
-                change: change.as_ref(),
+            .zip(&authored_changes)
+            .map(|((change, locator), source)| TrackedStateDeltaRef {
+                change: *change,
                 locator: locator.as_ref(),
-                created_at: &change.created_at,
-                updated_at: &change.created_at,
+                created_at: &source.created_at,
+                updated_at: &source.created_at,
             })
             .collect::<Vec<_>>();
         let mut writer = tracked_state.writer(&read, &mut writes);
         writer
-            .stage_delta(&receipt.initial_commit_id, None, &deltas)
+            .stage_projection_root(&receipt.initial_commit_id, None, deltas)
             .await?;
     }
 
@@ -255,9 +239,10 @@ where
     Ok(receipt)
 }
 
-fn seed_change_to_commit_store_change(change: &InitSeedChange) -> Result<Change, LixError> {
+fn seed_change_to_changelog_change(change: &InitSeedChange) -> Result<Change, LixError> {
     Ok(Change {
         id: change.id.clone(),
+        authored_commit_id: None,
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
@@ -265,6 +250,151 @@ fn seed_change_to_commit_store_change(change: &InitSeedChange) -> Result<Change,
         metadata_ref: None,
         created_at: change.created_at.clone(),
     })
+}
+
+async fn stage_init_changelog_commit(
+    read: &mut (impl crate::storage::StorageRead + Send + Sync),
+    writes: &mut StorageWriteSet,
+    plan: &InitSeedPlan,
+) -> Result<InitStagedChangelogCommit, LixError> {
+    let membership = plan
+        .changes
+        .iter()
+        .map(|change| MembershipRecord {
+            member_change_id: change.id.clone(),
+            role: MembershipRole::Authored,
+            source_parent_ordinal: None,
+        })
+        .collect::<Vec<_>>();
+    let membership_ordinals = plan
+        .changes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, change)| (change.id.clone(), ordinal as u32))
+        .collect::<Vec<_>>();
+    let state_row_identities = plan
+        .changes
+        .iter()
+        .map(|change| {
+            Ok((
+                state_row_identity_from_seed_change(change)?,
+                change.id.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let changes = plan
+        .changes
+        .iter()
+        .map(|change| segment_change_from_seed_change(change, &plan.commit.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let segment = Segment {
+        header: SegmentHeader {
+            segment_id: format!("init-{}", plan.commit.id),
+            format_version: 0,
+            commit_count: 0,
+            change_count: 0,
+            byte_count: 0,
+            payload_count: 0,
+            checksum: String::new(),
+        },
+        directory: SegmentDirectory::default(),
+        commits: vec![SegmentCommit {
+            header: CommitHeader {
+                id: plan.commit.id.clone(),
+                parent_commit_ids: plan.commit.parent_ids.clone(),
+                derivable_change_id: plan.commit.change_id.clone(),
+                author_account_ids: plan.commit.author_account_ids.clone(),
+                created_at: plan.commit.created_at.clone(),
+                membership_count: 0,
+            },
+            body: CommitBody { membership },
+            directory: SegmentCommitDirectory {
+                state_row_identities,
+                membership_ordinals,
+            },
+            checksum: String::new(),
+        }],
+        changes,
+    };
+    let mut writer = ChangelogContext::new().writer(read, writes);
+    let report = writer.stage_segment(segment).await?;
+    writer.stage_publish_commit(&plan.commit.id).await?;
+    let change_locations = report
+        .change_locations
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let authored_locators = plan
+        .changes
+        .iter()
+        .map(|change| {
+            Ok(ChangelogChangeLocator {
+                change_id: change.id.clone(),
+                commit_id: plan.commit.id.clone(),
+                location: change_locations.get(&change.id).cloned().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "init changelog segment report is missing change '{}'",
+                            change.id
+                        ),
+                    )
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(InitStagedChangelogCommit { authored_locators })
+}
+
+struct InitStagedChangelogCommit {
+    authored_locators: Vec<ChangelogChangeLocator>,
+}
+
+fn segment_change_from_seed_change(
+    change: &InitSeedChange,
+    commit_id: &str,
+) -> Result<SegmentChange, LixError> {
+    let json_ref = JsonRef::for_content(change.snapshot_content.as_bytes());
+    Ok(SegmentChange {
+        id: change.id.clone(),
+        authored_commit_id: Some(commit_id.to_string()),
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        file_id: None,
+        snapshot_ref: Some(json_ref),
+        metadata_ref: None,
+        created_at: change.created_at.clone(),
+        inline_payloads: vec![SegmentInlinePayload {
+            json_ref,
+            bytes: change.snapshot_content.as_bytes().to_vec(),
+        }],
+        directory: SegmentChangeDirectory::default(),
+    })
+}
+
+fn state_row_identity_from_seed_change(
+    change: &InitSeedChange,
+) -> Result<StateRowIdentity, LixError> {
+    Ok(StateRowIdentity {
+        schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
+        file_id: FileId::new("__global__".to_string())?,
+        entity_id: EntityId::new(change.entity_id.as_json_array_text()?)?,
+    })
+}
+
+fn changelog_change_ref_from_seed_change<'a>(
+    change: &'a Change,
+    commit_id: &'a String,
+) -> ChangelogChangeRef<'a> {
+    ChangelogChangeRef {
+        id: &change.id,
+        authored_commit_id: Some(commit_id),
+        entity_id: &change.entity_id,
+        schema_key: &change.schema_key,
+        file_id: change.file_id.as_deref(),
+        snapshot_ref: change.snapshot_ref.as_ref(),
+        metadata_ref: change.metadata_ref.as_ref(),
+        created_at: &change.created_at,
+    }
 }
 
 fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedStateRow, LixError> {
@@ -483,51 +613,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_writes_initial_commit_through_commit_store() {
+    async fn initialize_writes_initial_commit_through_changelog() {
         let backend = InMemoryStorageBackend::new();
         let storage = StorageContext::new(backend);
-        let commit_store = CommitStoreContext::new();
         let tracked_state = TrackedStateContext::new();
         let untracked_state = UntrackedStateContext::new();
 
-        let receipt = initialize(
-            storage.clone(),
-            &commit_store,
-            &tracked_state,
-            &untracked_state,
-        )
-        .await
-        .expect("engine should initialize");
-        let read = storage
-            .begin_read(crate::storage::StorageReadOptions::default())
-            .expect("read should open");
-        let reader = commit_store.reader(read);
-        let commit = reader
-            .load_commit(&receipt.initial_commit_id)
+        let receipt = initialize(storage.clone(), &tracked_state, &untracked_state)
             .await
-            .expect("commit should load")
-            .expect("initial commit should exist");
-
-        assert_eq!(commit.id, receipt.initial_commit_id);
-        assert_eq!(commit.change_pack_count, 1);
-        assert_eq!(commit.membership_pack_count, 0);
-
-        let change_pack = reader
-            .load_change_pack(&commit.id, 0)
+            .expect("engine should initialize");
+        let mut reader = ChangelogContext::new().reader(
+            storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open"),
+        );
+        let commits = reader
+            .load_commits(crate::changelog::CommitLoadRequest {
+                commit_ids: &[receipt.initial_commit_id.clone()],
+                projection: crate::changelog::CommitProjection::Full,
+                visibility: crate::changelog::CommitVisibilityMode::RequireVisible,
+            })
             .await
-            .expect("change pack should load")
-            .expect("initial change pack should exist");
-        assert_eq!(change_pack.len(), seed_schema_definitions().len() + 3);
-        assert!(change_pack
+            .expect("commit should load");
+        let Some(crate::changelog::CommitLoadEntry::Full { header, body }) =
+            commits.entries.into_iter().next().flatten()
+        else {
+            panic!("initial commit should exist");
+        };
+
+        assert_eq!(header.id, receipt.initial_commit_id);
+        assert_eq!(body.membership.len(), seed_schema_definitions().len() + 3);
+        assert!(body
+            .membership
             .iter()
-            .all(|change| change.id != commit.change_id));
+            .all(|membership| membership.member_change_id != header.derivable_change_id));
 
-        let entries = reader
-            .load_change_index_entries(&[commit.change_id.clone(), "global".to_string()])
+        let changes = reader
+            .load_changes(crate::changelog::ChangeLoadRequest {
+                change_ids: &["global".to_string()],
+                projection: crate::changelog::ChangeProjection::PhysicalLocation,
+                visibility:
+                    crate::changelog::ChangeVisibilityMode::RequireReachableFromVisibleCommit,
+            })
             .await
             .expect("change index should load");
-        assert!(entries[0].is_some());
-        assert!(entries[1].is_some());
+        assert!(matches!(
+            changes.entries.as_slice(),
+            [Some(crate::changelog::ChangeLoadEntry::PhysicalLocation(_))]
+        ));
+        let missing_derivable = reader
+            .load_changes(crate::changelog::ChangeLoadRequest {
+                change_ids: &[header.derivable_change_id],
+                projection: crate::changelog::ChangeProjection::PhysicalLocation,
+                visibility: crate::changelog::ChangeVisibilityMode::PhysicalOnly,
+            })
+            .await
+            .expect("derivable change lookup should load");
+        assert!(matches!(missing_derivable.entries.as_slice(), [None]));
     }
 
     fn snapshot(change: &InitSeedChange) -> JsonValue {

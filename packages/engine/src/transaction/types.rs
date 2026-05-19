@@ -189,6 +189,7 @@ pub(crate) struct TransactionFileData {
 pub(crate) struct TransactionAdoptedChange {
     pub(crate) version_id: String,
     pub(crate) change_id: String,
+    pub(crate) source_parent_commit_id: String,
     pub(crate) projected_row: MaterializedTrackedStateRow,
 }
 
@@ -313,6 +314,8 @@ pub(crate) struct PreparedAdoptedStateRow {
     pub(crate) updated_at: String,
     pub(crate) global: bool,
     pub(crate) change_id: String,
+    pub(crate) source_commit_id: String,
+    pub(crate) source_parent_commit_id: String,
     pub(crate) commit_id: String,
     pub(crate) version_id: String,
 }

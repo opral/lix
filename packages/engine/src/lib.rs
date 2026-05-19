@@ -5,8 +5,6 @@ pub(crate) mod cel;
 #[allow(dead_code, unused_imports)]
 pub mod changelog;
 pub(crate) mod commit_graph;
-#[allow(dead_code, unused_imports)]
-pub(crate) mod commit_store;
 mod common;
 pub(crate) mod domain;
 pub mod engine;
