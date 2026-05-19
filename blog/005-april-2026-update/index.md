@@ -1,5 +1,6 @@
 ---
 date: "2026-05-11"
+authors: ["samuelstroschein"]
 og:description: "The new DataFusion path runs the core Lix MVP flow. April did not hit the 10k inserts target, but it clarified why Lix needs control from incoming query down to storage."
 og:image: "./cover.svg"
 og:image:alt: "Lix April 2026 Update cover showing DataFusion planning queries, Lix owning the storage abstraction, and SQLite, RocksDB, S3/R2, and OPFS as backends"

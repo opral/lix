@@ -33,7 +33,6 @@ await lix.execute(
     JSON.stringify({
       $schema: "https://json-schema.org/draft/2020-12/schema",
       "x-lix-key": "task",
-      "x-lix-version": "1",
       "x-lix-primary-key": ["/id"],
       type: "object",
       required: ["id", "title", "done"],
@@ -68,7 +67,29 @@ const row = result.rows[0]!;
 console.log(row.value("title").asText(), row.value("done").asBoolean());
 ```
 
-`execute()` returns `{ columns, rows, rowsAffected, notices }`. Use `row.value(name).asText() | .asBoolean() | .asInteger() | .asJson()` for typed access, or `row.toObject()` for a plain JS object. See [API Reference](./api-reference.md).
+`execute()` returns `{ columns, rows, rowsAffected, notices }`.
+
+## Read result values
+
+Each row is a `Row`. Use `row.value(name)` for a typed `Value`, or `row.get(name)` / `row.toObject()` for plain JavaScript values.
+
+| Accessor | Use for |
+| --- | --- |
+| `asText()` | text columns |
+| `asBoolean()` | boolean columns |
+| `asInteger()` | integer columns |
+| `asReal()` | decimal columns |
+| `asJson()` | JSON columns such as `snapshot_content` and `entity_id` |
+| `asBlob()` | binary columns such as `lix_file.data` |
+
+There is no `asBytes()` accessor. Use `asBlob()` for bytes:
+
+```ts
+const file = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
+  "/orders.xlsx",
+]);
+const bytes = file.rows[0]!.value("data").asBlob();
+```
 
 ## Isolate a change in a version
 

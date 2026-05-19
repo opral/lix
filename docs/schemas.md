@@ -6,7 +6,7 @@ description: Define the entity types Lix tracks for you. The x-lix-* JSON Schema
 
 Schemas describe the entities Lix tracks. You declare each entity type as a JSON Schema with a few `x-lix-*` extensions, and Lix exposes a SQL table for it.
 
-Schemas are also the foundation file-format plugins build on: a plugin parses a file format (XLSX, DOCX, CAD, …) into entities described by a schema. Today you register schemas yourself; once the plugin API lands, plugin authors register theirs.
+Schemas are also the foundation file-format plugins build on: a plugin parses a file format (XLSX, DOCX, CAD, ...) into entities described by a schema. Today you register schemas yourself; once the plugin API lands, plugin authors register theirs.
 
 > [!NOTE]
 > **For agents.** Lix is self-documenting. When operating against a Lix repository, query `lix_registered_schema` to discover every schema currently in effect (including Lix's own internal schemas `lix_*`) rather than relying on a snapshot of these docs. The schemas you read back are authoritative and current.
@@ -98,15 +98,15 @@ Lix is a version-controlled repository. Every change is immutable. Once a row ha
 This makes retroactive schema migrations impossible. There is no point in time at which Lix could "convert all existing rows from the old shape to the new one"; the old rows are part of history, and history doesn't change.
 
 ```
-       schema grows forward (additive only) ──────────────►
+       schema grows forward (additive only) -------------->
        v1: {id, body}              v2: {id, body, tag?}
 
-time   ──●──────●──────●─────────●──────●──────────────►
+time   --o------o------o---------o------o-------------->
          c1     c2     c3        c4     c5
-         └─ written under v1 ────┘└─ under v2 ─┘
-                    │
-                    └─ immutable; reading c1 must still
-                       succeed after the v1 → v2 amendment.
+         +-- written under v1 ---+ +-- under v2 --+
+                    |
+                    +-- immutable; reading c1 must still
+                       succeed after the v1 -> v2 amendment.
 ```
 
 The only safe direction of evolution is therefore additive: a schema can grow in ways that leave existing rows valid, but it cannot tighten, rename, or remove anything that already exists. This is what the rules below enforce.
@@ -127,7 +127,7 @@ If a schema author truly needs a breaking change, they mint a new `x-lix-key` (e
 - **Constraints (`x-lix-primary-key`, `x-lix-unique`, `x-lix-foreign-keys`).** Frozen. You can reorder list elements cosmetically (Lix normalizes the comparison), but you can't add, remove, or modify a constraint. Primary-key column order is semantic and cannot be reordered.
 - **Top-level keywords** like `type`, `examples`, `patternProperties`. Frozen.
 - **Nested object schemas.** A property whose `type` is `object` is frozen as a unit: you cannot add subproperties to it. Recursive schema evolution is intentionally a later, explicit feature.
-- **`x-lix-version`.** Rejected if present on either side.
+- **`x-lix-version`.** Rejected if present on either side. The `schema_version` columns you may see on state/history SQL surfaces are engine metadata, not a schema authoring field.
 
 ### What to do when you really need a breaking change
 
@@ -143,7 +143,7 @@ Mint a new `x-lix-key`. Ship `acme_section_v2` as a separate schema, write migra
 | `xlsx_cell`, `xlsx_sheet`    | `cell`, `sheet`   |
 | `figma_layer`, `figma_frame` | `layer`, `frame`  |
 
-Why it matters: a single Lix can hold many files and many schemas at once. App-level entities, file-format plugins (XLSX, DOCX, CAD, …), and Lix's own internal schemas all share the `lix_registered_schema` namespace. An unprefixed `task` collides the moment a second source registers the same name. The `lix_*` prefix is reserved for Lix-internal schemas; don't use it for your own.
+Why it matters: a single Lix can hold many files and many schemas at once. App-level entities, file-format plugins (XLSX, DOCX, CAD, ...), and Lix's own internal schemas all share the `lix_registered_schema` namespace. An unprefixed `task` collides the moment a second source registers the same name. The `lix_*` prefix is reserved for Lix-internal schemas; don't use it for your own.
 
 Treat `x-lix-key` like a package name: lowercase, stable, namespaced. Once data is written, the key is permanent (see the amendment rules above).
 

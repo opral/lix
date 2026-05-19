@@ -16,6 +16,7 @@ import {
   resolveOgImage,
   splitTitleFromHtml,
 } from "../../lib/seo";
+import { normalizeMarkdownHtml } from "../../lib/markdown-html";
 
 const rfcMarkdownFiles = import.meta.glob<string>(
   "../../../../../rfcs/**/index.md",
@@ -97,7 +98,9 @@ async function loadRfc(slug: string) {
     assetBaseUrl: `/rfc/${slug}/`,
   });
 
-  const rendered = splitTitleFromHtml(rewriteRfcLinks(parsed.html));
+  const rendered = splitTitleFromHtml(
+    normalizeMarkdownHtml(rewriteRfcLinks(parsed.html)),
+  );
   const title =
     getMarkdownTitle({
       rawMarkdown,

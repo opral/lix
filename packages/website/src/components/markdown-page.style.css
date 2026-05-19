@@ -615,11 +615,15 @@
 }
 
 /* Tables */
-.markdown-wc-body table {
-  display: block;
-  border-collapse: collapse;
+.markdown-wc-body .table-wrapper {
   margin: 20px 0;
   overflow-x: auto;
+}
+
+.markdown-wc-body table {
+  display: table;
+  border-collapse: collapse;
+  min-width: 100%;
 }
 
 .markdown-wc-body tr {
@@ -704,6 +708,19 @@
 .markdown-wc-body p > img:only-child {
   display: block;
   margin: 16px auto;
+}
+
+.markdown-wc-body p > img:not(:only-child) {
+  display: inline-block;
+  vertical-align: text-bottom;
+  margin: 0 0.15em;
+  border-radius: 0;
+}
+
+.markdown-wc-body p[align="center"] > img[src*="assets/logo.svg"]:only-child {
+  border-radius: 0;
+  box-sizing: content-box;
+  padding: 4px;
 }
 
 /* Images inside links - Always inline (badges, logos, icons) */

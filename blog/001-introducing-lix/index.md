@@ -1,5 +1,6 @@
 ---
 date: "2026-01-20"
+authors: ["samuelstroschein"]
 og:description: "Lix is a version control system you import as a library. It records semantic changes to enable diffs, reviews, rollback, and querying of edits."
 ---
 
