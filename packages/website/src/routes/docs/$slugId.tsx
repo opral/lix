@@ -25,6 +25,7 @@ import {
   getMarkdownTitle,
   resolveOgImage,
 } from "../../lib/seo";
+import { normalizeMarkdownHtml } from "../../lib/markdown-html";
 import { parse } from "@opral/markdown-wc";
 import markdownPageCss from "../../components/markdown-page.style.css?url";
 
@@ -241,7 +242,7 @@ export const Route = createFileRoute("/docs/$slugId")({
       resolveHref: (href) =>
         resolveDocsMarkdownHref(href, doc, docsByRelativePath),
     });
-    const html = parsedMarkdown.html;
+    const html = normalizeMarkdownHtml(parsedMarkdown.html);
     const pageToc = buildPageToc(html);
 
     return {

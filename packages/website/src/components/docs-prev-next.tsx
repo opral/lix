@@ -7,7 +7,6 @@ type DocRoute = {
 
 const navTitleOverrides: Record<string, string> = {
   "next-js": "Next.js",
-  "api-reference": "API Reference",
 };
 
 function formatNavTitle(input: string) {

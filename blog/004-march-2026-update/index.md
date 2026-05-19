@@ -1,5 +1,6 @@
 ---
 date: "2026-04-03"
+authors: ["samuelstroschein"]
 og:description: "500 real commits replayed with no corruption bugs. Without the semantic layer, Lix is ~8x faster than Git, but semantic writes still bottleneck on write amplification."
 og:image: "./cover.svg"
 og:image:alt: "Lix March 2026 Update: 500 commits with zero corruption, blob commit in 5ms, semantic writes need fixing"

@@ -9,10 +9,10 @@ import { PrevNextNav } from "../../components/prev-next-nav";
 import { resolveOgImageUrl } from "../../blog/og-image";
 import {
   buildCanonicalUrl,
-  buildWebPageJsonLd,
   resolveOgImage,
   splitTitleFromHtml,
 } from "../../lib/seo";
+import { normalizeMarkdownHtml } from "../../lib/markdown-html";
 
 const blogMarkdownFiles = import.meta.glob<string>(
   "../../../../../blog/**/*.md",
@@ -104,10 +104,6 @@ async function loadBlogPost(slug: string) {
     ? { slug: nextEntry.slug, title: nextEntry.title }
     : null;
 
-  const authors = entry.authors
-    ?.map((authorId) => authorsMap[authorId])
-    .filter(Boolean);
-
   const relativePath = entry.path.startsWith("./")
     ? entry.path.slice(2)
     : entry.path;
@@ -117,7 +113,19 @@ async function loadBlogPost(slug: string) {
   const parsed = await parse(rawMarkdown, {
     assetBaseUrl: `/blog/${folderName}/`,
   });
-  const rendered = splitTitleFromHtml(parsed.html);
+  const rawFrontmatterAuthors = parsed.frontmatter?.authors;
+  const frontmatterAuthors = Array.isArray(rawFrontmatterAuthors)
+    ? rawFrontmatterAuthors.filter(
+        (authorId): authorId is string => typeof authorId === "string",
+      )
+    : undefined;
+  const authorIds = frontmatterAuthors?.length
+    ? frontmatterAuthors
+    : entry.authors;
+  const authors = authorIds
+    ?.map((authorId) => authorsMap[authorId])
+    .filter(Boolean);
+  const rendered = splitTitleFromHtml(normalizeMarkdownHtml(parsed.html));
   const title =
     getBlogTitle({
       rawMarkdown,
@@ -130,6 +138,11 @@ async function loadBlogPost(slug: string) {
 
   // Get date from frontmatter
   const date = parsed.frontmatter?.date as string | undefined;
+  const dateModified =
+    (parsed.frontmatter?.dateModified as string | undefined) ??
+    (parsed.frontmatter?.modified as string | undefined) ??
+    (parsed.frontmatter?.updated as string | undefined) ??
+    date;
 
   const ogImageOverrideRaw =
     typeof parsed.frontmatter?.["og:image"] === "string"
@@ -152,6 +165,7 @@ async function loadBlogPost(slug: string) {
       title,
       description,
       date,
+      dateModified,
       authors,
       readingTime,
       ogImage: ogImageOverride,
@@ -175,6 +189,7 @@ export function buildBlogPostHead(loaderData?: BlogPostLoaderData) {
   const ogImageUrl = loaderData?.post.ogImage ?? defaultOg.url;
   const ogImageAlt =
     loaderData?.post.ogImageAlt ?? (title ? `${title} cover` : "Lix blog post");
+  const dateModified = loaderData?.post.dateModified ?? loaderData?.post.date;
   const canonicalUrl = slug
     ? buildCanonicalUrl(`/blog/${slug}`)
     : buildCanonicalUrl("/blog");
@@ -246,14 +261,6 @@ export function buildBlogPostHead(loaderData?: BlogPostLoaderData) {
     });
   }
 
-  const pageTitle = title ? `${title} | Lix Blog` : "Lix Blog";
-  const jsonLd = buildWebPageJsonLd({
-    title: pageTitle,
-    description,
-    canonicalUrl,
-    image: ogImageUrl,
-  });
-
   return {
     meta,
     links,
@@ -266,11 +273,15 @@ export function buildBlogPostHead(loaderData?: BlogPostLoaderData) {
               "@type": "BlogPosting",
               headline: title ?? slug,
               description,
-              url: canonicalUrl,
+              mainEntityOfPage: {
+                "@type": "WebPage",
+                "@id": canonicalUrl,
+              },
               image: ogImageUrl,
               ...(loaderData?.post.date
                 ? { datePublished: loaderData.post.date }
                 : {}),
+              ...(dateModified ? { dateModified } : {}),
               ...(loaderData?.post.authors
                 ? {
                     author: loaderData.post.authors.map((author) => ({
@@ -287,30 +298,17 @@ export function buildBlogPostHead(loaderData?: BlogPostLoaderData) {
                     })),
                   }
                 : {}),
+              publisher: {
+                "@type": "Organization",
+                name: "Lix",
+                url: buildCanonicalUrl("/"),
+                logo: {
+                  "@type": "ImageObject",
+                  url: buildCanonicalUrl("/opengraph/lix.png"),
+                },
+              },
             }),
           },
-          {
-            type: "application/ld+json",
-            children: JSON.stringify(jsonLd),
-          },
-          ...(loaderData?.post.authors
-            ? loaderData.post.authors.map((author) => ({
-                type: "application/ld+json",
-                children: JSON.stringify({
-                  "@context": "https://schema.org",
-                  "@type": "Person",
-                  name: author.name,
-                  ...(author.avatar ? { image: author.avatar } : {}),
-                  ...(author.twitter || author.github
-                    ? {
-                        sameAs: [author.twitter, author.github].filter(
-                          (value): value is string => Boolean(value),
-                        ),
-                      }
-                    : {}),
-                }),
-              }))
-            : []),
         ]
       : [],
   };

@@ -1,5 +1,6 @@
 ---
 date: "2026-03-04"
+authors: ["samuelstroschein"]
 og:description: "The Rust rewrite is complete. 33x faster file writes, lix was trending on HackerNews, and what's next in March."
 og:image: "./cover.png"
 og:image:alt: "February 2026 update cover showing the Lix Rust rewrite milestone"
