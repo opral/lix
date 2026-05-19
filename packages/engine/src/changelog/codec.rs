@@ -94,6 +94,7 @@ pub(crate) fn decode_segment(bytes: &[u8]) -> Result<Segment, LixError> {
         header.commit_count as usize,
         header.change_count as usize,
     )?;
+    let mut object_slice_cursor = cursor.clone();
     let commit_len = cursor.read_len("commits")?;
     cursor.ensure_len_fits_remaining(commit_len, "commits")?;
     cursor.ensure_counted_records_fit_remaining(commit_len, MIN_COMMIT_OBJECT_BYTES, "commits")?;
@@ -164,12 +165,39 @@ pub(crate) fn decode_segment(bytes: &[u8]) -> Result<Segment, LixError> {
             ))
         }),
     )?;
-    let (commit_slices, change_slices) = read_segment_object_slices_view(bytes)?;
+    let header_view = SegmentHeaderView {
+        segment_id: &header.segment_id,
+        format_version: header.format_version,
+        commit_count: header.commit_count,
+        change_count: header.change_count,
+        byte_count: header.byte_count,
+        payload_count: header.payload_count,
+        checksum: &header.checksum,
+    };
+    let object_slices =
+        read_segment_object_slices_for_header_fast(&mut object_slice_cursor, &header_view)?;
+    let commit_slices = object_slices.commit_slices();
+    let change_slices = object_slices.change_slices();
     validate_segment_directory_object_slices_owned(
         &header.segment_id,
         &directory,
         &commit_slices,
         &change_slices,
+    )?;
+    let directory_change_refs = directory
+        .changes
+        .iter()
+        .map(|(id, location)| SegmentDirectoryEntryRef {
+            id,
+            location: location.as_ref(),
+        })
+        .collect::<Vec<_>>();
+    validate_segment_view_checksum(
+        bytes,
+        &header_view,
+        &directory_change_refs,
+        &object_slices.commits,
+        &object_slices.changes,
     )?;
     let segment = Segment {
         header,
@@ -680,10 +708,14 @@ fn read_segment_header_and_directory_view(
         validate_directory_locations_are_in_bounds(
             header.segment_id,
             bytes.len() as u64,
-            directory_commits
-                .iter()
-                .chain(directory_changes.iter())
-                .copied(),
+            "commit",
+            directory_commits.iter().copied(),
+        )?;
+        validate_directory_locations_are_in_bounds(
+            header.segment_id,
+            bytes.len() as u64,
+            "change",
+            directory_changes.iter().copied(),
         )?;
     }
     Ok(SegmentDirectoryViewRead {
@@ -719,6 +751,7 @@ fn segment_view_from_parts<'a>(
 fn validate_directory_locations_are_in_bounds<'a>(
     segment_id: &str,
     byte_count: u64,
+    kind: &str,
     entries: impl Iterator<Item = SegmentDirectoryEntryRef<'a>>,
 ) -> Result<(), LixError> {
     let mut seen = HashSet::new();
@@ -732,7 +765,7 @@ fn validate_directory_locations_are_in_bounds<'a>(
         }
         if !seen.insert(entry.id) {
             return Err(LixError::unknown(format!(
-                "changelog segment '{segment_id}' contains duplicate directory locator for '{}'",
+                "changelog segment '{segment_id}' contains duplicate {kind} directory locator for '{}'",
                 entry.id
             )));
         }
@@ -912,27 +945,6 @@ fn validate_segment_header_object_counts(
         payload_count,
         "inline payloads",
     )
-}
-
-fn validate_change_payload_directory(
-    change_id: &str,
-    inline_payloads: &[SegmentInlinePayload],
-    directory: &SegmentChangeDirectory,
-) -> Result<(), LixError> {
-    validate_count_matches_usize(
-        "payload_count",
-        inline_payloads.len() as u32,
-        directory.payloads.len(),
-        "change directory payloads",
-    )?;
-    let inline_payloads = inline_payloads
-        .iter()
-        .map(|payload| PayloadDescriptor {
-            json_ref: payload.json_ref.clone(),
-            len: payload.bytes.len() as u64,
-        })
-        .collect::<Vec<_>>();
-    validate_payload_descriptors_against_directory(change_id, &inline_payloads, directory)
 }
 
 fn validate_payload_descriptors_against_directory(
@@ -2132,20 +2144,6 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
-    fn read_commit_header_fast(&mut self) -> Result<CommitHeaderView<'a>, LixError> {
-        let id = self.read_string_ref_fast()?;
-        let parent_count = self.read_strings_fast_owned()?.len();
-        self.skip_string_fast()?;
-        self.read_strings_fast_owned()?;
-        self.skip_string_fast()?;
-        let membership_count = self.read_u32_fast()?;
-        Ok(CommitHeaderView {
-            id,
-            parent_count,
-            membership_count,
-        })
-    }
-
     fn read_commit_body(
         &mut self,
         field: &str,
@@ -3254,12 +3252,6 @@ struct SegmentHeaderView<'a> {
     checksum: &'a str,
 }
 
-struct CommitHeaderView<'a> {
-    id: &'a str,
-    parent_count: usize,
-    membership_count: u32,
-}
-
 fn changelog_codec_not_implemented(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
@@ -3285,6 +3277,25 @@ mod tests {
         assert_eq!(view.directory_commits[0].id, "commit-1");
         assert_eq!(view.directory_changes[0].id, "change-1");
         assert!(!view.object_bytes.is_empty());
+    }
+
+    #[test]
+    fn directory_view_allows_same_commit_and_change_id() {
+        let mut segment = sample_segment();
+        segment.changes[0].id = "commit-1".to_string();
+        segment.changes[0].authored_commit_id = Some("commit-1".to_string());
+        segment.commits[0].body.membership[0].member_change_id = "commit-1".to_string();
+        segment.commits[0].directory.state_row_identities[0].1 = "commit-1".to_string();
+        segment.commits[0].directory.membership_ordinals[0].0 = "commit-1".to_string();
+        segment.directory.changes[0].0 = "commit-1".to_string();
+        apply_sample_encoded_locations(&mut segment);
+
+        let encoded = encode_segment(&segment).unwrap();
+        let view = view_segment_directory(&encoded)
+            .expect("commit and change ids should be separate directory namespaces");
+
+        assert_eq!(view.directory_commits[0].id, "commit-1");
+        assert_eq!(view.directory_changes[0].id, "commit-1");
     }
 
     #[test]
@@ -3578,7 +3589,7 @@ mod tests {
             view_segment_directory(&bytes).expect_err("duplicate directory id should reject");
 
         assert!(
-            error.message.contains("duplicate directory locator"),
+            error.message.contains("duplicate change directory locator"),
             "unexpected error: {error}"
         );
     }
@@ -3775,8 +3786,8 @@ mod tests {
     }
 
     #[test]
-    fn segment_object_slices_rejects_inline_payloads_exceeding_header_payload_count_before_scanning(
-    ) {
+    fn segment_object_slices_rejects_inline_payloads_exceeding_header_payload_count_before_scanning()
+     {
         let mut segment = sample_segment();
         segment.header.payload_count = 0;
         let bytes = encode_segment(&segment).unwrap();
