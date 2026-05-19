@@ -274,10 +274,14 @@ fn load_values(
         .value
         .into_iter()
         .map(|value| match value {
-            Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
-            Some(StorageProjectedValue::KeyOnly) | None => None,
+            Some(StorageProjectedValue::FullValue(bytes)) => Ok(Some(bytes.to_vec())),
+            Some(StorageProjectedValue::KeyOnly) => Err(LixError::unknown(format!(
+                "json_store read over namespace '{}' requested full value but storage returned key-only entry",
+                space.name
+            ))),
+            None => Ok(None),
         })
-        .collect())
+        .collect::<Result<Vec<_>, LixError>>()?)
 }
 
 fn encode_stored_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
@@ -374,10 +378,83 @@ fn decode_json_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{
+        BackendError, BackendRead, BufferedRangeScan, GetOptions, Key, KeyRange, PointVisitor,
+        ProjectedValueRef, ScanOptions,
+    };
     use crate::storage::StorageContext;
     use crate::storage::{
-        InMemoryStorageBackend, StorageKey, StorageReadOptions, StorageValue, StorageWriteOptions,
+        InMemoryStorageBackend, StorageKey, StorageReadOptions, StorageReadScope, StorageValue,
+        StorageWriteOptions,
     };
+
+    struct KeyOnlyPointRead;
+
+    impl BackendRead for KeyOnlyPointRead {
+        type RangeScan<'cursor> = BufferedRangeScan;
+
+        fn visit_keys<V>(
+            &self,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+            visitor: &mut V,
+        ) -> Result<(), BackendError>
+        where
+            V: PointVisitor + ?Sized,
+        {
+            for (index, key) in keys.iter().enumerate() {
+                visitor.visit(index, key, Some(ProjectedValueRef::KeyOnly))?;
+            }
+            Ok(())
+        }
+
+        fn with_range_scan<T, F>(
+            &self,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+            _f: F,
+        ) -> Result<T, BackendError>
+        where
+            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        {
+            unreachable!("json_store point-read test does not scan")
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_load_rejects_key_only_point_read() {
+        let read = StorageReadScope::new(KeyOnlyPointRead);
+        let json_ref = JsonRef::for_content(br#"{"value":"json"}"#);
+
+        let error = load_json_bytes_direct(&read, &json_ref)
+            .await
+            .expect_err("key-only JSON point read must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_load_rejects_key_only_point_read() {
+        let read = StorageReadScope::new(KeyOnlyPointRead);
+        let json_ref = JsonRef::for_content(br#"{"value":"json"}"#);
+
+        let error =
+            load_json_bytes_many_in_scope(&read, &[json_ref], JsonReadScopeRef::OutOfBand)
+                .await
+                .expect_err("key-only JSON batch read must be corruption");
+
+        assert!(
+            error
+                .message
+                .contains("requested full value but storage returned key-only entry"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn json_roundtrips_raw_payload() {
