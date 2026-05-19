@@ -1,13 +1,13 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::LixError;
 use crate::changelog::{ChangeLocator, SegmentObjectLocation};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
-    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TRACKED_STATE_HASH_BYTES,
+    TRACKED_STATE_HASH_BYTES, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
+    TrackedStateKeyRef,
 };
-use crate::LixError;
 
 const NODE_VERSION: u8 = 2;
 const VALUE_VERSION: u8 = 8;
@@ -211,7 +211,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("tracked-state tree key has invalid file_id presence byte {other}"),
-            ))
+            ));
         }
     };
     let entity_id = read_entity_identity(bytes, &mut cursor)?;
@@ -503,13 +503,14 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixErr
                     subtree_count,
                 });
             }
+            validate_internal_children(&children)?;
             DecodedNodeRef::Internal(DecodedInternalNode { children })
         }
         other => {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("unknown tracked-state tree node kind {other}"),
-            ))
+            ));
         }
     };
     if cursor != bytes.len() {
@@ -565,11 +566,90 @@ fn decode_leaf_node_ref_after_count<'a>(
     }
     let payload_start = *cursor;
     *cursor = bytes.len();
+    validate_leaf_entry_order(bytes, payload_start, &offsets)?;
     Ok(DecodedLeafNodeRef {
         bytes,
         payload_start,
         offsets,
     })
+}
+
+fn validate_leaf_entry_order(
+    bytes: &[u8],
+    payload_start: usize,
+    offsets: &[usize],
+) -> Result<(), LixError> {
+    let mut previous_key: Option<&[u8]> = None;
+    for index in 0..offsets.len().saturating_sub(1) {
+        let start = payload_start + offsets[index];
+        let end = payload_start + offsets[index + 1];
+        let record = bytes.get(start..end).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf offset points outside node payload",
+            )
+        })?;
+        let mut cursor = 0usize;
+        let key = read_sized_slice(record, &mut cursor, "leaf key")?;
+        let _value = read_sized_slice(record, &mut cursor, "leaf value")?;
+        if cursor != record.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf entry decode found trailing bytes",
+            ));
+        }
+        if let Some(previous_key) = previous_key {
+            if previous_key >= key {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state leaf keys must be strictly increasing",
+                ));
+            }
+        }
+        previous_key = Some(key);
+    }
+    Ok(())
+}
+
+fn validate_internal_children(children: &[ChildSummary]) -> Result<(), LixError> {
+    if children.is_empty() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state internal node must contain at least one child",
+        ));
+    }
+
+    let mut previous_last_key: Option<&[u8]> = None;
+    for child in children {
+        if child.first_key.is_empty() || child.last_key.is_empty() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal child range keys must be non-empty",
+            ));
+        }
+        if child.first_key > child.last_key {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal child first_key must be <= last_key",
+            ));
+        }
+        if child.subtree_count == 0 {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state internal child subtree_count must be non-zero",
+            ));
+        }
+        if let Some(previous_last_key) = previous_last_key {
+            if previous_last_key >= child.first_key.as_slice() {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state internal child ranges must be strictly increasing",
+                ));
+            }
+        }
+        previous_last_key = Some(child.last_key.as_slice());
+    }
+    Ok(())
 }
 
 fn ensure_counted_records_fit_remaining(
@@ -692,7 +772,7 @@ fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdenti
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("tracked-state tree key has invalid entity identity part tag {other}"),
-                ))
+                ));
             }
         }
     }
@@ -755,7 +835,7 @@ fn read_timestamp_pair(bytes: &[u8], cursor: &mut usize) -> Result<(String, Stri
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("tracked-state timestamp pair has invalid updated_at tag {other}"),
-            ))
+            ));
         }
     };
     Ok((created_at, updated_at))
@@ -993,9 +1073,11 @@ mod tests {
         encoded[entity_tag_offset] = 2;
 
         let error = decode_key(&encoded).expect_err("non-string identity tag should reject");
-        assert!(error
-            .to_string()
-            .contains("invalid entity identity part tag 2"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid entity identity part tag 2")
+        );
     }
 
     #[test]
@@ -1173,25 +1255,68 @@ mod tests {
 
         let mut non_zero_first = encoded.clone();
         non_zero_first[6..10].copy_from_slice(&1u32.to_be_bytes());
-        assert!(decode_node_ref(&non_zero_first)
-            .expect_err("non-zero first offset should reject")
-            .to_string()
-            .contains("offset table must start at zero"));
+        assert!(
+            decode_node_ref(&non_zero_first)
+                .expect_err("non-zero first offset should reject")
+                .to_string()
+                .contains("offset table must start at zero")
+        );
 
         let mut non_monotonic = encoded.clone();
         non_monotonic[10..14].copy_from_slice(&100u32.to_be_bytes());
-        assert!(decode_node_ref(&non_monotonic)
-            .expect_err("non-monotonic offsets should reject")
-            .to_string()
-            .contains("offsets must be monotonic"));
+        assert!(
+            decode_node_ref(&non_monotonic)
+                .expect_err("non-monotonic offsets should reject")
+                .to_string()
+                .contains("offsets must be monotonic")
+        );
 
         let mut short_coverage = encoded;
         let payload_len = short_coverage.len() - 18;
         short_coverage[14..18].copy_from_slice(&((payload_len - 1) as u32).to_be_bytes());
-        assert!(decode_node_ref(&short_coverage)
-            .expect_err("short offset coverage should reject")
-            .to_string()
-            .contains("offset table does not cover full payload"));
+        assert!(
+            decode_node_ref(&short_coverage)
+                .expect_err("short offset coverage should reject")
+                .to_string()
+                .contains("offset table does not cover full payload")
+        );
+    }
+
+    #[test]
+    fn leaf_node_codec_rejects_unsorted_or_duplicate_keys() {
+        let unsorted = encode_leaf_node(&[
+            EncodedLeafEntry {
+                key: b"bravo".to_vec(),
+                value: b"two".to_vec(),
+            },
+            EncodedLeafEntry {
+                key: b"alpha".to_vec(),
+                value: b"one".to_vec(),
+            },
+        ]);
+        assert!(
+            decode_node_ref(&unsorted)
+                .expect_err("unsorted leaf keys should reject")
+                .to_string()
+                .contains("leaf keys must be strictly increasing")
+        );
+
+        let duplicate = encode_leaf_node(&[
+            EncodedLeafEntry {
+                key: b"alpha".to_vec(),
+                value: b"one".to_vec(),
+            },
+            EncodedLeafEntry {
+                key: b"alpha".to_vec(),
+                value: b"two".to_vec(),
+            },
+        ]);
+        assert!(
+            decode_node_ref(&duplicate)
+                .expect_err("duplicate leaf keys should reject")
+                .to_string()
+                .contains("leaf keys must be strictly increasing")
+        );
     }
 
     #[test]
@@ -1201,9 +1326,11 @@ mod tests {
 
         let error = decode_node_ref(&encoded).expect_err("impossible leaf count should reject");
 
-        assert!(error
-            .to_string()
-            .contains("field 'leaf offsets' exceeds remaining node bytes"));
+        assert!(
+            error
+                .to_string()
+                .contains("field 'leaf offsets' exceeds remaining node bytes")
+        );
     }
 
     #[test]
@@ -1213,9 +1340,79 @@ mod tests {
 
         let error = decode_node_ref(&encoded).expect_err("impossible internal count should reject");
 
-        assert!(error
-            .to_string()
-            .contains("field 'internal children' exceeds remaining node bytes"));
+        assert!(
+            error
+                .to_string()
+                .contains("field 'internal children' exceeds remaining node bytes")
+        );
+    }
+
+    #[test]
+    fn internal_node_codec_rejects_invalid_child_ranges() {
+        let child = |first_key: &[u8], last_key: &[u8], subtree_count: u64| ChildSummary {
+            first_key: first_key.to_vec(),
+            last_key: last_key.to_vec(),
+            child_hash: [7; TRACKED_STATE_HASH_BYTES],
+            subtree_count,
+        };
+
+        let empty = encode_internal_node(&[]);
+        assert!(
+            decode_node_ref(&empty)
+                .expect_err("empty internal node should reject")
+                .to_string()
+                .contains("internal node must contain at least one child")
+        );
+
+        let reversed_range = encode_internal_node(&[child(b"bravo", b"alpha", 1)]);
+        assert!(
+            decode_node_ref(&reversed_range)
+                .expect_err("reversed child range should reject")
+                .to_string()
+                .contains("first_key must be <= last_key")
+        );
+
+        let zero_count = encode_internal_node(&[child(b"alpha", b"bravo", 0)]);
+        assert!(
+            decode_node_ref(&zero_count)
+                .expect_err("zero subtree_count should reject")
+                .to_string()
+                .contains("subtree_count must be non-zero")
+        );
+
+        let empty_first = encode_internal_node(&[child(b"", b"bravo", 1)]);
+        assert!(
+            decode_node_ref(&empty_first)
+                .expect_err("empty first_key should reject")
+                .to_string()
+                .contains("range keys must be non-empty")
+        );
+
+        let empty_last = encode_internal_node(&[child(b"alpha", b"", 1)]);
+        assert!(
+            decode_node_ref(&empty_last)
+                .expect_err("empty last_key should reject")
+                .to_string()
+                .contains("range keys must be non-empty")
+        );
+
+        let overlapping =
+            encode_internal_node(&[child(b"alpha", b"charlie", 2), child(b"bravo", b"delta", 2)]);
+        assert!(
+            decode_node_ref(&overlapping)
+                .expect_err("overlapping child ranges should reject")
+                .to_string()
+                .contains("child ranges must be strictly increasing")
+        );
+
+        let duplicate_boundary =
+            encode_internal_node(&[child(b"alpha", b"bravo", 2), child(b"bravo", b"delta", 2)]);
+        assert!(
+            decode_node_ref(&duplicate_boundary)
+                .expect_err("duplicate child boundary should reject")
+                .to_string()
+                .contains("child ranges must be strictly increasing")
+        );
     }
 
     #[test]

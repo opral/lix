@@ -7,18 +7,18 @@ use std::{
 
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::codec::{
-    boundary_trigger, child_summary_from_node, decode_key, decode_key_with_trusted_prefix,
-    decode_node, decode_node_ref, decode_value, decode_visible_value, encode_internal_node,
+    ChildSummary, ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef,
+    EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite, boundary_trigger,
+    child_summary_from_node, decode_key, decode_key_with_trusted_prefix, decode_node,
+    decode_node_ref, decode_value, decode_visible_value, encode_internal_node,
     encode_internal_node_refs, encode_key, encode_leaf_node, encode_leaf_node_refs,
-    encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary, ChildSummaryRef,
-    DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef,
-    PendingChunkWrite,
+    encode_schema_file_prefix, encode_schema_key_prefix,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::types::{
-    TrackedStateApplyResult, TrackedStateIndexValue, TrackedStateKey, TrackedStateMutation,
-    TrackedStateRootId, TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
-    TRACKED_STATE_HASH_BYTES,
+    TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateIndexValue, TrackedStateKey,
+    TrackedStateMutation, TrackedStateRootId, TrackedStateTreeDiffEntry,
+    TrackedStateTreeScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -2453,7 +2453,7 @@ mod tests {
     use crate::entity_identity::EntityIdentity;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::tracked_state::codec::encode_value;
+    use crate::tracked_state::codec::{encode_value, hash_bytes};
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_applied_root() {
@@ -2626,6 +2626,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_rejects_unsorted_persisted_leaf_chunk() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tree = TrackedStateTree::new();
+        let alpha = key("schema", None, "alpha");
+        let bravo = key("schema", None, "bravo");
+        let node = encode_leaf_node(&[
+            EncodedLeafEntry {
+                key: encode_key(&bravo),
+                value: encode_value(&value("change-bravo", Some("{}"))),
+            },
+            EncodedLeafEntry {
+                key: encode_key(&alpha),
+                value: encode_value(&value("change-alpha", Some("{}"))),
+            },
+        ]);
+        let root_id = stage_raw_root_chunk(&storage, node);
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = tree
+            .scan(&store, &root_id, &TrackedStateTreeScanRequest::default())
+            .await
+            .expect_err("corrupt persisted leaf order must reject");
+
+        assert!(
+            error
+                .message
+                .contains("leaf keys must be strictly increasing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_many_rejects_invalid_persisted_internal_child_ranges() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tree = TrackedStateTree::new();
+        let alpha = encode_key(&key("schema", None, "alpha"));
+        let bravo = encode_key(&key("schema", None, "bravo"));
+        let charlie = encode_key(&key("schema", None, "charlie"));
+        let delta = encode_key(&key("schema", None, "delta"));
+        let node = encode_internal_node(&[
+            ChildSummary {
+                first_key: alpha.clone(),
+                last_key: charlie,
+                child_hash: [1; TRACKED_STATE_HASH_BYTES],
+                subtree_count: 2,
+            },
+            ChildSummary {
+                first_key: bravo,
+                last_key: delta,
+                child_hash: [2; TRACKED_STATE_HASH_BYTES],
+                subtree_count: 2,
+            },
+        ]);
+        let root_id = stage_raw_root_chunk(&storage, node);
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .expect("read should open");
+        let error = tree
+            .get_many(&store, &root_id, &[key("schema", None, "alpha")])
+            .await
+            .expect_err("corrupt persisted internal ranges must reject");
+
+        assert!(
+            error
+                .message
+                .contains("internal child ranges must be strictly increasing"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn scan_schema_file_prefix_honors_tombstones_and_limit() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tree = TrackedStateTree::new();
@@ -2794,16 +2868,18 @@ mod tests {
                 .expect("branch b shared row should load"),
             Some(value("shared-change", Some("{\"shared\":true}")))
         );
-        assert!(tree
-            .get(&store, &branch_a.root_id, &branch_b_key)
-            .await
-            .expect("branch a should read")
-            .is_none());
-        assert!(tree
-            .get(&store, &branch_b.root_id, &branch_a_key)
-            .await
-            .expect("branch b should read")
-            .is_none());
+        assert!(
+            tree.get(&store, &branch_a.root_id, &branch_b_key)
+                .await
+                .expect("branch a should read")
+                .is_none()
+        );
+        assert!(
+            tree.get(&store, &branch_b.root_id, &branch_a_key)
+                .await
+                .expect("branch b should read")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2843,9 +2919,11 @@ mod tests {
             .collect_leaf_entries(&read, &base.root_id)
             .await
             .expect("base entries should collect");
-        assert!(canonical_entries
-            .windows(2)
-            .all(|window| window[0].key < window[1].key));
+        assert!(
+            canonical_entries
+                .windows(2)
+                .all(|window| window[0].key < window[1].key)
+        );
         let encoded_changed_key = encode_key(&changed_key);
         let encoded_changed_value = encode_value(&changed_value);
         let index = canonical_entries
@@ -3091,6 +3169,20 @@ mod tests {
 
     fn mutation_owned(key: TrackedStateKey, value: TrackedStateIndexValue) -> TrackedStateMutation {
         mutation(&key, &value)
+    }
+
+    fn stage_raw_root_chunk(
+        storage: &StorageContext<InMemoryStorageBackend>,
+        node: Vec<u8>,
+    ) -> TrackedStateRootId {
+        let hash = hash_bytes(&node);
+        let chunk = PendingChunkWrite { hash, data: node };
+        let mut writes = storage.new_write_set();
+        storage::stage_chunks(&mut writes, &[chunk]);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("raw chunk should commit");
+        TrackedStateRootId::new(hash)
     }
 
     fn encoded_entries_with_change_id(change_id: &str) -> Vec<EncodedLeafEntry> {
