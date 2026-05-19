@@ -22,9 +22,9 @@ use super::store::{
     COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use crate::changelog::{
-    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
-    decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
-    view_segment_directory,
+    decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility,
+    decode_empty_index_value, decode_segment, decode_segment_change, decode_segment_commit,
+    segment_commit_membership_contains_any, view_segment_directory,
 };
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
@@ -1070,13 +1070,19 @@ where
                     prefix.clone(),
                     after,
                     256,
-                    StorageCoreProjection::KeyOnly,
+                    StorageCoreProjection::FullValue,
                 )
                 .await?;
             for index in 0..page.keys.len() {
                 let Some(key) = page.keys.get(index) else {
                     continue;
                 };
+                let Some(value) = page.value(index) else {
+                    return Err(LixError::unknown(format!(
+                        "changelog by_change_membership index returned key without value for visible change '{change_id}'"
+                    )));
+                };
+                decode_empty_index_value(value)?;
                 if let Some(commit_id) = by_change_membership_commit_id_from_key(change_id, key)? {
                     out.push(commit_id);
                 }
@@ -3808,6 +3814,53 @@ mod tests {
             error
                 .to_string()
                 .contains("failed to decode changelog by_change entry"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_changes_visible_errors_when_by_change_membership_value_is_corrupt() {
+        let (context, storage) = changelog_test_context();
+        let segment = test_segment();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_segment(segment).await.unwrap();
+            writer.stage_publish_commit("commit-1").await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        writes.delete(
+            VISIBLE_CHANGE_PROOF_SPACE,
+            visible_change_proof_key("change-1"),
+        );
+        writes.put(
+            BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+            by_change_membership_key("change-1", "commit-1"),
+            b"not empty".to_vec(),
+        );
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut reader = context.reader(storage);
+        let error = reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &["change-1".to_string()],
+                projection: ChangeProjection::Segment,
+                visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
+            })
+            .await
+            .expect_err("visible read should error on corrupt membership value");
+
+        assert!(
+            error
+                .to_string()
+                .contains("changelog empty index value must be zero bytes"),
             "unexpected error: {error}"
         );
     }
