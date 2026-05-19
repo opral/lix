@@ -4,16 +4,16 @@ use std::collections::{HashMap, HashSet};
 
 use super::codec::{
     decode_segment, decode_segment_change, decode_segment_commit,
-    encode_segment_with_object_locations, view_segment_directory, view_segment_object_ranges,
-    view_segment_object_slices,
+    encode_segment_with_object_locations, view_segment, view_segment_directory,
+    view_segment_object_ranges, view_segment_object_slices,
 };
 use super::store::segment_value;
 use super::types::{
     MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentDirectory, SegmentObjectLocation,
     SegmentPayloadLocation, StateRowIdentity,
 };
-use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::LixError;
+use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 
 pub(super) fn directory_commit_location(
     segment: &Segment,
@@ -94,7 +94,7 @@ struct SegmentObjectRangeMeta {
 
 impl DecodedSegmentIndex {
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, LixError> {
-        let view = view_segment_directory(bytes)?;
+        let view = view_segment(bytes)?;
         let segment_id = view.segment_id.to_string();
         let mut commit_ordinals = HashMap::new();
         let mut commit_locations = HashMap::new();
