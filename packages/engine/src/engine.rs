@@ -134,7 +134,11 @@ where
         .await
     }
 
-    /// Rebuilds the tracked serving projection root for one version from changelog.
+    /// Rebuilds the tracked serving projection root for one version.
+    ///
+    /// The rebuild replays changelog entries from the nearest available
+    /// first-parent projection root, preserving the existing incremental
+    /// projection metadata shape used by historical SQL reads.
     ///
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked

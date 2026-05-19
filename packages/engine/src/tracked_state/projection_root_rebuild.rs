@@ -2,8 +2,9 @@ use crate::changelog::{
     Change, ChangeLoadEntry, ChangeLoadRequest, ChangeLocator as ChangelogChangeLocator,
     ChangeProjection, ChangeRef as ChangelogChangeRef, ChangeVisibilityMode, ChangelogContext,
     CommitBody, CommitHeader, CommitLoadEntry, CommitLoadRequest, CommitProjection,
-    CommitVisibilityMode,
+    CommitVisibilityMode, StateRowIdentity,
 };
+use crate::common::{CanonicalSchemaKey, EntityId, FileId};
 use crate::storage::StorageRead;
 use crate::tracked_state::context::{TrackedStateRootRebuilder, TrackedStateWriteReport};
 use crate::tracked_state::storage;
@@ -83,7 +84,16 @@ pub(crate) async fn rebuild_projection_root_at<S>(
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
-    let input = build_incremental_projection_root_rebuild_input(rebuilder.store, commit_id).await?;
+    // Explicit rebuilds keep the legacy incremental behavior: they may reuse
+    // the nearest first-parent projection root without validating its rows.
+    // Missing-root repair goes through ensure_projection_root, which enables
+    // parent validation before inheriting created_at values.
+    let input = build_incremental_projection_root_rebuild_input_with_parent_validation(
+        rebuilder.store,
+        commit_id,
+        false,
+    )
+    .await?;
     let delta_refs = input
         .deltas
         .iter()
@@ -163,6 +173,18 @@ pub(super) async fn build_incremental_projection_root_rebuild_input<S>(
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
+    build_incremental_projection_root_rebuild_input_with_parent_validation(store, commit_id, true)
+        .await
+}
+
+async fn build_incremental_projection_root_rebuild_input_with_parent_validation<S>(
+    store: &S,
+    commit_id: &str,
+    validate_parent_values: bool,
+) -> Result<ProjectionRootRebuildInput, LixError>
+where
+    S: StorageRead + Send + Sync + ?Sized,
+{
     let mut reverse_replay = Vec::new();
     let mut seen = BTreeSet::new();
     let mut current = Some(commit_id.to_string());
@@ -198,9 +220,11 @@ where
         Some((commit_id, root_id)) => (Some(commit_id), Some(root_id)),
         None => (None, None),
     };
+    let parent = parent_commit_id.as_deref().zip(parent_root_id.as_ref());
     let deltas = project_projection_root_rebuild_deltas_with_parent(
         store,
-        parent_root_id.as_ref(),
+        parent,
+        validate_parent_values,
         located_changes,
     )
     .await?;
@@ -383,14 +407,15 @@ fn project_projection_root_rebuild_deltas(
 
 async fn project_projection_root_rebuild_deltas_with_parent<S>(
     store: &S,
-    parent_root_id: Option<&TrackedStateRootId>,
+    parent: Option<(&str, &TrackedStateRootId)>,
+    validate_parent_values: bool,
     changes: impl IntoIterator<Item = LocatedChange>,
 ) -> Result<Vec<ProjectionRootRebuildDelta>, LixError>
 where
     S: StorageRead + Send + Sync + ?Sized,
 {
     let mut deltas = project_projection_root_rebuild_deltas(changes);
-    let Some(parent_root_id) = parent_root_id else {
+    let Some((parent_commit_id, parent_root_id)) = parent else {
         return Ok(deltas);
     };
     let keys = deltas
@@ -404,12 +429,76 @@ where
     let parent_values = TrackedStateTree::new()
         .get_many(store, parent_root_id, &keys)
         .await?;
+    if validate_parent_values {
+        validate_parent_values_against_changelog(store, parent_commit_id, &keys, &parent_values)
+            .await?;
+    }
     for (delta, parent_value) in deltas.iter_mut().zip(parent_values) {
         if let Some(TrackedStateIndexValue { created_at, .. }) = parent_value {
             delta.created_at = created_at;
         }
     }
     Ok(deltas)
+}
+
+async fn validate_parent_values_against_changelog<S>(
+    store: &S,
+    parent_commit_id: &str,
+    keys: &[TrackedStateKey],
+    values: &[Option<TrackedStateIndexValue>],
+) -> Result<(), LixError>
+where
+    S: StorageRead + Send + Sync + ?Sized,
+{
+    let identities = keys
+        .iter()
+        .map(state_row_identity_from_key)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut reader = ChangelogContext::new().reader(store);
+    let facts = reader
+        .load_first_parent_winner_facts_for_visible_commit(parent_commit_id, &identities)
+        .await?;
+    for (identity, value) in identities.into_iter().zip(values) {
+        let fact = facts.get(&identity);
+        let Some(value) = value else {
+            if fact.is_some() {
+                return Err(LixError::unknown(format!(
+                    "tracked_state materialization parent root for commit '{}' is missing changelog first-parent winner for identity {:?}",
+                    parent_commit_id, identity
+                )));
+            }
+            continue;
+        };
+        let Some(fact) = fact else {
+            return Err(LixError::unknown(format!(
+                "tracked_state materialization parent root for commit '{}' contains non-winner identity {:?}",
+                parent_commit_id, identity
+            )));
+        };
+        if fact.change_id != value.change_locator.change_id
+            || fact.created_at != value.created_at
+            || fact.updated_at != value.updated_at
+            || fact.deleted != value.deleted
+        {
+            return Err(LixError::unknown(format!(
+                "tracked_state materialization parent root for commit '{}' does not match changelog first-parent winner for identity {:?}",
+                parent_commit_id, identity
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn state_row_identity_from_key(key: &TrackedStateKey) -> Result<StateRowIdentity, LixError> {
+    Ok(StateRowIdentity {
+        schema_key: CanonicalSchemaKey::new(key.schema_key.clone())?,
+        file_id: FileId::new(
+            key.file_id
+                .clone()
+                .unwrap_or_else(|| "__global__".to_string()),
+        )?,
+        entity_id: EntityId::new(key.entity_id.as_json_array_text()?)?,
+    })
 }
 
 fn missing_change_error(commit_id: &str, change_id: &str) -> LixError {
@@ -431,6 +520,8 @@ mod tests {
     use super::*;
     use crate::changelog::SegmentObjectLocation;
     use crate::entity_identity::EntityIdentity;
+    use crate::tracked_state::tree::TrackedStateTree;
+    use crate::tracked_state::types::TrackedStateIndexValue;
 
     #[test]
     fn projection_root_rebuild_delta_ref_borrows_owned_facts() {
@@ -561,35 +652,90 @@ mod tests {
         let storage =
             crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
         let tracked_state = crate::tracked_state::TrackedStateContext::new();
-        let parent_row = crate::tracked_state::MaterializedTrackedStateRow {
-            entity_id: EntityIdentity::single("entity-1"),
-            schema_key: "schema".to_string(),
-            file_id: Some("file".to_string()),
-            snapshot_content: Some("{\"value\":\"parent\"}".to_string()),
-            metadata: None,
-            deleted: false,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: "change-parent".to_string(),
-            commit_id: "parent".to_string(),
-        };
-        let mut read = storage
-            .begin_read(crate::storage::StorageReadOptions::default())
-            .expect("read should open");
-        let mut writes = storage.new_write_set();
-        crate::test_support::stage_tracked_root_from_materialized(
-            &mut read,
-            &mut writes,
-            &tracked_state,
+        let parent_row = materialized_row(
+            "entity-1",
+            "change-parent",
             "parent",
-            None,
-            std::slice::from_ref(&parent_row),
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_materialized_root(&storage, &tracked_state, "parent", None, &[parent_row])
+            .await
+            .expect("parent root should stage");
+        let child_row = materialized_row(
+            "entity-1",
+            "change-child",
+            "child",
+            "child",
+            "2026-01-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        stage_materialized_root(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[child_row],
         )
         .await
-        .expect("parent root should stage");
-        storage
-            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
-            .expect("parent root should commit");
+        .expect("child root should stage");
+
+        let input = build_incremental_projection_root_rebuild_input(
+            &storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open"),
+            "child",
+        )
+        .await
+        .expect("rebuild input should load");
+
+        assert_eq!(input.parent_commit_id.as_deref(), Some("parent"));
+        assert_eq!(input.replayed_commits, 1);
+        assert_eq!(input.deltas.len(), 1);
+        assert_eq!(input.deltas[0].created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(input.deltas[0].updated_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_rebuild_rejects_corrupt_parent_root_created_at() {
+        let storage =
+            crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let parent_row = materialized_row(
+            "entity-1",
+            "change-parent",
+            "parent",
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_materialized_root(&storage, &tracked_state, "parent", None, &[parent_row])
+            .await
+            .expect("parent root should stage");
+        let child_row = materialized_row(
+            "entity-1",
+            "change-child",
+            "child",
+            "child",
+            "2026-01-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        stage_materialized_root(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[child_row],
+        )
+        .await
+        .expect("child root should stage");
+
+        let parent_key = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            entity_id: EntityIdentity::single("entity-1"),
+        };
         let parent_root = storage::load_root(
             &storage
                 .begin_read(crate::storage::StorageReadOptions::default())
@@ -599,26 +745,494 @@ mod tests {
         .await
         .expect("parent root should load")
         .expect("parent root should exist");
+        let mut corrupt_parent_value = TrackedStateTree::new()
+            .get(
+                &storage
+                    .begin_read(crate::storage::StorageReadOptions::default())
+                    .expect("read should open"),
+                &parent_root,
+                &parent_key,
+            )
+            .await
+            .expect("parent value should load")
+            .expect("parent value should exist");
+        corrupt_parent_value.created_at = "1999-01-01T00:00:00Z".to_string();
+        let forged_root = {
+            let read = storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open");
+            let mut writes = storage.new_write_set();
+            let result = TrackedStateTree::new()
+                .apply_mutations(
+                    &read,
+                    &mut writes,
+                    None,
+                    vec![
+                        crate::tracked_state::types::TrackedStateMutation::put_encoded(
+                            crate::tracked_state::codec::encode_key(&parent_key),
+                            crate::tracked_state::codec::encode_value(&corrupt_parent_value),
+                        ),
+                    ],
+                    Some("forged-parent"),
+                )
+                .await
+                .expect("forged root should write");
+            storage::stage_projection_metadata(
+                &mut writes,
+                &crate::tracked_state::types::TrackedStateProjectionMetadata {
+                    commit_id: "parent".to_string(),
+                    root_id: result.root_id.clone(),
+                    parent_roots: Vec::new(),
+                    changed_key_count: 1,
+                    row_count_estimate: result.row_count as u64,
+                    tree_height: result.tree_height as u32,
+                    primary_chunk_count: result.chunk_count as u64,
+                    primary_chunk_bytes: result.chunk_bytes as u64,
+                },
+            )
+            .expect("corrupt parent metadata should encode");
+            writes.delete(
+                storage::TRACKED_STATE_PROJECTION_SPACE,
+                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"child")),
+            );
+            storage
+                .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+                .expect("corruption should commit");
+            result.root_id
+        };
 
-        let deltas = project_projection_root_rebuild_deltas_with_parent(
+        assert_eq!(
+            storage::load_root(
+                &storage
+                    .begin_read(crate::storage::StorageReadOptions::default())
+                    .expect("read should open"),
+                "parent",
+            )
+            .await
+            .expect("corrupt parent root should load"),
+            Some(forged_root)
+        );
+
+        assert_child_repair_rejects(
+            &storage,
+            &tracked_state,
+            "does not match changelog first-parent winner",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_projection_rebuild_allows_corrupt_parent_created_at_for_legacy_rebuild_mode() {
+        let storage =
+            crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let parent_row = materialized_row(
+            "entity-1",
+            "change-parent",
+            "parent",
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_materialized_root(&storage, &tracked_state, "parent", None, &[parent_row])
+            .await
+            .expect("parent root should stage");
+        let child_row = materialized_row(
+            "entity-1",
+            "change-child",
+            "child",
+            "child",
+            "2026-01-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        stage_materialized_root(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[child_row],
+        )
+        .await
+        .expect("child root should stage");
+        let parent_key = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            entity_id: EntityIdentity::single("entity-1"),
+        };
+        let parent_root = storage::load_root(
             &storage
                 .begin_read(crate::storage::StorageReadOptions::default())
                 .expect("read should open"),
-            Some(&parent_root),
-            vec![located_change(
-                "child",
-                0,
-                "change-child",
-                "entity-1",
-                "2026-02-01T00:00:00Z",
-            )],
+            "parent",
         )
         .await
-        .expect("incremental projection should project");
+        .expect("parent root should load")
+        .expect("parent root should exist");
+        let mut corrupt_parent_value = TrackedStateTree::new()
+            .get(
+                &storage
+                    .begin_read(crate::storage::StorageReadOptions::default())
+                    .expect("read should open"),
+                &parent_root,
+                &parent_key,
+            )
+            .await
+            .expect("parent value should load")
+            .expect("parent value should exist");
+        corrupt_parent_value.created_at = "1999-01-01T00:00:00Z".to_string();
+        stage_parent_projection_root_and_delete_child(
+            &storage,
+            "parent",
+            "child",
+            vec![(parent_key, corrupt_parent_value)],
+        )
+        .await
+        .expect("corruption should stage");
 
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(deltas[0].updated_at, "2026-02-01T00:00:00Z");
+        let mut read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let report = tracked_state
+            .root_rebuilder(&mut read, &mut writes)
+            .rebuild_projection_root_at("child")
+            .await
+            .expect("explicit rebuild should preserve legacy unvalidated parent behavior");
+        assert_eq!(report.commit_id, "child");
+        storage
+            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+            .expect("explicit rebuild should commit");
+        let input = build_incremental_projection_root_rebuild_input_with_parent_validation(
+            &storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open"),
+            "child",
+            false,
+        )
+        .await
+        .expect("legacy rebuild input should load");
+        assert_eq!(input.parent_commit_id.as_deref(), Some("parent"));
+        assert_eq!(input.deltas[0].created_at, "1999-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_rebuild_rejects_parent_root_missing_winner_row() {
+        let storage =
+            crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let parent_row = materialized_row(
+            "entity-1",
+            "change-parent",
+            "parent",
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_materialized_root(&storage, &tracked_state, "parent", None, &[parent_row])
+            .await
+            .expect("parent root should stage");
+        let child_row = materialized_row(
+            "entity-1",
+            "change-child",
+            "child",
+            "child",
+            "2026-01-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        stage_materialized_root(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[child_row],
+        )
+        .await
+        .expect("child root should stage");
+
+        {
+            let read = storage
+                .begin_read(crate::storage::StorageReadOptions::default())
+                .expect("read should open");
+            let mut writes = storage.new_write_set();
+            let result = TrackedStateTree::new()
+                .apply_mutations(&read, &mut writes, None, Vec::new(), Some("empty-parent"))
+                .await
+                .expect("empty root should write");
+            storage::stage_projection_metadata(
+                &mut writes,
+                &crate::tracked_state::types::TrackedStateProjectionMetadata {
+                    commit_id: "parent".to_string(),
+                    root_id: result.root_id.clone(),
+                    parent_roots: Vec::new(),
+                    changed_key_count: 0,
+                    row_count_estimate: result.row_count as u64,
+                    tree_height: result.tree_height as u32,
+                    primary_chunk_count: result.chunk_count as u64,
+                    primary_chunk_bytes: result.chunk_bytes as u64,
+                },
+            )
+            .expect("corrupt parent metadata should encode");
+            writes.delete(
+                storage::TRACKED_STATE_PROJECTION_SPACE,
+                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"child")),
+            );
+            storage
+                .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+                .expect("corruption should commit");
+        }
+
+        assert_child_repair_rejects(
+            &storage,
+            &tracked_state,
+            "is missing changelog first-parent winner",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_rebuild_rejects_parent_root_non_winner_row() {
+        let storage =
+            crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        stage_materialized_root(&storage, &tracked_state, "parent", None, &[])
+            .await
+            .expect("parent root should stage");
+        let child_row = materialized_row(
+            "entity-1",
+            "change-child",
+            "child",
+            "child",
+            "2026-02-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        stage_materialized_root(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[child_row],
+        )
+        .await
+        .expect("child root should stage");
+
+        let forged_key = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            entity_id: EntityIdentity::single("entity-1"),
+        };
+        let forged_value = tracked_value(
+            "change-forged",
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_parent_projection_root_and_delete_child(
+            &storage,
+            "parent",
+            "child",
+            vec![(forged_key, forged_value)],
+        )
+        .await
+        .expect("corruption should stage");
+
+        assert_child_repair_rejects(&storage, &tracked_state, "contains non-winner identity").await;
+    }
+
+    #[tokio::test]
+    async fn incremental_projection_rebuild_rejects_parent_root_wrong_winner_change_id() {
+        let storage =
+            crate::storage::StorageContext::new(crate::storage::InMemoryStorageBackend::new());
+        let tracked_state = crate::tracked_state::TrackedStateContext::new();
+        let parent_row = materialized_row(
+            "entity-1",
+            "change-parent",
+            "parent",
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_materialized_root(&storage, &tracked_state, "parent", None, &[parent_row])
+            .await
+            .expect("parent root should stage");
+        let child_row = materialized_row(
+            "entity-1",
+            "change-child",
+            "child",
+            "child",
+            "2026-01-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        stage_materialized_root(
+            &storage,
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[child_row],
+        )
+        .await
+        .expect("child root should stage");
+
+        let forged_key = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            entity_id: EntityIdentity::single("entity-1"),
+        };
+        let forged_value = tracked_value(
+            "change-forged",
+            "parent",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        stage_parent_projection_root_and_delete_child(
+            &storage,
+            "parent",
+            "child",
+            vec![(forged_key, forged_value)],
+        )
+        .await
+        .expect("corruption should stage");
+
+        assert_child_repair_rejects(
+            &storage,
+            &tracked_state,
+            "does not match changelog first-parent winner",
+        )
+        .await;
+    }
+
+    async fn assert_child_repair_rejects(
+        storage: &crate::storage::StorageContext,
+        tracked_state: &crate::tracked_state::TrackedStateContext,
+        expected_error: &str,
+    ) {
+        let mut read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let error = tracked_state
+            .root_rebuilder(&mut read, &mut writes)
+            .ensure_projection_root("child")
+            .await
+            .expect_err("repair must reject corrupt parent projection root");
+        assert!(
+            error.message.contains(expected_error),
+            "unexpected error: {error}"
+        );
+    }
+
+    async fn stage_parent_projection_root_and_delete_child(
+        storage: &crate::storage::StorageContext,
+        parent_commit_id: &str,
+        child_commit_id: &str,
+        entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
+    ) -> Result<(), LixError> {
+        let read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mutations = entries
+            .into_iter()
+            .map(|(key, value)| {
+                crate::tracked_state::types::TrackedStateMutation::put_encoded(
+                    crate::tracked_state::codec::encode_key(&key),
+                    crate::tracked_state::codec::encode_value(&value),
+                )
+            })
+            .collect::<Vec<_>>();
+        let changed_key_count = mutations.len();
+        let result = TrackedStateTree::new()
+            .apply_mutations(&read, &mut writes, None, mutations, Some("forged-parent"))
+            .await?;
+        storage::stage_projection_metadata(
+            &mut writes,
+            &crate::tracked_state::types::TrackedStateProjectionMetadata {
+                commit_id: parent_commit_id.to_string(),
+                root_id: result.root_id,
+                parent_roots: Vec::new(),
+                changed_key_count: changed_key_count as u64,
+                row_count_estimate: result.row_count as u64,
+                tree_height: result.tree_height as u32,
+                primary_chunk_count: result.chunk_count as u64,
+                primary_chunk_bytes: result.chunk_bytes as u64,
+            },
+        )?;
+        writes.delete(
+            storage::TRACKED_STATE_PROJECTION_SPACE,
+            crate::storage::StorageKey(bytes::Bytes::copy_from_slice(child_commit_id.as_bytes())),
+        );
+        storage.commit_write_set(writes, crate::storage::StorageWriteOptions::default())?;
+        Ok(())
+    }
+
+    async fn stage_materialized_root(
+        storage: &crate::storage::StorageContext,
+        tracked_state: &crate::tracked_state::TrackedStateContext,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        rows: &[crate::tracked_state::MaterializedTrackedStateRow],
+    ) -> Result<(), LixError> {
+        let mut read = storage
+            .begin_read(crate::storage::StorageReadOptions::default())
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        crate::test_support::stage_tracked_root_from_materialized(
+            &mut read,
+            &mut writes,
+            tracked_state,
+            commit_id,
+            parent_commit_id,
+            rows,
+        )
+        .await?;
+        storage.commit_write_set(writes, crate::storage::StorageWriteOptions::default())?;
+        Ok(())
+    }
+
+    fn materialized_row(
+        entity_id: &str,
+        change_id: &str,
+        commit_id: &str,
+        value: &str,
+        created_at: &str,
+        updated_at: &str,
+    ) -> crate::tracked_state::MaterializedTrackedStateRow {
+        crate::tracked_state::MaterializedTrackedStateRow {
+            entity_id: EntityIdentity::single(entity_id),
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
+            metadata: None,
+            deleted: false,
+            created_at: created_at.to_string(),
+            updated_at: updated_at.to_string(),
+            change_id: change_id.to_string(),
+            commit_id: commit_id.to_string(),
+        }
+    }
+
+    fn tracked_value(
+        change_id: &str,
+        commit_id: &str,
+        created_at: &str,
+        updated_at: &str,
+    ) -> TrackedStateIndexValue {
+        TrackedStateIndexValue {
+            change_locator: ChangelogChangeLocator {
+                change_id: change_id.to_string(),
+                commit_id: commit_id.to_string(),
+                location: SegmentObjectLocation {
+                    segment_id: format!("segment-{commit_id}"),
+                    offset: 0,
+                    len: 1,
+                    checksum: change_id.to_string(),
+                },
+            },
+            deleted: false,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: created_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
     }
 
     fn located_change(
