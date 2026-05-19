@@ -4,9 +4,13 @@ use std::ops::Bound;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::by_change_index::by_change_entries_for_segments;
-use super::by_change_membership_index::by_change_membership_entries_for_segments;
-use super::by_commit_index::{by_commit_entries_for_segment, by_commit_entries_for_segments};
+use super::by_change_index::{by_change_entries_for_segments, by_change_entries_for_truth};
+use super::by_change_membership_index::{
+    by_change_membership_entries_for_segments, by_change_membership_entries_for_truth,
+};
+use super::by_commit_index::{
+    by_commit_entries_for_segment, by_commit_entries_for_segments, by_commit_entries_for_truth,
+};
 use super::segment::{
     DecodedSegmentIndex, canonicalize_segment, directory_change_location,
     directory_commit_location, segment_change, segment_commit, validate_change_checksum,
@@ -21,6 +25,7 @@ use super::store::{
     commit_visibility_key, commit_visibility_value, segment_key, segment_value,
     visible_change_proof_key, visible_change_proof_value,
 };
+use super::truth::{SegmentTruthSnapshot, load_segment_truth_index};
 use crate::LixError;
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
@@ -2417,34 +2422,40 @@ where
     pub(crate) async fn rebuild_mandatory_indexes(
         &mut self,
     ) -> Result<RebuildIndexStats, LixError> {
-        let segments = self.scan_all_segments().await?;
+        let truth = load_segment_truth_index(&mut *self.store).await?;
         let stats = self
-            .stage_by_commit_index_rebuild(&segments)
+            .stage_by_commit_index_rebuild_from_truth(&truth)
             .await?
-            .combine(self.stage_by_change_index_rebuild(&segments).await?)
             .combine(
-                self.stage_by_change_membership_index_rebuild(&segments)
+                self.stage_by_change_index_rebuild_from_truth(&truth)
                     .await?,
             )
-            .combine(self.stage_visible_change_proof_rebuild(&segments).await?);
+            .combine(
+                self.stage_by_change_membership_index_rebuild_from_truth(&truth)
+                    .await?,
+            )
+            .combine(
+                self.stage_visible_change_proof_rebuild_from_truth(&truth)
+                    .await?,
+            );
         Ok(stats)
     }
 
     pub(crate) async fn rebuild_by_commit_index(&mut self) -> Result<RebuildIndexStats, LixError> {
-        let segments = self.scan_all_segments().await?;
-        self.stage_by_commit_index_rebuild(&segments).await
+        let truth = load_segment_truth_index(&mut *self.store).await?;
+        self.stage_by_commit_index_rebuild_from_truth(&truth).await
     }
 
     pub(crate) async fn rebuild_by_change_index(&mut self) -> Result<RebuildIndexStats, LixError> {
-        let segments = self.scan_all_segments().await?;
-        self.stage_by_change_index_rebuild(&segments).await
+        let truth = load_segment_truth_index(&mut *self.store).await?;
+        self.stage_by_change_index_rebuild_from_truth(&truth).await
     }
 
     pub(crate) async fn rebuild_by_change_membership_index(
         &mut self,
     ) -> Result<RebuildIndexStats, LixError> {
-        let segments = self.scan_all_segments().await?;
-        self.stage_by_change_membership_index_rebuild(&segments)
+        let truth = load_segment_truth_index(&mut *self.store).await?;
+        self.stage_by_change_membership_index_rebuild_from_truth(&truth)
             .await
     }
 
@@ -2478,11 +2489,11 @@ where
         Ok(segments)
     }
 
-    async fn stage_by_commit_index_rebuild(
+    async fn stage_by_commit_index_rebuild_from_truth(
         &mut self,
-        segments: &[Segment],
+        truth: &SegmentTruthSnapshot,
     ) -> Result<RebuildIndexStats, LixError> {
-        let entries = by_commit_entries_for_segments(segments)?;
+        let entries = by_commit_entries_for_truth(truth)?;
         let mut expected_rows = HashMap::new();
         for entry in &entries {
             expected_rows.insert(
@@ -2502,11 +2513,11 @@ where
         Ok(stats)
     }
 
-    async fn stage_by_change_index_rebuild(
+    async fn stage_by_change_index_rebuild_from_truth(
         &mut self,
-        segments: &[Segment],
+        truth: &SegmentTruthSnapshot,
     ) -> Result<RebuildIndexStats, LixError> {
-        let entries = by_change_entries_for_segments(segments)?;
+        let entries = by_change_entries_for_truth(truth);
         let mut expected_rows = HashMap::new();
         for entry in &entries {
             expected_rows.insert(
@@ -2518,11 +2529,11 @@ where
             .await
     }
 
-    async fn stage_by_change_membership_index_rebuild(
+    async fn stage_by_change_membership_index_rebuild_from_truth(
         &mut self,
-        segments: &[Segment],
+        truth: &SegmentTruthSnapshot,
     ) -> Result<RebuildIndexStats, LixError> {
-        let entries = by_change_membership_entries_for_segments(segments);
+        let entries = by_change_membership_entries_for_truth(truth);
         let mut expected_rows = HashMap::new();
         for entry in &entries {
             expected_rows.insert(
@@ -2534,24 +2545,31 @@ where
             .await
     }
 
-    async fn stage_visible_change_proof_rebuild(
+    async fn stage_visible_change_proof_rebuild_from_truth(
         &mut self,
-        segments: &[Segment],
+        truth: &SegmentTruthSnapshot,
     ) -> Result<RebuildIndexStats, LixError> {
-        let mut segments_by_id = HashMap::new();
-        for segment in segments {
-            segments_by_id.insert(segment.header.segment_id.as_str(), segment);
-        }
-
+        let retained_segments = truth.segment_ids.iter().collect::<HashSet<_>>();
         let mut expected_rows = HashMap::new();
         for visibility in self.scan_commit_visibilities().await? {
-            let Some(segment) = segments_by_id.get(visibility.location.segment_id.as_str()) else {
-                continue;
+            if !retained_segments.contains(&visibility.location.segment_id) {
+                return Err(LixError::unknown(format!(
+                    "changelog commit_visibility for '{}' points to missing segment '{}'",
+                    visibility.commit_id, visibility.location.segment_id
+                )));
+            }
+            let Some((truth_location, commit)) = truth.commits.get(&visibility.commit_id) else {
+                return Err(LixError::unknown(format!(
+                    "changelog commit_visibility for '{}' points to segment '{}' without that commit",
+                    visibility.commit_id, visibility.location.segment_id
+                )));
             };
-            let Some(commit) = segment_commit(segment, &visibility.commit_id) else {
-                continue;
-            };
-            validate_commit_location(&visibility.location, segment, &visibility.commit_id)?;
+            if truth_location != &visibility.location {
+                return Err(LixError::unknown(format!(
+                    "changelog commit_visibility for '{}' locator does not match segment truth",
+                    visibility.commit_id
+                )));
+            }
             validate_commit_checksum(&visibility.checksum, &visibility.commit_id, commit)?;
             for membership in &commit.body.membership {
                 expected_rows.insert(
@@ -4460,7 +4478,7 @@ mod tests {
         };
 
         assert!(
-            error.message.contains("duplicate commit 'commit-1'"),
+            error.message.contains("duplicate commit id 'commit-1'"),
             "unexpected error: {error}"
         );
     }
