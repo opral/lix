@@ -41,8 +41,14 @@ pub mod storage_bench;
 #[cfg_attr(feature = "storage-benches", allow(dead_code))]
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
+#[cfg(feature = "storage-benches")]
+pub mod tracked_state;
+#[cfg(not(feature = "storage-benches"))]
 pub(crate) mod tracked_state;
+#[cfg(feature = "storage-benches")]
 pub mod transaction;
+#[cfg(not(feature = "storage-benches"))]
+pub(crate) mod transaction;
 pub(crate) mod untracked_state;
 pub(crate) mod version;
 pub mod wasm;
