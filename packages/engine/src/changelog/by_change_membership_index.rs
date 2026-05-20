@@ -1,7 +1,7 @@
 //! Rebuildable by_change_membership index behavior.
 
 use super::truth::SegmentTruthSnapshot;
-use super::types::{CommitId, Segment};
+use super::types::{CommitId, MembershipRole, Segment};
 
 pub(super) struct ByChangeMembershipEntry {
     #[allow(dead_code)]
@@ -17,6 +17,9 @@ pub(super) fn by_change_membership_entries_for_segments(
     for segment in segments {
         for commit in &segment.commits {
             for membership in &commit.body.membership {
+                if membership.role != MembershipRole::Adopted {
+                    continue;
+                }
                 entries.push(ByChangeMembershipEntry {
                     change_id: membership.member_change_id.clone(),
                     commit_id: commit.header.id.clone(),
@@ -33,6 +36,9 @@ pub(super) fn by_change_membership_entries_for_truth(
     let mut entries = Vec::new();
     for (commit_id, _, commit) in truth.commits_in_segment_order() {
         for membership in &commit.body.membership {
+            if membership.role != MembershipRole::Adopted {
+                continue;
+            }
             entries.push(ByChangeMembershipEntry {
                 change_id: membership.member_change_id.clone(),
                 commit_id: commit_id.to_string(),
@@ -51,7 +57,7 @@ mod tests {
     };
 
     #[test]
-    fn entries_include_authored_and_adopted_membership() {
+    fn entries_include_only_adopted_membership() {
         let segment = super::Segment {
             header: SegmentHeader {
                 segment_id: "segment-1".to_string(),
@@ -72,11 +78,9 @@ mod tests {
 
         let entries = by_change_membership_entries_for_segments(&[segment]);
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].change_id, "change-1");
-        assert_eq!(entries[0].commit_id, "commit-authored");
-        assert_eq!(entries[1].change_id, "change-1");
-        assert_eq!(entries[1].commit_id, "commit-adopted");
+        assert_eq!(entries[0].commit_id, "commit-adopted");
     }
 
     fn commit(commit_id: &str, change_id: &str, role: MembershipRole) -> SegmentCommit {

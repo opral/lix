@@ -196,6 +196,88 @@ Layout footprint after 1k transaction insert:
 | transaction | `0x00060005` | `changelog.index.by_change_membership` | 1,016 |    79,023 |           0 |
 | transaction | `0x00060006` | `changelog.index.visible_change`       | 1,016 |    40,559 |      36,432 |
 
+## Optimization Run: by_change_membership only indexes adopted changes
+
+Date: 2026-05-20
+
+Change:
+
+- `changelog.index.by_change_membership` now stores adopted/merge memberships
+  only.
+- Authored changes already have a direct `changelog.index.by_change` locator,
+  so authored membership rows were duplicate physical index entries.
+- This is a hard cut with no backward compatibility path.
+
+Smoke scorecard after this change. `read_many_by_pk` reads 10 primary keys:
+
+### Direct KV Layout
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    2.24 ms |   500 us |         286 us |          351 us |    2.53 ms |     618 us |    1.22 ms |     552 us |
+| RocksDB |     438 us |   161 us |        5.94 us |         19.5 us |     549 us |    14.4 us |    6.96 us |    6.63 us |
+| redb    |    6.99 ms |   150 us |        10.8 us |         20.3 us |    8.00 ms |    3.96 ms |    4.17 ms |    3.84 ms |
+
+### Transaction Layer
+
+Direct transaction API, bypassing SQL.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   33.07 ms | 17.95 ms |        8.81 ms |        86.18 ms |   97.71 ms |   65.77 ms |   95.75 ms |   68.97 ms |
+| RocksDB |   30.49 ms | 17.64 ms |        8.59 ms |        83.26 ms |   92.16 ms |   64.95 ms |   88.70 ms |   64.81 ms |
+| redb    |   38.69 ms | 16.56 ms |        8.06 ms |        82.17 ms |  100.84 ms |   71.61 ms |   98.09 ms |   69.78 ms |
+
+### SQL Session
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   70.48 ms | 20.16 ms |        6.25 ms |         6.90 ms |   excluded |   excluded |  110.40 ms |   86.32 ms |
+
+Accounting delta for 1k transaction insert/update/delete, relative to the
+previous `visible_change -> commit_id` run:
+
+| Metric                              |    Before |     After |   Delta |
+| ----------------------------------- | --------: | --------: | ------: |
+| `by_change_membership` rows         |     1,016 |         0 |  -1,016 |
+| `by_change_membership` key bytes    |    79,023 |         0 | -79,023 |
+| `by_change_membership` value bytes  |         0 |         0 |       0 |
+| transaction `insert_all` puts       |     3,037 |     2,037 |  -1,000 |
+| transaction `update_all` puts       |     3,037 |     2,037 |  -1,000 |
+| transaction `delete_all` puts       |     3,037 |     2,037 |  -1,000 |
+| transaction `update_one_by_pk` puts |        11 |        10 |      -1 |
+| transaction `delete_one_by_pk` puts |        11 |        10 |      -1 |
+| transaction touched spaces          |         9 |         8 |      -1 |
+| transaction `insert_all` bytes      | 1,787,993 | 1,787,993 |       0 |
+| transaction `update_all` bytes      | 1,874,264 | 1,874,264 |       0 |
+| transaction `delete_all` bytes      | 1,243,657 | 1,243,657 |       0 |
+
+Net: one whole index space disappears for authored-only workloads. Put
+amplification drops from 3.04x to 2.04x for 1k all-row transaction operations,
+and single-row transaction mutations drop from 11 puts to 10 puts. The
+accounted write bytes are unchanged because this index had empty values; the
+layout footprint still shrinks by 1,016 rows and 79,023 key bytes.
+
+Layout footprint after 1k transaction insert:
+
+| Layer       |     Space id | Space                                  |  Rows | Key bytes | Value bytes |
+| ----------- | -----------: | -------------------------------------- | ----: | --------: | ----------: |
+| kv_layout   | `0x00020001` | `tracked_state.crud.row.v1`            | 1,000 |    87,244 |     396,363 |
+| transaction | `0x00010002` | `untracked_state.row.v1`               |     2 |       120 |         273 |
+| transaction | `0x00020001` | `json_store.json`                      |     0 |         0 |           0 |
+| transaction | `0x00040001` | `tracked_state.tree.chunk`             |    33 |     1,188 |     413,693 |
+| transaction | `0x00040003` | `tracked_state.tree.root.by_file`      |     0 |         0 |           0 |
+| transaction | `0x00040004` | `tracked_state.projection`             |     2 |        71 |         288 |
+| transaction | `0x00050001` | `binary_cas.manifest`                  |     0 |         0 |           0 |
+| transaction | `0x00050002` | `binary_cas.manifest_chunk`            |     0 |         0 |           0 |
+| transaction | `0x00050003` | `binary_cas.chunk`                     |     0 |         0 |           0 |
+| transaction | `0x00060001` | `changelog.segment`                    |     2 |       124 |   1,156,775 |
+| transaction | `0x00060002` | `changelog.commit_visibility`          |     2 |        71 |         509 |
+| transaction | `0x00060003` | `changelog.index.by_commit`            |     2 |        71 |         428 |
+| transaction | `0x00060004` | `changelog.index.by_change`            | 1,016 |    40,559 |     214,639 |
+| transaction | `0x00060005` | `changelog.index.by_change_membership` |     0 |         0 |           0 |
+| transaction | `0x00060006` | `changelog.index.visible_change`       | 1,016 |    40,559 |      36,432 |
+
 ## 10k Reference Checks
 
 The full 10k matrix was started once after the rebase to understand scale, but
