@@ -4,13 +4,14 @@ use lix_engine::{Engine, ExecuteResult, SessionContext, Value};
 use crate::workload::{sql_string, WorkloadRow};
 
 const SQL_CHUNK_SIZE: usize = 500;
+const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 
 pub(crate) struct SqlFixture {
     session: SessionContext<InMemoryStorageBackend>,
     row_count: usize,
     insert_sql_chunks: Vec<String>,
     select_all_sql: String,
-    select_by_pk_sql_chunks: Vec<String>,
+    select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
     update_one_by_pk_sql: String,
     update_all_sql_rows: Vec<String>,
@@ -45,13 +46,10 @@ impl SqlFixture {
         result.len()
     }
 
-    pub(crate) async fn read_all_by_pk(&self) -> usize {
-        let mut total = 0;
-        for sql in &self.select_by_pk_sql_chunks {
-            total += execute(&self.session, sql).await.len();
-        }
-        assert_eq!(total, self.row_count);
-        total
+    pub(crate) async fn read_many_by_pk(&self) -> usize {
+        let result = execute(&self.session, &self.select_many_by_pk_sql).await;
+        assert_eq!(result.len(), READ_MANY_PK_COUNT.min(self.row_count));
+        result.len()
     }
 
     pub(crate) async fn read_one_by_pk(&self) -> usize {
@@ -104,7 +102,7 @@ fn fixture_for_session(
         row_count: rows.len(),
         insert_sql_chunks: rows.chunks(SQL_CHUNK_SIZE).map(insert_rows_sql).collect(),
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
-        select_by_pk_sql_chunks: rows.chunks(SQL_CHUNK_SIZE).map(select_by_pk_sql).collect(),
+        select_many_by_pk_sql: select_by_pk_sql(&rows[..READ_MANY_PK_COUNT.min(rows.len())]),
         select_one_by_pk_sql: select_by_pk_sql(&rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&rows[mid]),
         update_all_sql_rows: rows.iter().map(update_row_sql).collect(),

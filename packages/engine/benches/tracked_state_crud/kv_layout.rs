@@ -100,8 +100,9 @@ impl KvFixture {
             .read_all(self.rows.len(), StorageCoreProjection::FullValue)
     }
 
-    pub(crate) fn read_all_by_pk(&self) -> usize {
-        self.storage.read_points(&self.rows)
+    pub(crate) fn read_many_by_pk(&self, count: usize) -> usize {
+        self.storage
+            .read_points(&self.rows[..count.min(self.rows.len())])
     }
 
     pub(crate) fn read_one_by_pk(&self) -> usize {

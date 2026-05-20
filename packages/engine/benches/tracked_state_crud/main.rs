@@ -13,6 +13,8 @@ mod workload;
 use backends::{BackendProfile, BACKEND_PROFILES};
 use workload::{fixture_rows, row_label, WorkloadRow, REAL_WORKLOAD_ROWS, SMOKE_ROWS};
 
+const READ_MANY_PK_COUNT: usize = 10;
+
 fn tracked_state_crud_benches(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -76,10 +78,10 @@ fn bench_transaction_api(
             BatchSize::LargeInput,
         )
     });
-    group.bench_function(format!("read_all_by_pk/{}", row_label(rows.len())), |b| {
+    group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
             || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.read_all_by_pk())),
+            |fixture| black_box(runtime.block_on(fixture.read_many_by_pk(READ_MANY_PK_COUNT))),
             BatchSize::LargeInput,
         )
     });
@@ -145,10 +147,10 @@ fn bench_sql_session(
             BatchSize::LargeInput,
         )
     });
-    group.bench_function(format!("read_all_by_pk/{}", row_label(rows.len())), |b| {
+    group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(&rows)),
-            |fixture| black_box(runtime.block_on(fixture.read_all_by_pk())),
+            |fixture| black_box(runtime.block_on(fixture.read_many_by_pk())),
             BatchSize::LargeInput,
         )
     });
@@ -193,7 +195,7 @@ trait SyncOps {
     fn insert_all(fixture: &mut Self::Fixture) -> usize;
     fn read_all(fixture: &mut Self::Fixture) -> usize;
     fn read_one_by_pk(fixture: &mut Self::Fixture) -> usize;
-    fn read_all_by_pk(fixture: &mut Self::Fixture) -> usize;
+    fn read_many_by_pk(fixture: &mut Self::Fixture, count: usize) -> usize;
     fn update_all(fixture: &mut Self::Fixture) -> usize;
     fn update_one_by_pk(fixture: &mut Self::Fixture) -> usize;
     fn delete_all(fixture: &mut Self::Fixture) -> usize;
@@ -225,8 +227,8 @@ impl SyncOps for KvOps {
         fixture.read_one_by_pk()
     }
 
-    fn read_all_by_pk(fixture: &mut Self::Fixture) -> usize {
-        fixture.read_all_by_pk()
+    fn read_many_by_pk(fixture: &mut Self::Fixture, count: usize) -> usize {
+        fixture.read_many_by_pk(count)
     }
 
     fn update_all(fixture: &mut Self::Fixture) -> usize {
@@ -275,10 +277,10 @@ fn bench_sync_ops<O: SyncOps>(
             BatchSize::LargeInput,
         )
     });
-    group.bench_function(format!("read_all_by_pk/{}", row_label(rows.len())), |b| {
+    group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
-            |fixture| black_box(O::read_all_by_pk(fixture)),
+            |fixture| black_box(O::read_many_by_pk(fixture, READ_MANY_PK_COUNT)),
             BatchSize::LargeInput,
         )
     });

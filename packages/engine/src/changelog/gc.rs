@@ -5,8 +5,9 @@ use super::store::{
     by_change_index_value, by_change_key, by_change_membership_ids_from_key,
     by_change_membership_index_value, by_change_membership_key, by_commit_index_value,
     by_commit_key, commit_visibility_key, commit_visibility_value, segment_key,
-    visible_change_proof_key, BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-    BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    visible_change_proof_key, visible_change_proof_value, BY_CHANGE_INDEX_SPACE,
+    BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE,
+    SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::truth::{compute_retained_primary_closure, load_segment_truth_index};
 use super::types::{
@@ -399,11 +400,11 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
             by_change_membership_index_value(),
         );
     }
-    for (change_id, visibility) in &plan.repair.visible_change_proof {
+    for (change_id, commit_id) in &plan.repair.visible_change_proof {
         writes.put(
             VISIBLE_CHANGE_PROOF_SPACE,
             visible_change_proof_key(change_id),
-            commit_visibility_value(visibility)?,
+            visible_change_proof_value(commit_id),
         );
     }
     Ok(())
@@ -580,18 +581,17 @@ fn expected_visible_change_proofs(
     commit_index: &HashMap<String, (SegmentObjectLocation, SegmentCommit)>,
     live_commit_order: &[String],
     live_commits: &HashSet<String>,
-) -> HashMap<String, CommitVisibility> {
-    let visibilities = expected_commit_visibilities(commit_index, live_commits);
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for commit_id in live_commit_order {
         let Some((_, commit)) = commit_index.get(commit_id) else {
             continue;
         };
-        let Some(visibility) = visibilities.get(commit_id) else {
+        if !live_commits.contains(commit_id) {
             continue;
-        };
+        }
         for membership in &commit.body.membership {
-            out.insert(membership.member_change_id.clone(), visibility.clone());
+            out.insert(membership.member_change_id.clone(), commit_id.clone());
         }
     }
     out
@@ -1410,7 +1410,7 @@ mod tests {
         writes.put(
             VISIBLE_CHANGE_PROOF_SPACE,
             visible_change_proof_key("change-live"),
-            commit_visibility_value(&stale_visibility).unwrap(),
+            visible_change_proof_value(&stale_visibility.commit_id),
         );
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_sweeps_visible_change_proof_that_does_not_match_current_visibility() {
+    async fn gc_repairs_visible_change_proof_that_points_to_wrong_commit() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = canonicalize_segment(single_commit_segment(
@@ -1456,9 +1456,6 @@ mod tests {
             "change-live",
         ))
         .unwrap();
-        let mut stale_visibility = commit_visibility_from_segment(&live_segment, "commit-live");
-        stale_visibility.checksum = "stale-checksum".to_string();
-
         write_segments(&storage, &context, vec![live_segment], &["commit-live"]).await;
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
@@ -1466,7 +1463,7 @@ mod tests {
         writes.put(
             VISIBLE_CHANGE_PROOF_SPACE,
             visible_change_proof_key("change-live"),
-            commit_visibility_value(&stale_visibility).unwrap(),
+            visible_change_proof_value(&"wrong-commit".to_string()),
         );
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -1482,7 +1479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_rejects_visible_change_proof_that_matches_stale_visibility() {
+    async fn gc_rejects_stale_commit_visibility_even_when_visible_change_points_to_commit() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = canonicalize_segment(single_commit_segment(
@@ -1506,7 +1503,7 @@ mod tests {
         writes.put(
             VISIBLE_CHANGE_PROOF_SPACE,
             visible_change_proof_key("change-live"),
-            commit_visibility_value(&stale_visibility).unwrap(),
+            visible_change_proof_value(&"commit-live".to_string()),
         );
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -1524,7 +1521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_repairs_corrupt_live_visible_change_proof() {
+    async fn gc_repairs_stale_live_visible_change_proof() {
         let storage = test_storage();
         let context = ChangelogContext::new();
         let live_segment = single_commit_segment("segment-live", "commit-live", "change-live");
@@ -1536,7 +1533,7 @@ mod tests {
         writes.put(
             VISIBLE_CHANGE_PROOF_SPACE,
             visible_change_proof_key("change-live"),
-            b"not a commit visibility".to_vec(),
+            b"missing-commit".to_vec(),
         );
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
