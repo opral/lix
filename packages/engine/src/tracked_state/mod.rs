@@ -1,3 +1,5 @@
+#[cfg(feature = "storage-benches")]
+mod bench_support;
 mod by_file_index;
 mod codec;
 mod context;
@@ -24,8 +26,16 @@ pub(crate) use merge::{
 };
 pub(crate) use row_materialization::{materialize_rows_from_index_entries, TrackedRowProjection};
 #[allow(unused_imports)]
+pub(crate) use storage::{
+    TRACKED_STATE_BY_FILE_ROOT_SPACE, TRACKED_STATE_CHUNK_SPACE, TRACKED_STATE_PROJECTION_SPACE,
+};
+#[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter,
     TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateProjection, TrackedStateRowRequest,
     TrackedStateScanRequest,
 };
+#[cfg(feature = "storage-benches")]
+pub mod bench {
+    pub use super::bench_support::*;
+}

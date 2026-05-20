@@ -23,6 +23,7 @@ use crate::sql2::{
 };
 use crate::storage::{
     InMemoryStorageBackend, StorageBackend, StorageReadOptions, StorageWriteOptions,
+    StorageWriteSetStats,
 };
 use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWriteSet};
 use crate::tracked_state::{
@@ -48,7 +49,9 @@ use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct TransactionCommitOutcome;
+pub(crate) struct TransactionCommitOutcome {
+    pub(crate) storage_stats: StorageWriteSetStats,
+}
 
 /// One execution-scoped transaction capability for engine write paths.
 ///
@@ -322,13 +325,13 @@ where
             Err(error) => return Err(error),
         };
         writes.extend(transaction.staged_storage_writes);
-        commit_at_boundary(commit_boundary.as_ref(), || {
-            transaction
+        let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || {
+            let (_commit, stats) = transaction
                 .storage
                 .commit_write_set(writes, StorageWriteOptions::default())?;
-            Ok(())
+            Ok(stats)
         })?;
-        Ok(TransactionCommitOutcome::default())
+        Ok(TransactionCommitOutcome { storage_stats })
     }
 
     pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
