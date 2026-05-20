@@ -1,18 +1,15 @@
-use crate::backend::BackendRead;
 use crate::changelog::{Change, ChangeLocator, SegmentObjectLocation};
 use crate::common::NullableKeyFilter;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{
-    ScanPlan, StorageBackend, StorageBackendReadOf, StorageContext, StorageCoreProjection,
-    StoragePrefix, StorageRead, StorageReadOptions, StorageReadScope, StorageScanOptions,
-    StorageSpace, StorageWriteOptions, StorageWriteSetStats,
+    StorageBackend, StorageBackendRead, StorageBackendReadOf, StorageContext, StorageRead,
+    StorageReadOptions, StorageReadScope, StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
-use bytes::Bytes;
 
 #[derive(Clone)]
 pub struct BenchTrackedRow {
@@ -90,7 +87,7 @@ unsafe impl<R: Send> Sync for BenchRead<R> {}
 
 impl<R> StorageRead for BenchRead<R>
 where
-    R: BackendRead,
+    R: StorageBackendRead,
 {
     type BackendRead = R;
 
@@ -305,9 +302,15 @@ where
                 .begin_read(StorageReadOptions::default())
                 .expect("begin tracked-state layout accounting read"),
         );
-        native_storage_spaces()
-            .iter()
-            .map(|space| scan_layout_space(&read, *space))
+        crate::storage_bench::layout_accounting(&read)
+            .into_iter()
+            .map(|space| BenchLayoutAccounting {
+                space_id: space.space_id,
+                space: space.space,
+                rows: space.rows,
+                key_bytes: space.key_bytes,
+                value_bytes: space.value_bytes,
+            })
             .collect()
     }
 
@@ -320,69 +323,6 @@ where
         self.current_commit_id
             .as_deref()
             .expect("tracked-state fixture should be seeded")
-    }
-}
-
-fn native_storage_spaces() -> &'static [StorageSpace] {
-    &[
-        crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE,
-        crate::json_store::store::JSON_SPACE,
-        crate::tracked_state::storage::TRACKED_STATE_CHUNK_SPACE,
-        crate::tracked_state::storage::TRACKED_STATE_BY_FILE_ROOT_SPACE,
-        crate::tracked_state::storage::TRACKED_STATE_PROJECTION_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::SEGMENT_SPACE,
-        crate::changelog::COMMIT_VISIBILITY_SPACE,
-        crate::changelog::BY_COMMIT_INDEX_SPACE,
-        crate::changelog::BY_CHANGE_INDEX_SPACE,
-        crate::changelog::BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-        crate::changelog::VISIBLE_CHANGE_PROOF_SPACE,
-    ]
-}
-
-fn scan_layout_space<R>(read: &R, space: StorageSpace) -> BenchLayoutAccounting
-where
-    R: StorageRead,
-{
-    let result = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    )
-    .collect(
-        read,
-        StorageScanOptions {
-            projection: StorageCoreProjection::FullValue,
-            limit_rows: 1_000_000,
-            ..StorageScanOptions::default()
-        },
-    )
-    .expect("scan tracked-state layout space");
-
-    let rows = result.value.entries.len() as u64;
-
-    BenchLayoutAccounting {
-        space_id: space.id.0,
-        space: space.name,
-        rows,
-        key_bytes: result
-            .value
-            .entries
-            .iter()
-            .map(|entry| entry.key.0.len() as u64 + 4)
-            .sum(),
-        value_bytes: result
-            .value
-            .entries
-            .iter()
-            .map(|entry| match &entry.value {
-                crate::backend::ProjectedValue::KeyOnly => 0,
-                crate::backend::ProjectedValue::FullValue(value) => value.len() as u64,
-            })
-            .sum(),
     }
 }
 

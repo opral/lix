@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::entity_identity::EntityIdentity;
-use crate::storage::{StorageKey, StorageValue};
+use crate::storage::{
+    ScanPlan, StorageCoreProjection, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
+    StorageScanOptions, StorageValue, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
+};
 use crate::untracked_state::UntrackedStateRowRef;
 
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +33,97 @@ pub(crate) fn record_transaction_schema_catalog_load() {
 
 pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
     JSON_STORE_STAGE_BYTES.fetch_add(hash.len() as u64, Ordering::Relaxed);
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageLayoutAccounting {
+    pub space_id: u32,
+    pub space: &'static str,
+    pub rows: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+}
+
+pub(crate) fn commit_write_set_for_bench<B>(
+    storage: &crate::storage::StorageContext<B>,
+    writes: StorageWriteSet,
+) -> Result<crate::storage::StorageWriteSetStats, StorageWriteSetError>
+where
+    B: crate::storage::StorageBackend,
+{
+    let (_commit, stats) = storage.commit_write_set(writes, StorageWriteOptions::default())?;
+    Ok(stats)
+}
+
+pub fn layout_accounting<R>(read: &R) -> Vec<StorageLayoutAccounting>
+where
+    R: StorageRead,
+{
+    native_storage_spaces()
+        .iter()
+        .map(|space| scan_layout_space(read, *space))
+        .collect()
+}
+
+fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
+    &[
+        crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE,
+        crate::json_store::store::JSON_SPACE,
+        crate::tracked_state::TRACKED_STATE_CHUNK_SPACE,
+        crate::tracked_state::TRACKED_STATE_BY_FILE_ROOT_SPACE,
+        crate::tracked_state::TRACKED_STATE_PROJECTION_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+        crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
+        crate::changelog::SEGMENT_SPACE,
+        crate::changelog::COMMIT_VISIBILITY_SPACE,
+        crate::changelog::BY_COMMIT_INDEX_SPACE,
+        crate::changelog::BY_CHANGE_INDEX_SPACE,
+        crate::changelog::BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
+        crate::changelog::VISIBLE_CHANGE_PROOF_SPACE,
+    ]
+}
+
+fn scan_layout_space<R>(read: &R, space: crate::storage::StorageSpace) -> StorageLayoutAccounting
+where
+    R: StorageRead,
+{
+    let result = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    )
+    .collect(
+        read,
+        StorageScanOptions {
+            projection: StorageCoreProjection::FullValue,
+            limit_rows: 1_000_000,
+            ..StorageScanOptions::default()
+        },
+    )
+    .expect("scan storage bench layout space");
+
+    StorageLayoutAccounting {
+        space_id: space.id.0,
+        space: space.name,
+        rows: result.value.entries.len() as u64,
+        key_bytes: result
+            .value
+            .entries
+            .iter()
+            .map(|entry| entry.key.0.len() as u64 + 4)
+            .sum(),
+        value_bytes: result
+            .value
+            .entries
+            .iter()
+            .map(|entry| match &entry.value {
+                StorageProjectedValue::KeyOnly => 0,
+                StorageProjectedValue::FullValue(value) => value.len() as u64,
+            })
+            .sum(),
+    }
 }
 
 pub fn untracked_state_row_key_value(
