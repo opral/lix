@@ -589,7 +589,7 @@ export function V2Hero() {
         href="/blog/introducing-lix"
       >
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#08b5d6]" />
-        <span>Lix v0.6 "Ready to embed" was released</span>
+        <span>Lix v0.6 SDK was released</span>
         <span className="text-[#034e61]">Read the announcement →</span>
       </a>
       <h1
@@ -809,11 +809,11 @@ function Roadmap() {
         />
         <RoadmapMilestone
           title="now / v0.6"
-          subtitle="Ready to embed"
+          subtitle="Lix SDK"
           items={shipped}
           shipped
         />
-        <RoadmapMilestone title="v0.7" subtitle="CLI" items={roadmap07} />
+        <RoadmapMilestone title="v0.7" subtitle="Lix CLI" items={roadmap07} />
         <RoadmapMilestone
           title="v0.8"
           subtitle="file plugin API"
