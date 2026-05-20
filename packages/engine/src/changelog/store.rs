@@ -1,6 +1,6 @@
 use super::codec;
 use super::types::{
-    ByChangeEntry, ByCommitEntry, ChangeLoadBatch, ChangeLoadRequest, CommitLoadBatch,
+    ByChangeEntry, ByCommitEntry, ChangeLoadBatch, ChangeLoadRequest, CommitId, CommitLoadBatch,
     CommitLoadRequest, CommitVisibility, GcPlan, GcRoot, RebuildIndexStats, Segment,
     SegmentStageReport,
 };
@@ -101,10 +101,19 @@ pub(crate) fn commit_visibility_value(visibility: &CommitVisibility) -> Result<V
     codec::encode_commit_visibility(visibility)
 }
 
-pub(crate) fn visible_change_proof_value(
-    visibility: &CommitVisibility,
-) -> Result<Vec<u8>, LixError> {
-    codec::encode_commit_visibility(visibility)
+pub(crate) fn visible_change_proof_value(commit_id: &CommitId) -> Vec<u8> {
+    identity_key(commit_id)
+}
+
+pub(crate) fn visible_change_proof_commit_id_from_value(
+    bytes: &[u8],
+) -> Result<CommitId, LixError> {
+    String::from_utf8(bytes.to_vec()).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("visible_change proof value contains invalid UTF-8 commit id: {error}"),
+        )
+    })
 }
 
 pub(crate) fn by_commit_index_value(entry: &ByCommitEntry) -> Result<Vec<u8>, LixError> {

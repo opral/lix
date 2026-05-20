@@ -193,11 +193,11 @@ impl TransactionFixture {
         }
     }
 
-    pub(crate) async fn read_all_by_pk(&self) -> usize {
+    pub(crate) async fn read_many_by_pk(&self, count: usize) -> usize {
         match self {
-            Self::Sqlite(fixture) => fixture.read_all_by_pk().await,
-            Self::RocksDb(fixture) => fixture.read_all_by_pk().await,
-            Self::Redb(fixture) => fixture.read_all_by_pk().await,
+            Self::Sqlite(fixture) => fixture.read_many_by_pk(count).await,
+            Self::RocksDb(fixture) => fixture.read_many_by_pk(count).await,
+            Self::Redb(fixture) => fixture.read_many_by_pk(count).await,
         }
     }
 

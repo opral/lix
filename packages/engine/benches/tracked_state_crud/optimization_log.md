@@ -120,6 +120,62 @@ transaction table inventories every native storage space.
 | transaction | `0x00060005` | `changelog.index.by_change_membership` | 1,016 |    79,023 |           0 |
 | transaction | `0x00060006` | `changelog.index.visible_change`       | 1,016 |    40,559 |     283,664 |
 
+## Optimization Run: visible_change -> commit_id
+
+Date: 2026-05-20
+
+Change:
+
+- `changelog.index.visible_change` now stores `change_id -> commit_id`.
+- It no longer stores a full `CommitVisibility` locator/checksum payload per
+  visible change.
+- Readers still verify through current `commit_visibility(commit_id)` and
+  segment membership before treating a change as visible.
+- Routine smoke replaced `read_all_by_pk/1k` with `read_many_by_pk/10`; the old
+  serial 1,000-key benchmark took about 80-90 seconds per backend group and was
+  not a useful CRUD smoke signal.
+
+Smoke scorecard after this change. `read_many_by_pk` reads 10 primary keys:
+
+### Direct KV Layout
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    2.32 ms |   473 us |         295 us |          352 us |    2.62 ms |     670 us |    1.13 ms |     501 us |
+| RocksDB |     448 us |   158 us |        3.12 us |         9.14 us |     483 us |    9.34 us |    5.82 us |    12.2 us |
+| redb    |    7.43 ms |   199 us |        12.6 us |         22.2 us |    8.15 ms |    4.14 ms |    4.58 ms |    4.64 ms |
+
+### Transaction Layer
+
+Direct transaction API, bypassing SQL.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   34.77 ms | 18.09 ms |        8.86 ms |        85.40 ms |  100.97 ms |   68.25 ms |   91.43 ms |   68.17 ms |
+| RocksDB |   30.27 ms | 17.68 ms |        8.21 ms |        83.35 ms |   90.37 ms |   66.39 ms |   88.94 ms |   64.31 ms |
+| redb    |   43.34 ms | 16.84 ms |        8.22 ms |        80.19 ms |  103.48 ms |   69.60 ms |   96.40 ms |   68.96 ms |
+
+### SQL Session
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   70.25 ms | 20.34 ms |        5.81 ms |         9.27 ms |   excluded |   excluded |  101.20 ms |   82.01 ms |
+
+Accounting delta for 1k transaction insert/update/delete:
+
+| Metric                         |    Before |     After |    Delta |
+| ------------------------------ | --------: | --------: | -------: |
+| `visible_change` rows          |     1,016 |     1,016 |        0 |
+| `visible_change` key bytes     |    40,559 |    40,559 |        0 |
+| `visible_change` value bytes   |   283,664 |    36,432 | -247,232 |
+| transaction `insert_all` bytes | 2,031,993 | 1,787,993 | -244,000 |
+| transaction `update_all` bytes | 2,118,264 | 1,874,264 | -244,000 |
+| transaction `delete_all` bytes | 1,487,657 | 1,243,657 | -244,000 |
+
+Net: about 12% less transaction write bytes on 1k `insert_all`, 11.5% less on
+`update_all`, and 16.4% less on `delete_all`. Put amplification is unchanged
+because the index still has one row per visible change.
+
 ## 10k Reference Checks
 
 The full 10k matrix was started once after the rebase to understand scale, but

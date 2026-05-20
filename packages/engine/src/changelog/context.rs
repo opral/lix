@@ -22,9 +22,10 @@ use super::store::{
     by_change_index_value, by_change_key, by_change_membership_commit_id_from_key,
     by_change_membership_index_value, by_change_membership_key, by_change_membership_prefix,
     by_commit_index_value, by_commit_key, commit_visibility_key, commit_visibility_value,
-    segment_key, segment_value, visible_change_proof_key, visible_change_proof_value,
-    BY_CHANGE_INDEX_SPACE, BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE,
-    COMMIT_VISIBILITY_SPACE, SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    segment_key, segment_value, visible_change_proof_commit_id_from_value,
+    visible_change_proof_key, visible_change_proof_value, BY_CHANGE_INDEX_SPACE,
+    BY_CHANGE_MEMBERSHIP_INDEX_SPACE, BY_COMMIT_INDEX_SPACE, COMMIT_VISIBILITY_SPACE,
+    SEGMENT_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
 };
 use super::truth::{
     find_change_by_exhaustive_segment_scan, find_changes_by_exhaustive_segment_scan,
@@ -969,7 +970,7 @@ where
     async fn load_visible_change_proofs_many(
         &mut self,
         change_ids: &[String],
-    ) -> Result<Vec<Option<CommitVisibility>>, LixError> {
+    ) -> Result<Vec<Option<String>>, LixError> {
         let values = get_many(
             &mut self.store,
             VISIBLE_CHANGE_PROOF_SPACE,
@@ -981,7 +982,11 @@ where
         .await?;
         values
             .into_iter()
-            .map(|value| Ok(value.and_then(|bytes| decode_commit_visibility(&bytes).ok())))
+            .map(|value| {
+                value
+                    .map(|bytes| visible_change_proof_commit_id_from_value(&bytes))
+                    .transpose()
+            })
             .collect()
     }
 
@@ -1200,16 +1205,12 @@ where
     ) -> Result<(HashSet<String>, HashSet<String>), LixError> {
         let proofs = self.load_visible_change_proofs_many(change_ids).await?;
         let mut changes_by_commit: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut proof_by_commit = HashMap::new();
         for (change_id, proof) in change_ids.iter().zip(proofs.into_iter()) {
-            let Some(proof) = proof else {
+            let Some(commit_id) = proof else {
                 continue;
             };
-            proof_by_commit
-                .entry(proof.commit_id.clone())
-                .or_insert_with(|| proof.clone());
             changes_by_commit
-                .entry(proof.commit_id)
+                .entry(commit_id)
                 .or_default()
                 .insert(change_id.clone());
         }
@@ -1221,16 +1222,10 @@ where
         let current_visibilities = self.load_commit_visibility_many(&commit_ids).await?;
         let mut segment_ids = Vec::new();
         let mut usable = Vec::new();
-        for (commit_id, current) in commit_ids.iter().zip(current_visibilities.into_iter()) {
+        for current in current_visibilities.into_iter() {
             let Some(current) = current else {
                 continue;
             };
-            let Some(proof) = proof_by_commit.get(commit_id) else {
-                continue;
-            };
-            if proof.location != current.location || proof.checksum != current.checksum {
-                continue;
-            }
             push_unique(&mut segment_ids, current.location.segment_id.clone());
             usable.push(current);
         }
@@ -1861,7 +1856,7 @@ where
                 self.writes.put(
                     VISIBLE_CHANGE_PROOF_SPACE,
                     visible_change_proof_key(&membership.member_change_id),
-                    visible_change_proof_value(&visibility)?,
+                    visible_change_proof_value(&visibility.commit_id),
                 );
             }
         }
@@ -2591,7 +2586,7 @@ where
             for membership in &commit.body.membership {
                 expected_rows.insert(
                     visible_change_proof_key(&membership.member_change_id),
-                    visible_change_proof_value(&visibility)?,
+                    visible_change_proof_value(&visibility.commit_id),
                 );
             }
         }
@@ -2941,10 +2936,7 @@ mod tests {
             expected_visibility
         );
         let visible_proof_bytes = result[5][0].as_deref().unwrap();
-        assert_eq!(
-            decode_commit_visibility(visible_proof_bytes).unwrap(),
-            expected_visibility
-        );
+        assert_eq!(visible_proof_bytes, b"commit-1");
     }
 
     #[tokio::test]
@@ -3717,7 +3709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_changes_visible_recovers_from_corrupt_visible_change_proof() {
+    async fn load_changes_visible_recovers_from_stale_visible_change_proof() {
         let (context, storage) = changelog_test_context();
         let segment = test_segment();
 
@@ -3736,7 +3728,7 @@ mod tests {
         writes.put(
             VISIBLE_CHANGE_PROOF_SPACE,
             visible_change_proof_key("change-1"),
-            b"not a commit visibility".to_vec(),
+            b"missing-commit".to_vec(),
         );
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
@@ -3749,7 +3741,7 @@ mod tests {
                 visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
             })
             .await
-            .expect("corrupt visible proof should fall back to membership/visibility truth");
+            .expect("stale visible proof should fall back to membership/visibility truth");
 
         assert_eq!(
             batch.entries,

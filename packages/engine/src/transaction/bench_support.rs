@@ -207,6 +207,15 @@ where
         count
     }
 
+    pub async fn read_many_by_pk(&self, count: usize) -> usize {
+        let count = count.min(self.rows.len());
+        let mut found = 0;
+        for row in &self.rows[..count] {
+            found += self.read_one(row).await;
+        }
+        found
+    }
+
     pub async fn read_one_by_pk(&self) -> usize {
         self.read_one(&self.rows[self.rows.len() / 2]).await
     }
