@@ -278,6 +278,50 @@ Layout footprint after 1k transaction insert:
 | transaction | `0x00060005` | `changelog.index.by_change_membership` |     0 |         0 |           0 |
 | transaction | `0x00060006` | `changelog.index.visible_change`       | 1,016 |    40,559 |      36,432 |
 
+## Pre Physical Layout Change Smoke: commit/change direct-layout planning
+
+Date: 2026-05-20
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+```
+
+Purpose:
+
+- Capture the current 1k smoke scorecard before changing the physical layout
+  away from segment-centered changelog storage.
+- This run is still on the existing implemented layout:
+  `changelog.segment`, `commit_visibility`, `by_commit`, `by_change`,
+  authored-only `by_change_membership`, `visible_change`, and
+  `tracked_state.projection`.
+- `read_many_by_pk` reads 10 primary keys.
+
+### Direct KV Layout
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    2.47 ms |   561 us |         342 us |          391 us |    2.81 ms |     703 us |    1.25 ms |     555 us |
+| RocksDB |     489 us |   173 us |        6.26 us |         14.5 us |     536 us |    12.7 us |    7.69 us |    7.37 us |
+| redb    |    7.22 ms |   179 us |        28.6 us |         28.6 us |    8.18 ms |    3.94 ms |    4.28 ms |    4.01 ms |
+
+### Transaction Layer
+
+Direct transaction API, bypassing SQL.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   35.54 ms | 18.93 ms |        9.69 ms |        89.16 ms |  100.36 ms |   72.15 ms |   96.67 ms |   67.77 ms |
+| RocksDB |   30.25 ms | 17.97 ms |        8.42 ms |        86.40 ms |   96.97 ms |   66.33 ms |   89.20 ms |   65.77 ms |
+| redb    |   40.77 ms | 18.22 ms |        8.79 ms |        83.34 ms |  105.39 ms |   81.10 ms |  105.89 ms |   74.69 ms |
+
+### SQL Session
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   76.84 ms | 21.72 ms |        6.68 ms |         7.75 ms |   excluded |   excluded |  111.17 ms |   87.64 ms |
+
 ## 10k Reference Checks
 
 The full 10k matrix was started once after the rebase to understand scale, but
