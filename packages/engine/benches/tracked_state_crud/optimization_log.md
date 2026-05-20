@@ -176,6 +176,26 @@ Net: about 12% less transaction write bytes on 1k `insert_all`, 11.5% less on
 `update_all`, and 16.4% less on `delete_all`. Put amplification is unchanged
 because the index still has one row per visible change.
 
+Layout footprint after 1k transaction insert:
+
+| Layer       |     Space id | Space                                  |  Rows | Key bytes | Value bytes |
+| ----------- | -----------: | -------------------------------------- | ----: | --------: | ----------: |
+| kv_layout   | `0x00020001` | `tracked_state.crud.row.v1`            | 1,000 |    87,244 |     396,363 |
+| transaction | `0x00010002` | `untracked_state.row.v1`               |     2 |       120 |         273 |
+| transaction | `0x00020001` | `json_store.json`                      |     0 |         0 |           0 |
+| transaction | `0x00040001` | `tracked_state.tree.chunk`             |    33 |     1,188 |     413,693 |
+| transaction | `0x00040003` | `tracked_state.tree.root.by_file`      |     0 |         0 |           0 |
+| transaction | `0x00040004` | `tracked_state.projection`             |     2 |        71 |         288 |
+| transaction | `0x00050001` | `binary_cas.manifest`                  |     0 |         0 |           0 |
+| transaction | `0x00050002` | `binary_cas.manifest_chunk`            |     0 |         0 |           0 |
+| transaction | `0x00050003` | `binary_cas.chunk`                     |     0 |         0 |           0 |
+| transaction | `0x00060001` | `changelog.segment`                    |     2 |       124 |   1,156,775 |
+| transaction | `0x00060002` | `changelog.commit_visibility`          |     2 |        71 |         509 |
+| transaction | `0x00060003` | `changelog.index.by_commit`            |     2 |        71 |         428 |
+| transaction | `0x00060004` | `changelog.index.by_change`            | 1,016 |    40,559 |     214,639 |
+| transaction | `0x00060005` | `changelog.index.by_change_membership` | 1,016 |    79,023 |           0 |
+| transaction | `0x00060006` | `changelog.index.visible_change`       | 1,016 |    40,559 |      36,432 |
+
 ## 10k Reference Checks
 
 The full 10k matrix was started once after the rebase to understand scale, but
