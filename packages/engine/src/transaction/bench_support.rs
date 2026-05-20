@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value as JsonValue};
 
 use crate::binary_cas::BinaryCasContext;
@@ -12,15 +11,14 @@ use crate::live_state::{
 };
 use crate::session::SessionMode;
 use crate::storage::{
-    ScanPlan, StorageBackend, StorageBackendReadOf, StorageContext, StorageCoreProjection,
-    StoragePrefix, StorageRead, StorageReadOptions, StorageReadScope, StorageScanOptions,
-    StorageSpace, StorageWriteOptions, StorageWriteSet, StorageWriteSetStats,
+    StorageBackend, StorageBackendRead, StorageBackendReadOf, StorageContext, StorageRead,
+    StorageReadOptions, StorageReadScope, StorageWriteSet, StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::VersionContext;
-use crate::{BackendRead, NullableKeyFilter, GLOBAL_VERSION_ID};
+use crate::{NullableKeyFilter, GLOBAL_VERSION_ID};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "tracked-crud-schema-fixture";
 const TIMESTAMP: &str = "2026-05-19T00:00:00.000Z";
@@ -60,7 +58,7 @@ unsafe impl<R: Send> Sync for BenchRead<R> {}
 
 impl<R> StorageRead for BenchRead<R>
 where
-    R: BackendRead,
+    R: StorageBackendRead,
 {
     type BackendRead = R;
 
@@ -272,9 +270,15 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .expect("begin transaction layout accounting read");
-        native_storage_spaces()
-            .iter()
-            .map(|space| scan_layout_space(&read, *space))
+        crate::storage_bench::layout_accounting(&read)
+            .into_iter()
+            .map(|space| BenchLayoutAccounting {
+                space_id: space.space_id,
+                space: space.space,
+                rows: space.rows,
+                key_bytes: space.key_bytes,
+                value_bytes: space.value_bytes,
+            })
             .collect()
     }
 }
@@ -384,8 +388,7 @@ async fn seed_visible_schema_rows<B>(
             bench_version_ref_row.row.as_ref(),
         ])
         .expect("schema fixture version ref should stage");
-    storage
-        .commit_write_set(writes, StorageWriteOptions::default())
+    crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .expect("schema fixture transaction should commit");
 }
 
@@ -401,65 +404,4 @@ fn json_pointer_schema() -> JsonValue {
         "required": ["path", "value"],
         "additionalProperties": false
     })
-}
-
-fn native_storage_spaces() -> &'static [StorageSpace] {
-    &[
-        crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE,
-        crate::json_store::store::JSON_SPACE,
-        crate::tracked_state::TRACKED_STATE_CHUNK_SPACE,
-        crate::tracked_state::TRACKED_STATE_BY_FILE_ROOT_SPACE,
-        crate::tracked_state::TRACKED_STATE_PROJECTION_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
-        crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::SEGMENT_SPACE,
-        crate::changelog::COMMIT_VISIBILITY_SPACE,
-        crate::changelog::BY_COMMIT_INDEX_SPACE,
-        crate::changelog::BY_CHANGE_INDEX_SPACE,
-        crate::changelog::BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-        crate::changelog::VISIBLE_CHANGE_PROOF_SPACE,
-    ]
-}
-
-fn scan_layout_space<R>(read: &R, space: StorageSpace) -> BenchLayoutAccounting
-where
-    R: crate::storage::StorageRead,
-{
-    let result = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    )
-    .collect(
-        read,
-        StorageScanOptions {
-            projection: StorageCoreProjection::FullValue,
-            limit_rows: 1_000_000,
-            ..StorageScanOptions::default()
-        },
-    )
-    .expect("scan transaction layout space");
-
-    BenchLayoutAccounting {
-        space_id: space.id.0,
-        space: space.name,
-        rows: result.value.entries.len() as u64,
-        key_bytes: result
-            .value
-            .entries
-            .iter()
-            .map(|entry| entry.key.0.len() as u64 + 4)
-            .sum(),
-        value_bytes: result
-            .value
-            .entries
-            .iter()
-            .map(|entry| match &entry.value {
-                crate::backend::ProjectedValue::KeyOnly => 0,
-                crate::backend::ProjectedValue::FullValue(value) => value.len() as u64,
-            })
-            .sum(),
-    }
 }
