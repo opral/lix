@@ -2891,7 +2891,7 @@ mod tests {
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
         let stats = writes.apply(&mut *transaction).await.unwrap();
-        assert_eq!(stats.staged_puts, 6);
+        assert_eq!(stats.staged_puts, 5);
         transaction.commit().await.unwrap();
 
         let result = read_test_value_groups(
@@ -2928,7 +2928,7 @@ mod tests {
         assert_eq!(by_change.change_id, "change-1");
         assert_eq!(by_change.location.segment_id, "segment-1");
 
-        assert_eq!(result[3][0].as_deref(), Some([].as_slice()));
+        assert_eq!(result[3][0], None);
 
         let visibility_bytes = result[4][0].as_deref().unwrap();
         assert_eq!(
@@ -3784,8 +3784,8 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 4,
-                put: 3,
+                expected: 3,
+                put: 2,
                 deleted: 0,
                 unchanged: 1
             }
@@ -3856,8 +3856,8 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 3,
-                put: 3,
+                expected: 2,
+                put: 2,
                 deleted: 0,
                 unchanged: 0
             }
@@ -3915,10 +3915,10 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 3,
+                expected: 2,
                 put: 0,
                 deleted: 3,
-                unchanged: 3
+                unchanged: 2
             }
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -3973,10 +3973,10 @@ mod tests {
         assert_eq!(
             by_change_membership,
             RebuildIndexStats {
-                expected: 1,
+                expected: 0,
                 put: 0,
                 deleted: 1,
-                unchanged: 1
+                unchanged: 0
             }
         );
         writes.apply(&mut *transaction).await.unwrap();
@@ -4028,9 +4028,9 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 3,
-                put: 3,
-                deleted: 0,
+                expected: 2,
+                put: 2,
+                deleted: 1,
                 unchanged: 0
             }
         );
@@ -4088,10 +4088,10 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 3,
+                expected: 2,
                 put: 2,
                 deleted: 0,
-                unchanged: 1
+                unchanged: 0
             }
         );
         writes.apply(&mut *transaction).await.unwrap();

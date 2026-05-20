@@ -826,10 +826,7 @@ mod tests {
         assert_eq!(plan.sweep.segments, vec!["segment-dead"]);
         assert_eq!(plan.sweep.by_commit, vec!["commit-dead"]);
         assert_eq!(plan.sweep.by_change, vec!["change-dead"]);
-        assert_eq!(
-            plan.sweep.by_change_membership,
-            vec![("change-dead".to_string(), "commit-dead".to_string())]
-        );
+        assert!(plan.sweep.by_change_membership.is_empty());
     }
 
     #[tokio::test]
@@ -2245,8 +2242,8 @@ mod tests {
         assert_eq!(
             stats,
             RebuildIndexStats {
-                expected: 4,
-                put: 3,
+                expected: 3,
+                put: 2,
                 deleted: 0,
                 unchanged: 1
             }

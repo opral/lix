@@ -192,7 +192,7 @@ pub(crate) async fn assert_mandatory_index_rows_match_segment(
         directory_change_location(segment, "change-1").unwrap()
     );
 
-    assert_eq!(result[2][0].as_deref(), Some([].as_slice()));
+    assert_eq!(result[2][0], None);
 }
 
 pub(crate) fn stage_stale_mandatory_index_rows(writes: &mut StorageWriteSet) {
@@ -237,10 +237,7 @@ pub(crate) async fn assert_stale_mandatory_index_rows_deleted(storage: &StorageC
             ),
             (
                 BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-                vec![
-                    by_change_membership_key("stale-change", "stale-commit"),
-                    by_change_membership_key("change-1", "commit-1"),
-                ],
+                vec![by_change_membership_key("stale-change", "stale-commit")],
             ),
         ],
     );
@@ -250,7 +247,6 @@ pub(crate) async fn assert_stale_mandatory_index_rows_deleted(storage: &StorageC
     assert_eq!(result[1][0], None);
     assert!(result[1][1].is_some());
     assert_eq!(result[2][0], None);
-    assert_eq!(result[2][1].as_deref(), Some([].as_slice()));
 }
 
 pub(crate) async fn write_raw_segment(storage: &StorageContext, segment: &Segment) {
