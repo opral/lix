@@ -6,6 +6,13 @@ description: Lix's storage is pluggable. Implement the LixBackend interface (a s
 
 Lix's engine is independent of where the bytes live. Storage is exposed through a single interface, `LixBackend`, that any transactional key-value store can implement. Open a Lix with a different backend and the rest of the API (`openLix`, `execute`, `createVersion`, `mergeVersion`, …) is unchanged.
 
+Lix stops at the storage boundary. The engine writes semantic rows and chunks
+such as changelog commits, changelog changes, commit change-ref chunks, JSON
+payload rows, and tracked-state tree chunks. The backend is responsible for the
+physical layout underneath those rows: pages, B-trees, LSM/SST files, WALs,
+checksums, caches, locks, compaction, and file/object placement. In other
+words, Lix defines *what facts exist*; the backend decides *how bytes are stored*.
+
 ## What ships today
 
 | Backend                        | Module                          | Use for                              |
@@ -170,6 +177,26 @@ Every batch operation is grouped by `namespace: string`. Treat namespaces as log
 
 The current JS/WASM engine bridge sends engine storage through one namespace, `"default"`, and encodes Lix storage-space identity into the key bytes. Backends must still implement namespace isolation because the public backend contract supports multiple namespaces and direct backend tests may exercise them, but engine traffic today does not require dynamic namespace creation.
 
+### Physical boundary
+
+The keys and values Lix writes are already the engine's physical contract. They
+are semantic storage rows, not instructions for how a backend should arrange
+disk blocks. A backend should not try to understand Lix-level spaces like
+`changelog.commit`, `changelog.change`, or `tracked_state.tree_chunk` beyond
+storing and scanning the bytes by namespace/key.
+
+This is intentional. SQLite should use its pages, B-trees, WAL, and overflow
+pages. RocksDB should use its memtables, WAL, SST blocks, block cache, and
+compaction. redb should use its copy-on-write B-trees and MVCC pages. An object
+storage backend might build its own manifest/chunk scheme. Those are backend
+concerns.
+
+Lix therefore avoids a second giant application-level packfile/segment layer on
+top of those systems. If Lix needs locality for a first-class query, it expresses
+that as a semantic row or bounded chunk, for example
+`commit_id/chunk_no -> commit_change_ref_chunk`. It does not require every
+backend to store many unrelated facts inside one opaque value.
+
 ## Required guarantees
 
 1. **Atomic write batches.** `writeKvBatch` either applies all ordered operations across all namespaces, or none of them. A partial failure must roll back the batch.
@@ -190,7 +217,7 @@ The contract is small enough that **any transactional KV store with a synchronou
 
 **Synchronous, ready today.** `better-sqlite3` (shipping), `node:sqlite` (Node 22+, sync), in-memory `Map`, OPFS via `createSyncAccessHandle` (web workers only), Neon/NAPI bindings to RocksDB or LMDB that expose sync APIs.
 
-**Relational (Postgres, MySQL, SQLite-elsewhere)** (*async-only Node bindings*. One table per namespace, or a shared `(namespace, key)` PK table. Wrap each Lix transaction in a SQL transaction. Use repeatable-read isolation for reads, serializable or `SELECT ... FOR UPDATE` for writes. Postgres `bytea` matches Lix's byte-ordered scan requirement.
+**Relational (Postgres, MySQL, SQLite-elsewhere)** (*async-only Node bindings*. One table per namespace, or a shared `(namespace, key)` PK table. Wrap each Lix transaction in a SQL transaction. Use repeatable-read isolation for reads, serializable or `SELECT ... FOR UPDATE` for writes. Postgres `bytea` matches Lix's byte-ordered scan requirement. Let the database own page layout, indexes, WAL, checkpoints, and vacuum/compaction; Lix only needs ordered transactional rows.
 
 **Object storage (S3, R2, GCS)** (*async-only*, plus not natively transactional. Coordinate writes via a manifest object plus conditional PUT (`If-Match`). For atomic multi-key batches: stage chunks → upload → swap the manifest pointer in one CAS.
 
@@ -198,7 +225,7 @@ The contract is small enough that **any transactional KV store with a synchronou
 
 **Browser.** *async-only* for IndexedDB, *sync if used in a worker* for OPFS. IndexedDB needs object stores declared at `onupgradeneeded`, so the namespace set must be known up front. The auto-commit-on-event-loop trap means buffered-write strategies are the only safe path.
 
-**Embedded KV (RocksDB, LMDB, sled)** fit varies by binding. The closest-shaped substrates; map namespaces to column families or key prefixes. Native ranged iterators map directly to `scanKeys`. Sync via Neon binding or N-API works today; async-only bindings will need the future async backend.
+**Embedded KV (RocksDB, LMDB, sled)** fit varies by binding. The closest-shaped substrates; map namespaces to column families or key prefixes. Native ranged iterators map directly to `scanKeys`. Sync via Neon binding or N-API works today; async-only bindings will need the future async backend. Do not mirror Lix's old segment idea inside the backend; these engines already have blocks, pages, caches, and compaction.
 
 **Distributed KV (DynamoDB, FoundationDB, TiKV)** (*async-only* in JS. Native transactional semantics. Redis with `MULTI`/`EXEC` is workable for single-instance setups, but its weak isolation makes multi-writer risky.
 
@@ -218,5 +245,11 @@ Run the same suite against the in-memory and `better-sqlite3` backends as a base
 ## Why this design
 
 The engine that implements branches, merge, schemas, change journals, and SQL queries is one piece of code. The storage is another. Keeping the contract small (synchronous, namespaced, transactional KV) is what makes it tractable to put Lix on a SQLite file today and on Postgres, S3, or Durable Objects once the async variant lands, without forking the engine.
+
+That boundary is also why Lix writes rows instead of owning a universal
+on-disk pack format. Backends are better positioned to decide physical layout
+for their substrate. The engine's job is to produce stable semantic facts and
+derived read models; the backend's job is to make those rows durable, ordered,
+transactional, cached, and compacted.
 
 Same shape DuckDB takes with its readers: one engine, many places to read bytes from. Lix takes it for writes too.
