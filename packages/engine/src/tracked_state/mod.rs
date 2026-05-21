@@ -1,38 +1,32 @@
 #[cfg(feature = "storage-benches")]
 mod bench_support;
-mod by_file_index;
 mod codec;
+mod commit_root_rebuild;
 mod context;
 mod diff;
 mod merge;
-mod projection_root_rebuild;
 mod row_materialization;
 mod storage;
 mod tree;
 mod types;
 
-#[allow(unused_imports)]
-pub(crate) use context::{
-    TrackedStateContext, TrackedStateRootRebuilder, TrackedStateStoreReader, TrackedStateWriter,
-};
-#[allow(unused_imports)]
+pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader};
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow,
 };
-#[allow(unused_imports)]
 pub(crate) use merge::{
-    plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
+    plan_merge, TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
 };
-pub(crate) use row_materialization::{materialize_rows_from_index_entries, TrackedRowProjection};
-#[allow(unused_imports)]
-pub(crate) use storage::{
-    TRACKED_STATE_BY_FILE_ROOT_SPACE, TRACKED_STATE_CHUNK_SPACE, TRACKED_STATE_PROJECTION_SPACE,
+pub(crate) use row_materialization::{
+    materialize_rows_from_index_entries, TrackedRowMaterialization,
 };
-#[allow(unused_imports)]
+#[cfg(feature = "storage-benches")]
+pub(crate) use storage::{TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE};
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use types::TrackedStateKey;
 pub(crate) use types::{
-    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateProjection, TrackedStateRowRequest,
+    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest,
 };
 #[cfg(feature = "storage-benches")]

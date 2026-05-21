@@ -1303,7 +1303,7 @@ mod tests {
     use crate::binary_cas::BlobDataReader;
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
-        CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
+        CommitGraphReader, ReachableCommitGraphCommit,
     };
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
@@ -1326,7 +1326,6 @@ mod tests {
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
-    use crate::untracked_state::UntrackedStateContext;
     use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
     use crate::{LixError, NullableKeyFilter, Value, GLOBAL_VERSION_ID};
@@ -1541,12 +1540,10 @@ mod tests {
             let count = match &write {
                 TransactionWrite::Rows { rows, .. } => rows.len() as u64,
                 TransactionWrite::RowsWithFileData { count, .. } => *count,
-                TransactionWrite::AdoptedChanges { changes } => changes.len() as u64,
             };
             let rows = match write {
                 TransactionWrite::Rows { rows, .. } => rows,
                 TransactionWrite::RowsWithFileData { rows, .. } => rows,
-                TransactionWrite::AdoptedChanges { .. } => Vec::new(),
             };
             self.staged_writes
                 .lock()
@@ -1606,38 +1603,11 @@ mod tests {
             Ok(None)
         }
 
-        async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
-            Ok(Vec::new())
-        }
-
         async fn reachable_commits(
             &mut self,
             _head_commit_id: &str,
         ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
             Ok(Vec::new())
-        }
-
-        async fn best_common_ancestors(
-            &mut self,
-            _left_commit_id: &str,
-            _right_commit_id: &str,
-        ) -> Result<Vec<CommitGraphCommit>, LixError> {
-            Ok(Vec::new())
-        }
-
-        async fn merge_base(
-            &mut self,
-            _left_commit_id: &str,
-            _right_commit_id: &str,
-        ) -> Result<CommitGraphCommit, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "dummy commit graph reader cannot resolve merge base",
-            ))
-        }
-
-        fn commit_edges(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
-            Vec::new()
         }
 
         async fn change_history_from_commit(
@@ -4996,64 +4966,6 @@ mod tests {
         assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
         assert!(rows.iter().any(|row| row.entity_id == "[\"entity-1\"]"));
         assert!(rows.iter().any(|row| row.entity_id == "[\"entity-2\"]"));
-    }
-
-    struct BackendSqlExecutionContext<'a> {
-        active_version_id: &'a str,
-        storage: StorageContext,
-        blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateReader>,
-        schema_definitions: Vec<JsonValue>,
-    }
-
-    impl SqlExecutionContext for BackendSqlExecutionContext<'_> {
-        type ReadStore = StorageReadScope<InMemoryStorageRead>;
-
-        fn active_version_id(&self) -> &str {
-            self.active_version_id
-        }
-
-        fn live_state(&self) -> Arc<dyn LiveStateReader> {
-            Arc::clone(&self.live_state)
-        }
-
-        fn functions(&self) -> FunctionProviderHandle {
-            test_functions()
-        }
-
-        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-            Arc::clone(&self.blob_reader)
-        }
-
-        fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
-            let read_scope = test_read_scope(&self.storage);
-            HistoryQuerySource {
-                json_reader: JsonStoreContext::new().reader(read_scope.store()),
-            }
-        }
-
-        fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
-            let read_scope = test_read_scope(&self.storage);
-            ChangelogQuerySource {
-                store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope.store()),
-            }
-        }
-
-        fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-            Box::new(DummyCommitGraphReader)
-        }
-
-        fn version_ref(&self) -> Arc<dyn VersionRefReader> {
-            Arc::new(
-                crate::version::VersionContext::new(Arc::new(UntrackedStateContext::new()))
-                    .ref_reader(test_read_scope(&self.storage)),
-            )
-        }
-
-        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-            Ok(self.schema_definitions.clone())
-        }
     }
 
     async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, crate::LixError>

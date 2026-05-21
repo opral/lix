@@ -824,18 +824,18 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_adopts_source_change_without_minting_equivalent_copy,
+    merge_version_selects_source_change_without_minting_equivalent_copy,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         main.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-target', 'target')",
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-select-target', 'target')",
             &[],
         )
         .await
         .expect("main write should succeed");
         draft
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-change', 'source')",
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-select-change', 'source')",
                 &[],
             )
             .await
@@ -864,8 +864,8 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND entity_id = lix_json('[\"merge-adopt-change\"]') \
-	       AND snapshot_content = lix_json('{\"key\":\"merge-adopt-change\",\"value\":\"source\"}')",
+	       AND entity_id = lix_json('[\"merge-select-change\"]') \
+	       AND snapshot_content = lix_json('{\"key\":\"merge-select-change\",\"value\":\"source\"}')",
         )
         .await;
         assert_eq!(
@@ -878,7 +878,7 @@ simulation_test!(
                 "SELECT snapshot_content \
 	             FROM lix_state_history \
 	             WHERE start_commit_id = lix_active_version_commit_id() \
-	               AND entity_id = lix_json('[\"merge-adopt-change\"]') \
+	               AND entity_id = lix_json('[\"merge-select-change\"]') \
 	             ORDER BY depth",
                 &[],
             )
@@ -887,13 +887,13 @@ simulation_test!(
         assert_eq!(
             history.len(),
             1,
-            "history should show the adopted canonical change once, not once from the merge commit and once from the source parent"
+            "history should show the selected canonical change once, not once from the merge commit and once from the source parent"
         );
     }
 );
 
 simulation_test!(
-    merge_version_adopts_schema_registration_before_schema_rows,
+    merge_version_selects_schema_registration_before_schema_rows,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -928,7 +928,7 @@ simulation_test!(
             source_version_id: "draft-version".to_string(),
         })
         .await
-        .expect("merge should adopt schema registration before rows that use it");
+        .expect("merge should select schema registration before rows that use it");
 
         let reopened_main = sim.wrap_session(
             engine

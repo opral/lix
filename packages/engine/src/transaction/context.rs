@@ -26,10 +26,7 @@ use crate::storage::{
     StorageWriteSetStats,
 };
 use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWriteSet};
-use crate::tracked_state::{
-    materialize_rows_from_index_entries, TrackedRowProjection, TrackedStateContext,
-    TrackedStateDiffRow, TrackedStateStoreReader,
-};
+use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
@@ -39,9 +36,9 @@ use crate::transaction::prepare_version_ref_row;
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
 use crate::transaction::types::{
-    stage_json_from_value, PreparedAdoptedStateRow, PreparedRowFacts, PreparedStateRow,
-    PreparedTransactionWrite, TransactionAdoptedChange, TransactionFileData, TransactionJson,
-    TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TransactionWriteRow,
+    stage_json_from_value, PreparedStateRow, PreparedTransactionWrite, StagedCommitChangeRef,
+    TransactionFileData, TransactionJson, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOutcome, TransactionWriteRow,
 };
 use crate::transaction::validation::{validate_prepared_writes, TransactionValidationInput};
 use crate::version::{VersionContext, VersionRefReader};
@@ -353,7 +350,7 @@ where
     /// This is the programmatic write entrypoint used by non-SQL APIs. The
     /// transaction still owns preparation from `TransactionWriteRow` into
     /// `PreparedStateRow`, so generated timestamps, change ids, commit ids, and
-    /// commit membership stay in one place.
+    /// commit change refs stay in one place.
     #[allow(dead_code)]
     pub(crate) async fn stage_write(
         &mut self,
@@ -395,11 +392,6 @@ where
                 file_data,
                 count,
             },
-            TransactionWrite::AdoptedChanges { changes } => {
-                PreparedTransactionWrite::AdoptedChanges {
-                    rows: self.prepare_adopted_changes(changes).await?,
-                }
-            }
         })
     }
 
@@ -466,99 +458,6 @@ where
             .map(|row| {
                 row.expect("every row should be prepared exactly once by schema scope grouping")
             })
-            .collect())
-    }
-
-    async fn prepare_adopted_changes(
-        &mut self,
-        changes: Vec<TransactionAdoptedChange>,
-    ) -> Result<Vec<PreparedAdoptedStateRow>, LixError> {
-        let change_count = changes.len();
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = self.storage.begin_read(StorageReadOptions::default())?;
-        let live_state = self.live_state.reader(&read);
-        let mut changes_by_scope =
-            BTreeMap::<Domain, Vec<(usize, TransactionAdoptedChange)>>::new();
-        for (index, change) in changes.into_iter().enumerate() {
-            let schema_scope_version_id = if change.version_id == GLOBAL_VERSION_ID {
-                GLOBAL_VERSION_ID
-            } else {
-                change.version_id.as_str()
-            };
-            changes_by_scope
-                .entry(Domain::schema_catalog(
-                    schema_scope_version_id.to_string(),
-                    false,
-                ))
-                .or_default()
-                .push((index, change));
-        }
-
-        let mut prepared_rows = Vec::with_capacity(change_count);
-        prepared_rows.resize_with(change_count, || None);
-        for (domain, changes) in changes_by_scope {
-            let catalog = self
-                .schema_resolver
-                .catalog_for_row_normalization(&live_state, &staged, &domain)
-                .await?;
-            for (_, change) in &changes {
-                let row = &change.projected_row;
-                if row.schema_key != REGISTERED_SCHEMA_KEY {
-                    continue;
-                }
-                if row.file_id.is_some() {
-                    return Err(LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        "lix_registered_schema rows must not be scoped to a file",
-                    )
-                    .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
-                }
-                remember_adopted_registered_schema(
-                    Domain::schema_catalog(change.version_id.clone(), false),
-                    adopted_registered_schema_snapshot(&read, row)
-                        .await?
-                        .as_deref(),
-                    catalog,
-                )?;
-            }
-            let mut planned_changes = Vec::with_capacity(changes.len());
-            for (index, change) in changes {
-                let row = &change.projected_row;
-                let Some((schema_plan_id, _)) = catalog.plan_for_key(&row.schema_key) else {
-                    return Err(LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        format!(
-                            "schema '{}' is not visible to this transaction",
-                            row.schema_key
-                        ),
-                    ));
-                };
-                if row.schema_key == REGISTERED_SCHEMA_KEY {
-                    if row.file_id.is_some() {
-                        return Err(LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            "lix_registered_schema rows must not be scoped to a file",
-                        )
-                        .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
-                    }
-                    remember_adopted_registered_schema(
-                        Domain::schema_catalog(change.version_id.clone(), false),
-                        adopted_registered_schema_snapshot(&read, row)
-                            .await?
-                            .as_deref(),
-                        catalog,
-                    )?;
-                }
-                planned_changes.push((index, change, schema_plan_id));
-            }
-            for (index, change, schema_plan_id) in planned_changes {
-                prepared_rows[index] =
-                    Some(prepare_adopted_state_row(&read, change, schema_plan_id).await?);
-            }
-        }
-        Ok(prepared_rows
-            .into_iter()
-            .map(|row| row.expect("every adopted row should be prepared exactly once"))
             .collect())
     }
 
@@ -649,20 +548,6 @@ where
         })
     }
 
-    /// Adds an extra parent to the commit generated for `version_id`.
-    ///
-    /// Merge uses this to preserve source-branch ancestry. Ordinary writes do
-    /// not call this because commit finalization already parents to the
-    /// version's previous head.
-    pub(crate) fn add_commit_parent(
-        &self,
-        version_id: String,
-        parent_commit_id: String,
-    ) -> Result<(), LixError> {
-        self.staged_writes
-            .add_commit_parent(version_id, parent_commit_id)
-    }
-
     /// Advances a version ref without staging tracked rows.
     ///
     /// Fast-forward merges use this path because the commit graph already
@@ -678,15 +563,18 @@ where
             .stage_canonical_ref_rows(&mut self.staged_storage_writes, &[canonical_row.row])
     }
 
-    /// Returns the commit id currently staged for `version_id`, if tracked rows
-    /// have been staged for that version.
-    pub(crate) fn staged_commit_id(&self, version_id: &str) -> Result<Option<String>, LixError> {
-        self.staged_writes.staged_commit_id(version_id)
-    }
-
-    /// Stages a commit for `version_id` even if no tracked rows changed.
-    pub(crate) fn stage_empty_commit(&self, version_id: String) -> Result<String, LixError> {
-        self.staged_writes.stage_empty_commit(version_id)
+    pub(crate) fn stage_merge_commit(
+        &self,
+        version_id: String,
+        source_parent_commit_id: String,
+        selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
+    ) -> Result<String, LixError> {
+        let commit_id = self
+            .staged_writes
+            .stage_selected_commit_change_refs(version_id.clone(), selected_changes)?;
+        self.staged_writes
+            .add_commit_parent(version_id, source_parent_commit_id)?;
+        Ok(commit_id)
     }
 
     /// Creates a version-ref reader scoped to this write transaction.
@@ -707,41 +595,6 @@ where
             .begin_read(StorageReadOptions::default())
             .expect("open transaction read scope");
         self.tracked_state.reader(read)
-    }
-
-    /// Ensures commit-addressed tracked-state roots exist as durable derived
-    /// cache before opening readers that require structural tree diff.
-    pub(crate) async fn ensure_tracked_state_projection_roots(
-        &mut self,
-        commit_ids: &[String],
-    ) -> Result<(), LixError> {
-        let mut unique_commit_ids = BTreeSet::new();
-        for commit_id in commit_ids {
-            unique_commit_ids.insert(commit_id.as_str());
-        }
-        if unique_commit_ids.is_empty() {
-            return Ok(());
-        }
-
-        let commit_boundary = self.commit_boundary.clone();
-        let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
-        check_commit_boundary(commit_boundary.as_ref())?;
-        let mut writes = self.storage.new_write_set();
-        {
-            let read = self.storage.begin_read(StorageReadOptions::default())?;
-            let mut rebuilder = self.tracked_state.root_rebuilder(&read, &mut writes);
-            for commit_id in unique_commit_ids {
-                rebuilder.ensure_projection_root(commit_id).await?;
-            }
-        }
-        if !writes.is_empty() {
-            commit_at_boundary(commit_boundary.as_ref(), || {
-                self.storage
-                    .commit_write_set(writes, StorageWriteOptions::default())?;
-                Ok(())
-            })?;
-        }
-        Ok(())
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
@@ -912,134 +765,6 @@ fn prepare_state_row(
     })
 }
 
-fn remember_adopted_registered_schema(
-    domain: Domain,
-    snapshot_content: Option<&str>,
-    catalog: &mut crate::catalog::CatalogSnapshot,
-) -> Result<(), LixError> {
-    let snapshot = snapshot_content
-        .map(|value| {
-            serde_json::from_str::<JsonValue>(value).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("adopted registered schema snapshot_content is invalid JSON: {error}"),
-                )
-            })
-        })
-        .transpose()?;
-    remember_pending_registered_schema(snapshot.as_ref(), domain, catalog)
-}
-
-async fn prepare_adopted_state_row<S>(
-    read: &S,
-    change: TransactionAdoptedChange,
-    schema_plan_id: crate::catalog::SchemaPlanId,
-) -> Result<PreparedAdoptedStateRow, LixError>
-where
-    S: StorageRead + Send + Sync,
-{
-    if change.change_id != change.projected_row.change_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "adopted change '{}' does not match projected row change_id '{}'",
-                change.change_id, change.projected_row.change_id
-            ),
-        ));
-    }
-    let row = change.projected_row;
-    let materialized = materialize_adopted_diff_row(read, &row).await?;
-    let snapshot = materialized
-        .snapshot_content
-        .as_deref()
-        .map(|value| stage_materialized_json_text(value, "adopted row snapshot_content"))
-        .transpose()?;
-    let metadata = materialized
-        .metadata
-        .as_deref()
-        .map(|value| stage_materialized_json_text(value, "adopted row metadata"))
-        .transpose()?;
-    Ok(PreparedAdoptedStateRow {
-        schema_plan_id,
-        facts: PreparedRowFacts::default(),
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot,
-        metadata,
-        snapshot_ref: row.snapshot_ref,
-        metadata_ref: row.metadata_ref,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        global: change.version_id == GLOBAL_VERSION_ID,
-        change_id: change.change_id,
-        source_commit_id: row.commit_id,
-        source_parent_commit_id: change.source_parent_commit_id,
-        commit_id: String::new(),
-        version_id: change.version_id,
-    })
-}
-
-async fn adopted_registered_schema_snapshot<S>(
-    read: &S,
-    row: &TrackedStateDiffRow,
-) -> Result<Option<String>, LixError>
-where
-    S: StorageRead + Send + Sync,
-{
-    if row.deleted {
-        return Ok(None);
-    }
-    let mut rows = materialize_rows_from_index_entries(
-        read,
-        vec![row.clone().into_index_entry()],
-        &TrackedRowProjection {
-            snapshot_content: true,
-            metadata: false,
-        },
-    )
-    .await?;
-    Ok(rows.pop().and_then(|row| row.snapshot_content))
-}
-
-async fn materialize_adopted_diff_row<S>(
-    read: &S,
-    row: &TrackedStateDiffRow,
-) -> Result<crate::tracked_state::MaterializedTrackedStateRow, LixError>
-where
-    S: StorageRead + Send + Sync,
-{
-    let mut rows = materialize_rows_from_index_entries(
-        read,
-        vec![row.clone().into_index_entry()],
-        &TrackedRowProjection {
-            snapshot_content: true,
-            metadata: true,
-        },
-    )
-    .await?;
-    rows.pop().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "adopted tracked-state row materialization returned no row",
-        )
-    })
-}
-
-fn stage_materialized_json_text(
-    value: &str,
-    context: &str,
-) -> Result<crate::transaction::types::StageJson, LixError> {
-    let parsed = serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("{context} is invalid JSON: {error}"),
-        )
-    })?;
-    let prepared = TransactionJson::from_value(parsed, context)?;
-    stage_json_from_value(prepared, context)
-}
-
 pub(crate) struct OpenTransaction<B: StorageBackend = InMemoryStorageBackend> {
     pub(crate) transaction: Transaction<B>,
     pub(crate) runtime_functions: FunctionContext,
@@ -1132,10 +857,6 @@ fn transaction_write_version_ids(write: &TransactionWrite) -> BTreeSet<String> {
             .into_iter()
             .chain(stage_file_data_version_ids(file_data))
             .collect(),
-        TransactionWrite::AdoptedChanges { changes } => changes
-            .iter()
-            .map(|change| change.version_id.clone())
-            .collect(),
     }
 }
 
@@ -1144,7 +865,6 @@ fn transaction_write_row_count(write: &TransactionWrite) -> usize {
     match write {
         TransactionWrite::Rows { rows, .. } => rows.len(),
         TransactionWrite::RowsWithFileData { rows, .. } => rows.len(),
-        TransactionWrite::AdoptedChanges { changes } => changes.len(),
     }
 }
 
@@ -1155,7 +875,6 @@ fn transaction_write_untracked_row_count(write: &TransactionWrite) -> usize {
         TransactionWrite::RowsWithFileData { rows, .. } => {
             rows.iter().filter(|row| row.untracked).count()
         }
-        TransactionWrite::AdoptedChanges { .. } => 0,
     }
 }
 
@@ -1169,7 +888,6 @@ fn require_valid_transaction_write_storage_scopes(
         TransactionWrite::RowsWithFileData { rows, .. } => {
             require_valid_transaction_write_row_storage_scopes(rows)
         }
-        TransactionWrite::AdoptedChanges { .. } => Ok(()),
     }
 }
 
@@ -1276,14 +994,14 @@ async fn load_workspace_version_id(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use serde_json::json;
 
     use super::*;
+    use crate::changelog::ChangelogReader;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
-    use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
+    use crate::tracked_state::{TrackedStateKey, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
     use crate::version::VersionContext;
@@ -1366,16 +1084,13 @@ mod tests {
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &[tracked_change_id],
-                projection: crate::changelog::ChangeProjection::Logical,
-                visibility:
-                    crate::changelog::ChangeVisibilityMode::RequireReachableFromVisibleCommit,
             })
             .await
             .expect("changelog should load tracked change");
         assert!(
             matches!(
                 changes.entries.as_slice(),
-                [Some(crate::changelog::ChangeLoadEntry::Logical(change))]
+                [Some(change)]
                     if change.entity_id.as_single_string_owned().as_deref()
                         == Ok("tracked-programmatic")
             ),
@@ -1401,12 +1116,12 @@ mod tests {
             )
             .load_rows_at_commit(
                 &head_commit_id,
-                &[TrackedStateRowRequest {
+                &[TrackedStateKey {
                     schema_key: "lix_key_value".to_string(),
                     entity_id: crate::entity_identity::EntityIdentity::single(
                         "tracked-programmatic",
                     ),
-                    file_id: NullableKeyFilter::Null,
+                    file_id: None,
                 }],
             )
             .await
@@ -1692,56 +1407,6 @@ mod tests {
             "schema-mismatch",
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn projection_root_repair_uses_attached_commit_boundary() {
-        let backend = InMemoryStorageBackend::new();
-        let storage = StorageContext::new(backend.clone());
-        let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
-            open_test_transaction(&backend).await;
-
-        let projection_space = crate::storage::StorageSpace::new(
-            crate::storage::StorageSpaceId(0x0004_0004),
-            "tracked_state.projection",
-        );
-        let mut deletes = storage.new_write_set();
-        deletes.delete(
-            projection_space,
-            crate::storage::StorageKey(bytes::Bytes::copy_from_slice(
-                SCHEMA_FIXTURE_COMMIT_ID.as_bytes(),
-            )),
-        );
-        storage
-            .commit_write_set(deletes, StorageWriteOptions::default())
-            .expect("projection root delete should commit");
-
-        let check_count = Arc::new(AtomicUsize::new(0));
-        let commit_boundary = CommitBoundaryState::new();
-        let check_count_for_boundary = Arc::clone(&check_count);
-        let commit_boundary_for_assert = commit_boundary.clone();
-        transaction.attach_commit_boundary(TransactionCommitBoundary::new(
-            commit_boundary,
-            Arc::new(move || {
-                assert!(
-                    commit_boundary_for_assert.is_active(),
-                    "direct projection-root commit checks should run while the commit guard is visible"
-                );
-                check_count_for_boundary.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }),
-        ));
-
-        transaction
-            .ensure_tracked_state_projection_roots(&[SCHEMA_FIXTURE_COMMIT_ID.to_string()])
-            .await
-            .expect("projection root should repair through guarded direct commit");
-
-        assert_eq!(
-            check_count.load(Ordering::SeqCst),
-            2,
-            "direct projection-root commit should use the attached commit boundary"
-        );
     }
 
     #[tokio::test]

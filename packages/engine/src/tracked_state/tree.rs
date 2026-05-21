@@ -60,7 +60,7 @@ impl TrackedStateTree {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn with_options(options: TrackedStateTreeOptions) -> Self {
         Self { options }
     }
@@ -133,24 +133,9 @@ impl TrackedStateTree {
         Ok(values)
     }
 
-    pub(crate) async fn row_count(
-        &self,
-        store: &(impl StorageRead + Send + Sync),
-        root_id: &TrackedStateRootId,
-    ) -> Result<usize, LixError> {
-        match self.load_node(store, root_id.as_bytes()).await? {
-            DecodedNode::Leaf(leaf) => Ok(leaf.entries().len()),
-            DecodedNode::Internal(internal) => Ok(internal
-                .children()
-                .iter()
-                .map(|child| child.subtree_count as usize)
-                .sum()),
-        }
-    }
-
     pub(crate) async fn scan(
         &self,
-        store: &(impl StorageRead + Send + Sync),
+        store: &(impl StorageRead + Send + Sync + ?Sized),
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
@@ -171,21 +156,6 @@ impl TrackedStateTree {
         )
         .await?;
         Ok(rows)
-    }
-
-    pub(crate) async fn count_matching_keys(
-        &self,
-        store: &(impl StorageRead + Send + Sync),
-        root_id: &TrackedStateRootId,
-        request: &TrackedStateTreeScanRequest,
-    ) -> Result<usize, LixError> {
-        if request.limit == Some(0) {
-            return Ok(0);
-        }
-
-        let ranges = scan_ranges(request);
-        self.count_matching_keys_node(store, *root_id.as_bytes(), request, &ranges)
-            .await
     }
 
     pub(crate) async fn diff(
@@ -231,6 +201,7 @@ impl TrackedStateTree {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn apply_mutations(
         &self,
         store: &(impl StorageRead + Send + Sync + ?Sized),
@@ -1366,6 +1337,7 @@ impl TrackedStateTree {
             .collect()
     }
 
+    #[cfg(test)]
     async fn collect_leaf_entries(
         &self,
         store: &(impl StorageRead + Send + Sync + ?Sized),
@@ -1401,7 +1373,7 @@ impl TrackedStateTree {
 
     async fn collect_filtered_entries(
         &self,
-        store: &(impl StorageRead + Send + Sync),
+        store: &(impl StorageRead + Send + Sync + ?Sized),
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
@@ -1418,7 +1390,7 @@ impl TrackedStateTree {
         rows: &'a mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
-        S: StorageRead + Send + Sync + 'a,
+        S: StorageRead + Send + Sync + ?Sized + 'a,
     {
         Box::pin(async move {
             let bytes = self.load_node_bytes(store, &hash).await?;
@@ -1545,48 +1517,6 @@ impl TrackedStateTree {
                 }
             }
             Ok(())
-        })
-    }
-
-    fn count_matching_keys_node<'a, S>(
-        &'a self,
-        store: &'a S,
-        hash: [u8; TRACKED_STATE_HASH_BYTES],
-        request: &'a TrackedStateTreeScanRequest,
-        ranges: &'a [EncodedScanRange],
-    ) -> Pin<Box<dyn Future<Output = Result<usize, LixError>> + Send + 'a>>
-    where
-        S: StorageRead + Send + Sync + 'a,
-    {
-        Box::pin(async move {
-            let mut count = 0usize;
-            match self.load_node(store, &hash).await? {
-                DecodedNode::Leaf(leaf) => {
-                    for entry in leaf.entries() {
-                        if !encoded_key_in_scan_ranges(&entry.key, ranges) {
-                            continue;
-                        }
-                        let key = decode_key(&entry.key)?;
-                        if key_matches_scan_filters(request, &key) {
-                            count += 1;
-                        }
-                    }
-                }
-                DecodedNode::Internal(internal) => {
-                    for child in internal.children() {
-                        if child_summary_contained_by_scan_ranges(child, ranges)
-                            && request.entity_ids.is_empty()
-                        {
-                            count += child.subtree_count as usize;
-                        } else if child_summary_overlaps_scan_ranges(child, ranges) {
-                            count += self
-                                .count_matching_keys_node(store, child.child_hash, request, ranges)
-                                .await?;
-                        }
-                    }
-                }
-            }
-            Ok(count)
         })
     }
 
@@ -2403,20 +2333,6 @@ fn child_summary_overlaps_scan_ranges(child: &ChildSummary, ranges: &[EncodedSca
         })
 }
 
-fn child_summary_contained_by_scan_ranges(
-    child: &ChildSummary,
-    ranges: &[EncodedScanRange],
-) -> bool {
-    ranges.is_empty()
-        || ranges.iter().any(|range| {
-            child.first_key.as_slice() >= range.start.as_slice()
-                && range
-                    .end
-                    .as_ref()
-                    .is_none_or(|end| child.last_key.as_slice() < end.as_slice())
-        })
-}
-
 fn encoded_key_in_scan_ranges(key: &[u8], ranges: &[EncodedScanRange]) -> bool {
     ranges.is_empty()
         || ranges.iter().any(|range| {
@@ -2502,8 +2418,8 @@ mod tests {
             .await
             .expect("row should load")
             .expect("row should exist");
-        assert_eq!(loaded.change_locator.change_id, "change-new");
-        assert_eq!(loaded.change_locator.commit_id, "commit");
+        assert_eq!(loaded.change_id, "change-new");
+        assert_eq!(loaded.commit_id, "commit");
     }
 
     #[tokio::test]
@@ -2725,7 +2641,6 @@ mod tests {
                 .await
                 .expect("unchanged read")
                 .expect("unchanged exists")
-                .change_locator
                 .change_id,
             "c1"
         );
@@ -2734,7 +2649,6 @@ mod tests {
                 .await
                 .expect("changed read")
                 .expect("changed exists")
-                .change_locator
                 .change_id,
             "c3"
         );
@@ -3135,23 +3049,9 @@ mod tests {
     }
 
     fn value(change_id: &str, snapshot_content: Option<&str>) -> TrackedStateIndexValue {
-        let source_ordinal = match snapshot_content {
-            Some("{\"v\":1}") => 1,
-            Some("{\"v\":2}") => 2,
-            Some(_) => 3,
-            None => 0,
-        } as u64;
         TrackedStateIndexValue {
-            change_locator: crate::changelog::ChangeLocator {
-                change_id: change_id.to_string(),
-                commit_id: "commit".to_string(),
-                location: crate::changelog::SegmentObjectLocation {
-                    segment_id: "segment".to_string(),
-                    offset: 0,
-                    len: source_ordinal,
-                    checksum: change_id.to_string(),
-                },
-            },
+            change_id: change_id.to_string(),
+            commit_id: "commit".to_string(),
             deleted: snapshot_content.is_none(),
             snapshot_ref: snapshot_content
                 .map(|content| crate::json_store::JsonRef::for_content(content.as_bytes())),

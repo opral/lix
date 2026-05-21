@@ -1,4 +1,3 @@
-use crate::changelog::{ChangeLocator, SegmentObjectLocation};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
@@ -53,7 +52,6 @@ pub(crate) struct TrackedStateDiffRow {
     pub(crate) updated_at: String,
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
-    pub(crate) change_location: SegmentObjectLocation,
 }
 
 /// Root-local tracked-state identity.
@@ -129,6 +127,9 @@ where
             Some(row) => TrackedStateDiffIdentity::from(row),
             None => continue,
         };
+        if identity.schema_key == "lix_commit" {
+            continue;
+        }
         let Some(entry) = classify_diff(identity, before, after) else {
             continue;
         };
@@ -209,9 +210,8 @@ impl TrackedStateDiffRow {
             metadata_ref: value.metadata_ref,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            change_id: value.change_locator.change_id,
-            commit_id: value.change_locator.commit_id,
-            change_location: value.change_locator.location,
+            change_id: value.change_id,
+            commit_id: value.commit_id,
         }
     }
 
@@ -223,11 +223,8 @@ impl TrackedStateDiffRow {
                 entity_id: self.entity_id,
             },
             TrackedStateIndexValue {
-                change_locator: ChangeLocator {
-                    change_id: self.change_id,
-                    commit_id: self.commit_id,
-                    location: self.change_location,
-                },
+                change_id: self.change_id,
+                commit_id: self.commit_id,
                 deleted: self.deleted,
                 snapshot_ref: self.snapshot_ref,
                 metadata_ref: self.metadata_ref,
@@ -266,7 +263,7 @@ mod tests {
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::types::{
-        TrackedStateMutation, TrackedStateProjectionMetadata, TrackedStateProjectionParent,
+        TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateMutation,
         TrackedStateRootId,
     };
     use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateContext};
@@ -409,7 +406,7 @@ mod tests {
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -433,7 +430,7 @@ mod tests {
             ],
         )
         .await;
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = tracked_state.reader(read);
@@ -468,7 +465,7 @@ mod tests {
         diff.entries[0].after.as_mut().expect("after row").entity_id =
             EntityIdentity::single("entity-corrupt");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -484,29 +481,18 @@ mod tests {
             error
                 .message
                 .contains("does not match changelog change identity")
-                || error.message.contains("visible changelog commit"),
+                || error.message.contains("changelog commit"),
             "unexpected error: {error}"
         );
     }
 
     #[tokio::test]
-    async fn diff_validation_rejects_stale_changelog_locator() {
+    async fn diff_validation_rejects_missing_changelog_change() {
         let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0]
-            .after
-            .as_mut()
-            .expect("after row")
-            .change_location
-            .offset = diff.entries[0]
-            .after
-            .as_ref()
-            .expect("after row")
-            .change_location
-            .offset
-            .saturating_add(1);
+        diff.entries[0].after.as_mut().expect("after row").change_id = "missing-change".to_string();
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -516,10 +502,10 @@ mod tests {
                 "right",
             )])
             .await
-            .expect_err("stale locator must be rejected");
+            .expect_err("missing change must be rejected");
 
         assert!(
-            error.message.contains("stale changelog locator"),
+            error.message.contains("missing changelog change"),
             "unexpected error: {error}"
         );
     }
@@ -534,7 +520,7 @@ mod tests {
             .expect("after row")
             .updated_at = "2026-01-02T00:00:00Z".to_string();
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -562,7 +548,7 @@ mod tests {
             .expect("after row")
             .created_at = "2025-12-31T00:00:00Z".to_string();
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -620,7 +606,7 @@ mod tests {
         .await
         .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let valid_diff = tracked_state
@@ -635,18 +621,21 @@ mod tests {
             .expect("child row should appear");
         let (key, mut value) = row.into_index_entry();
         value.created_at = "2026-01-03T00:00:00Z".to_string();
-        stage_corrupt_projection_root(
+        let parent_commit_row =
+            commit_root_row_entry("parent", "parent:commit", "2026-01-01T00:00:00Z");
+        let commit_row = commit_root_row_entry("child", "child:commit", "2026-01-02T00:00:00Z");
+        stage_corrupt_commit_root(
             &storage,
             "child",
-            vec![(key, value)],
-            vec![TrackedStateProjectionParent {
+            vec![(key, value), parent_commit_row, commit_row],
+            vec![TrackedStateCommitRootParent {
                 commit_id: "parent".to_string(),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -684,7 +673,7 @@ mod tests {
         .await
         .expect("right changelog should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let valid_diff = tracked_state
@@ -721,9 +710,9 @@ mod tests {
                 )
                 .await
                 .expect("corrupt root should write");
-            crate::tracked_state::storage::stage_projection_metadata(
+            crate::tracked_state::storage::stage_commit_root(
                 &mut writes,
-                &TrackedStateProjectionMetadata {
+                &TrackedStateCommitRoot {
                     commit_id: "right-corrupt".to_string(),
                     root_id: result.root_id.clone(),
                     parent_roots: Vec::new(),
@@ -742,7 +731,7 @@ mod tests {
         };
         assert_eq!(result.row_count, 1);
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -755,7 +744,7 @@ mod tests {
             error
                 .message
                 .contains("does not match changelog change identity")
-                || error.message.contains("visible changelog commit"),
+                || error.message.contains("changelog commit"),
             "unexpected error: {error}"
         );
     }
@@ -786,7 +775,7 @@ mod tests {
         .await
         .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let parent_diff = tracked_state
@@ -800,18 +789,18 @@ mod tests {
             .find_map(|entry| entry.after.clone())
             .expect("parent row should appear");
         let (stale_key, stale_value) = stale_row.into_index_entry();
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "child",
             vec![(stale_key, stale_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "parent".to_string(),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -821,7 +810,7 @@ mod tests {
             .expect_err("stale ancestor winner must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -848,7 +837,7 @@ mod tests {
         .await
         .expect("unrelated changelog should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let unrelated_diff = tracked_state
@@ -889,9 +878,9 @@ mod tests {
                 )
                 .await
                 .expect("corrupt root should write");
-            crate::tracked_state::storage::stage_projection_metadata(
+            crate::tracked_state::storage::stage_commit_root(
                 &mut writes,
-                &TrackedStateProjectionMetadata {
+                &TrackedStateCommitRoot {
                     commit_id: "right-corrupt".to_string(),
                     root_id: result.root_id.clone(),
                     parent_roots: Vec::new(),
@@ -910,7 +899,7 @@ mod tests {
         };
         assert_eq!(result.row_count, 1);
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -920,13 +909,13 @@ mod tests {
             .expect_err("unreachable valid change must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_non_adopted_second_parent_row() {
+    async fn diff_commits_rejects_second_parent_row_without_commit_root_proof() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -945,7 +934,7 @@ mod tests {
         .await
         .expect("source root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let source_diff = tracked_state
@@ -977,34 +966,34 @@ mod tests {
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .expect("merge changelog should commit");
         }
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "merge",
             vec![(source_key, source_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "target".to_string(),
                 root_id: tracked_state_root_id(&storage, "target").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
             .reader(read)
             .diff_commits("left", "merge", &TrackedStateDiffRequest::default())
             .await
-            .expect_err("non-adopted second-parent row must be rejected");
+            .expect_err("second-parent row without commit-root proof must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_second_parent_row_with_forged_projection_parent() {
+    async fn diff_commits_rejects_second_parent_row_with_forged_commit_root_parent() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -1023,7 +1012,7 @@ mod tests {
         .await
         .expect("source root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let source_diff = tracked_state
@@ -1055,18 +1044,18 @@ mod tests {
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .expect("merge changelog should commit");
         }
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "merge",
             vec![(source_key, source_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "source".to_string(),
                 root_id: tracked_state_root_id(&storage, "source").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1076,13 +1065,13 @@ mod tests {
             .expect_err("forged source parent must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_unrelated_row_with_forged_projection_parent() {
+    async fn diff_commits_rejects_unrelated_row_with_forged_commit_root_parent() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -1098,7 +1087,7 @@ mod tests {
         .await
         .expect("source root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let source_diff = tracked_state
@@ -1130,18 +1119,18 @@ mod tests {
                 .commit_write_set(writes, StorageWriteOptions::default())
                 .expect("right changelog should commit");
         }
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "right-corrupt",
             vec![(source_key, source_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "source".to_string(),
                 root_id: tracked_state_root_id(&storage, "source").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1151,7 +1140,7 @@ mod tests {
             .expect_err("forged unrelated parent must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -1185,7 +1174,7 @@ mod tests {
         .await
         .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let child_diff = tracked_state
@@ -1200,18 +1189,18 @@ mod tests {
             .expect("child row should appear");
         let (child_key, child_value) = child_row.into_index_entry();
 
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "child",
             vec![(child_key, child_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "source".to_string(),
                 root_id: tracked_state_root_id(&storage, "source").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1221,13 +1210,13 @@ mod tests {
             .expect_err("current winner root metadata must still be validated");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
 
     #[tokio::test]
-    async fn diff_commits_rejects_stale_grandparent_row_with_forged_projection_parent() {
+    async fn diff_commits_rejects_stale_grandparent_row_with_forged_commit_root_parent() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "left", None, &[])
@@ -1255,7 +1244,7 @@ mod tests {
             .await
             .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let stale_diff = tracked_state
@@ -1270,18 +1259,18 @@ mod tests {
             .expect("grandparent row should appear");
         let (stale_key, stale_value) = stale_row.into_index_entry();
 
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "child",
             vec![(stale_key, stale_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "grandparent".to_string(),
                 root_id: tracked_state_root_id(&storage, "grandparent").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1291,7 +1280,7 @@ mod tests {
             .expect_err("forged grandparent parent must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -1316,7 +1305,7 @@ mod tests {
             .await
             .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -1332,7 +1321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_commits_allows_adopted_source_update_with_source_created_at() {
+    async fn diff_commits_allows_source_update_with_source_created_at() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         write_root_committed_for_test(&storage, &tracked_state, "target", None, &[])
@@ -1392,14 +1381,14 @@ mod tests {
                 .expect("merge root should commit");
         }
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
             .reader(read)
             .diff_commits("target", "merge", &TrackedStateDiffRequest::default())
             .await
-            .expect("adopted source update should validate");
+            .expect("source update should validate");
 
         assert_eq!(
             kinds(&diff),
@@ -1434,7 +1423,7 @@ mod tests {
         .await
         .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let valid_diff = tracked_state
@@ -1454,18 +1443,18 @@ mod tests {
             })
             .expect("unrelated child row should appear");
         let (unrelated_key, unrelated_value) = unrelated_row.into_index_entry();
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "child",
             vec![(unrelated_key, unrelated_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "parent".to_string(),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1475,7 +1464,7 @@ mod tests {
             .expect_err("omitted inherited row must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -1506,7 +1495,7 @@ mod tests {
         .await
         .expect("child root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let valid_diff = tracked_state
@@ -1526,18 +1515,18 @@ mod tests {
             })
             .expect("unrelated child row should appear");
         let (unrelated_key, unrelated_value) = unrelated_row.into_index_entry();
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "child",
             vec![(unrelated_key, unrelated_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "parent".to_string(),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1547,7 +1536,7 @@ mod tests {
             .expect_err("omitted updated row must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -1584,7 +1573,7 @@ mod tests {
         .await
         .expect("right root should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let left_diff = tracked_state
@@ -1604,7 +1593,7 @@ mod tests {
             })
             .expect("left row should appear");
         let (left_key, left_value) = left_row.into_index_entry();
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let right_diff = tracked_state
@@ -1624,28 +1613,28 @@ mod tests {
             })
             .expect("right row should appear");
         let (right_key, right_value) = right_row.into_index_entry();
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "left",
             vec![(left_key, left_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "parent".to_string(),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
         .await;
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "right",
             vec![(right_key, right_value)],
-            vec![TrackedStateProjectionParent {
+            vec![TrackedStateCommitRootParent {
                 commit_id: "parent".to_string(),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1655,7 +1644,7 @@ mod tests {
             .expect_err("shared hidden omission must be rejected");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -1680,7 +1669,7 @@ mod tests {
             .await
             .expect("right changelog should write");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let source_diff = tracked_state
@@ -1699,14 +1688,14 @@ mod tests {
             .expect("source row should appear");
         let (source_key, source_value) = source_row.into_index_entry();
 
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "left-corrupt",
             vec![(source_key.clone(), source_value.clone())],
             Vec::new(),
         )
         .await;
-        stage_corrupt_projection_root(
+        stage_corrupt_commit_root(
             &storage,
             "right-corrupt",
             vec![(source_key, source_value)],
@@ -1714,7 +1703,7 @@ mod tests {
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let error = tracked_state
@@ -1728,7 +1717,7 @@ mod tests {
             .expect_err("identical corrupt roots must still be validated");
 
         assert!(
-            is_projection_validation_error(&error),
+            is_commit_root_validation_error(&error),
             "unexpected error: {error}"
         );
     }
@@ -1775,7 +1764,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should commit");
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -1811,7 +1800,7 @@ mod tests {
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -1847,7 +1836,7 @@ mod tests {
         )
         .await;
 
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let diff = tracked_state
@@ -1875,7 +1864,7 @@ mod tests {
         storage: &StorageContext,
         tracked_state: &TrackedStateContext,
     ) -> TrackedStateDiff {
-        let mut read = storage
+        let read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         tracked_state
@@ -1977,11 +1966,11 @@ mod tests {
             .expect("root should exist")
     }
 
-    async fn stage_corrupt_projection_root(
+    async fn stage_corrupt_commit_root(
         storage: &StorageContext,
         commit_id: &str,
         entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-        parent_roots: Vec<TrackedStateProjectionParent>,
+        parent_roots: Vec<TrackedStateCommitRootParent>,
     ) {
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -2001,9 +1990,9 @@ mod tests {
             .apply_mutations(&read, &mut writes, None, mutations, Some(commit_id))
             .await
             .expect("corrupt root should write");
-        crate::tracked_state::storage::stage_projection_metadata(
+        crate::tracked_state::storage::stage_commit_root(
             &mut writes,
-            &TrackedStateProjectionMetadata {
+            &TrackedStateCommitRoot {
                 commit_id: commit_id.to_string(),
                 root_id: result.root_id,
                 parent_roots,
@@ -2036,7 +2025,7 @@ mod tests {
             .collect()
     }
 
-    fn is_projection_validation_error(error: &LixError) -> bool {
+    fn is_commit_root_validation_error(error: &LixError) -> bool {
         error.message.contains("not the first-parent winner")
             || error.message.contains("does not match parent root")
             || error
@@ -2050,6 +2039,37 @@ mod tests {
             || error.message.contains("references unexpected parent")
             || error.message.contains("missing changelog winner")
             || error.message.contains("has change")
+            || error.message.contains("omits current changelog change")
+            || error.message.contains("omits inherited identity")
+            || error
+                .message
+                .contains("does not preserve inherited identity")
+            || error.message.contains("but changelog winner is")
+    }
+
+    fn commit_root_row_entry(
+        commit_id: &str,
+        change_id: &str,
+        created_at: &str,
+    ) -> (TrackedStateKey, TrackedStateIndexValue) {
+        (
+            TrackedStateKey {
+                schema_key: "lix_commit".to_string(),
+                file_id: None,
+                entity_id: EntityIdentity::single(commit_id),
+            },
+            TrackedStateIndexValue {
+                change_id: change_id.to_string(),
+                commit_id: commit_id.to_string(),
+                deleted: false,
+                snapshot_ref: Some(JsonRef::for_content(
+                    format!("{{\"id\":\"{commit_id}\"}}").as_bytes(),
+                )),
+                metadata_ref: None,
+                created_at: created_at.to_string(),
+                updated_at: created_at.to_string(),
+            },
+        )
     }
 
     fn tombstone(

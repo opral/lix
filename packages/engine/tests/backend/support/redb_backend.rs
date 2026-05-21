@@ -29,7 +29,6 @@ pub struct RedbBackendFactory {
 #[derive(Clone, Debug)]
 pub struct RedbBackendFixture {
     path: PathBuf,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -79,10 +78,7 @@ impl BackendFactory for RedbBackendFactory {
             .temp_dir
             .path()
             .join(format!("backend-{database_id}.redb"));
-        RedbBackendFixture {
-            durable_write_lock: durable_write_lock_for_path(&path),
-            path,
-        }
+        RedbBackendFixture { path }
     }
 
     fn config(&self) -> BackendTestConfig {
@@ -98,8 +94,7 @@ impl BackendFixture for RedbBackendFixture {
     type Backend = RedbBackend;
 
     fn open(&self) -> Self::Backend {
-        RedbBackend::open_with_write_lock(&self.path, self.durable_write_lock.clone())
-            .expect("open redb backend")
+        RedbBackend::open(&self.path).expect("open redb backend")
     }
 }
 
@@ -107,14 +102,6 @@ impl RedbBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
         let durable_write_lock = durable_write_lock_for_path(&path);
-        Self::open_with_write_lock(path, durable_write_lock)
-    }
-
-    fn open_with_write_lock(
-        path: impl Into<PathBuf>,
-        durable_write_lock: DurableWriteLock,
-    ) -> Result<Self, BackendError> {
-        let path = path.into();
         let db = Arc::new(Database::create(&path).map_err(redb_error)?);
         initialize_database(&db)?;
         Ok(Self {

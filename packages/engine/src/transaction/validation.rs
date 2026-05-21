@@ -2970,7 +2970,6 @@ mod tests {
         ];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_row("pending_schema")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let input = validation_input(&staged_writes, &visible_schemas);
@@ -2996,7 +2995,6 @@ mod tests {
         ];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_row("same_schema")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3110,7 +3108,6 @@ mod tests {
     fn schema_catalog_rejects_foreign_key_missing_target_schema() {
         let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(fk_child_schema())],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let visible_schemas = vec![registered_schema()];
@@ -3207,7 +3204,6 @@ mod tests {
         });
         let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(schema)],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let visible_schemas = vec![registered_schema()];
@@ -3228,7 +3224,6 @@ mod tests {
         schema["x-lix-state-foreign-keys"][0] = json!(["/target_entity_id"]);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(schema)],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let visible_schemas = vec![registered_schema()];
@@ -3263,7 +3258,6 @@ mod tests {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row("unknown_schema", None)],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3305,7 +3299,6 @@ mod tests {
         tracked_row.entity_id = EntityIdentity::single("row-1");
         let staged_writes = PreparedWriteSet {
             state_rows: vec![untracked_schema, tracked_row],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3347,7 +3340,6 @@ mod tests {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row("lix_key_value", None)],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3361,7 +3353,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3470,7 +3461,6 @@ mod tests {
                 file_descriptor_delete,
                 unique_row("post-1", "hello-world", "first"),
             ],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3492,7 +3482,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3513,7 +3502,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let mut untracked_file_descriptor = committed_file_descriptor_row("file-a", "version-a");
@@ -3542,7 +3530,6 @@ mod tests {
         mark_prepared_row_untracked(&mut untracked_row);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![untracked_row],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StrictStaticLiveStateReader {
@@ -3563,7 +3550,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let tracked_file_descriptor = committed_file_descriptor_row("file-a", "version-a");
@@ -3594,7 +3580,6 @@ mod tests {
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![file_descriptor_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3625,7 +3610,6 @@ mod tests {
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![file_descriptor_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let mut untracked_row =
@@ -3672,7 +3656,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StrictStaticLiveStateReader {
@@ -3701,7 +3684,6 @@ mod tests {
         conflicting.entity_id = crate::entity_identity::EntityIdentity::single("post-2");
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), conflicting],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3755,7 +3737,6 @@ mod tests {
         duplicate.version_id = "version-a".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), duplicate],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3773,7 +3754,6 @@ mod tests {
         version_b.version_id = "version-b".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), version_b],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3805,7 +3785,6 @@ mod tests {
         tombstone.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![tombstone, unique_row("post-2", "hello-world", "second")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3840,7 +3819,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3864,7 +3842,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let tracked_duplicate = committed_unique_row("post-1", "hello-world", "first");
@@ -3898,7 +3875,6 @@ mod tests {
                 untracked_tombstone,
                 unique_row("post-2", "hello-world", "second"),
             ],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3922,7 +3898,6 @@ mod tests {
         let visible_schemas = vec![nullable_unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![nullable_unique_row("row-2", None, "root-name")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3946,7 +3921,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3972,7 +3946,6 @@ mod tests {
         version_b.version_id = "version-b".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![version_b],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3993,7 +3966,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
@@ -4017,7 +3989,6 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "updated")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4046,7 +4017,6 @@ mod tests {
         committed_two.file_id = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_one, staged_two],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = CountingStaticLiveStateReader {
@@ -4072,7 +4042,6 @@ mod tests {
         tombstone.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![tombstone, unique_row("post-2", "hello-world", "second")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4097,7 +4066,6 @@ mod tests {
         different_version.version_id = "version-b".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![different_file, different_version],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4118,7 +4086,6 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -4225,7 +4192,6 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4249,7 +4215,6 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let mut untracked_parent =
@@ -4285,7 +4250,6 @@ mod tests {
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![untracked_file_descriptor, untracked_child],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4309,7 +4273,6 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
@@ -4338,7 +4301,6 @@ mod tests {
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
@@ -4370,7 +4332,6 @@ mod tests {
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
@@ -4398,7 +4359,6 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4464,7 +4424,6 @@ mod tests {
                 untracked_parent_delete,
                 fk_child_row("child-1", "parent-1", "version-a"),
             ],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4731,7 +4690,6 @@ mod tests {
         };
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -4760,7 +4718,6 @@ mod tests {
         };
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -4788,7 +4745,6 @@ mod tests {
         };
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete, child_delete],
-            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -5378,9 +5334,8 @@ mod tests {
     fn empty_staged_write_set() -> PreparedWriteSet {
         PreparedWriteSet {
             state_rows: Vec::new(),
-            adopted_rows: Vec::new(),
             insert_identities: BTreeMap::new(),
-            commit_members_by_version: BTreeMap::new(),
+            commit_change_refs_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),
             file_data_writes: Vec::new(),
         }

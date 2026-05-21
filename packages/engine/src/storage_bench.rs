@@ -69,18 +69,14 @@ fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
     &[
         crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE,
         crate::json_store::store::JSON_SPACE,
-        crate::tracked_state::TRACKED_STATE_CHUNK_SPACE,
-        crate::tracked_state::TRACKED_STATE_BY_FILE_ROOT_SPACE,
-        crate::tracked_state::TRACKED_STATE_PROJECTION_SPACE,
+        crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
-        crate::changelog::SEGMENT_SPACE,
-        crate::changelog::COMMIT_VISIBILITY_SPACE,
-        crate::changelog::BY_COMMIT_INDEX_SPACE,
-        crate::changelog::BY_CHANGE_INDEX_SPACE,
-        crate::changelog::BY_CHANGE_MEMBERSHIP_INDEX_SPACE,
-        crate::changelog::VISIBLE_CHANGE_PROOF_SPACE,
+        crate::changelog::COMMIT_SPACE,
+        crate::changelog::CHANGE_SPACE,
+        crate::changelog::COMMIT_CHANGE_REF_CHUNK_SPACE,
     ]
 }
 

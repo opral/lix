@@ -37,7 +37,7 @@ Notes:
 - `transaction` builds `TransactionWriteRow`s directly and stages them through
   the transaction layer. It bypasses SQL/DataFusion but still exercises
   normalization, validation, changelog segments/indexes, commit visibility,
-  version refs, and tracked-state projection roots.
+  version refs, and tracked-state commit roots.
 - `sql_session` runs on `InMemoryStorageBackend`; the copied SQLite/RocksDB/redb
   backend support modules do not satisfy the SQL session read bounds.
 - SQL update benches are gated behind `LIX_TRACKED_STATE_CRUD_SQL_UPDATE=1`.
@@ -338,3 +338,85 @@ it is not the regular scorecard. Completed reference numbers:
 10k SQL update with bulk `CASE` failed because that expression shape is not
 supported by the SQL layer. Per-row SQL update works but is too slow to include
 in routine scorecards.
+
+## Hard-cut direct changelog smoke: 2026-05-21
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+```
+
+Notes:
+
+- This run is after the physical-layout hard cut to direct
+  `changelog.commit`, direct `changelog.change`,
+  `changelog.commit_change_ref_chunk`, and `tracked_state.commit_root`.
+- The scorecard also required finishing the backend support `open(path)` API so
+  the bench backends derive their durable write lock internally.
+- Criterion: 10 samples, 250 ms warmup, 1 s measurement for smoke groups.
+- Values below are Criterion point estimates.
+
+### 1k Smoke Scorecard
+
+#### Direct KV Layout
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    2.29 ms |   501 us |         329 us |          333 us |    2.75 ms |     614 us |    1.17 ms |     520 us |
+| RocksDB |     438 us |   158 us |        2.84 us |         9.55 us |     569 us |    13.6 us |    5.72 us |    6.90 us |
+| redb    |    8.68 ms |   195 us |        15.0 us |         29.0 us |    8.55 ms |    3.92 ms |    4.64 ms |    4.39 ms |
+
+#### Transaction Layer
+
+Direct transaction API, bypassing SQL.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   12.74 ms |  3.20 ms |         181 us |          668 us |   15.13 ms |    2.27 ms |   12.87 ms |    2.24 ms |
+| RocksDB |   10.39 ms |  2.87 ms |        86.2 us |          420 us |   12.70 ms |    1.93 ms |   11.41 ms |    1.73 ms |
+| redb    |   21.77 ms |  3.00 ms |        90.8 us |          432 us |   20.97 ms |    6.41 ms |   20.22 ms |    6.48 ms |
+
+#### SQL Session
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   17.61 ms |  6.22 ms |        1.30 ms |         1.35 ms |   excluded |   excluded |   14.48 ms |    6.52 ms |
+
+### 1k Smoke Accounting
+
+The logical write counts were identical across SQLite, RocksDB, and redb.
+
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
+| kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
+| kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
+| kv_layout   | update_one_by_pk |            1 |     1 |             0 |             0 |              1 |             1 |         6,693 |   1.00x |      0.00x |
+| kv_layout   | delete_all       |        1,000 |     0 |             0 |             1 |              0 |             1 |             0 |   0.00x |      0.00x |
+| kv_layout   | delete_one_by_pk |            1 |     0 |             1 |             0 |              1 |             1 |             0 |   0.00x |      1.00x |
+| transaction | insert_all       |        1,000 | 2,037 |             0 |             0 |              7 |             7 |       827,460 |   2.04x |      0.00x |
+| transaction | update_all       |        1,000 | 2,037 |             0 |             0 |              7 |             7 |       941,913 |   2.04x |      0.00x |
+| transaction | update_one_by_pk |            1 |    12 |             0 |             0 |              7 |             7 |        28,608 |  12.00x |      0.00x |
+| transaction | delete_all       |        1,000 | 1,037 |             0 |             0 |              7 |             7 |       508,404 |   1.04x |      0.00x |
+| transaction | delete_one_by_pk |            1 |    11 |             0 |             0 |              7 |             7 |        28,307 |  11.00x |      0.00x |
+
+### Layout Footprint After Insert
+
+The transaction layout footprint was identical across SQLite, RocksDB, and
+redb for this fixture.
+
+| Layer       | Space id     | Space                               |  Rows | Key bytes | Value bytes |
+| ----------- | ------------ | ----------------------------------- | ----: | --------: | ----------: |
+| kv_layout   | `0x00020001` | `tracked_state.crud.row.v1`         | 1,000 |    87,244 |     396,363 |
+| transaction | `0x00010002` | `untracked_state.row.v1`            |     2 |       120 |         273 |
+| transaction | `0x00020001` | `json_store.json`                   | 1,018 |    36,648 |     299,846 |
+| transaction | `0x00040001` | `tracked_state.tree_chunk`          |    33 |     1,188 |     243,324 |
+| transaction | `0x00040004` | `tracked_state.commit_root`         |     2 |        71 |         288 |
+| transaction | `0x00050001` | `binary_cas.manifest`               |     0 |         0 |           0 |
+| transaction | `0x00050002` | `binary_cas.manifest_chunk`         |     0 |         0 |           0 |
+| transaction | `0x00050003` | `binary_cas.chunk`                  |     0 |         0 |           0 |
+| transaction | `0x00060001` | `changelog.commit`                  |     2 |        71 |         270 |
+| transaction | `0x00060002` | `changelog.change`                  | 1,016 |    40,559 |     189,738 |
+| transaction | `0x00060003` | `changelog.commit_change_ref_chunk` |     2 |        81 |     117,699 |
+

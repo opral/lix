@@ -138,7 +138,7 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
         .await
         .expect("initialized backend should create an engine");
 
-    backend.fail_read_namespace("changelog.commit_visibility");
+    backend.fail_read_namespace("changelog.commit");
     let before = backend.stats();
     let error = engine
         .rebuild_tracked_state_for_version(&receipt.main_version_id)
@@ -158,7 +158,7 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
 }
 
 #[tokio::test]
-async fn write_segment_failure_does_not_commit_backend_write() {
+async fn write_changelog_commit_failure_does_not_commit_backend_write() {
     let backend = RecordingBackend::new();
     let _receipt = Engine::initialize(backend.clone())
         .await
@@ -171,15 +171,15 @@ async fn write_segment_failure_does_not_commit_backend_write() {
         .await
         .expect("workspace session should open");
 
-    backend.fail_write_namespace("changelog.segment");
+    backend.fail_write_namespace("changelog.commit");
     let before = backend.stats();
     let error = session
         .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('segment-write-failure', 'value')",
+            "INSERT INTO lix_key_value (key, value) VALUES ('changelog-commit-write-failure', 'value')",
             &[],
         )
         .await
-        .expect_err("forced segment write failure should fail transaction commit");
+        .expect_err("forced changelog commit write failure should fail transaction commit");
     assert!(
         error.message.contains("forced write failure"),
         "unexpected error: {error:?}"
@@ -189,7 +189,7 @@ async fn write_segment_failure_does_not_commit_backend_write() {
     assert_eq!(delta.write_opened, 1, "write should open a backend write");
     assert_eq!(
         delta.write_committed, 0,
-        "failed changelog segment write must not commit"
+        "failed changelog commit write must not commit"
     );
 }
 
@@ -1372,10 +1372,9 @@ impl RecordingRead {
 
 fn namespace_prefix(namespace: &str) -> Option<[u8; 4]> {
     match namespace {
-        "changelog.commit_visibility" => {
-            Some(lix_engine::changelog::COMMIT_VISIBILITY_SPACE.physical_prefix())
-        }
-        "changelog.segment" => Some(lix_engine::changelog::SEGMENT_SPACE.physical_prefix()),
+        "changelog.commit" => Some(0x0006_0001_u32.to_be_bytes()),
+        "changelog.change" => Some(0x0006_0002_u32.to_be_bytes()),
+        "changelog.commit_change_ref_chunk" => Some(0x0006_0003_u32.to_be_bytes()),
         _ => None,
     }
 }

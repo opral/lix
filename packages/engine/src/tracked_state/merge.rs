@@ -14,48 +14,40 @@ use crate::LixError;
 /// - `base -> target`: what the destination version changed.
 /// - `base -> source`: what the incoming version changed.
 ///
-/// The planner returns source-side patches that can be applied to the target
-/// root plus first-class conflicts for identities changed differently on both
-/// sides.
+/// The planner returns source-side picks plus first-class conflicts for
+/// identities changed differently on both sides.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TrackedStateMergePlan {
-    pub(crate) patches: Vec<TrackedStateMergePatch>,
+    pub(crate) picks: Vec<TrackedStateMergePick>,
     pub(crate) conflicts: Vec<TrackedStateMergeConflict>,
 }
 
-/// One source-side patch to apply to the target root.
+/// One source-side change selected for the merge result.
 ///
-/// Merge patches are expressed as canonical change adoption, not as new row
-/// writes. The projected row carries the target-root materialization shape,
-/// including tombstones, while `change_id` preserves the source canonical
-/// change identity.
+/// Merge picks describe source-side state that will be selected into
+/// the target root. The selected row carries the target-root materialization
+/// shape, including tombstones.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TrackedStateMergePatch {
-    Adopt {
-        identity: TrackedStateDiffIdentity,
-        change_id: String,
-        projected_row: TrackedStateDiffRow,
-    },
+pub(crate) struct TrackedStateMergePick {
+    pub(crate) identity: TrackedStateDiffIdentity,
+    pub(crate) change_id: String,
+    pub(crate) selected_row: TrackedStateDiffRow,
 }
 
-impl TrackedStateMergePatch {
+impl TrackedStateMergePick {
     #[cfg(test)]
     pub(crate) fn identity(&self) -> &TrackedStateDiffIdentity {
-        match self {
-            Self::Adopt { identity, .. } => identity,
-        }
+        &self.identity
     }
 
-    pub(crate) fn change_id(&self) -> &str {
-        match self {
-            Self::Adopt { change_id, .. } => change_id,
-        }
+    #[cfg(test)]
+    pub(crate) fn source_change_id(&self) -> &str {
+        &self.change_id
     }
 
-    pub(crate) fn projected_row(&self) -> &TrackedStateDiffRow {
-        match self {
-            Self::Adopt { projected_row, .. } => projected_row,
-        }
+    #[cfg(test)]
+    pub(crate) fn source_row(&self) -> &TrackedStateDiffRow {
+        &self.selected_row
     }
 }
 
@@ -70,7 +62,7 @@ pub(crate) struct TrackedStateMergeConflict {
 /// Plans a three-way tracked-state merge from two base-relative diffs.
 ///
 /// This follows the same shape as prolly-tree merge systems: compare
-/// `base -> target` and `base -> source` by identity, emit source-only patches
+/// `base -> target` and `base -> source` by identity, emit source-only picks
 /// for the target root, ignore target-only changes, collapse convergent
 /// changes, and report divergent same-identity changes as conflicts.
 pub(crate) fn plan_merge(
@@ -94,11 +86,10 @@ pub(crate) fn plan_merge(
             (None, None) => {}
             (Some(_target), None) => {
                 // Target already changed this identity. Source did not, so
-                // there is nothing to apply.
+                // there is nothing to pick.
             }
             (None, Some(source)) => {
-                plan.patches
-                    .push(adopt_source_change_patch(identity, source)?);
+                plan.picks.push(source_change_pick(identity, source)?);
             }
             (Some(target), Some(source)) if same_final_state(target, source) => {
                 // Both sides reached the same visible state. Keep target to
@@ -122,6 +113,9 @@ fn diff_by_identity(
 ) -> Result<BTreeMap<TrackedStateDiffIdentity, &TrackedStateDiffEntry>, LixError> {
     let mut entries = BTreeMap::new();
     for entry in &diff.entries {
+        if entry.identity.schema_key == "lix_commit" {
+            continue;
+        }
         if entries.insert(entry.identity.clone(), entry).is_some() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -136,24 +130,24 @@ fn diff_by_identity(
     Ok(entries)
 }
 
-fn adopt_source_change_patch(
+fn source_change_pick(
     identity: TrackedStateDiffIdentity,
     entry: &TrackedStateDiffEntry,
-) -> Result<TrackedStateMergePatch, LixError> {
+) -> Result<TrackedStateMergePick, LixError> {
     let Some(row) = entry.after.clone() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "tracked-state merge cannot apply source removal for schema '{}' entity '{}' without a tombstone row",
+                "tracked-state merge cannot pick source removal for schema '{}' entity '{}' without a tombstone row",
                 entry.identity.schema_key,
                 entry.identity.entity_id.as_json_array_text()?
             ),
         ));
     };
-    Ok(TrackedStateMergePatch::Adopt {
+    Ok(TrackedStateMergePick {
         identity,
         change_id: row.change_id.clone(),
-        projected_row: row,
+        selected_row: row,
     })
 }
 
@@ -196,7 +190,7 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(patch_ids(&plan), vec!["entity-a"]);
+        assert_eq!(pick_ids(&plan), vec!["entity-a"]);
         assert!(plan.conflicts.is_empty());
     }
 
@@ -213,9 +207,9 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(patch_ids(&plan), vec!["entity-a"]);
-        assert!(plan.patches[0].projected_row().snapshot_ref.is_some());
-        assert_eq!(plan.patches[0].change_id(), "source");
+        assert_eq!(pick_ids(&plan), vec!["entity-a"]);
+        assert!(plan.picks[0].source_row().snapshot_ref.is_some());
+        assert_eq!(plan.picks[0].source_change_id(), "source");
     }
 
     #[test]
@@ -231,9 +225,9 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(patch_ids(&plan), vec!["entity-a"]);
-        assert!(plan.patches[0].projected_row().deleted);
-        assert_eq!(plan.patches[0].change_id(), "source-delete");
+        assert_eq!(pick_ids(&plan), vec!["entity-a"]);
+        assert!(plan.picks[0].source_row().deleted);
+        assert_eq!(plan.picks[0].source_change_id(), "source-delete");
     }
 
     #[test]
@@ -249,7 +243,7 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert!(plan.patches.is_empty());
+        assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -270,7 +264,7 @@ mod tests {
 
         let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
-        assert!(plan.patches.is_empty());
+        assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -291,7 +285,7 @@ mod tests {
 
         let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
-        assert!(plan.patches.is_empty());
+        assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -312,7 +306,7 @@ mod tests {
 
         let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
-        assert!(plan.patches.is_empty());
+        assert!(plan.picks.is_empty());
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
     }
 
@@ -373,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_and_conflict_order_is_deterministic_by_identity() {
+    fn pick_and_conflict_order_is_deterministic_by_identity() {
         let target = diff(vec![entry(
             "entity-b",
             TrackedStateDiffKind::Modified,
@@ -403,7 +397,7 @@ mod tests {
 
         let plan = plan_merge(&target, &source).expect("merge should plan");
 
-        assert_eq!(patch_ids(&plan), vec!["entity-a", "entity-c"]);
+        assert_eq!(pick_ids(&plan), vec!["entity-a", "entity-c"]);
         assert_eq!(conflict_ids(&plan), vec!["entity-b"]);
     }
 
@@ -429,8 +423,8 @@ mod tests {
         }
     }
 
-    fn patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
-        plan.patches
+    fn pick_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
+        plan.picks
             .iter()
             .map(|entry| {
                 entry
@@ -479,12 +473,6 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: change_id.to_string(),
             commit_id: change_id.replace("change", "commit"),
-            change_location: crate::changelog::SegmentObjectLocation {
-                segment_id: "test-segment".to_string(),
-                offset: 0,
-                len: 0,
-                checksum: "test-checksum".to_string(),
-            },
         }
     }
 }

@@ -1,5 +1,3 @@
-use crate::changelog::{Change, ChangeLocator, SegmentObjectLocation};
-use crate::common::NullableKeyFilter;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{
@@ -7,8 +5,8 @@ use crate::storage::{
     StorageReadOptions, StorageReadScope, StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateProjection,
-    TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
+    TrackedStateReadColumns, TrackedStateScanRequest,
 };
 
 #[derive(Clone)]
@@ -198,7 +196,7 @@ where
                 self.current_commit_id(),
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter::default(),
-                    projection: TrackedStateProjection::default(),
+                    read_columns: TrackedStateReadColumns::default(),
                     limit: None,
                 },
             )
@@ -209,22 +207,16 @@ where
     }
 
     pub async fn read_all_by_pk(&self) -> usize {
-        let requests = self
-            .rows
-            .iter()
-            .map(row_request)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("build tracked-state row requests");
-        self.read_by_pk(&requests).await
+        let keys = self.rows.iter().map(row_key).collect::<Vec<_>>();
+        self.read_by_pk(&keys).await
     }
 
     pub async fn read_one_by_pk(&self) -> usize {
-        let request =
-            row_request(&self.rows[self.rows.len() / 2]).expect("build tracked-state row request");
-        self.read_by_pk(&[request]).await
+        let key = row_key(&self.rows[self.rows.len() / 2]);
+        self.read_by_pk(&[key]).await
     }
 
-    async fn read_by_pk(&self, requests: &[TrackedStateRowRequest]) -> usize {
+    async fn read_by_pk(&self, keys: &[TrackedStateKey]) -> usize {
         let read = BenchRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -232,7 +224,7 @@ where
         );
         let mut reader = self.context.reader(read);
         let rows = reader
-            .load_rows_at_commit(self.current_commit_id(), requests)
+            .load_rows_at_commit(self.current_commit_id(), keys)
             .await
             .expect("load tracked-state rows");
         assert!(rows.iter().all(Option::is_some));
@@ -277,9 +269,9 @@ where
             );
             let mut writer = self.context.writer(&read, &mut writes);
             writer
-                .stage_projection_root(&commit_id, parent_commit_id.as_deref(), deltas)
+                .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
                 .await
-                .expect("stage tracked-state projection root");
+                .expect("stage tracked-state commit root");
         }
         let (_commit, stats) = self
             .storage
@@ -327,8 +319,14 @@ where
 }
 
 struct OwnedDelta {
-    change: Change,
-    locator: ChangeLocator,
+    change_id: String,
+    commit_id: String,
+    entity_id: EntityIdentity,
+    schema_key: String,
+    file_id: Option<String>,
+    snapshot_ref: Option<crate::json_store::JsonRef>,
+    metadata_ref: Option<crate::json_store::JsonRef>,
+    deleted: bool,
     created_at: String,
     updated_at: String,
 }
@@ -357,29 +355,15 @@ impl OwnedDelta {
             Some(refs[0])
         };
         let change_id = format!("tracked-crud-change-{commit_id}-{index}");
-        let change = Change {
-            id: change_id.clone(),
-            authored_commit_id: Some(commit_id.to_string()),
+        Self {
+            change_id,
+            commit_id: commit_id.to_string(),
             entity_id: EntityIdentity::single(row.entity_id),
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_ref,
             metadata_ref: None,
-            created_at: "2026-05-19T00:00:00.000Z".to_string(),
-        };
-        let locator = ChangeLocator {
-            change_id,
-            commit_id: commit_id.to_string(),
-            location: SegmentObjectLocation {
-                segment_id: format!("tracked-crud-segment-{commit_id}"),
-                offset: 0,
-                len: 0,
-                checksum: "bench".to_string(),
-            },
-        };
-        Self {
-            change,
-            locator,
+            deleted,
             created_at: "2026-05-19T00:00:00.000Z".to_string(),
             updated_at: "2026-05-19T00:00:00.000Z".to_string(),
         }
@@ -387,18 +371,24 @@ impl OwnedDelta {
 
     fn as_ref(&self) -> TrackedStateDeltaRef<'_> {
         TrackedStateDeltaRef {
-            change: self.change.as_ref(),
-            locator: self.locator.as_ref(),
+            schema_key: &self.schema_key,
+            file_id: self.file_id.as_deref(),
+            entity_id: &self.entity_id,
+            change_id: &self.change_id,
+            commit_id: &self.commit_id,
+            snapshot_ref: self.snapshot_ref.as_ref(),
+            metadata_ref: self.metadata_ref.as_ref(),
+            deleted: self.deleted,
             created_at: &self.created_at,
             updated_at: &self.updated_at,
         }
     }
 }
 
-fn row_request(row: &BenchTrackedRow) -> Result<TrackedStateRowRequest, crate::LixError> {
-    Ok(TrackedStateRowRequest {
+fn row_key(row: &BenchTrackedRow) -> TrackedStateKey {
+    TrackedStateKey {
         schema_key: row.schema_key.clone(),
         entity_id: EntityIdentity::single(row.entity_id.clone()),
-        file_id: NullableKeyFilter::from_nullable(row.file_id.clone()),
-    })
+        file_id: row.file_id.clone(),
+    }
 }
