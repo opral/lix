@@ -420,3 +420,86 @@ redb for this fixture.
 | transaction | `0x00060002` | `changelog.change`                  | 1,016 |    40,559 |     189,738 |
 | transaction | `0x00060003` | `changelog.commit_change_ref_chunk` |     2 |        81 |     117,699 |
 
+## Commit Change Ref Chunk Codec Cut: 2026-05-21
+
+Commands:
+
+```sh
+cargo test -p lix_engine changelog --no-fail-fast
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+```
+
+Notes:
+
+- Hard-cut the `changelog.commit_change_ref_chunk` value codec in place.
+- The chunk value no longer stores `commit_id`; the reader reconstructs it from
+  the chunk key/read context.
+- The chunk value now uses chunk-local dictionaries for repeated `schema_key`
+  and `file_id` values, stores those dictionary references as `u16`, and uses a
+  compact one-part `EntityIdentity` encoding for the common CRUD case.
+- This is a byte/footprint optimization. Criterion timings were noisy: some
+  unrelated `kv_layout` benches reported regressions even though this patch does
+  not touch that path. Treat the accounting deltas below as the reliable signal.
+
+### 1k Smoke Scorecard
+
+Transaction layer, direct transaction API, Criterion point estimates:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   12.83 ms |  3.06 ms |         188 us |          657 us |   14.79 ms |    2.26 ms |   14.09 ms |    2.24 ms |
+| RocksDB |   11.44 ms |  2.96 ms |        67.1 us |          436 us |   12.43 ms |    2.00 ms |   11.49 ms |    1.62 ms |
+| redb    |   21.07 ms |  2.91 ms |        82.5 us |          388 us |   21.40 ms |    6.21 ms |   19.02 ms |    6.21 ms |
+
+SQL session:
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   16.89 ms |  5.68 ms |        1.31 ms |         1.48 ms |   excluded |   excluded |   14.19 ms |    6.25 ms |
+
+### 1k Smoke Accounting
+
+The logical write counts were unchanged. Written bytes dropped because the
+`changelog.commit_change_ref_chunk` values are smaller.
+
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
+| kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
+| kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
+| kv_layout   | update_one_by_pk |            1 |     1 |             0 |             0 |              1 |             1 |         6,693 |   1.00x |      0.00x |
+| kv_layout   | delete_all       |        1,000 |     0 |             0 |             1 |              0 |             1 |             0 |   0.00x |      0.00x |
+| kv_layout   | delete_one_by_pk |            1 |     0 |             1 |             0 |              1 |             1 |             0 |   0.00x |      1.00x |
+| transaction | insert_all       |        1,000 | 2,037 |             0 |             0 |              7 |             7 |       811,445 |   2.04x |      0.00x |
+| transaction | update_all       |        1,000 | 2,037 |             0 |             0 |              7 |             7 |       925,898 |   2.04x |      0.00x |
+| transaction | update_one_by_pk |            1 |    12 |             0 |             0 |              7 |             7 |        28,577 |  12.00x |      0.00x |
+| transaction | delete_all       |        1,000 | 1,037 |             0 |             0 |              7 |             7 |       492,389 |   1.04x |      0.00x |
+| transaction | delete_one_by_pk |            1 |    11 |             0 |             0 |              7 |             7 |        28,276 |  11.00x |      0.00x |
+
+### Layout Footprint After Insert
+
+The transaction layout footprint was identical across SQLite, RocksDB, and
+redb for this fixture.
+
+| Layer       | Space id     | Space                               |  Rows | Key bytes | Value bytes |
+| ----------- | ------------ | ----------------------------------- | ----: | --------: | ----------: |
+| kv_layout   | `0x00020001` | `tracked_state.crud.row.v1`         | 1,000 |    87,244 |     396,363 |
+| transaction | `0x00010002` | `untracked_state.row.v1`            |     2 |       120 |         273 |
+| transaction | `0x00020001` | `json_store.json`                   | 1,018 |    36,648 |     299,846 |
+| transaction | `0x00040001` | `tracked_state.tree_chunk`          |    33 |     1,188 |     243,324 |
+| transaction | `0x00040004` | `tracked_state.commit_root`         |     2 |        71 |         288 |
+| transaction | `0x00050001` | `binary_cas.manifest`               |     0 |         0 |           0 |
+| transaction | `0x00050002` | `binary_cas.manifest_chunk`         |     0 |         0 |           0 |
+| transaction | `0x00050003` | `binary_cas.chunk`                  |     0 |         0 |           0 |
+| transaction | `0x00060001` | `changelog.commit`                  |     2 |        71 |         270 |
+| transaction | `0x00060002` | `changelog.change`                  | 1,016 |    40,559 |     189,738 |
+| transaction | `0x00060003` | `changelog.commit_change_ref_chunk` |     2 |        81 |     101,287 |
+
+### Delta From Previous Entry
+
+| Metric                                 |  Before |   After |  Delta |
+| -------------------------------------- | ------: | ------: | -----: |
+| `commit_change_ref_chunk` value bytes  | 117,699 | 101,287 | -13.9% |
+| transaction `insert_all` written bytes | 827,460 | 811,445 |  -1.9% |
+| transaction `update_all` written bytes | 941,913 | 925,898 |  -1.7% |
+| transaction `delete_all` written bytes | 508,404 | 492,389 |  -3.2% |

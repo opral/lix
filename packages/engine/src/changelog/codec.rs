@@ -109,32 +109,73 @@ pub(crate) fn encode_commit_change_ref_chunk(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(COMMIT_CHANGE_REF_CHUNK_MAGIC);
     write_u32(&mut bytes, chunk.format_version);
-    write_str(&mut bytes, &chunk.commit_id)?;
+    let schema_keys = commit_change_ref_schema_dictionary(&chunk.entries);
+    let file_ids = commit_change_ref_file_dictionary(&chunk.entries);
+    write_len(
+        &mut bytes,
+        schema_keys.len(),
+        "commit change ref schema dictionary",
+    )?;
+    for schema_key in &schema_keys {
+        write_str(&mut bytes, schema_key)?;
+    }
+    write_len(
+        &mut bytes,
+        file_ids.len(),
+        "commit change ref file dictionary",
+    )?;
+    for file_id in &file_ids {
+        write_optional_str(&mut bytes, *file_id)?;
+    }
     write_len(&mut bytes, chunk.entries.len(), "commit change ref entries")?;
     for entry in &chunk.entries {
-        write_str(&mut bytes, &entry.schema_key)?;
-        write_optional_str(&mut bytes, entry.file_id.as_deref())?;
-        write_entity_identity(&mut bytes, &entry.entity_id)?;
+        let schema_index = dictionary_index(
+            schema_keys.iter().copied(),
+            entry.schema_key.as_str(),
+            "commit change ref schema dictionary",
+        )?;
+        let file_index = optional_dictionary_index(
+            file_ids.iter().copied(),
+            entry.file_id.as_deref(),
+            "commit change ref file dictionary",
+        )?;
+        write_u16_index(&mut bytes, schema_index, "commit change ref schema index")?;
+        write_u16_index(&mut bytes, file_index, "commit change ref file index")?;
+        write_entity_identity_compact(&mut bytes, &entry.entity_id)?;
         write_str(&mut bytes, &entry.change_id)?;
     }
     Ok(bytes)
 }
 
-pub(crate) fn view_commit_change_ref_chunk(
-    bytes: &[u8],
-) -> Result<CommitChangeRefChunkView<'_>, LixError> {
+pub(crate) fn view_commit_change_ref_chunk<'a>(
+    bytes: &'a [u8],
+    commit_id: &'a str,
+) -> Result<CommitChangeRefChunkView<'a>, LixError> {
     let mut cursor = ByteCursor::new(bytes);
     cursor.expect_magic(COMMIT_CHANGE_REF_CHUNK_MAGIC, "commit change ref chunk")?;
     let format_version = cursor.read_u32("format_version")?;
-    let commit_id = cursor.read_str("commit_id")?;
+    let schema_keys = cursor.read_str_vec("commit change ref schema dictionary")?;
+    let file_ids = cursor.read_optional_str_vec("commit change ref file dictionary")?;
     let entry_count = cursor.read_len("commit change ref entries")?;
     let mut entries = Vec::with_capacity(entry_count);
     for index in 0..entry_count {
         let context = format!("commit change ref entries[{index}]");
+        let schema_index = cursor.read_u16(&format!("{context}.schema_index"))? as usize;
+        let file_index = cursor.read_u16(&format!("{context}.file_index"))? as usize;
         entries.push(CommitChangeRefView {
-            schema_key: cursor.read_str(&format!("{context}.schema_key"))?,
-            file_id: cursor.read_optional_str(&format!("{context}.file_id"))?,
-            entity_id: cursor.read_entity_identity(&format!("{context}.entity_id"))?,
+            schema_key: *schema_keys.get(schema_index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("changelog {context}.schema_index is out of bounds"),
+                )
+            })?,
+            file_id: *file_ids.get(file_index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("changelog {context}.file_index is out of bounds"),
+                )
+            })?,
+            entity_id: cursor.read_entity_identity_compact(&format!("{context}.entity_id"))?,
             change_id: cursor.read_str(&format!("{context}.change_id"))?,
         });
     }
@@ -148,8 +189,9 @@ pub(crate) fn view_commit_change_ref_chunk(
 
 pub(crate) fn decode_commit_change_ref_chunk(
     bytes: &[u8],
+    commit_id: &str,
 ) -> Result<CommitChangeRefChunk, LixError> {
-    let view = view_commit_change_ref_chunk(bytes)?;
+    let view = view_commit_change_ref_chunk(bytes, commit_id)?;
     Ok(CommitChangeRefChunk {
         format_version: view.format_version,
         commit_id: view.commit_id.to_string(),
@@ -168,6 +210,53 @@ pub(crate) fn decode_commit_change_ref_chunk(
     })
 }
 
+fn commit_change_ref_schema_dictionary(entries: &[CommitChangeRef]) -> Vec<&str> {
+    let mut values = Vec::new();
+    for entry in entries {
+        if !values.contains(&entry.schema_key.as_str()) {
+            values.push(entry.schema_key.as_str());
+        }
+    }
+    values
+}
+
+fn commit_change_ref_file_dictionary(entries: &[CommitChangeRef]) -> Vec<Option<&str>> {
+    let mut values = Vec::new();
+    for entry in entries {
+        let value = entry.file_id.as_deref();
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn dictionary_index<'a>(
+    mut values: impl Iterator<Item = &'a str>,
+    needle: &str,
+    context: &str,
+) -> Result<usize, LixError> {
+    values.position(|value| value == needle).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("changelog {context} is missing value '{needle}'"),
+        )
+    })
+}
+
+fn optional_dictionary_index<'a>(
+    mut values: impl Iterator<Item = Option<&'a str>>,
+    needle: Option<&str>,
+    context: &str,
+) -> Result<usize, LixError> {
+    values.position(|value| value == needle).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("changelog {context} is missing optional value"),
+        )
+    })
+}
+
 fn write_str_vec(out: &mut Vec<u8>, values: &[String]) -> Result<(), LixError> {
     write_len(out, values.len(), "string vec")?;
     for value in values {
@@ -182,6 +271,19 @@ fn write_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) -> Result
         write_str(out, part)?;
     }
     Ok(())
+}
+
+fn write_entity_identity_compact(
+    out: &mut Vec<u8>,
+    identity: &EntityIdentity,
+) -> Result<(), LixError> {
+    if identity.parts.len() == 1 {
+        out.push(1);
+        write_str(out, &identity.parts[0])
+    } else {
+        out.push(0);
+        write_entity_identity(out, identity)
+    }
 }
 
 fn write_optional_str(out: &mut Vec<u8>, value: Option<&str>) -> Result<(), LixError> {
@@ -229,6 +331,17 @@ fn write_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
+fn write_u16_index(out: &mut Vec<u8>, value: usize, context: &str) -> Result<(), LixError> {
+    let value = u16::try_from(value).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("changelog {context} exceeds u16"),
+        )
+    })?;
+    out.extend_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
 fn entity_identity_from_ref(value: EntityIdentityRef<'_>) -> Result<EntityIdentity, LixError> {
     EntityIdentity::from_parts(value.parts.iter().map(|part| (*part).to_string()).collect())
         .map_err(|error| {
@@ -270,6 +383,15 @@ impl<'a> ByteCursor<'a> {
         Ok(values)
     }
 
+    fn read_optional_str_vec(&mut self, context: &str) -> Result<Vec<Option<&'a str>>, LixError> {
+        let len = self.read_len(context)?;
+        let mut values = Vec::with_capacity(len);
+        for index in 0..len {
+            values.push(self.read_optional_str(&format!("{context}[{index}]"))?);
+        }
+        Ok(values)
+    }
+
     fn read_entity_identity(&mut self, context: &str) -> Result<EntityIdentityRef<'a>, LixError> {
         let len = self.read_len(context)?;
         let mut parts = Vec::with_capacity(len);
@@ -277,6 +399,22 @@ impl<'a> ByteCursor<'a> {
             parts.push(self.read_str(&format!("{context}.parts[{index}]"))?);
         }
         Ok(EntityIdentityRef { parts })
+    }
+
+    fn read_entity_identity_compact(
+        &mut self,
+        context: &str,
+    ) -> Result<EntityIdentityRef<'a>, LixError> {
+        match self.read_bytes(1, context)?[0] {
+            0 => self.read_entity_identity(context),
+            1 => Ok(EntityIdentityRef {
+                parts: vec![self.read_str(&format!("{context}.part"))?],
+            }),
+            _ => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("changelog {context} compact entity identity flag is invalid"),
+            )),
+        }
     }
 
     fn read_optional_str(&mut self, context: &str) -> Result<Option<&'a str>, LixError> {
@@ -328,6 +466,11 @@ impl<'a> ByteCursor<'a> {
     fn read_u32(&mut self, context: &str) -> Result<u32, LixError> {
         let bytes = self.read_bytes(4, context)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u16(&mut self, context: &str) -> Result<u16, LixError> {
+        let bytes = self.read_bytes(2, context)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_bytes(&mut self, len: usize, context: &str) -> Result<&'a [u8], LixError> {
