@@ -437,7 +437,7 @@ Notes:
   the chunk key/read context.
 - The chunk value now uses chunk-local dictionaries for repeated `schema_key`
   and `file_id` values, stores those dictionary references as `u16`, and uses a
-  compact one-part `EntityIdentity` encoding for the common CRUD case.
+  compact one-part `EntityPk` encoding for the common CRUD case.
 - This is a byte/footprint optimization. Criterion timings were noisy: some
   unrelated `kv_layout` benches reported regressions even though this patch does
   not touch that path. Treat the accounting deltas below as the reliable signal.

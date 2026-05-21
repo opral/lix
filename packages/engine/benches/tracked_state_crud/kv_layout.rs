@@ -233,11 +233,11 @@ fn bench_rows(rows: &[WorkloadRow]) -> Vec<BenchRow> {
         .collect()
 }
 
-fn row_key(entity_id: &str) -> Vec<u8> {
+fn row_key(entity_pk: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_component(&mut out, "main");
     push_component(&mut out, "json_pointer");
-    push_component(&mut out, entity_id);
+    push_component(&mut out, entity_pk);
     push_component(&mut out, "");
     out
 }

@@ -44,7 +44,7 @@ After registration, `acme_section` is a SQL table you can `INSERT`, `SELECT`, `U
 | `x-lix-unique`       | Optional. Array of unique constraints, each itself an array of JSON Pointer paths.                                                                                                                           |
 | `x-lix-foreign-keys` | Optional. Array of foreign keys to other registered schemas. See [Foreign keys](#foreign-keys).                                                                                                              |
 
-Without `x-lix-primary-key` you'll get an error like `requires lixcol_entity_id because the schema has no x-lix-primary-key`.
+Without `x-lix-primary-key` you'll get an error like `requires lixcol_entity_pk because the schema has no x-lix-primary-key`.
 
 Schema identity is `x-lix-key` alone. There is no version field. Evolution is governed by the [amendment rules](#schema-amendment-rules).
 
@@ -156,9 +156,9 @@ You don't need `created_at` or `updated_at` on app schemas. Lix already records 
 ### Inspecting registered schemas
 
 ```sql
-SELECT lixcol_entity_id, value
+SELECT lixcol_entity_pk, value
 FROM lix_registered_schema
-ORDER BY lixcol_entity_id;
+ORDER BY lixcol_entity_pk;
 ```
 
 ### Design for querying, not for merging

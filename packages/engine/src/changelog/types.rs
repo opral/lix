@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 
 pub(crate) type CommitId = String;
@@ -58,7 +58,7 @@ pub(crate) struct CommitChangeRefChunkView<'a> {
 pub(crate) struct CommitChangeRef {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: ChangeId,
 }
 
@@ -66,12 +66,12 @@ pub(crate) struct CommitChangeRef {
 pub(crate) struct CommitChangeRefView<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_id: EntityIdentityRef<'a>,
+    pub(crate) entity_pk: EntityPkRef<'a>,
     pub(crate) change_id: ChangeIdRef<'a>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EntityIdentityRef<'a> {
+pub(crate) struct EntityPkRef<'a> {
     pub(crate) parts: Vec<&'a str>,
 }
 
@@ -121,7 +121,7 @@ pub(crate) struct ChangeRecord {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeId,
     pub(crate) schema_key: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
@@ -133,7 +133,7 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeIdRef<'a>,
     pub(crate) schema_key: &'a str,
-    pub(crate) entity_id: EntityIdentityRef<'a>,
+    pub(crate) entity_pk: EntityPkRef<'a>,
     pub(crate) file_id: Option<&'a str>,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,

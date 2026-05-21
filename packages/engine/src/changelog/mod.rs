@@ -24,6 +24,6 @@ pub(crate) use types::{
     ChangeScanBatch, ChangeScanRequest, ChangelogAppend, CommitChangeRef, CommitChangeRefChunk,
     CommitChangeRefChunkView, CommitChangeRefSet, CommitChangeRefView, CommitId, CommitIdRef,
     CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitRecordView, CommitScanBatch, CommitScanRequest, EntityIdentityRef, GcLiveSet, GcPlan,
+    CommitRecordView, CommitScanBatch, CommitScanRequest, EntityPkRef, GcLiveSet, GcPlan,
     GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
 };

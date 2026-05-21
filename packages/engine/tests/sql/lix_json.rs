@@ -99,7 +99,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT entity_id FROM lix_state WHERE entity_id = 'state-latest'",
+                "SELECT entity_pk FROM lix_state WHERE entity_pk = 'state-latest'",
                 &[],
             )
             .await
@@ -126,9 +126,9 @@ simulation_test!(
         );
 
         for sql in [
-            "SELECT entity_id FROM lix_state WHERE entity_id = '[ \"state-latest\" ]'",
-            "SELECT id FROM lix_file WHERE lixcol_entity_id = '[ \"file-readme\" ]'",
-            "SELECT id FROM lix_directory WHERE lixcol_entity_id = '[ \"directory-root\" ]'",
+            "SELECT entity_pk FROM lix_state WHERE entity_pk = '[ \"state-latest\" ]'",
+            "SELECT id FROM lix_file WHERE lixcol_entity_pk = '[ \"file-readme\" ]'",
+            "SELECT id FROM lix_directory WHERE lixcol_entity_pk = '[ \"directory-root\" ]'",
         ] {
             let error = session
                 .execute(sql, &[])
@@ -143,9 +143,9 @@ simulation_test!(
         }
 
         for sql in [
-            "SELECT entity_id FROM lix_state WHERE entity_id = $1",
-            "SELECT id FROM lix_file WHERE lixcol_entity_id = $1",
-            "SELECT id FROM lix_directory WHERE lixcol_entity_id = $1",
+            "SELECT entity_pk FROM lix_state WHERE entity_pk = $1",
+            "SELECT id FROM lix_file WHERE lixcol_entity_pk = $1",
+            "SELECT id FROM lix_directory WHERE lixcol_entity_pk = $1",
         ] {
             let error = session
                 .execute(sql, &[Value::Text("[\"state-latest\"]".to_string())])
@@ -177,7 +177,7 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT entity_id FROM lix_state WHERE entity_id = lix_json('[\"state-latest\"]')",
+                "SELECT entity_pk FROM lix_state WHERE entity_pk = lix_json('[\"state-latest\"]')",
                 &[],
             )
             .await
@@ -245,7 +245,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_schema_dml_rejects_bare_lixcol_entity_id_text,
+    registered_schema_dml_rejects_bare_lixcol_entity_pk_text,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -260,22 +260,22 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = lix_json('{\"x-lix-key\":\"engine_schema_update_history\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}') \
-                 WHERE lixcol_entity_id = 'engine_schema_update_history'",
+                 WHERE lixcol_entity_pk = 'engine_schema_update_history'",
                 &[],
             )
             .await
-            .expect_err("bare text lixcol_entity_id update should fail before matching rows");
+            .expect_err("bare text lixcol_entity_pk update should fail before matching rows");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
 
         let error = session
             .execute(
                 "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_id = 'engine_schema_update_history'",
+                 WHERE lixcol_entity_pk = 'engine_schema_update_history'",
                 &[],
             )
             .await
-            .expect_err("bare text lixcol_entity_id delete should fail before matching rows");
+            .expect_err("bare text lixcol_entity_pk delete should fail before matching rows");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }

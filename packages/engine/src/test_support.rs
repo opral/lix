@@ -101,7 +101,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     .await?;
     let commit_snapshot = commit_row_snapshot_content(commit_id)?;
     let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
-    let commit_entity_id = crate::entity_identity::EntityIdentity::single(commit_id);
+    let commit_entity_pk = crate::entity_pk::EntityPk::single(commit_id);
     let mut deltas = staged
         .change_commit_ids
         .iter()
@@ -111,7 +111,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_id: &change.entity_id,
+                entity_pk: &change.entity_pk,
                 change_id: &change.change_id,
                 commit_id: change_commit_id,
                 snapshot_ref: change.snapshot_ref.as_ref(),
@@ -125,7 +125,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     deltas.push(TrackedStateDeltaRef {
         schema_key: "lix_commit",
         file_id: None,
-        entity_id: &commit_entity_id,
+        entity_pk: &commit_entity_pk,
         change_id: &staged.commit_change_id,
         commit_id,
         snapshot_ref: Some(&commit_snapshot_ref),
@@ -167,7 +167,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
     .await?;
     let commit_snapshot = commit_row_snapshot_content(commit_id)?;
     let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
-    let commit_entity_id = crate::entity_identity::EntityIdentity::single(commit_id);
+    let commit_entity_pk = crate::entity_pk::EntityPk::single(commit_id);
     let mut deltas = staged
         .change_commit_ids
         .iter()
@@ -177,7 +177,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_id: &change.entity_id,
+                entity_pk: &change.entity_pk,
                 change_id: &change.change_id,
                 commit_id: change_commit_id,
                 snapshot_ref: change.snapshot_ref.as_ref(),
@@ -191,7 +191,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
     deltas.push(TrackedStateDeltaRef {
         schema_key: "lix_commit",
         file_id: None,
-        entity_id: &commit_entity_id,
+        entity_pk: &commit_entity_pk,
         change_id: &staged.commit_change_id,
         commit_id,
         snapshot_ref: Some(&commit_snapshot_ref),
@@ -358,20 +358,14 @@ async fn load_existing_changelog_change_ids(
 fn final_state_row_winner_indices(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<Vec<usize>, crate::LixError> {
-    let mut winners = BTreeMap::<
-        (
-            String,
-            Option<String>,
-            crate::entity_identity::EntityIdentity,
-        ),
-        usize,
-    >::new();
+    let mut winners =
+        BTreeMap::<(String, Option<String>, crate::entity_pk::EntityPk), usize>::new();
     for (index, row) in rows.iter().enumerate() {
         winners.insert(
             (
                 row.schema_key.clone(),
                 row.file_id.clone(),
-                row.entity_id.clone(),
+                row.entity_pk.clone(),
             ),
             index,
         );
@@ -415,7 +409,7 @@ fn commit_change_ref_from_change(change: &ChangeRecord) -> CommitChangeRef {
     CommitChangeRef {
         schema_key: change.schema_key.clone(),
         file_id: change.file_id.clone(),
-        entity_id: change.entity_id.clone(),
+        entity_pk: change.entity_pk.clone(),
         change_id: change.change_id.clone(),
     }
 }
@@ -426,7 +420,7 @@ pub(crate) fn tracked_change_from_materialized(
     Ok(ChangeRecord {
         format_version: 1,
         change_id: row.change_id.clone(),
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot_ref: row.snapshot_content.as_deref().map(prepare_json_ref),
@@ -443,7 +437,7 @@ pub(crate) fn untracked_state_row_from_materialized(
     row: &MaterializedUntrackedStateRow,
 ) -> Result<UntrackedStateRow, crate::LixError> {
     Ok(UntrackedStateRow {
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot_content: row.snapshot_content.clone(),

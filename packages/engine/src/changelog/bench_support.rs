@@ -8,7 +8,7 @@ use super::types::{
     ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitChangeRef, CommitChangeRefSet,
     CommitLoadRequest, CommitProjection, CommitRecord, GcPlan, GcRoot, RebuildIndexStats,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::storage::{
     StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions, StorageWriteSetStats,
@@ -618,12 +618,12 @@ fn direct_append_with_shape(
         let take = remaining.min(changes_per_commit);
         for _ in 0..take {
             let change_id = format!("{name}-change-{next_change}");
-            let entity_id = EntityIdentity::single(format!("entity-{next_change}"));
+            let entity_pk = EntityPk::single(format!("entity-{next_change}"));
             append.changes.push(ChangeRecord {
                 format_version: 1,
                 change_id: change_id.clone(),
                 schema_key: "message".to_string(),
-                entity_id: entity_id.clone(),
+                entity_pk: entity_pk.clone(),
                 file_id: None,
                 snapshot_ref: Some(JsonRef::for_content(
                     format!("{{\"value\":{next_change}}}").as_bytes(),
@@ -634,7 +634,7 @@ fn direct_append_with_shape(
             refs.push(CommitChangeRef {
                 schema_key: "message".to_string(),
                 file_id: None,
-                entity_id,
+                entity_pk,
                 change_id,
             });
             next_change += 1;

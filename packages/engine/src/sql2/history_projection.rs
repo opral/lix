@@ -1,12 +1,12 @@
 use serde_json::Value as JsonValue;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::LixError;
 
 /// Shared projection contract for typed history views.
 ///
 /// On tombstone rows (`snapshot_content IS NULL`), identity columns survive by
-/// projecting from canonical entity identity. Non-identity columns must remain
+/// projecting from canonical entity primary key. Non-identity columns must remain
 /// NULL because there is no snapshot to project payload from.
 pub(crate) enum HistoryIdentityProjection<'a> {
     PrimaryKeyPaths(&'a [Vec<String>]),
@@ -15,26 +15,26 @@ pub(crate) enum HistoryIdentityProjection<'a> {
 
 pub(crate) fn tombstone_identity_column_value(
     column_name: &str,
-    entity_id: &str,
+    entity_pk: &str,
     projection: HistoryIdentityProjection<'_>,
 ) -> Result<Option<JsonValue>, LixError> {
     match projection {
         HistoryIdentityProjection::SingleColumn { column } => {
             if column_name == column {
-                Ok(Some(JsonValue::String(entity_id.to_string())))
+                Ok(Some(JsonValue::String(entity_pk.to_string())))
             } else {
                 Ok(None)
             }
         }
         HistoryIdentityProjection::PrimaryKeyPaths(primary_key_paths) => {
-            primary_key_tombstone_value(column_name, entity_id, primary_key_paths)
+            primary_key_tombstone_value(column_name, entity_pk, primary_key_paths)
         }
     }
 }
 
 fn primary_key_tombstone_value(
     column_name: &str,
-    entity_id: &str,
+    entity_pk: &str,
     primary_key_paths: &[Vec<String>],
 ) -> Result<Option<JsonValue>, LixError> {
     let Some(part_index) = primary_key_paths
@@ -44,9 +44,9 @@ fn primary_key_tombstone_value(
         return Ok(None);
     };
 
-    let identity = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
+    let identity = EntityPk::from_json_array_text(entity_pk).map_err(|error| {
         LixError::unknown(format!(
-            "failed to decode history tombstone entity identity: {error}"
+            "failed to decode history tombstone entity primary key: {error}"
         ))
     })?;
     Ok(identity

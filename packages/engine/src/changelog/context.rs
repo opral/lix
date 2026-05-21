@@ -868,13 +868,13 @@ fn chunk_one_commit_change_refs(
         (
             left.schema_key.as_str(),
             left.file_id.as_deref(),
-            &left.entity_id,
+            &left.entity_pk,
             left.change_id.as_str(),
         )
             .cmp(&(
                 right.schema_key.as_str(),
                 right.file_id.as_deref(),
-                &right.entity_id,
+                &right.entity_pk,
                 right.change_id.as_str(),
             ))
     });
@@ -1006,13 +1006,11 @@ fn commit_change_ref_chunk_fixed_size() -> usize {
 fn encoded_commit_change_ref_entry_size(entry: &CommitChangeRef) -> usize {
     2 // schema index
         + 2 // file index
-        + encoded_entity_identity_compact_size(&entry.entity_id)
+        + encoded_entity_pk_compact_size(&entry.entity_pk)
         + encoded_str_size(&entry.change_id)
 }
 
-fn encoded_entity_identity_compact_size(
-    identity: &crate::entity_identity::EntityIdentity,
-) -> usize {
+fn encoded_entity_pk_compact_size(identity: &crate::entity_pk::EntityPk) -> usize {
     if identity.parts.len() == 1 {
         1 + encoded_str_size(&identity.parts[0])
     } else {
@@ -1054,7 +1052,7 @@ fn validate_unique_ref_keys(entries: &[CommitChangeRef], commit_id: &str) -> Res
         let key = (
             entry.schema_key.as_str(),
             entry.file_id.as_deref(),
-            &entry.entity_id,
+            &entry.entity_pk,
         );
         if !seen.insert(key) {
             return Err(LixError::unknown(format!(
@@ -1072,7 +1070,7 @@ fn validate_ref_matches_change(
 ) -> Result<(), LixError> {
     if entry.schema_key != change.schema_key
         || entry.file_id != change.file_id
-        || entry.entity_id != change.entity_id
+        || entry.entity_pk != change.entity_pk
     {
         return Err(LixError::unknown(format!(
             "changelog commit '{}' change ref '{}' does not match referenced ChangeRecord key",
@@ -1186,7 +1184,7 @@ mod tests {
         ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogAppend, ChangelogReader,
         ChangelogWriter, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitScanRequest,
     };
-    use crate::entity_identity::EntityIdentity;
+    use crate::entity_pk::EntityPk;
 
     use super::*;
 
@@ -1194,7 +1192,7 @@ mod tests {
         CommitChangeRef {
             schema_key: "message".to_string(),
             file_id: None,
-            entity_id: EntityIdentity::single(entity.to_string()),
+            entity_pk: EntityPk::single(entity.to_string()),
             change_id: change_id.to_string(),
         }
     }
@@ -1382,7 +1380,7 @@ mod tests {
             format_version: 1,
             change_id: "change-0".to_string(),
             schema_key: "alpha".to_string(),
-            entity_id: EntityIdentity::single("entity-0"),
+            entity_pk: EntityPk::single("entity-0"),
             file_id: None,
             snapshot_ref: None,
             metadata_ref: None,
@@ -1393,7 +1391,7 @@ mod tests {
             crate::changelog::CommitChangeRef {
                 schema_key: "alpha".to_string(),
                 file_id: None,
-                entity_id: EntityIdentity::single("entity-0"),
+                entity_pk: EntityPk::single("entity-0"),
                 change_id: "change-0".to_string(),
             },
         );
@@ -1561,7 +1559,7 @@ mod tests {
                 format_version: 1,
                 change_id: format!("change-{index:04}"),
                 schema_key: "message".to_string(),
-                entity_id: EntityIdentity::single(format!("entity-{index:04}")),
+                entity_pk: EntityPk::single(format!("entity-{index:04}")),
                 file_id: None,
                 snapshot_ref: None,
                 metadata_ref: None,

@@ -25,7 +25,7 @@ pub fn parse_snapshot_value_from_change(change: &PluginEntityChange) -> Value {
 
     let parsed: SnapshotContent =
         serde_json::from_str(snapshot_content).expect("snapshot content should parse");
-    assert_eq!(parsed.path, change.entity_id);
+    assert_eq!(parsed.path, change.entity_pk);
     parsed.value
 }
 

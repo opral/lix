@@ -255,11 +255,11 @@ Schema basics:
 
 - `x-lix-key` becomes the generated SQL table name.
 - Compatible schema amendments are keyed by `x-lix-key`.
-- `x-lix-primary-key` tells Lix how to derive entity identity.
+- `x-lix-primary-key` tells Lix how to derive `entity_pk`.
 - Primary-key entries are JSON Pointers with a leading slash, such as `["/id"]` or `["/owner/email"]`.
 - Use `additionalProperties: false` so accidental fields fail fast.
 
-Without `x-lix-primary-key`, table-style INSERTs fail with an error like `requires lixcol_entity_id because the schema has no x-lix-primary-key`.
+Without `x-lix-primary-key`, table-style INSERTs fail with an error like `requires lixcol_entity_pk because the schema has no x-lix-primary-key`.
 
 Uniqueness is not inferred from ordinary JSON Schema fields. If a non-primary-key field must be unique, declare it explicitly:
 
@@ -284,7 +284,7 @@ Discover live schemas before guessing:
 
 ```ts
 const schemas = await lix.execute(
-  "SELECT lixcol_entity_id, value FROM lix_registered_schema ORDER BY lixcol_entity_id",
+  "SELECT lixcol_entity_pk, value FROM lix_registered_schema ORDER BY lixcol_entity_pk",
 );
 
 for (const row of schemas.rows) {
@@ -425,7 +425,7 @@ Columns consumers usually need:
 
 `lix_change` is an immutable SQL table of changes across registered schemas and versions. Use it for audit logs, blame, history, activity feeds, and undo-style UI.
 
-Important columns include `id`, `entity_id`, `schema_key`, `snapshot_content`, `created_at`, and `lixcol_*` metadata.
+Important columns include `id`, `entity_pk`, `schema_key`, `snapshot_content`, `created_at`, and `lixcol_*` metadata.
 
 ```ts
 // Audit log for one entity, oldest to newest.
@@ -433,14 +433,14 @@ await lix.execute(
   `SELECT created_at, snapshot_content
      FROM lix_change
     WHERE schema_key = $1
-      AND lix_json_get_text(entity_id, 0) = $2
+      AND lix_json_get_text(entity_pk, 0) = $2
     ORDER BY created_at`,
   ["acme_note", "n1"],
 );
 
 // Latest activity across a schema.
 await lix.execute(
-  `SELECT created_at, entity_id, snapshot_content
+  `SELECT created_at, entity_pk, snapshot_content
      FROM lix_change
     WHERE schema_key = $1
     ORDER BY created_at DESC

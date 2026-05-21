@@ -1,6 +1,6 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
@@ -17,8 +17,8 @@ const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
-const ENTITY_IDENTITY_END: u8 = 0;
-const ENTITY_IDENTITY_STRING: u8 = 1;
+const ENTITY_PKENTITY_END: u8 = 0;
+const ENTITY_PKENTITY_STRING: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -160,7 +160,7 @@ pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
     encode_key_ref(TrackedStateKeyRef {
         schema_key: &key.schema_key,
         file_id: key.file_id.as_deref(),
-        entity_id: &key.entity_id,
+        entity_pk: &key.entity_pk,
     })
 }
 
@@ -179,7 +179,7 @@ fn append_key_ref(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>) {
         }
         None => out.push(0),
     }
-    push_entity_identity(out, key.entity_id);
+    push_entity_pk(out, key.entity_pk);
 }
 
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
@@ -213,7 +213,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
             ))
         }
     };
-    let entity_id = read_entity_identity(bytes, &mut cursor)?;
+    let entity_pk = read_entity_pk(bytes, &mut cursor)?;
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -223,7 +223,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     Ok(TrackedStateKey {
         schema_key,
         file_id,
-        entity_id,
+        entity_pk,
     })
 }
 
@@ -238,7 +238,7 @@ pub(crate) fn decode_key_with_trusted_prefix(
     prefix_len: usize,
 ) -> Result<TrackedStateKey, LixError> {
     let mut cursor = prefix_len;
-    let entity_id = read_entity_identity(bytes, &mut cursor)?;
+    let entity_pk = read_entity_pk(bytes, &mut cursor)?;
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -248,7 +248,7 @@ pub(crate) fn decode_key_with_trusted_prefix(
     Ok(TrackedStateKey {
         schema_key: schema_key.to_string(),
         file_id: file_id.map(str::to_string),
-        entity_id,
+        entity_pk,
     })
 }
 
@@ -623,35 +623,37 @@ fn level_salt(level: usize) -> u64 {
     value ^ (value >> 31)
 }
 
-fn push_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) {
+fn push_entity_pk(out: &mut Vec<u8>, identity: &EntityPk) {
     assert!(
         !identity.parts.is_empty(),
-        "tracked-state key entity identity must contain at least one part"
+        "tracked-state key entity primary key must contain at least one part"
     );
     for part in &identity.parts {
-        out.push(ENTITY_IDENTITY_STRING);
+        out.push(ENTITY_PKENTITY_STRING);
         push_sized_bytes(out, part.as_bytes());
     }
-    out.push(ENTITY_IDENTITY_END);
+    out.push(ENTITY_PKENTITY_END);
 }
 
-fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity, LixError> {
+fn read_entity_pk(bytes: &[u8], cursor: &mut usize) -> Result<EntityPk, LixError> {
     let mut parts = Vec::new();
     loop {
-        let tag = read_u8(bytes, cursor, "entity identity part tag")?;
+        let tag = read_u8(bytes, cursor, "entity primary key part tag")?;
         match tag {
-            ENTITY_IDENTITY_END => break,
-            ENTITY_IDENTITY_STRING => {
+            ENTITY_PKENTITY_END => break,
+            ENTITY_PKENTITY_STRING => {
                 parts.push(read_sized_string(
                     bytes,
                     cursor,
-                    "entity identity string part",
+                    "entity primary key string part",
                 )?);
             }
             other => {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("tracked-state tree key has invalid entity identity part tag {other}"),
+                    format!(
+                        "tracked-state tree key has invalid entity primary key part tag {other}"
+                    ),
                 ))
             }
         }
@@ -659,10 +661,10 @@ fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdenti
     if parts.is_empty() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "tracked-state tree key entity identity must contain at least one part",
+            "tracked-state tree key entity primary key must contain at least one part",
         ));
     }
-    Ok(EntityIdentity { parts })
+    Ok(EntityPk { parts })
 }
 
 fn push_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -863,12 +865,12 @@ mod tests {
         let null_key = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity::single("entity"),
+            entity_pk: EntityPk::single("entity"),
         });
         let file_key = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_id: EntityIdentity::single("entity"),
+            entity_pk: EntityPk::single("entity"),
         });
 
         assert_ne!(null_key, file_key);
@@ -877,7 +879,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: None,
-                entity_id: EntityIdentity::single("entity"),
+                entity_pk: EntityPk::single("entity"),
             }
         );
         assert_eq!(
@@ -885,7 +887,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: Some("file".to_string()),
-                entity_id: EntityIdentity::single("entity"),
+                entity_pk: EntityPk::single("entity"),
             }
         );
     }
@@ -895,7 +897,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec![
                     "namespace".to_string(),
                     "true".to_string(),
@@ -914,7 +916,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["namespace".to_string(), "id".to_string()],
             },
         };
@@ -933,7 +935,7 @@ mod tests {
         let mut encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["true".to_string()],
             },
         });
@@ -945,7 +947,7 @@ mod tests {
         let error = decode_key(&encoded).expect_err("non-string identity tag should reject");
         assert!(error
             .to_string()
-            .contains("invalid entity identity part tag 2"));
+            .contains("invalid entity primary key part tag 2"));
     }
 
     #[test]
@@ -953,14 +955,14 @@ mod tests {
         let prefix = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["a".to_string()],
             },
         });
         let extended = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["a".to_string(), "b".to_string()],
             },
         });

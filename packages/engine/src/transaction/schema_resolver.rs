@@ -148,7 +148,7 @@ impl LiveStateReader for TransactionSchemaLiveStateReader<'_> {
             .scan_rows(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
-                    entity_ids: vec![request.entity_id.clone()],
+                    entity_pks: vec![request.entity_pk.clone()],
                     version_ids: vec![request.version_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     ..Default::default()

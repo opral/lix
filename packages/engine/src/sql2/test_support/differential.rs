@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::common::serialize_row_metadata;
-    use crate::entity_identity::EntityIdentity;
+    use crate::entity_pk::EntityPk;
     use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::session::CreateVersionOptions;
     use crate::sql2::test_support::generators::{
@@ -415,26 +415,26 @@ mod tests {
         match probe {
             DifferentialProbe::LixStateActive {
                 schema_key,
-                entity_ids,
+                entity_pks,
             } => {
-                let mut params = Vec::with_capacity(entity_ids.len() + 1);
+                let mut params = Vec::with_capacity(entity_pks.len() + 1);
                 params.push(Value::Text((*schema_key).to_string()));
-                let placeholders = entity_ids
+                let placeholders = entity_pks
                     .iter()
                     .enumerate()
-                    .map(|(index, entity_id)| {
-                        params.push(Value::Json(serde_json::json!([*entity_id])));
+                    .map(|(index, entity_pk)| {
+                        params.push(Value::Json(serde_json::json!([*entity_pk])));
                         format!("${}", index + 2)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 ProbeQuery {
-                    name: format!("lix_state:{schema_key}:{entity_ids:?}"),
+                    name: format!("lix_state:{schema_key}:{entity_pks:?}"),
                     sql: format!(
-                        "SELECT entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked \
+                        "SELECT entity_pk, schema_key, file_id, snapshot_content, metadata, global, untracked \
                          FROM lix_state \
-                         WHERE schema_key = $1 AND entity_id IN ({placeholders}) \
-                         ORDER BY schema_key, entity_id, file_id"
+                         WHERE schema_key = $1 AND entity_pk IN ({placeholders}) \
+                         ORDER BY schema_key, entity_pk, file_id"
                     ),
                     params,
                     version_column_indexes: &[],
@@ -442,16 +442,16 @@ mod tests {
             }
             DifferentialProbe::LixStateByVersion {
                 schema_key,
-                entity_ids,
+                entity_pks,
                 version_ids,
             } => {
-                let mut params = Vec::with_capacity(entity_ids.len() + version_ids.len() + 1);
+                let mut params = Vec::with_capacity(entity_pks.len() + version_ids.len() + 1);
                 params.push(Value::Text((*schema_key).to_string()));
-                let entity_placeholders = entity_ids
+                let entity_placeholders = entity_pks
                     .iter()
                     .enumerate()
-                    .map(|(index, entity_id)| {
-                        params.push(Value::Json(serde_json::json!([*entity_id])));
+                    .map(|(index, entity_pk)| {
+                        params.push(Value::Json(serde_json::json!([*entity_pk])));
                         format!("${}", index + 2)
                     })
                     .collect::<Vec<_>>()
@@ -471,15 +471,15 @@ mod tests {
                     .join(", ");
                 ProbeQuery {
                     name: format!(
-                        "lix_state_by_version:{schema_key}:{entity_ids:?}:{version_ids:?}"
+                        "lix_state_by_version:{schema_key}:{entity_pks:?}:{version_ids:?}"
                     ),
                     sql: format!(
-                        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, metadata, global, untracked \
+                        "SELECT entity_pk, schema_key, file_id, version_id, snapshot_content, metadata, global, untracked \
                          FROM lix_state_by_version \
                          WHERE schema_key = $1 \
-                           AND entity_id IN ({entity_placeholders}) \
+                           AND entity_pk IN ({entity_placeholders}) \
                            AND version_id IN ({version_placeholders}) \
-                         ORDER BY schema_key, entity_id, file_id, version_id"
+                         ORDER BY schema_key, entity_pk, file_id, version_id"
                     ),
                     params,
                     version_column_indexes: &[3],
@@ -487,9 +487,9 @@ mod tests {
             }
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
                 name: "lix_registered_schema".to_string(),
-                sql: "SELECT lixcol_entity_id, value, lixcol_metadata, lixcol_global, lixcol_untracked \
+                sql: "SELECT lixcol_entity_pk, value, lixcol_metadata, lixcol_global, lixcol_untracked \
                  FROM lix_registered_schema \
-                 ORDER BY lixcol_entity_id"
+                 ORDER BY lixcol_entity_pk"
                     .to_string(),
                 params: Vec::new(),
                 version_column_indexes: &[],
@@ -511,10 +511,10 @@ mod tests {
                 ProbeQuery {
                     name: format!("lix_registered_schema_by_version:{version_ids:?}"),
                     sql: format!(
-                        "SELECT lixcol_entity_id, value, lixcol_version_id, lixcol_metadata, lixcol_global, lixcol_untracked \
+                        "SELECT lixcol_entity_pk, value, lixcol_version_id, lixcol_metadata, lixcol_global, lixcol_untracked \
                          FROM lix_registered_schema_by_version \
                          WHERE lixcol_version_id IN ({placeholders}) \
-                         ORDER BY lixcol_entity_id, lixcol_version_id"
+                         ORDER BY lixcol_entity_pk, lixcol_version_id"
                     ),
                     params,
                     version_column_indexes: &[2],
@@ -531,20 +531,20 @@ mod tests {
         match probe {
             DifferentialProbe::LixStateByVersion {
                 schema_key,
-                entity_ids,
+                entity_pks,
                 version_ids,
             } => {
                 let rows = scan_transaction_live_state(
                     transaction,
                     schema_key,
-                    *entity_ids,
+                    *entity_pks,
                     *version_ids,
                     active_version_id,
                 )
                 .await;
                 Some(ProbeSnapshot {
                     name: format!(
-                        "lix_state_by_version_staged:{schema_key}:{entity_ids:?}:{version_ids:?}"
+                        "lix_state_by_version_staged:{schema_key}:{entity_pks:?}:{version_ids:?}"
                     ),
                     rows: lix_state_by_version_rows(rows, active_version_id),
                 })
@@ -570,7 +570,7 @@ mod tests {
     async fn scan_transaction_live_state(
         transaction: &mut crate::session::SessionTransaction,
         schema_key: &str,
-        entity_ids: &[&str],
+        entity_pks: &[&str],
         version_ids: &[&str],
         active_version_id: &str,
     ) -> Vec<MaterializedLiveStateRow> {
@@ -578,9 +578,9 @@ mod tests {
             .scan_live_state_for_test(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![schema_key.to_string()],
-                    entity_ids: entity_ids
+                    entity_pks: entity_pks
                         .iter()
-                        .map(|entity_id| EntityIdentity::single(*entity_id))
+                        .map(|entity_pk| EntityPk::single(*entity_pk))
                         .collect(),
                     version_ids: version_ids
                         .iter()
@@ -606,7 +606,7 @@ mod tests {
         rows.sort_by_key(|row| {
             (
                 row.schema_key.clone(),
-                row.entity_id.clone(),
+                row.entity_pk.clone(),
                 row.file_id.clone(),
                 row.version_id.clone(),
             )
@@ -615,7 +615,7 @@ mod tests {
             .map(|row| {
                 canonical_probe_values(
                     &[
-                        entity_id_value(row),
+                        entity_pk_value(row),
                         Value::Text(row.schema_key.clone()),
                         optional_text_value(row.file_id.clone()),
                         Value::Text(row.version_id.clone()),
@@ -639,7 +639,7 @@ mod tests {
         mut rows: Vec<MaterializedLiveStateRow>,
         active_version_id: &str,
     ) -> Vec<Vec<Value>> {
-        rows.sort_by_key(|row| (row.entity_id.clone(), row.version_id.clone()));
+        rows.sort_by_key(|row| (row.entity_pk.clone(), row.version_id.clone()));
         rows.iter()
             .map(|row| {
                 let value = row
@@ -653,7 +653,7 @@ mod tests {
                     .unwrap_or(Value::Null);
                 canonical_probe_values(
                     &[
-                        entity_id_value(row),
+                        entity_pk_value(row),
                         value,
                         Value::Text(row.version_id.clone()),
                         row.metadata
@@ -671,11 +671,11 @@ mod tests {
             .collect()
     }
 
-    fn entity_id_value(row: &MaterializedLiveStateRow) -> Value {
+    fn entity_pk_value(row: &MaterializedLiveStateRow) -> Value {
         Value::Text(
-            row.entity_id
+            row.entity_pk
                 .as_json_array_text()
-                .expect("materialized entity id should encode"),
+                .expect("materialized entity pk should encode"),
         )
     }
 

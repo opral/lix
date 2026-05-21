@@ -240,7 +240,7 @@ fn detect_state_foreign_key_tuple_shape(schema: &JsonValue) -> Option<LixError> 
             return Some(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
-                    "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_id, schema_key, file_id]; [0] entity_id, [1] schema_key, [2] file_id."
+                    "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_pk, schema_key, file_id]; [0] entity_pk, [1] schema_key, [2] file_id."
                 ),
             ));
         }
@@ -406,7 +406,7 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
         }
 
         let roles = [
-            ("entity_id", "a non-empty JSON array of strings"),
+            ("entity_pk", "a non-empty JSON array of strings"),
             ("schema_key", "a string"),
             ("file_id", "a string or null"),
         ];
@@ -430,13 +430,13 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be required. Tuple order is [entity_id, schema_key, file_id]."
+                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be required. Tuple order is [entity_pk, schema_key, file_id]."
                     ),
                 ));
             }
 
             let valid = match *role {
-                "entity_id" => schema_property_is_string_array(property_schema),
+                "entity_pk" => schema_property_is_string_array(property_schema),
                 "schema_key" => schema_property_is_string_only(property_schema),
                 "file_id" => schema_property_is_string_or_null(property_schema),
                 _ => unreachable!("state foreign key roles are exhaustive"),
@@ -445,7 +445,7 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be {expected}. Tuple order is [entity_id, schema_key, file_id]."
+                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be {expected}. Tuple order is [entity_pk, schema_key, file_id]."
                     ),
                 ));
             }

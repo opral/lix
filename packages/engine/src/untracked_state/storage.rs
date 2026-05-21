@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageRead, StorageScanOptions, StorageSpace, StorageSpaceId,
@@ -84,7 +84,7 @@ pub(super) async fn existing_identities<'a>(
             let owned = UntrackedStateIdentity {
                 version_id: identity.version_id.to_string(),
                 schema_key: identity.schema_key.to_string(),
-                entity_id: identity.entity_id.clone(),
+                entity_pk: identity.entity_pk.clone(),
                 file_id: identity.file_id.map(str::to_string),
             };
             let key = encode_untracked_state_row_key_ref(owned.as_ref())?;
@@ -260,14 +260,14 @@ fn scan_prefixes_for_filter(
         for schema_key in &filter.schema_keys {
             let mut schema_prefix = version_prefix.clone();
             push_component(&mut schema_prefix, schema_key)?;
-            if filter.entity_ids.is_empty() {
+            if filter.entity_pks.is_empty() {
                 prefixes.push(schema_prefix);
                 continue;
             }
 
-            for entity_id in &filter.entity_ids {
+            for entity_pk in &filter.entity_pks {
                 let mut entity_prefix = schema_prefix.clone();
-                push_entity_component(&mut entity_prefix, entity_id)?;
+                push_entity_component(&mut entity_prefix, entity_pk)?;
                 append_file_prefixes(&mut prefixes, entity_prefix, &filter.file_ids)?;
             }
         }
@@ -275,8 +275,8 @@ fn scan_prefixes_for_filter(
     Ok(prefixes)
 }
 
-fn push_entity_component(out: &mut Vec<u8>, entity_id: &EntityIdentity) -> Result<(), LixError> {
-    push_entity_tuple(out, entity_id)
+fn push_entity_component(out: &mut Vec<u8>, entity_pk: &EntityPk) -> Result<(), LixError> {
+    push_entity_tuple(out, entity_pk)
 }
 
 fn append_file_prefixes(
@@ -317,8 +317,8 @@ fn full_value(value: StorageProjectedValue) -> Option<Bytes> {
 
 fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest) -> bool {
     (request.filter.schema_keys.is_empty() || request.filter.schema_keys.contains(&row.schema_key))
-        && (request.filter.entity_ids.is_empty()
-            || request.filter.entity_ids.contains(&row.entity_id))
+        && (request.filter.entity_pks.is_empty()
+            || request.filter.entity_pks.contains(&row.entity_pk))
         && (request.filter.version_ids.is_empty()
             || request.filter.version_ids.contains(&row.version_id))
         && nullable_matches_filters(&row.file_id, &request.filter.file_ids)
@@ -342,7 +342,7 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
     Some(UntrackedStateIdentity {
         version_id: request.version_id.clone(),
         schema_key: request.schema_key.clone(),
-        entity_id: request.entity_id.clone(),
+        entity_pk: request.entity_pk.clone(),
         file_id,
     })
 }
@@ -357,7 +357,7 @@ pub(crate) fn encode_untracked_state_row_key_ref(
     let mut out = key_header();
     push_component(&mut out, identity.version_id)?;
     push_component(&mut out, identity.schema_key)?;
-    push_entity_tuple(&mut out, identity.entity_id)?;
+    push_entity_tuple(&mut out, identity.entity_pk)?;
     match identity.file_id {
         Some(file_id) => {
             out.push(1);
@@ -391,7 +391,7 @@ fn decode_untracked_state_row_key_ref(bytes: &[u8]) -> Result<UntrackedStateIden
     }
     let version_id = read_key_component(bytes, &mut cursor, "version_id")?;
     let schema_key = read_key_component(bytes, &mut cursor, "schema_key")?;
-    let entity_id = read_entity_tuple(bytes, &mut cursor)?;
+    let entity_pk = read_entity_tuple(bytes, &mut cursor)?;
     let file_tag = bytes.get(cursor).copied().ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -418,7 +418,7 @@ fn decode_untracked_state_row_key_ref(bytes: &[u8]) -> Result<UntrackedStateIden
     Ok(UntrackedStateIdentity {
         version_id,
         schema_key,
-        entity_id,
+        entity_pk,
         file_id,
     })
 }
@@ -463,12 +463,12 @@ fn read_key_component(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<S
         })
 }
 
-fn read_entity_tuple(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity, LixError> {
+fn read_entity_tuple(bytes: &[u8], cursor: &mut usize) -> Result<EntityPk, LixError> {
     let part_count = read_key_u32(bytes, cursor, "entity_part_count")? as usize;
     if part_count == 0 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: entity identity has no parts",
+            "failed to decode untracked-state key: entity primary key has no parts",
         ));
     }
 
@@ -479,13 +479,13 @@ fn read_entity_tuple(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity,
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "failed to decode untracked-state key: entity identity part {index} is empty"
+                    "failed to decode untracked-state key: entity primary key part {index} is empty"
                 ),
             ));
         }
         parts.push(part);
     }
-    Ok(EntityIdentity { parts })
+    Ok(EntityPk { parts })
 }
 
 fn read_key_u32(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u32, LixError> {
@@ -519,25 +519,25 @@ fn push_component(out: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
     push_bytes_component(out, bytes)
 }
 
-fn push_entity_tuple(out: &mut Vec<u8>, entity_id: &EntityIdentity) -> Result<(), LixError> {
-    let part_count = u32::try_from(entity_id.parts.len()).map_err(|_| {
+fn push_entity_tuple(out: &mut Vec<u8>, entity_pk: &EntityPk) -> Result<(), LixError> {
+    let part_count = u32::try_from(entity_pk.parts.len()).map_err(|_| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "failed to encode untracked-state key: entity identity part count exceeds u32",
+            "failed to encode untracked-state key: entity primary key part count exceeds u32",
         )
     })?;
     if part_count == 0 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "failed to encode untracked-state key: entity identity has no parts",
+            "failed to encode untracked-state key: entity primary key has no parts",
         ));
     }
     out.extend_from_slice(&part_count.to_be_bytes());
-    for part in &entity_id.parts {
+    for part in &entity_pk.parts {
         if part.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "failed to encode untracked-state key: entity identity part is empty",
+                "failed to encode untracked-state key: entity primary key part is empty",
             ));
         }
         push_bytes_component(out, part.as_bytes())?;
@@ -569,7 +569,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -587,7 +587,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: Some(String::new()),
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -603,11 +603,11 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-東京".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::tuple(vec![
+            entity_pk: crate::entity_pk::EntityPk::tuple(vec![
                 "entity-1".to_string(),
                 "ключ".to_string(),
             ])
-            .expect("entity identity should build"),
+            .expect("entity primary key should build"),
             file_id: Some("file-δ".to_string()),
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -623,11 +623,11 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::tuple(vec![
+            entity_pk: crate::entity_pk::EntityPk::tuple(vec![
                 "entity/1".to_string(),
                 "quote\"part".to_string(),
             ])
-            .expect("entity identity should build"),
+            .expect("entity primary key should build"),
             file_id: None,
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -653,7 +653,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
         };
         let mut key =
@@ -669,7 +669,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
         };
         let mut key =
@@ -685,7 +685,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
         };
         let mut key =
@@ -733,7 +733,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     version_id: "global".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("ui-tab"),
+                    entity_pk: crate::entity_pk::EntityPk::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -777,8 +777,8 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_id,
-            crate::entity_identity::EntityIdentity::single("version-ui")
+            rows[0].entity_pk,
+            crate::entity_pk::EntityPk::single("version-ui")
         );
     }
 
@@ -790,7 +790,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             version_id: row.version_id.clone(),
             schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
         };
         write_materialized_rows_to_store(&context, &storage, std::slice::from_ref(&row)).await;
@@ -813,7 +813,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     version_id: "global".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("ui-tab"),
+                    entity_pk: crate::entity_pk::EntityPk::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -848,7 +848,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     version_id: "global".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("legacy-row-key"),
+                    entity_pk: crate::entity_pk::EntityPk::single("legacy-row-key"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -878,13 +878,13 @@ mod tests {
     fn untracked_row(
         version_id: &str,
         schema_key: &str,
-        entity_id: &str,
+        entity_pk: &str,
     ) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"key\":\"{}\",\"value\":\"value\"}}", entity_id)),
+            snapshot_content: Some(format!("{{\"key\":\"{}\",\"value\":\"value\"}}", entity_pk)),
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),

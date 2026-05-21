@@ -1,7 +1,7 @@
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
 use crate::exports::lix::plugin::api::{EntityChange, File, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
-use crate::ROOT_ENTITY_ID;
+use crate::ROOT_ENTITY_PK;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn apply_changes(
@@ -18,16 +18,16 @@ pub(crate) fn apply_changes(
         }
 
         if change.schema_key == DOCUMENT_SCHEMA_KEY {
-            if change.entity_id != ROOT_ENTITY_ID {
+            if change.entity_pk != ROOT_ENTITY_PK {
                 return Err(PluginError::InvalidInput(format!(
-                    "unsupported entity_id '{}' for schema_key '{}', expected '{}'",
-                    change.entity_id, DOCUMENT_SCHEMA_KEY, ROOT_ENTITY_ID
+                    "unsupported entity_pk '{}' for schema_key '{}', expected '{}'",
+                    change.entity_pk, DOCUMENT_SCHEMA_KEY, ROOT_ENTITY_PK
                 )));
             }
             if document.is_some() {
                 return Err(PluginError::InvalidInput(format!(
-                    "duplicate entity_id '{}' for schema_key '{}'",
-                    ROOT_ENTITY_ID, DOCUMENT_SCHEMA_KEY
+                    "duplicate entity_pk '{}' for schema_key '{}'",
+                    ROOT_ENTITY_PK, DOCUMENT_SCHEMA_KEY
                 )));
             }
 
@@ -36,20 +36,20 @@ pub(crate) fn apply_changes(
                     let parsed: DocumentSnapshotContent =
                         serde_json::from_str(&raw).map_err(|error| {
                             PluginError::InvalidInput(format!(
-                                "invalid snapshot_content for entity_id '{}': {error}",
-                                ROOT_ENTITY_ID
+                                "invalid snapshot_content for entity_pk '{}': {error}",
+                                ROOT_ENTITY_PK
                             ))
                         })?;
-                    if parsed.id != ROOT_ENTITY_ID {
+                    if parsed.id != ROOT_ENTITY_PK {
                         return Err(PluginError::InvalidInput(format!(
                             "document snapshot id '{}' does not match expected '{}'",
-                            parsed.id, ROOT_ENTITY_ID
+                            parsed.id, ROOT_ENTITY_PK
                         )));
                     }
                     parsed
                 }
                 None => DocumentSnapshotContent {
-                    id: ROOT_ENTITY_ID.to_string(),
+                    id: ROOT_ENTITY_PK.to_string(),
                     order: Vec::new(),
                 },
             };
@@ -59,10 +59,10 @@ pub(crate) fn apply_changes(
         }
 
         // BLOCK_SCHEMA_KEY
-        if !seen_block_ids.insert(change.entity_id.clone()) {
+        if !seen_block_ids.insert(change.entity_pk.clone()) {
             return Err(PluginError::InvalidInput(format!(
-                "duplicate entity_id '{}' for schema_key '{}'",
-                change.entity_id, BLOCK_SCHEMA_KEY
+                "duplicate entity_pk '{}' for schema_key '{}'",
+                change.entity_pk, BLOCK_SCHEMA_KEY
             )));
         }
 
@@ -73,19 +73,19 @@ pub(crate) fn apply_changes(
         let snapshot: BlockSnapshotContent =
             serde_json::from_str(&snapshot_content).map_err(|error| {
                 PluginError::InvalidInput(format!(
-                    "invalid snapshot_content for entity_id '{}': {error}",
-                    change.entity_id
+                    "invalid snapshot_content for entity_pk '{}': {error}",
+                    change.entity_pk
                 ))
             })?;
 
-        if snapshot.id != change.entity_id {
+        if snapshot.id != change.entity_pk {
             return Err(PluginError::InvalidInput(format!(
-                "block snapshot id '{}' does not match entity_id '{}'",
-                snapshot.id, change.entity_id
+                "block snapshot id '{}' does not match entity_pk '{}'",
+                snapshot.id, change.entity_pk
             )));
         }
 
-        blocks_by_id.insert(change.entity_id, snapshot);
+        blocks_by_id.insert(change.entity_pk, snapshot);
     }
 
     if document.is_none() && blocks_by_id.is_empty() {

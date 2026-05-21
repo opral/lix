@@ -69,7 +69,7 @@ mod tests {
     #[test]
     fn plan_write_contradiction_does_not_drop_bound_params() {
         let plan = plan_sql(
-            "UPDATE lix_state SET metadata = $1 WHERE schema_key IN ('profile') AND schema_key IN ('note') AND entity_id = $2",
+            "UPDATE lix_state SET metadata = $1 WHERE schema_key IN ('profile') AND schema_key IN ('note') AND entity_pk = $2",
         );
 
         assert_eq!(

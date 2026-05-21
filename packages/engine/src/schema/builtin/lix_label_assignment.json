@@ -1,12 +1,12 @@
 {
   "x-lix-key": "lix_label_assignment",
-  "description": "Mapping table that assigns a label to any live Lix row addressed by (target_entity_id, target_schema_key, target_file_id). The state foreign-key tuple is ordered as [0] target_entity_id, [1] target_schema_key, [2] target_file_id.",
+  "description": "Mapping table that assigns a label to any live Lix row addressed by (target_entity_pk, target_schema_key, target_file_id). The state foreign-key tuple is ordered as [0] target_entity_pk, [1] target_schema_key, [2] target_file_id.",
   "x-lix-primary-key": [
     "/id"
   ],
   "x-lix-unique": [
     [
-      "/target_entity_id",
+      "/target_entity_pk",
       "/target_schema_key",
       "/target_file_id",
       "/label_id"
@@ -14,7 +14,7 @@
   ],
   "x-lix-state-foreign-keys": [
     [
-      "/target_entity_id",
+      "/target_entity_pk",
       "/target_schema_key",
       "/target_file_id"
     ]
@@ -39,9 +39,9 @@
       "x-lix-default": "lix_uuid_v7()",
       "description": "Stable identifier for this label assignment row."
     },
-    "target_entity_id": {
+    "target_entity_pk": {
       "type": "array",
-      "description": "Target row entity_id. This is slot [0] in x-lix-state-foreign-keys and must be the canonical JSON array of string primary-key parts.",
+      "description": "Target row entity_pk. This is slot [0] in x-lix-state-foreign-keys and must be the canonical JSON array of string primary-key parts.",
       "items": {
         "type": "string"
       },
@@ -65,7 +65,7 @@
   },
   "required": [
     "id",
-    "target_entity_id",
+    "target_entity_pk",
     "target_schema_key",
     "target_file_id",
     "label_id"

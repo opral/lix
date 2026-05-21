@@ -18,9 +18,9 @@ interface api {
   /// any ordering of `changes`.
   ///
   /// Uniqueness: callers provide at most one row per
-  /// (`schema-key`, `entity-id`) for the same (`file.id`, version).
+  /// (`schema-key`, `entity-pk`) for the same (`file.id`, version).
   record entity-change {
-    entity-id: string,
+    entity-pk: string,
     schema-key: string,
     /// Deterministically encoded JSON text.
     snapshot-content: option<canonical-json>,
@@ -31,7 +31,7 @@ interface api {
   ///
   /// Scope is implicit and engine-defined: same plugin + same file + active rows.
   record active-state-row {
-    entity-id: string,
+    entity-pk: string,
     schema-key: option<string>,
     /// Deterministically encoded JSON text.
     snapshot-content: option<canonical-json>,

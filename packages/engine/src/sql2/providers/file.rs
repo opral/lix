@@ -27,7 +27,7 @@ use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
@@ -1431,7 +1431,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_id")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_pk")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -1772,7 +1772,7 @@ async fn lix_file_record_batch(
     let mut names = Vec::new();
     let mut hiddens = Vec::new();
     let mut data_values = Vec::new();
-    let mut entity_ids = Vec::new();
+    let mut entity_pks = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
     let mut globals = Vec::new();
@@ -1820,7 +1820,7 @@ async fn lix_file_record_batch(
         names.push(Some(file.name));
         hiddens.push(Some(file.hidden));
         data_values.push(data);
-        entity_ids.push(Some(file.live.entity_id.as_json_array_text()?));
+        entity_pks.push(Some(file.live.entity_pk.as_json_array_text()?));
         schema_keys.push(Some(file.live.schema_key));
         file_ids.push(file.live.file_id);
         globals.push(Some(file.live.global));
@@ -1847,7 +1847,7 @@ async fn lix_file_record_batch(
                     .map(|value| value.as_deref())
                     .collect::<Vec<_>>(),
             )),
-            "lixcol_entity_id" => Arc::new(StringArray::from(entity_ids.clone())),
+            "lixcol_entity_pk" => Arc::new(StringArray::from(entity_pks.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
@@ -2040,16 +2040,16 @@ async fn scan_lix_file_live_rows(
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
     ];
-    file_request.filter.entity_ids = target_file_ids
+    file_request.filter.entity_pks = target_file_ids
         .iter()
-        .map(|file_id| EntityIdentity::single(file_id.clone()))
+        .map(|file_id| EntityPk::single(file_id.clone()))
         .collect();
 
     let mut rows = live_state.scan_rows(&file_request).await?;
 
     let mut directory_request = request.clone();
     directory_request.filter.schema_keys = vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()];
-    directory_request.filter.entity_ids.clear();
+    directory_request.filter.entity_pks.clear();
     directory_request.limit = None;
     rows.extend(live_state.scan_rows(&directory_request).await?);
 
@@ -2598,7 +2598,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, false),
         Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
-        json_field("lixcol_entity_id", false),
+        json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -2907,20 +2907,20 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -2929,20 +2929,20 @@ mod tests {
     }
 
     fn live_file_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -3113,10 +3113,8 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            rows[0].entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(rows[0].version_id, "version-b");
@@ -3341,10 +3339,8 @@ mod tests {
             .find(|row| row.schema_key == "lix_directory_descriptor")
             .expect("missing /docs/ directory should be staged");
         assert_eq!(
-            directory.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "dir-generated-docs"
-            ))
+            directory.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("dir-generated-docs"))
         );
 
         let descriptor = staged
@@ -3435,10 +3431,8 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("data insert should stage blob ref row");
         assert_eq!(
-            blob_ref_row.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            blob_ref_row.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(blob_ref_row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(staged.file_data_writes.len(), 1);
@@ -3465,10 +3459,8 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be staged");
         assert_eq!(
-            descriptor.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            descriptor.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot, None);
@@ -3479,10 +3471,8 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be staged");
         assert_eq!(
-            blob_ref.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            blob_ref.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot, None);
@@ -3498,10 +3488,8 @@ mod tests {
         assert_eq!(staged.state_rows.len(), 1);
         assert_eq!(staged.state_rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(
-            staged.state_rows[0].entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            staged.state_rows[0].entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(staged.state_rows[0].snapshot, None);
     }
@@ -3600,10 +3588,8 @@ mod tests {
                 assert_eq!(*mode, TransactionWriteMode::Insert);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
-                    rows[0].entity_id.as_ref(),
-                    Some(&crate::entity_identity::EntityIdentity::single(
-                        "file-readme"
-                    ))
+                    rows[0].entity_pk.as_ref(),
+                    Some(&crate::entity_pk::EntityPk::single("file-readme"))
                 );
                 assert_eq!(rows[0].schema_key, "lix_file_descriptor");
             }

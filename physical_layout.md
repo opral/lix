@@ -46,7 +46,7 @@ Lix's primary read keys are:
 commit_id
 change_id
 commit_id -> change_id set
-schema_key + file_id + entity_id at commit_id
+schema_key + file_id + entity_pk at commit_id
 json_ref
 ```
 
@@ -93,7 +93,7 @@ changelog.commit
 changelog.commit_change_ref_chunk
   directly keyed semantic chunk of commit change refs for one commit
   represents commit_id -> set<ordinary row/entity change_id>
-  ordered by schema_key, file_id, and entity_id in the canonical layout
+  ordered by schema_key, file_id, and entity_pk in the canonical layout
 
 changelog.change
   directly keyed catalog object for one row/entity Change
@@ -104,7 +104,7 @@ tracked_state.commit_root
 
 tracked_state.tree_chunk
   shared Dolt-like/prolly tree node storage
-  stores schema_key + file_id + entity_id -> latest change_id + cached refs
+  stores schema_key + file_id + entity_pk -> latest change_id + cached refs
 
 json_store.json
   direct large/deduplicated JSON payloads by json_ref
@@ -140,7 +140,7 @@ value:
     entries[] {
       schema_key
       file_id optional
-      entity_id
+      entity_pk
       change_id
     }
   }
@@ -155,7 +155,7 @@ value:
     format_version
     change_id
     schema_key
-    entity_id
+    entity_pk
     file_id optional
     snapshot_ref optional json_ref
     metadata_ref optional json_ref
@@ -185,7 +185,7 @@ key:
 value:
   ProllyNode {
     entries:
-      schema_key + file_id + entity_id -> {
+      schema_key + file_id + entity_pk -> {
         change_id
         deleted
         snapshot_ref cache
@@ -208,7 +208,7 @@ Untracked version refs:
 ```text
 space: untracked_state.row
 key:
-  version_id | schema_key | entity_id | file_id optional
+  version_id | schema_key | entity_pk | file_id optional
 value:
   snapshot_ref / metadata_ref
 ```
@@ -250,13 +250,13 @@ Staging changelog.commit for commit C is valid only if:
   - every parent_commit_id already has a changelog.commit record, or has one
     staged earlier in the same atomic write set.
   - every commit change-ref chunk for C decodes.
-  - entries are strictly increasing by schema_key, file_id, and entity_id
+  - entries are strictly increasing by schema_key, file_id, and entity_pk
     within each chunk and across chunks ordered by chunk_no.
-  - no schema_key + file_id + entity_id tuple appears twice in the commit
+  - no schema_key + file_id + entity_pk tuple appears twice in the commit
     change-ref stream.
   - every commit change-ref entry's change_id resolves to an existing
     changelog.change in staged or stored changelog truth.
-  - every commit change-ref entry's schema_key, file_id, and entity_id match
+  - every commit change-ref entry's schema_key, file_id, and entity_pk match
     the referenced changelog.change fields.
 ```
 
@@ -287,7 +287,7 @@ Physical pack/block placement is not logical identity.
 Canonical row key:
 
 ```text
-schema_key + file_id + entity_id
+schema_key + file_id + entity_pk
 ```
 
 Commit and change identity:
@@ -331,15 +331,15 @@ Commit change refs:
 
 ```text
 Within one logical changelog.commit, commit change refs are coalesced to at most
-one winning change_id per schema_key + file_id + entity_id tuple. They are
+one winning change_id per schema_key + file_id + entity_pk tuple. They are
 references to `changelog.change` records, not embedded ChangeRecord bytes, and
 there is no separate commit-level set object or id in the physical layout. The
 commit's own derived `lix_commit` row is not part of this ref stream.
 
-Multiple writes to the same schema_key + file_id + entity_id tuple within one
+Multiple writes to the same schema_key + file_id + entity_pk tuple within one
 transaction produce one net durable changelog.change for the tracked state model.
 
-Commit change-ref chunks are canonical in schema_key, file_id, entity_id order.
+Commit change-ref chunks are canonical in schema_key, file_id, entity_pk order.
 This favors merge planning, conflict checks, commit-root rebuild, and branch diff.
 
 If an operation log is later needed for audit, it is a separate object and not
@@ -347,7 +347,7 @@ part of tracked_state tree semantics.
 
 The changelog is a durable state-change log, not a per-operation audit log. If
 one transaction inserts, updates, and deletes the same schema_key + file_id +
-entity_id tuple, the MVP stores the net tracked-state change, not every
+entity_pk tuple, the MVP stores the net tracked-state change, not every
 intermediate operation.
 ```
 
@@ -409,7 +409,7 @@ Every durable commit gets one logical `tracked_state.commit_root`.
 That root is the derived state index for all tracked rows at the commit. This
 matches the current Lix shape more than "one root per schema": current
 `tracked_state.commit_root` is keyed by `commit_id`, and its tree keys are
-`schema_key + file_id + entity_id`.
+`schema_key + file_id + entity_pk`.
 
 Dolt's analogous shape is:
 
@@ -429,7 +429,7 @@ refs.
 commit_id
   -> tracked_state.commit_root
   -> tracked_state.tree_chunk
-  -> schema_key + file_id + entity_id lookup / diff / scan
+  -> schema_key + file_id + entity_pk lookup / diff / scan
   -> change_id + deleted/snapshot_ref/metadata_ref cache
   -> changelog.change only for truth hydration
 ```
@@ -439,7 +439,7 @@ commit_id
 state index for the hot path:
 
 ```text
-schema_key + file_id + entity_id ->
+schema_key + file_id + entity_pk ->
   change_id
   deleted
   snapshot_ref cache
@@ -453,7 +453,7 @@ refs, `changelog.change` facts, and derived `lix_commit` rows from
 `changelog.commit`. The primary key space is ordered by:
 
 ```text
-schema_key + file_id + entity_id
+schema_key + file_id + entity_pk
 ```
 
 Schema reads are prefix/range reads over that key space. If schema count or
@@ -463,11 +463,11 @@ logical model can evolve to a Dolt-style root-of-roots:
 ```text
 tracked_state.tree_chunk
   schema_key -> schema_root_ref
-    -> file_id + entity_id -> change_id + cached refs
+    -> file_id + entity_pk -> change_id + cached refs
 ```
 
 That is an internal physical optimization. The read model remains
-`commit -> tracked root -> schema_key + file_id + entity_id -> cached row refs`.
+`commit -> tracked root -> schema_key + file_id + entity_pk -> cached row refs`.
 
 ```text
 root-covered read: O(log_B N)
@@ -484,7 +484,7 @@ B = prolly fanout / leaf capacity
 ```
 
 Every durable commit persists its `tracked_state.commit_root`. Mutations into
-the tree are sorted by schema_key, file_id, and entity_id and applied as one
+the tree are sorted by schema_key, file_id, and entity_pk and applied as one
 batch per commit. Tree bytes written are `O(T * node_bytes)`; scattered keys can make `T` approach
 `K * tree_height`. This is the write-amplification tradeoff for `O(log_B N)`
 reads and Dolt-style `O(D)` target diffs.
@@ -498,7 +498,7 @@ refs, and changelog.change records. If no ancestor root exists, rebuild starts
 from the initial root through first-parent ancestry. Normal hot-path read bounds
 apply after the derived root has been rebuilt.
 
-Prolly chunk boundaries are a function of schema_key, file_id, and entity_id
+Prolly chunk boundaries are a function of schema_key, file_id, and entity_pk
 only, not `change_id`, `snapshot_ref`, `metadata_ref`, or cached leaf values.
 Re-pointing an existing key to a new change_id must not move chunk boundaries.
 
@@ -551,7 +551,7 @@ Merge commit change refs are the deterministic net state after planning:
 
 ```text
 CommitChangeRefChunk entries contain change_ids that survive conflict checks.
-For one schema_key + file_id + entity_id tuple, the merge result has one
+For one schema_key + file_id + entity_pk tuple, the merge result has one
 winning change_id.
 If the merge writes a new row change for the same key, that new change wins.
 CommitChangeRefChunk entries are for changed/chosen keys, not all keys in the result.
@@ -566,7 +566,7 @@ merge_commit
   -> changelog.commit_change_ref_chunk entries
   -> change_id
   -> changelog.change
-  -> schema_key / file_id / entity_id / snapshot_ref / metadata_ref
+  -> schema_key / file_id / entity_pk / snapshot_ref / metadata_ref
   -> payload hydration only if needed
 ```
 
@@ -580,7 +580,7 @@ Exact row at version:
 ```text
 tracked_state.commit_root(commit_id)
   -> root_ref
-  -> tracked_state.tree_chunk lookup(schema_key, file_id, entity_id)
+  -> tracked_state.tree_chunk lookup(schema_key, file_id, entity_pk)
   -> change_id + deleted/snapshot_ref/metadata_ref cache
   -> hydrate snapshot_ref / metadata_ref only if requested
 ```
@@ -641,7 +641,7 @@ Key/header scan:
 ```text
 tracked_state.commit_root
   -> tracked_state.tree_chunk key ranges
-  -> schema_key + file_id + entity_id, deleted bits, cached scalar refs
+  -> schema_key + file_id + entity_pk, deleted bits, cached scalar refs
   -> no payload hydration
 ```
 

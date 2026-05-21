@@ -5,7 +5,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value as JsonValue;
 
 use crate::sql2::history_route::{
-    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID,
+    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
@@ -143,7 +143,7 @@ pub(crate) fn entity_surface_schema(
 pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
     if shape == EntitySurfaceShape::History {
         return vec![
-            json_field(HISTORY_COL_ENTITY_ID, false),
+            json_field(HISTORY_COL_ENTITY_PK, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
@@ -157,7 +157,7 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
     }
 
     let mut fields = vec![
-        json_field("lixcol_entity_id", true),
+        json_field("lixcol_entity_pk", true),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         json_field("lixcol_snapshot_content", true),

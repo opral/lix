@@ -5,12 +5,12 @@ use plugin_json_v2::{apply_changes, PluginApiError, PluginEntityChange, SCHEMA_K
 use serde_json::Value;
 
 fn with_root_object(mut changes: Vec<PluginEntityChange>) -> Vec<PluginEntityChange> {
-    if changes.iter().any(|change| change.entity_id.is_empty()) {
+    if changes.iter().any(|change| change.entity_pk.is_empty()) {
         return changes;
     }
 
     let mut with_root = vec![PluginEntityChange {
-        entity_id: "".to_string(),
+        entity_pk: "".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content("", Value::Object(serde_json::Map::new()))),
     }];
@@ -23,7 +23,7 @@ fn applies_insert_update_delete() {
     let file = file_from_json("f1", "/x.json", r#"{"stale":"cache"}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/Name".to_string(),
+            entity_pk: "/Name".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/Name",
@@ -31,12 +31,12 @@ fn applies_insert_update_delete() {
             )),
         },
         PluginEntityChange {
-            entity_id: "/Age".to_string(),
+            entity_pk: "/Age".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/Age", Value::Number(20.into()))),
         },
         PluginEntityChange {
-            entity_id: "/City".to_string(),
+            entity_pk: "/City".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -54,27 +54,27 @@ fn applies_array_changes_with_indexes() {
     let file = file_from_json("f1", "/x.json", r#"{"stale":"cache"}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/list".to_string(),
+            entity_pk: "/list".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/list", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/list/0".to_string(),
+            entity_pk: "/list/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/list/0", Value::String("a".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/list/1".to_string(),
+            entity_pk: "/list/1".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/list/1", Value::String("x".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/list/2".to_string(),
+            entity_pk: "/list/2".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/list/2", Value::String("c".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/list/3".to_string(),
+            entity_pk: "/list/3".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/list/3", Value::String("d".to_string()))),
         },
@@ -91,7 +91,7 @@ fn applies_array_changes_with_indexes() {
 fn rejects_snapshot_missing_path() {
     let file = file_from_json("f1", "/x.json", r#"{"foo":1}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "/foo".to_string(),
+        entity_pk: "/foo".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"value":2}"#.to_string()),
     }];
@@ -113,12 +113,12 @@ fn infers_array_parent_for_numeric_pointer_segment() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/team".to_string(),
+            entity_pk: "/team".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/team", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/team/0".to_string(),
+            entity_pk: "/team/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/team/0",
@@ -126,7 +126,7 @@ fn infers_array_parent_for_numeric_pointer_segment() {
             )),
         },
         PluginEntityChange {
-            entity_id: "/team/0/name".to_string(),
+            entity_pk: "/team/0/name".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/team/0/name",
@@ -145,7 +145,7 @@ fn infers_array_parent_for_numeric_pointer_segment() {
 fn removing_root_sets_null() {
     let file = file_from_json("f1", "/x.json", r#"{"foo":1}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "".to_string(),
+        entity_pk: "".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: None,
     }];
@@ -157,16 +157,16 @@ fn removing_root_sets_null() {
 }
 
 #[test]
-fn rejects_duplicate_entity_ids_in_projection_set() {
+fn rejects_duplicate_entity_pks_in_projection_set() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/foo".to_string(),
+            entity_pk: "/foo".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/foo", Value::Number(1.into()))),
         },
         PluginEntityChange {
-            entity_id: "/foo".to_string(),
+            entity_pk: "/foo".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/foo", Value::Number(2.into()))),
         },
@@ -176,7 +176,7 @@ fn rejects_duplicate_entity_ids_in_projection_set() {
         apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
-            assert!(message.contains("duplicate entity_id"));
+            assert!(message.contains("duplicate entity_pk"));
         }
         PluginApiError::Internal(message) => {
             panic!("expected InvalidInput, got Internal({message})");
@@ -188,7 +188,7 @@ fn rejects_duplicate_entity_ids_in_projection_set() {
 fn rejects_mismatched_snapshot_path() {
     let file = file_from_json("f1", "/x.json", r#"{"foo":1}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "/foo".to_string(),
+        entity_pk: "/foo".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":"/bar","value":2}"#.to_string()),
     }];
@@ -209,7 +209,7 @@ fn rejects_mismatched_snapshot_path() {
 fn rejects_invalid_json_pointer_escape() {
     let file = file_from_json("f1", "/x.json", r#"{"foo":1}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "/foo/~2bar".to_string(),
+        entity_pk: "/foo/~2bar".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content("/foo/~2bar", Value::Number(2.into()))),
     }];
@@ -231,12 +231,12 @@ fn rejects_invalid_dash_placement() {
     let file = file_from_json("f1", "/x.json", r#"{"list":[{"x":"a"}]}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/list".to_string(),
+            entity_pk: "/list".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/list", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/list/-/x".to_string(),
+            entity_pk: "/list/-/x".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/list/-/x",
@@ -262,7 +262,7 @@ fn allows_proto_like_keys_when_projection_rows_are_consistent() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/__proto__".to_string(),
+            entity_pk: "/__proto__".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/__proto__",
@@ -270,7 +270,7 @@ fn allows_proto_like_keys_when_projection_rows_are_consistent() {
             )),
         },
         PluginEntityChange {
-            entity_id: "/__proto__/x".to_string(),
+            entity_pk: "/__proto__/x".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/__proto__/x",
@@ -290,12 +290,12 @@ fn rejects_descendant_upsert_under_tombstoned_ancestor() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/a".to_string(),
+            entity_pk: "/a".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
         PluginEntityChange {
-            entity_id: "/a/b".to_string(),
+            entity_pk: "/a/b".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/a/b", Value::Number(1.into()))),
         },
@@ -318,12 +318,12 @@ fn rejects_root_tombstone_with_non_root_rows() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "".to_string(),
+            entity_pk: "".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
         PluginEntityChange {
-            entity_id: "/a".to_string(),
+            entity_pk: "/a".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/a", Value::Number(1.into()))),
         },
@@ -345,7 +345,7 @@ fn rejects_root_tombstone_with_non_root_rows() {
 fn rejects_snapshot_path_non_string() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "/safe".to_string(),
+        entity_pk: "/safe".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":123,"value":1}"#.to_string()),
     }];
@@ -367,7 +367,7 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
 
     let with_extra = vec![PluginEntityChange {
-        entity_id: "/safe".to_string(),
+        entity_pk: "/safe".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":"/safe","value":1,"extra":true}"#.to_string()),
     }];
@@ -383,7 +383,7 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
     }
 
     let missing_value = vec![PluginEntityChange {
-        entity_id: "/safe".to_string(),
+        entity_pk: "/safe".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":"/safe"}"#.to_string()),
     }];
@@ -403,7 +403,7 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
 fn rejects_numeric_child_without_parent_container_row() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "/foo/0".to_string(),
+        entity_pk: "/foo/0".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content("/foo/0", Value::String("x".to_string()))),
     }];
@@ -425,12 +425,12 @@ fn rejects_huge_array_index_growth() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/100001".to_string(),
+            entity_pk: "/arr/100001".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content(
                 "/arr/100001",
@@ -456,12 +456,12 @@ fn rejects_leading_zero_array_indices_under_array_ancestor() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/01".to_string(),
+            entity_pk: "/arr/01".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/01", Value::String("A".to_string()))),
         },
@@ -484,12 +484,12 @@ fn accepts_canonical_zero_array_index() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/0".to_string(),
+            entity_pk: "/arr/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/0", Value::String("A".to_string()))),
         },
@@ -506,12 +506,12 @@ fn rejects_sparse_array_projection_rows() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/5".to_string(),
+            entity_pk: "/arr/5".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/5", Value::String("x".to_string()))),
         },
@@ -534,17 +534,17 @@ fn rejects_aliasing_array_indices_via_non_canonical_form() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/1".to_string(),
+            entity_pk: "/arr/1".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/1", Value::String("A".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/01".to_string(),
+            entity_pk: "/arr/01".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/01", Value::String("B".to_string()))),
         },
@@ -567,17 +567,17 @@ fn rejects_tombstone_with_leading_zero_token_under_live_array_context() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/0".to_string(),
+            entity_pk: "/arr/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/0", Value::String("A".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/01".to_string(),
+            entity_pk: "/arr/01".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -600,17 +600,17 @@ fn rejects_tombstone_with_dash_token_under_live_array_context() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/0".to_string(),
+            entity_pk: "/arr/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/0", Value::String("A".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/-".to_string(),
+            entity_pk: "/arr/-".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -633,12 +633,12 @@ fn allows_tombstone_with_leading_zero_token_with_only_live_array_container() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/00".to_string(),
+            entity_pk: "/arr/00".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -655,12 +655,12 @@ fn allows_tombstone_with_dash_token_with_only_live_array_container() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/-".to_string(),
+            entity_pk: "/arr/-".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -677,22 +677,22 @@ fn rejects_live_array_row_with_non_canonical_tombstone_alias() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/0".to_string(),
+            entity_pk: "/arr/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/0", Value::Null)),
         },
         PluginEntityChange {
-            entity_id: "/arr/1".to_string(),
+            entity_pk: "/arr/1".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/1", Value::String("B".to_string()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/01".to_string(),
+            entity_pk: "/arr/01".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -715,17 +715,17 @@ fn allows_tombstone_non_numeric_token_under_live_array_context() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/0".to_string(),
+            entity_pk: "/arr/0".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/0", Value::Null)),
         },
         PluginEntityChange {
-            entity_id: "/arr/foo".to_string(),
+            entity_pk: "/arr/foo".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },
@@ -742,12 +742,12 @@ fn rejects_root_scalar_with_non_root_descendants() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "".to_string(),
+            entity_pk: "".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("", Value::Number(7.into()))),
         },
         PluginEntityChange {
-            entity_id: "/a".to_string(),
+            entity_pk: "/a".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/a", Value::Number(1.into()))),
         },
@@ -770,12 +770,12 @@ fn rejects_scalar_ancestor_with_descendant_row() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/a".to_string(),
+            entity_pk: "/a".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/a", Value::Number(1.into()))),
         },
         PluginEntityChange {
-            entity_id: "/a/b".to_string(),
+            entity_pk: "/a/b".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/a/b", Value::Number(2.into()))),
         },
@@ -798,12 +798,12 @@ fn rejects_final_dash_token_in_projection_rows() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![
         PluginEntityChange {
-            entity_id: "/arr".to_string(),
+            entity_pk: "/arr".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
         },
         PluginEntityChange {
-            entity_id: "/arr/-".to_string(),
+            entity_pk: "/arr/-".to_string(),
             schema_key: SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content("/arr/-", Value::String("x".to_string()))),
         },
@@ -825,7 +825,7 @@ fn rejects_final_dash_token_in_projection_rows() {
 fn rejects_non_root_rows_when_root_row_is_missing() {
     let file = file_from_json("f1", "/x.json", r#"{}"#);
     let changes = vec![PluginEntityChange {
-        entity_id: "/0".to_string(),
+        entity_pk: "/0".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content("/0", Value::String("x".to_string()))),
     }];

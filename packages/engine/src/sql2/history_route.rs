@@ -7,7 +7,7 @@ use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::LixError;
 
 use super::SqlJsonReader;
@@ -22,7 +22,7 @@ use crate::storage::StorageRead;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HistoryRoute {
     pub(crate) start_commit_ids: Vec<String>,
-    pub(crate) entity_ids: Vec<String>,
+    pub(crate) entity_pks: Vec<String>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<i64>,
@@ -83,7 +83,7 @@ impl HistoryRoute {
     pub(crate) fn matches_surface_row(
         &self,
         schema_key: &str,
-        entity_id: &str,
+        entity_pk: &str,
         file_id: Option<&str>,
         depth: u32,
     ) -> bool {
@@ -98,11 +98,11 @@ impl HistoryRoute {
         {
             return false;
         }
-        if !self.entity_ids.is_empty()
+        if !self.entity_pks.is_empty()
             && !self
-                .entity_ids
+                .entity_pks
                 .iter()
-                .any(|candidate| candidate == entity_id)
+                .any(|candidate| candidate == entity_pk)
         {
             return false;
         }
@@ -141,7 +141,7 @@ pub(crate) struct HistoryEntry {
     pub(crate) depth: u32,
 }
 
-pub(crate) const HISTORY_COL_ENTITY_ID: &str = "lixcol_entity_id";
+pub(crate) const HISTORY_COL_ENTITY_PK: &str = "lixcol_entity_pk";
 pub(crate) const HISTORY_COL_SCHEMA_KEY: &str = "lixcol_schema_key";
 pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
 pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
@@ -188,10 +188,10 @@ pub(crate) fn commit_graph_history_request(
 ) -> Option<CommitGraphChangeHistoryRequest> {
     let schema_keys = effective_schema_keys(route, schema_keys)?;
     Some(CommitGraphChangeHistoryRequest {
-        entity_ids: route
-            .entity_ids
+        entity_pks: route
+            .entity_pks
             .iter()
-            .filter_map(|entity_id| EntityIdentity::from_json_array_text(entity_id).ok())
+            .filter_map(|entity_pk| EntityPk::from_json_array_text(entity_pk).ok())
             .collect(),
         schema_keys,
         file_ids: route.file_ids.clone(),
@@ -370,7 +370,7 @@ fn parse_history_disjunction(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryFilterTerm {
     StartCommitIds(Vec<String>),
-    EntityIds(Vec<String>),
+    EntityPks(Vec<String>),
     SchemaKeys(Vec<String>),
     FileIds(Vec<String>),
     MinDepth(i64),
@@ -387,9 +387,9 @@ fn merge_history_disjunction_terms(
             extend_unique(&mut left, right);
             Some(HistoryFilterTerm::StartCommitIds(left))
         }
-        (HistoryFilterTerm::EntityIds(mut left), HistoryFilterTerm::EntityIds(right)) => {
+        (HistoryFilterTerm::EntityPks(mut left), HistoryFilterTerm::EntityPks(right)) => {
             extend_unique(&mut left, right);
-            Some(HistoryFilterTerm::EntityIds(left))
+            Some(HistoryFilterTerm::EntityPks(left))
         }
         (HistoryFilterTerm::FileIds(mut left), HistoryFilterTerm::FileIds(right)) => {
             extend_unique(&mut left, right);
@@ -423,8 +423,8 @@ fn parse_history_binary_filter(
                 _ => unreachable!(),
             })
         }
-        ("entity_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            canonical_entity_id_value(value).map(|value| HistoryFilterTerm::EntityIds(vec![value]))
+        ("entity_pk", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
+            canonical_entity_pk_value(value).map(|value| HistoryFilterTerm::EntityPks(vec![value]))
         }
         ("depth", Operator::Eq, depth_expr) => {
             scalar_i64_literal(depth_expr).map(HistoryFilterTerm::ExactDepth)
@@ -468,7 +468,7 @@ fn parse_history_in_list_filter(
 
     match column_name {
         "start_commit_id" => Some(HistoryFilterTerm::StartCommitIds(values)),
-        "entity_id" => canonical_entity_id_values(values).map(HistoryFilterTerm::EntityIds),
+        "entity_pk" => canonical_entity_pk_values(values).map(HistoryFilterTerm::EntityPks),
         "schema_key" => Some(HistoryFilterTerm::SchemaKeys(values)),
         "file_id" => Some(HistoryFilterTerm::FileIds(values)),
         _ => None,
@@ -482,9 +482,9 @@ fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute, column_style: His
                 route.contradictory |=
                     apply_conjunctive_values_filter(&mut route.start_commit_ids, values)
             }
-            HistoryFilterTerm::EntityIds(values) => {
+            HistoryFilterTerm::EntityPks(values) => {
                 route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.entity_ids, values)
+                    apply_conjunctive_values_filter(&mut route.entity_pks, values)
             }
             HistoryFilterTerm::SchemaKeys(values) => {
                 route.contradictory |=
@@ -522,15 +522,15 @@ fn apply_conjunctive_values_filter(bucket: &mut Vec<String>, incoming_values: Ve
     bucket.is_empty()
 }
 
-fn canonical_entity_id_values(values: Vec<String>) -> Option<Vec<String>> {
+fn canonical_entity_pk_values(values: Vec<String>) -> Option<Vec<String>> {
     values
         .into_iter()
-        .map(|value| canonical_entity_id_value(&value))
+        .map(|value| canonical_entity_pk_value(&value))
         .collect()
 }
 
-fn canonical_entity_id_value(value: &str) -> Option<String> {
-    EntityIdentity::from_json_array_text(value)
+fn canonical_entity_pk_value(value: &str) -> Option<String> {
+    EntityPk::from_json_array_text(value)
         .ok()?
         .as_json_array_text()
         .ok()
@@ -540,8 +540,8 @@ fn canonical_history_column_name(name: &str, column_style: HistoryColumnStyle) -
     match (column_style, name) {
         (HistoryColumnStyle::Bare, "start_commit_id")
         | (HistoryColumnStyle::Prefixed, "lixcol_start_commit_id") => Some("start_commit_id"),
-        (HistoryColumnStyle::Bare, "entity_id")
-        | (HistoryColumnStyle::Prefixed, "lixcol_entity_id") => Some("entity_id"),
+        (HistoryColumnStyle::Bare, "entity_pk")
+        | (HistoryColumnStyle::Prefixed, "lixcol_entity_pk") => Some("entity_pk"),
         (HistoryColumnStyle::Bare, "schema_key")
         | (HistoryColumnStyle::Prefixed, "lixcol_schema_key") => Some("schema_key"),
         (HistoryColumnStyle::Bare, "file_id")
