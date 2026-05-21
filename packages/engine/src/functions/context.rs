@@ -275,7 +275,7 @@ mod tests {
         .expect("snapshot should serialize");
         let mut writes = storage.new_write_set();
         let row = crate::untracked_state::UntrackedStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(key),
+            entity_pk: crate::entity_pk::EntityPk::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content),

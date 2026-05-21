@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn try_make_fast_write_plan_declines_literal_insert() {
         let plan = plan_sql(
-            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
+            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
              VALUES (lix_json('[\"entity-1\"]'), 'lix_key_value', '{}')",
         );
 

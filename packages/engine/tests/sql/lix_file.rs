@@ -411,10 +411,10 @@ simulation_test!(
 
         let staged_state_result = session
             .execute(
-                "SELECT entity_id, schema_key \
+                "SELECT entity_pk, schema_key \
              FROM lix_state \
-             WHERE entity_id = lix_json('[\"file-readme\"]') \
-             ORDER BY schema_key, entity_id",
+             WHERE entity_pk = lix_json('[\"file-readme\"]') \
+             ORDER BY schema_key, entity_pk",
                 &[],
             )
             .await
@@ -1414,10 +1414,10 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
 
     let state_result = session
         .execute(
-            "SELECT entity_id, schema_key \
+            "SELECT entity_pk, schema_key \
              FROM lix_state \
-             WHERE entity_id = lix_json('[\"file-readme\"]') \
-             ORDER BY schema_key, entity_id",
+             WHERE entity_pk = lix_json('[\"file-readme\"]') \
+             ORDER BY schema_key, entity_pk",
             &[],
         )
         .await

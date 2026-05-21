@@ -25,9 +25,9 @@ simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT entity_id, schema_key, snapshot_content \
+            "SELECT entity_pk, schema_key, snapshot_content \
              FROM lix_change \
-             WHERE entity_id = lix_json('[\"change-query\"]')",
+             WHERE entity_pk = lix_json('[\"change-query\"]')",
             &[],
         )
         .await
@@ -78,7 +78,7 @@ simulation_test!(lix_change_includes_commit_changes, |sim| async move {
 });
 
 simulation_test!(
-    lix_change_entity_id_is_json_array_for_composite_primary_keys,
+    lix_change_entity_pk_is_json_array_for_composite_primary_keys,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -112,16 +112,16 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT entity_id, \
-                        lix_json_get_text(entity_id, 0) AS entity_key, \
-                        lix_json_get_text(entity_id, 1) AS entity_locale \
+                "SELECT entity_pk, \
+                        lix_json_get_text(entity_pk, 0) AS entity_key, \
+                        lix_json_get_text(entity_pk, 1) AS entity_locale \
                  FROM lix_change \
                  WHERE schema_key = 'engine_composite_message' \
-                   AND entity_id = lix_json('[\"welcome.title\",\"en\"]')",
+                   AND entity_pk = lix_json('[\"welcome.title\",\"en\"]')",
                 &[],
             )
             .await
-            .expect("lix_change should expose composite entity_id as JSON");
+            .expect("lix_change should expose composite entity_pk as JSON");
 
         assert_eq!(result.len(), 1);
         assert_eq!(

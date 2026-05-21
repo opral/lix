@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateTreeScanRequest,
@@ -42,7 +42,7 @@ pub(crate) struct TrackedStateDiffEntry {
 /// snapshot or metadata bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateDiffRow {
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) deleted: bool,
@@ -56,11 +56,11 @@ pub(crate) struct TrackedStateDiffRow {
 
 /// Root-local tracked-state identity.
 ///
-/// Entity identity used by merge/diff logic.
+/// Entity pk used by merge/diff logic.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TrackedStateDiffIdentity {
     pub(crate) schema_key: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -145,7 +145,7 @@ fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeS
     filter.include_tombstones = true;
     TrackedStateTreeScanRequest {
         schema_keys: filter.schema_keys,
-        entity_ids: filter.entity_ids,
+        entity_pks: filter.entity_pks,
         file_ids: filter.file_ids,
         include_tombstones: true,
         limit: None,
@@ -193,7 +193,7 @@ impl TrackedStateDiffIdentity {
     fn from(row: &TrackedStateDiffRow) -> Self {
         Self {
             schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
         }
     }
@@ -202,7 +202,7 @@ impl TrackedStateDiffIdentity {
 impl TrackedStateDiffRow {
     pub(crate) fn from_tree_entry(key: TrackedStateKey, value: TrackedStateIndexValue) -> Self {
         Self {
-            entity_id: key.entity_id,
+            entity_pk: key.entity_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             deleted: value.deleted,
@@ -220,7 +220,7 @@ impl TrackedStateDiffRow {
             TrackedStateKey {
                 schema_key: self.schema_key,
                 file_id: self.file_id,
-                entity_id: self.entity_id,
+                entity_pk: self.entity_pk,
             },
             TrackedStateIndexValue {
                 change_id: self.change_id,
@@ -441,9 +441,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema-b".to_string()],
-                        entity_ids: vec![crate::entity_identity::EntityIdentity::single(
-                            "entity-b",
-                        )],
+                        entity_pks: vec![crate::entity_pk::EntityPk::single("entity-b")],
                         file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
                         ..Default::default()
                     },
@@ -462,8 +460,8 @@ mod tests {
     async fn diff_validation_rejects_row_identity_that_does_not_match_changelog_change() {
         let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0].after.as_mut().expect("after row").entity_id =
-            EntityIdentity::single("entity-corrupt");
+        diff.entries[0].after.as_mut().expect("after row").entity_pk =
+            EntityPk::single("entity-corrupt");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -690,7 +688,7 @@ mod tests {
         let corrupt_key = TrackedStateKey {
             schema_key: "test_schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity::single("entity-a"),
+            entity_pk: EntityPk::single("entity-a"),
         };
         let result = {
             let mut read = storage
@@ -2016,7 +2014,7 @@ mod tests {
                 (
                     entry
                         .identity
-                        .entity_id
+                        .entity_pk
                         .as_single_string_owned()
                         .expect("identity"),
                     entry.kind,
@@ -2056,7 +2054,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
-                entity_id: EntityIdentity::single(commit_id),
+                entity_pk: EntityPk::single(commit_id),
             },
             TrackedStateIndexValue {
                 change_id: change_id.to_string(),
@@ -2073,61 +2071,61 @@ mod tests {
     }
 
     fn tombstone(
-        entity_id: &str,
+        entity_pk: &str,
         file_id: Option<&str>,
         change_id: &str,
     ) -> MaterializedTrackedStateRow {
-        let mut row = row(entity_id, file_id, change_id);
+        let mut row = row(entity_pk, file_id, change_id);
         row.snapshot_content = None;
         row.deleted = true;
         row
     }
 
-    fn row(entity_id: &str, file_id: Option<&str>, change_id: &str) -> MaterializedTrackedStateRow {
-        row_with_schema(entity_id, file_id, "test_schema", change_id)
+    fn row(entity_pk: &str, file_id: Option<&str>, change_id: &str) -> MaterializedTrackedStateRow {
+        row_with_schema(entity_pk, file_id, "test_schema", change_id)
     }
 
     fn row_with_schema(
-        entity_id: &str,
+        entity_pk: &str,
         file_id: Option<&str>,
         schema_key: &str,
         change_id: &str,
     ) -> MaterializedTrackedStateRow {
-        row_with_schema_and_value(entity_id, file_id, schema_key, change_id, "value")
+        row_with_schema_and_value(entity_pk, file_id, schema_key, change_id, "value")
     }
 
     fn row_with_value(
-        entity_id: &str,
+        entity_pk: &str,
         file_id: Option<&str>,
         change_id: &str,
         value: &str,
     ) -> MaterializedTrackedStateRow {
-        row_with_schema_and_value(entity_id, file_id, "test_schema", change_id, value)
+        row_with_schema_and_value(entity_pk, file_id, "test_schema", change_id, value)
     }
 
     fn row_with_times(
-        entity_id: &str,
+        entity_pk: &str,
         file_id: Option<&str>,
         change_id: &str,
         value: &str,
         created_at: &str,
         updated_at: &str,
     ) -> MaterializedTrackedStateRow {
-        let mut row = row_with_value(entity_id, file_id, change_id, value);
+        let mut row = row_with_value(entity_pk, file_id, change_id, value);
         row.created_at = created_at.to_string();
         row.updated_at = updated_at.to_string();
         row
     }
 
     fn row_with_schema_and_value(
-        entity_id: &str,
+        entity_pk: &str,
         file_id: Option<&str>,
         schema_key: &str,
         change_id: &str,
         value: &str,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_id: EntityIdentity::single(entity_id),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),

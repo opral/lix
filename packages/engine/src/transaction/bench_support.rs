@@ -4,7 +4,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::binary_cas::BinaryCasContext;
 use crate::catalog::CatalogContext;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
     LiveStateScanRequest,
@@ -28,7 +28,7 @@ const BENCH_VERSION_ID: &str = "tracked-crud-version";
 pub struct BenchTransactionRow {
     pub schema_key: String,
     pub file_id: Option<String>,
-    pub entity_id: String,
+    pub entity_pk: String,
     pub value: JsonValue,
     pub updated_value: JsonValue,
 }
@@ -229,7 +229,7 @@ where
             .load_row(&LiveStateRowRequest {
                 schema_key: "json_pointer".to_string(),
                 version_id: BENCH_VERSION_ID.to_string(),
-                entity_id: EntityIdentity::single(row.entity_id.clone()),
+                entity_pk: EntityPk::single(row.entity_pk.clone()),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -298,7 +298,7 @@ fn write_accounting(logical_rows: usize, stats: StorageWriteSetStats) -> BenchWr
 
 fn transaction_row(row: &BenchTransactionRow, value: &JsonValue) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_id: Some(EntityIdentity::single(row.entity_id.clone())),
+        entity_pk: Some(EntityPk::single(row.entity_pk.clone())),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot: Some(TransactionJson::from_value_unchecked(value.clone())),
@@ -340,7 +340,7 @@ async fn seed_visible_schema_rows<B>(
                 .expect("seed schema key should derive");
             let snapshot_content = json!({ "value": schema }).to_string();
             crate::tracked_state::MaterializedTrackedStateRow {
-                entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
+                entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
                     .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,

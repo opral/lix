@@ -11,7 +11,7 @@
       "x-lix-default": "lix_uuid_v7()",
       "description": "Stable identifier for this change."
     },
-    "entity_id": {
+    "entity_pk": {
       "type": "array",
       "description": "Canonical JSON primary-key tuple for the entity this change applies to, scoped by (`schema_key`, `file_id`). Values are ordered according to the target schema's `x-lix-primary-key`.",
       "items": {
@@ -54,7 +54,7 @@
   },
   "required": [
     "id",
-    "entity_id",
+    "entity_pk",
     "schema_key",
     "file_id",
     "created_at"

@@ -138,7 +138,7 @@ impl BenchmarkCaseKind {
                 "Create a fresh SQLite database.",
                 "Boot the engine and install the JSON plugin.",
                 "Insert an empty {} JSON file so direct state writes target an existing JSON file.",
-                "Load the committed root json_pointer entity id for that file.",
+                "Load the committed root json_pointer entity pk for that file.",
             ],
         }
     }
@@ -524,11 +524,11 @@ async fn run_direct_entity_write_sample(
     let active_version_id = session.active_version_id();
 
     bootstrap_empty_json_file(&session, &file_id, &file_path).await?;
-    let root_entity_id =
-        load_root_json_pointer_entity_id(&session, &file_id, &active_version_id).await?;
+    let root_entity_pk =
+        load_root_json_pointer_entity_pk(&session, &file_id, &active_version_id).await?;
     let direct_write_sql_batches = build_direct_entity_write_sql_batches(
         &file_id,
-        &root_entity_id,
+        &root_entity_pk,
         payload,
         DIRECT_ENTITY_WRITE_CHUNK_SIZE,
     )?;
@@ -683,20 +683,20 @@ async fn bootstrap_empty_json_file(
     Ok(())
 }
 
-async fn load_root_json_pointer_entity_id(
+async fn load_root_json_pointer_entity_pk(
     session: &Session,
     file_id: &str,
     active_version_id: &str,
 ) -> BenchResult<String> {
     let result = session
         .execute(
-            "SELECT entity_id \
+            "SELECT entity_pk \
              FROM lix_state_by_version \
              WHERE file_id = ?1 \
                AND version_id = ?2 \
                AND schema_key = ?3 \
                AND snapshot_content IS NOT NULL \
-             ORDER BY entity_id ASC \
+             ORDER BY entity_pk ASC \
              LIMIT 1",
             &[
                 Value::Text(file_id.to_string()),
@@ -714,16 +714,21 @@ async fn load_root_json_pointer_entity_id(
         .ok_or_else(|| format!("query returned no root json_pointer row for '{file_id}'"))?;
 
     match value {
-        Value::Text(text) => Ok(text.clone()),
+        Value::Json(serde_json::Value::Array(parts)) => match parts.as_slice() {
+            [serde_json::Value::String(text)] => Ok(text.clone()),
+            other => Err(format!(
+                "expected single-part entity_pk for root json_pointer row of '{file_id}', got {other:?}"
+            )),
+        },
         other => Err(format!(
-            "expected text entity_id for root json_pointer row of '{file_id}', got {other:?}"
+            "expected JSON-array entity_pk for root json_pointer row of '{file_id}', got {other:?}"
         )),
     }
 }
 
 fn build_direct_entity_write_sql_batches(
     file_id: &str,
-    root_entity_id: &str,
+    root_entity_pk: &str,
     payload: &[u8],
     chunk_size: usize,
 ) -> BenchResult<Vec<String>> {
@@ -737,42 +742,41 @@ fn build_direct_entity_write_sql_batches(
         .ok_or_else(|| "expected generated payload to be a JSON object".to_string())?;
 
     let root_snapshot_content = serde_json::json!({
-        "path": root_entity_id,
+        "path": root_entity_pk,
         "value": expected_json,
     });
     let root_snapshot_content = serde_json::to_string(&root_snapshot_content).map_err(serde_err)?;
-    let root_entity_id_json =
-        serde_json::to_string(&serde_json::json!([root_entity_id])).map_err(serde_err)?;
+    let root_entity_pk_json =
+        serde_json::to_string(&serde_json::json!([root_entity_pk])).map_err(serde_err)?;
 
     let mut statements = vec![format!(
         "UPDATE lix_state \
          SET snapshot_content = '{}' \
-         WHERE entity_id = lix_json('{}') \
+         WHERE entity_pk = lix_json('{}') \
            AND file_id = '{}' \
-           AND schema_key = '{}' \
-           AND plugin_key = '{}'",
+           AND schema_key = '{}'",
         escape_sql_string(&root_snapshot_content),
-        escape_sql_string(&root_entity_id_json),
+        escape_sql_string(&root_entity_pk_json),
         escape_sql_string(file_id),
         PLUGIN_SCHEMA_KEY,
-        PLUGIN_KEY,
     )];
 
     let entries = object
         .iter()
         .map(|(key, value)| -> BenchResult<String> {
-            let entity_id = format!("/{}", escape_json_pointer_segment(key));
+            let entity_pk = format!("/{}", escape_json_pointer_segment(key));
             let snapshot_content = serde_json::json!({
-                "path": entity_id,
+                "path": entity_pk,
                 "value": value,
             });
             let snapshot_content = serde_json::to_string(&snapshot_content).map_err(serde_err)?;
+            let entity_pk_json =
+                serde_json::to_string(&serde_json::json!([entity_pk])).map_err(serde_err)?;
             Ok(format!(
-                "('{}', '{}', '{}', '{}', '{}')",
-                escape_sql_string(&entity_id),
+                "(lix_json('{}'), '{}', '{}', '{}')",
+                escape_sql_string(&entity_pk_json),
                 escape_sql_string(file_id),
                 PLUGIN_SCHEMA_KEY,
-                PLUGIN_KEY,
                 escape_sql_string(&snapshot_content),
             ))
         })
@@ -780,7 +784,7 @@ fn build_direct_entity_write_sql_batches(
 
     for chunk in entries.chunks(chunk_size) {
         statements.push(format!(
-            "INSERT INTO lix_state (entity_id, file_id, schema_key, plugin_key, snapshot_content) VALUES {}",
+            "INSERT INTO lix_state (entity_pk, file_id, schema_key, snapshot_content) VALUES {}",
             chunk.join(", ")
         ));
     }

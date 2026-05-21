@@ -873,7 +873,7 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column)
-            if matches!(column.name.as_str(), "entity_id" | "lixcol_entity_id")
+            if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
     )
 }
 
@@ -1164,12 +1164,12 @@ const HISTORY_NOTICE_RULES: &[HistoryNoticeRule] = &[
     HistoryNoticeRule {
         table_name: "lix_file_history",
         payload_columns: &["path", "directory_id", "name", "hidden", "data"],
-        identity_columns: &["id", "lixcol_entity_id"],
+        identity_columns: &["id", "lixcol_entity_pk"],
     },
     HistoryNoticeRule {
         table_name: "lix_directory_history",
         payload_columns: &["path", "parent_id", "name", "hidden"],
-        identity_columns: &["id", "lixcol_entity_id"],
+        identity_columns: &["id", "lixcol_entity_pk"],
     },
 ];
 
@@ -1227,7 +1227,7 @@ fn history_non_identity_filter_notice(view_name: &str) -> LixNotice {
         code: "LIX_HISTORY_NON_IDENTITY_FILTER".to_string(),
         message: format!("{view_name} was filtered without an identity predicate."),
         hint: Some(
-            "Filter by id or lixcol_entity_id to include tombstones and renamed history."
+            "Filter by id or lixcol_entity_pk to include tombstones and renamed history."
                 .to_string(),
         ),
     }
@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     struct CapturedStageRow {
-        entity_id: String,
+        entity_pk: String,
         schema_key: String,
         version_id: String,
         file_id: Option<String>,
@@ -1420,11 +1420,11 @@ mod tests {
     impl From<TransactionWriteRow> for CapturedStageRow {
         fn from(row: TransactionWriteRow) -> Self {
             Self {
-                entity_id: row
-                    .entity_id
-                    .expect("captured staged row should carry entity_id")
+                entity_pk: row
+                    .entity_pk
+                    .expect("captured staged row should carry entity_pk")
                     .as_json_array_text()
-                    .expect("captured staged row should project entity_id"),
+                    .expect("captured staged row should project entity_pk"),
                 schema_key: row.schema_key,
                 version_id: row.version_id,
                 file_id: row.file_id,
@@ -1660,8 +1660,8 @@ mod tests {
                 .filter(|row| {
                     (request.filter.schema_keys.is_empty()
                         || request.filter.schema_keys.contains(&row.schema_key))
-                        && (request.filter.entity_ids.is_empty()
-                            || request.filter.entity_ids.contains(&row.entity_id))
+                        && (request.filter.entity_pks.is_empty()
+                            || request.filter.entity_pks.contains(&row.entity_pk))
                         && (request.filter.version_ids.is_empty()
                             || request.filter.version_ids.contains(&row.version_id))
                         && request
@@ -1722,17 +1722,17 @@ mod tests {
         }
     }
 
-    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+    fn live_lix_state_row(entity_pk: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
             deleted: false,
             version_id: "version-a".to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1740,24 +1740,24 @@ mod tests {
         }
     }
 
-    fn global_lix_state_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
-        let mut row = live_lix_state_row(entity_id, metadata);
+    fn global_lix_state_row(entity_pk: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+        let mut row = live_lix_state_row(entity_pk, metadata);
         row.version_id = GLOBAL_VERSION_ID.to_string();
         row.global = true;
         row
     }
 
-    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> MaterializedLiveStateRow {
+    fn live_entity_row(entity_pk: &str, version_id: &str, value: &str) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
-            metadata: Some(json!({ "source": entity_id }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1766,30 +1766,30 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         parent_id: Option<&str>,
         name: &str,
         hidden: bool,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
                 json!({
-                    "id": entity_id,
+                    "id": entity_pk,
                     "parent_id": parent_id,
                     "name": name,
                     "hidden": hidden
                 })
                 .to_string(),
             ),
-            metadata: Some(json!({ "source": entity_id }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1798,30 +1798,30 @@ mod tests {
     }
 
     fn live_file_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         directory_id: Option<&str>,
         name: &str,
         hidden: bool,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "lix_file_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
                 json!({
-                    "id": entity_id,
+                    "id": entity_pk,
                     "directory_id": directory_id,
                     "name": name,
                     "hidden": hidden
                 })
                 .to_string(),
             ),
-            metadata: Some(json!({ "source": entity_id }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1830,27 +1830,27 @@ mod tests {
     }
 
     fn live_blob_ref_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         bytes: &[u8],
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "lix_binary_blob_ref".to_string(),
-            file_id: Some(entity_id.to_string()),
+            file_id: Some(entity_pk.to_string()),
             snapshot_content: Some(
                 json!({
-                    "id": entity_id,
+                    "id": entity_pk,
                     "blob_hash": crate::common::stable_content_fingerprint_hex(bytes),
                     "size_bytes": bytes.len()
                 })
                 .to_string(),
             ),
-            metadata: Some(json!({ "source": entity_id }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}-blob")),
-            commit_id: Some(format!("commit-{entity_id}-blob")),
+            change_id: Some(format!("change-{entity_pk}-blob")),
+            commit_id: Some(format!("commit-{entity_pk}-blob")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -2004,7 +2004,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO test_state_schema \
-	             (lixcol_entity_id, value, count, lixcol_metadata, lixcol_untracked) \
+	             (lixcol_entity_pk, value, count, lixcol_metadata, lixcol_untracked) \
 	             VALUES (lix_json('[\"entity-history\"]'), 'A', 7, '{\"source\":\"history\"}', false)",
                 &[],
             )
@@ -2281,10 +2281,10 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT entity_id, snapshot_content, metadata, depth, start_commit_id \
+                    "SELECT entity_pk, snapshot_content, metadata, depth, start_commit_id \
 	             FROM lix_state_history \
 	             WHERE schema_key = 'test_state_schema' \
-	               AND entity_id = lix_json('[\"entity-history\"]') \
+	               AND entity_pk = lix_json('[\"entity-history\"]') \
 	               AND start_commit_id = '{head_commit_id}' \
 	               AND depth >= 0"
                 ),
@@ -2297,7 +2297,7 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                "entity_id",
+                "entity_pk",
                 "snapshot_content",
                 "metadata",
                 "depth",
@@ -2320,10 +2320,10 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_entity_id, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT value, count, lixcol_entity_pk, lixcol_start_commit_id, lixcol_depth \
 	             FROM test_state_schema_history \
 	             WHERE lixcol_start_commit_id = '{head_commit_id}' \
-	               AND lixcol_entity_id = lix_json('[\"entity-history\"]')"
+	               AND lixcol_entity_pk = lix_json('[\"entity-history\"]')"
                 ),
                 &[],
             )
@@ -2336,7 +2336,7 @@ mod tests {
             vec![
                 "value",
                 "count",
-                "lixcol_entity_id",
+                "lixcol_entity_pk",
                 "lixcol_start_commit_id",
                 "lixcol_depth",
             ]
@@ -2519,7 +2519,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state (\
-		         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
+		         entity_pk, schema_key, file_id, snapshot_content, metadata, global, untracked\
 		         ) VALUES (\
 		         lix_json('[\"entity-1\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', false, false\
 		         )",
@@ -2538,7 +2538,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-1\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -2565,7 +2565,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, global\
+             entity_pk, schema_key, snapshot_content, version_id, global\
              ) VALUES (\
              lix_json('[\"entity-b\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-b\"}', 'version-b', false\
              )",
@@ -2584,7 +2584,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-b\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert_eq!(
@@ -2609,7 +2609,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id\
+             entity_pk, schema_key, snapshot_content, version_id\
              ) VALUES (\
              lix_json('[\"entity-global\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global\"}', 'global'\
              )",
@@ -2628,7 +2628,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-global\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-global\"]");
         assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
         assert!(rows[0].global);
     }
@@ -2650,7 +2650,7 @@ mod tests {
         execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id\
+             entity_pk, schema_key, snapshot_content, version_id\
              ) VALUES (\
              lix_json('[\"entity-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param\"}', $1\
              )",
@@ -2665,7 +2665,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-global-param\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-global-param\"]");
         assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
         assert!(rows[0].global);
     }
@@ -2686,7 +2686,7 @@ mod tests {
         execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id\
+             entity_pk, schema_key, snapshot_content, version_id\
              ) VALUES (\
              lix_json('[\"entity-version-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param\"}', $1\
              )",
@@ -2701,7 +2701,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-version-param\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-version-param\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
     }
@@ -2723,7 +2723,7 @@ mod tests {
         execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, global\
+             entity_pk, schema_key, snapshot_content, version_id, global\
              ) VALUES (\
              lix_json('[\"entity-version-param-b\"]'), 'lix_key_value', '{\"key\":\"hello-b\",\"value\":\"version-b\"}', $1, false\
              ), (\
@@ -2764,7 +2764,7 @@ mod tests {
         execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, global\
+             entity_pk, schema_key, snapshot_content, version_id, global\
              ) VALUES (\
              lix_json('[\"entity-version-param-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param\"}', $1, $2\
              )",
@@ -2800,7 +2800,7 @@ mod tests {
         let error = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, global\
+             entity_pk, schema_key, snapshot_content, version_id, global\
              ) VALUES (\
              lix_json('[\"entity-global-param-null\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param-null\"}', $1, $2\
              )",
@@ -2832,7 +2832,7 @@ mod tests {
         let error = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, global\
+             entity_pk, schema_key, snapshot_content, version_id, global\
              ) VALUES (\
              lix_json('[\"entity-global-param-false\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param-false\"}', $1, false\
              )",
@@ -2864,7 +2864,7 @@ mod tests {
         let error = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, global\
+             entity_pk, schema_key, snapshot_content, version_id, global\
              ) VALUES (\
              lix_json('[\"entity-version-param-true\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param-true\"}', $1, true\
              )",
@@ -3149,7 +3149,7 @@ mod tests {
         let result = execute_write_sql(
 			&mut ctx,
 			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, metadata\
+	         entity_pk, schema_key, file_id, snapshot_content, metadata\
 	         ) VALUES (\
 	         lix_json('[\"entity-defaults\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"defaults\"}', NULL\
 	         )",
@@ -3168,7 +3168,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-defaults\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-defaults\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3190,7 +3190,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state (\
-             entity_id, schema_key, snapshot_content\
+             entity_pk, schema_key, snapshot_content\
              ) VALUES (\
              lix_json('[\"entity-numeric\"]'), 'lix_key_value', -1\
              )",
@@ -3209,7 +3209,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-numeric\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-numeric\"]");
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("-1"));
     }
 
@@ -3229,10 +3229,10 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_state (\
-		         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
+		         entity_pk, schema_key, file_id, snapshot_content, metadata, global, untracked\
 		         ) \
 	         SELECT \
-	         lix_json('[\"entity-from-select\"]') AS entity_id, \
+	         lix_json('[\"entity-from-select\"]') AS entity_pk, \
 	         'lix_key_value' AS schema_key, \
 	         NULL AS file_id, \
              '{\"key\":\"hello\",\"value\":\"from-select\"}' AS snapshot_content, \
@@ -3254,7 +3254,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-from-select\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-from-select\"]");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
@@ -3278,8 +3278,8 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state (schema_key, entity_id, snapshot_content) \
-             SELECT 'lix_key_value' AS looks_like_entity_id, \
+            "INSERT INTO lix_state (schema_key, entity_pk, snapshot_content) \
+             SELECT 'lix_key_value' AS looks_like_entity_pk, \
                     lix_json($1) AS looks_like_schema_key, \
                     -2 AS looks_like_metadata",
             &[Value::Text("[\"entity-select-param\"]".to_string())],
@@ -3295,7 +3295,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-select-param\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-select-param\"]");
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("-2"));
     }
 
@@ -3314,10 +3314,10 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
-             SELECT entity_id, schema_key, snapshot_content \
+            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
+             SELECT entity_pk, schema_key, snapshot_content \
              FROM lix_state \
-             WHERE entity_id = '[\"state-latest\"]'",
+             WHERE entity_pk = '[\"state-latest\"]'",
             &[],
         )
         .await
@@ -3347,11 +3347,11 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
-             SELECT left_state.entity_id, left_state.schema_key, left_state.snapshot_content \
+            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
+             SELECT left_state.entity_pk, left_state.schema_key, left_state.snapshot_content \
              FROM lix_state AS left_state \
              JOIN lix_state AS right_state \
-             ON left_state.entity_id = $1",
+             ON left_state.entity_pk = $1",
             &[Value::Text("[\"state-latest\"]".to_string())],
         )
         .await
@@ -3392,7 +3392,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"file-from-select\"]");
+        assert_eq!(rows[0].entity_pk, "[\"file-from-select\"]");
         assert_eq!(rows[0].version_id, "version-a");
     }
 
@@ -3418,7 +3418,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_version (\
-	     lixcol_entity_id, lixcol_version_id, value\
+	     lixcol_entity_pk, lixcol_version_id, value\
 	     ) VALUES (lix_json('[\"entity-c\"]'), 'version-b', 'C')",
             &[],
         )
@@ -3435,7 +3435,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-c\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3467,7 +3467,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema_by_version (\
-             lixcol_entity_id, lixcol_version_id, value\
+             lixcol_entity_pk, lixcol_version_id, value\
              ) VALUES (lix_json('[\"entity-c\"]'), $1, 'C')",
             &[Value::Text("version-b".to_string())],
         )
@@ -3482,7 +3482,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-c\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
         assert_eq!(rows[0].version_id, "version-b");
     }
 
@@ -3507,7 +3507,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_id, value) \
+            "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
 	     VALUES (lix_json('[\"entity-c\"]'), 'C')",
             &[],
         )
@@ -3524,7 +3524,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-c\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3555,7 +3555,7 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema (lixcol_entity_id, value) \
+            "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
              VALUES (lix_json('[\"entity-c\"]'), 'C')",
             &[],
         )
@@ -3639,7 +3639,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"dir-docs\"]");
+        assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3681,7 +3681,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"dir-docs\"]");
+        assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3725,7 +3725,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"dir-docs\"]");
+        assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -3815,7 +3815,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"dir-guides\"]");
+        assert_eq!(rows[0].entity_pk, "[\"dir-guides\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
@@ -3854,7 +3854,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"file-readme\"]");
+        assert_eq!(rows[0].entity_pk, "[\"file-readme\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3899,7 +3899,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"file-readme\"]");
+        assert_eq!(rows[0].entity_pk, "[\"file-readme\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -3938,10 +3938,10 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(descriptor_rows.len(), 1);
-        assert_eq!(descriptor_rows[0].entity_id, "[\"file-readme\"]");
+        assert_eq!(descriptor_rows[0].entity_pk, "[\"file-readme\"]");
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
-        assert_eq!(blob_ref_rows[0].entity_id, "[\"file-readme\"]");
+        assert_eq!(blob_ref_rows[0].entity_pk, "[\"file-readme\"]");
         assert_eq!(blob_ref_rows[0].file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref_rows[0].version_id, "version-b");
         let snapshot: JsonValue =
@@ -4005,7 +4005,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"file-readme\"]");
+        assert_eq!(rows[0].entity_pk, "[\"file-readme\"]");
         assert_eq!(rows[0].version_id, "version-a");
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
@@ -4065,7 +4065,7 @@ mod tests {
             .is_empty());
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
-        assert_eq!(blob_ref_rows[0].entity_id, "[\"file-readme\"]");
+        assert_eq!(blob_ref_rows[0].entity_pk, "[\"file-readme\"]");
         let snapshot: JsonValue =
             serde_json::from_str(blob_ref_rows[0].snapshot_content.as_deref().unwrap())
                 .expect("blob ref snapshot JSON");
@@ -4173,7 +4173,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"file-guide\"]");
+        assert_eq!(rows[0].entity_pk, "[\"file-guide\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
@@ -4223,7 +4223,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-a\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-a\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -4278,7 +4278,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-b\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
@@ -4323,7 +4323,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-1\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -4445,7 +4445,7 @@ mod tests {
             &mut ctx,
             "UPDATE lix_state \
              SET metadata = lix_json('{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}') \
-             WHERE entity_id = $1",
+             WHERE entity_pk = $1",
             &[Value::Json(json!(["entity-1"]))],
         )
         .await
@@ -4461,7 +4461,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-1\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
         assert_eq!(
             rows[0].metadata.as_deref(),
             Some("{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}")
@@ -4490,7 +4490,7 @@ mod tests {
             &mut ctx,
             "UPDATE lix_state \
              SET metadata = lix_json('{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}') \
-             WHERE entity_id = $1",
+             WHERE entity_pk = $1",
             &[Value::Text("[\"entity-1\"]".to_string())],
         )
         .await
@@ -4506,7 +4506,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-1\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
         assert_eq!(
             rows[0].metadata.as_deref(),
             Some("{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}")
@@ -4535,7 +4535,7 @@ mod tests {
             &mut ctx,
             "UPDATE lix_state \
              SET snapshot_content = -1 \
-             WHERE entity_id = lix_json('[\"entity-1\"]')",
+             WHERE entity_pk = lix_json('[\"entity-1\"]')",
             &[],
         )
         .await
@@ -4551,7 +4551,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-1\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("-1"));
     }
 
@@ -4633,7 +4633,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-b\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
         assert_eq!(rows[0].version_id, "version-b");
         assert_eq!(
             rows[0].metadata.as_deref(),
@@ -4679,7 +4679,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-global\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-global\"]");
         assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
         assert!(rows[0].global);
         assert_eq!(
@@ -4725,7 +4725,7 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "[\"entity-global\"]");
+        assert_eq!(rows[0].entity_pk, "[\"entity-global\"]");
         assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
         assert!(rows[0].global);
         assert!(rows[0].tombstone);
@@ -4970,8 +4970,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.tombstone));
         assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
-        assert!(rows.iter().any(|row| row.entity_id == "[\"entity-1\"]"));
-        assert!(rows.iter().any(|row| row.entity_id == "[\"entity-2\"]"));
+        assert!(rows.iter().any(|row| row.entity_pk == "[\"entity-1\"]"));
+        assert!(rows.iter().any(|row| row.entity_pk == "[\"entity-2\"]"));
     }
 
     async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, crate::LixError>
@@ -5031,7 +5031,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT entity_id, version_id, snapshot_content, commit_id \
+                    "SELECT entity_pk, version_id, snapshot_content, commit_id \
                      FROM lix_state_by_version \
                      WHERE version_id = 'version-b' AND schema_key = 'test_state_schema'",
                     &[],
@@ -5041,7 +5041,7 @@ mod tests {
 
                 assert_eq!(
                     result.columns,
-                    vec!["entity_id", "version_id", "snapshot_content", "commit_id"]
+                    vec!["entity_pk", "version_id", "snapshot_content", "commit_id"]
                 );
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Json(json!(["entity-b"])));
@@ -5065,7 +5065,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT entity_id FROM lix_state_by_version WHERE schema_key = 'test_state_schema'",
+                    "SELECT entity_pk FROM lix_state_by_version WHERE schema_key = 'test_state_schema'",
                     &[],
                 )
                 .await
@@ -5091,7 +5091,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT entity_id, snapshot_content \
+                    "SELECT entity_pk, snapshot_content \
                      FROM lix_state \
                      WHERE schema_key = 'test_state_schema'",
                     &[],
@@ -5099,7 +5099,7 @@ mod tests {
                 .await
                 .expect("sql2 execute should read lix_state");
 
-                assert_eq!(result.columns, vec!["entity_id", "snapshot_content"]);
+                assert_eq!(result.columns, vec!["entity_pk", "snapshot_content"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Json(json!(["entity-a"])));
                 assert_eq!(result.rows[0][1], Value::Json(json!({"value": "A"})));
@@ -5117,14 +5117,14 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT value, lixcol_entity_id \
+                    "SELECT value, lixcol_entity_pk \
                      FROM test_state_schema",
                     &[],
                 )
                 .await
                 .expect("sql2 execute should read entity view");
 
-                assert_eq!(result.columns, vec!["value", "lixcol_entity_id"]);
+                assert_eq!(result.columns, vec!["value", "lixcol_entity_pk"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
                 assert_eq!(result.rows[0][1], Value::Json(json!(["entity-a"])));

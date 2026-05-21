@@ -3,7 +3,7 @@ use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
     CommitChangeRefSet, CommitRecord,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageRead, StorageWriteSet};
@@ -300,7 +300,7 @@ fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, 
     Ok(ChangeRecord {
         format_version: 1,
         change_id: change_id.clone(),
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| snapshot.json_ref),
@@ -343,7 +343,7 @@ fn commit_change_ref_from_state_row(row: &PreparedStateRow, change_id: &str) -> 
     CommitChangeRef {
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         change_id: change_id.to_string(),
     }
 }
@@ -354,7 +354,7 @@ fn commit_change_ref_from_selected_change_ref(
     CommitChangeRef {
         schema_key: change_ref.schema_key.clone(),
         file_id: change_ref.file_id.clone(),
-        entity_id: change_ref.entity_id.clone(),
+        entity_pk: change_ref.entity_pk.clone(),
         change_id: change_ref.change_id.clone(),
     }
 }
@@ -377,7 +377,7 @@ fn tracked_delta_from_state_row(
     Ok(TrackedStateDeltaRef {
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
-        entity_id: &row.entity_id,
+        entity_pk: &row.entity_pk,
         change_id,
         commit_id,
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
@@ -395,7 +395,7 @@ fn tracked_delta_from_selected_change_ref<'a>(
     Ok(TrackedStateDeltaRef {
         schema_key: &change_ref.schema_key,
         file_id: change_ref.file_id.as_deref(),
-        entity_id: &change_ref.entity_id,
+        entity_pk: &change_ref.entity_pk,
         change_id: &change_ref.change_id,
         commit_id,
         snapshot_ref: change_ref.snapshot_ref.as_ref(),
@@ -443,7 +443,7 @@ async fn stage_tracked_roots(
         }
         let commit_snapshot = commit_row_snapshot_content(&root.commit_id)?;
         let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
-        let commit_entity_id = EntityIdentity::single(root.commit_id.clone());
+        let commit_entity_pk = EntityPk::single(root.commit_id.clone());
         let mut deltas = state_row_indices
             .iter()
             .map(|&row_index| tracked_delta_from_state_row(&state_rows[row_index]))
@@ -454,7 +454,7 @@ async fn stage_tracked_roots(
         deltas.push(TrackedStateDeltaRef {
             schema_key: "lix_commit",
             file_id: None,
-            entity_id: &commit_entity_id,
+            entity_pk: &commit_entity_pk,
             change_id: &staged.commit_change_id,
             commit_id: &root.commit_id,
             snapshot_ref: Some(&commit_snapshot_ref),
@@ -571,7 +571,7 @@ fn visit_tracked_root_parent_first<'a>(
 
 fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRowRef<'_> {
     UntrackedStateRowRef {
-        entity_id: &row.entity_id,
+        entity_pk: &row.entity_pk,
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
         snapshot_content: row
@@ -593,7 +593,7 @@ fn untracked_identity_ref_from_state_row(row: &PreparedStateRow) -> UntrackedSta
     UntrackedStateIdentityRef {
         version_id: &row.version_id,
         schema_key: &row.schema_key,
-        entity_id: &row.entity_id,
+        entity_pk: &row.entity_pk,
         file_id: row.file_id.as_deref(),
     }
 }
@@ -954,7 +954,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+                    entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -1096,7 +1096,7 @@ mod tests {
                 )
                 .expect("deterministic mode snapshot should stage");
             let row = crate::untracked_state::UntrackedStateRow {
-                entity_id: crate::entity_identity::EntityIdentity::single(DETERMINISTIC_MODE_KEY),
+                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_MODE_KEY),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot_content: Some(mode_snapshot.to_string()),
@@ -1132,7 +1132,7 @@ mod tests {
 
         let tracked_row = tracked_global_row("change-tracked");
         let mut untracked_row = untracked_global_row("change-untracked");
-        untracked_row.entity_id = crate::entity_identity::EntityIdentity::single("entity-2");
+        untracked_row.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
 
         let writes = commit_prepared_writes(
             &binary_cas,
@@ -1213,7 +1213,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
+                    entity_pk: crate::entity_pk::EntityPk::single("entity-2"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -1234,9 +1234,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single(
-                    DETERMINISTIC_SEQUENCE_KEY,
-                ),
+                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1460,7 +1458,7 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot: Some(
@@ -1507,7 +1505,7 @@ mod tests {
         UntrackedStateRowRequest {
             schema_key: "test_schema".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -1516,7 +1514,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "test_schema".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }

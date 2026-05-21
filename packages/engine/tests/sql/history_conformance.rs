@@ -166,7 +166,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_history_conformance \
-                 (lixcol_entity_id, id, value, lixcol_untracked) \
+                 (lixcol_entity_pk, id, value, lixcol_untracked) \
                  VALUES (lix_json('[\"history-conformance-entity\"]'), 'history-conformance-entity', 'one', false)",
                 &[],
             )
@@ -176,7 +176,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_history_conformance \
                  SET value = 'two' \
-                 WHERE lixcol_entity_id = lix_json('[\"history-conformance-entity\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]')",
                 &[],
             )
             .await
@@ -184,7 +184,7 @@ simulation_test!(
         session
             .execute(
                 "DELETE FROM engine_history_conformance \
-                 WHERE lixcol_entity_id = lix_json('[\"history-conformance-entity\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]')",
                 &[],
             )
             .await
@@ -192,10 +192,10 @@ simulation_test!(
 
         let typed_rows = select_rows(
             &session,
-            "SELECT id, value, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM engine_history_conformance_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
-               AND lixcol_entity_id = lix_json('[\"history-conformance-entity\"]') \
+               AND lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
              ORDER BY lixcol_depth",
         )
         .await;
@@ -217,7 +217,7 @@ simulation_test!(
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
                AND schema_key = 'engine_history_conformance' \
-               AND entity_id = lix_json('[\"history-conformance-entity\"]') \
+               AND entity_pk = lix_json('[\"history-conformance-entity\"]') \
                AND snapshot_content IS NULL",
         )
         .await;
@@ -255,7 +255,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT key, value, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT key, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM lix_key_value_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND key = 'history-pk-backfill' \
@@ -405,7 +405,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, data, lixcol_entity_id, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, name, data, lixcol_entity_pk, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
              FROM lix_file_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND id = 'history-conformance-file' \
@@ -432,7 +432,7 @@ simulation_test!(
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
                AND schema_key = 'lix_file_descriptor' \
-               AND entity_id = lix_json('[\"history-conformance-file\"]') \
+               AND entity_pk = lix_json('[\"history-conformance-file\"]') \
                AND snapshot_content IS NULL",
         )
         .await;
@@ -478,7 +478,7 @@ simulation_test!(
 
         let directory_rows = select_rows(
             &session,
-            "SELECT id, path, parent_id, name, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM lix_directory_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND id = 'history-conformance-dir' \
@@ -504,7 +504,7 @@ simulation_test!(
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
                AND schema_key = 'lix_directory_descriptor' \
-               AND entity_id = lix_json('[\"history-conformance-dir\"]') \
+               AND entity_pk = lix_json('[\"history-conformance-dir\"]') \
                AND snapshot_content IS NULL",
         )
         .await;

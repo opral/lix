@@ -1083,7 +1083,7 @@ fn is_user_visible_filesystem_delete_row(row: &TransactionWriteRow) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StateRowDedupeKey {
-    entity_id: String,
+    entity_pk: String,
     schema_key: String,
     file_id: Option<String>,
     version_id: String,
@@ -1094,12 +1094,12 @@ struct StateRowDedupeKey {
 impl From<&TransactionWriteRow> for StateRowDedupeKey {
     fn from(row: &TransactionWriteRow) -> Self {
         Self {
-            entity_id: row
-                .entity_id
+            entity_pk: row
+                .entity_pk
                 .as_ref()
-                .expect("directory provider staged row should carry entity_id")
+                .expect("directory provider staged row should carry entity_pk")
                 .as_single_string_owned()
-                .expect("directory provider staged row entity identity should project"),
+                .expect("directory provider staged row entity primary key should project"),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -1137,7 +1137,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_entity_id")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_entity_pk")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
@@ -1221,14 +1221,14 @@ fn attach_lix_directory_insert_origin(
         if row.schema_key != DIRECTORY_SCHEMA_KEY {
             continue;
         }
-        let Some(entity_id) = row
-            .entity_id
+        let Some(entity_pk) = row
+            .entity_pk
             .as_ref()
-            .and_then(|entity_id| entity_id.as_single_string_owned().ok())
+            .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
         else {
             continue;
         };
-        if entity_id == directory_id {
+        if entity_pk == directory_id {
             row.origin = Some(origin.clone());
         }
     }
@@ -1369,7 +1369,7 @@ fn lix_directory_record_batch(
     let mut parent_ids = Vec::new();
     let mut names = Vec::new();
     let mut hiddens = Vec::new();
-    let mut entity_ids = Vec::new();
+    let mut entity_pks = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
     let mut globals = Vec::new();
@@ -1391,7 +1391,7 @@ fn lix_directory_record_batch(
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
         hiddens.push(Some(directory.hidden));
-        entity_ids.push(Some(directory.live.entity_id.as_json_array_text()?));
+        entity_pks.push(Some(directory.live.entity_pk.as_json_array_text()?));
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
         globals.push(Some(directory.live.global));
@@ -1412,7 +1412,7 @@ fn lix_directory_record_batch(
             "parent_id" => Arc::new(StringArray::from(parent_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
             "hidden" => Arc::new(BooleanArray::from(hiddens.clone())),
-            "lixcol_entity_id" => Arc::new(StringArray::from(entity_ids.clone())),
+            "lixcol_entity_pk" => Arc::new(StringArray::from(entity_pks.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
@@ -1833,7 +1833,7 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("hidden", DataType::Boolean, true),
-        json_field("lixcol_entity_id", false),
+        json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -1976,12 +1976,12 @@ mod tests {
     }
 
     fn live_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         live_filesystem_row(
-            entity_id,
+            entity_pk,
             super::DIRECTORY_SCHEMA_KEY,
             None,
             version_id,
@@ -1990,22 +1990,22 @@ mod tests {
     }
 
     fn live_filesystem_row(
-        entity_id: &str,
+        entity_pk: &str,
         schema_key: &str,
         file_id: Option<&str>,
         version_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -2205,7 +2205,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![TransactionWriteRow {
-                entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
+                entity_pk: Some(crate::entity_pk::EntityPk::single("dir-docs")),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(
@@ -2308,11 +2308,11 @@ mod tests {
                 .map(|row| {
                     (
                         row.schema_key.as_str(),
-                        row.entity_id
+                        row.entity_pk
                             .as_ref()
-                            .expect("planned delete row should carry entity_id")
+                            .expect("planned delete row should carry entity_pk")
                             .as_single_string_owned()
-                            .expect("planned delete row should project entity_id"),
+                            .expect("planned delete row should project entity_pk"),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -2347,7 +2347,7 @@ mod tests {
             .map(|row| {
                 (
                     row.schema_key.clone(),
-                    row.entity_id.clone(),
+                    row.entity_pk.clone(),
                     row.file_id.clone(),
                     row.version_id.clone(),
                 )
@@ -2375,7 +2375,7 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: vec![TransactionWriteRow {
-                    entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
+                    entity_pk: Some(crate::entity_pk::EntityPk::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(

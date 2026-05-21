@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{
     StorageBackend, StorageBackendRead, StorageBackendReadOf, StorageContext, StorageRead,
@@ -13,7 +13,7 @@ use crate::tracked_state::{
 pub struct BenchTrackedRow {
     pub schema_key: String,
     pub file_id: Option<String>,
-    pub entity_id: String,
+    pub entity_pk: String,
     pub value: Vec<u8>,
     pub updated_value: Vec<u8>,
 }
@@ -321,7 +321,7 @@ where
 struct OwnedDelta {
     change_id: String,
     commit_id: String,
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: String,
     file_id: Option<String>,
     snapshot_ref: Option<crate::json_store::JsonRef>,
@@ -358,7 +358,7 @@ impl OwnedDelta {
         Self {
             change_id,
             commit_id: commit_id.to_string(),
-            entity_id: EntityIdentity::single(row.entity_id),
+            entity_pk: EntityPk::single(row.entity_pk),
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_ref,
@@ -373,7 +373,7 @@ impl OwnedDelta {
         TrackedStateDeltaRef {
             schema_key: &self.schema_key,
             file_id: self.file_id.as_deref(),
-            entity_id: &self.entity_id,
+            entity_pk: &self.entity_pk,
             change_id: &self.change_id,
             commit_id: &self.commit_id,
             snapshot_ref: self.snapshot_ref.as_ref(),
@@ -388,7 +388,7 @@ impl OwnedDelta {
 fn row_key(row: &BenchTrackedRow) -> TrackedStateKey {
     TrackedStateKey {
         schema_key: row.schema_key.clone(),
-        entity_id: EntityIdentity::single(row.entity_id.clone()),
+        entity_pk: EntityPk::single(row.entity_pk.clone()),
         file_id: row.file_id.clone(),
     }
 }

@@ -1,18 +1,18 @@
 import type { ExpressionBuilder, ExpressionWrapper, SqlBool } from "kysely";
 import type { LixDatabaseSchema } from "./schema.js";
 
-type LixEntityId = string[];
+type LixEntityPk = string[];
 
 type LixEntityCanonical = {
 	schema_key: string;
 	file_id: string | null;
-	entity_id: LixEntityId;
+	entity_pk: LixEntityPk;
 };
 
 type LixEntity = {
 	lixcol_schema_key: string;
 	lixcol_file_id: string | null;
-	lixcol_entity_id: LixEntityId;
+	lixcol_entity_pk: LixEntityPk;
 };
 
 const CANONICAL_TABLES = [
@@ -31,14 +31,14 @@ export function ebEntity<
 		entity: LixEntity | LixEntityCanonical,
 	): boolean => {
 		return (
-			"entity_id" in entity && "schema_key" in entity && "file_id" in entity
+			"entity_pk" in entity && "schema_key" in entity && "file_id" in entity
 		);
 	};
 
 	const getColumnNames = (entity?: LixEntity | LixEntityCanonical) => {
 		if (entityType !== undefined) {
 			return {
-				entityIdCol: isCanonicalTable ? "entity_id" : "lixcol_entity_id",
+				entityPkCol: isCanonicalTable ? "entity_pk" : "lixcol_entity_pk",
 				schemaKeyCol: isCanonicalTable ? "schema_key" : "lixcol_schema_key",
 				fileIdCol: isCanonicalTable ? "file_id" : "lixcol_file_id",
 			};
@@ -47,23 +47,23 @@ export function ebEntity<
 		if (entity) {
 			const useCanonical = detectColumnType(entity);
 			return {
-				entityIdCol: useCanonical ? "entity_id" : "lixcol_entity_id",
+				entityPkCol: useCanonical ? "entity_pk" : "lixcol_entity_pk",
 				schemaKeyCol: useCanonical ? "schema_key" : "lixcol_schema_key",
 				fileIdCol: useCanonical ? "file_id" : "lixcol_file_id",
 			};
 		}
 
 		return {
-			entityIdCol: "lixcol_entity_id",
+			entityPkCol: "lixcol_entity_pk",
 			schemaKeyCol: "lixcol_schema_key",
 			fileIdCol: "lixcol_file_id",
 		};
 	};
 
 	const getColumnRefs = (entity?: LixEntity | LixEntityCanonical) => {
-		const { entityIdCol, schemaKeyCol, fileIdCol } = getColumnNames(entity);
+		const { entityPkCol, schemaKeyCol, fileIdCol } = getColumnNames(entity);
 		return {
-			entityIdRef: entityType ? `${entityType}.${entityIdCol}` : entityIdCol,
+			entityPkRef: entityType ? `${entityType}.${entityPkCol}` : entityPkCol,
 			schemaKeyRef: entityType ? `${entityType}.${schemaKeyCol}` : schemaKeyCol,
 			fileIdRef: entityType ? `${entityType}.${fileIdCol}` : fileIdCol,
 		};
@@ -71,8 +71,8 @@ export function ebEntity<
 
 	const getTargetValues = (entity: LixEntity | LixEntityCanonical) => {
 		return {
-			targetEntityId:
-				"entity_id" in entity ? entity.entity_id : entity.lixcol_entity_id,
+			targetEntityPk:
+				"entity_pk" in entity ? entity.entity_pk : entity.lixcol_entity_pk,
 			targetSchemaKey:
 				"schema_key" in entity ? entity.schema_key : entity.lixcol_schema_key,
 			targetFileId: "file_id" in entity ? entity.file_id : entity.lixcol_file_id,
@@ -83,11 +83,11 @@ export function ebEntity<
 		eb: ExpressionBuilder<LixDatabaseSchema, TB>,
 		entity: LixEntity | LixEntityCanonical,
 	): ExpressionWrapper<LixDatabaseSchema, TB, SqlBool> => {
-		const { targetEntityId, targetSchemaKey, targetFileId } =
+		const { targetEntityPk, targetSchemaKey, targetFileId } =
 			getTargetValues(entity);
-		const { entityIdRef, schemaKeyRef, fileIdRef } = getColumnRefs(entity);
+		const { entityPkRef, schemaKeyRef, fileIdRef } = getColumnRefs(entity);
 		return eb.and([
-			eb(eb.ref(entityIdRef as any), "=", targetEntityId),
+			eb(eb.ref(entityPkRef as any), "=", targetEntityPk),
 			eb(eb.ref(schemaKeyRef as any), "=", targetSchemaKey),
 			targetFileId === null
 				? eb(eb.ref(fileIdRef as any), "is", null)
@@ -102,7 +102,7 @@ export function ebEntity<
 			return (
 				eb: ExpressionBuilder<LixDatabaseSchema, TB>,
 			): ExpressionWrapper<LixDatabaseSchema, TB, SqlBool> => {
-				const { entityIdRef, schemaKeyRef, fileIdRef } = getColumnRefs();
+				const { entityPkRef, schemaKeyRef, fileIdRef } = getColumnRefs();
 				const labelQuery = eb
 					.selectFrom("lix_label_assignment" as any)
 					.innerJoin(
@@ -112,11 +112,11 @@ export function ebEntity<
 					) as any;
 				return eb.exists(
 					labelQuery
-						.select("lix_label_assignment.target_entity_id" as any)
+						.select("lix_label_assignment.target_entity_pk" as any)
 						.whereRef(
-							"lix_label_assignment.target_entity_id" as any,
+							"lix_label_assignment.target_entity_pk" as any,
 							"=",
-							entityIdRef as any,
+							entityPkRef as any,
 						)
 						.whereRef(
 							"lix_label_assignment.target_schema_key" as any,

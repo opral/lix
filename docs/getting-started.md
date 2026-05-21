@@ -79,7 +79,7 @@ Each row is a `Row`. Use `row.value(name)` for a typed `Value`, or `row.get(name
 | `asBoolean()` | boolean columns |
 | `asInteger()` | integer columns |
 | `asReal()` | decimal columns |
-| `asJson()` | JSON columns such as `snapshot_content` and `entity_id` |
+| `asJson()` | JSON columns such as `snapshot_content` and `entity_pk` |
 | `asBlob()` | binary columns such as `lix_file.data` |
 
 There is no `asBytes()` accessor. Use `asBlob()` for bytes:

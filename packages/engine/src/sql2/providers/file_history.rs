@@ -31,7 +31,7 @@ use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryId
 use crate::sql2::history_route::{
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
     HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID, HISTORY_COL_FILE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SCHEMA_KEY,
     HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
@@ -330,7 +330,7 @@ struct FileHistoryEvent {
 
 #[derive(Debug, Clone)]
 struct FileHistoryOutputRow {
-    entity_id: String,
+    entity_pk: String,
     id: String,
     path: Option<String>,
     directory_id: Option<String>,
@@ -442,7 +442,7 @@ where
         .unwrap_or_else(|| descriptor.id.clone());
 
         output.push(FileHistoryOutputRow {
-            entity_id: descriptor.id.clone(),
+            entity_pk: descriptor.id.clone(),
             id,
             path,
             directory_id: descriptor.directory_id.clone(),
@@ -454,18 +454,18 @@ where
         });
     }
     output.retain(|row| {
-        let entity_id = entity_id_json_array(&row.entity_id).ok();
+        let entity_pk = entity_pk_json_array(&row.entity_pk).ok();
         route.matches_surface_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            entity_id.as_deref().unwrap_or(&row.entity_id),
-            Some(&row.entity_id),
+            entity_pk.as_deref().unwrap_or(&row.entity_pk),
+            Some(&row.entity_pk),
             row.event.depth,
         )
     });
 
     output.sort_by(|left, right| {
-        left.entity_id
-            .cmp(&right.entity_id)
+        left.entity_pk
+            .cmp(&right.entity_pk)
             .then(left.event.start_commit_id.cmp(&right.event.start_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
             .then(
@@ -589,7 +589,7 @@ fn parse_file_history_descriptors(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDescriptorRecord {
-                    id: entry.change.entity_id.as_single_string_owned()?,
+                    id: entry.change.entity_pk.as_single_string_owned()?,
                     directory_id: None,
                     name: None,
                     hidden: None,
@@ -654,9 +654,9 @@ fn parse_file_history_blobs(
                     file_id: entry.change.file_id.clone().unwrap_or_else(|| {
                         entry
                             .change
-                            .entity_id
+                            .entity_pk
                             .as_single_string_owned()
-                            .expect("canonical change entity identity should project")
+                            .expect("canonical change entity primary key should project")
                     }),
                     blob_hash: None,
                     entry: entry.clone(),
@@ -821,15 +821,15 @@ fn file_history_column_array(
                 .map(|row| row.data.as_deref())
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        HISTORY_COL_ENTITY_ID => Arc::new(StringArray::from(
+        HISTORY_COL_ENTITY_PK => Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| entity_id_json_array(&row.entity_id).map(Some))
+                .map(|row| entity_pk_json_array(&row.entity_pk).map(Some))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         )) as ArrayRef,
         HISTORY_COL_SCHEMA_KEY => {
             string_array(rows.iter().map(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY)))
         }
-        HISTORY_COL_FILE_ID => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+        HISTORY_COL_FILE_ID => string_array(rows.iter().map(|row| Some(row.entity_pk.as_str()))),
         HISTORY_COL_CHANGE_ID => {
             string_array(rows.iter().map(|row| Some(row.event.change.id.as_str())))
         }
@@ -883,7 +883,7 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, true),
         Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
-        json_field(HISTORY_COL_ENTITY_ID, false),
+        json_field(HISTORY_COL_ENTITY_PK, false),
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
         json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
@@ -911,10 +911,10 @@ fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
     crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
-fn entity_id_json_array(entity_id: &str) -> Result<String, LixError> {
-    serde_json::to_string(&[entity_id]).map_err(|error| {
+fn entity_pk_json_array(entity_pk: &str) -> Result<String, LixError> {
+    serde_json::to_string(&[entity_pk]).map_err(|error| {
         LixError::unknown(format!(
-            "failed to encode history entity id as JSON: {error}"
+            "failed to encode history entity pk as JSON: {error}"
         ))
     })
 }

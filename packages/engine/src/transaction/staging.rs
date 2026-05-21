@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog::SchemaPlanId;
 use crate::domain::{Domain, DomainRowIdentity};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
@@ -76,9 +76,9 @@ pub(crate) enum PreparedValidationRow<'a> {
 }
 
 impl<'a> PreparedValidationRow<'a> {
-    pub(crate) fn entity_id(&self) -> &EntityIdentity {
+    pub(crate) fn entity_pk(&self) -> &EntityPk {
         match self {
-            Self::State(row) => &row.entity_id,
+            Self::State(row) => &row.entity_pk,
         }
     }
 
@@ -158,7 +158,7 @@ impl<'a> PreparedValidationRow<'a> {
         DomainRowIdentity::in_domain(
             self.domain(),
             self.schema_key().to_string(),
-            self.entity_id().clone(),
+            self.entity_pk().clone(),
         )
     }
 }
@@ -630,7 +630,7 @@ pub(crate) enum StagedExactRow {
 pub(crate) struct PreparedStateRowIdentity {
     untracked: bool,
     schema_key: String,
-    entity_id: crate::entity_identity::EntityIdentity,
+    entity_pk: crate::entity_pk::EntityPk,
     file_id: Option<String>,
     version_id: String,
 }
@@ -640,7 +640,7 @@ impl PreparedStateRowIdentity {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
         }
@@ -657,7 +657,7 @@ impl PreparedStateRowIdentity {
         Some(Self {
             untracked,
             schema_key: request.schema_key.clone(),
-            entity_id: request.entity_id.clone(),
+            entity_pk: request.entity_pk.clone(),
             file_id,
             version_id: request.version_id.clone(),
         })
@@ -667,8 +667,8 @@ impl PreparedStateRowIdentity {
         &self.schema_key
     }
 
-    pub(crate) fn entity_id(&self) -> &crate::entity_identity::EntityIdentity {
-        &self.entity_id
+    pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
+        &self.entity_pk
     }
 
     pub(crate) fn domain(&self) -> Domain {
@@ -691,7 +691,7 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
         }
@@ -720,12 +720,12 @@ fn duplicate_staged_present_row_error(
     let message = logical_primary_key_violation_message(row.origin.as_ref())
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_id '{}' in version '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_pk '{}' in version '{}'",
                 row.schema_key,
                 previous
-                    .entity_id
+                    .entity_pk
                     .as_json_array_text()
-                    .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
+                    .unwrap_or_else(|_| "<invalid entity_pk>".to_string()),
                 row.version_id
             )
         });
@@ -734,22 +734,22 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    entity_id: &crate::entity_identity::EntityIdentity,
+    entity_pk: &crate::entity_pk::EntityPk,
     version_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
 ) -> String {
     if let Some(message) = logical_primary_key_violation_message(origin) {
         return message;
     }
-    let entity_id = entity_id
+    let entity_pk = entity_pk
         .as_json_array_text()
-        .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
     match version_id {
         Some(version_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_id '{entity_id}' in version '{version_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}' in version '{version_id}'"
         ),
         None => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_id '{entity_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}'"
         ),
     }
 }
@@ -757,7 +757,7 @@ pub(crate) fn duplicate_insert_identity_message(
 fn duplicate_insert_identity_error(row: &PreparedStateRow) -> LixError {
     let message = duplicate_insert_identity_message(
         &row.schema_key,
-        &row.entity_id,
+        &row.entity_pk,
         Some(&row.version_id),
         row.origin.as_ref(),
     );
@@ -849,7 +849,7 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !request.filter.entity_ids.is_empty() && !request.filter.entity_ids.contains(&row.entity_id)
+    if !request.filter.entity_pks.is_empty() && !request.filter.entity_pks.contains(&row.entity_pk)
     {
         return false;
     }
@@ -929,7 +929,7 @@ mod tests {
             .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("sql2-duplicate-key"),
+                entity_pk: crate::entity_pk::EntityPk::single("sql2-duplicate-key"),
                 file_id: NullableKeyFilter::Null,
             })
             .expect("staged row should be visible");
@@ -1068,7 +1068,7 @@ mod tests {
 
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_id == crate::entity_identity::EntityIdentity::single("sql2-key-a")
+            row.entity_pk == crate::entity_pk::EntityPk::single("sql2-key-a")
                 && row
                     .snapshot
                     .as_ref()
@@ -1076,7 +1076,7 @@ mod tests {
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_id == crate::entity_identity::EntityIdentity::single("sql2-key-b")
+            row.entity_pk == crate::entity_pk::EntityPk::single("sql2-key-b")
                 && row
                     .snapshot
                     .as_ref()
@@ -1255,11 +1255,11 @@ mod tests {
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_id == crate::entity_identity::EntityIdentity::single("shared-domain-key")
+            row.entity_pk == crate::entity_pk::EntityPk::single("shared-domain-key")
                 && !row.untracked
         }));
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_id == crate::entity_identity::EntityIdentity::single("shared-domain-key")
+            row.entity_pk == crate::entity_pk::EntityPk::single("shared-domain-key")
                 && row.untracked
         }));
     }
@@ -1337,9 +1337,7 @@ mod tests {
         let rows = overlay
             .scan(&LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    entity_ids: vec![crate::entity_identity::EntityIdentity::single(
-                        "shared-entity",
-                    )],
+                    entity_pks: vec![crate::entity_pk::EntityPk::single("shared-entity")],
                     include_tombstones: true,
                     ..LiveStateFilter::default()
                 },
@@ -1350,11 +1348,12 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
-                .filter(|row| row.entity_id
-                    == crate::entity_identity::EntityIdentity::single("shared-entity")
-                    && row.version_id == "global"
-                    && row.schema_key == "lix_key_value"
-                    && row.file_id.is_none())
+                .filter(
+                    |row| row.entity_pk == crate::entity_pk::EntityPk::single("shared-entity")
+                        && row.version_id == "global"
+                        && row.schema_key == "lix_key_value"
+                        && row.file_id.is_none()
+                )
                 .count(),
             1
         );
@@ -1445,7 +1444,7 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
-            entity_id: crate::entity_identity::EntityIdentity::single(key),
+            entity_pk: crate::entity_pk::EntityPk::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot: Some(snapshot),
@@ -1471,7 +1470,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: "global".to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single(key),
+            entity_pk: crate::entity_pk::EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -1480,7 +1479,7 @@ mod tests {
         LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                entity_ids: vec![crate::entity_identity::EntityIdentity::single(key)],
+                entity_pks: vec![crate::entity_pk::EntityPk::single(key)],
                 version_ids: vec!["global".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,

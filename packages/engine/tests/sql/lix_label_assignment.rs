@@ -32,7 +32,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_label_assignment \
-                 (target_entity_id, target_schema_key, target_file_id, label_id) \
+                 (target_entity_pk, target_schema_key, target_file_id, label_id) \
                  VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, 'label-a')",
                 &[],
             )
@@ -41,9 +41,9 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT id, target_entity_id, target_schema_key, target_file_id, label_id \
+            "SELECT id, target_entity_pk, target_schema_key, target_file_id, label_id \
              FROM lix_label_assignment \
-             WHERE target_entity_id = lix_json('[\"label-target\"]')",
+             WHERE target_entity_pk = lix_json('[\"label-target\"]')",
         )
         .await;
 
@@ -66,7 +66,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_label_assignment \
-                 (target_entity_id, target_schema_key, target_file_id, label_id) \
+                 (target_entity_pk, target_schema_key, target_file_id, label_id) \
                  VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, 'label-a')",
                 &[],
             )
@@ -110,7 +110,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_label_assignment \
-                 (target_entity_id, target_schema_key, target_file_id, label_id) \
+                 (target_entity_pk, target_schema_key, target_file_id, label_id) \
                  VALUES (lix_json('[\"missing-target\"]'), 'lix_key_value', NULL, 'label-a')",
                 &[],
             )

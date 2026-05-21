@@ -37,7 +37,7 @@ struct WireDetectStateContext {
 
 #[derive(Debug, serde::Deserialize)]
 struct WireActiveStateRow {
-    entity_id: String,
+    entity_pk: String,
     schema_key: Option<String>,
     snapshot_content: Option<CanonicalJson>,
     file_id: Option<String>,
@@ -51,7 +51,7 @@ struct WireActiveStateRow {
 
 #[derive(Debug, serde::Deserialize)]
 struct WirePluginEntityChange {
-    entity_id: String,
+    entity_pk: String,
     schema_key: String,
     snapshot_content: Option<CanonicalJson>,
 }
@@ -64,7 +64,7 @@ struct WireApplyChangesRequest {
 
 #[derive(Debug, serde::Serialize)]
 struct WirePluginEntityChangeOutput {
-    entity_id: String,
+    entity_pk: String,
     schema_key: String,
     snapshot_content: Option<CanonicalJson>,
 }
@@ -315,7 +315,7 @@ fn wire_change_to_binding(
     change: WirePluginEntityChange,
 ) -> plugin_bindings::exports::lix::plugin::api::EntityChange {
     plugin_bindings::exports::lix::plugin::api::EntityChange {
-        entity_id: change.entity_id,
+        entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         snapshot_content: change.snapshot_content.map(Into::into),
     }
@@ -337,7 +337,7 @@ fn wire_active_state_row_to_binding(
     row: WireActiveStateRow,
 ) -> plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
     plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
-        entity_id: row.entity_id,
+        entity_pk: row.entity_pk,
         schema_key: row.schema_key,
         snapshot_content: row.snapshot_content.map(Into::into),
         file_id: row.file_id,
@@ -354,7 +354,7 @@ fn binding_change_to_wire(
     change: plugin_bindings::exports::lix::plugin::api::EntityChange,
 ) -> Result<WirePluginEntityChangeOutput, LixError> {
     Ok(WirePluginEntityChangeOutput {
-        entity_id: change.entity_id,
+        entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         snapshot_content: change
             .snapshot_content

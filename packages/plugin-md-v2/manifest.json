@@ -10,7 +10,7 @@
     "state_context": {
       "include_active_state": true,
       "columns": [
-        "entity_id",
+        "entity_pk",
         "schema_key",
         "snapshot_content"
       ]

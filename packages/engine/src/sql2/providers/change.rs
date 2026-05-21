@@ -313,7 +313,7 @@ fn commit_record_canonical_change(
     .expect("lix_commit snapshot serialization should not fail");
     crate::commit_graph::CommitGraphChange {
         id: commit.change_id.clone(),
-        entity_id: crate::entity_identity::EntityIdentity::single(&commit.commit_id),
+        entity_pk: crate::entity_pk::EntityPk::single(&commit.commit_id),
         schema_key: "lix_commit".to_string(),
         file_id: None,
         snapshot_ref: Some(crate::json_store::JsonRef::for_content(
@@ -327,7 +327,7 @@ fn commit_record_canonical_change(
 #[derive(Debug, Clone, Copy)]
 enum ChangeColumn {
     Id,
-    EntityId,
+    EntityPk,
     SchemaKey,
     FileId,
     Metadata,
@@ -338,7 +338,7 @@ enum ChangeColumn {
 pub(super) fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
-        json_field("entity_id", false),
+        json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("metadata", true),
@@ -350,7 +350,7 @@ pub(super) fn lix_change_schema() -> SchemaRef {
 fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeColumn> {
     let all_columns = vec![
         ChangeColumn::Id,
-        ChangeColumn::EntityId,
+        ChangeColumn::EntityPk,
         ChangeColumn::SchemaKey,
         ChangeColumn::FileId,
         ChangeColumn::Metadata,
@@ -380,14 +380,14 @@ fn change_record_batch(
         .iter()
         .map(|column| match column {
             ChangeColumn::Id => string_array(changes.iter().map(|row| Some(row.id.as_str()))),
-            ChangeColumn::EntityId => Arc::new(StringArray::from(
+            ChangeColumn::EntityPk => Arc::new(StringArray::from(
                 changes
                     .iter()
                     .map(|row| {
                         Some(
-                            row.entity_id
+                            row.entity_pk
                                 .as_json_array_text()
-                                .expect("canonical change entity identity should project"),
+                                .expect("canonical change entity primary key should project"),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -421,7 +421,7 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
             .iter()
             .map(|column| match column {
                 ChangeColumn::Id => Field::new("id", DataType::Utf8, false),
-                ChangeColumn::EntityId => json_field("entity_id", false),
+                ChangeColumn::EntityPk => json_field("entity_pk", false),
                 ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
                 ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),
                 ChangeColumn::Metadata => json_field("metadata", true),

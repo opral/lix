@@ -1,11 +1,11 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {
     pub(crate) id: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_ref: Option<JsonRef>,
@@ -47,7 +47,7 @@ pub(crate) struct CommitGraphEdge {
 /// Filter for canonical change history from a chosen traversal start commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<u32>,

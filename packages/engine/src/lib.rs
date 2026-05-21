@@ -25,7 +25,7 @@ pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod domain;
 pub mod engine;
-pub(crate) mod entity_identity;
+pub(crate) mod entity_pk;
 pub(crate) mod functions;
 pub(crate) mod init;
 #[allow(dead_code)]
@@ -76,7 +76,7 @@ pub use backend::{
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
-pub use common::{CanonicalPluginKey, CanonicalSchemaKey, EntityId, FileId, VersionId};
+pub use common::{CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId, VersionId};
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;

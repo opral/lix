@@ -102,7 +102,7 @@ WHERE schema_key = 'lix_key_value'
 -- Preprocessor rewrites to (pseudocode):
 SELECT * FROM (
   SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY entity_id
+    PARTITION BY entity_pk
     ORDER BY priority
   ) AS rn
   FROM (
@@ -271,9 +271,9 @@ async function execute(sql: string): Promise<string> {
     END;
 
     -- Bulk insert into physical table
-    INSERT INTO ${targetTable} (entity_id, schema_key, file_id, ...)
+    INSERT INTO ${targetTable} (entity_pk, schema_key, file_id, ...)
     VALUES ${allRows.map(formatRow).join(", ")}
-    ON CONFLICT (entity_id, schema_key, file_id, version_id)
+    ON CONFLICT (entity_pk, schema_key, file_id, version_id)
     DO UPDATE SET snapshot_content = excluded.snapshot_content, ...;
   `;
 

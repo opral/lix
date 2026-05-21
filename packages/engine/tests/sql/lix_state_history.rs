@@ -22,7 +22,7 @@ simulation_test!(
             .expect("tracked write should succeed");
 
         let error = session
-            .execute("SELECT entity_id FROM lix_state_history", &[])
+            .execute("SELECT entity_pk FROM lix_state_history", &[])
             .await
             .expect_err("history queries must provide start_commit_id");
 
@@ -64,7 +64,7 @@ simulation_test!(
 
         let rows = select_history_rows(
             &session,
-            "SELECT entity_id FROM lix_state_history WHERE start_commit_id = lix_active_version_commit_id()",
+            "SELECT entity_pk FROM lix_state_history WHERE start_commit_id = lix_active_version_commit_id()",
         )
         .await;
 
@@ -98,7 +98,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT entity_id \
+                "SELECT entity_pk \
                  FROM lix_state_history \
                  WHERE lixcol_start_commit_id = lix_active_version_commit_id()",
                 &[],
@@ -174,7 +174,7 @@ simulation_test!(
                 "SELECT start_commit_id, depth, snapshot_content, change_id, observed_commit_id, commit_created_at \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{first_commit_id}' \
-                   AND entity_id = lix_json('[\"history-explicit\"]') \
+                   AND entity_pk = lix_json('[\"history-explicit\"]') \
                  ORDER BY depth"
             ),
         )
@@ -210,7 +210,7 @@ simulation_test!(
                 "SELECT depth, snapshot_content \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{second_commit_id}' \
-                   AND entity_id = lix_json('[\"history-explicit\"]') \
+                   AND entity_pk = lix_json('[\"history-explicit\"]') \
                  ORDER BY depth"
             ),
         )
@@ -236,7 +236,7 @@ simulation_test!(
                 "SELECT depth, snapshot_content \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{third_commit_id}' \
-                   AND entity_id = lix_json('[\"history-explicit\"]') \
+                   AND entity_pk = lix_json('[\"history-explicit\"]') \
                    AND depth = 0 \
                    AND snapshot_content IS NULL"
             ),
@@ -292,11 +292,11 @@ simulation_test!(
         let rows = select_history_rows(
             &session,
             &format!(
-                "SELECT entity_id, schema_key, file_id, depth \
+                "SELECT entity_pk, schema_key, file_id, depth \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{second_commit_id}' \
                    AND schema_key = 'lix_binary_blob_ref' \
-                   AND entity_id = lix_json('[\"history-file-a\"]') \
+                   AND entity_pk = lix_json('[\"history-file-a\"]') \
                    AND file_id = 'history-file-a' \
                    AND depth >= 0 \
                    AND depth <= 1 \
@@ -320,7 +320,7 @@ simulation_test!(
                     Value::Integer(1),
                 ],
             ],
-            "schema_key, entity_id, file_id, and depth range filters should route through the provider"
+            "schema_key, entity_pk, file_id, and depth range filters should route through the provider"
         );
 
         let parent_only_rows = select_history_rows(
@@ -330,7 +330,7 @@ simulation_test!(
                  FROM lix_state_history \
                  WHERE start_commit_id = '{second_commit_id}' \
                    AND schema_key = 'lix_binary_blob_ref' \
-                   AND entity_id = lix_json('[\"history-file-a\"]') \
+                   AND entity_pk = lix_json('[\"history-file-a\"]') \
                    AND file_id = 'history-file-a' \
                    AND depth > 0 \
                    AND depth < 2"
@@ -350,7 +350,7 @@ simulation_test!(
                  FROM lix_state_history \
                  WHERE start_commit_id = '{first_commit_id}' \
                    AND schema_key = 'lix_binary_blob_ref' \
-                   AND entity_id = lix_json('[\"history-file-a\"]') \
+                   AND entity_pk = lix_json('[\"history-file-a\"]') \
                    AND file_id = 'history-file-a'"
             ),
         )
@@ -416,7 +416,7 @@ simulation_test!(
                 "SELECT observed_commit_id, depth, snapshot_content \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{later_commit_id}' \
-                   AND entity_id = lix_json('[\"history-ancestor-tombstone\"]') \
+                   AND entity_pk = lix_json('[\"history-ancestor-tombstone\"]') \
                    AND snapshot_content IS NULL \
                  ORDER BY depth"
             ),
@@ -478,7 +478,7 @@ simulation_test!(
                 "SELECT start_commit_id, depth, snapshot_content \
                  FROM lix_state_history \
                  WHERE start_commit_id IN ('{first_commit_id}', '{second_commit_id}') \
-                   AND entity_id = lix_json('[\"history-multi-start\"]') \
+                   AND entity_pk = lix_json('[\"history-multi-start\"]') \
                    AND depth = 0 \
                  ORDER BY start_commit_id"
             ),
@@ -508,7 +508,7 @@ simulation_test!(
                  FROM lix_state_history \
                  WHERE (start_commit_id = '{first_commit_id}' \
                         OR start_commit_id = '{second_commit_id}') \
-                   AND entity_id = lix_json('[\"history-multi-start\"]') \
+                   AND entity_pk = lix_json('[\"history-multi-start\"]') \
                    AND depth = 0 \
                  ORDER BY start_commit_id"
             ),
@@ -560,11 +560,11 @@ simulation_test!(
         let narrowed_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT entity_id \
+                "SELECT entity_pk \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{head_commit_id}' \
-                   AND entity_id IN (lix_json('[\"history-and-a\"]'), lix_json('[\"history-and-b\"]')) \
-                   AND entity_id = lix_json('[\"history-and-a\"]')"
+                   AND entity_pk IN (lix_json('[\"history-and-a\"]'), lix_json('[\"history-and-b\"]')) \
+                   AND entity_pk = lix_json('[\"history-and-a\"]')"
             ),
         )
         .await;
@@ -577,11 +577,11 @@ simulation_test!(
         let contradictory_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT entity_id \
+                "SELECT entity_pk \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{head_commit_id}' \
-                   AND entity_id = lix_json('[\"history-and-a\"]') \
-                   AND entity_id = lix_json('[\"history-and-b\"]')"
+                   AND entity_pk = lix_json('[\"history-and-a\"]') \
+                   AND entity_pk = lix_json('[\"history-and-b\"]')"
             ),
         )
         .await;

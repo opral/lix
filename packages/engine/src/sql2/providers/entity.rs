@@ -24,7 +24,7 @@ use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::commit_graph::CommitGraphReader;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
@@ -283,7 +283,7 @@ impl TableProvider for EntityProvider {
         .await
         .map_err(lix_error_to_datafusion_error)?;
         apply_exact_version_id_filter(&mut request, exact_version_ids_from_filters(filters)?);
-        apply_exact_entity_id_filters(&mut request, &self.spec, filters)?;
+        apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
 
         Ok(Arc::new(EntityScanExec::new(
             Arc::clone(&self.spec),
@@ -320,35 +320,35 @@ impl TableProvider for EntityProvider {
     }
 }
 
-fn entity_ids_from_primary_key_filters(
+fn entity_pks_from_primary_key_filters(
     spec: &EntitySurfaceSpec,
     filters: &[Expr],
-) -> Result<Option<Vec<EntityIdentity>>> {
+) -> Result<Option<Vec<EntityPk>>> {
     let analyzer = EntityPrimaryKeyFilterAnalyzer::new(spec);
-    let mut entity_ids: Option<BTreeSet<EntityIdentity>> = None;
+    let mut entity_pks: Option<BTreeSet<EntityPk>> = None;
     for filter in filters {
         let Some(filter_ids) = analyzer.analyze(filter)? else {
             continue;
         };
-        entity_ids = Some(match entity_ids {
+        entity_pks = Some(match entity_pks {
             Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
             None => filter_ids,
         });
     }
 
-    Ok(entity_ids.map(|ids| ids.into_iter().collect()))
+    Ok(entity_pks.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_entity_id_filters(
+fn apply_exact_entity_pk_filters(
     request: &mut LiveStateScanRequest,
     spec: &EntitySurfaceSpec,
     filters: &[Expr],
 ) -> Result<()> {
-    if let Some(entity_ids) = entity_ids_from_primary_key_filters(spec, filters)? {
-        if entity_ids.is_empty() {
+    if let Some(entity_pks) = entity_pks_from_primary_key_filters(spec, filters)? {
+        if entity_pks.is_empty() {
             request.filter.rows = LiveStateRowFilter::None;
         }
-        request.filter.entity_ids = entity_ids;
+        request.filter.entity_pks = entity_pks;
     }
     Ok(())
 }
@@ -481,17 +481,17 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
             .is_ok_and(|constraint| constraint.is_some())
     }
 
-    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<EntityIdentity>>> {
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<EntityPk>>> {
         if self.primary_key_columns.is_empty() {
             return Ok(None);
         };
         let Some(constraint) = self.analyze_constraint(expr)? else {
             return Ok(None);
         };
-        Ok(constraint.into_entity_ids(&self.primary_key_columns))
+        Ok(constraint.into_entity_pks(&self.primary_key_columns))
     }
 
-    fn analyze_constraint(&self, expr: &Expr) -> Result<Option<EntityIdentityConstraint>> {
+    fn analyze_constraint(&self, expr: &Expr) -> Result<Option<EntityPkConstraint>> {
         match expr {
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
                 let Some(left) = self.analyze_constraint(&binary_expr.left)? else {
@@ -509,20 +509,20 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
                 let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
                     return Ok(None);
                 };
-                let Some(left_ids) = left.into_entity_ids(&self.primary_key_columns) else {
+                let Some(left_ids) = left.into_entity_pks(&self.primary_key_columns) else {
                     return Ok(None);
                 };
-                let Some(mut right_ids) = right.into_entity_ids(&self.primary_key_columns) else {
+                let Some(mut right_ids) = right.into_entity_pks(&self.primary_key_columns) else {
                     return Ok(None);
                 };
                 right_ids.extend(left_ids);
-                Ok(Some(EntityIdentityConstraint::Full(right_ids)))
+                Ok(Some(EntityPkConstraint::Full(right_ids)))
             }
-            Expr::BinaryExpr(binary_expr) => Ok(entity_identity_constraint_from_binary_filter(
+            Expr::BinaryExpr(binary_expr) => Ok(entity_pk_constraint_from_binary_filter(
                 binary_expr,
                 &self.primary_key_columns,
             )),
-            Expr::InList(in_list) => Ok(entity_identity_constraint_from_in_list_filter(
+            Expr::InList(in_list) => Ok(entity_pk_constraint_from_in_list_filter(
                 in_list,
                 &self.primary_key_columns,
             )),
@@ -532,12 +532,12 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EntityIdentityConstraint {
-    Full(BTreeSet<EntityIdentity>),
+enum EntityPkConstraint {
+    Full(BTreeSet<EntityPk>),
     Parts(BTreeMap<String, BTreeSet<String>>),
 }
 
-impl EntityIdentityConstraint {
+impl EntityPkConstraint {
     fn intersect(self, other: Self, primary_key_columns: &[&str]) -> Self {
         match (self, other) {
             (Self::Full(left), Self::Full(right)) => {
@@ -566,10 +566,10 @@ impl EntityIdentityConstraint {
         }
     }
 
-    fn into_entity_ids(self, primary_key_columns: &[&str]) -> Option<BTreeSet<EntityIdentity>> {
+    fn into_entity_pks(self, primary_key_columns: &[&str]) -> Option<BTreeSet<EntityPk>> {
         match self {
             Self::Full(ids) => Some(ids),
-            Self::Parts(parts) => entity_ids_from_primary_key_parts(primary_key_columns, parts),
+            Self::Parts(parts) => entity_pks_from_primary_key_parts(primary_key_columns, parts),
         }
     }
 }
@@ -588,20 +588,20 @@ fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-fn entity_identity_constraint_from_binary_filter(
+fn entity_pk_constraint_from_binary_filter(
     binary_expr: &BinaryExpr,
     primary_key_columns: &[&str],
-) -> Option<EntityIdentityConstraint> {
+) -> Option<EntityPkConstraint> {
     if binary_expr.op != Operator::Eq {
         return None;
     }
-    entity_identity_constraint_from_column_literal_filter(
+    entity_pk_constraint_from_column_literal_filter(
         &binary_expr.left,
         &binary_expr.right,
         primary_key_columns,
     )
     .or_else(|| {
-        entity_identity_constraint_from_column_literal_filter(
+        entity_pk_constraint_from_column_literal_filter(
             &binary_expr.right,
             &binary_expr.left,
             primary_key_columns,
@@ -609,10 +609,10 @@ fn entity_identity_constraint_from_binary_filter(
     })
 }
 
-fn entity_identity_constraint_from_in_list_filter(
+fn entity_pk_constraint_from_in_list_filter(
     in_list: &InList,
     primary_key_columns: &[&str],
-) -> Option<EntityIdentityConstraint> {
+) -> Option<EntityPkConstraint> {
     if in_list.negated {
         return None;
     }
@@ -628,13 +628,13 @@ fn entity_identity_constraint_from_in_list_filter(
         return None;
     }
     match column.name.as_str() {
-        "lixcol_entity_id" => values
+        "lixcol_entity_pk" => values
             .into_iter()
-            .map(|value| EntityIdentity::from_json_array_text(&value).ok())
+            .map(|value| EntityPk::from_json_array_text(&value).ok())
             .collect::<Option<BTreeSet<_>>>()
-            .map(EntityIdentityConstraint::Full),
+            .map(EntityPkConstraint::Full),
         column_name if primary_key_columns.contains(&column_name) => {
-            Some(EntityIdentityConstraint::Parts(BTreeMap::from([(
+            Some(EntityPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
                 values.into_iter().collect(),
             )])))
@@ -643,21 +643,21 @@ fn entity_identity_constraint_from_in_list_filter(
     }
 }
 
-fn entity_identity_constraint_from_column_literal_filter(
+fn entity_pk_constraint_from_column_literal_filter(
     column_expr: &Expr,
     literal_expr: &Expr,
     primary_key_columns: &[&str],
-) -> Option<EntityIdentityConstraint> {
+) -> Option<EntityPkConstraint> {
     let Expr::Column(column) = column_expr else {
         return None;
     };
     let value = string_expr_literal(literal_expr)?;
     match column.name.as_str() {
-        "lixcol_entity_id" => EntityIdentity::from_json_array_text(&value)
+        "lixcol_entity_pk" => EntityPk::from_json_array_text(&value)
             .ok()
-            .map(|identity| EntityIdentityConstraint::Full(BTreeSet::from([identity]))),
+            .map(|identity| EntityPkConstraint::Full(BTreeSet::from([identity]))),
         column_name if primary_key_columns.contains(&column_name) => {
-            Some(EntityIdentityConstraint::Parts(BTreeMap::from([(
+            Some(EntityPkConstraint::Parts(BTreeMap::from([(
                 column_name.to_string(),
                 BTreeSet::from([value]),
             )])))
@@ -666,10 +666,10 @@ fn entity_identity_constraint_from_column_literal_filter(
     }
 }
 
-fn entity_ids_from_primary_key_parts(
+fn entity_pks_from_primary_key_parts(
     primary_key_columns: &[&str],
     parts: BTreeMap<String, BTreeSet<String>>,
-) -> Option<BTreeSet<EntityIdentity>> {
+) -> Option<BTreeSet<EntityPk>> {
     if primary_key_columns
         .iter()
         .any(|column| !parts.contains_key(*column))
@@ -694,13 +694,13 @@ fn entity_ids_from_primary_key_parts(
     Some(
         identities
             .into_iter()
-            .map(|parts| EntityIdentity { parts })
+            .map(|parts| EntityPk { parts })
             .collect(),
     )
 }
 
 fn identity_matches_parts(
-    identity: &EntityIdentity,
+    identity: &EntityPk,
     primary_key_columns: &[&str],
     parts: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
@@ -968,10 +968,10 @@ fn entity_system_column_array(
     rows: &[MaterializedLiveStateRow],
 ) -> Result<ArrayRef> {
     Ok(match column_name {
-        "entity_id" => Arc::new(StringArray::from(
+        "entity_pk" => Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| {
-                    row.entity_id
+                    row.entity_pk
                         .as_json_array_text()
                         .map(Some)
                         .map_err(lix_error_to_datafusion_error)
@@ -1138,7 +1138,7 @@ mod tests {
 
     fn live_row() -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             schema_key: "project_message".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1204,7 +1204,7 @@ mod tests {
                 "body": { "type": "string" },
                 "rating": { "type": "number" },
                 "meta": { "type": "object" },
-                "lixcol_entity_id": { "type": "string" }
+                "lixcol_entity_pk": { "type": "string" }
             }
         }))
         .expect("schema should derive entity surface spec");
@@ -1227,7 +1227,7 @@ mod tests {
             spec.visible_column("meta").map(|column| column.column_type),
             Some(EntityColumnType::Json)
         );
-        assert!(spec.visible_column("lixcol_entity_id").is_none());
+        assert!(spec.visible_column("lixcol_entity_pk").is_none());
     }
 
     #[test]
@@ -1265,7 +1265,7 @@ mod tests {
 
         let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByVersion);
         assert!(schema.field_with_name("body").is_ok());
-        assert!(schema.field_with_name("lixcol_entity_id").is_ok());
+        assert!(schema.field_with_name("lixcol_entity_pk").is_ok());
         assert!(schema.field_with_name("lixcol_version_id").is_ok());
     }
 
@@ -1282,7 +1282,7 @@ mod tests {
 
         let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(schema.field_with_name("body").is_ok());
-        assert!(schema.field_with_name("lixcol_entity_id").is_ok());
+        assert!(schema.field_with_name("lixcol_entity_pk").is_ok());
         assert!(schema.field_with_name("lixcol_version_id").is_err());
     }
 
@@ -1309,8 +1309,8 @@ mod tests {
         );
         assert!(
             schema
-                .field_with_name("lixcol_entity_id")
-                .expect("entity id field")
+                .field_with_name("lixcol_entity_pk")
+                .expect("entity pk field")
                 .is_nullable(),
             "opaque identity projection should be nullable for normal primary-key inserts"
         );
@@ -1370,11 +1370,11 @@ mod tests {
         );
         assert_eq!(
             batch
-                .column_by_name("lixcol_entity_id")
-                .expect("entity id column")
+                .column_by_name("lixcol_entity_pk")
+                .expect("entity pk column")
                 .as_any()
                 .downcast_ref::<datafusion::arrow::array::StringArray>()
-                .expect("entity id is string")
+                .expect("entity pk is string")
                 .value(0),
             "[\"entity-1\"]"
         );
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_filters_route_entity_ids_for_string_primary_key() {
+    fn primary_key_filters_route_entity_pks_for_string_primary_key() {
         let spec = entity_insert_spec_with_primary_key();
         let filters = vec![
             eq_filter("id", "entity-a"),
@@ -1423,13 +1423,13 @@ mod tests {
             )),
         ];
 
-        let entity_ids = super::entity_ids_from_primary_key_filters(&spec, &filters)
+        let entity_pks = super::entity_pks_from_primary_key_filters(&spec, &filters)
             .expect("primary-key filters should analyze")
             .expect("primary-key filters should produce a constraint");
 
         assert_eq!(
-            entity_ids,
-            vec![crate::entity_identity::EntityIdentity::single("entity-a")]
+            entity_pks,
+            vec![crate::entity_pk::EntityPk::single("entity-a")]
         );
     }
 
@@ -1451,17 +1451,17 @@ mod tests {
         let disjunction_ids = analyzer
             .analyze(&disjunction)
             .expect("OR should analyze")
-            .expect("OR should produce an entity-id set");
+            .expect("OR should produce an entity-pk set");
         let contradiction_ids = analyzer
             .analyze(&contradiction)
             .expect("AND should analyze")
-            .expect("AND should produce an entity-id set");
+            .expect("AND should produce an entity-pk set");
 
         assert_eq!(
             disjunction_ids.into_iter().collect::<Vec<_>>(),
             vec![
-                crate::entity_identity::EntityIdentity::single("entity-a"),
-                crate::entity_identity::EntityIdentity::single("entity-b"),
+                crate::entity_pk::EntityPk::single("entity-a"),
+                crate::entity_pk::EntityPk::single("entity-b"),
             ]
         );
         assert!(contradiction_ids.is_empty());
@@ -1479,7 +1479,7 @@ mod tests {
             )),
         ];
 
-        assert!(super::entity_ids_from_primary_key_filters(&spec, &filters)
+        assert!(super::entity_pks_from_primary_key_filters(&spec, &filters)
             .expect("ignored filters should analyze")
             .unwrap_or_default()
             .is_empty());

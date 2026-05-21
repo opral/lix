@@ -1,7 +1,7 @@
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
 use crate::exports::lix::plugin::api::{DetectStateContext, EntityChange, File, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
-use crate::ROOT_ENTITY_ID;
+use crate::ROOT_ENTITY_PK;
 use markdown::mdast::{Node, Root};
 use markdown::{to_mdast, ParseOptions};
 use serde_json::Value;
@@ -68,7 +68,7 @@ pub(crate) fn detect_changes(
                 .get(id)
                 .expect("key came from before_by_id.keys() iterator");
             changes.push(EntityChange {
-                entity_id: id.clone(),
+                entity_pk: id.clone(),
                 schema_key: before_block.schema_key.clone(),
                 snapshot_content: None,
             });
@@ -85,7 +85,7 @@ pub(crate) fn detect_changes(
 
     if before_order != after_order {
         let snapshot_content = serde_json::to_string(&DocumentSnapshotContent {
-            id: ROOT_ENTITY_ID.to_string(),
+            id: ROOT_ENTITY_PK.to_string(),
             order: after_order,
         })
         .map_err(|error| {
@@ -95,7 +95,7 @@ pub(crate) fn detect_changes(
         })?;
 
         changes.push(EntityChange {
-            entity_id: ROOT_ENTITY_ID.to_string(),
+            entity_pk: ROOT_ENTITY_PK.to_string(),
             schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content),
         });
@@ -154,7 +154,7 @@ fn parse_state_context_projection(
             })?;
         let fingerprint = normalize_text_for_fingerprint(&snapshot.markdown);
         let block = ParsedBlock {
-            id: row.entity_id.clone(),
+            id: row.entity_pk.clone(),
             schema_key: BLOCK_SCHEMA_KEY.to_string(),
             node_type: snapshot.node_type,
             node_json: snapshot.node,
@@ -464,7 +464,7 @@ fn block_upsert_change(block: &ParsedBlock) -> Result<EntityChange, PluginError>
     })?;
 
     Ok(EntityChange {
-        entity_id: block.id.clone(),
+        entity_pk: block.id.clone(),
         schema_key: block.schema_key.clone(),
         snapshot_content: Some(snapshot_content),
     })

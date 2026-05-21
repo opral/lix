@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::{NullableKeyFilter, GLOBAL_VERSION_ID};
 
@@ -185,19 +185,15 @@ pub(crate) enum DomainFileScope {
 pub(crate) struct DomainRowIdentity {
     domain: Domain,
     schema_key: String,
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
 }
 
 impl DomainRowIdentity {
-    pub(crate) fn new(
-        domain: Domain,
-        schema_key: impl Into<String>,
-        entity_id: EntityIdentity,
-    ) -> Self {
+    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>, entity_pk: EntityPk) -> Self {
         Self {
             domain,
             schema_key: schema_key.into(),
-            entity_id,
+            entity_pk,
         }
     }
 
@@ -205,16 +201,16 @@ impl DomainRowIdentity {
         Self::new(
             Domain::for_live_row(row),
             row.schema_key.clone(),
-            row.entity_id.clone(),
+            row.entity_pk.clone(),
         )
     }
 
     pub(crate) fn in_domain(
         domain: Domain,
         schema_key: impl Into<String>,
-        entity_id: EntityIdentity,
+        entity_pk: EntityPk,
     ) -> Self {
-        Self::new(domain, schema_key, entity_id)
+        Self::new(domain, schema_key, entity_pk)
     }
 
     #[cfg(test)]
@@ -223,12 +219,12 @@ impl DomainRowIdentity {
         untracked: bool,
         file_id: Option<String>,
         schema_key: impl Into<String>,
-        entity_id: EntityIdentity,
+        entity_pk: EntityPk,
     ) -> Self {
         Self::new(
             Domain::exact_file(version_id, untracked, file_id),
             schema_key,
-            entity_id,
+            entity_pk,
         )
     }
 
@@ -236,7 +232,7 @@ impl DomainRowIdentity {
         Self {
             domain,
             schema_key: self.schema_key.clone(),
-            entity_id: self.entity_id.clone(),
+            entity_pk: self.entity_pk.clone(),
         }
     }
 
@@ -252,21 +248,21 @@ impl DomainRowIdentity {
         self.schema_key.clone()
     }
 
-    pub(crate) fn entity_id(&self) -> &EntityIdentity {
-        &self.entity_id
+    pub(crate) fn entity_pk(&self) -> &EntityPk {
+        &self.entity_pk
     }
 
-    pub(crate) fn entity_id_owned(&self) -> EntityIdentity {
-        self.entity_id.clone()
+    pub(crate) fn entity_pk_owned(&self) -> EntityPk {
+        self.entity_pk.clone()
     }
 
     pub(crate) fn matches_parts(
         &self,
         domain: &Domain,
         schema_key: &str,
-        entity_id: &EntityIdentity,
+        entity_pk: &EntityPk,
     ) -> bool {
-        &self.domain == domain && self.schema_key == schema_key && &self.entity_id == entity_id
+        &self.domain == domain && self.schema_key == schema_key && &self.entity_pk == entity_pk
     }
 
     pub(crate) fn reachable_target_identities(&self) -> Vec<Self> {

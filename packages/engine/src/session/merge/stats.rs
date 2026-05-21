@@ -36,7 +36,7 @@ pub(crate) fn stats_from_plan(
                 format!(
                     "merge analysis could not find source diff entry for source schema '{}' entity '{}'",
                     identity.schema_key,
-                    identity.entity_id.as_json_array_text()?
+                    identity.entity_pk.as_json_array_text()?
                 ),
             ));
         };

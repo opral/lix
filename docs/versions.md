@@ -87,7 +87,7 @@ Each conflict has the shape:
 {
   kind: "sameEntityChanged",
   schemaKey: "acme_section",
-  entityId: "s1",
+  entityPk: ["s1"],
   fileId: null,
   target: { kind: "added" | "modified" | "removed", beforeChangeId, afterChangeId },
   source: { kind: "added" | "modified" | "removed", beforeChangeId, afterChangeId },

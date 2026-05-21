@@ -23,7 +23,7 @@ await lix.execute(
 );
 
 const changes = await lix.execute(
-  "SELECT created_at, schema_key, entity_id FROM lix_change",
+  "SELECT created_at, schema_key, entity_pk FROM lix_change",
 );
 ```
 
@@ -62,11 +62,11 @@ Lix stores changes as data, not snapshots. One immutable journal across every en
 
 ```sql
 -- What does this version see right now?
-SELECT entity_id, schema_key, snapshot_content
+SELECT entity_pk, schema_key, snapshot_content
 FROM lix_state_history
 WHERE start_commit_id = lix_active_version_commit_id()
   AND depth = 0
-ORDER BY schema_key, entity_id;
+ORDER BY schema_key, entity_pk;
 ```
 
 Whether the entity is a spreadsheet cell, a document clause, a CAD part, or an application row, the surface is the same. Diffs, undo, audit, blame, and attribution are all SQL. See [Change History](./history.md).

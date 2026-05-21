@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::common::top_level_property_name;
-use crate::entity_identity::canonical_json_text;
+use crate::entity_pk::canonical_json_text;
 use crate::LixError;
 
 const DOC_ONLY_SCHEMA_FIELDS: &[&str] = &["$comment", "deprecated", "description", "title"];
@@ -23,7 +23,7 @@ const CONSTRAINT_FIELDS: &[&str] = &[
 /// 0.6; recursive schema evolution is a later, explicit feature.
 ///
 /// Primary-key column order is semantic because it defines composite
-/// `entity_id` tuple order, so primary keys are never normalized. Relational
+/// `entity_pk` tuple order, so primary keys are never normalized. Relational
 /// constraints are frozen even when a particular addition could be
 /// retroactively safe, such as a new FK on a new optional property. That is a
 /// deliberate MVP rule we may relax later.
@@ -129,7 +129,7 @@ fn validate_constraints_unchanged(
     schema_key: &str,
 ) -> Result<(), LixError> {
     // Primary-key column order is semantic because it defines composite
-    // entity_id tuple order, so it is compared directly and never normalized.
+    // entity_pk tuple order, so it is compared directly and never normalized.
     if previous.get("x-lix-primary-key") != next.get("x-lix-primary-key") {
         return schema_amendment_error(format!(
             "schema '{schema_key}' cannot amend constraint field 'x-lix-primary-key'"
@@ -344,14 +344,14 @@ mod tests {
                 }
             ],
             "x-lix-state-foreign-keys": [
-                ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+                ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
             ],
             "properties": {
                 "id": { "type": "string", "description": "Stable id" },
                 "isbn": { "type": "string" },
                 "title": { "type": "string", "title": "Title" },
                 "author_id": { "type": "string" },
-                "target_entity_id": {
+                "target_entity_pk": {
                     "type": "array",
                     "items": { "type": "string" }
                 },
@@ -363,7 +363,7 @@ mod tests {
                 "isbn",
                 "title",
                 "author_id",
-                "target_entity_id",
+                "target_entity_pk",
                 "target_schema_key",
                 "target_file_id"
             ],
@@ -442,8 +442,8 @@ mod tests {
             }
         ]);
         previous["x-lix-state-foreign-keys"] = json!([
-            ["/target_entity_id", "/target_schema_key", "/target_file_id"],
-            ["/other_entity_id", "/other_schema_key", "/other_file_id"]
+            ["/target_entity_pk", "/target_schema_key", "/target_file_id"],
+            ["/other_entity_pk", "/other_schema_key", "/other_file_id"]
         ]);
         let mut next = previous.clone();
         next["x-lix-unique"] = json!([["/title"], ["/isbn"]]);
@@ -464,8 +464,8 @@ mod tests {
             }
         ]);
         next["x-lix-state-foreign-keys"] = json!([
-            ["/other_entity_id", "/other_schema_key", "/other_file_id"],
-            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+            ["/other_entity_pk", "/other_schema_key", "/other_file_id"],
+            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
         ]);
 
         validate_schema_amendment(&previous, &next)
@@ -480,7 +480,7 @@ mod tests {
             "id",
             "isbn",
             "author_id",
-            "target_entity_id",
+            "target_entity_pk",
             "target_schema_key",
             "target_file_id"
         ]);

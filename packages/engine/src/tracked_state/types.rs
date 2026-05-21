@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::{LixError, NullableKeyFilter};
 
@@ -33,12 +33,12 @@ impl TrackedStateRootId {
     }
 }
 
-/// Root-independent tracked entity identity.
+/// Root-independent tracked entity primary key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateKey {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
 }
 
 /// Zero-copy view of primary tracked-state key.
@@ -46,7 +46,7 @@ pub(crate) struct TrackedStateKey {
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) entity_pk: &'a EntityPk,
 }
 
 /// Zero-copy tracked-state commit-root delta prepared from changelog facts.
@@ -54,7 +54,7 @@ pub(crate) struct TrackedStateKeyRef<'a> {
 pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) entity_pk: &'a EntityPk,
     pub(crate) change_id: &'a str,
     pub(crate) commit_id: &'a str,
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
@@ -115,7 +115,7 @@ pub(crate) struct TrackedStateCommitRootParent {
 /// responsible for combining both sources.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
@@ -133,7 +133,7 @@ pub(crate) struct TrackedStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
@@ -176,7 +176,7 @@ impl TrackedStateMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
@@ -186,7 +186,7 @@ impl Default for TrackedStateTreeScanRequest {
     fn default() -> Self {
         Self {
             schema_keys: Vec::new(),
-            entity_ids: Vec::new(),
+            entity_pks: Vec::new(),
             file_ids: Vec::new(),
             include_tombstones: true,
             limit: None,
@@ -206,7 +206,7 @@ impl TrackedStateTreeScanRequest {
         if !self.schema_keys.is_empty() && !self.schema_keys.contains(&key.schema_key) {
             return false;
         }
-        if !self.entity_ids.is_empty() && !self.entity_ids.contains(&key.entity_id) {
+        if !self.entity_pks.is_empty() && !self.entity_pks.contains(&key.entity_pk) {
             return false;
         }
         if !self.file_ids.is_empty()

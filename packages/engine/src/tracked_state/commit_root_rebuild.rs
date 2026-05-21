@@ -6,7 +6,7 @@ use crate::changelog::{
     ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitChangeRef, CommitLoadEntry,
     CommitLoadRequest, CommitProjection, CommitRecord,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::context::{
@@ -25,7 +25,7 @@ use crate::LixError;
 pub(crate) struct CommitRootRebuildDelta {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
     pub(crate) snapshot_ref: Option<JsonRef>,
@@ -270,7 +270,7 @@ where
         .map(|delta| TrackedStateDeltaRef {
             schema_key: &delta.schema_key,
             file_id: delta.file_id.as_deref(),
-            entity_id: &delta.entity_id,
+            entity_pk: &delta.entity_pk,
             change_id: &delta.change_id,
             commit_id: &delta.commit_id,
             snapshot_ref: delta.snapshot_ref.as_ref(),
@@ -296,7 +296,7 @@ fn rebuild_delta_from_commit_record(
     Ok(CommitRootRebuildDelta {
         schema_key: "lix_commit".to_string(),
         file_id: None,
-        entity_id: EntityIdentity::single(&commit.commit_id),
+        entity_pk: EntityPk::single(&commit.commit_id),
         change_id: commit.change_id.clone(),
         commit_id: commit.commit_id.clone(),
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
@@ -334,7 +334,7 @@ fn rebuild_delta_from_change_ref(
     }
     if change.schema_key != change_ref.schema_key
         || change.file_id != change_ref.file_id
-        || change.entity_id != change_ref.entity_id
+        || change.entity_pk != change_ref.entity_pk
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -347,7 +347,7 @@ fn rebuild_delta_from_change_ref(
     Ok(CommitRootRebuildDelta {
         schema_key: change.schema_key,
         file_id: change.file_id,
-        entity_id: change.entity_id,
+        entity_pk: change.entity_pk,
         change_id: change.change_id,
         commit_id: commit_id.to_string(),
         snapshot_ref: change.snapshot_ref,

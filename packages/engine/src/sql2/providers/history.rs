@@ -279,7 +279,7 @@ where
 
 pub(super) fn lix_state_history_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        json_field("entity_id", false),
+        json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
@@ -309,7 +309,7 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
 
 #[derive(Debug, Clone)]
 struct StateHistorySqlRow {
-    entity_id: String,
+    entity_pk: String,
     schema_key: String,
     file_id: Option<String>,
     snapshot_content: Option<String>,
@@ -330,7 +330,7 @@ fn state_history_record_batch(
         .iter()
         .map(|field| {
             Ok(match field.name().as_str() {
-                "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+                "entity_pk" => string_array(rows.iter().map(|row| Some(row.entity_pk.as_str()))),
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
                 "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
                 "snapshot_content" => {
@@ -392,7 +392,7 @@ where
         .into_iter()
         .map(|entry| -> Result<StateHistorySqlRow, LixError> {
             Ok(StateHistorySqlRow {
-                entity_id: entry.change.entity_id.as_json_array_text()?,
+                entity_pk: entry.change.entity_pk.as_json_array_text()?,
                 schema_key: entry.change.schema_key,
                 file_id: entry.change.file_id,
                 snapshot_content: entry.change.snapshot_content,
@@ -407,8 +407,8 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     rows.sort_by(|left, right| {
-        left.entity_id
-            .cmp(&right.entity_id)
+        left.entity_pk
+            .cmp(&right.entity_pk)
             .then(left.file_id.cmp(&right.file_id))
             .then(left.schema_key.cmp(&right.schema_key))
             .then(left.depth.cmp(&right.depth))

@@ -4,7 +4,7 @@ use crate::changelog::{
     ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitLoadEntry,
     CommitLoadRequest, CommitProjection, CommitRecord,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{
@@ -29,7 +29,7 @@ use crate::{LixError, NullableKeyFilter};
 struct TrackedStateIdentity {
     schema_key: String,
     file_id: Option<String>,
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
 }
 
 /// Factory for tracked-state readers, root writers, and commit-root rebuilders.
@@ -303,7 +303,7 @@ where
         let key = TrackedStateKey {
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
         };
         let root_metadata = self
             .load_cached_commit_root_metadata(root_commit_id, cache)
@@ -471,7 +471,7 @@ where
             TrackedStateIdentity {
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
-                entity_id: EntityIdentity::single(&record.commit_id),
+                entity_pk: EntityPk::single(&record.commit_id),
             },
             record.change_id,
         );
@@ -480,7 +480,7 @@ where
                 TrackedStateIdentity {
                     schema_key: change_ref.schema_key,
                     file_id: change_ref.file_id,
-                    entity_id: change_ref.entity_id,
+                    entity_pk: change_ref.entity_pk,
                 },
                 change_ref.change_id,
             );
@@ -893,7 +893,7 @@ where
                 .map(|delta| TrackedStateKey {
                     schema_key: delta.schema_key.to_string(),
                     file_id: delta.file_id.map(str::to_string),
-                    entity_id: delta.entity_id.clone(),
+                    entity_pk: delta.entity_pk.clone(),
                 })
                 .collect::<Vec<_>>();
             self.tree.get_many(self.store, base_root, &keys).await?
@@ -909,7 +909,7 @@ where
             let key = TrackedStateKeyRef {
                 schema_key: delta.schema_key,
                 file_id: delta.file_id,
-                entity_id: delta.entity_id,
+                entity_pk: delta.entity_pk,
             };
             let value = crate::tracked_state::types::TrackedStateIndexValueRef {
                 change_id: delta.change_id,
@@ -1016,7 +1016,7 @@ fn tree_scan_request_from_tracked(
 ) -> TrackedStateTreeScanRequest {
     TrackedStateTreeScanRequest {
         schema_keys: request.filter.schema_keys.clone(),
-        entity_ids: request.filter.entity_ids.clone(),
+        entity_pks: request.filter.entity_pks.clone(),
         file_ids: request.filter.file_ids.clone(),
         include_tombstones: request.filter.include_tombstones,
         // User limits belong above delta overlay and tombstone visibility.
@@ -1038,7 +1038,7 @@ fn validate_diff_row_against_changelog(
     };
     if change.schema_key != row.schema_key
         || change.file_id != row.file_id
-        || change.entity_id != row.entity_id
+        || change.entity_pk != row.entity_pk
     {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{}' does not match changelog change identity",
@@ -1072,7 +1072,7 @@ fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecor
         format_version: 1,
         change_id: commit.change_id.clone(),
         schema_key: "lix_commit".to_string(),
-        entity_id: EntityIdentity::single(&commit.commit_id),
+        entity_pk: EntityPk::single(&commit.commit_id),
         file_id: None,
         snapshot_ref: Some(crate::json_store::JsonRef::for_content(
             snapshot_content.as_bytes(),
@@ -1100,7 +1100,7 @@ fn tracked_state_identity_from_diff_row(
     Ok(TrackedStateIdentity {
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
     })
 }
 
@@ -1108,7 +1108,7 @@ fn tracked_state_identity_from_key(key: &TrackedStateKey) -> TrackedStateIdentit
     TrackedStateIdentity {
         schema_key: key.schema_key.clone(),
         file_id: key.file_id.clone(),
-        entity_id: key.entity_id.clone(),
+        entity_pk: key.entity_pk.clone(),
     }
 }
 
@@ -1119,7 +1119,7 @@ fn tracked_state_identity_matches_tree_request(
     if !request.schema_keys.is_empty() && !request.schema_keys.contains(&identity.schema_key) {
         return false;
     }
-    if !request.entity_ids.is_empty() && !request.entity_ids.contains(&identity.entity_id) {
+    if !request.entity_pks.is_empty() && !request.entity_pks.contains(&identity.entity_pk) {
         return false;
     }
     nullable_key_filter_allows(&request.file_ids, identity.file_id.as_deref())
@@ -1954,9 +1954,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_id
+                .entity_pk
                 .as_single_string_owned()
-                .expect("entity id"),
+                .expect("entity pk"),
             "entity-a"
         );
         assert_eq!(rows[0].file_id.as_deref(), Some("file-a.json"));
@@ -1993,7 +1993,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_id".to_string()],
+                        columns: vec!["entity_pk".to_string()],
                     },
                     ..Default::default()
                 },
@@ -2056,9 +2056,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_id
+                .entity_pk
                 .as_single_string_owned()
-                .expect("entity id"),
+                .expect("entity pk"),
             "entity-a"
         );
     }
@@ -2112,12 +2112,12 @@ mod tests {
             .await
             .expect("mixed scan should use primary tree");
 
-        let mut entity_ids = rows
+        let mut entity_pks = rows
             .iter()
-            .map(|row| row.entity_id.as_single_string_owned().expect("entity id"))
+            .map(|row| row.entity_pk.as_single_string_owned().expect("entity pk"))
             .collect::<Vec<_>>();
-        entity_ids.sort();
-        assert_eq!(entity_ids, vec!["entity-file", "entity-null"]);
+        entity_pks.sort();
+        assert_eq!(entity_pks, vec!["entity-file", "entity-null"]);
     }
 
     #[tokio::test]
@@ -2146,7 +2146,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_id".to_string()],
+                        columns: vec!["entity_pk".to_string()],
                     },
                     ..Default::default()
                 },
@@ -2157,9 +2157,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_id
+                .entity_pk
                 .as_single_string_owned()
-                .expect("entity id"),
+                .expect("entity pk"),
             "entity-live"
         );
     }
@@ -2247,7 +2247,7 @@ mod tests {
         assert_eq!(
             rows.iter()
                 .map(|row| (
-                    row.entity_id.as_single_string_owned().expect("entity id"),
+                    row.entity_pk.as_single_string_owned().expect("entity pk"),
                     row.snapshot_content.clone()
                 ))
                 .collect::<Vec<_>>(),
@@ -2304,9 +2304,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_id
+                .entity_pk
                 .as_single_string_owned()
-                .expect("entity id"),
+                .expect("entity pk"),
             "entity-b"
         );
     }
@@ -2337,7 +2337,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_id".to_string()],
+                        columns: vec!["entity_pk".to_string()],
                     },
                     limit: Some(1),
                 },
@@ -2348,9 +2348,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0]
-                .entity_id
+                .entity_pk
                 .as_single_string_owned()
-                .expect("entity id"),
+                .expect("entity pk"),
             "entity-b"
         );
     }
@@ -2381,7 +2381,7 @@ mod tests {
                 "commit-1",
                 &[TrackedStateKey {
                     schema_key: row.schema_key.clone(),
-                    entity_id: row.entity_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
                     file_id: None,
                 }],
             )
@@ -2426,7 +2426,7 @@ mod tests {
                 "commit-1",
                 &[TrackedStateKey {
                     schema_key: row.schema_key.clone(),
-                    entity_id: row.entity_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
                     file_id: None,
                 }],
             )
@@ -2473,7 +2473,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: child.schema_key.clone(),
             file_id: child.file_id.clone(),
-            entity_id: child.entity_id.clone(),
+            entity_pk: child.entity_pk.clone(),
         };
         let loaded = tracked_state
             .reader(
@@ -2561,7 +2561,7 @@ mod tests {
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
-                        columns: vec!["entity_id".to_string()],
+                        columns: vec!["entity_pk".to_string()],
                     },
                     ..Default::default()
                 },
@@ -2610,7 +2610,7 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity()
-                    .entity_id
+                    .entity_pk
                     .as_single_string_owned()
                     .expect("identity")
             })
@@ -2623,7 +2623,7 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity
-                    .entity_id
+                    .entity_pk
                     .as_single_string_owned()
                     .expect("identity")
             })
@@ -2706,7 +2706,7 @@ mod tests {
                     let key = TrackedStateKey {
                         schema_key: row.schema_key.clone(),
                         file_id: row.file_id.clone(),
-                        entity_id: row.entity_id.clone(),
+                        entity_pk: row.entity_pk.clone(),
                     };
                     let value = TrackedStateIndexValue {
                         change_id: row.change_id.clone(),
@@ -2769,24 +2769,24 @@ mod tests {
         }
     }
 
-    fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
-        let mut row = row(entity_id, change_id, commit_id);
+    fn tombstone(entity_pk: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
+        let mut row = row(entity_pk, change_id, commit_id);
         row.snapshot_content = None;
         row
     }
 
-    fn row(entity_id: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
-        row_with_value(entity_id, change_id, commit_id, "value")
+    fn row(entity_pk: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
+        row_with_value(entity_pk, change_id, commit_id, "value")
     }
 
     fn row_with_value(
-        entity_id: &str,
+        entity_pk: &str,
         change_id: &str,
         commit_id: &str,
         value: &str,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),

@@ -234,7 +234,7 @@ fn insert_row_preferring_untracked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_identity::EntityIdentity;
+    use crate::entity_pk::EntityPk;
     use crate::live_state::LiveStateRowRequest;
     use async_trait::async_trait;
 
@@ -600,13 +600,13 @@ mod tests {
 
     fn row_at(
         version_id: &str,
-        entity_id: &str,
+        entity_pk: &str,
         value: &str,
         global: bool,
         change_id: Option<&str>,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: EntityIdentity::single(entity_id),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: "schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
@@ -624,14 +624,14 @@ mod tests {
 
     fn tombstone_at(
         version_id: &str,
-        entity_id: &str,
+        entity_pk: &str,
         global: bool,
         change_id: Option<&str>,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             snapshot_content: None,
             deleted: true,
-            ..row_at(version_id, entity_id, "ignored", global, change_id)
+            ..row_at(version_id, entity_pk, "ignored", global, change_id)
         }
     }
 
