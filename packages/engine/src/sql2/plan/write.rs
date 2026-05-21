@@ -51,7 +51,10 @@ fn collect_predicate_filters(
             Ok(())
         }
         BoundPredicate::Or(_) => Ok(()),
-        BoundPredicate::Eq(_, _) | BoundPredicate::In { .. } => Ok(()),
+        BoundPredicate::Eq(_, _)
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_)
+        | BoundPredicate::In { .. } => Ok(()),
     }
 }
 

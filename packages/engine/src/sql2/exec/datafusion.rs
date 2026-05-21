@@ -706,6 +706,12 @@ fn datafusion_filters_from_predicate(
                 )?),
             ))])
         }
+        BoundPredicate::IsNull(expr) => Ok(vec![Expr::IsNull(Box::new(
+            datafusion_filter_expr_from_bound_expr(session, expr, params, false, false)?,
+        ))]),
+        BoundPredicate::IsNotNull(expr) => Ok(vec![Expr::IsNotNull(Box::new(
+            datafusion_filter_expr_from_bound_expr(session, expr, params, false, false)?,
+        ))]),
         BoundPredicate::In { expr, values } => {
             let expr_is_json = bound_expr_is_json(expr, schema);
             let values_include_json = values.iter().any(|value| bound_expr_is_json(value, schema));

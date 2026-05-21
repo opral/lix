@@ -379,6 +379,9 @@ fn resolved_predicate_version_selector(
                 .transpose()
                 .map(|selector| selector.unwrap_or(ResolvedVersionSelector::Missing))
         }
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
+            Ok(ResolvedVersionSelector::Missing)
+        }
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
                 return Ok(ResolvedVersionSelector::Missing);
@@ -531,6 +534,9 @@ fn resolved_predicate_global_selector(
             .map(|expr| global_selector_value(expr, params))
             .transpose()
             .map(|selector| selector.unwrap_or(ResolvedGlobalSelector::Missing)),
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
+            Ok(ResolvedGlobalSelector::Missing)
+        }
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
                 return Ok(ResolvedGlobalSelector::Missing);
