@@ -260,7 +260,7 @@ SQL is the query interface on top. Agents can ask what changed without rereading
 
 ## Roadmap
 
-**v0.6: ready to embed (current)**
+**v0.6: Lix SDK (current)**
 
 - [x] Importable SDK
 - [x] ACID transactions across state, blobs, and history
@@ -269,7 +269,7 @@ SQL is the query interface on top. Agents can ask what changed without rereading
 - [x] Stable physical storage layout
 - [x] Pluggable backend interface
 
-**v0.7: CLI**
+**v0.7: Lix CLI**
 
 - [ ] CLI for creating, inspecting, and scripting Lix repositories
 
