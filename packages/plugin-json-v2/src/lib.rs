@@ -104,7 +104,7 @@ impl Guest for JsonPlugin {
     }
 
     fn apply_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-        let mut seen_entity_ids = BTreeSet::new();
+        let mut seen_entity_pks = BTreeSet::new();
         let mut upserts = Vec::new();
         let mut tombstones = Vec::new();
 
@@ -113,10 +113,10 @@ impl Guest for JsonPlugin {
                 continue;
             }
 
-            let pointer = change.entity_id;
-            if !seen_entity_ids.insert(pointer.clone()) {
+            let pointer = change.entity_pk;
+            if !seen_entity_pks.insert(pointer.clone()) {
                 return Err(PluginError::InvalidInput(format!(
-                    "duplicate entity_id '{pointer}' for schema_key '{SCHEMA_KEY}'"
+                    "duplicate entity_pk '{pointer}' for schema_key '{SCHEMA_KEY}'"
                 )));
             }
 
@@ -151,7 +151,7 @@ impl Guest for JsonPlugin {
             || tombstones.iter().any(|entry| !entry.tokens.is_empty());
         if has_non_root_rows && !has_root_upsert {
             return Err(PluginError::InvalidInput(
-                "non-root projection rows require a root row with entity_id ''".to_string(),
+                "non-root projection rows require a root row with entity_pk ''".to_string(),
             ));
         }
 
@@ -183,13 +183,13 @@ impl Guest for JsonPlugin {
             for token in raw_tokens {
                 if tombstone_pointers.contains(&ancestor) {
                     return Err(PluginError::InvalidInput(format!(
-                        "entity_id '{}' conflicts with tombstoned ancestor '{ancestor}'",
+                        "entity_pk '{}' conflicts with tombstoned ancestor '{ancestor}'",
                         upsert.pointer
                     )));
                 }
                 if !upsert_pointers.contains(&ancestor) {
                     return Err(PluginError::InvalidInput(format!(
-                        "missing ancestor container row '{ancestor}' for entity_id '{}'",
+                        "missing ancestor container row '{ancestor}' for entity_pk '{}'",
                         upsert.pointer
                     )));
                 }
@@ -281,7 +281,7 @@ fn parse_snapshot_value(raw: &str, pointer: &str) -> Result<Value, PluginError> 
     if let Ok(parsed) = serde_json::from_str::<SnapshotContentWithPath>(raw) {
         if parsed.path != pointer {
             return Err(PluginError::InvalidInput(format!(
-                "snapshot path '{}' does not match entity_id '{}'",
+                "snapshot path '{}' does not match entity_pk '{}'",
                 parsed.path, pointer
             )));
         }
@@ -316,12 +316,12 @@ fn parse_snapshot_value_slow(raw: &str, pointer: &str) -> Result<Value, PluginEr
         (Some(path), Some(value)) => {
             let Some(path_string) = path.as_str() else {
                 return Err(PluginError::InvalidInput(format!(
-                    "snapshot path for entity_id '{pointer}' must be a string"
+                    "snapshot path for entity_pk '{pointer}' must be a string"
                 )));
             };
             if path_string != pointer {
                 return Err(PluginError::InvalidInput(format!(
-                    "snapshot path '{path_string}' does not match entity_id '{pointer}'"
+                    "snapshot path '{path_string}' does not match entity_pk '{pointer}'"
                 )));
             }
             Ok(value)
@@ -512,7 +512,7 @@ fn collect_leaves(
 
 fn push_deletion(changes: &mut Vec<EntityChange>, pointer: String) {
     changes.push(EntityChange {
-        entity_id: pointer,
+        entity_pk: pointer,
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: None,
     });
@@ -534,7 +534,7 @@ fn push_upsert(
     })?;
 
     changes.push(EntityChange {
-        entity_id: pointer,
+        entity_pk: pointer,
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
     });
@@ -605,7 +605,7 @@ fn pointer_tokens(pointer: &str) -> Result<Vec<String>, PluginError> {
 
     if !pointer.starts_with('/') {
         return Err(PluginError::InvalidInput(format!(
-            "entity_id '{pointer}' must be a JSON pointer"
+            "entity_pk '{pointer}' must be a JSON pointer"
         )));
     }
 
@@ -625,7 +625,7 @@ fn validate_child_token_for_ancestor(
     ancestor_kind: ProjectionNodeKind,
     child_token: &str,
     ancestor_pointer: &str,
-    entity_id: &str,
+    entity_pk: &str,
 ) -> Result<ValidatedChildToken, PluginError> {
     match ancestor_kind {
         ProjectionNodeKind::Object => Ok(ValidatedChildToken {
@@ -633,14 +633,14 @@ fn validate_child_token_for_ancestor(
             array_index: None,
         }),
         ProjectionNodeKind::Array => {
-            let index = parse_projection_array_index(child_token, ancestor_pointer, entity_id)?;
+            let index = parse_projection_array_index(child_token, ancestor_pointer, entity_pk)?;
             Ok(ValidatedChildToken {
                 canonical_token: index.to_string(),
                 array_index: Some(index),
             })
         }
         ProjectionNodeKind::Scalar => Err(PluginError::InvalidInput(format!(
-            "ancestor '{ancestor_pointer}' for entity_id '{entity_id}' is not a container"
+            "ancestor '{ancestor_pointer}' for entity_pk '{entity_pk}' is not a container"
         ))),
     }
 }
@@ -667,11 +667,11 @@ fn validate_sparse_array_children(
 fn parse_projection_array_index(
     token: &str,
     ancestor_pointer: &str,
-    entity_id: &str,
+    entity_pk: &str,
 ) -> Result<usize, PluginError> {
     if token == "-" {
         return Err(PluginError::InvalidInput(format!(
-            "entity_id '{entity_id}' uses non-canonical '-' array token under '{ancestor_pointer}'"
+            "entity_pk '{entity_pk}' uses non-canonical '-' array token under '{ancestor_pointer}'"
         )));
     }
     if token.is_empty() || !token.chars().all(|ch| ch.is_ascii_digit()) {
@@ -681,7 +681,7 @@ fn parse_projection_array_index(
     }
     if token.len() > 1 && token.starts_with('0') {
         return Err(PluginError::InvalidInput(format!(
-            "entity_id '{entity_id}' uses non-canonical array index token '{token}' under '{ancestor_pointer}'"
+            "entity_pk '{entity_pk}' uses non-canonical array index token '{token}' under '{ancestor_pointer}'"
         )));
     }
 
@@ -726,7 +726,7 @@ fn build_document_from_projection(
 
     let root_index = index_by_pointer.get("").copied().ok_or_else(|| {
         PluginError::InvalidInput(
-            "non-root projection rows require a root row with entity_id ''".to_string(),
+            "non-root projection rows require a root row with entity_pk ''".to_string(),
         )
     })?;
 
@@ -741,7 +741,7 @@ fn build_document_from_projection(
             .copied()
             .ok_or_else(|| {
                 PluginError::InvalidInput(format!(
-                    "missing ancestor container row '{parent_pointer}' for entity_id '{pointer}'"
+                    "missing ancestor container row '{parent_pointer}' for entity_pk '{pointer}'"
                 ))
             })?;
         let terminal_token = nodes[index].terminal_token.take().ok_or_else(|| {

@@ -1,11 +1,10 @@
-use crate::changelog::{ChangeLocator, ChangeLocatorRef, ChangeRef};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 
-/// Content-addressed root id for one tracked-state projection tree.
+/// Content-addressed root id for one tracked-state commit-root tree.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateRootId([u8; TRACKED_STATE_HASH_BYTES]);
 
@@ -34,12 +33,12 @@ impl TrackedStateRootId {
     }
 }
 
-/// Root-independent tracked entity identity.
+/// Root-independent tracked entity primary key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateKey {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
 }
 
 /// Zero-copy view of primary tracked-state key.
@@ -47,22 +46,29 @@ pub(crate) struct TrackedStateKey {
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) entity_pk: &'a EntityPk,
 }
 
-/// Zero-copy tracked-state projection delta prepared from changelog facts.
+/// Zero-copy tracked-state commit-root delta prepared from changelog facts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateDeltaRef<'a> {
-    pub(crate) change: ChangeRef<'a>,
-    pub(crate) locator: ChangeLocatorRef<'a>,
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) change_id: &'a str,
+    pub(crate) commit_id: &'a str,
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) deleted: bool,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
 }
 
-/// Projection value stored in tracked-state trees.
+/// Value stored in tracked-state commit-root trees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateIndexValue {
-    pub(crate) change_locator: ChangeLocator,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
     pub(crate) deleted: bool,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
@@ -70,10 +76,11 @@ pub(crate) struct TrackedStateIndexValue {
     pub(crate) updated_at: String,
 }
 
-/// Zero-copy view of a tracked-state projection value.
+/// Zero-copy view of a tracked-state commit-root value.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateIndexValueRef<'a> {
-    pub(crate) change_locator: ChangeLocatorRef<'a>,
+    pub(crate) change_id: &'a str,
+    pub(crate) commit_id: &'a str,
     pub(crate) deleted: bool,
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     pub(crate) metadata_ref: Option<&'a JsonRef>,
@@ -81,12 +88,12 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) updated_at: &'a str,
 }
 
-/// Durable metadata for the tracked-state projection at one commit.
+/// Durable tracked-state root metadata for one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateProjectionMetadata {
+pub(crate) struct TrackedStateCommitRoot {
     pub(crate) commit_id: String,
     pub(crate) root_id: TrackedStateRootId,
-    pub(crate) parent_roots: Vec<TrackedStateProjectionParent>,
+    pub(crate) parent_roots: Vec<TrackedStateCommitRootParent>,
     pub(crate) changed_key_count: u64,
     pub(crate) row_count_estimate: u64,
     pub(crate) tree_height: u32,
@@ -95,20 +102,20 @@ pub(crate) struct TrackedStateProjectionMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateProjectionParent {
+pub(crate) struct TrackedStateCommitRootParent {
     pub(crate) commit_id: String,
     pub(crate) root_id: TrackedStateRootId,
 }
 
-/// Materialized tracked-state projection row.
+/// Materialized tracked-state commit-root row.
 ///
-/// Tracked rows are the projection that can be rebuilt from changelog facts.
+/// Tracked rows are the serving state that can be rebuilt from changelog facts.
 /// They intentionally do not carry an `untracked` flag: untracked local overlay
 /// data belongs to `untracked_state`, and the serving `live_state` facade is
 /// responsible for combining both sources.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
@@ -126,7 +133,7 @@ pub(crate) struct TrackedStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
@@ -135,28 +142,20 @@ pub(crate) struct TrackedStateFilter {
 
 /// Requested property set for a tracked-state scan.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct TrackedStateProjection {
+pub(crate) struct TrackedStateReadColumns {
     #[serde(default)]
     pub(crate) columns: Vec<String>,
 }
 
-/// Scan request for the tracked-state projection.
+/// Scan request for tracked-state commit roots.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct TrackedStateScanRequest {
     #[serde(default)]
     pub(crate) filter: TrackedStateFilter,
     #[serde(default)]
-    pub(crate) projection: TrackedStateProjection,
+    pub(crate) read_columns: TrackedStateReadColumns,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
-}
-
-/// Point lookup request for one tracked-state row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateRowRequest {
-    pub(crate) schema_key: String,
-    pub(crate) entity_id: EntityIdentity,
-    pub(crate) file_id: NullableKeyFilter<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -177,7 +176,7 @@ impl TrackedStateMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
@@ -187,7 +186,7 @@ impl Default for TrackedStateTreeScanRequest {
     fn default() -> Self {
         Self {
             schema_keys: Vec::new(),
-            entity_ids: Vec::new(),
+            entity_pks: Vec::new(),
             file_ids: Vec::new(),
             include_tombstones: true,
             limit: None,
@@ -207,7 +206,7 @@ impl TrackedStateTreeScanRequest {
         if !self.schema_keys.is_empty() && !self.schema_keys.contains(&key.schema_key) {
             return false;
         }
-        if !self.entity_ids.is_empty() && !self.entity_ids.contains(&key.entity_id) {
+        if !self.entity_pks.is_empty() && !self.entity_pks.contains(&key.entity_pk) {
             return false;
         }
         if !self.file_ids.is_empty()

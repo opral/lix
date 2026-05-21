@@ -223,12 +223,14 @@ async fn ensure_benchmark_file_descriptor(lix: &Lix) -> BenchResult<()> {
         "extension": "json",
         "hidden": false
     });
+    let entity_pk = serde_json::json!(["bench.json"]);
     let sql = format!(
         "INSERT INTO lix_state (\
-         entity_id, schema_key, file_id, snapshot_content, global, untracked\
+         entity_pk, schema_key, file_id, snapshot_content, global, untracked\
          ) VALUES (\
-         'bench.json', 'lix_file_descriptor', NULL, lix_json('{}'), false, false\
+         lix_json('{}'), 'lix_file_descriptor', NULL, lix_json('{}'), false, false\
          )",
+        sql_string(&entity_pk.to_string()),
         sql_string(&snapshot.to_string())
     );
     match lix.execute(&sql, &[]).await.map_err(display_lix_error)? {
@@ -250,7 +252,7 @@ fn build_insert_batches(row_count: usize, chunk_size: usize) -> BenchResult<Vec<
         let end = (next + chunk_size).min(row_count);
         let mut sql = String::from(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES ",
         );
         for index in next..end {
@@ -265,9 +267,10 @@ fn build_insert_batches(row_count: usize, chunk_size: usize) -> BenchResult<Vec<
                     "label": format!("value-{index}")
                 }
             });
+            let entity_pk = serde_json::json!([pointer]);
             sql.push_str(&format!(
-                "('{}','json_pointer','bench.json',lix_json('{}'),false,false)",
-                sql_string(&pointer),
+                "(lix_json('{}'),'json_pointer','bench.json',lix_json('{}'),false,false)",
+                sql_string(&entity_pk.to_string()),
                 sql_string(&snapshot.to_string())
             ));
         }

@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
@@ -79,7 +79,7 @@ async fn load_key_value_row(
         .load_row(&LiveStateRowRequest {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: EntityIdentity::single(key),
+            entity_pk: EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         })
         .await
@@ -154,7 +154,7 @@ fn deterministic_key_value_row(
     timestamp: &str,
 ) -> Result<UntrackedStateRow, LixError> {
     Ok(UntrackedStateRow {
-        entity_id: crate::entity_identity::EntityIdentity::single(key),
+        entity_pk: crate::entity_pk::EntityPk::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content.to_string()),
@@ -299,9 +299,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single(
-                    DETERMINISTIC_SEQUENCE_KEY,
-                ),
+                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await

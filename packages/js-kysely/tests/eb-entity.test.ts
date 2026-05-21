@@ -14,7 +14,7 @@ test("hasLabel compiles to the label assignment state-address tuple for entity t
 
 	expect(compiled.sql).toContain("from lix_label_assignment");
 	expect(compiled.sql).toContain(
-		"lix_label_assignment.target_entity_id = lix_commit.lixcol_entity_id",
+		"lix_label_assignment.target_entity_pk = lix_commit.lixcol_entity_pk",
 	);
 	expect(compiled.sql).toContain(
 		"lix_label_assignment.target_schema_key = lix_commit.lixcol_schema_key",
@@ -31,11 +31,11 @@ test("hasLabel compiles to the label assignment state-address tuple for canonica
 	const compiled = db
 		.selectFrom("lix_state")
 		.where(ebEntity("lix_state").hasLabel({ id: "label-a" }))
-		.select("entity_id")
+		.select("entity_pk")
 		.compile();
 
 	expect(compiled.sql).toContain(
-		"lix_label_assignment.target_entity_id = lix_state.entity_id",
+		"lix_label_assignment.target_entity_pk = lix_state.entity_pk",
 	);
 	expect(compiled.sql).toContain(
 		"lix_label_assignment.target_schema_key = lix_state.schema_key",

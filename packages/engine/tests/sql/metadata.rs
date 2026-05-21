@@ -466,7 +466,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_state (\
-                     entity_id, schema_key, file_id, snapshot_content, metadata\
+                     entity_pk, schema_key, file_id, snapshot_content, metadata\
                      ) VALUES (\
                      lix_json('[\"metadata-state-insert\"]'), 'lix_key_value', NULL, \
                      lix_json('{\"key\":\"metadata-state-insert\",\"value\":\"value\"}'), \
@@ -481,7 +481,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content\
+                 entity_pk, schema_key, file_id, snapshot_content\
                  ) VALUES (\
                  lix_json('[\"metadata-state-update\"]'), 'lix_key_value', NULL, \
                  lix_json('{\"key\":\"metadata-state-update\",\"value\":\"value\"}')\
@@ -496,7 +496,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_state \
                      SET metadata = '{bad' \
-                     WHERE entity_id = lix_json('[\"metadata-state-update\"]') \
+                     WHERE entity_pk = lix_json('[\"metadata-state-update\"]') \
                        AND schema_key = 'lix_key_value'",
                     &[],
                 )
@@ -559,7 +559,7 @@ simulation_test!(
                 .execute(
                     "SELECT metadata \
                      FROM lix_state \
-                     WHERE entity_id = lix_json('[\"metadata-valid-object\"]') \
+                     WHERE entity_pk = lix_json('[\"metadata-valid-object\"]') \
                        AND schema_key = 'lix_key_value'",
                     &[],
                 )
@@ -574,7 +574,7 @@ simulation_test!(
                 .execute(
                     "SELECT metadata \
                      FROM lix_change \
-                     WHERE entity_id = lix_json('[\"metadata-valid-object\"]') \
+                     WHERE entity_pk = lix_json('[\"metadata-valid-object\"]') \
                        AND schema_key = 'lix_key_value'",
                     &[],
                 )
@@ -591,7 +591,7 @@ simulation_test!(
                         "SELECT metadata \
                          FROM lix_state_history \
                          WHERE start_commit_id = '{commit_id}' \
-                           AND entity_id = lix_json('[\"metadata-valid-object\"]') \
+                           AND entity_pk = lix_json('[\"metadata-valid-object\"]') \
                            AND schema_key = 'lix_key_value'"
                     ),
                     &[],

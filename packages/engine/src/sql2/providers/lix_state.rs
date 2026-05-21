@@ -25,7 +25,7 @@ use datafusion::scalar::ScalarValue;
 use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
@@ -764,15 +764,15 @@ fn lix_state_update_write_rows_from_batch(
             }
 
             Ok(TransactionWriteRow {
-                entity_id: Some(
-                    EntityIdentity::from_json_array_text(&required_string_value(
+                entity_pk: Some(
+                    EntityPk::from_json_array_text(&required_string_value(
                         batch,
                         row_index,
-                        "entity_id",
+                        "entity_pk",
                     )?)
                     .map_err(|error| {
                         DataFusionError::Execution(format!(
-                            "lix_state UPDATE has invalid entity_id: {error}"
+                            "lix_state UPDATE has invalid entity_pk: {error}"
                         ))
                     })?,
                 ),
@@ -902,15 +902,15 @@ fn lix_state_write_rows_from_batch(
             }
 
             Ok(TransactionWriteRow {
-                entity_id: Some(
-                    EntityIdentity::from_json_array_text(&required_string_value(
+                entity_pk: Some(
+                    EntityPk::from_json_array_text(&required_string_value(
                         batch,
                         row_index,
-                        "entity_id",
+                        "entity_pk",
                     )?)
                     .map_err(|error| {
                         DataFusionError::Execution(format!(
-                            "lix_state INSERT has invalid entity_id: {error}"
+                            "lix_state INSERT has invalid entity_pk: {error}"
                         ))
                     })?,
                 ),
@@ -1169,7 +1169,7 @@ impl ExecutionPlan for LixStateScanExec {
 
 pub(super) fn lix_state_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        json_field("entity_id", false),
+        json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
@@ -1185,7 +1185,7 @@ pub(super) fn lix_state_schema() -> SchemaRef {
 
 pub(super) fn lix_state_by_version_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        json_field("entity_id", false),
+        json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
@@ -1204,7 +1204,7 @@ pub(super) fn lix_state_by_version_schema() -> SchemaRef {
 struct LixStateByVersionRoute {
     schema_keys: Option<BTreeSet<String>>,
     version_ids: Option<BTreeSet<String>>,
-    entity_ids: Option<BTreeSet<String>>,
+    entity_pks: Option<BTreeSet<String>>,
     file_id: Option<NullableKeyFilter<String>>,
     contradictory: bool,
 }
@@ -1232,9 +1232,9 @@ impl LixStateByVersionRoute {
                             &mut route.contradictory,
                         );
                     }
-                    LixStateFilterPredicate::EntityIds(values) => {
+                    LixStateFilterPredicate::EntityPks(values) => {
                         merge_string_route_slot(
-                            &mut route.entity_ids,
+                            &mut route.entity_pks,
                             values,
                             &mut route.contradictory,
                         );
@@ -1257,7 +1257,7 @@ impl LixStateByVersionRoute {
 enum LixStateFilterPredicate {
     SchemaKeys(BTreeSet<String>),
     VersionIds(BTreeSet<String>),
-    EntityIds(BTreeSet<String>),
+    EntityPks(BTreeSet<String>),
     FileId(NullableKeyFilter<String>),
 }
 
@@ -1277,13 +1277,13 @@ fn lix_state_scan_request(
             .as_ref()
             .map(|values| values.iter().cloned().collect())
             .unwrap_or_default(),
-        entity_ids: route
-            .entity_ids
+        entity_pks: route
+            .entity_pks
             .as_ref()
             .map(|values| {
                 values
                     .iter()
-                    .filter_map(|value| EntityIdentity::from_json_array_text(value).ok())
+                    .filter_map(|value| EntityPk::from_json_array_text(value).ok())
                     .collect()
             })
             .unwrap_or_default(),
@@ -1409,7 +1409,7 @@ fn parse_lix_state_in_list_filter(in_list: &InList) -> Option<LixStateFilterPred
     match column.name.as_str() {
         "schema_key" => Some(LixStateFilterPredicate::SchemaKeys(values)),
         "version_id" => Some(LixStateFilterPredicate::VersionIds(values)),
-        "entity_id" => canonical_entity_id_values(values).map(LixStateFilterPredicate::EntityIds),
+        "entity_pk" => canonical_entity_pk_values(values).map(LixStateFilterPredicate::EntityPks),
         _ => None,
     }
 }
@@ -1438,23 +1438,23 @@ fn parse_lix_state_column_literal_filter(
             .map(|value| LixStateFilterPredicate::SchemaKeys(BTreeSet::from([value]))),
         "version_id" => string_expr_literal(literal_expr)
             .map(|value| LixStateFilterPredicate::VersionIds(BTreeSet::from([value]))),
-        "entity_id" => string_expr_literal(literal_expr)
-            .and_then(|value| canonical_entity_id_value(&value))
-            .map(|value| LixStateFilterPredicate::EntityIds(BTreeSet::from([value]))),
+        "entity_pk" => string_expr_literal(literal_expr)
+            .and_then(|value| canonical_entity_pk_value(&value))
+            .map(|value| LixStateFilterPredicate::EntityPks(BTreeSet::from([value]))),
         "file_id" => nullable_key_literal(literal_expr).map(LixStateFilterPredicate::FileId),
         _ => None,
     }
 }
 
-fn canonical_entity_id_values(values: BTreeSet<String>) -> Option<BTreeSet<String>> {
+fn canonical_entity_pk_values(values: BTreeSet<String>) -> Option<BTreeSet<String>> {
     values
         .into_iter()
-        .map(|value| canonical_entity_id_value(&value))
+        .map(|value| canonical_entity_pk_value(&value))
         .collect()
 }
 
-fn canonical_entity_id_value(value: &str) -> Option<String> {
-    EntityIdentity::from_json_array_text(value)
+fn canonical_entity_pk_value(value: &str) -> Option<String> {
+    EntityPk::from_json_array_text(value)
         .ok()?
         .as_json_array_text()
         .ok()
@@ -1502,9 +1502,9 @@ fn lix_state_record_batch(
         .iter()
         .map(|field| {
             Ok(match field.name().as_str() {
-                "entity_id" => Arc::new(StringArray::from(
+                "entity_pk" => Arc::new(StringArray::from(
                     rows.iter()
-                        .map(|row| row.entity_id.as_json_array_text().map(Some))
+                        .map(|row| row.entity_pk.as_json_array_text().map(Some))
                         .collect::<std::result::Result<Vec<_>, LixError>>()?,
                 )) as ArrayRef,
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
@@ -1592,7 +1592,7 @@ mod tests {
     };
     use crate::version::{VersionHead, VersionRefReader};
     use crate::{
-        entity_identity::EntityIdentity,
+        entity_pk::EntityPk,
         live_state::{
             LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
         },
@@ -1928,17 +1928,17 @@ mod tests {
         .expect("valid stageable lix_state batch")
     }
 
-    fn live_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+    fn live_row(entity_pk: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: EntityIdentity::single(entity_id),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
             deleted: false,
             version_id: "version-a".to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -2005,7 +2005,7 @@ mod tests {
         assert_eq!(
             request.projection.columns,
             vec![
-                "entity_id".to_string(),
+                "entity_pk".to_string(),
                 "schema_key".to_string(),
                 "version_id".to_string()
             ]
@@ -2017,7 +2017,7 @@ mod tests {
     fn builds_route_from_and_filter_tree() {
         let route = LixStateByVersionRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("entity_id")),
+                Box::new(col("entity_pk")),
                 Operator::Eq,
                 Box::new(str_lit("[\"entity-a\"]")),
             ))),
@@ -2030,7 +2030,7 @@ mod tests {
         ))]);
 
         assert_eq!(
-            route.entity_ids,
+            route.entity_pks,
             Some(BTreeSet::from(["[\"entity-a\"]".to_string()]))
         );
         assert_eq!(
@@ -2234,14 +2234,14 @@ mod tests {
         let error = provider
             .update(
                 &session.state(),
-                vec![("entity_id".to_string(), str_lit("entity-2"))],
+                vec![("entity_pk".to_string(), str_lit("entity-2"))],
                 vec![],
             )
             .await
             .expect_err("updating a read-only field should fail");
 
         assert!(
-            error.to_string().contains("read-only column 'entity_id'"),
+            error.to_string().contains("read-only column 'entity_pk'"),
             "unexpected error: {error}"
         );
     }
@@ -2293,7 +2293,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![TransactionWriteRow {
-                entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
+                entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(
@@ -2344,7 +2344,7 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: vec![TransactionWriteRow {
-                    entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
+                    entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(
@@ -2452,7 +2452,7 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![TransactionWriteRow {
-                    entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
+                    entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(
@@ -2511,7 +2511,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
                     TransactionWriteRow {
-                        entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
+                        entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot: None,
@@ -2528,7 +2528,7 @@ mod tests {
                         version_id: "version-a".to_string(),
                     },
                     TransactionWriteRow {
-                        entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-2")),
+                        entity_pk: Some(crate::entity_pk::EntityPk::single("entity-2")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot: None,

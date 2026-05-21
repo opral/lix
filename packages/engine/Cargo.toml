@@ -26,12 +26,20 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
-name = "changelog_visible_profile"
-path = "benches/changelog/profile_visible.rs"
+name = "changelog_direct_profile"
+path = "benches/changelog/profile_direct.rs"
+harness = false
+required-features = ["storage-benches"]
 
 [[bench]]
 name = "untracked_state_crud"
 path = "benches/untracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "tracked_state_crud"
+path = "benches/tracked_state_crud/main.rs"
 harness = false
 required-features = ["storage-benches"]
 

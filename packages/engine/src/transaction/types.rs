@@ -1,10 +1,9 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::catalog::SchemaPlanId;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::tracked_state::TrackedStateDiffRow;
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::LixError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -112,7 +111,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 /// `PreparedStateRow` without serializing already-normalized JSON again.
 ///
 /// SQL providers stage semantic rows, not final storage rows. INSERT providers
-/// may omit defaulted snapshot fields and leave `entity_id` unset when the
+/// may omit defaulted snapshot fields and leave `entity_pk` unset when the
 /// target schema has an `x-lix-primary-key`; transaction normalization applies
 /// schema defaults and derives the final identity. Typed UPDATE providers must
 /// stage full rewritten snapshots after applying column assignments to the
@@ -120,7 +119,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 /// implicit patches.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TransactionWriteRow {
-    pub(crate) entity_id: Option<EntityIdentity>,
+    pub(crate) entity_pk: Option<EntityPk>,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: Option<TransactionJson>,
@@ -180,19 +179,6 @@ pub(crate) struct TransactionFileData {
     pub(crate) data: Vec<u8>,
 }
 
-/// Existing canonical change adopted into another version's tracked projection.
-///
-/// Merges use this path when the source side already owns the canonical
-/// changelog fact. The target commit references that existing change id and
-/// writes a target-version projection row without appending a copied change.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransactionAdoptedChange {
-    pub(crate) version_id: String,
-    pub(crate) change_id: String,
-    pub(crate) source_parent_commit_id: String,
-    pub(crate) projected_row: TrackedStateDiffRow,
-}
-
 /// One decoded write batch accepted by the transaction boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransactionWrite {
@@ -205,9 +191,6 @@ pub(crate) enum TransactionWrite {
         rows: Vec<TransactionWriteRow>,
         file_data: Vec<TransactionFileData>,
         count: u64,
-    },
-    AdoptedChanges {
-        changes: Vec<TransactionAdoptedChange>,
     },
 }
 
@@ -223,9 +206,6 @@ pub(crate) enum PreparedTransactionWrite {
         rows: Vec<PreparedStateRow>,
         file_data: Vec<TransactionFileData>,
         count: u64,
-    },
-    AdoptedChanges {
-        rows: Vec<PreparedAdoptedStateRow>,
     },
 }
 
@@ -285,7 +265,7 @@ pub(crate) struct PreparedRowFacts {
 pub(crate) struct PreparedStateRow {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: Option<StageJson>,
@@ -300,33 +280,11 @@ pub(crate) struct PreparedStateRow {
     pub(crate) version_id: String,
 }
 
-/// Transaction-hydrated projection for an adopted canonical change.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedAdoptedStateRow {
-    pub(crate) schema_plan_id: SchemaPlanId,
-    pub(crate) facts: PreparedRowFacts,
-    pub(crate) entity_id: EntityIdentity,
-    pub(crate) schema_key: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) snapshot: Option<StageJson>,
-    pub(crate) metadata: Option<StageJson>,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
-    pub(crate) global: bool,
-    pub(crate) change_id: String,
-    pub(crate) source_commit_id: String,
-    pub(crate) source_parent_commit_id: String,
-    pub(crate) commit_id: String,
-    pub(crate) version_id: String,
-}
-
 impl From<PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: PreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
         MaterializedLiveStateRow {
-            entity_id: row.entity_id,
+            entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
@@ -346,7 +304,7 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
 impl From<&PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: &PreparedStateRow) -> Self {
         MaterializedLiveStateRow {
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
@@ -363,52 +321,11 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
     }
 }
 
-impl From<PreparedAdoptedStateRow> for MaterializedLiveStateRow {
-    fn from(row: PreparedAdoptedStateRow) -> Self {
-        let deleted = row.snapshot_ref.is_none();
-        MaterializedLiveStateRow {
-            entity_id: row.entity_id,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
-            metadata: row.metadata.map(|metadata| metadata.materialize()),
-            deleted,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: Some(row.change_id),
-            commit_id: Some(row.commit_id),
-            untracked: false,
-            version_id: row.version_id,
-        }
-    }
-}
-
-impl From<&PreparedAdoptedStateRow> for MaterializedLiveStateRow {
-    fn from(row: &PreparedAdoptedStateRow) -> Self {
-        MaterializedLiveStateRow {
-            entity_id: row.entity_id.clone(),
-            schema_key: row.schema_key.clone(),
-            file_id: row.file_id.clone(),
-            snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
-            metadata: row.metadata.as_ref().map(StageJson::materialize),
-            deleted: row.snapshot_ref.is_none(),
-            created_at: row.created_at.clone(),
-            updated_at: row.updated_at.clone(),
-            global: row.global,
-            change_id: Some(row.change_id.clone()),
-            commit_id: Some(row.commit_id.clone()),
-            untracked: false,
-            version_id: row.version_id.clone(),
-        }
-    }
-}
-
 impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
     fn from(row: PreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
         MaterializedUntrackedStateRow {
-            entity_id: row.entity_id,
+            entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
@@ -422,33 +339,54 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
     }
 }
 
-/// Transaction-local introduced-change membership accumulated while rows are staged.
+/// Transaction-local commit change refs accumulated while rows are staged.
 ///
 /// Final commit row materialization owns commit ids, parent heads, and commit
 /// row timestamps. Staging only tracks which hydrated tracked changes the
 /// future commit introduces for a version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StagedCommitMembers {
+pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_id: String,
     pub(crate) commit_change_id: String,
     pub(crate) created_at: String,
     pub(crate) change_ids: BTreeSet<String>,
+    pub(crate) selected_change_refs: Vec<StagedCommitChangeRef>,
     pub(crate) allow_empty: bool,
 }
 
-impl StagedCommitMembers {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedCommitChangeRef {
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) change_id: String,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) deleted: bool,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+impl StagedCommitChangeRefs {
     pub(crate) fn new(commit_id: String, commit_change_id: String, created_at: String) -> Self {
         Self {
             commit_id,
             commit_change_id,
             created_at,
             change_ids: BTreeSet::new(),
+            selected_change_refs: Vec::new(),
             allow_empty: false,
         }
     }
 
     pub(crate) fn add_change_id(&mut self, change_id: String) {
         self.change_ids.insert(change_id);
+    }
+
+    pub(crate) fn add_selected_change_ref(&mut self, change_ref: StagedCommitChangeRef) {
+        if self.change_ids.insert(change_ref.change_id.clone()) {
+            self.selected_change_refs.push(change_ref);
+        }
     }
 
     pub(crate) fn remove_change_id(&mut self, change_id: &str) {

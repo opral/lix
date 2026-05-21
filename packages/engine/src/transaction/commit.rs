@@ -1,20 +1,16 @@
 use crate::binary_cas::BinaryCasContext;
 use crate::changelog::{
-    ChangeLoadEntry, ChangeLoadRequest, ChangeLocator as ChangelogChangeLocator, ChangeProjection,
-    ChangeRef as ChangelogChangeRef, ChangeVisibilityMode, ChangelogContext, CommitBody,
-    CommitHeader, MembershipRecord, MembershipRole, Segment, SegmentChange, SegmentChangeDirectory,
-    SegmentCommit, SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentInlinePayload,
-    SegmentObjectLocation, StateRowIdentity, COMMIT_VISIBILITY_SPACE, VISIBLE_CHANGE_PROOF_SPACE,
+    ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
+    CommitChangeRefSet, CommitRecord,
 };
-use crate::common::{CanonicalSchemaKey, EntityId, FileId};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::FunctionContext;
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
-use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
+use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateIdentity, UntrackedStateIdentityRef, UntrackedStateRowRef,
 };
@@ -23,14 +19,13 @@ use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
 
 type RowIndex = usize;
-type AdoptedRowIndex = usize;
 
 /// Commits prepared transaction rows into durable tracked and untracked stores.
 ///
 /// Providers decode DataFusion DML into hydrated `PreparedStateRow`s. Untracked
-/// rows are durable local overlay state and bypass changelog membership. Tracked
+/// rows are durable local overlay state and bypass changelog change refs. Tracked
 /// rows stage canonical changelog facts, then update the live-state serving
-/// projection. The tracked side of that projection is a prolly root keyed by
+/// commit root. The tracked side of that commit root is a prolly root keyed by
 /// the new commit id.
 pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
@@ -50,9 +45,8 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     let state_rows = prepared_writes.state_rows;
-    let adopted_rows = prepared_writes.adopted_rows;
     let finalized = finalize_commit_rows(
-        prepared_writes.commit_members_by_version,
+        prepared_writes.commit_change_refs_by_version,
         prepared_writes.extra_commit_parents_by_version,
         version_ctx,
         &*read,
@@ -62,7 +56,6 @@ pub(crate) async fn commit_prepared_writes(
     let version_heads = finalized.version_heads;
     let tracked_roots = finalized.tracked_roots;
     let row_index = index_prepared_rows(&state_rows)?;
-    let adopted_index = index_adopted_rows(&adopted_rows);
 
     if let Some(runtime_functions) = runtime_functions {
         runtime_functions
@@ -71,7 +64,6 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     if state_rows.is_empty()
-        && adopted_rows.is_empty()
         && commit_rows.is_empty()
         && version_heads.is_empty()
         && writes.is_empty()
@@ -79,25 +71,23 @@ pub(crate) async fn commit_prepared_writes(
         return Ok(writes);
     }
 
-    let (staged_commits, _staged_commit_locations) = stage_changelog_commits(
+    let staged_commits = stage_changelog_commits(
         read,
         &mut writes,
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
-        &adopted_rows,
-        &adopted_index.tracked_row_indices_by_commit,
         &commit_rows,
     )
     .await?;
 
-    stage_untracked_json_payloads(
+    stage_state_json_payloads(
         &mut json_writer,
         &mut writes,
         &state_rows,
-        &row_index.untracked_row_indices,
+        &row_index.canonical_row_indices,
     )?;
 
-    // The serving projection is updated in the same backend transaction as the
+    // The serving commit root is updated in the same backend transaction as the
     // changelog append. Tracked rows become prolly mutations under their owning
     // commit root; untracked rows remain in the separate local overlay store.
     {
@@ -106,12 +96,7 @@ pub(crate) async fn commit_prepared_writes(
             row_index
                 .canonical_row_indices
                 .iter()
-                .map(|&row_index| untracked_identity_ref_from_state_row(&state_rows[row_index]))
-                .chain(
-                    adopted_rows
-                        .iter()
-                        .map(untracked_identity_ref_from_adopted_row),
-                ),
+                .map(|&row_index| untracked_identity_ref_from_state_row(&state_rows[row_index])),
         )
         .await?;
         UntrackedStateContext::new()
@@ -134,8 +119,6 @@ pub(crate) async fn commit_prepared_writes(
             &mut writes,
             &state_rows,
             row_index.tracked_row_indices_by_commit,
-            &adopted_rows,
-            adopted_index.tracked_row_indices_by_commit,
             tracked_roots,
             staged_commits,
         )
@@ -151,22 +134,19 @@ pub(crate) async fn commit_prepared_writes(
         version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
-    writes.move_space_to_end(VISIBLE_CHANGE_PROOF_SPACE);
-    writes.move_space_to_end(COMMIT_VISIBILITY_SPACE);
-
     Ok(writes)
 }
 
-fn stage_untracked_json_payloads(
+fn stage_state_json_payloads(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
-    untracked_row_indices: &[RowIndex],
+    row_indices: &[RowIndex],
 ) -> Result<(), LixError> {
     json_writer.stage_batch(
         writes,
         JsonWritePlacementRef::OutOfBand,
-        untracked_row_indices
+        row_indices
             .iter()
             .flat_map(|&row_index| json_payloads_from_state_row(&state_rows[row_index])),
     )?;
@@ -196,10 +176,6 @@ struct PreparedRowIndex {
     canonical_row_indices: Vec<RowIndex>,
     untracked_row_indices: Vec<RowIndex>,
     tracked_row_indices_by_commit: BTreeMap<String, Vec<RowIndex>>,
-}
-
-struct PreparedAdoptedRowIndex {
-    tracked_row_indices_by_commit: BTreeMap<String, Vec<AdoptedRowIndex>>,
 }
 
 fn index_prepared_rows(rows: &[PreparedStateRow]) -> Result<PreparedRowIndex, LixError> {
@@ -232,23 +208,12 @@ fn index_prepared_rows(rows: &[PreparedStateRow]) -> Result<PreparedRowIndex, Li
     })
 }
 
-fn index_adopted_rows(rows: &[PreparedAdoptedStateRow]) -> PreparedAdoptedRowIndex {
-    let mut tracked_row_indices_by_commit = BTreeMap::<String, Vec<AdoptedRowIndex>>::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        tracked_row_indices_by_commit
-            .entry(row.commit_id.clone())
-            .or_default()
-            .push(row_index);
-    }
-    PreparedAdoptedRowIndex {
-        tracked_row_indices_by_commit,
-    }
-}
-
 #[derive(Clone, Debug)]
 struct StagedChangelogCommit {
-    authored_locators: Vec<ChangelogChangeLocator>,
-    adopted_locators: Vec<ChangelogChangeLocator>,
+    change_ids: Vec<String>,
+    selected_change_refs: Vec<StagedCommitChangeRef>,
+    commit_change_id: String,
+    commit_created_at: String,
 }
 
 async fn stage_changelog_commits(
@@ -256,38 +221,24 @@ async fn stage_changelog_commits(
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
     tracked_row_indices_by_commit: &BTreeMap<String, Vec<RowIndex>>,
-    adopted_rows: &[PreparedAdoptedStateRow],
-    adopted_row_indices_by_commit: &BTreeMap<String, Vec<AdoptedRowIndex>>,
     commit_rows: &[FinalizedCommitRow],
-) -> Result<
-    (
-        BTreeMap<String, StagedChangelogCommit>,
-        BTreeMap<String, SegmentObjectLocation>,
-    ),
-    LixError,
-> {
+) -> Result<BTreeMap<String, StagedChangelogCommit>, LixError> {
     if commit_rows.is_empty() {
-        return Ok((BTreeMap::new(), BTreeMap::new()));
+        return Ok(BTreeMap::new());
     }
 
     let mut commits = Vec::with_capacity(commit_rows.len());
     let mut changes = Vec::new();
-    let mut authored_change_ids_by_commit = BTreeMap::<String, Vec<String>>::new();
-    let mut adopted_change_ids_by_commit = BTreeMap::<String, Vec<String>>::new();
+    let mut commit_change_refs = Vec::with_capacity(commit_rows.len());
+    let mut staged = BTreeMap::<String, StagedChangelogCommit>::new();
     for commit_row in commit_rows {
         let state_row_indices = tracked_row_indices_by_commit
             .get(&commit_row.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let adopted_row_indices = adopted_row_indices_by_commit
-            .get(&commit_row.commit_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let mut membership =
-            Vec::with_capacity(state_row_indices.len() + adopted_row_indices.len());
-        let mut state_row_identities = Vec::new();
-        let mut membership_ordinals = Vec::new();
-        let mut authored_change_ids = Vec::with_capacity(state_row_indices.len());
+        let mut refs = Vec::with_capacity(state_row_indices.len());
+        let mut change_ids =
+            Vec::with_capacity(state_row_indices.len() + commit_row.selected_change_refs.len());
         for &row_index in state_row_indices {
             let row = &state_rows[row_index];
             let change_id = row.change_id.as_ref().ok_or_else(|| {
@@ -296,411 +247,162 @@ async fn stage_changelog_commits(
                     "tracked staged row is missing change_id before changelog append",
                 )
             })?;
-            membership.push(MembershipRecord {
-                member_change_id: change_id.clone(),
-                role: MembershipRole::Authored,
-                source_parent_ordinal: None,
-            });
-            membership_ordinals.push((change_id.clone(), (membership.len() - 1) as u32));
-            if let Some(identity) = state_row_identity_from_state_row(row)? {
-                state_row_identities.push((identity, change_id.clone()));
-            }
-            authored_change_ids.push(change_id.clone());
-            changes.push(segment_change_from_state_row(row, &commit_row.commit_id)?);
+            refs.push(commit_change_ref_from_state_row(row, change_id));
+            change_ids.push(change_id.clone());
+            changes.push(change_record_from_state_row(row)?);
         }
-        let mut adopted_change_ids = Vec::with_capacity(adopted_row_indices.len());
-        for &row_index in adopted_row_indices {
-            let row = &adopted_rows[row_index];
-            membership.push(MembershipRecord {
-                member_change_id: row.change_id.clone(),
-                role: MembershipRole::Adopted,
-                source_parent_ordinal: adopted_source_parent_ordinal(commit_row, row)?,
-            });
-            membership_ordinals.push((row.change_id.clone(), (membership.len() - 1) as u32));
-            state_row_identities.push((
-                state_row_identity_from_adopted_row(row)?,
-                row.change_id.clone(),
-            ));
-            adopted_change_ids.push(row.change_id.clone());
+        for change_ref in &commit_row.selected_change_refs {
+            refs.push(commit_change_ref_from_selected_change_ref(change_ref));
+            change_ids.push(change_ref.change_id.clone());
         }
-        authored_change_ids_by_commit.insert(commit_row.commit_id.clone(), authored_change_ids);
-        adopted_change_ids_by_commit.insert(commit_row.commit_id.clone(), adopted_change_ids);
-        commits.push(SegmentCommit {
-            header: CommitHeader {
-                id: commit_row.commit_id.clone(),
-                parent_commit_ids: commit_row.parent_commit_ids.clone(),
-                derivable_change_id: commit_row.change_id.clone(),
-                author_account_ids: Vec::new(),
-                created_at: commit_row.created_at.clone(),
-                membership_count: 0,
-            },
-            body: CommitBody { membership },
-            directory: SegmentCommitDirectory {
-                state_row_identities,
-                membership_ordinals,
-            },
-            checksum: String::new(),
+        commits.push(CommitRecord {
+            format_version: 1,
+            commit_id: commit_row.commit_id.clone(),
+            parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            change_id: commit_row.change_id.clone(),
+            author_account_ids: Vec::new(),
+            created_at: commit_row.created_at.clone(),
         });
-    }
-
-    let segment = Segment {
-        header: SegmentHeader {
-            segment_id: segment_id_for_commit_rows(commit_rows),
-            format_version: 0,
-            commit_count: 0,
-            change_count: 0,
-            byte_count: 0,
-            payload_count: 0,
-            checksum: String::new(),
-        },
-        directory: SegmentDirectory::default(),
-        commits,
-        changes,
-    };
-
-    let mut writer = ChangelogContext::new().writer(read, writes);
-    let report = writer.stage_segment(segment).await?;
-    for commit_row in commit_rows_parent_first(commit_rows)? {
-        writer.stage_publish_commit(&commit_row.commit_id).await?;
-    }
-    drop(writer);
-
-    let change_locations = report
-        .change_locations
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let commit_locations = report
-        .commit_locations
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let adopted_locators_by_change = load_existing_changelog_locators(
-        read,
-        adopted_change_ids_by_commit
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-
-    let mut staged = BTreeMap::new();
-    for commit_row in commit_rows {
-        let authored_locators = authored_change_ids_by_commit
-            .remove(&commit_row.commit_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|change_id| {
-                let location = change_locations.get(&change_id).cloned().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "changelog segment report is missing authored change '{change_id}'"
-                        ),
-                    )
-                })?;
-                Ok(ChangelogChangeLocator {
-                    change_id,
-                    commit_id: commit_row.commit_id.clone(),
-                    location,
-                })
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        let adopted_locators = adopted_change_ids_by_commit
-            .remove(&commit_row.commit_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|change_id| {
-                let locator = adopted_locators_by_change
-                    .get(&change_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("changelog locator is missing adopted change '{change_id}'"),
-                        )
-                    })?;
-                Ok(locator)
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
+        commit_change_refs.push(CommitChangeRefSet {
+            commit_id: commit_row.commit_id.clone(),
+            entries: refs,
+        });
         staged.insert(
             commit_row.commit_id.clone(),
             StagedChangelogCommit {
-                authored_locators,
-                adopted_locators,
+                change_ids,
+                selected_change_refs: commit_row.selected_change_refs.clone(),
+                commit_change_id: commit_row.change_id.clone(),
+                commit_created_at: commit_row.created_at.clone(),
             },
         );
     }
-    Ok((staged, commit_locations))
-}
 
-fn segment_id_for_commit_rows(commit_rows: &[FinalizedCommitRow]) -> String {
-    let first = commit_rows
-        .first()
-        .map(|row| row.commit_id.as_str())
-        .unwrap_or("empty");
-    let last = commit_rows
-        .last()
-        .map(|row| row.commit_id.as_str())
-        .unwrap_or(first);
-    format!("txn-{first}-{last}-{}", commit_rows.len())
-}
-
-fn commit_rows_parent_first(
-    commit_rows: &[FinalizedCommitRow],
-) -> Result<Vec<&FinalizedCommitRow>, LixError> {
-    let mut rows_by_id = BTreeMap::new();
-    for row in commit_rows {
-        if rows_by_id.insert(row.commit_id.as_str(), row).is_some() {
-            return Err(LixError::unknown(format!(
-                "cannot publish duplicate changelog commit '{}'",
-                row.commit_id
-            )));
-        }
-    }
-
-    let mut ordered = Vec::with_capacity(commit_rows.len());
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for row in commit_rows {
-        visit_commit_row_parent_first(
-            row.commit_id.as_str(),
-            &rows_by_id,
-            &mut visiting,
-            &mut visited,
-            &mut ordered,
-        )?;
-    }
-    Ok(ordered)
-}
-
-fn visit_commit_row_parent_first<'a>(
-    commit_id: &str,
-    rows_by_id: &BTreeMap<&'a str, &'a FinalizedCommitRow>,
-    visiting: &mut BTreeSet<&'a str>,
-    visited: &mut BTreeSet<&'a str>,
-    ordered: &mut Vec<&'a FinalizedCommitRow>,
-) -> Result<(), LixError> {
-    if visited.contains(commit_id) {
-        return Ok(());
-    }
-    let Some(row) = rows_by_id.get(commit_id).copied() else {
-        return Ok(());
+    let append = ChangelogAppend {
+        commits,
+        changes,
+        commit_change_refs,
     };
-    if !visiting.insert(row.commit_id.as_str()) {
-        return Err(LixError::unknown(format!(
-            "cannot publish changelog commit '{}' because staged commit parents contain a cycle",
-            row.commit_id
-        )));
-    }
-    for parent_id in &row.parent_commit_ids {
-        if rows_by_id.contains_key(parent_id.as_str()) {
-            visit_commit_row_parent_first(
-                parent_id.as_str(),
-                rows_by_id,
-                visiting,
-                visited,
-                ordered,
-            )?;
-        }
-    }
-    visiting.remove(row.commit_id.as_str());
-    visited.insert(row.commit_id.as_str());
-    ordered.push(row);
-    Ok(())
+
+    let mut writer = ChangelogContext::new().writer(read, writes);
+    writer.stage_append(append).await?;
+    stage_commit_row_json_payloads(writes, commit_rows)?;
+    Ok(staged)
 }
 
-fn segment_change_from_state_row(
-    row: &PreparedStateRow,
-    commit_id: &str,
-) -> Result<SegmentChange, LixError> {
+fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "tracked staged row is missing change_id before changelog change construction",
         ));
     };
-    Ok(SegmentChange {
-        id: change_id.clone(),
-        authored_commit_id: Some(commit_id.to_string()),
-        entity_id: row.entity_id.clone(),
+    Ok(ChangeRecord {
+        format_version: 1,
+        change_id: change_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| metadata.json_ref),
         created_at: row.updated_at.clone(),
-        inline_payloads: inline_payloads_from_state_row(row),
-        directory: SegmentChangeDirectory::default(),
     })
 }
 
-fn inline_payloads_from_state_row(row: &PreparedStateRow) -> Vec<SegmentInlinePayload> {
-    row.snapshot
+fn stage_commit_row_json_payloads(
+    writes: &mut StorageWriteSet,
+    commit_rows: &[FinalizedCommitRow],
+) -> Result<(), LixError> {
+    let snapshots = commit_rows
         .iter()
-        .map(|snapshot| SegmentInlinePayload {
-            json_ref: snapshot.json_ref,
-            bytes: snapshot.normalized.as_bytes().to_vec(),
-        })
-        .chain(row.metadata.iter().map(|metadata| SegmentInlinePayload {
-            json_ref: metadata.json_ref,
-            bytes: metadata.normalized.as_bytes().to_vec(),
-        }))
-        .collect()
+        .map(|row| commit_row_snapshot_content(&row.commit_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    JsonStoreContext::new().writer().stage_batch(
+        writes,
+        JsonWritePlacementRef::OutOfBand,
+        snapshots
+            .iter()
+            .map(|snapshot| NormalizedJsonRef::new(snapshot.as_str())),
+    )?;
+    Ok(())
 }
 
-fn state_row_identity_from_state_row(
-    row: &PreparedStateRow,
-) -> Result<Option<StateRowIdentity>, LixError> {
-    Ok(Some(StateRowIdentity {
-        schema_key: CanonicalSchemaKey::new(row.schema_key.clone())?,
-        file_id: FileId::new(
-            row.file_id
-                .clone()
-                .unwrap_or_else(|| "__global__".to_string()),
-        )?,
-        entity_id: state_row_entity_id(&row.entity_id)?,
+fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
+    serde_json::to_string(&serde_json::json!({
+        "id": commit_id,
     }))
-}
-
-fn state_row_identity_from_adopted_row(
-    row: &PreparedAdoptedStateRow,
-) -> Result<StateRowIdentity, LixError> {
-    Ok(StateRowIdentity {
-        schema_key: CanonicalSchemaKey::new(row.schema_key.clone())?,
-        file_id: FileId::new(
-            row.file_id
-                .clone()
-                .unwrap_or_else(|| "__global__".to_string()),
-        )?,
-        entity_id: state_row_entity_id(&row.entity_id)?,
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode lix_commit snapshot: {error}"),
+        )
     })
 }
 
-fn state_row_entity_id(entity_id: &EntityIdentity) -> Result<EntityId, LixError> {
-    EntityId::new(entity_id.as_json_array_text()?)
-}
-
-async fn load_existing_changelog_locators(
-    read: &(impl StorageRead + Send + Sync + ?Sized),
-    change_ids: Vec<String>,
-) -> Result<BTreeMap<String, ChangelogChangeLocator>, LixError> {
-    if change_ids.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let mut unique = change_ids;
-    unique.sort();
-    unique.dedup();
-    let mut reader = ChangelogContext::new().reader(read);
-    let logical = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: &unique,
-            projection: ChangeProjection::Logical,
-            visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
-        })
-        .await?;
-    let physical = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: &unique,
-            projection: ChangeProjection::PhysicalLocation,
-            visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
-        })
-        .await?;
-    let mut out = BTreeMap::new();
-    for ((change_id, logical), physical) in unique
-        .into_iter()
-        .zip(logical.entries)
-        .zip(physical.entries)
-    {
-        let Some(ChangeLoadEntry::Logical(change)) = logical else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog adopted change '{change_id}' is not visible"),
-            ));
-        };
-        let Some(ChangeLoadEntry::PhysicalLocation(location)) = physical else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog location is missing adopted change '{change_id}'"),
-            ));
-        };
-        let Some(authored_commit_id) = change.authored_commit_id else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog adopted change '{change_id}' has no authored commit"),
-            ));
-        };
-        if change.id != change_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "changelog adopted change lookup for '{change_id}' returned '{}'",
-                    change.id
-                ),
-            ));
-        }
-        out.insert(
-            change_id.clone(),
-            ChangelogChangeLocator {
-                change_id,
-                commit_id: authored_commit_id,
-                location,
-            },
-        );
-    }
-    Ok(out)
-}
-
-fn adopted_source_parent_ordinal(
-    commit_row: &FinalizedCommitRow,
-    row: &PreparedAdoptedStateRow,
-) -> Result<Option<u32>, LixError> {
-    let Some(ordinal) = commit_row
-        .parent_commit_ids
-        .iter()
-        .position(|parent_id| parent_id == &row.source_parent_commit_id)
-    else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "adopted change '{}' from source parent '{}' is not parented by adopting commit '{}'",
-                row.change_id, row.source_parent_commit_id, commit_row.commit_id
-            ),
-        ));
-    };
-    Ok(Some(ordinal as u32))
-}
-
-fn changelog_change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> ChangelogChangeRef<'_> {
-    ChangelogChangeRef {
-        id: &row.change_id,
-        authored_commit_id: Some(&row.source_commit_id),
-        entity_id: &row.entity_id,
-        schema_key: &row.schema_key,
-        file_id: row.file_id.as_deref(),
-        snapshot_ref: row.snapshot_ref.as_ref(),
-        metadata_ref: row.metadata_ref.as_ref(),
-        created_at: &row.created_at,
+fn commit_change_ref_from_state_row(row: &PreparedStateRow, change_id: &str) -> CommitChangeRef {
+    CommitChangeRef {
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        entity_pk: row.entity_pk.clone(),
+        change_id: change_id.to_string(),
     }
 }
 
-fn changelog_change_ref_from_state_row(
+fn commit_change_ref_from_selected_change_ref(
+    change_ref: &StagedCommitChangeRef,
+) -> CommitChangeRef {
+    CommitChangeRef {
+        schema_key: change_ref.schema_key.clone(),
+        file_id: change_ref.file_id.clone(),
+        entity_pk: change_ref.entity_pk.clone(),
+        change_id: change_ref.change_id.clone(),
+    }
+}
+
+fn tracked_delta_from_state_row(
     row: &PreparedStateRow,
-) -> Result<ChangelogChangeRef<'_>, LixError> {
+) -> Result<TrackedStateDeltaRef<'_>, LixError> {
     let Some(change_id) = row.change_id.as_deref() else {
         return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked staged row is missing change_id before changelog delta staging",
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked staged row is missing change_id before tracked root staging",
         ));
     };
-
-    Ok(ChangelogChangeRef {
-        id: change_id,
-        authored_commit_id: row.commit_id.as_ref(),
-        entity_id: &row.entity_id,
+    let Some(commit_id) = row.commit_id.as_deref() else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked staged row is missing commit_id before tracked root staging",
+        ));
+    };
+    Ok(TrackedStateDeltaRef {
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
+        entity_pk: &row.entity_pk,
+        change_id,
+        commit_id,
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-        created_at: &row.updated_at,
+        deleted: row.snapshot.is_none(),
+        created_at: &row.created_at,
+        updated_at: &row.updated_at,
+    })
+}
+
+fn tracked_delta_from_selected_change_ref<'a>(
+    change_ref: &'a StagedCommitChangeRef,
+    commit_id: &'a str,
+) -> Result<TrackedStateDeltaRef<'a>, LixError> {
+    Ok(TrackedStateDeltaRef {
+        schema_key: &change_ref.schema_key,
+        file_id: change_ref.file_id.as_deref(),
+        entity_pk: &change_ref.entity_pk,
+        change_id: &change_ref.change_id,
+        commit_id,
+        snapshot_ref: change_ref.snapshot_ref.as_ref(),
+        metadata_ref: change_ref.metadata_ref.as_ref(),
+        deleted: change_ref.deleted,
+        created_at: &change_ref.created_at,
+        updated_at: &change_ref.updated_at,
     })
 }
 
@@ -708,115 +410,75 @@ async fn stage_tracked_roots(
     read: &(impl StorageRead + Send + Sync + ?Sized),
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
-    mut tracked_row_indices_by_commit: BTreeMap<String, Vec<RowIndex>>,
-    adopted_rows: &[PreparedAdoptedStateRow],
-    mut adopted_row_indices_by_commit: BTreeMap<String, Vec<AdoptedRowIndex>>,
+    tracked_row_indices_by_commit: BTreeMap<String, Vec<RowIndex>>,
     tracked_roots: Vec<PendingTrackedRoot>,
-    mut staged_commits: BTreeMap<String, StagedChangelogCommit>,
+    staged_commits: BTreeMap<String, StagedChangelogCommit>,
 ) -> Result<(), LixError> {
     let tracked_state = TrackedStateContext::new();
-    let mut writer = tracked_state.writer(read, writes);
+    let mut tracked_writer = tracked_state.writer(read, writes);
     for root in tracked_roots_parent_first(&tracked_roots)? {
-        let staged = staged_commits.remove(&root.commit_id).ok_or_else(|| {
+        let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "tracked-state root for commit '{}' has no staged changelog locators",
+                    "tracked-state root for commit '{}' has no staged changelog facts",
                     root.commit_id
                 ),
             )
         })?;
         let state_row_indices = tracked_row_indices_by_commit
-            .remove(&root.commit_id)
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
             .unwrap_or_default();
-        let adopted_row_indices = adopted_row_indices_by_commit
-            .remove(&root.commit_id)
-            .unwrap_or_default();
-        if state_row_indices.len() != staged.authored_locators.len() {
+        if state_row_indices.len() > staged.change_ids.len() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "commit '{}' has {} tracked authored rows but {} changelog authored locators",
+                    "commit '{}' has {} tracked rows but only {} changelog changes",
                     root.commit_id,
                     state_row_indices.len(),
-                    staged.authored_locators.len()
+                    staged.change_ids.len()
                 ),
             ));
         }
-        if adopted_row_indices.len() != staged.adopted_locators.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "commit '{}' has {} tracked adopted rows but {} changelog adopted locators",
-                    root.commit_id,
-                    adopted_row_indices.len(),
-                    staged.adopted_locators.len()
-                ),
-            ));
-        }
-        let authored_changes = state_row_indices
+        let commit_snapshot = commit_row_snapshot_content(&root.commit_id)?;
+        let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
+        let commit_entity_pk = EntityPk::single(root.commit_id.clone());
+        let mut deltas = state_row_indices
             .iter()
-            .map(|&row_index| changelog_change_ref_from_state_row(&state_rows[row_index]))
+            .map(|&row_index| tracked_delta_from_state_row(&state_rows[row_index]))
+            .chain(staged.selected_change_refs.iter().map(|change_ref| {
+                tracked_delta_from_selected_change_ref(change_ref, &root.commit_id)
+            }))
             .collect::<Result<Vec<_>, _>>()?;
-        let adopted_changes = adopted_row_indices
-            .iter()
-            .map(|&row_index| changelog_change_ref_from_adopted_row(&adopted_rows[row_index]))
-            .collect::<Vec<_>>();
-        let authored_updated_at = state_row_indices
-            .iter()
-            .map(|&row_index| state_rows[row_index].updated_at.as_str())
-            .collect::<Vec<_>>();
-        let authored_created_at = state_row_indices
-            .iter()
-            .map(|&row_index| state_rows[row_index].created_at.as_str())
-            .collect::<Vec<_>>();
-        let adopted_updated_at = adopted_row_indices
-            .iter()
-            .map(|&row_index| adopted_rows[row_index].updated_at.as_str())
-            .collect::<Vec<_>>();
-        let adopted_created_at = adopted_row_indices
-            .iter()
-            .map(|&row_index| adopted_rows[row_index].created_at.as_str())
-            .collect::<Vec<_>>();
-        let mut deltas = Vec::with_capacity(authored_changes.len() + adopted_changes.len());
-        deltas.extend(
-            authored_changes
-                .iter()
-                .zip(&staged.authored_locators)
-                .zip(authored_created_at)
-                .zip(authored_updated_at)
-                .map(
-                    |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
-                        change: *change,
-                        locator: locator.as_ref(),
-                        created_at,
-                        updated_at,
-                    },
-                ),
-        );
-        deltas.extend(
-            adopted_changes
-                .iter()
-                .zip(&staged.adopted_locators)
-                .zip(adopted_created_at)
-                .zip(adopted_updated_at)
-                .map(
-                    |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
-                        change: *change,
-                        locator: locator.as_ref(),
-                        created_at,
-                        updated_at,
-                    },
-                ),
-        );
-        writer
-            .stage_projection_root(&root.commit_id, root.parent_commit_id.as_deref(), deltas)
+        deltas.push(TrackedStateDeltaRef {
+            schema_key: "lix_commit",
+            file_id: None,
+            entity_pk: &commit_entity_pk,
+            change_id: &staged.commit_change_id,
+            commit_id: &root.commit_id,
+            snapshot_ref: Some(&commit_snapshot_ref),
+            metadata_ref: None,
+            deleted: false,
+            created_at: &staged.commit_created_at,
+            updated_at: &staged.commit_created_at,
+        });
+        tracked_writer
+            .stage_commit_root(&root.commit_id, root.parent_commit_id.as_deref(), deltas)
             .await?;
     }
-    if !tracked_row_indices_by_commit.is_empty() || !adopted_row_indices_by_commit.is_empty() {
+    let rooted_commit_ids = tracked_roots
+        .iter()
+        .map(|root| root.commit_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let extra_tracked = tracked_row_indices_by_commit
+        .keys()
+        .filter(|commit_id| !rooted_commit_ids.contains(commit_id.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !extra_tracked.is_empty() {
         let mut commit_ids = tracked_row_indices_by_commit
             .keys()
-            .chain(adopted_row_indices_by_commit.keys())
             .cloned()
             .collect::<Vec<_>>();
         commit_ids.sort();
@@ -830,7 +492,14 @@ async fn stage_tracked_roots(
         ));
     }
     if !staged_commits.is_empty() {
-        let commit_ids = staged_commits.keys().cloned().collect::<Vec<_>>();
+        let commit_ids = staged_commits
+            .keys()
+            .filter(|commit_id| !rooted_commit_ids.contains(commit_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if commit_ids.is_empty() {
+            return Ok(());
+        }
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -902,7 +571,7 @@ fn visit_tracked_root_parent_first<'a>(
 
 fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRowRef<'_> {
     UntrackedStateRowRef {
-        entity_id: &row.entity_id,
+        entity_pk: &row.entity_pk,
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
         snapshot_content: row
@@ -924,36 +593,23 @@ fn untracked_identity_ref_from_state_row(row: &PreparedStateRow) -> UntrackedSta
     UntrackedStateIdentityRef {
         version_id: &row.version_id,
         schema_key: &row.schema_key,
-        entity_id: &row.entity_id,
+        entity_pk: &row.entity_pk,
         file_id: row.file_id.as_deref(),
     }
 }
 
-fn untracked_identity_ref_from_adopted_row(
-    row: &PreparedAdoptedStateRow,
-) -> UntrackedStateIdentityRef<'_> {
-    UntrackedStateIdentityRef {
-        version_id: &row.version_id,
-        schema_key: &row.schema_key,
-        entity_id: &row.entity_id,
-        file_id: row.file_id.as_deref(),
-    }
-}
-
-/// Materializes tracked staged membership into changelog commits.
+/// Materializes tracked staged change refs into changelog commits.
 ///
 /// Staging only accumulates `version_id -> change_ids` because commit ids,
 /// parent heads, and commit-row timestamps belong to transaction finalization.
 /// The `change_ids` list is the ordered set of canonical changes whose effects
-/// the commit introduces relative to its first parent; merge commits may later
-/// populate this list with existing source-parent changes instead of copied
-/// change payloads.
-/// This function turns those membership sets into finalized commit facts.
+/// the commit introduces relative to its first parent.
+/// This function turns those change-ref sets into finalized commit facts.
 ///
 /// Commit finalization output split by durability target.
 ///
 /// `commit_rows` are canonical changelog commit facts. tracked_state roots store
-/// serving projections keyed by the corresponding commit id.
+/// serving commit roots keyed by the corresponding commit id.
 ///
 /// `version_heads` are moving refs. They are written through `VersionContext`,
 /// not the canonical changelog.
@@ -968,6 +624,7 @@ struct FinalizedCommitRow {
     parent_commit_ids: Vec<String>,
     created_at: String,
     change_id: String,
+    selected_change_refs: Vec<StagedCommitChangeRef>,
 }
 
 struct PendingVersionHead {
@@ -982,7 +639,7 @@ struct PendingTrackedRoot {
 }
 
 async fn finalize_commit_rows(
-    commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
+    commit_change_refs_by_version: BTreeMap<String, StagedCommitChangeRefs>,
     extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     version_ctx: &VersionContext,
     read: &(impl StorageRead + Send + Sync + ?Sized),
@@ -991,15 +648,15 @@ async fn finalize_commit_rows(
     let mut version_heads = Vec::new();
     let mut tracked_roots = Vec::new();
 
-    for (version_id, members) in commit_members_by_version {
-        if members.is_empty() && !members.allow_empty {
+    for (version_id, change_refs) in commit_change_refs_by_version {
+        if change_refs.is_empty() && !change_refs.allow_empty {
             continue;
         }
 
-        let commit_id = members.commit_id;
-        let commit_change_id = members.commit_change_id;
-        let timestamp = members.created_at;
-        let _change_ids = members.change_ids;
+        let commit_id = change_refs.commit_id;
+        let commit_change_id = change_refs.commit_change_id;
+        let timestamp = change_refs.created_at;
+        let selected_change_refs = change_refs.selected_change_refs;
         let parent_commit_ids = version_ctx
             .ref_reader(read)
             .load_head_commit_id(&version_id)
@@ -1020,6 +677,7 @@ async fn finalize_commit_rows(
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp.clone(),
             change_id: commit_change_id,
+            selected_change_refs,
         });
         version_heads.push(PendingVersionHead {
             version_id: version_id.clone(),
@@ -1062,6 +720,7 @@ mod tests {
         KeyRange, PutBatch,
     };
     use crate::catalog::SchemaPlanId;
+    use crate::changelog::ChangelogReader;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, InMemoryStorageWrite, StorageContext,
@@ -1087,7 +746,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_staged_writes_appends_changelog_and_updates_serving_projection() {
+    async fn commit_staged_writes_appends_changelog_and_updates_commit_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
@@ -1104,10 +763,9 @@ mod tests {
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                adopted_rows: Vec::new(),
-                commit_members_by_version: BTreeMap::from([(
+                commit_change_refs_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
-                    members(["change-1"]),
+                    change_refs(["change-1"]),
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
@@ -1128,33 +786,62 @@ mod tests {
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &["test-uuid-1".to_string()],
                 projection: crate::changelog::CommitProjection::Full,
-                visibility: crate::changelog::CommitVisibilityMode::RequireVisible,
             })
             .await
             .expect("changelog commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Full { header, body }) =
-            commits.entries.into_iter().next().flatten()
+        let Some(crate::changelog::CommitLoadEntry::Full {
+            record,
+            change_ref_chunks,
+        }) = commits.entries.into_iter().next().flatten()
         else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(header.derivable_change_id, "test-uuid-2");
-        assert_eq!(body.membership.len(), 1);
+        assert_eq!(record.change_id, "test-uuid-2");
+        assert!(change_ref_chunks
+            .iter()
+            .flat_map(|chunk| chunk.entries.iter())
+            .any(|entry| entry.change_id == "change-1"));
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &["change-1".to_string()],
-                projection: crate::changelog::ChangeProjection::Segment,
-                visibility:
-                    crate::changelog::ChangeVisibilityMode::RequireReachableFromVisibleCommit,
+                change_ids: &["change-1".to_string(), record.change_id.clone()],
             })
             .await
             .expect("changelog change should load");
-        let Some(crate::changelog::ChangeLoadEntry::Segment(change)) =
-            changes.entries.into_iter().next().flatten()
-        else {
+        let mut loaded_changes = changes.entries.into_iter();
+        let Some(change) = loaded_changes.next().flatten() else {
             panic!("changelog change should exist");
         };
-        assert_eq!(change.id, "change-1");
+        assert_eq!(change.change_id, "change-1");
         assert_eq!(change.schema_key, "test_schema");
+        assert!(
+            loaded_changes.next().flatten().is_none(),
+            "commit row change is derived from changelog.commit, not stored as changelog.change"
+        );
+
+        let mut tracked_reader = crate::tracked_state::TrackedStateContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
+        let commit_rows = tracked_reader
+            .scan_rows_at_commit(
+                "test-uuid-1",
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["lix_commit".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit root should scan");
+        assert!(
+            commit_rows
+                .iter()
+                .any(|row| row.change_id == record.change_id && row.snapshot_content.is_some()),
+            "commit root should surface the derived lix_commit row"
+        );
 
         let loaded_head = version_ctx
             .ref_reader(
@@ -1169,106 +856,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changelog_adopted_membership_records_source_parent_ordinal() {
-        let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let mut writes = StorageWriteSet::new();
-        let mut source_read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("source read should open");
-        let mut source_row = tracked_global_row("source-change");
-        source_row.commit_id = Some("source-commit".to_string());
-        let source_commits = vec![
-            FinalizedCommitRow {
-                commit_id: "target-commit".to_string(),
-                parent_commit_ids: Vec::new(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                change_id: "target-commit-change".to_string(),
-            },
-            FinalizedCommitRow {
-                commit_id: "source-commit".to_string(),
-                parent_commit_ids: Vec::new(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                change_id: "source-commit-change".to_string(),
-            },
-            FinalizedCommitRow {
-                commit_id: "source-head".to_string(),
-                parent_commit_ids: vec!["source-commit".to_string()],
-                created_at: "2026-01-01T00:00:01Z".to_string(),
-                change_id: "source-head-change".to_string(),
-            },
-        ];
-        stage_changelog_commits(
-            &mut source_read,
-            &mut writes,
-            &[source_row],
-            &BTreeMap::from([("source-commit".to_string(), vec![0])]),
-            &[],
-            &BTreeMap::new(),
-            &source_commits,
-        )
-        .await
-        .expect("source commit should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .expect("source commit should persist");
-
-        let mut adopted_writes = StorageWriteSet::new();
-        let mut adopted_read = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("adopted read should open");
-        let adopted_row = adopted_global_row(
-            "source-change",
-            "source-commit",
-            "source-head",
-            "merge-commit",
-        );
-        let merge_commits = vec![FinalizedCommitRow {
-            commit_id: "merge-commit".to_string(),
-            parent_commit_ids: vec!["target-commit".to_string(), "source-head".to_string()],
-            created_at: "2026-01-01T00:00:01Z".to_string(),
-            change_id: "merge-commit-change".to_string(),
-        }];
-        stage_changelog_commits(
-            &mut adopted_read,
-            &mut adopted_writes,
-            &[],
-            &BTreeMap::new(),
-            &[adopted_row],
-            &BTreeMap::from([("merge-commit".to_string(), vec![0])]),
-            &merge_commits,
-        )
-        .await
-        .expect("adopting commit should stage");
-        storage
-            .commit_write_set(adopted_writes, StorageWriteOptions::default())
-            .expect("adopting commit should persist");
-
-        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .expect("read should open"),
-        );
-        let commits = changelog_reader
-            .load_commits(crate::changelog::CommitLoadRequest {
-                commit_ids: &["merge-commit".to_string()],
-                projection: crate::changelog::CommitProjection::Body,
-                visibility: crate::changelog::CommitVisibilityMode::RequireVisible,
-            })
-            .await
-            .expect("adopting commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Body(body)) =
-            commits.entries.into_iter().next().flatten()
-        else {
-            panic!("adopting commit body should exist");
-        };
-        assert_eq!(body.membership.len(), 1);
-        assert_eq!(body.membership[0].member_change_id, "source-change");
-        assert_eq!(body.membership[0].role, MembershipRole::Adopted);
-        assert_eq!(body.membership[0].source_parent_ordinal, Some(1));
-    }
-
-    #[tokio::test]
-    async fn stage_changelog_commits_publishes_staged_parents_before_children() {
+    async fn stage_changelog_commits_orders_staged_parents_before_children() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let mut writes = StorageWriteSet::new();
         let mut read = storage
@@ -1285,12 +873,14 @@ mod tests {
                 parent_commit_ids: vec!["parent-commit".to_string()],
                 created_at: "2026-01-01T00:00:01Z".to_string(),
                 change_id: "child-commit-change".to_string(),
+                selected_change_refs: Vec::new(),
             },
             FinalizedCommitRow {
                 commit_id: "parent-commit".to_string(),
                 parent_commit_ids: Vec::new(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 change_id: "parent-commit-change".to_string(),
+                selected_change_refs: Vec::new(),
             },
         ];
         stage_changelog_commits(
@@ -1301,12 +891,10 @@ mod tests {
                 ("parent-commit".to_string(), vec![0]),
                 ("child-commit".to_string(), vec![1]),
             ]),
-            &[],
-            &BTreeMap::new(),
             &commits,
         )
         .await
-        .expect("child-before-parent input should still publish parent first");
+        .expect("child-before-parent input should still stage parent first");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should persist");
@@ -1319,8 +907,7 @@ mod tests {
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &["parent-commit".to_string(), "child-commit".to_string()],
-                projection: crate::changelog::CommitProjection::Header,
-                visibility: crate::changelog::CommitVisibilityMode::RequireVisible,
+                projection: crate::changelog::CommitProjection::Record,
             })
             .await
             .expect("commits should load");
@@ -1346,8 +933,7 @@ mod tests {
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                adopted_rows: Vec::new(),
-                commit_members_by_version: BTreeMap::new(),
+                commit_change_refs_by_version: BTreeMap::new(),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
@@ -1368,7 +954,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+                    entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -1416,10 +1002,9 @@ mod tests {
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                adopted_rows: Vec::new(),
-                commit_members_by_version: BTreeMap::from([(
+                commit_change_refs_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
-                    members(["change-tracked"]),
+                    change_refs(["change-tracked"]),
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
@@ -1511,7 +1096,7 @@ mod tests {
                 )
                 .expect("deterministic mode snapshot should stage");
             let row = crate::untracked_state::UntrackedStateRow {
-                entity_id: crate::entity_identity::EntityIdentity::single(DETERMINISTIC_MODE_KEY),
+                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_MODE_KEY),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot_content: Some(mode_snapshot.to_string()),
@@ -1547,7 +1132,7 @@ mod tests {
 
         let tracked_row = tracked_global_row("change-tracked");
         let mut untracked_row = untracked_global_row("change-untracked");
-        untracked_row.entity_id = crate::entity_identity::EntityIdentity::single("entity-2");
+        untracked_row.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
 
         let writes = commit_prepared_writes(
             &binary_cas,
@@ -1557,10 +1142,9 @@ mod tests {
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![tracked_row, untracked_row],
-                adopted_rows: Vec::new(),
-                commit_members_by_version: BTreeMap::from([(
+                commit_change_refs_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
-                    members(["change-tracked"]),
+                    change_refs(["change-tracked"]),
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
@@ -1587,29 +1171,25 @@ mod tests {
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &["test-uuid-1".to_string()],
-                projection: crate::changelog::CommitProjection::Header,
-                visibility: crate::changelog::CommitVisibilityMode::RequireVisible,
+                projection: crate::changelog::CommitProjection::Record,
             })
             .await
             .expect("changelog commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Header(commit)) =
+        let Some(crate::changelog::CommitLoadEntry::Record(commit)) =
             commits.entries.into_iter().next().flatten()
         else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.derivable_change_id, "test-uuid-2");
+        assert_eq!(commit.change_id, "test-uuid-2");
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &["change-tracked".to_string()],
-                projection: crate::changelog::ChangeProjection::PhysicalLocation,
-                visibility:
-                    crate::changelog::ChangeVisibilityMode::RequireReachableFromVisibleCommit,
             })
             .await
             .expect("changelog change should load");
         assert!(matches!(
             changes.entries.as_slice(),
-            [Some(crate::changelog::ChangeLoadEntry::PhysicalLocation(_))]
+            [Some(change)] if change.change_id == "change-tracked"
         ));
 
         let loaded_head = version_ctx
@@ -1633,7 +1213,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
+                    entity_pk: crate::entity_pk::EntityPk::single("entity-2"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -1654,9 +1234,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single(
-                    DETERMINISTIC_SEQUENCE_KEY,
-                ),
+                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1690,10 +1268,9 @@ mod tests {
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                adopted_rows: Vec::new(),
-                commit_members_by_version: BTreeMap::from([(
+                commit_change_refs_by_version: BTreeMap::from([(
                     "version-a".to_string(),
-                    members(["change-version-a"]),
+                    change_refs(["change-version-a"]),
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
@@ -1713,17 +1290,16 @@ mod tests {
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &["test-uuid-1".to_string()],
-                projection: crate::changelog::CommitProjection::Header,
-                visibility: crate::changelog::CommitVisibilityMode::RequireVisible,
+                projection: crate::changelog::CommitProjection::Record,
             })
             .await
             .expect("changelog commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Header(commit)) =
+        let Some(crate::changelog::CommitLoadEntry::Record(commit)) =
             commits.entries.into_iter().next().flatten()
         else {
             panic!("changelog commit should exist");
         };
-        assert_eq!(commit.derivable_change_id, "test-uuid-2");
+        assert_eq!(commit.change_id, "test-uuid-2");
         assert_eq!(commit.parent_commit_ids, vec!["version-a-before"]);
 
         let global_head = version_ctx
@@ -1765,7 +1341,7 @@ mod tests {
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_VERSION_ID.to_string(),
-                members(["change-a", "change-b"]),
+                change_refs(["change-a", "change-b"]),
             )]),
             BTreeMap::new(),
             &version_ctx,
@@ -1797,14 +1373,14 @@ mod tests {
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_VERSION_ID.to_string(),
-                StagedCommitMembers::default(),
+                StagedCommitChangeRefs::default(),
             )]),
             BTreeMap::new(),
             &version_ctx,
             &mut read,
         )
         .await
-        .expect("empty members should be ignored");
+        .expect("empty change_refs should be ignored");
 
         assert!(rows.commit_rows.is_empty());
         assert!(rows.version_heads.is_empty());
@@ -1823,7 +1399,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let rows = finalize_commit_rows(
-            BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
+            BTreeMap::from([("version-a".to_string(), change_refs(["change-a"]))]),
             BTreeMap::new(),
             &version_ctx,
             &mut read,
@@ -1848,7 +1424,7 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let rows = finalize_commit_rows(
-            BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
+            BTreeMap::from([("version-a".to_string(), change_refs(["change-a"]))]),
             BTreeMap::from([("version-a".to_string(), vec!["source-head".to_string()])]),
             &version_ctx,
             &mut read,
@@ -1862,16 +1438,16 @@ mod tests {
         );
     }
 
-    fn members<const N: usize>(change_ids: [&str; N]) -> StagedCommitMembers {
-        let mut members = StagedCommitMembers::new(
+    fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {
+        let mut change_refs = StagedCommitChangeRefs::new(
             "test-uuid-1".to_string(),
             "test-uuid-2".to_string(),
             "test-timestamp-1".to_string(),
         );
         for change_id in change_ids {
-            members.add_change_id(change_id.to_string());
+            change_refs.add_change_id(change_id.to_string());
         }
-        members
+        change_refs
     }
 
     fn tracked_global_row(change_id: &str) -> PreparedStateRow {
@@ -1882,7 +1458,7 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot: Some(
@@ -1925,48 +1501,11 @@ mod tests {
         }
     }
 
-    fn adopted_global_row(
-        change_id: &str,
-        source_commit_id: &str,
-        source_parent_commit_id: &str,
-        commit_id: &str,
-    ) -> PreparedAdoptedStateRow {
-        PreparedAdoptedStateRow {
-            schema_plan_id: SchemaPlanId::for_test(0),
-            facts: PreparedRowFacts::default(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-            schema_key: "test_schema".to_string(),
-            file_id: None,
-            snapshot: Some(
-                crate::transaction::types::stage_json_from_value(
-                    crate::transaction::types::TransactionJson::from_value_for_test(
-                        serde_json::json!({ "value": 1 }),
-                    ),
-                    "test adopted row snapshot",
-                )
-                .expect("test adopted snapshot should stage"),
-            ),
-            metadata: None,
-            snapshot_ref: Some(crate::json_store::JsonRef::for_content(
-                serde_json::json!({ "value": 1 }).to_string().as_bytes(),
-            )),
-            metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: true,
-            change_id: change_id.to_string(),
-            source_commit_id: source_commit_id.to_string(),
-            source_parent_commit_id: source_parent_commit_id.to_string(),
-            commit_id: commit_id.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-        }
-    }
-
     fn untracked_request() -> UntrackedStateRowRequest {
         UntrackedStateRowRequest {
             schema_key: "test_schema".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -1975,7 +1514,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "test_schema".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }

@@ -25,7 +25,6 @@ pub struct RocksDbBackendFactory {
 #[derive(Clone, Debug)]
 pub struct RocksDbBackendFixture {
     path: PathBuf,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -73,10 +72,7 @@ impl BackendFactory for RocksDbBackendFactory {
             .temp_dir
             .path()
             .join(format!("backend-{database_id}.rocksdb"));
-        RocksDbBackendFixture {
-            durable_write_lock: durable_write_lock_for_path(&path),
-            path,
-        }
+        RocksDbBackendFixture { path }
     }
 
     fn config(&self) -> BackendTestConfig {
@@ -92,8 +88,7 @@ impl BackendFixture for RocksDbBackendFixture {
     type Backend = RocksDbBackend;
 
     fn open(&self) -> Self::Backend {
-        RocksDbBackend::open_with_write_lock(&self.path, self.durable_write_lock.clone())
-            .expect("open rocksdb backend")
+        RocksDbBackend::open(&self.path).expect("open rocksdb backend")
     }
 }
 
@@ -101,14 +96,6 @@ impl RocksDbBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
         let durable_write_lock = durable_write_lock_for_path(&path);
-        Self::open_with_write_lock(path, durable_write_lock)
-    }
-
-    fn open_with_write_lock(
-        path: impl Into<PathBuf>,
-        durable_write_lock: DurableWriteLock,
-    ) -> Result<Self, BackendError> {
-        let path = path.into();
         let db = Arc::new(open_rocksdb(&path)?);
         Ok(Self {
             path,

@@ -1,5 +1,4 @@
 mod analysis;
-mod apply;
 mod conflicts;
 mod stats;
 mod version;

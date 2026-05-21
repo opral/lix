@@ -9,7 +9,7 @@ use crate::common::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
@@ -810,23 +810,23 @@ fn directory_parent_cycle_error(directory_id: &str) -> LixError {
 }
 
 fn state_row(
-    entity_id: String,
+    entity_pk: String,
     schema_key: &str,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
-    partial_state_row(Some(entity_id), schema_key, snapshot, context)
+    partial_state_row(Some(entity_pk), schema_key, snapshot, context)
 }
 
 fn partial_state_row(
-    entity_id: Option<String>,
+    entity_pk: Option<String>,
     schema_key: &str,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
     let snapshot = snapshot.map(TransactionJson::from_value_unchecked);
     TransactionWriteRow {
-        entity_id: entity_id.map(EntityIdentity::single),
+        entity_pk: entity_pk.map(EntityPk::single),
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
         snapshot,
@@ -843,11 +843,11 @@ fn partial_state_row(
 }
 
 fn tombstone_row(
-    entity_id: String,
+    entity_pk: String,
     schema_key: &str,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
-    state_row(entity_id, schema_key, None, context)
+    state_row(entity_pk, schema_key, None, context)
 }
 
 fn collect_recursive_directory_delete(
@@ -906,7 +906,7 @@ mod tests {
     use crate::sql2::filesystem_visibility::{
         VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
     };
-    use crate::{entity_identity::EntityIdentity, live_state::MaterializedLiveStateRow};
+    use crate::{entity_pk::EntityPk, live_state::MaterializedLiveStateRow};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -924,8 +924,8 @@ mod tests {
         });
 
         assert_eq!(
-            row.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single("dir-docs"))
+            row.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("dir-docs"))
         );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
         assert_eq!(row.version_id, "version-a");
@@ -947,10 +947,8 @@ mod tests {
         });
 
         assert_eq!(
-            row.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            row.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
@@ -968,10 +966,8 @@ mod tests {
         .expect("blob ref row should build");
 
         assert_eq!(
-            row.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            row.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
@@ -1305,10 +1301,8 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
-            descriptor.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            descriptor.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot, None);
@@ -1319,10 +1313,8 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be planned");
         assert_eq!(
-            blob_ref.entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single(
-                "file-readme"
-            ))
+            blob_ref.entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot, None);
@@ -1352,8 +1344,8 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
-            plan.rows[0].entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single("dir-docs"))
+            plan.rows[0].entity_pk.as_ref(),
+            Some(&crate::entity_pk::EntityPk::single("dir-docs"))
         );
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);
@@ -1414,11 +1406,11 @@ mod tests {
                 .map(|row| {
                     (
                         row.schema_key.as_str(),
-                        row.entity_id
+                        row.entity_pk
                             .as_ref()
-                            .expect("planned recursive delete row should carry entity_id")
+                            .expect("planned recursive delete row should carry entity_pk")
                             .as_single_string_owned()
-                            .expect("planned recursive delete row should project entity_id"),
+                            .expect("planned recursive delete row should project entity_pk"),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -1473,20 +1465,20 @@ mod tests {
     }
 
     fn live_directory_row(
-        entity_id: &str,
+        entity_pk: &str,
         version_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: EntityIdentity::single(entity_id),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

@@ -1,25 +1,28 @@
-use crate::changelog::{Change, SegmentInlinePayload};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
+use crate::json_store::JsonRef;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LocatedChange {
-    pub(crate) record: Change,
-    pub(crate) source_commit_id: String,
-    pub(crate) inline_payloads: Vec<SegmentInlinePayload>,
+pub(crate) struct CommitGraphChange {
+    pub(crate) id: String,
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) created_at: String,
 }
 
 /// Parsed `lix_commit` entity from the changelog.
 ///
-/// Commits are stored as ordinary canonical changes. The graph reader parses
-/// their snapshot so traversal code can work with explicit parent ids and the
-/// ordered canonical changes introduced relative to the first parent. A merge
-/// commit may reference existing changes from another parent instead of owning
-/// newly minted copies.
+/// The graph reader projects direct changelog commit records into explicit
+/// parent ids plus the commit's referenced canonical changes. A merge commit
+/// points at selected existing change ids; it does not mint row/entity changes
+/// for the merge itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphCommit {
-    pub(crate) canonical_change: Change,
-    pub(crate) change: Change,
+    pub(crate) canonical_change: CommitGraphChange,
+    pub(crate) change: CommitGraphChange,
     pub(crate) commit_id: String,
     pub(crate) change_ids: Vec<String>,
     pub(crate) author_account_ids: Vec<String>,
@@ -44,7 +47,7 @@ pub(crate) struct CommitGraphEdge {
 /// Filter for canonical change history from a chosen traversal start commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<u32>,
@@ -58,7 +61,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 /// necessarily a graph root or a version head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
-    pub(crate) located_change: LocatedChange,
+    pub(crate) change: CommitGraphChange,
     pub(crate) observed_commit_id: String,
     pub(crate) start_commit_id: String,
     pub(crate) depth: u32,
@@ -68,45 +71,15 @@ pub(crate) struct CommitGraphChangeHistoryEntry {
 ///
 /// SQL surfaces consume this trait so they depend on graph semantics, not on
 /// changelog storage or traversal details.
-#[allow(dead_code)]
 #[async_trait::async_trait]
 pub(crate) trait CommitGraphReader: Send + Sync {
-    #[allow(dead_code)]
     async fn load_commit(&mut self, commit_id: &str)
         -> Result<Option<CommitGraphCommit>, LixError>;
-
-    async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError>;
 
     async fn reachable_commits(
         &mut self,
         head_commit_id: &str,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>;
-
-    /// Returns the best common ancestors shared by two commit heads.
-    ///
-    /// This is intentionally not called "lowest common ancestor": commit
-    /// history is a DAG, not a tree, and some histories have multiple equally
-    /// good common ancestors. Merge policy can require exactly one base later.
-    #[allow(dead_code)]
-    async fn best_common_ancestors(
-        &mut self,
-        left_commit_id: &str,
-        right_commit_id: &str,
-    ) -> Result<Vec<CommitGraphCommit>, LixError>;
-
-    /// Resolves the single commit base to use for a three-way merge.
-    ///
-    /// This is merge policy, not raw graph math: no common history and multiple
-    /// best common ancestors are both errors until merge has explicit support
-    /// for those cases.
-    #[allow(dead_code)]
-    async fn merge_base(
-        &mut self,
-        left_commit_id: &str,
-        right_commit_id: &str,
-    ) -> Result<CommitGraphCommit, LixError>;
-
-    fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge>;
 
     async fn change_history_from_commit(
         &mut self,

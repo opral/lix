@@ -45,11 +45,11 @@ pub(crate) enum DifferentialParam {
 pub(crate) enum DifferentialProbe {
     LixStateActive {
         schema_key: &'static str,
-        entity_ids: &'static [&'static str],
+        entity_pks: &'static [&'static str],
     },
     LixStateByVersion {
         schema_key: &'static str,
-        entity_ids: &'static [&'static str],
+        entity_pks: &'static [&'static str],
         version_ids: &'static [&'static str],
     },
     RegisteredSchemaActive,
@@ -59,7 +59,7 @@ pub(crate) enum DifferentialProbe {
 }
 
 #[cfg(test)]
-const SEED_LIX_STATE_ROW_SQL: &str = "INSERT INTO lix_state (entity_id, schema_key, file_id, snapshot_content, global, untracked) VALUES (lix_json('[\"diff-key\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"diff-key\",\"value\":\"base\"}'), false, true)";
+const SEED_LIX_STATE_ROW_SQL: &str = "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content, global, untracked) VALUES (lix_json('[\"diff-key\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"diff-key\",\"value\":\"base\"}'), false, true)";
 
 #[cfg(test)]
 const SETUP_SEED_LIX_STATE_ROW: &[&str] = &[SEED_LIX_STATE_ROW_SQL];
@@ -73,18 +73,18 @@ pub(crate) const ACTIVE_VERSION_PROBE_ID: &str = "__active_version__";
 #[cfg(test)]
 const LIX_KEY_VALUE_PROBE: &[DifferentialProbe] = &[DifferentialProbe::LixStateActive {
     schema_key: "lix_key_value",
-    entity_ids: &["diff-key", "global-diff", "tx-diff", "dup"],
+    entity_pks: &["diff-key", "global-diff", "tx-diff", "dup"],
 }];
 
 #[cfg(test)]
 const LIX_KEY_VALUE_VERSIONED_PROBE: &[DifferentialProbe] = &[
     DifferentialProbe::LixStateActive {
         schema_key: "lix_key_value",
-        entity_ids: &["diff-key", "global-diff", "tx-diff", "dup"],
+        entity_pks: &["diff-key", "global-diff", "tx-diff", "dup"],
     },
     DifferentialProbe::LixStateByVersion {
         schema_key: "lix_key_value",
-        entity_ids: &["diff-key", "global-diff", "tx-diff", "dup"],
+        entity_pks: &["diff-key", "global-diff", "tx-diff", "dup"],
         version_ids: &[ACTIVE_VERSION_PROBE_ID, "global", "version-a", "version-b"],
     },
 ];
@@ -101,13 +101,13 @@ const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[
 const LIX_KEY_VALUE_AND_REGISTERED_SCHEMA_PROBES: &[DifferentialProbe] = &[
     DifferentialProbe::LixStateActive {
         schema_key: "lix_key_value",
-        entity_ids: &["diff-key", "global-diff", "tx-diff", "dup"],
+        entity_pks: &["diff-key", "global-diff", "tx-diff", "dup"],
     },
     DifferentialProbe::RegisteredSchemaActive,
 ];
 
 #[cfg(test)]
-const STAGED_TX_INSERT_SQL: &str = "INSERT INTO lix_state (entity_id, schema_key, file_id, snapshot_content, global, untracked) VALUES (lix_json('[\"tx-diff\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"tx-diff\",\"value\":\"base\"}'), false, true)";
+const STAGED_TX_INSERT_SQL: &str = "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content, global, untracked) VALUES (lix_json('[\"tx-diff\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"tx-diff\",\"value\":\"base\"}'), false, true)";
 
 #[cfg(test)]
 const TX_SETUP_STAGED_LIX_STATE_ROW: &[&str] = &[STAGED_TX_INSERT_SQL];
@@ -117,7 +117,7 @@ const PARAM_METADATA_JSON: &[DifferentialParam] =
     &[DifferentialParam::Json("{\"seen\":\"param\"}")];
 
 #[cfg(test)]
-const PARAM_ENTITY_ID_AND_METADATA: &[DifferentialParam] = &[
+const PARAM_ENTITY_PK_AND_METADATA: &[DifferentialParam] = &[
     DifferentialParam::Json("[\"diff-key\"]"),
     DifferentialParam::Json("{\"seen\":\"param\"}"),
 ];
@@ -211,7 +211,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/duplicate-insert-target-columns".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_state (entity_id, entity_id, schema_key, file_id, snapshot_content) VALUES (lix_json('[\"dup\"]'), lix_json('[\"dup\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"dup\",\"value\":\"dup\"}'))".into(),
+            sql: "INSERT INTO lix_state (entity_pk, entity_pk, schema_key, file_id, snapshot_content) VALUES (lix_json('[\"dup\"]'), lix_json('[\"dup\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"dup\",\"value\":\"dup\"}'))".into(),
             params: EMPTY_PARAMS,
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -247,7 +247,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/staged-overlay-global-row-read".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_state (entity_id, schema_key, file_id, snapshot_content, global, untracked) VALUES (lix_json('[\"global-diff\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"global-diff\",\"value\":\"global\"}'), true, true)".into(),
+            sql: "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content, global, untracked) VALUES (lix_json('[\"global-diff\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"global-diff\",\"value\":\"global\"}'), true, true)".into(),
             params: EMPTY_PARAMS,
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -257,7 +257,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/empty-version-filter-base-staged-dedupe".into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_state SET snapshot_content = lix_json('{\"key\":\"diff-key\",\"value\":\"staged\"}') WHERE schema_key IN ('lix_key_value') AND entity_id = lix_json('[\"diff-key\"]')".into(),
+            sql: "UPDATE lix_state SET snapshot_content = lix_json('{\"key\":\"diff-key\",\"value\":\"staged\"}') WHERE schema_key IN ('lix_key_value') AND entity_pk = lix_json('[\"diff-key\"]')".into(),
             params: EMPTY_PARAMS,
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -267,8 +267,8 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/parameter-binding-after-contradiction".into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_state SET metadata = $2 WHERE schema_key = 'lix_key_value' AND schema_key = 'other_schema' AND entity_id = $1".into(),
-            params: PARAM_ENTITY_ID_AND_METADATA,
+            sql: "UPDATE lix_state SET metadata = $2 WHERE schema_key = 'lix_key_value' AND schema_key = 'other_schema' AND entity_pk = $1".into(),
+            params: PARAM_ENTITY_PK_AND_METADATA,
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Ok,
@@ -277,7 +277,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/staged-overlay-update-sees-prior-staged-row".into(),
             setup_sql: &[],
             transaction_setup_sql: TX_SETUP_STAGED_LIX_STATE_ROW,
-            sql: "UPDATE lix_state SET snapshot_content = lix_json('{\"key\":\"tx-diff\",\"value\":\"updated\"}') WHERE schema_key = 'lix_key_value' AND entity_id = lix_json('[\"tx-diff\"]')".into(),
+            sql: "UPDATE lix_state SET snapshot_content = lix_json('{\"key\":\"tx-diff\",\"value\":\"updated\"}') WHERE schema_key = 'lix_key_value' AND entity_pk = lix_json('[\"tx-diff\"]')".into(),
             params: EMPTY_PARAMS,
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -342,7 +342,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/lix-state/update-param-metadata".into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_state SET metadata = $1 WHERE schema_key = 'lix_key_value' AND entity_id = lix_json('[\"diff-key\"]')".into(),
+            sql: "UPDATE lix_state SET metadata = $1 WHERE schema_key = 'lix_key_value' AND entity_pk = lix_json('[\"diff-key\"]')".into(),
             params: PARAM_METADATA_JSON,
             probes: LIX_KEY_VALUE_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,

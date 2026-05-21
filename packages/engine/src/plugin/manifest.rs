@@ -100,7 +100,7 @@ impl DetectStateContextConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateContextColumn {
-    EntityId,
+    EntityPk,
     SchemaKey,
     SchemaVersion,
     SnapshotContent,
@@ -117,7 +117,7 @@ pub enum StateContextColumn {
 impl StateContextColumn {
     pub const fn default_active_state_columns() -> &'static [StateContextColumn] {
         &[
-            StateContextColumn::EntityId,
+            StateContextColumn::EntityPk,
             StateContextColumn::SchemaKey,
             StateContextColumn::SchemaVersion,
             StateContextColumn::SnapshotContent,
@@ -357,7 +357,7 @@ mod tests {
         let config = DetectStateContextConfig {
             include_active_state: Some(true),
             columns: Some(vec![
-                StateContextColumn::EntityId,
+                StateContextColumn::EntityPk,
                 StateContextColumn::SchemaKey,
             ]),
         };
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(
             config.resolved_columns_or_default(),
             Some(vec![
-                StateContextColumn::EntityId,
+                StateContextColumn::EntityPk,
                 StateContextColumn::SchemaKey
             ])
         );
@@ -457,7 +457,7 @@ mod tests {
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
-                        "columns": ["entity_id", "schema_key", "snapshot_content"]
+                        "columns": ["entity_pk", "schema_key", "snapshot_content"]
                     }
                 }
             }"#,
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(
             state_context.columns,
             Some(vec![
-                StateContextColumn::EntityId,
+                StateContextColumn::EntityPk,
                 StateContextColumn::SchemaKey,
                 StateContextColumn::SnapshotContent
             ])

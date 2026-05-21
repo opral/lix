@@ -14,7 +14,7 @@ fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<Plug
                 continue;
             }
             latest.insert(
-                (change.schema_key.clone(), change.entity_id.clone()),
+                (change.schema_key.clone(), change.entity_pk.clone()),
                 change,
             );
         }
@@ -264,11 +264,11 @@ fn roundtrip_is_invariant_to_change_order_permutations() {
     permutations.push(rotated);
 
     let mut lexicographic = projected.clone();
-    lexicographic.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    lexicographic.sort_by(|a, b| a.entity_pk.cmp(&b.entity_pk));
     permutations.push(lexicographic);
 
     let mut reverse_lexicographic = projected.clone();
-    reverse_lexicographic.sort_by(|a, b| b.entity_id.cmp(&a.entity_id));
+    reverse_lexicographic.sort_by(|a, b| b.entity_pk.cmp(&a.entity_pk));
     permutations.push(reverse_lexicographic);
 
     for changes in permutations {
@@ -278,11 +278,11 @@ fn roundtrip_is_invariant_to_change_order_permutations() {
 }
 
 #[test]
-fn roundtrip_reconstructs_with_lexicographic_entity_id_order() {
+fn roundtrip_reconstructs_with_lexicographic_entity_pk_order() {
     let before_json = r#"{"list":["a","b","c","d"]}"#;
     let after_json = r#"{"list":["a"]}"#;
     let mut projected = projected_changes_for_transition(before_json, after_json);
-    projected.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    projected.sort_by(|a, b| a.entity_pk.cmp(&b.entity_pk));
 
     let reconstructed = apply_projection(projected);
     let expected: Value = serde_json::from_str(after_json).expect("expected JSON should parse");

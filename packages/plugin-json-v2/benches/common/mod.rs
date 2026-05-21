@@ -105,7 +105,7 @@ pub fn merge_latest_state_rows(
                 continue;
             }
             latest.insert(
-                (change.schema_key.clone(), change.entity_id.clone()),
+                (change.schema_key.clone(), change.entity_pk.clone()),
                 change,
             );
         }

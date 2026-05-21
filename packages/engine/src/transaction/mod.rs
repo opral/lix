@@ -1,3 +1,5 @@
+#[cfg(feature = "storage-benches")]
+mod bench_support;
 mod commit;
 mod context;
 mod normalization;
@@ -6,6 +8,11 @@ mod schema_resolver;
 mod staging;
 pub(crate) mod types;
 mod validation;
+
+#[cfg(feature = "storage-benches")]
+pub mod bench {
+    pub use super::bench_support::*;
+}
 
 pub(crate) use context::begin_commit_boundary;
 pub(crate) use context::commit_at_boundary;

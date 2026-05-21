@@ -27,59 +27,59 @@ fn main() {
 }
 
 fn cpu_scorecard() -> Result<Vec<(&'static str, Duration)>, LixError> {
-    let segment = changelog_bench::segment_1c_1000ch()?;
-    let encoded = changelog_bench::encode_bench_segment(&segment)?;
+    let append = changelog_bench::append_1c_1000ch()?;
+    let encoded = changelog_bench::encode_bench_append(&append)?;
     let samples = 10;
 
     Ok(vec![
         (
-            "encode_segment / 1c_1000ch",
+            "encode_append / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::encode_bench_segment(&segment)?);
+                black_box(changelog_bench::encode_bench_append(&append)?);
                 Ok(())
             })?,
         ),
         (
-            "decode_segment / 1c_1000ch",
+            "decode_append / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::decode_bench_segment(&encoded)?);
+                black_box(changelog_bench::decode_bench_append(&encoded)?);
                 Ok(())
             })?,
         ),
         (
-            "view_segment / 1c_1000ch",
+            "view_append / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::view_bench_segment(&encoded)?);
+                black_box(changelog_bench::view_bench_append(&encoded)?);
                 Ok(())
             })?,
         ),
         (
-            "validate_segment_shape / 1c_1000ch",
+            "validate_append_shape / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::validate_bench_segment_shape(&segment)?);
+                black_box(changelog_bench::validate_bench_append_shape(&append)?);
                 Ok(())
             })?,
         ),
         (
-            "build_decoded_segment_index / 1c_1000ch",
+            "build_decoded_append_index / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::build_decoded_segment_index(&segment)?);
+                black_box(changelog_bench::build_decoded_append_index(&append)?);
                 Ok(())
             })?,
         ),
         (
-            "build_by_change / 1c_1000ch",
+            "build_direct_change_records / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::build_by_change_entries(&segment)?);
+                black_box(changelog_bench::build_direct_change_record_entries(
+                    &append,
+                )?);
                 Ok(())
             })?,
         ),
         (
-            "build_by_change_membership / 1c_1000ch",
+            "build_commit_change_refs / 1c_1000ch",
             measure_cpu(samples, || {
-                black_box(changelog_bench::build_by_change_membership_entries(
-                    &segment,
-                ));
+                black_box(changelog_bench::build_commit_change_ref_entries(&append));
                 Ok(())
             })?,
         ),
@@ -92,14 +92,14 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "stage_segment_raw_no_indexes / 1c_1000ch",
+            "stage_append_raw_no_indexes / 1c_1000ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let segment = changelog_bench::segment_1c_1000ch()?;
+                    let append = changelog_bench::append_1c_1000ch()?;
                     let start = Instant::now();
                     black_box(
-                        changelog_bench::stage_segment_raw_once(backend.create(), &segment).await?,
+                        changelog_bench::stage_append_raw_once(backend.create(), &append).await?,
                     );
                     Ok(start.elapsed())
                 })
@@ -109,11 +109,11 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     );
 
     rows.push(
-        backend_row("stage_segment / 1c_1000ch", samples, |backend| {
+        backend_row("stage_append / 1c_1000ch", samples, |backend| {
             Box::pin(async move {
-                let segment = changelog_bench::segment_1c_1000ch()?;
+                let append = changelog_bench::append_1c_1000ch()?;
                 let start = Instant::now();
-                black_box(changelog_bench::stage_segment_once(backend.create(), &segment).await?);
+                black_box(changelog_bench::stage_append_once(backend.create(), &append).await?);
                 Ok(start.elapsed())
             })
         })
@@ -121,25 +121,25 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     );
 
     rows.push(
-        stage_publish_row(
-            "stage_publish_commit / 1c_1ch",
-            || changelog_bench::segment_1c_1ch(),
+        stage_commit_noop_row(
+            "stage_commit_noop / 1c_1ch",
+            || changelog_bench::append_1c_1ch(),
             samples,
         )
         .await?,
     );
     rows.push(
-        stage_publish_row(
-            "stage_publish_commit / 1c_100ch",
-            || changelog_bench::segment_1c_100ch(),
+        stage_commit_noop_row(
+            "stage_commit_noop / 1c_100ch",
+            || changelog_bench::append_1c_100ch(),
             samples,
         )
         .await?,
     );
     rows.push(
-        stage_publish_row(
-            "stage_publish_commit / 1c_1000ch single-shot",
-            || changelog_bench::segment_1c_1000ch(),
+        stage_commit_noop_row(
+            "stage_commit_noop / 1c_1000ch single-shot",
+            || changelog_bench::append_1c_1000ch(),
             1,
         )
         .await?,
@@ -147,16 +147,15 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "load_commits_visible_batched / 1c_100ch",
+            "load_commits_direct_batched / 1c_100ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let segment = changelog_bench::segment_1c_100ch()?;
-                    let store =
-                        changelog_bench::prepare_store(backend.create(), &segment, true).await?;
-                    let commit_ids = segment.commit_ids();
+                    let append = changelog_bench::append_1c_100ch()?;
+                    let store = changelog_bench::prepare_store(backend.create(), &append).await?;
+                    let commit_ids = append.commit_ids();
                     let start = Instant::now();
-                    black_box(changelog_bench::load_commits_visible(&store, &commit_ids).await?);
+                    black_box(changelog_bench::load_commits_direct(&store, &commit_ids).await?);
                     Ok(start.elapsed())
                 })
             },
@@ -166,16 +165,15 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "load_changes_visible_batched / 1c_100ch",
+            "load_changes_direct_batched / 1c_100ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let segment = changelog_bench::segment_1c_100ch()?;
-                    let store =
-                        changelog_bench::prepare_store(backend.create(), &segment, true).await?;
-                    let change_ids = segment.change_ids();
+                    let append = changelog_bench::append_1c_100ch()?;
+                    let store = changelog_bench::prepare_store(backend.create(), &append).await?;
+                    let change_ids = append.change_ids();
                     let start = Instant::now();
-                    black_box(changelog_bench::load_changes_visible(&store, &change_ids).await?);
+                    black_box(changelog_bench::load_changes_direct(&store, &change_ids).await?);
                     Ok(start.elapsed())
                 })
             },
@@ -185,16 +183,15 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "load_changes_visible_batched / 1c_1000ch",
+            "load_changes_direct_batched / 1c_1000ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let segment = changelog_bench::segment_1c_1000ch()?;
-                    let store =
-                        changelog_bench::prepare_store(backend.create(), &segment, true).await?;
-                    let change_ids = segment.change_ids();
+                    let append = changelog_bench::append_1c_1000ch()?;
+                    let store = changelog_bench::prepare_store(backend.create(), &append).await?;
+                    let change_ids = append.change_ids();
                     let start = Instant::now();
-                    black_box(changelog_bench::load_changes_visible(&store, &change_ids).await?);
+                    black_box(changelog_bench::load_changes_direct(&store, &change_ids).await?);
                     Ok(start.elapsed())
                 })
             },
@@ -204,17 +201,18 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "load_changes_physical_scattered / 100seg_100c_1000ch",
+            "load_changes_direct_by_id_scattered / 100append_100c_1000ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let corpus = changelog_bench::corpus_100seg_100c_1000ch()?;
+                    let corpus = changelog_bench::corpus_100append_100c_1000ch()?;
                     let store =
-                        changelog_bench::prepare_corpus_store(backend.create(), &corpus, false)
-                            .await?;
+                        changelog_bench::prepare_corpus_store(backend.create(), &corpus).await?;
                     let change_ids = corpus.change_ids().to_vec();
                     let start = Instant::now();
-                    black_box(changelog_bench::load_changes_physical(&store, &change_ids).await?);
+                    black_box(
+                        changelog_bench::load_changes_direct_by_id(&store, &change_ids).await?,
+                    );
                     Ok(start.elapsed())
                 })
             },
@@ -224,17 +222,16 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "load_changes_visible_scattered / 100seg_100c_1000ch",
+            "load_changes_direct_scattered / 100append_100c_1000ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let corpus = changelog_bench::corpus_100seg_100c_1000ch()?;
+                    let corpus = changelog_bench::corpus_100append_100c_1000ch()?;
                     let store =
-                        changelog_bench::prepare_corpus_store(backend.create(), &corpus, true)
-                            .await?;
+                        changelog_bench::prepare_corpus_store(backend.create(), &corpus).await?;
                     let change_ids = corpus.change_ids().to_vec();
                     let start = Instant::now();
-                    black_box(changelog_bench::load_changes_visible(&store, &change_ids).await?);
+                    black_box(changelog_bench::load_changes_direct(&store, &change_ids).await?);
                     Ok(start.elapsed())
                 })
             },
@@ -244,11 +241,11 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
 
     rows.push(
         backend_row(
-            "rebuild_mandatory_indexes / 100seg_100c_1000ch",
+            "rebuild_mandatory_indexes / 100append_100c_1000ch",
             samples,
             |backend| {
                 Box::pin(async move {
-                    let corpus = changelog_bench::corpus_100seg_100c_1000ch()?;
+                    let corpus = changelog_bench::corpus_100append_100c_1000ch()?;
                     let store = changelog_bench::prepare_rebuild_store(
                         backend.create(),
                         &corpus,
@@ -265,21 +262,25 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     );
 
     rows.push(
-        backend_row("plan_gc / live_50pct_mixed_segments", samples, |backend| {
-            Box::pin(async move {
-                let (store, root_commit_id) =
-                    changelog_bench::prepare_gc_store(backend.create(), 50, 50, 10).await?;
-                let start = Instant::now();
-                black_box(changelog_bench::plan_gc(&store, &root_commit_id).await?);
-                Ok(start.elapsed())
-            })
-        })
+        backend_row(
+            "plan_gc / live_50pct_mixed_append_batches",
+            samples,
+            |backend| {
+                Box::pin(async move {
+                    let (store, root_commit_id) =
+                        changelog_bench::prepare_gc_store(backend.create(), 50, 50, 10).await?;
+                    let start = Instant::now();
+                    black_box(changelog_bench::plan_gc(&store, &root_commit_id).await?);
+                    Ok(start.elapsed())
+                })
+            },
+        )
         .await?,
     );
 
     rows.push(
         backend_row(
-            "collect_garbage / live_50pct_mixed_segments",
+            "collect_garbage / live_50pct_mixed_append_batches",
             samples,
             |backend| {
                 Box::pin(async move {
@@ -297,19 +298,17 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     Ok(rows)
 }
 
-async fn stage_publish_row(
+async fn stage_commit_noop_row(
     label: &'static str,
-    segment: fn() -> Result<changelog_bench::BenchSegment, LixError>,
+    append: fn() -> Result<changelog_bench::BenchAppend, LixError>,
     samples: usize,
 ) -> Result<BackendScoreRow, LixError> {
     backend_row(label, samples, move |backend| {
         Box::pin(async move {
-            let segment = segment()?;
-            let store = changelog_bench::prepare_store(backend.create(), &segment, false).await?;
+            let append = append()?;
+            let store = changelog_bench::prepare_store(backend.create(), &append).await?;
             let start = Instant::now();
-            black_box(
-                changelog_bench::stage_publish_first_commit_in_store(&store, &segment).await?,
-            );
+            black_box(changelog_bench::stage_first_commit_noop_in_store(&store, &append).await?);
             Ok(start.elapsed())
         })
     })
@@ -382,7 +381,7 @@ struct BackendScoreRow {
 }
 
 fn print_scorecard(cpu: &[(&'static str, Duration)], backend: &[BackendScoreRow]) {
-    println!("## CPU Segment Scoreboard");
+    println!("## CPU Append Scoreboard");
     println!();
     println!("| row | baseline_ms |");
     println!("| --- | ---: |");

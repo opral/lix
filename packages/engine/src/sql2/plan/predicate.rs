@@ -13,6 +13,8 @@ pub(crate) enum BoundPredicate {
     And(Vec<BoundPredicate>),
     Or(Vec<BoundPredicate>),
     Eq(BoundExpr, BoundExpr),
+    IsNull(BoundExpr),
+    IsNotNull(BoundExpr),
     In {
         expr: BoundExpr,
         values: Vec<BoundExpr>,

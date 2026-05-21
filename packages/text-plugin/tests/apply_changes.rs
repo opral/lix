@@ -33,7 +33,7 @@ fn supports_binary_bytes() {
 #[test]
 fn rejects_missing_document_snapshot() {
     let changes = vec![PluginEntityChange {
-        entity_id: "line:abc:0".to_string(),
+        entity_pk: "line:abc:0".to_string(),
         schema_key: LINE_SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"content_base64":"YQ==","ending":"\n"}"#.to_string()),
     }];

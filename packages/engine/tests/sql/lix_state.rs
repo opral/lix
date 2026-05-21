@@ -17,7 +17,7 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
              lix_json('[\"state-latest\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-latest\",\"value\":\"old\"}'), false, false\
              )",
@@ -29,7 +29,7 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
         .execute(
             "UPDATE lix_state \
              SET snapshot_content = lix_json('{\"key\":\"state-latest\",\"value\":\"new\"}') \
-             WHERE entity_id = lix_json('[\"state-latest\"]') AND schema_key = 'lix_key_value'",
+             WHERE entity_pk = lix_json('[\"state-latest\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -39,7 +39,7 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
         .execute(
             "SELECT snapshot_content \
              FROM lix_state \
-             WHERE entity_id = lix_json('[\"state-latest\"]') AND schema_key = 'lix_key_value'",
+             WHERE entity_pk = lix_json('[\"state-latest\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -60,7 +60,7 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
              lix_json('[\"state-delete\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-delete\",\"value\":\"delete-me\"}'), false, false\
              )",
@@ -71,7 +71,7 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
     session
         .execute(
             "DELETE FROM lix_state \
-             WHERE entity_id = lix_json('[\"state-delete\"]') AND schema_key = 'lix_key_value'",
+             WHERE entity_pk = lix_json('[\"state-delete\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -79,9 +79,9 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT entity_id \
+            "SELECT entity_pk \
              FROM lix_state \
-             WHERE entity_id = lix_json('[\"state-delete\"]') AND schema_key = 'lix_key_value'",
+             WHERE entity_pk = lix_json('[\"state-delete\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -105,7 +105,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
                  ('[\"state-repeat-a\"]', 'lix_key_value', NULL, '{\"key\":\"state-repeat-a\",\"value\":\"a\"}', false, false), \
                  ('[\"state-repeat-b\"]', 'lix_key_value', NULL, '{\"key\":\"state-repeat-b\",\"value\":\"b\"}', false, false)",
@@ -118,9 +118,9 @@ simulation_test!(
             .execute(
                 "UPDATE lix_state \
                  SET snapshot_content = '{\"key\":\"state-repeat-b\",\"value\":\"wrong\"}' \
-                 WHERE entity_id = '[\"state-repeat-a\"]' \
+                 WHERE entity_pk = '[\"state-repeat-a\"]' \
                    AND schema_key = 'lix_key_value' \
-                   AND entity_id = '[\"state-repeat-b\"]'",
+                   AND entity_pk = '[\"state-repeat-b\"]'",
                 &[],
             )
             .await
@@ -131,7 +131,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-repeat-b\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-repeat-b\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -165,7 +165,7 @@ simulation_test!(
                 "UPDATE lix_state \
                  SET snapshot_content = lix_json('{\"key\":\"state-json-text\",\"value\":\"after\"}') \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = '[ \"state-json-text\" ]'",
+                   AND entity_pk = '[ \"state-json-text\" ]'",
                 &[],
             )
             .await
@@ -202,7 +202,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
                  ('[\"state-tx-repeat-a\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-repeat-a\",\"value\":\"a\"}', false, false), \
                  ('[\"state-tx-repeat-b\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-repeat-b\",\"value\":\"b\"}', false, false)",
@@ -215,9 +215,9 @@ simulation_test!(
             .execute(
                 "UPDATE lix_state \
                  SET snapshot_content = '{\"key\":\"state-tx-repeat-b\",\"value\":\"wrong\"}' \
-                 WHERE entity_id = '[\"state-tx-repeat-a\"]' \
+                 WHERE entity_pk = '[\"state-tx-repeat-a\"]' \
                    AND schema_key = 'lix_key_value' \
-                   AND entity_id = '[\"state-tx-repeat-b\"]'",
+                   AND entity_pk = '[\"state-tx-repeat-b\"]'",
                 &[],
             )
             .await
@@ -228,7 +228,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-tx-repeat-b\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-tx-repeat-b\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -252,7 +252,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
                  ('[\"state-delete-repeat-a\"]', 'lix_key_value', NULL, '{\"key\":\"state-delete-repeat-a\",\"value\":\"a\"}', false, false), \
                  ('[\"state-delete-repeat-b\"]', 'lix_key_value', NULL, '{\"key\":\"state-delete-repeat-b\",\"value\":\"b\"}', false, false)",
@@ -264,9 +264,9 @@ simulation_test!(
         let result = session
             .execute(
                 "DELETE FROM lix_state \
-                 WHERE entity_id = '[\"state-delete-repeat-a\"]' \
+                 WHERE entity_pk = '[\"state-delete-repeat-a\"]' \
                    AND schema_key = 'lix_key_value' \
-                   AND entity_id = '[\"state-delete-repeat-b\"]'",
+                   AND entity_pk = '[\"state-delete-repeat-b\"]'",
                 &[],
             )
             .await
@@ -277,7 +277,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-delete-repeat-b\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-delete-repeat-b\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -308,7 +308,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  '[\"state-tx-global\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-global\",\"value\":\"global\"}', true, false\
                  )",
@@ -321,7 +321,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-tx-global\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-tx-global\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -332,7 +332,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_state \
                  SET snapshot_content = '{\"key\":\"state-tx-global\",\"value\":\"updated\"}' \
-                 WHERE entity_id = '[\"state-tx-global\"]' AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = '[\"state-tx-global\"]' AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -343,7 +343,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-tx-global\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-tx-global\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -370,7 +370,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  '[\"state-tx-global-shadowed\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-global-shadowed\",\"value\":\"active\"}', false, false\
                  )",
@@ -386,7 +386,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  '[\"state-tx-global-shadowed\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-global-shadowed\",\"value\":\"global\"}', true, false\
                  )",
@@ -399,7 +399,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-tx-global-shadowed\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-tx-global-shadowed\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -426,7 +426,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  lix_json('[\"state-global-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-overlay\",\"value\":\"global\"}'), true, false\
                  )",
@@ -437,9 +437,9 @@ simulation_test!(
 
         let active_result = session
             .execute(
-                "SELECT entity_id, global, untracked \
+                "SELECT entity_pk, global, untracked \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -456,9 +456,9 @@ simulation_test!(
         let by_version_result = session
             .execute(
                 &format!(
-                    "SELECT entity_id, version_id, global, untracked \
+                    "SELECT entity_pk, version_id, global, untracked \
                  FROM lix_state_by_version \
-                 WHERE entity_id = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value' \
+                 WHERE entity_pk = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value' \
                  AND version_id IN ('{}', 'global') \
                  ORDER BY version_id",
                     sim.main_version_id()
@@ -502,7 +502,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-tombstone-overlay\",\"value\":\"global\"}'), true, false\
                  )",
@@ -513,7 +513,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, NULL, false, false\
                  )",
@@ -524,9 +524,9 @@ simulation_test!(
 
         let active_result = session
             .execute(
-                "SELECT entity_id \
+                "SELECT entity_pk \
                  FROM lix_state \
-                 WHERE entity_id = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value'",
+                 WHERE entity_pk = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -536,9 +536,9 @@ simulation_test!(
         let by_version_result = session
             .execute(
                 &format!(
-                    "SELECT entity_id, version_id, global, untracked \
+                    "SELECT entity_pk, version_id, global, untracked \
                      FROM lix_state_by_version \
-                     WHERE entity_id = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value' \
+                     WHERE entity_pk = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value' \
                      AND version_id IN ('{}', 'global') \
                      ORDER BY version_id",
                     sim.main_version_id()

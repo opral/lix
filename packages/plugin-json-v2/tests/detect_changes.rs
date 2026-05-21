@@ -26,7 +26,7 @@ fn detects_root_insert() {
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].entity_id, "/City");
+    assert_eq!(changes[0].entity_pk, "/City");
     assert_eq!(changes[0].schema_key, SCHEMA_KEY);
     assert_eq!(
         parse_snapshot_value_from_change(&changes[0]),
@@ -42,12 +42,12 @@ fn detects_nested_array_updates_and_deletions() {
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].entity_id, "/list/1");
+    assert_eq!(changes[0].entity_pk, "/list/1");
     assert_eq!(
         parse_snapshot_value_from_change(&changes[0]),
         Value::String("x".to_string())
     );
-    assert_eq!(changes[1].entity_id, "/list/2");
+    assert_eq!(changes[1].entity_pk, "/list/2");
     assert_eq!(changes[1].snapshot_content, None);
 }
 
@@ -59,9 +59,9 @@ fn detects_container_replacement() {
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].entity_id, "/a/x");
+    assert_eq!(changes[0].entity_pk, "/a/x");
     assert_eq!(changes[0].snapshot_content, None);
-    assert_eq!(changes[1].entity_id, "/a");
+    assert_eq!(changes[1].entity_pk, "/a");
     assert_eq!(
         parse_snapshot_value_from_change(&changes[1]),
         Value::Number(2.into())
@@ -75,12 +75,12 @@ fn handles_file_creation_without_synthetic_root_deletion() {
     let changes = detect_changes(None, after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].entity_id, "");
+    assert_eq!(changes[0].entity_pk, "");
     assert_eq!(
         parse_snapshot_value_from_change(&changes[0]),
         Value::Object(serde_json::Map::new())
     );
-    assert_eq!(changes[1].entity_id, "/Name");
+    assert_eq!(changes[1].entity_pk, "/Name");
     assert_eq!(
         parse_snapshot_value_from_change(&changes[1]),
         Value::String("Anna".to_string())
@@ -95,11 +95,11 @@ fn detects_multi_delete_array_in_descending_order() {
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 3);
-    assert_eq!(changes[0].entity_id, "/list/3");
+    assert_eq!(changes[0].entity_pk, "/list/3");
     assert_eq!(changes[0].snapshot_content, None);
-    assert_eq!(changes[1].entity_id, "/list/2");
+    assert_eq!(changes[1].entity_pk, "/list/2");
     assert_eq!(changes[1].snapshot_content, None);
-    assert_eq!(changes[2].entity_id, "/list/1");
+    assert_eq!(changes[2].entity_pk, "/list/1");
     assert_eq!(changes[2].snapshot_content, None);
 }
 
@@ -111,9 +111,9 @@ fn deleting_non_empty_container_emits_subtree_tombstones() {
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 2);
-    assert_eq!(changes[0].entity_id, "/a");
+    assert_eq!(changes[0].entity_pk, "/a");
     assert_eq!(changes[0].snapshot_content, None);
-    assert_eq!(changes[1].entity_id, "/a/b");
+    assert_eq!(changes[1].entity_pk, "/a/b");
     assert_eq!(changes[1].snapshot_content, None);
 }
 
@@ -125,11 +125,11 @@ fn replacing_non_empty_container_with_scalar_tombstones_subtree() {
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
     assert_eq!(changes.len(), 3);
-    assert_eq!(changes[0].entity_id, "/a");
+    assert_eq!(changes[0].entity_pk, "/a");
     assert_eq!(changes[0].snapshot_content, None);
-    assert_eq!(changes[1].entity_id, "/a/b");
+    assert_eq!(changes[1].entity_pk, "/a/b");
     assert_eq!(changes[1].snapshot_content, None);
-    assert_eq!(changes[2].entity_id, "");
+    assert_eq!(changes[2].entity_pk, "");
     assert_eq!(
         parse_snapshot_value_from_change(&changes[2]),
         Value::Number(2.into())
@@ -146,14 +146,14 @@ fn deleting_whole_object_property_emits_subtree_tombstones() {
     let after = file_from_json("f1", "/x.json", r#"{"keep":1}"#);
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
-    let mut entity_ids = changes
+    let mut entity_pks = changes
         .iter()
-        .map(|change| change.entity_id.as_str())
+        .map(|change| change.entity_pk.as_str())
         .collect::<Vec<_>>();
-    entity_ids.sort_unstable();
+    entity_pks.sort_unstable();
 
     assert_eq!(
-        entity_ids,
+        entity_pks,
         vec!["/obj", "/obj/k", "/obj/nested", "/obj/nested/z"]
     );
     assert!(changes
@@ -167,14 +167,14 @@ fn deleting_whole_array_property_emits_subtree_tombstones() {
     let after = file_from_json("f1", "/x.json", r#"{"keep":1}"#);
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
-    let mut entity_ids = changes
+    let mut entity_pks = changes
         .iter()
-        .map(|change| change.entity_id.as_str())
+        .map(|change| change.entity_pk.as_str())
         .collect::<Vec<_>>();
-    entity_ids.sort_unstable();
+    entity_pks.sort_unstable();
 
     assert_eq!(
-        entity_ids,
+        entity_pks,
         vec!["/arr", "/arr/0", "/arr/0/x", "/arr/1", "/arr/2"]
     );
     assert!(changes
@@ -188,13 +188,13 @@ fn deleting_nested_subtree_emits_all_descendant_tombstones() {
     let after = file_from_json("f1", "/x.json", r#"{"a":{"e":3},"x":0}"#);
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
-    let mut entity_ids = changes
+    let mut entity_pks = changes
         .iter()
-        .map(|change| change.entity_id.as_str())
+        .map(|change| change.entity_pk.as_str())
         .collect::<Vec<_>>();
-    entity_ids.sort_unstable();
+    entity_pks.sort_unstable();
 
-    assert_eq!(entity_ids, vec!["/a/b", "/a/b/c", "/a/b/d"]);
+    assert_eq!(entity_pks, vec!["/a/b", "/a/b/c", "/a/b/d"]);
     assert!(changes
         .iter()
         .all(|change| change.snapshot_content.is_none()));
