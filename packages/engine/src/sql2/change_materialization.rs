@@ -1,11 +1,15 @@
-use crate::changelog::SegmentInlinePayload;
-use crate::commit_graph::LocatedChange;
+use crate::changelog::ChangeRecord;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
 use crate::storage::StorageRead;
 use crate::{parse_row_metadata, LixError};
 
 /// Read-boundary view of a changelog change with JSON refs resolved.
+///
+/// `lix_change` materializes direct durable `changelog.change` facts and
+/// derived `lix_commit` changes from `changelog.commit`. History surfaces
+/// materialize reachability-aware commit-graph changes, while traversal context
+/// stays outside this row shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
@@ -17,25 +21,54 @@ pub(crate) struct MaterializedChange {
     pub(crate) created_at: String,
 }
 
-pub(crate) async fn materialize_changelog_change<S>(
+pub(crate) async fn materialize_located_history_change<S>(
     json_reader: &mut JsonStoreReader<S>,
-    located: LocatedChange,
+    change: crate::commit_graph::CommitGraphChange,
 ) -> Result<MaterializedChange, LixError>
 where
     S: StorageRead,
 {
-    let change = located.record;
+    materialize_commit_graph_change(json_reader, change).await
+}
+
+pub(crate) async fn materialize_changelog_change_record<S>(
+    json_reader: &mut JsonStoreReader<S>,
+    change: ChangeRecord,
+) -> Result<MaterializedChange, LixError>
+where
+    S: StorageRead,
+{
+    materialize_commit_graph_change(
+        json_reader,
+        crate::commit_graph::CommitGraphChange {
+            id: change.change_id,
+            entity_id: change.entity_id,
+            schema_key: change.schema_key,
+            file_id: change.file_id,
+            snapshot_ref: change.snapshot_ref,
+            metadata_ref: change.metadata_ref,
+            created_at: change.created_at,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn materialize_commit_graph_change<S>(
+    json_reader: &mut JsonStoreReader<S>,
+    change: crate::commit_graph::CommitGraphChange,
+) -> Result<MaterializedChange, LixError>
+where
+    S: StorageRead,
+{
     let snapshot_content = load_optional_changelog_json_text(
         json_reader,
         change.snapshot_ref.as_ref(),
-        &located.inline_payloads,
         "snapshot_ref",
     )
     .await?;
     let metadata = match load_optional_changelog_json_text(
         json_reader,
         change.metadata_ref.as_ref(),
-        &located.inline_payloads,
         "metadata_ref",
     )
     .await?
@@ -57,7 +90,6 @@ where
 async fn load_optional_changelog_json_text<S>(
     json_reader: &mut JsonStoreReader<S>,
     json_ref: Option<&JsonRef>,
-    inline_payloads: &[SegmentInlinePayload],
     field: &str,
 ) -> Result<Option<String>, LixError>
 where
@@ -66,20 +98,6 @@ where
     let Some(json_ref) = json_ref else {
         return Ok(None);
     };
-    if let Some(payload) = inline_payloads
-        .iter()
-        .find(|payload| &payload.json_ref == json_ref)
-    {
-        return String::from_utf8(payload.bytes.clone())
-            .map(Some)
-            .map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("changelog change {field} is not UTF-8 JSON: {error}"),
-                )
-            });
-    }
-
     let batch = json_reader
         .load_bytes_many(JsonLoadRequestRef {
             refs: std::slice::from_ref(json_ref),

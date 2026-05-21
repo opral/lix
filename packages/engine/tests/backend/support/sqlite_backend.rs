@@ -25,7 +25,6 @@ pub struct SqliteBackendFactory {
 #[derive(Clone, Debug)]
 pub struct SqliteBackendFixture {
     path: PathBuf,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -76,10 +75,7 @@ impl BackendFactory for SqliteBackendFactory {
             .temp_dir
             .path()
             .join(format!("backend-{database_id}.sqlite"));
-        SqliteBackendFixture {
-            durable_write_lock: durable_write_lock_for_path(&path),
-            path,
-        }
+        SqliteBackendFixture { path }
     }
 
     fn config(&self) -> BackendTestConfig {
@@ -95,8 +91,7 @@ impl BackendFixture for SqliteBackendFixture {
     type Backend = SqliteBackend;
 
     fn open(&self) -> Self::Backend {
-        SqliteBackend::open_with_write_lock(&self.path, self.durable_write_lock.clone())
-            .expect("open sqlite backend")
+        SqliteBackend::open(&self.path).expect("open sqlite backend")
     }
 }
 
@@ -104,14 +99,6 @@ impl SqliteBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
         let durable_write_lock = durable_write_lock_for_path(&path);
-        Self::open_with_write_lock(path, durable_write_lock)
-    }
-
-    fn open_with_write_lock(
-        path: impl Into<PathBuf>,
-        durable_write_lock: DurableWriteLock,
-    ) -> Result<Self, BackendError> {
-        let path = path.into();
         initialize_database(&path)?;
         Ok(Self {
             path,

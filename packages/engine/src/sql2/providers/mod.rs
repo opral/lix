@@ -268,7 +268,7 @@ mod tests {
 
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
-        CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
+        CommitGraphReader, ReachableCommitGraphCommit,
     };
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
@@ -490,38 +490,11 @@ mod tests {
             Ok(None)
         }
 
-        async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
-            Ok(Vec::new())
-        }
-
         async fn reachable_commits(
             &mut self,
             _head_commit_id: &str,
         ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
             Ok(Vec::new())
-        }
-
-        async fn best_common_ancestors(
-            &mut self,
-            _left_commit_id: &str,
-            _right_commit_id: &str,
-        ) -> Result<Vec<CommitGraphCommit>, LixError> {
-            Ok(Vec::new())
-        }
-
-        async fn merge_base(
-            &mut self,
-            _left_commit_id: &str,
-            _right_commit_id: &str,
-        ) -> Result<CommitGraphCommit, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "empty commit graph reader cannot resolve merge base",
-            ))
-        }
-
-        fn commit_edges(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
-            Vec::new()
         }
 
         async fn change_history_from_commit(

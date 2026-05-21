@@ -5,7 +5,7 @@ use serde_json::json;
 
 use super::select_rows;
 
-simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
+simulation_test!(lix_change_queries_durable_change_facts, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine

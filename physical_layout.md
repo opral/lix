@@ -1,9 +1,9 @@
 # Physical Layout
 
 This document is the hard-cut physical layout target for tracked Lix state.
-It separates durable changelog facts, direct lookup indexes, and derived state
-read models. Compaction and packing are later storage optimizations, not the
-core truth shape.
+It separates durable changelog facts, untracked version refs, and derived
+state read models. Compaction, packing, and reachability accelerators are
+later storage optimizations, not the core truth shape.
 
 ## Summary
 
@@ -17,13 +17,12 @@ core truth shape.
 │ changelog.change              change_id -> ChangeRecord      │
 │ json_store.json               json_ref -> JSON bytes         │
 └───────────────────────────────┬──────────────────────────────┘
-                                │ referenced by versions / projected into state
+                                │ referenced by versions / folded into commit roots
                                 ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ untracked state / reachability plane                         │
+│ untracked version-ref plane                                  │
 ├──────────────────────────────────────────────────────────────┤
 │ untracked_state.row          version refs, workspace refs     │
-│ optional reachability/history indexes                        │
 └───────────────────────────────┬──────────────────────────────┘
                                 │ derived serving state
                                 ▼
@@ -88,11 +87,12 @@ Mental model:
 ```text
 changelog.commit
   directly keyed catalog object for one Lix Commit
-  contains logical commit header, parents, commit row change, and author metadata
+  contains logical commit header, parents, derived commit row change_id, and
+  author metadata
 
 changelog.commit_change_ref_chunk
   directly keyed semantic chunk of commit change refs for one commit
-  represents commit_id -> set<change_id>
+  represents commit_id -> set<ordinary row/entity change_id>
   ordered by schema_key, file_id, and entity_id in the canonical layout
 
 changelog.change
@@ -203,7 +203,7 @@ value:
   normalized JSON bytes
 ```
 
-Untracked refs and optional accelerators:
+Untracked version refs:
 
 ```text
 space: untracked_state.row
@@ -215,34 +215,6 @@ value:
 
 Version refs are `lix_version_ref` rows inside `untracked_state.row`. They are
 moving pointers and reachability roots, not changelog truth.
-
-The optional indexes below are not part of the MVP write path. They are
-rebuildable extension points for product paths that need global reachability,
-key history, or ancestry acceleration.
-
-```text
-space: changelog.index.change_reachability
-key:
-  change_id | commit_id
-value:
-  commit_change_ref_chunk_no | entry_ordinal
-```
-
-```text
-space: changelog.index.key_history
-key:
-  schema_key | file_id | entity_id | commit_id
-value:
-  change_id
-```
-
-```text
-space: changelog.index.commit_ancestry
-key:
-  commit_id | ancestor/skip marker
-value:
-  ancestor_commit_id
-```
 
 Direct `commit_id` and `change_id` lookup do not require locator indexes in the
 MVP layout because `changelog.commit` and `changelog.change` are keyed by those
@@ -321,9 +293,11 @@ schema_key + file_id + entity_id
 Commit and change identity:
 
 ```text
-CommitRecord.change_id is the commit's own change id for the lix_commit projection.
+CommitRecord.change_id is the commit's derived change id for the `lix_commit`
+row. It is not stored as a changelog.change record and is not listed in the
+commit's commit_change_ref_chunks.
 changelog.change objects are first-class row/entity changes.
-CommitChangeRefChunk entries reference change_id.
+CommitChangeRefChunk entries reference ordinary changelog.change ids.
 tracked_state.tree_chunk leaves reference change_id.
 change_id is logical row-change identity, not physical placement.
 json_ref is payload/content identity.
@@ -334,13 +308,23 @@ Change reachability:
 
 ```text
 A raw changelog.change hit proves durable physical truth only. It does not prove
-the change is reachable from any commit or version ref.
+the change is reachable from any commit or version ref. A commit's derived
+`lix_commit` change is instead proven by loading changelog.commit and reading
+CommitRecord.change_id.
 
 A change is reachable from commit C only when C's change refs contain the
-change_id. A change is reachable from a version ref only when the ref's
-commit ancestry contains a commit whose change refs contain the change_id.
-Optional reachability indexes return candidates only; readers still validate
-through commit records and commit change-ref chunks.
+change_id, except for C's own derived `lix_commit` row, which is reachable from
+C by definition. A change is reachable from a version ref only when the ref's
+commit ancestry contains a commit whose change refs contain the change_id, or
+when the change_id is that commit's CommitRecord.change_id.
+```
+
+SQL surfaces:
+
+```text
+lix_change is the unscoped durable change surface: direct changelog.change
+records plus derived `lix_commit` changes from changelog.commit.
+Reachability-aware reads belong to history routes.
 ```
 
 Commit change refs:
@@ -349,13 +333,14 @@ Commit change refs:
 Within one logical changelog.commit, commit change refs are coalesced to at most
 one winning change_id per schema_key + file_id + entity_id tuple. They are
 references to `changelog.change` records, not embedded ChangeRecord bytes, and
-there is no separate commit-level set object or id in the physical layout.
+there is no separate commit-level set object or id in the physical layout. The
+commit's own derived `lix_commit` row is not part of this ref stream.
 
 Multiple writes to the same schema_key + file_id + entity_id tuple within one
 transaction produce one net durable changelog.change for the tracked state model.
 
 Commit change-ref chunks are canonical in schema_key, file_id, entity_id order.
-This favors merge planning, conflict checks, projection rebuild, and branch diff.
+This favors merge planning, conflict checks, commit-root rebuild, and branch diff.
 
 If an operation log is later needed for audit, it is a separate object and not
 part of tracked_state tree semantics.
@@ -373,7 +358,7 @@ Lix separates row-change identity from payload identity:
 ```text
 change_id
   addresses the exact row/entity change
-  optimized for merge planning, projection rebuild, GC, and direct truth
+  optimized for merge planning, commit-root rebuild, GC, and direct truth
   hydration
 
 json_ref
@@ -462,9 +447,10 @@ schema_key + file_id + entity_id ->
   optional scalar/header cache
 ```
 
-The cache values are copies of changelog truth. If they are missing, stale, or
-discarded, they are rebuilt from durable commit change refs and
-`changelog.change` facts. The primary key space is ordered by:
+The cache values are copies of changelog truth or derived commit facts. If they
+are missing, stale, or discarded, they are rebuilt from durable commit change
+refs, `changelog.change` facts, and derived `lix_commit` rows from
+`changelog.commit`. The primary key space is ordered by:
 
 ```text
 schema_key + file_id + entity_id
@@ -503,11 +489,14 @@ batch per commit. Tree bytes written are `O(T * node_bytes)`; scattered keys can
 `K * tree_height`. This is the write-amplification tradeoff for `O(log_B N)`
 reads and Dolt-style `O(D)` target diffs.
 
-A durable commit remains readable if its `tracked_state.commit_root` or
-`tracked_state.tree_chunk` objects are missing. The slow path rebuilds from the nearest
-available ancestor root plus durable commit change refs. If no ancestor
-root exists, rebuild starts from the initial root through reachable ancestry.
-Normal hot-path read bounds do not apply until the derived root is rebuilt.
+`tracked_state.commit_root` and `tracked_state.tree_chunk` are derived, but they
+are still the MVP serving read model. Ordinary tracked-state reads require the
+commit root and referenced tree chunks to exist. If they are missing, corrupt, or
+stale, an explicit commit-root rebuild/repair operation reconstructs them from
+the nearest available ancestor root plus durable commit records, commit change
+refs, and changelog.change records. If no ancestor root exists, rebuild starts
+from the initial root through first-parent ancestry. Normal hot-path read bounds
+apply after the derived root has been rebuilt.
 
 Prolly chunk boundaries are a function of schema_key, file_id, and entity_id
 only, not `change_id`, `snapshot_ref`, `metadata_ref`, or cached leaf values.
@@ -625,11 +614,8 @@ Global reachable-change query:
 
 ```text
 change_id
-  -> optional changelog.index.change_reachability candidates
+  -> scan reachable commit change refs from version refs
   -> validate candidate commit and commit change refs
-
-without changelog.index.change_reachability:
-  scan reachable commit change refs from version refs
 ```
 
 Commit change refs:
@@ -684,10 +670,10 @@ Reader contract:
 ```text
 Commit reads load `changelog.commit` directly by commit_id.
 
-Reachable change reads prove reachability through commit change refs and,
-when needed, version refs. They may use optional reachability indexes as
-accelerators, but must validate that the candidate commit exists and its
-change refs contain the change_id.
+Reachable ordinary change reads prove reachability through commit change refs
+and, when needed, version refs. A commit's derived `lix_commit` row is proven by
+its changelog.commit record. The MVP does not maintain a changelog reachability
+index; global reachability queries walk commit refs from version refs.
 
 Physical/debug reads can read changelog.commit or changelog.change directly by
 ID, but a raw changelog.change hit does not prove root reachability.
@@ -775,11 +761,8 @@ merge
   storage:           O(M + A), never O(N)
 
 ancestry / merge-base
-  parent edges: O(visited ancestors)
-  target O(log C) or better requires skip/closure index
-
-rebuild optional changelog indexes
-  O(R + C + commit change-ref entries)
+  walk CommitRecord.parent_commit_ids[]: O(visited ancestors)
+  child/descendant or skip/closure indexes are deferred
 
 rebuild tracked root for one commit
   from existing parent root: O(Q log_B N) naive, batched expected O(T + Q)
@@ -826,7 +809,6 @@ Derived retention:
 ```text
 tracked_state objects are retained only for reachable commits
 tracked_state never keeps changelog or payload facts alive
-optional changelog.index.* records keep nothing alive
 tracked_state.commit_root and tracked_state.tree_chunk are derived, rebuildable objects
 ```
 
@@ -856,19 +838,18 @@ lix_version_ref row in untracked_state.row
   -> json_store.json, for large/deduplicated payloads
 ```
 
-`tracked_state.*` and `changelog.index.*` keep nothing alive. They are retained
-only when attached to reachable commits and may be deleted/rebuilt.
+`tracked_state.*` keeps nothing alive. It is retained only when attached to
+reachable commits and may be deleted/rebuilt.
 
 | Case                                                                 | Keep                                                                                          | Sweep                                               | Note                                                                       |
 | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------- |
 | Reachable normal commit                                              | `changelog.commit`, commit change-ref chunks, referenced `changelog.change` objects, payloads | unrelated objects                                   | Standard mark path.                                                        |
 | Unreachable commit with no referenced changes                        | nothing after retention horizon                                                               | commit, commit change-ref chunks, changes, payloads | Retention horizon is policy, not layout.                                   |
 | Unreachable commit, reused change reachable                          | reused `changelog.change` and payloads                                                        | unrelated commits if otherwise unreachable          | Change reachability flows through commit change refs, not origin metadata. |
-| Reachable commit, missing `tracked_state.commit_root` or tree chunks | commit/change/payload truth                                                                   | missing root stays missing until rebuilt            | Reader rebuilds derived root from changelog facts.                         |
+| Reachable commit, missing `tracked_state.commit_root` or tree chunks | commit/change/payload truth                                                                   | missing root stays missing until rebuilt            | Explicit repair rebuilds derived root from changelog facts.                |
 | Reachable tree chunks, unreachable commit                            | nothing solely because of tree chunks                                                         | tree chunks/commit root may be swept                | Derived state is not a retention root.                                     |
 | Large JSON referenced by reachable change                            | `json_store.json` payload                                                                     | none                                                | Payload is in truth closure through `changelog.change`.                    |
 | Large JSON referenced only by unreachable change                     | none after retention horizon                                                                  | payload                                             | Sweep after no reachable change references it.                             |
-| Stale/missing optional index                                         | reachable truth objects                                                                       | stale index records                                 | Rebuild from changelog facts and reachable commits.                        |
 
 ## Clean Cuts
 
@@ -879,6 +860,5 @@ only when attached to reachable commits and may be deleted/rebuilt.
 4. Keep json_ref as payload/content identity and change_id as row-change identity.
 5. Use version refs as MVP reachability roots.
 6. Make tracked_state only a derived commit root plus tree chunks.
-7. Keep optional changelog indexes rebuildable and non-authoritative.
-8. Keep tracked-state repair flowing from durable changelog facts to derived roots.
+7. Keep tracked-state repair flowing from durable changelog facts to derived roots.
 ```

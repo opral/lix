@@ -136,33 +136,6 @@ pub(crate) async fn register_entity_write_providers(
     Ok(())
 }
 
-pub(crate) async fn register_entity_history_providers<S>(
-    ctx: &SessionContext,
-    commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlHistoryQuerySource<S>,
-    catalog: &PublicCatalog,
-) -> Result<(), LixError>
-where
-    S: StorageRead + Clone + Send + Sync + 'static,
-{
-    for surface in catalog.surfaces() {
-        if let PublicSurfaceKind::EntityHistory { schema_key } = &surface.kind {
-            let spec = catalog_entity_spec(catalog, schema_key)?;
-            ctx.register_table(
-                &surface.name,
-                Arc::new(EntityHistoryProvider::new(
-                    spec,
-                    Arc::clone(&commit_graph),
-                    query_source.clone(),
-                )),
-            )
-            .map_err(datafusion_error_to_lix_error)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn catalog_entity_spec(
     catalog: &PublicCatalog,
     schema_key: &str,

@@ -19,15 +19,15 @@ use datafusion::physical_plan::{
 use futures_util::stream;
 
 use crate::changelog::{
-    ChangeLoadEntry, ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, ChangelogContext,
-    CommitHeader, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitVisibilityMode,
+    ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitLoadEntry,
+    CommitProjection, CommitScanRequest,
 };
-use crate::commit_graph::LocatedChange;
-use crate::entity_identity::EntityIdentity;
 use crate::serialize_row_metadata;
 use crate::LixError;
 
-use crate::sql2::change_materialization::{materialize_changelog_change, MaterializedChange};
+use crate::sql2::change_materialization::{
+    materialize_changelog_change_record, materialize_commit_graph_change, MaterializedChange,
+};
 use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::SqlChangelogQuerySource;
@@ -47,6 +47,12 @@ where
     Ok(())
 }
 
+/// SQL provider for `lix_change`.
+///
+/// `lix_change` is the unscoped durable change surface: it scans direct
+/// `changelog.change` records and unions derived `lix_commit` changes from
+/// `changelog.commit`. It does not prove version reachability. History
+/// providers are the reachability-aware SQL surfaces.
 struct LixChangeProvider<S> {
     schema: SchemaRef,
     query_source: SqlChangelogQuerySource<S>,
@@ -98,14 +104,15 @@ where
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let pushed_limit = if filters.is_empty() { limit } else { None };
         Ok(Arc::new(LixChangeScanExec::new(
             self.query_source.clone(),
             projected_schema(&self.schema, projection),
             projection.cloned(),
-            limit,
+            pushed_limit,
         )))
     }
 }
@@ -207,16 +214,23 @@ where
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
             let mut json_reader = query_source.json_reader;
-            let canonical_changes = scan_visible_changelog_changes(query_source.store, limit)
+            let canonical_changes = scan_changelog_changes(query_source.store, limit)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let mut changes = Vec::with_capacity(canonical_changes.len());
             for change in canonical_changes {
-                changes.push(
-                    materialize_changelog_change(&mut json_reader, change)
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?,
-                );
+                match change {
+                    LixChangeRow::Direct(change) => changes.push(
+                        materialize_changelog_change_record(&mut json_reader, change)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                    ),
+                    LixChangeRow::DerivedCommit(change) => changes.push(
+                        materialize_commit_graph_change(&mut json_reader, change)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?,
+                    ),
+                }
             }
             change_record_batch(&projection, &changes)
         });
@@ -224,120 +238,89 @@ where
     }
 }
 
-async fn scan_visible_changelog_changes<S>(
+async fn scan_changelog_changes<S>(
     store: S,
     limit: Option<usize>,
-) -> Result<Vec<LocatedChange>, LixError>
+) -> Result<Vec<LixChangeRow>, LixError>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
     let mut reader = ChangelogContext::new().reader(store);
-    let mut visibilities = reader.scan_commit_visibilities().await?;
-    visibilities.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
-
-    let commit_ids = visibilities
-        .into_iter()
-        .map(|visibility| visibility.commit_id)
-        .collect::<Vec<_>>();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut change_ids = Vec::new();
-    let mut commit_headers_by_change_id = std::collections::BTreeMap::new();
-    for commit_id in commit_ids {
-        let commits = reader
-            .load_commits(CommitLoadRequest {
-                commit_ids: std::slice::from_ref(&commit_id),
-                projection: CommitProjection::Full,
-                visibility: CommitVisibilityMode::RequireVisible,
+    let mut changes = Vec::<LixChangeRow>::new();
+    let mut start_after = None::<String>;
+    loop {
+        let scan = reader
+            .scan_changes(ChangeScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1024),
             })
             .await?;
-        let Some(CommitLoadEntry::Full { header, body }) =
-            commits.entries.into_iter().next().flatten()
-        else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("visible changelog commit '{commit_id}' is missing"),
-            ));
-        };
-        for membership in body.membership {
-            if seen.insert(membership.member_change_id.clone()) {
-                change_ids.push(membership.member_change_id);
-                if limit.is_some_and(|limit| change_ids.len() >= limit) {
-                    break;
-                }
-            }
-        }
-        if seen.insert(header.derivable_change_id.clone()) {
-            commit_headers_by_change_id.insert(header.derivable_change_id.clone(), header.clone());
-            change_ids.push(header.derivable_change_id);
-        }
-        if limit.is_some_and(|limit| change_ids.len() >= limit) {
-            change_ids.truncate(limit.unwrap_or(change_ids.len()));
+        changes.extend(scan.entries.into_iter().map(LixChangeRow::Direct));
+        let Some(next) = scan.next_start_after else {
             break;
-        }
-    }
-
-    let changes = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: &change_ids,
-            projection: ChangeProjection::Segment,
-            visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
-        })
-        .await?;
-    let mut located_changes = Vec::with_capacity(change_ids.len());
-    for (change_id, entry) in change_ids.into_iter().zip(changes.entries) {
-        let located = match entry {
-            Some(ChangeLoadEntry::Segment(change)) => {
-                let source_commit_id = change.authored_commit_id.clone().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("changelog visible change '{change_id}' has no authored commit"),
-                    )
-                })?;
-                LocatedChange {
-                    record: crate::changelog::Change {
-                        id: change.id,
-                        authored_commit_id: Some(source_commit_id.clone()),
-                        entity_id: change.entity_id,
-                        schema_key: change.schema_key,
-                        file_id: change.file_id,
-                        snapshot_ref: change.snapshot_ref,
-                        metadata_ref: change.metadata_ref,
-                        created_at: change.created_at,
-                    },
-                    source_commit_id,
-                    inline_payloads: change.inline_payloads,
-                }
-            }
-            _ => {
-                let Some(header) = commit_headers_by_change_id.remove(&change_id) else {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("changelog visible change '{change_id}' is missing"),
-                    ));
-                };
-                located_commit_header_change(header)
-            }
         };
-        located_changes.push(located);
+        start_after = Some(next);
     }
-    Ok(located_changes)
+    let mut start_after = None::<String>;
+    loop {
+        let scan = reader
+            .scan_commits(CommitScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1024),
+                projection: CommitProjection::Record,
+            })
+            .await?;
+        for entry in scan.entries {
+            let CommitLoadEntry::Record(commit) = entry else {
+                continue;
+            };
+            changes.push(LixChangeRow::DerivedCommit(commit_record_canonical_change(
+                &commit,
+            )));
+        }
+        let Some(next) = scan.next_start_after else {
+            break;
+        };
+        start_after = Some(next);
+    }
+    changes.sort_by(|left, right| left.change_id().cmp(right.change_id()));
+    if let Some(limit) = limit {
+        changes.truncate(limit);
+    }
+    Ok(changes)
 }
 
-fn located_commit_header_change(header: CommitHeader) -> LocatedChange {
-    let commit_id = header.id.clone();
-    LocatedChange {
-        record: crate::changelog::Change {
-            id: header.derivable_change_id,
-            authored_commit_id: Some(commit_id.clone()),
-            entity_id: EntityIdentity::single(&commit_id),
-            schema_key: "lix_commit".to_string(),
-            file_id: None,
-            snapshot_ref: None,
-            metadata_ref: None,
-            created_at: header.created_at,
-        },
-        source_commit_id: commit_id,
-        inline_payloads: Vec::new(),
+enum LixChangeRow {
+    Direct(ChangeRecord),
+    DerivedCommit(crate::commit_graph::CommitGraphChange),
+}
+
+impl LixChangeRow {
+    fn change_id(&self) -> &str {
+        match self {
+            Self::Direct(change) => &change.change_id,
+            Self::DerivedCommit(change) => &change.id,
+        }
+    }
+}
+
+fn commit_record_canonical_change(
+    commit: &crate::changelog::CommitRecord,
+) -> crate::commit_graph::CommitGraphChange {
+    let snapshot_content = serde_json::to_string(&serde_json::json!({
+        "id": commit.commit_id,
+    }))
+    .expect("lix_commit snapshot serialization should not fail");
+    crate::commit_graph::CommitGraphChange {
+        id: commit.change_id.clone(),
+        entity_id: crate::entity_identity::EntityIdentity::single(&commit.commit_id),
+        schema_key: "lix_commit".to_string(),
+        file_id: None,
+        snapshot_ref: Some(crate::json_store::JsonRef::for_content(
+            snapshot_content.as_bytes(),
+        )),
+        metadata_ref: None,
+        created_at: commit.created_at.clone(),
     }
 }
 

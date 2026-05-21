@@ -135,7 +135,7 @@ where
         .await
     }
 
-    /// Rebuilds the tracked serving projection root for one version from changelog.
+    /// Rebuilds the tracked serving commit root for one version from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
@@ -162,7 +162,7 @@ where
         let rebuild_result = self
             .tracked_state
             .root_rebuilder(&read, &mut writes)
-            .rebuild_projection_root_at(&head_commit_id)
+            .rebuild_commit_root_at(&head_commit_id)
             .await;
         if let Err(error) = rebuild_result {
             return Err(error);

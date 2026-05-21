@@ -1,11 +1,10 @@
-use crate::changelog::{ChangeLocator, ChangeLocatorRef, ChangeRef};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 
-/// Content-addressed root id for one tracked-state projection tree.
+/// Content-addressed root id for one tracked-state commit-root tree.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TrackedStateRootId([u8; TRACKED_STATE_HASH_BYTES]);
 
@@ -50,19 +49,26 @@ pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) entity_id: &'a EntityIdentity,
 }
 
-/// Zero-copy tracked-state projection delta prepared from changelog facts.
+/// Zero-copy tracked-state commit-root delta prepared from changelog facts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateDeltaRef<'a> {
-    pub(crate) change: ChangeRef<'a>,
-    pub(crate) locator: ChangeLocatorRef<'a>,
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) change_id: &'a str,
+    pub(crate) commit_id: &'a str,
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) deleted: bool,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
 }
 
-/// Projection value stored in tracked-state trees.
+/// Value stored in tracked-state commit-root trees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateIndexValue {
-    pub(crate) change_locator: ChangeLocator,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
     pub(crate) deleted: bool,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
@@ -70,10 +76,11 @@ pub(crate) struct TrackedStateIndexValue {
     pub(crate) updated_at: String,
 }
 
-/// Zero-copy view of a tracked-state projection value.
+/// Zero-copy view of a tracked-state commit-root value.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateIndexValueRef<'a> {
-    pub(crate) change_locator: ChangeLocatorRef<'a>,
+    pub(crate) change_id: &'a str,
+    pub(crate) commit_id: &'a str,
     pub(crate) deleted: bool,
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     pub(crate) metadata_ref: Option<&'a JsonRef>,
@@ -81,12 +88,12 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) updated_at: &'a str,
 }
 
-/// Durable metadata for the tracked-state projection at one commit.
+/// Durable tracked-state root metadata for one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateProjectionMetadata {
+pub(crate) struct TrackedStateCommitRoot {
     pub(crate) commit_id: String,
     pub(crate) root_id: TrackedStateRootId,
-    pub(crate) parent_roots: Vec<TrackedStateProjectionParent>,
+    pub(crate) parent_roots: Vec<TrackedStateCommitRootParent>,
     pub(crate) changed_key_count: u64,
     pub(crate) row_count_estimate: u64,
     pub(crate) tree_height: u32,
@@ -95,14 +102,14 @@ pub(crate) struct TrackedStateProjectionMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateProjectionParent {
+pub(crate) struct TrackedStateCommitRootParent {
     pub(crate) commit_id: String,
     pub(crate) root_id: TrackedStateRootId,
 }
 
-/// Materialized tracked-state projection row.
+/// Materialized tracked-state commit-root row.
 ///
-/// Tracked rows are the projection that can be rebuilt from changelog facts.
+/// Tracked rows are the serving state that can be rebuilt from changelog facts.
 /// They intentionally do not carry an `untracked` flag: untracked local overlay
 /// data belongs to `untracked_state`, and the serving `live_state` facade is
 /// responsible for combining both sources.
@@ -135,28 +142,20 @@ pub(crate) struct TrackedStateFilter {
 
 /// Requested property set for a tracked-state scan.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct TrackedStateProjection {
+pub(crate) struct TrackedStateReadColumns {
     #[serde(default)]
     pub(crate) columns: Vec<String>,
 }
 
-/// Scan request for the tracked-state projection.
+/// Scan request for tracked-state commit roots.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct TrackedStateScanRequest {
     #[serde(default)]
     pub(crate) filter: TrackedStateFilter,
     #[serde(default)]
-    pub(crate) projection: TrackedStateProjection,
+    pub(crate) read_columns: TrackedStateReadColumns,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
-}
-
-/// Point lookup request for one tracked-state row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateRowRequest {
-    pub(crate) schema_key: String,
-    pub(crate) entity_id: EntityIdentity,
-    pub(crate) file_id: NullableKeyFilter<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]

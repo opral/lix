@@ -11,7 +11,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
 use super::SqlJsonReader;
-use crate::sql2::change_materialization::{materialize_changelog_change, MaterializedChange};
+use crate::sql2::change_materialization::{materialize_located_history_change, MaterializedChange};
 use crate::storage::StorageRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
@@ -201,7 +201,7 @@ pub(crate) fn commit_graph_history_request(
     })
 }
 
-/// Loads commit-graph history once for all SQL history providers.
+/// Loads reachability-aware commit-graph history once for all SQL history providers.
 ///
 /// Providers pass the schema keys they know how to shape. An empty list means
 /// "do not constrain by provider schema"; this is what `lix_state_history` uses.
@@ -256,8 +256,7 @@ where
             .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
-            let change =
-                materialize_changelog_change(&mut json_reader, entry.located_change).await?;
+            let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
             rows.push(HistoryEntry {
                 commit_created_at: commit_created_at_by_id
                     .get(&entry.observed_commit_id)

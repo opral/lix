@@ -1,5 +1,5 @@
 use crate::tracked_state::{
-    TrackedStateDiff, TrackedStateDiffKind, TrackedStateMergePatch, TrackedStateMergePlan,
+    TrackedStateDiff, TrackedStateDiffKind, TrackedStateMergePick, TrackedStateMergePlan,
 };
 use crate::LixError;
 
@@ -24,8 +24,8 @@ pub(crate) fn stats_from_plan(
     source_diff: &TrackedStateDiff,
 ) -> Result<MergeStats, LixError> {
     let mut stats = MergeStats::default();
-    for patch in &plan.patches {
-        let identity = patch_identity(patch);
+    for pick in &plan.picks {
+        let identity = pick_identity(pick);
         let Some(entry) = source_diff
             .entries
             .iter()
@@ -34,7 +34,7 @@ pub(crate) fn stats_from_plan(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                    "merge analysis could not find source diff entry for adopted schema '{}' entity '{}'",
+                    "merge analysis could not find source diff entry for source schema '{}' entity '{}'",
                     identity.schema_key,
                     identity.entity_id.as_json_array_text()?
                 ),
@@ -56,10 +56,6 @@ impl MergeStats {
     }
 }
 
-fn patch_identity(
-    patch: &TrackedStateMergePatch,
-) -> &crate::tracked_state::TrackedStateDiffIdentity {
-    match patch {
-        TrackedStateMergePatch::Adopt { identity, .. } => identity,
-    }
+fn pick_identity(pick: &TrackedStateMergePick) -> &crate::tracked_state::TrackedStateDiffIdentity {
+    &pick.identity
 }
