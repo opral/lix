@@ -524,6 +524,8 @@ fn bind_predicate(
             bind_expr(table, left, params)?,
             bind_expr(table, right, params)?,
         )),
+        Expr::IsNull(expr) => Ok(BoundPredicate::IsNull(bind_expr(table, expr, params)?)),
+        Expr::IsNotNull(expr) => Ok(BoundPredicate::IsNotNull(bind_expr(table, expr, params)?)),
         Expr::InList {
             expr,
             list,
@@ -1281,6 +1283,7 @@ fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelecto
             .or_else(|| global_value_from_binary_exprs(right, left))
             .transpose()
             .map(|selector| selector.unwrap_or(GlobalSelector::Missing)),
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(GlobalSelector::Missing),
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
                 return Ok(GlobalSelector::Missing);
@@ -1476,6 +1479,7 @@ fn predicate_version_selector(
                 .transpose()
                 .map(|selector| selector.unwrap_or(VersionSelector::Missing))
         }
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(VersionSelector::Missing),
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
                 return Ok(VersionSelector::Missing);
@@ -1959,6 +1963,17 @@ mod tests {
                 .expect("no-match write should bind");
             let write = bound;
             assert_eq!(write.version_scope, VersionScope::Empty, "{sql}");
+        }
+    }
+
+    #[test]
+    fn bind_statement_accepts_is_null_and_is_not_null_predicates() {
+        for sql in [
+            "DELETE FROM lix_file WHERE data IS NULL",
+            "DELETE FROM lix_file WHERE data IS NOT NULL",
+        ] {
+            bind_statement(&parse_statement(sql), &[], "version1")
+                .unwrap_or_else(|error| panic!("{sql} should bind, got {error:?}"));
         }
     }
 
