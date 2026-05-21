@@ -803,7 +803,7 @@ async fn load_commit_change_ref_chunks(
             )
             .await?;
         for value in page.values {
-            chunks.push(decode_commit_change_ref_chunk(&value)?);
+            chunks.push(decode_commit_change_ref_chunk(&value, commit_id)?);
         }
         let Some(resume_after) = page.resume_after else {
             break;
