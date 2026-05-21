@@ -487,7 +487,7 @@ test("merge conflicts expose structured details", async () => {
 		const details = error.details as {
 			conflicts?: Array<{
 				schemaKey?: string;
-				entityId?: string[];
+				entityPk?: string[];
 				target?: unknown;
 				source?: unknown;
 			}>;
@@ -495,7 +495,7 @@ test("merge conflicts expose structured details", async () => {
 		expect(details.conflicts).toHaveLength(1);
 		expect(details.conflicts?.[0]).toMatchObject({
 			schemaKey: "crm_task",
-			entityId: ["conflict-task"],
+			entityPk: ["conflict-task"],
 		});
 		expect(details.conflicts?.[0]?.target).toBeDefined();
 		expect(details.conflicts?.[0]?.source).toBeDefined();
@@ -524,7 +524,7 @@ test("engine errors expose structured hints", async () => {
 	const lix = await openLix();
 
 	try {
-		await lix.execute("SELECT entity_id FROM lix_state_history");
+		await lix.execute("SELECT entity_pk FROM lix_state_history");
 		throw new Error("expected history query to fail");
 	} catch (error) {
 		expect(isLixError(error)).toBe(true);

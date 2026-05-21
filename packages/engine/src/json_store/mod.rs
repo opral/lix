@@ -28,7 +28,7 @@ pub(crate) fn stage_direct_json_payload_delete(writes: &mut StorageWriteSet, jso
     writes.delete(store::JSON_SPACE, json_ref.as_hash_bytes().to_vec());
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) fn stage_direct_json_payload_put(
     writes: &mut StorageWriteSet,
     json_ref: &JsonRef,

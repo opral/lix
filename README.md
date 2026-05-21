@@ -154,7 +154,7 @@ Unlike Git's line-based diffs, Lix can track structured entities: XLSX rows, DOC
 
 ```ts
 const changes = await lix.execute(`
-  SELECT created_at, schema_key, entity_id, snapshot_content
+  SELECT created_at, schema_key, entity_pk, snapshot_content
   FROM lix_change
   ORDER BY created_at DESC
   LIMIT 20
@@ -202,7 +202,7 @@ Agents burn fewer tokens and keep cleaner context when version-control questions
 
 ```ts
 const rows = await lix.execute(`
-  SELECT created_at, schema_key, entity_id, snapshot_content
+  SELECT created_at, schema_key, entity_pk, snapshot_content
   FROM lix_change
   ORDER BY created_at DESC
   LIMIT 20

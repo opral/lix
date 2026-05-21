@@ -62,7 +62,7 @@ struct BenchRow {
 struct RawUntrackedRow {
     version_id: String,
     schema_key: String,
-    entity_id: String,
+    entity_pk: String,
     file_id: String,
     snapshot_content: String,
     updated_snapshot_content: String,
@@ -1034,11 +1034,11 @@ fn escape_json_pointer(value: &str) -> String {
 fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
     rows.iter()
         .map(|row| {
-            let entity_id = entity_id(row);
+            let entity_pk = entity_pk(row);
             let value = snapshot_value(row.path.as_str(), row.value_json.as_str());
             let updated_value = snapshot_value(row.path.as_str(), row.updated_value_json.as_str());
             BenchRow {
-                key: Key(Bytes::from(row_key(&entity_id))),
+                key: Key(Bytes::from(row_key(&entity_pk))),
                 value: StorageValue {
                     bytes: Bytes::from(value),
                 },
@@ -1053,23 +1053,23 @@ fn bench_rows(rows: &[PointerRow]) -> Vec<BenchRow> {
 fn physical_layout_rows(rows: &[PointerRow], layout: PhysicalLayout) -> Vec<BenchRow> {
     rows.iter()
         .map(|row| {
-            let entity_id = entity_id(row);
+            let entity_pk = entity_pk(row);
             let value = snapshot_value(row.path.as_str(), row.value_json.as_str());
             let updated_value = snapshot_value(row.path.as_str(), row.updated_value_json.as_str());
             let (key, value) = match layout {
                 PhysicalLayout::FullRowValue => {
-                    storage_bench::untracked_state_full_row_key_value(&entity_id, &value)
+                    storage_bench::untracked_state_full_row_key_value(&entity_pk, &value)
                 }
                 PhysicalLayout::PayloadOnlyValue => {
-                    storage_bench::untracked_state_row_key_value(&entity_id, &value)
+                    storage_bench::untracked_state_row_key_value(&entity_pk, &value)
                 }
             };
             let (_, updated_value) = match layout {
                 PhysicalLayout::FullRowValue => {
-                    storage_bench::untracked_state_full_row_key_value(&entity_id, &updated_value)
+                    storage_bench::untracked_state_full_row_key_value(&entity_pk, &updated_value)
                 }
                 PhysicalLayout::PayloadOnlyValue => {
-                    storage_bench::untracked_state_row_key_value(&entity_id, &updated_value)
+                    storage_bench::untracked_state_row_key_value(&entity_pk, &updated_value)
                 }
             };
             BenchRow {
@@ -1086,7 +1086,7 @@ fn raw_rows(rows: &[PointerRow]) -> Vec<RawUntrackedRow> {
         .map(|row| RawUntrackedRow {
             version_id: "bench-version".to_string(),
             schema_key: "json_pointer".to_string(),
-            entity_id: entity_id(row),
+            entity_pk: entity_pk(row),
             file_id: String::new(),
             snapshot_content: snapshot_value(row.path.as_str(), row.value_json.as_str()),
             updated_snapshot_content: snapshot_value(
@@ -1116,15 +1116,15 @@ fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
     sql
 }
 
-fn entity_id(row: &PointerRow) -> String {
+fn entity_pk(row: &PointerRow) -> String {
     row.path.clone()
 }
 
-fn row_key(entity_id: &str) -> Vec<u8> {
+fn row_key(entity_pk: &str) -> Vec<u8> {
     let mut out = Vec::new();
     push_component(&mut out, "bench-version");
     push_component(&mut out, "json_pointer");
-    push_component(&mut out, entity_id);
+    push_component(&mut out, entity_pk);
     push_component(&mut out, "");
     out
 }
@@ -1167,14 +1167,14 @@ fn prepare_raw_sqlite_empty() -> RawSqliteFixture {
         CREATE TABLE untracked_state (
             version_id TEXT NOT NULL,
             schema_key TEXT NOT NULL,
-            entity_id TEXT NOT NULL,
+            entity_pk TEXT NOT NULL,
             file_id TEXT NOT NULL,
             snapshot_content TEXT,
             metadata TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             global INTEGER NOT NULL,
-            PRIMARY KEY (version_id, schema_key, entity_id, file_id)
+            PRIMARY KEY (version_id, schema_key, entity_pk, file_id)
         ) WITHOUT ROWID;
         ",
     )
@@ -1196,7 +1196,7 @@ fn raw_sqlite_insert_all(
             .prepare_cached(
                 "
                 INSERT INTO untracked_state (
-                    version_id, schema_key, entity_id, file_id, snapshot_content,
+                    version_id, schema_key, entity_pk, file_id, snapshot_content,
                     metadata, created_at, updated_at, global
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -1208,7 +1208,7 @@ fn raw_sqlite_insert_all(
                 .execute(params![
                     row.version_id,
                     row.schema_key,
-                    row.entity_id,
+                    row.entity_pk,
                     row.file_id,
                     row.snapshot_content,
                     row.metadata,
@@ -1236,7 +1236,7 @@ fn raw_sqlite_insert_all_unprepared_per_row(
         let mut sql = String::from(
             "
             INSERT INTO untracked_state (
-                version_id, schema_key, entity_id, file_id, snapshot_content,
+                version_id, schema_key, entity_pk, file_id, snapshot_content,
                 metadata, created_at, updated_at, global
             )
             VALUES ",
@@ -1264,7 +1264,7 @@ fn raw_sqlite_insert_all_unprepared_chunked(
         let mut sql = String::from(
             "
             INSERT INTO untracked_state (
-                version_id, schema_key, entity_id, file_id, snapshot_content,
+                version_id, schema_key, entity_pk, file_id, snapshot_content,
                 metadata, created_at, updated_at, global
             )
             VALUES ",
@@ -1291,7 +1291,7 @@ fn append_raw_sqlite_insert_values_tuple(sql: &mut String, row: &RawUntrackedRow
         "('{}', '{}', '{}', '{}', '{}', {}, '{}', '{}', {})",
         sql_string(row.version_id.as_str()),
         sql_string(row.schema_key.as_str()),
-        sql_string(row.entity_id.as_str()),
+        sql_string(row.entity_pk.as_str()),
         sql_string(row.file_id.as_str()),
         sql_string(row.snapshot_content.as_str()),
         optional_sql_string(row.metadata.as_deref()),
@@ -1307,10 +1307,10 @@ fn raw_sqlite_select_all(fixture: RawSqliteFixture, expected_rows: usize) -> usi
         .conn
         .prepare_cached(
             "
-            SELECT version_id, schema_key, entity_id, file_id, snapshot_content, metadata,
+            SELECT version_id, schema_key, entity_pk, file_id, snapshot_content, metadata,
                    created_at, updated_at, global
             FROM untracked_state
-            ORDER BY version_id, schema_key, entity_id, file_id
+            ORDER BY version_id, schema_key, entity_pk, file_id
             ",
         )
         .expect("prepare raw sqlite select all");
@@ -1320,7 +1320,7 @@ fn raw_sqlite_select_all(fixture: RawSqliteFixture, expected_rows: usize) -> usi
     while let Some(row) = rows.next().expect("read raw sqlite row") {
         let version_id: String = row.get(0).expect("read version_id");
         let schema_key: String = row.get(1).expect("read schema_key");
-        let entity_id: String = row.get(2).expect("read entity_id");
+        let entity_pk: String = row.get(2).expect("read entity_pk");
         let file_id: String = row.get(3).expect("read file_id");
         let snapshot_content: String = row.get(4).expect("read snapshot_content");
         let metadata: Option<String> = row.get(5).expect("read metadata");
@@ -1329,7 +1329,7 @@ fn raw_sqlite_select_all(fixture: RawSqliteFixture, expected_rows: usize) -> usi
         let global: i64 = row.get(8).expect("read global");
         materialized_bytes += version_id.len()
             + schema_key.len()
-            + entity_id.len()
+            + entity_pk.len()
             + file_id.len()
             + snapshot_content.len()
             + metadata.as_ref().map_or(0, String::len)
@@ -1350,9 +1350,9 @@ fn raw_sqlite_select_one_by_pk(fixture: RawSqliteFixture, row: &RawUntrackedRow)
             "
             SELECT snapshot_content
             FROM untracked_state
-            WHERE version_id = ?1 AND schema_key = ?2 AND entity_id = ?3 AND file_id = ?4
+            WHERE version_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
             ",
-            params![row.version_id, row.schema_key, row.entity_id, row.file_id],
+            params![row.version_id, row.schema_key, row.entity_pk, row.file_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()
@@ -1374,7 +1374,7 @@ fn raw_sqlite_update_all(mut fixture: RawSqliteFixture, rows: &[RawUntrackedRow]
                 "
                 UPDATE untracked_state
                 SET snapshot_content = ?5, updated_at = ?6
-                WHERE version_id = ?1 AND schema_key = ?2 AND entity_id = ?3 AND file_id = ?4
+                WHERE version_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
                 ",
             )
             .expect("prepare raw sqlite update all");
@@ -1383,7 +1383,7 @@ fn raw_sqlite_update_all(mut fixture: RawSqliteFixture, rows: &[RawUntrackedRow]
                 .execute(params![
                     row.version_id,
                     row.schema_key,
-                    row.entity_id,
+                    row.entity_pk,
                     row.file_id,
                     row.updated_snapshot_content,
                     row.updated_at,
@@ -1403,12 +1403,12 @@ fn raw_sqlite_update_one_by_pk(fixture: RawSqliteFixture, row: &RawUntrackedRow)
             "
             UPDATE untracked_state
             SET snapshot_content = ?5, updated_at = ?6
-            WHERE version_id = ?1 AND schema_key = ?2 AND entity_id = ?3 AND file_id = ?4
+            WHERE version_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
             ",
             params![
                 row.version_id,
                 row.schema_key,
-                row.entity_id,
+                row.entity_pk,
                 row.file_id,
                 row.updated_snapshot_content,
                 row.updated_at,
@@ -1434,9 +1434,9 @@ fn raw_sqlite_delete_one_by_pk(fixture: RawSqliteFixture, row: &RawUntrackedRow)
         .execute(
             "
             DELETE FROM untracked_state
-            WHERE version_id = ?1 AND schema_key = ?2 AND entity_id = ?3 AND file_id = ?4
+            WHERE version_id = ?1 AND schema_key = ?2 AND entity_pk = ?3 AND file_id = ?4
             ",
-            params![row.version_id, row.schema_key, row.entity_id, row.file_id],
+            params![row.version_id, row.schema_key, row.entity_pk, row.file_id],
         )
         .expect("execute raw sqlite delete one");
     assert_eq!(affected, 1);

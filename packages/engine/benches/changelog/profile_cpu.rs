@@ -16,26 +16,26 @@ fn main() {
 }
 
 fn run(op: &str, duration: Duration) -> Result<(), LixError> {
-    let segment = changelog_bench::segment_1c_1000ch()?;
-    let encoded = changelog_bench::encode_bench_segment(&segment)?;
+    let append = changelog_bench::append_1c_1000ch()?;
+    let encoded = changelog_bench::encode_bench_append(&append)?;
     let deadline = Instant::now() + duration;
     let mut iterations = 0u64;
 
     while Instant::now() < deadline {
         match op {
             "decode" => {
-                black_box(changelog_bench::decode_bench_segment(&encoded)?);
+                black_box(changelog_bench::decode_bench_append(&encoded)?);
             }
             "validate" => {
-                black_box(changelog_bench::validate_bench_segment_shape(&segment)?);
+                black_box(changelog_bench::validate_bench_append_shape(&append)?);
             }
             "index" => {
-                black_box(changelog_bench::build_decoded_segment_index(&segment)?);
+                black_box(changelog_bench::build_decoded_append_index(&append)?);
             }
             "all" => {
-                black_box(changelog_bench::decode_bench_segment(&encoded)?);
-                black_box(changelog_bench::validate_bench_segment_shape(&segment)?);
-                black_box(changelog_bench::build_decoded_segment_index(&segment)?);
+                black_box(changelog_bench::decode_bench_append(&encoded)?);
+                black_box(changelog_bench::validate_bench_append_shape(&append)?);
+                black_box(changelog_bench::build_decoded_append_index(&append)?);
             }
             _ => {
                 return Err(LixError::unknown(format!(

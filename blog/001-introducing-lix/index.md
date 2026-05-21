@@ -88,7 +88,7 @@ That means audit trails, rollbacks, and “blame” become simple queries:
 ```sql
 SELECT *
 FROM state_history
-WHERE entity_id = 'settings.theme'
+WHERE entity_pk = 'settings.theme'
 ORDER BY depth ASC;
 ```
 

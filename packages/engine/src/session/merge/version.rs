@@ -1,12 +1,10 @@
 use serde_json::{json, Value as JsonValue};
 
 use crate::storage::StorageBackend;
-use crate::transaction::types::TransactionWrite;
 use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
 
 use super::analysis::{analyze, MergeCommits, MergeOutcome};
-use super::apply::adopted_changes_from_merge_plan;
 use super::conflicts::{
     MergeConflict as AnalysisMergeConflict,
     MergeConflictChangeKind as AnalysisMergeConflictChangeKind,
@@ -14,6 +12,8 @@ use super::conflicts::{
 };
 use super::stats::MergeStats;
 use crate::session::context::SessionContext;
+use crate::tracked_state::TrackedStateMergePick;
+use crate::transaction::types::StagedCommitChangeRef;
 
 /// Options for merging another version into this session's active version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,7 @@ pub struct MergeVersionPreview {
 pub struct MergeConflict {
     pub kind: MergeConflictKind,
     pub schema_key: String,
-    pub entity_id: JsonValue,
+    pub entity_pk: JsonValue,
     pub file_id: Option<String>,
     pub target: MergeConflictSide,
     pub source: MergeConflictSide,
@@ -145,13 +145,6 @@ where
                     let mut reader = transaction.commit_graph_reader();
                     reader.merge_base(&target_head, &source_head).await?
                 };
-                transaction
-                    .ensure_tracked_state_projection_roots(&[
-                        merge_base.commit_id.clone(),
-                        target_head.clone(),
-                        source_head.clone(),
-                    ])
-                    .await?;
 
                 let analysis = {
                     let mut reader = transaction.tracked_state_reader();
@@ -180,8 +173,8 @@ where
     ///
     /// The generated target commit keeps the previous target head as its first
     /// parent and records the source head as an additional parent, so the
-    /// commit graph preserves branch ancestry while tracked-state storage can
-    /// build the new root by applying source effects onto the target root.
+    /// commit graph preserves branch ancestry while tracked-state storage
+    /// selects the planned source changes into the new target root.
     pub async fn merge_version(
         &self,
         options: MergeVersionOptions,
@@ -220,13 +213,6 @@ where
                     reader.merge_base(&target_head, &source_head).await?
                 };
                 let base_commit_id = merge_base.commit_id;
-                transaction
-                    .ensure_tracked_state_projection_roots(&[
-                        base_commit_id.clone(),
-                        target_head.clone(),
-                        source_head.clone(),
-                    ])
-                    .await?;
 
                 let analysis = {
                     let mut reader = transaction.tracked_state_reader();
@@ -287,63 +273,44 @@ where
                     )?);
                 }
 
-                let adopted_changes = adopted_changes_from_merge_plan(
-                    merge_plan,
-                    &active_version_id,
-                    &analysis.commits.source_commit_id,
-                );
-                if adopted_changes.is_empty() {
-                    let created_merge_commit_id =
-                        transaction.stage_empty_commit(active_version_id.clone())?;
-                    transaction.add_commit_parent(
-                        active_version_id.clone(),
-                        analysis.commits.source_commit_id.clone(),
-                    )?;
-                    return Ok(MergeVersionReceipt {
-                        outcome: MergeVersionOutcome::MergeCommitted,
-                        target_version_id: active_version_id,
-                        source_version_id,
-                        base_commit_id: analysis.commits.base_commit_id,
-                        target_head_after_commit_id: created_merge_commit_id.clone(),
-                        target_head_before_commit_id: analysis.commits.target_commit_id,
-                        source_head_before_commit_id: analysis.commits.source_commit_id,
-                        created_merge_commit_id: Some(created_merge_commit_id),
-                        change_stats: merge_change_stats_from_analysis(&analysis.stats),
-                    });
-                }
-
-                transaction
-                    .stage_write(TransactionWrite::AdoptedChanges {
-                        changes: adopted_changes,
-                    })
-                    .await?;
-                let created_merge_commit_id = transaction
-                    .staged_commit_id(&active_version_id)?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            "merge_version staged tracked rows without a commit id",
-                        )
-                    })?;
-                transaction.add_commit_parent(
+                let selected_changes = merge_plan
+                    .picks
+                    .iter()
+                    .map(selected_change_from_merge_pick)
+                    .collect::<Vec<_>>();
+                let created_merge_commit_id = transaction.stage_merge_commit(
                     active_version_id.clone(),
                     analysis.commits.source_commit_id.clone(),
+                    selected_changes,
                 )?;
-
-                Ok(MergeVersionReceipt {
+                return Ok(MergeVersionReceipt {
                     outcome: MergeVersionOutcome::MergeCommitted,
                     target_version_id: active_version_id,
                     source_version_id,
                     base_commit_id: analysis.commits.base_commit_id,
+                    target_head_after_commit_id: created_merge_commit_id.clone(),
                     target_head_before_commit_id: analysis.commits.target_commit_id,
                     source_head_before_commit_id: analysis.commits.source_commit_id,
-                    created_merge_commit_id: Some(created_merge_commit_id.clone()),
-                    target_head_after_commit_id: created_merge_commit_id,
+                    created_merge_commit_id: Some(created_merge_commit_id),
                     change_stats: merge_change_stats_from_analysis(&analysis.stats),
-                })
+                });
             })
         })
         .await
+    }
+}
+
+fn selected_change_from_merge_pick(pick: &TrackedStateMergePick) -> StagedCommitChangeRef {
+    StagedCommitChangeRef {
+        schema_key: pick.selected_row.schema_key.clone(),
+        file_id: pick.selected_row.file_id.clone(),
+        entity_pk: pick.selected_row.entity_pk.clone(),
+        change_id: pick.change_id.clone(),
+        snapshot_ref: pick.selected_row.snapshot_ref,
+        metadata_ref: pick.selected_row.metadata_ref,
+        deleted: pick.selected_row.deleted,
+        created_at: pick.selected_row.created_at.clone(),
+        updated_at: pick.selected_row.updated_at.clone(),
     }
 }
 
@@ -391,7 +358,7 @@ fn merge_conflict_from_analysis(conflict: &AnalysisMergeConflict) -> MergeConfli
             AnalysisMergeConflictKind::SameEntityChanged => MergeConflictKind::SameEntityChanged,
         },
         schema_key: conflict.schema_key.clone(),
-        entity_id: conflict.entity_id.clone(),
+        entity_pk: conflict.entity_pk.clone(),
         file_id: conflict.file_id.clone(),
         target: merge_conflict_side_from_analysis(&conflict.target),
         source: merge_conflict_side_from_analysis(&conflict.source),
@@ -430,7 +397,7 @@ fn merge_conflict_details(conflict: &MergeConflict) -> serde_json::Value {
             MergeConflictKind::SameEntityChanged => "sameEntityChanged",
         },
         "schemaKey": conflict.schema_key,
-        "entityId": conflict.entity_id,
+        "entityPk": conflict.entity_pk,
         "fileId": conflict.file_id,
         "target": merge_conflict_side_details(&conflict.target),
         "source": merge_conflict_side_details(&conflict.source),

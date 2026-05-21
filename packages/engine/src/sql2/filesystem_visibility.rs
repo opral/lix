@@ -331,49 +331,49 @@ mod tests {
         }
     }
 
-    fn directory_row(entity_id: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn directory_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(
-            entity_id,
+            entity_pk,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             None,
             snapshot_content,
         )
     }
 
-    fn file_row(entity_id: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn file_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(
-            entity_id,
+            entity_pk,
             FILE_DESCRIPTOR_SCHEMA_KEY,
             None,
             snapshot_content,
         )
     }
 
-    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
+    fn blob_ref_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(
-            entity_id,
+            entity_pk,
             BLOB_REF_SCHEMA_KEY,
-            Some(entity_id.to_string()),
+            Some(entity_pk.to_string()),
             snapshot_content,
         )
     }
 
     fn live_row(
-        entity_id: &str,
+        entity_pk: &str,
         schema_key: &str,
         file_id: Option<String>,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
             version_id: "version-a".to_string(),
-            change_id: Some(format!("change-{entity_id}")),
-            commit_id: Some(format!("commit-{entity_id}")),
+            change_id: Some(format!("change-{entity_pk}")),
+            commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

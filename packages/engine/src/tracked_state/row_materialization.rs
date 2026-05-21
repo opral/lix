@@ -1,31 +1,26 @@
-use crate::changelog::{
-    ChangeLoadEntry, ChangeLoadRequest, ChangeProjection, ChangeVisibilityMode, ChangelogContext,
-    SegmentInlinePayload,
-};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
 use crate::storage::StorageRead;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::LixError;
-use std::collections::BTreeMap;
 
 /// Materializes tracked-state index entries.
 ///
-/// The durable tracked_state value is authoritative for scalar projection
-/// fields and stores the JSON refs needed for payload projections. Snapshot and
+/// The durable tracked_state value is authoritative for scalar materialization
+/// fields and stores the JSON refs needed for payload hydration. Snapshot and
 /// metadata bytes are hydrated from grouped json_store loads only when the
-/// requested projection needs them.
+/// requested materialization needs them.
 pub(crate) async fn materialize_rows_from_index_entries<S>(
     store: &S,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-    projection: &TrackedRowProjection,
+    materialization: &TrackedRowMaterialization,
 ) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
     S: StorageRead + Send + Sync,
 {
-    if !projection.snapshot_content && !projection.metadata {
+    if !materialization.snapshot_content && !materialization.metadata {
         return Ok(entries
             .into_iter()
             .map(materialize_entry_without_json)
@@ -33,43 +28,40 @@ where
     }
 
     let json_slots_per_row =
-        usize::from(projection.snapshot_content) + usize::from(projection.metadata);
+        usize::from(materialization.snapshot_content) + usize::from(materialization.metadata);
     let json_ref_capacity = entries.len().saturating_mul(json_slots_per_row);
     let mut row_plans = Vec::with_capacity(entries.len());
     let mut json_refs = Vec::with_capacity(json_ref_capacity);
     let mut json_ref_localities = Vec::with_capacity(json_ref_capacity);
     for (key, value) in entries {
-        let row_index = row_plans.len();
-        let snapshot_ref_index = projected_json_ref_index(
-            projection.snapshot_content,
+        let snapshot_ref_index = materialized_json_ref_index(
+            materialization.snapshot_content,
             value.snapshot_ref,
-            row_index,
             &mut json_refs,
             &mut json_ref_localities,
         );
-        let metadata_ref_index = projected_json_ref_index(
-            projection.metadata,
+        let metadata_ref_index = materialized_json_ref_index(
+            materialization.metadata,
             value.metadata_ref,
-            row_index,
             &mut json_refs,
             &mut json_ref_localities,
         );
         row_plans.push(TrackedRowMaterializationPlan {
-            entity_id: key.entity_id,
+            entity_pk: key.entity_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            change_id: value.change_locator.change_id,
-            commit_id: value.change_locator.commit_id,
+            change_id: value.change_id,
+            commit_id: value.commit_id,
             snapshot_ref_index,
             metadata_ref_index,
         });
     }
 
     let mut json_values =
-        load_projection_json_values(store, &json_refs, &json_ref_localities, &row_plans).await?;
+        load_materialization_json_values(store, &json_refs, &json_ref_localities).await?;
     row_plans
         .into_iter()
         .map(|plan| materialize_row_plan(plan, &json_refs, &mut json_values))
@@ -80,7 +72,7 @@ fn materialize_entry_without_json(
     (key, value): (TrackedStateKey, TrackedStateIndexValue),
 ) -> MaterializedTrackedStateRow {
     MaterializedTrackedStateRow {
-        entity_id: key.entity_id,
+        entity_pk: key.entity_pk,
         schema_key: key.schema_key,
         file_id: key.file_id,
         snapshot_content: None,
@@ -88,13 +80,13 @@ fn materialize_entry_without_json(
         deleted: value.deleted,
         created_at: value.created_at,
         updated_at: value.updated_at,
-        change_id: value.change_locator.change_id,
-        commit_id: value.change_locator.commit_id,
+        change_id: value.change_id,
+        commit_id: value.commit_id,
     }
 }
 
 struct TrackedRowMaterializationPlan {
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: String,
     file_id: Option<String>,
     deleted: bool,
@@ -106,10 +98,9 @@ struct TrackedRowMaterializationPlan {
     metadata_ref_index: Option<usize>,
 }
 
-fn projected_json_ref_index(
+fn materialized_json_ref_index(
     include: bool,
     json_ref: Option<JsonRef>,
-    row_index: usize,
     json_refs: &mut Vec<JsonRef>,
     json_ref_localities: &mut Vec<JsonRefLocality>,
 ) -> Option<usize> {
@@ -118,19 +109,16 @@ fn projected_json_ref_index(
     }
     let index = json_refs.len();
     json_refs.push(json_ref?);
-    json_ref_localities.push(JsonRefLocality { row_index });
+    json_ref_localities.push(JsonRefLocality);
     Some(index)
 }
 
-struct JsonRefLocality {
-    row_index: usize,
-}
+struct JsonRefLocality;
 
-async fn load_projection_json_values<S>(
+async fn load_materialization_json_values<S>(
     store: &S,
     json_refs: &[JsonRef],
     json_ref_localities: &[JsonRefLocality],
-    row_plans: &[TrackedRowMaterializationPlan],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
     S: StorageRead + Send + Sync,
@@ -143,78 +131,17 @@ where
     }
 
     let mut json_values = vec![None; json_refs.len()];
-    let mut change_ids = Vec::new();
-    for index in 0..json_refs.len() {
-        let locality = json_ref_localities.get(index).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state materialization lost JSON locality index",
-            )
-        })?;
-        let row_plan = row_plans.get(locality.row_index).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state materialization lost JSON row locality index",
-            )
-        })?;
-        if !change_ids.contains(&row_plan.change_id) {
-            change_ids.push(row_plan.change_id.clone());
-        }
-    }
-
-    let mut inline_payloads_by_change = BTreeMap::<String, Vec<SegmentInlinePayload>>::new();
-    if !change_ids.is_empty() {
-        let mut changelog_reader = ChangelogContext::new().reader(store);
-        let changes = changelog_reader
-            .load_changes(ChangeLoadRequest {
-                change_ids: &change_ids,
-                projection: ChangeProjection::Segment,
-                visibility: ChangeVisibilityMode::RequireReachableFromVisibleCommit,
-            })
-            .await?;
-        for (change_id, entry) in change_ids.into_iter().zip(changes.entries) {
-            let Some(entry) = entry else {
-                continue;
-            };
-            let ChangeLoadEntry::Segment(change) = entry else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state materialization segment projection returned non-segment entry",
-                ));
-            };
-            inline_payloads_by_change.insert(change_id, change.inline_payloads);
-        }
-    }
-
     let mut out_of_band_indexes = Vec::new();
     let mut out_of_band_refs = Vec::new();
     for (index, json_ref) in json_refs.iter().copied().enumerate() {
-        let locality = json_ref_localities.get(index).ok_or_else(|| {
+        let _locality = json_ref_localities.get(index).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked_state materialization lost JSON locality index",
             )
         })?;
-        let row_plan = row_plans.get(locality.row_index).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state materialization lost JSON row locality index",
-            )
-        })?;
-        if let Some(bytes) = inline_payloads_by_change
-            .get(row_plan.change_id.as_str())
-            .and_then(|payloads| {
-                payloads
-                    .iter()
-                    .find(|payload| payload.json_ref == json_ref)
-                    .map(|payload| &payload.bytes)
-            })
-        {
-            json_values[index] = Some(bytes.clone());
-        } else {
-            out_of_band_indexes.push(index);
-            out_of_band_refs.push(json_ref);
-        }
+        out_of_band_indexes.push(index);
+        out_of_band_refs.push(json_ref);
     }
 
     if !out_of_band_refs.is_empty() {
@@ -244,7 +171,7 @@ fn materialize_row_plan(
     json_values: &mut [Option<Vec<u8>>],
 ) -> Result<MaterializedTrackedStateRow, LixError> {
     Ok(MaterializedTrackedStateRow {
-        entity_id: plan.entity_id,
+        entity_pk: plan.entity_pk,
         schema_key: plan.schema_key,
         file_id: plan.file_id,
         snapshot_content: materialized_json_string(
@@ -275,7 +202,7 @@ fn materialized_json_string(
             "tracked_state materialization lost JSON ref index",
         )
     })?;
-    // Each row plan owns its projected JSON slots. If this path starts
+    // Each row plan owns its materialized JSON slots. If this path starts
     // deduplicating refs, duplicate consumers must clone intentionally.
     let bytes = json_values
         .get_mut(index)
@@ -305,12 +232,12 @@ fn materialized_json_string(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TrackedRowProjection {
+pub(crate) struct TrackedRowMaterialization {
     pub(crate) snapshot_content: bool,
     pub(crate) metadata: bool,
 }
 
-impl TrackedRowProjection {
+impl TrackedRowMaterialization {
     pub(crate) fn full() -> Self {
         Self {
             snapshot_content: true,

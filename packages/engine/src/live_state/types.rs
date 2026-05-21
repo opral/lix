@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
@@ -11,7 +11,7 @@ use crate::{NullableKeyFilter, Value};
 /// generated fields should be caught before this type is constructed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedLiveStateRow {
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
@@ -29,7 +29,7 @@ pub(crate) struct MaterializedLiveStateRow {
 impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
     fn from(row: MaterializedUntrackedStateRow) -> Self {
         MaterializedLiveStateRow {
-            entity_id: row.entity_id,
+            entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot_content,
@@ -70,7 +70,7 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
         };
 
         Ok(MaterializedTrackedStateRow {
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
@@ -87,7 +87,7 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
 impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
     fn from(row: &MaterializedLiveStateRow) -> Self {
         MaterializedUntrackedStateRow {
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
@@ -104,7 +104,7 @@ impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
 /// Which indexed field a live-state scan constraint applies to.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ScanField {
-    EntityId,
+    EntityPk,
     FileId,
 }
 
@@ -141,7 +141,7 @@ pub(crate) struct LiveStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     #[serde(default)]
     pub(crate) version_ids: Vec<String>,
     #[serde(default)]
@@ -165,7 +165,7 @@ impl From<LiveStateFilter> for UntrackedStateFilter {
     fn from(filter: LiveStateFilter) -> Self {
         Self {
             schema_keys: filter.schema_keys,
-            entity_ids: filter.entity_ids,
+            entity_pks: filter.entity_pks,
             version_ids: filter.version_ids,
             file_ids: filter.file_ids,
         }
@@ -195,7 +195,7 @@ pub(crate) struct LiveStateScanRequest {
 pub(crate) struct LiveStateRowRequest {
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: NullableKeyFilter<String>,
 }
 
@@ -204,7 +204,7 @@ impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
         Self {
             schema_key: request.schema_key.clone(),
             version_id: request.version_id.clone(),
-            entity_id: request.entity_id.clone(),
+            entity_pk: request.entity_pk.clone(),
             file_id: request.file_id.clone(),
         }
     }
@@ -215,7 +215,7 @@ impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
 pub(crate) struct LiveStateRowIdentity {
     pub(crate) version_id: String,
     pub(crate) schema_key: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -224,7 +224,7 @@ impl LiveStateRowIdentity {
         Self {
             version_id: row.version_id.clone(),
             schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
         }
     }

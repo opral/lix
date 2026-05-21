@@ -55,7 +55,7 @@ fn collapse_to_latest_projection(batches: [Vec<PluginEntityChange>; 2]) -> Vec<P
     for batch in batches {
         for change in batch {
             latest.insert(
-                (change.schema_key.clone(), change.entity_id.clone()),
+                (change.schema_key.clone(), change.entity_pk.clone()),
                 change,
             );
         }

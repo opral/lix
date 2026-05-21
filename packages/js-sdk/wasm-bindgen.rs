@@ -213,7 +213,7 @@ export type MergeChangeStats = {
 export type MergeConflict = {
   kind: "sameEntityChanged";
   schemaKey: string;
-  entityId: string[];
+  entityPk: string[];
   fileId: string | null;
   target: MergeConflictSide;
   source: MergeConflictSide;
@@ -1849,7 +1849,7 @@ export type MergeConflictSide = {
         };
         set_string(&object, "kind", kind)?;
         set_string(&object, "schemaKey", &conflict.schema_key)?;
-        set_json(&object, "entityId", &conflict.entity_id)?;
+        set_json(&object, "entityPk", &conflict.entity_pk)?;
         set_optional_string(&object, "fileId", conflict.file_id.as_deref())?;
         Reflect::set(
             &object,

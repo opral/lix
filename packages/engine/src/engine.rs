@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::binary_cas::BinaryCasContext;
 use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
@@ -135,7 +135,7 @@ where
         .await
     }
 
-    /// Rebuilds the tracked serving projection root for one version from changelog.
+    /// Rebuilds the tracked serving commit root for one version from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
@@ -162,7 +162,7 @@ where
         let rebuild_result = self
             .tracked_state
             .root_rebuilder(&read, &mut writes)
-            .rebuild_projection_root_at(&head_commit_id)
+            .rebuild_commit_root_at(&head_commit_id)
             .await;
         if let Err(error) = rebuild_result {
             return Err(error);
@@ -189,7 +189,7 @@ where
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: EntityIdentity::single("lix_id"),
+            entity_pk: EntityPk::single("lix_id"),
             file_id: NullableKeyFilter::Null,
         })
         .await?

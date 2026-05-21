@@ -540,7 +540,7 @@ simulation_test!(
         let nfc_collision = session
 			.execute(
 				"INSERT INTO lix_state (\
-	             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+	             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
 	             ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
 				&[Value::Json(json!({
 					"id": "dir-cafe-decomposed",
@@ -555,7 +555,7 @@ simulation_test!(
         let zero_width = session
 			.execute(
 				"INSERT INTO lix_state (\
-	             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+	             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
 	             ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
 				&[Value::Json(json!({
 					"id": "dir-zero-width",
@@ -584,7 +584,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
                  (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\"}'), false, false), \
                  (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\"}'), false, false)",
@@ -617,7 +617,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
                  (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\"}'), false, false)",
                 &[],
@@ -773,10 +773,10 @@ simulation_test!(
         let state_result = session
             .execute(
                 &format!(
-                    "SELECT entity_id, schema_key \
+                    "SELECT entity_pk, schema_key \
                  FROM lix_state \
-                 WHERE entity_id IN (lix_json('[\"{}\"]'), lix_json('[\"{}\"]'), lix_json('[\"file-readme\"]')) \
-                 ORDER BY schema_key, entity_id",
+                 WHERE entity_pk IN (lix_json('[\"{}\"]'), lix_json('[\"{}\"]'), lix_json('[\"file-readme\"]')) \
+                 ORDER BY schema_key, entity_pk",
                     directory_ids[0], directory_ids[1]
                 ),
                 &[],

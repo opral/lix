@@ -2800,7 +2800,7 @@ fn sql2_public_boundary_does_not_reintroduce_stringly_validation() {
             "public_input::expect_json_text(\"",
             "public_input::expect_file_path_public(\"",
             "public_input::expect_directory_path_public(\"",
-            "public_input::expect_entity_identity_public(\"",
+            "public_input::expect_entity_pk_public(\"",
             "public_input::expect_non_blob_public_id(\"",
             "require_write(\"",
             "routed_surface(",

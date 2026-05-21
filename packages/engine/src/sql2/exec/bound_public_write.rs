@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::common::validate_row_metadata;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -324,7 +324,7 @@ enum InsertColumnTarget {
         name: String,
         column_type: EntityColumnType,
     },
-    EntityId,
+    EntityPk,
     FileId,
     Metadata,
     Global,
@@ -354,7 +354,7 @@ impl InsertRowLayout {
                     });
                 }
                 Ok(match column.name.as_str() {
-                    "lixcol_entity_id" => InsertColumnTarget::EntityId,
+                    "lixcol_entity_pk" => InsertColumnTarget::EntityPk,
                     "lixcol_file_id" => InsertColumnTarget::FileId,
                     "lixcol_metadata" => InsertColumnTarget::Metadata,
                     "lixcol_global" => InsertColumnTarget::Global,
@@ -398,7 +398,7 @@ fn entity_insert_row(
     }
 
     let mut snapshot = serde_json::Map::with_capacity(layout.snapshot_capacity);
-    let mut entity_id = None;
+    let mut entity_pk = None;
     let mut file_id = None;
     let mut metadata = None;
     let mut global = None;
@@ -429,8 +429,8 @@ fn entity_insert_row(
         let value = eval_value.into_json();
         match target {
             InsertColumnTarget::Visible { .. } => unreachable!("visible columns handled above"),
-            InsertColumnTarget::EntityId => {
-                entity_id = Some(entity_id_from_value(&value, "lixcol_entity_id")?);
+            InsertColumnTarget::EntityPk => {
+                entity_pk = Some(entity_pk_from_value(&value, "lixcol_entity_pk")?);
             }
             InsertColumnTarget::FileId => {
                 file_id = text_value(value, "lixcol_file_id")?;
@@ -452,7 +452,7 @@ fn entity_insert_row(
     let global = global.unwrap_or(false);
     let version_id = entity_row_version_id(plan, explicit_version_id, global)?;
     Ok(TransactionWriteRow {
-        entity_id,
+        entity_pk,
         schema_key: layout.schema_key.clone(),
         file_id,
         snapshot: Some(TransactionJson::from_value(
@@ -510,7 +510,7 @@ fn entity_replace_row_from_live(
     };
 
     Ok(TransactionWriteRow {
-        entity_id: Some(row.entity_id.clone()),
+        entity_pk: Some(row.entity_pk.clone()),
         schema_key: spec.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot: snapshot
@@ -811,6 +811,14 @@ fn predicate_matches(
             )?;
             Ok(!left.is_null() && !right.is_null() && left == right)
         }
+        BoundPredicate::IsNull(expr) => {
+            let value = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            Ok(value.is_null())
+        }
+        BoundPredicate::IsNotNull(expr) => {
+            let value = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            Ok(!value.is_null())
+        }
         BoundPredicate::In { expr, values } => {
             let candidate = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
             if candidate.is_null() {
@@ -962,6 +970,9 @@ fn validate_predicate_supported(
             validate_expr_supported(left)?;
             validate_expr_supported(right)
         }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            validate_expr_supported(expr)
+        }
         BoundPredicate::In { expr, values } => {
             validate_expr_supported(expr)?;
             for value in values {
@@ -992,6 +1003,7 @@ fn validate_json_predicate_types(
             Ok(())
         }
         BoundPredicate::Eq(left, right) => validate_json_comparison_operands(left, right, spec),
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(()),
         BoundPredicate::In { expr, values } => {
             if bound_expr_is_json(expr, spec) {
                 for value in values {
@@ -1055,7 +1067,7 @@ fn is_identity_json_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
         BoundExpr::Column(column)
-            if matches!(column.name.as_str(), "entity_id" | "lixcol_entity_id")
+            if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
     )
 }
 
@@ -1075,7 +1087,7 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
                 .is_some_and(|column| column.column_type == EntityColumnType::Json)
                 || matches!(
                     column.name.as_str(),
-                    "lixcol_entity_id" | "lixcol_metadata" | "lixcol_snapshot_content"
+                    "lixcol_entity_pk" | "lixcol_metadata" | "lixcol_snapshot_content"
                 )
         }
         BoundExpr::Literal(BoundLiteral::Json(_)) => true,
@@ -1352,8 +1364,8 @@ fn column_eval_value(
         return Ok(EntityEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_entity_id" => row
-            .entity_id
+        "lixcol_entity_pk" => row
+            .entity_pk
             .as_json_array_value()
             .map(EntityEvalValue::Json),
         "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
@@ -1580,15 +1592,15 @@ fn bool_value(value: JsonValue, column_name: &str) -> Result<Option<bool>, LixEr
     }
 }
 
-fn entity_id_from_value(value: &JsonValue, column_name: &str) -> Result<EntityIdentity, LixError> {
+fn entity_pk_from_value(value: &JsonValue, column_name: &str) -> Result<EntityPk, LixError> {
     match value {
-        JsonValue::String(value) => EntityIdentity::from_json_array_text(value).map_err(|error| {
+        JsonValue::String(value) => EntityPk::from_json_array_text(value).map_err(|error| {
             LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 format!("entity write has invalid {column_name}: {error}"),
             )
         }),
-        value => EntityIdentity::from_json_array_value(value).map_err(|error| {
+        value => EntityPk::from_json_array_value(value).map_err(|error| {
             LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 format!("entity write has invalid {column_name}: {error}"),

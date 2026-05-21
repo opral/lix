@@ -140,7 +140,7 @@ async fn install_plugin_with_writer(
 
 #[derive(Clone)]
 struct RegisteredSchemaRowSpec {
-    entity_id: String,
+    entity_pk: String,
     registered_schema_key: String,
     snapshot: JsonValue,
     schema_json: JsonValue,
@@ -165,7 +165,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
     let changes = schema_rows
         .iter()
         .map(|row| PublicChange {
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
             file_id: None,
             plugin_key: None,
@@ -266,7 +266,7 @@ fn registered_schema_row_spec_from_json(
     validate_lix_schema_definition(schema)?;
     let schema_key = schema_key_from_definition(schema)?;
     Ok(RegisteredSchemaRowSpec {
-        entity_id: schema_key.entity_id(),
+        entity_pk: schema_key.entity_pk(),
         registered_schema_key: schema_key.schema_key,
         snapshot: json!({ "value": schema }),
         schema_json: schema.clone(),
@@ -278,7 +278,7 @@ fn registered_schema_planned_row(
     target_version_id: &str,
 ) -> PlannedStateRow {
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    values.insert("entity_pk".to_string(), Value::Text(row.entity_pk.clone()));
     values.insert(
         "schema_key".to_string(),
         Value::Text(REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string()),
@@ -294,7 +294,7 @@ fn registered_schema_planned_row(
         Value::Text(target_version_id.to_string()),
     );
     PlannedStateRow {
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
         version_id: Some(target_version_id.to_string()),
         values,
@@ -316,7 +316,7 @@ fn plugin_archive_file_descriptor_row(
     })
     .to_string();
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(archive_id.to_string()));
+    values.insert("entity_pk".to_string(), Value::Text(archive_id.to_string()));
     values.insert(
         "schema_key".to_string(),
         Value::Text(FILESYSTEM_DESCRIPTOR_SCHEMA_KEY.to_string()),
@@ -332,7 +332,7 @@ fn plugin_archive_file_descriptor_row(
         Value::Text(target_version_id.to_string()),
     );
     PlannedStateRow {
-        entity_id: archive_id.to_string(),
+        entity_pk: archive_id.to_string(),
         schema_key: FILESYSTEM_DESCRIPTOR_SCHEMA_KEY.to_string(),
         version_id: Some(target_version_id.to_string()),
         values,
@@ -362,7 +362,7 @@ fn plugin_archive_binary_blob_ref_row(
     })
     .to_string();
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(archive_id.to_string()));
+    values.insert("entity_pk".to_string(), Value::Text(archive_id.to_string()));
     values.insert(
         "schema_key".to_string(),
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string()),
@@ -378,7 +378,7 @@ fn plugin_archive_binary_blob_ref_row(
         Value::Text(target_version_id.to_string()),
     );
     Ok(PlannedStateRow {
-        entity_id: archive_id.to_string(),
+        entity_pk: archive_id.to_string(),
         schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         version_id: Some(target_version_id.to_string()),
         values,
@@ -480,7 +480,7 @@ fn semantic_effect_markers_from_changes(changes: &[PublicChange]) -> Vec<Semanti
             effect_key: "state.upsert".to_string(),
             target: format!(
                 "{}:{}@{}",
-                change.schema_key, change.entity_id, change.version_id
+                change.schema_key, change.entity_pk, change.version_id
             ),
         })
         .collect()
@@ -488,7 +488,7 @@ fn semantic_effect_markers_from_changes(changes: &[PublicChange]) -> Vec<Semanti
 
 fn planned_row_to_public_change(row: &PlannedStateRow) -> Result<PublicChange, LixError> {
     Ok(PublicChange {
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: planned_row_text_value(row, "file_id"),
         plugin_key: planned_row_text_value(row, "plugin_key"),
@@ -550,7 +550,7 @@ fn semantic_idempotency_key(
 
 fn summarize_change(change: &PublicChange) -> JsonValue {
     json!({
-        "entity_id": change.entity_id,
+        "entity_pk": change.entity_pk,
         "schema_key": change.schema_key,
         "file_id": change.file_id,
         "plugin_key": change.plugin_key,
@@ -564,7 +564,7 @@ fn summarize_change(change: &PublicChange) -> JsonValue {
 
 fn summarize_planned_row(row: &PlannedStateRow) -> JsonValue {
     json!({
-        "entity_id": row.entity_id,
+        "entity_pk": row.entity_pk,
         "schema_key": row.schema_key,
         "version_id": row.version_id,
         "tombstone": row.tombstone,

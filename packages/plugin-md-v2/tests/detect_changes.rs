@@ -88,7 +88,7 @@ fn tombstone_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none())
-        .map(|change| change.entity_id.clone())
+        .map(|change| change.entity_pk.clone())
         .collect()
 }
 
@@ -96,7 +96,7 @@ fn upsert_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some())
-        .map(|change| change.entity_id.clone())
+        .map(|change| change.entity_pk.clone())
         .collect()
 }
 
@@ -105,7 +105,7 @@ fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginD
         active_state: Some(
             rows.iter()
                 .map(|row| plugin_md_v2::PluginActiveStateRow {
-                    entity_id: row.entity_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
                     schema_key: Some(row.schema_key.clone()),
                     snapshot_content: row.snapshot_content.clone(),
                     file_id: None,

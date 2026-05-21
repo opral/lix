@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
@@ -273,7 +273,7 @@ where
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: EntityIdentity::single(WORKSPACE_VERSION_KEY),
+                entity_pk: EntityPk::single(WORKSPACE_VERSION_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await?

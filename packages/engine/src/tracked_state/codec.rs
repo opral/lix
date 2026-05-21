@@ -1,7 +1,6 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::changelog::{ChangeLocator, SegmentObjectLocation};
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
@@ -18,8 +17,8 @@ const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
-const ENTITY_IDENTITY_END: u8 = 0;
-const ENTITY_IDENTITY_STRING: u8 = 1;
+const ENTITY_PKENTITY_END: u8 = 0;
+const ENTITY_PKENTITY_STRING: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -161,7 +160,7 @@ pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
     encode_key_ref(TrackedStateKeyRef {
         schema_key: &key.schema_key,
         file_id: key.file_id.as_deref(),
-        entity_id: &key.entity_id,
+        entity_pk: &key.entity_pk,
     })
 }
 
@@ -180,7 +179,7 @@ fn append_key_ref(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>) {
         }
         None => out.push(0),
     }
-    push_entity_identity(out, key.entity_id);
+    push_entity_pk(out, key.entity_pk);
 }
 
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
@@ -214,7 +213,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
             ))
         }
     };
-    let entity_id = read_entity_identity(bytes, &mut cursor)?;
+    let entity_pk = read_entity_pk(bytes, &mut cursor)?;
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -224,14 +223,14 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     Ok(TrackedStateKey {
         schema_key,
         file_id,
-        entity_id,
+        entity_pk,
     })
 }
 
 /// Decodes a key after the caller has already proven the schema/file prefix.
 ///
 /// This is for scan paths that have matched an encoded prefix range and only
-/// need to materialize the entity suffix plus the known projection fields.
+/// need to materialize the entity suffix plus the selected columns.
 pub(crate) fn decode_key_with_trusted_prefix(
     bytes: &[u8],
     schema_key: &str,
@@ -239,7 +238,7 @@ pub(crate) fn decode_key_with_trusted_prefix(
     prefix_len: usize,
 ) -> Result<TrackedStateKey, LixError> {
     let mut cursor = prefix_len;
-    let entity_id = read_entity_identity(bytes, &mut cursor)?;
+    let entity_pk = read_entity_pk(bytes, &mut cursor)?;
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -249,14 +248,15 @@ pub(crate) fn decode_key_with_trusted_prefix(
     Ok(TrackedStateKey {
         schema_key: schema_key.to_string(),
         file_id: file_id.map(str::to_string),
-        entity_id,
+        entity_pk,
     })
 }
 
 #[cfg(test)]
 pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
     encode_value_ref(TrackedStateIndexValueRef {
-        change_locator: value.change_locator.as_ref(),
+        change_id: &value.change_id,
+        commit_id: &value.commit_id,
         deleted: value.deleted,
         snapshot_ref: value.snapshot_ref.as_ref(),
         metadata_ref: value.metadata_ref.as_ref(),
@@ -273,9 +273,8 @@ pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> 
 
 fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
     out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
-    push_sized_bytes(out, value.change_locator.change_id.as_bytes());
-    push_sized_bytes(out, value.change_locator.commit_id.as_bytes());
-    append_segment_location_ref(out, value.change_locator.location);
+    push_sized_bytes(out, value.change_id.as_bytes());
+    push_sized_bytes(out, value.commit_id.as_bytes());
     push_timestamp_pair(out, value.created_at, value.updated_at);
     push_optional_json_ref(out, value.snapshot_ref);
     push_optional_json_ref(out, value.metadata_ref);
@@ -283,9 +282,8 @@ fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
 
 #[cfg(test)]
 pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
-    1 + sized_bytes_len(value.change_locator.change_id.as_bytes())
-        + sized_bytes_len(value.change_locator.commit_id.as_bytes())
-        + segment_location_len(&value.change_locator.location)
+    1 + sized_bytes_len(value.change_id.as_bytes())
+        + sized_bytes_len(value.commit_id.as_bytes())
         + timestamp_pair_len(&value.created_at, &value.updated_at)
         + optional_json_ref_len(value.snapshot_ref.as_ref())
         + optional_json_ref_len(value.metadata_ref.as_ref())
@@ -330,7 +328,6 @@ fn decode_value_after_header(
 ) -> Result<TrackedStateIndexValue, LixError> {
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
     let commit_id = read_sized_string(bytes, &mut cursor, "commit_id")?;
-    let location = read_segment_location(bytes, &mut cursor)?;
     let (created_at, updated_at) = read_timestamp_pair(bytes, &mut cursor)?;
     let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
     let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
@@ -341,50 +338,13 @@ fn decode_value_after_header(
         ));
     }
     Ok(TrackedStateIndexValue {
-        change_locator: ChangeLocator {
-            change_id,
-            commit_id,
-            location,
-        },
+        change_id,
+        commit_id,
         deleted,
         snapshot_ref,
         metadata_ref,
         created_at,
         updated_at,
-    })
-}
-
-fn append_segment_location_ref(
-    out: &mut Vec<u8>,
-    location: crate::changelog::SegmentObjectLocationRef<'_>,
-) {
-    push_sized_bytes(out, location.segment_id.as_bytes());
-    out.extend_from_slice(&location.offset.to_be_bytes());
-    out.extend_from_slice(&location.len.to_be_bytes());
-    push_sized_bytes(out, location.checksum.as_bytes());
-}
-
-#[cfg(test)]
-fn segment_location_len(location: &SegmentObjectLocation) -> usize {
-    sized_bytes_len(location.segment_id.as_bytes())
-        + 8
-        + 8
-        + sized_bytes_len(location.checksum.as_bytes())
-}
-
-fn read_segment_location(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<SegmentObjectLocation, LixError> {
-    let segment_id = read_sized_string(bytes, cursor, "segment_id")?;
-    let offset = read_u64(bytes, cursor, "segment_offset")?;
-    let len = read_u64(bytes, cursor, "segment_len")?;
-    let checksum = read_sized_string(bytes, cursor, "segment_checksum")?;
-    Ok(SegmentObjectLocation {
-        segment_id,
-        offset,
-        len,
-        checksum,
     })
 }
 
@@ -663,35 +623,37 @@ fn level_salt(level: usize) -> u64 {
     value ^ (value >> 31)
 }
 
-fn push_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) {
+fn push_entity_pk(out: &mut Vec<u8>, identity: &EntityPk) {
     assert!(
         !identity.parts.is_empty(),
-        "tracked-state key entity identity must contain at least one part"
+        "tracked-state key entity primary key must contain at least one part"
     );
     for part in &identity.parts {
-        out.push(ENTITY_IDENTITY_STRING);
+        out.push(ENTITY_PKENTITY_STRING);
         push_sized_bytes(out, part.as_bytes());
     }
-    out.push(ENTITY_IDENTITY_END);
+    out.push(ENTITY_PKENTITY_END);
 }
 
-fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity, LixError> {
+fn read_entity_pk(bytes: &[u8], cursor: &mut usize) -> Result<EntityPk, LixError> {
     let mut parts = Vec::new();
     loop {
-        let tag = read_u8(bytes, cursor, "entity identity part tag")?;
+        let tag = read_u8(bytes, cursor, "entity primary key part tag")?;
         match tag {
-            ENTITY_IDENTITY_END => break,
-            ENTITY_IDENTITY_STRING => {
+            ENTITY_PKENTITY_END => break,
+            ENTITY_PKENTITY_STRING => {
                 parts.push(read_sized_string(
                     bytes,
                     cursor,
-                    "entity identity string part",
+                    "entity primary key string part",
                 )?);
             }
             other => {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("tracked-state tree key has invalid entity identity part tag {other}"),
+                    format!(
+                        "tracked-state tree key has invalid entity primary key part tag {other}"
+                    ),
                 ))
             }
         }
@@ -699,10 +661,10 @@ fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdenti
     if parts.is_empty() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "tracked-state tree key entity identity must contain at least one part",
+            "tracked-state tree key entity primary key must contain at least one part",
         ));
     }
-    Ok(EntityIdentity { parts })
+    Ok(EntityPk { parts })
 }
 
 fn push_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -886,25 +848,15 @@ fn read_u64(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u64, L
 mod tests {
     use super::*;
 
-    fn test_location(
-        commit_id: &str,
-        pack_id: u32,
-        ordinal: u32,
-        checksum: &str,
-    ) -> SegmentObjectLocation {
-        SegmentObjectLocation {
-            segment_id: commit_id.to_string(),
-            offset: u64::from(pack_id),
-            len: u64::from(ordinal),
-            checksum: checksum.to_string(),
-        }
-    }
-
-    fn test_locator(commit_id: &str, pack_id: u32, ordinal: u32, change_id: &str) -> ChangeLocator {
-        ChangeLocator {
+    fn test_value(commit_id: &str, change_id: &str) -> TrackedStateIndexValue {
+        TrackedStateIndexValue {
             change_id: change_id.to_string(),
             commit_id: commit_id.to_string(),
-            location: test_location(commit_id, pack_id, ordinal, change_id),
+            deleted: false,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
         }
     }
 
@@ -913,12 +865,12 @@ mod tests {
         let null_key = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity::single("entity"),
+            entity_pk: EntityPk::single("entity"),
         });
         let file_key = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_id: EntityIdentity::single("entity"),
+            entity_pk: EntityPk::single("entity"),
         });
 
         assert_ne!(null_key, file_key);
@@ -927,7 +879,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: None,
-                entity_id: EntityIdentity::single("entity"),
+                entity_pk: EntityPk::single("entity"),
             }
         );
         assert_eq!(
@@ -935,7 +887,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema".to_string(),
                 file_id: Some("file".to_string()),
-                entity_id: EntityIdentity::single("entity"),
+                entity_pk: EntityPk::single("entity"),
             }
         );
     }
@@ -945,7 +897,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec![
                     "namespace".to_string(),
                     "true".to_string(),
@@ -964,7 +916,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["namespace".to_string(), "id".to_string()],
             },
         };
@@ -983,7 +935,7 @@ mod tests {
         let mut encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["true".to_string()],
             },
         });
@@ -995,7 +947,7 @@ mod tests {
         let error = decode_key(&encoded).expect_err("non-string identity tag should reject");
         assert!(error
             .to_string()
-            .contains("invalid entity identity part tag 2"));
+            .contains("invalid entity primary key part tag 2"));
     }
 
     #[test]
@@ -1003,14 +955,14 @@ mod tests {
         let prefix = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["a".to_string()],
             },
         });
         let extended = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_id: EntityIdentity {
+            entity_pk: EntityPk {
                 parts: vec!["a".to_string(), "b".to_string()],
             },
         });
@@ -1019,9 +971,10 @@ mod tests {
     }
 
     #[test]
-    fn value_codec_roundtrips_locator_value() {
+    fn value_codec_roundtrips_change_ref_value() {
         let value = TrackedStateIndexValue {
-            change_locator: test_locator("commit", 7, 11, "change"),
+            change_id: "change".to_string(),
+            commit_id: "commit".to_string(),
             deleted: false,
             snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
             metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
@@ -1034,9 +987,10 @@ mod tests {
     }
 
     #[test]
-    fn value_codec_roundtrips_second_locator_value() {
+    fn value_codec_roundtrips_second_change_ref_value() {
         let value = TrackedStateIndexValue {
-            change_locator: test_locator("other-commit", 0, 1, "other-change"),
+            change_id: "other-change".to_string(),
+            commit_id: "other-commit".to_string(),
             deleted: true,
             snapshot_ref: None,
             metadata_ref: None,
@@ -1050,14 +1004,8 @@ mod tests {
 
     #[test]
     fn value_codec_compacts_matching_timestamps() {
-        let mut compact = TrackedStateIndexValue {
-            change_locator: test_locator("commit", 0, 1, "change"),
-            deleted: false,
-            snapshot_ref: None,
-            metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        };
+        let mut compact = test_value("commit", "change");
+        compact.updated_at = compact.created_at.clone();
         let compact_len = encode_value(&compact).len();
         assert_eq!(
             decode_value(&encode_value(&compact)).expect("value"),
@@ -1078,7 +1026,8 @@ mod tests {
     fn encoded_value_len_matches_encoded_value_bytes() {
         let values = [
             TrackedStateIndexValue {
-                change_locator: test_locator("commit", 0, 0, "change"),
+                change_id: "change".to_string(),
+                commit_id: "commit".to_string(),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: None,
@@ -1086,7 +1035,8 @@ mod tests {
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
             TrackedStateIndexValue {
-                change_locator: test_locator("commit", 1, 2, "change-2"),
+                change_id: "change-2".to_string(),
+                commit_id: "commit".to_string(),
                 deleted: true,
                 snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
                 metadata_ref: None,
@@ -1094,7 +1044,8 @@ mod tests {
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
             TrackedStateIndexValue {
-                change_locator: test_locator("other", 4, 8, "change-3"),
+                change_id: "change-3".to_string(),
+                commit_id: "other".to_string(),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),

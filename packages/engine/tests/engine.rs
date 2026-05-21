@@ -33,10 +33,10 @@ simulation_test!(
 
         let version_result = session
             .execute(
-                "SELECT entity_id, snapshot_content \
+                "SELECT entity_pk, snapshot_content \
              FROM lix_state \
              WHERE schema_key = 'lix_version_descriptor' \
-             ORDER BY entity_id",
+             ORDER BY entity_pk",
                 &[],
             )
             .await
@@ -65,10 +65,10 @@ simulation_test!(
 
         let refs_result = session
             .execute(
-                "SELECT entity_id, snapshot_content, untracked \
+                "SELECT entity_pk, snapshot_content, untracked \
              FROM lix_state \
              WHERE schema_key = 'lix_version_ref' \
-             ORDER BY entity_id",
+             ORDER BY entity_pk",
                 &[],
             )
             .await
@@ -354,7 +354,7 @@ simulation_test!(
         let write_result = second_session
 			.execute(
 					"INSERT INTO lix_state (\
-					 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+					 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
 					 ) VALUES (\
 					 lix_json('[\"det-write\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), false, false\
 					 )",
