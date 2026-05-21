@@ -314,6 +314,7 @@ where
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
                         // transaction-owned SQL write context.
+                        transaction.prepare_sql_visible_schemas().await?;
                         let tx_plan =
                             sql2::create_write_logical_plan_from_parsed(transaction, statement)
                                 .await?;
@@ -395,6 +396,7 @@ where
             return self
                 .with_write_transaction_reserved(write_access, |transaction| {
                     Box::pin(async move {
+                        transaction.prepare_sql_visible_schemas().await?;
                         let tx_plan =
                             sql2::create_write_logical_plan_from_parsed(transaction, statement)
                                 .await?;
@@ -475,7 +477,7 @@ where
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
             sql2::BoundStatementRoute::Read => {
-                let read_ctx = transaction.sql_read_execution_context()?;
+                let read_ctx = transaction.sql_read_execution_context().await?;
                 let read_result = async {
                     let plan = sql2::create_transaction_read_logical_plan_from_parsed(
                         &read_ctx,
@@ -570,6 +572,7 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
+    transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
     Ok(ExecuteResult::from_rows_affected(affected_rows))
@@ -587,6 +590,7 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
+    transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let affected_rows =
         sql2::execute_write_logical_plan_with_mode(transaction, tx_plan, params, mode).await?;
@@ -605,6 +609,7 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
+    transaction.prepare_sql_visible_schemas().await?;
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let (affected_rows, path) =
         sql2::execute_write_logical_plan_with_mode_and_trace(transaction, tx_plan, params, mode)

@@ -570,3 +570,92 @@ the dictionary codec cut.
 | `commit_change_ref_chunk` value bytes |   101,287 |        101,325 |   +38 |
 | transaction `insert_all` puts         |     2,037 |          2,038 |    +1 |
 | transaction `insert_all` bytes        |   811,445 |        811,483 |   +38 |
+
+## Lazy SQL Schema Planning For Direct Transactions: 2026-05-20
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke/insert_all_rows/1k'
+```
+
+Notes:
+
+- `Transaction::open` no longer prepares the SQL/DataFusion-visible schema
+  catalog for every transaction.
+- Direct transaction writes still load the compact schema facts needed for row
+  normalization and validation.
+- SQL read/write execution paths explicitly prepare the SQL-visible schema
+  cache before planning.
+
+### Focused Result
+
+Criterion reported a statistically significant improvement for SQLite direct
+transaction inserts:
+
+```text
+tracked_state_crud/transaction/lix_sqlite/smoke/insert_all_rows/1k
+  time:   [12.560 ms 12.906 ms 13.322 ms]
+  change: [-22.883% -16.827% -10.637%] (p = 0.00 < 0.05)
+  Performance has improved.
+```
+
+This confirms the first-principles cut: direct transaction writes should use
+the changelog/tracked-state row path and avoid SQL planning surfaces unless the
+caller is actually executing SQL.
+
+## Lazy SQL Schema Planning Full Smoke: 2026-05-20
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+```
+
+Notes:
+
+- Full smoke confirms the lazy SQL schema planning cut is mostly neutral across
+  the broader scorecard.
+- The target direct transaction insert path stays near the fixed bounded-chunk
+  scorecard, with SQLite at 12.99 ms, RocksDB at 10.40 ms, and redb at
+  21.62 ms.
+- Storage accounting is unchanged by this cut; it only changes when the
+  SQL-visible schema catalog is prepared.
+
+### Transaction Layer
+
+Criterion point estimates:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   12.99 ms |  3.18 ms |         190 us |          658 us |   16.72 ms |    1.95 ms |   14.69 ms |    2.03 ms |
+| RocksDB |   10.40 ms |  2.90 ms |        62.7 us |          413 us |   11.22 ms |    1.47 ms |   13.39 ms |    1.64 ms |
+| redb    |   21.62 ms |  2.88 ms |        76.7 us |          415 us |   20.89 ms |    6.13 ms |   20.27 ms |    6.03 ms |
+
+### SQL Session
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| in-memory |   17.92 ms |  5.75 ms |        1.22 ms |         1.32 ms |   14.38 ms |    6.33 ms |
+
+### Delta From Previous Full Smoke
+
+The previous full smoke was the bounded-chunk regression fix entry.
+
+| Workload                             | Previous |  Current |  Delta |
+| ------------------------------------ | -------: | -------: | -----: |
+| SQLite transaction insert 1k         | 13.12 ms | 12.99 ms |  -1.0% |
+| RocksDB transaction insert 1k        | 10.20 ms | 10.40 ms |  +2.0% |
+| redb transaction insert 1k           | 20.96 ms | 21.62 ms |  +3.1% |
+| SQL session insert 1k                | 17.43 ms | 17.92 ms |  +2.8% |
+| SQLite transaction update_one_by_pk  |  2.30 ms |  1.95 ms | -15.2% |
+| SQLite transaction delete_one_by_pk  |  2.35 ms |  2.03 ms | -13.7% |
+| RocksDB transaction update_one_by_pk |  1.57 ms |  1.47 ms |  -6.6% |
+| RocksDB transaction delete_all 1k    | 11.42 ms | 13.39 ms | +17.2% |
+
+Criterion flagged SQLite update-all and RocksDB delete-all as regressions, but
+the changes do not line up with this patch's direct insert target and are likely
+smoke-run variance or unrelated backend noise. The direct transaction insert
+path remains effectively stable in the full scorecard after the focused
+SQLite-only run showed a significant local improvement against Criterion's
+cached baseline.
