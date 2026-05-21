@@ -67,13 +67,38 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     version_ctx: Arc<VersionContext>,
+    catalog_context: Arc<CatalogContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
     staged_storage_writes: StorageWriteSet,
     storage: StorageContext<B>,
-    visible_schemas: Vec<JsonValue>,
+    sql_schema_cache: SqlSchemaCache,
     functions: FunctionProviderHandle,
     commit_boundary: Option<TransactionCommitBoundary>,
+}
+
+#[derive(Default)]
+struct SqlSchemaCache {
+    visible_schemas: Option<Vec<JsonValue>>,
+}
+
+impl SqlSchemaCache {
+    fn is_prepared(&self) -> bool {
+        self.visible_schemas.is_some()
+    }
+
+    fn prepare(&mut self, visible_schemas: Vec<JsonValue>) {
+        self.visible_schemas = Some(visible_schemas);
+    }
+
+    fn visible_schemas(&self) -> Result<&[JsonValue], LixError> {
+        self.visible_schemas.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "SQL visible schemas were requested before SQL transaction context preparation",
+            )
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -224,12 +249,6 @@ where
                 FunctionContext::prepare(&runtime_live_state).await?
             };
             let functions = runtime_functions.provider();
-            let visible_schemas = {
-                let visible_live_state = live_state.reader(&read);
-                catalog_context
-                    .schema_jsons_for_sql_read_planning(&visible_live_state, &active_version_id)
-                    .await?
-            };
             let schema_facts = {
                 let visible_live_state = live_state.reader(&read);
                 catalog_context
@@ -243,19 +262,17 @@ where
                 active_version_id,
                 runtime_functions,
                 functions,
-                visible_schemas,
                 schema_facts,
             ))
         }
         .await;
-        let (active_version_id, runtime_functions, functions, visible_schemas, schema_facts) =
-            match setup_result {
-                Ok(result) => result,
-                Err(error) => {
-                    return Err(error);
-                }
-            };
-        let mut schema_resolver = TransactionSchemaResolver::new(catalog_context);
+        let (active_version_id, runtime_functions, functions, schema_facts) = match setup_result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_schema_facts(
             &Domain::schema_catalog(active_version_id.clone(), true),
             schema_facts,
@@ -268,11 +285,12 @@ where
                 tracked_state,
                 binary_cas,
                 version_ctx,
+                catalog_context,
                 schema_resolver,
                 staged_writes,
                 staged_storage_writes: StorageWriteSet::new(),
                 storage,
-                visible_schemas,
+                sql_schema_cache: SqlSchemaCache::default(),
                 functions,
                 commit_boundary: None,
             },
@@ -531,7 +549,14 @@ where
         self.functions.clone()
     }
 
-    pub(crate) fn sql_read_execution_context(
+    pub(crate) async fn sql_read_execution_context(
+        &mut self,
+    ) -> Result<TransactionSqlReadExecutionContext<B::Read<'_>>, LixError> {
+        self.prepare_sql_visible_schemas().await?;
+        self.sql_read_execution_context_from_cached_schemas()
+    }
+
+    fn sql_read_execution_context_from_cached_schemas(
         &self,
     ) -> Result<TransactionSqlReadExecutionContext<B::Read<'_>>, LixError> {
         let read_store = self.storage.begin_read(StorageReadOptions::default())?;
@@ -542,10 +567,28 @@ where
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             version_ctx: Arc::clone(&self.version_ctx),
-            visible_schemas: self.visible_schemas.clone(),
+            visible_schemas: self.cached_visible_schemas()?.to_vec(),
             functions: self.functions.clone(),
             staged,
         })
+    }
+
+    pub(crate) async fn prepare_sql_visible_schemas(&mut self) -> Result<(), LixError> {
+        if self.sql_schema_cache.is_prepared() {
+            return Ok(());
+        }
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let live_state = self.live_state.reader(&read);
+        let visible_schemas = self
+            .catalog_context
+            .schema_jsons_for_sql_read_planning(&live_state, &self.active_version_id)
+            .await?;
+        self.sql_schema_cache.prepare(visible_schemas);
+        Ok(())
+    }
+
+    fn cached_visible_schemas(&self) -> Result<&[JsonValue], LixError> {
+        self.sql_schema_cache.visible_schemas()
     }
 
     /// Advances a version ref without staging tracked rows.
@@ -812,7 +855,7 @@ where
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        Ok(self.visible_schemas.clone())
+        Ok(self.cached_visible_schemas()?.to_vec())
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
