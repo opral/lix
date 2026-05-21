@@ -12,7 +12,7 @@
         "minLength": 1
       },
       "uniqueItems": true,
-      "description": "Ordered line entity ids for the projected document."
+      "description": "Ordered line entity pks for the projected document."
     }
   },
   "required": [

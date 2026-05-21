@@ -17,7 +17,7 @@ pub(crate) fn materialize_row(
         None
     };
     Ok(MaterializedUntrackedStateRow {
-        entity_id: row.entity_id,
+        entity_pk: row.entity_pk,
         schema_key: row.schema_key,
         file_id: row.file_id,
         snapshot_content,

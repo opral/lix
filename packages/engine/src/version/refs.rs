@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow,
@@ -72,7 +72,7 @@ where
             .load_row(&UntrackedStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: EntityIdentity::single(version_id),
+                entity_pk: EntityPk::single(version_id),
                 file_id: NullableKeyFilter::Null,
             })
             .await?
@@ -107,7 +107,7 @@ where
         let mut heads = rows
             .iter()
             .map(|row| {
-                let version_id = row.entity_id.as_single_string_owned()?;
+                let version_id = row.entity_pk.as_single_string_owned()?;
                 decode_version_head(&version_id, row)
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -246,7 +246,7 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("version-a"),
+                entity_pk: crate::entity_pk::EntityPk::single("version-a"),
                 file_id: NullableKeyFilter::Null,
             })
             .await

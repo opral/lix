@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::GLOBAL_VERSION_ID;
 
@@ -13,7 +13,7 @@ pub(crate) fn version_descriptor_stage_row(
     hidden: bool,
 ) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_id: Some(EntityIdentity::single(version_id)),
+        entity_pk: Some(EntityPk::single(version_id)),
         schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
@@ -35,7 +35,7 @@ pub(crate) fn version_descriptor_stage_row(
 
 pub(crate) fn version_ref_stage_row(version_id: &str, commit_id: &str) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_id: Some(EntityIdentity::single(version_id)),
+        entity_pk: Some(EntityPk::single(version_id)),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({

@@ -389,7 +389,7 @@ function SemanticSqlVisual() {
             <span className={jsString}>{`\`
   SELECT
     f.path,
-    lix_json_get_text(c.entity_id, 0) AS row_id,
+    lix_json_get_text(c.entity_pk, 0) AS row_id,
     c.snapshot_content AS change
   FROM lix_change AS c
   JOIN lix_file AS f

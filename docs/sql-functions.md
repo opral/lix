@@ -35,7 +35,7 @@ History surfaces (`lix_state_history`, `<schema>_history`, `lix_file_history`, `
 SELECT depth, observed_commit_id, snapshot_content
 FROM lix_state_history
 WHERE schema_key = 'task'
-  AND lix_json_get_text(entity_id, 0) = 't1'
+  AND lix_json_get_text(entity_pk, 0) = 't1'
   AND start_commit_id = lix_active_version_commit_id()
 ORDER BY depth;
 ```
@@ -54,7 +54,7 @@ await lix.execute(
      FROM lix_state_history
     WHERE start_commit_id = $1
       AND schema_key = $2
-      AND lix_json_get_text(entity_id, 0) = $3
+      AND lix_json_get_text(entity_pk, 0) = $3
     ORDER BY depth`,
   [commitId, "task", "t1"],
 );
@@ -87,7 +87,7 @@ SELECT lix_json_get(snapshot_content, 'tags') FROM lix_state WHERE schema_key = 
 Same as `lix_json_get` but returns the value as plain text. Useful for filtering or display:
 
 ```sql
-SELECT entity_id
+SELECT entity_pk
 FROM lix_state
 WHERE schema_key = 'task'
   AND lix_json_get_text(snapshot_content, 'priority') = 'high';

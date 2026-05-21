@@ -14,7 +14,7 @@ pub(crate) use fs_path::{
     normalize_path_segment, parent_directory_path, ParsedFilePath,
 };
 pub(crate) use identity::{json_pointer_get, validate_non_empty_identity_value};
-pub use identity::{CanonicalPluginKey, CanonicalSchemaKey, EntityId, FileId, VersionId};
+pub use identity::{CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId, VersionId};
 pub(crate) use json_pointer::{format_json_pointer, parse_json_pointer, top_level_property_name};
 pub(crate) use metadata::{
     parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,

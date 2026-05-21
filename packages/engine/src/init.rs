@@ -2,14 +2,14 @@ use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
     CommitChangeRefSet, CommitRecord,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
-    registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
+    registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage::StorageBackend;
 use crate::storage::{StorageContext, StorageWriteSet};
@@ -49,7 +49,7 @@ struct InitSeedCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedChange {
     id: String,
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: String,
     snapshot_content: String,
     created_at: String,
@@ -57,7 +57,7 @@ struct InitSeedChange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InitSeedLiveRow {
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: String,
     snapshot_content: String,
     created_at: String,
@@ -90,7 +90,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         let key = schema_key_from_definition(schema)?;
         registered_schema_changes.push(canonical_change(
             functions.call_uuid_v7(),
-            registered_schema_entity_id(&key.schema_key)?,
+            registered_schema_entity_pk(&key.schema_key)?,
             REGISTERED_SCHEMA_KEY,
             registered_schema_snapshot(schema)?,
             &timestamp,
@@ -99,21 +99,21 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let global_version_descriptor_change = canonical_change(
         GLOBAL_VERSION_ID.to_string(),
-        EntityIdentity::single(GLOBAL_VERSION_ID),
+        EntityPk::single(GLOBAL_VERSION_ID),
         VERSION_DESCRIPTOR_SCHEMA_KEY,
         version_descriptor_snapshot(GLOBAL_VERSION_ID, "global", true)?,
         &timestamp,
     );
     let main_version_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityIdentity::single(&main_version_id),
+        EntityPk::single(&main_version_id),
         VERSION_DESCRIPTOR_SCHEMA_KEY,
         version_descriptor_snapshot(&main_version_id, "main", false)?,
         &timestamp,
     );
     let kv_lix_id_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityIdentity::single(LIX_ID_KEY),
+        EntityPk::single(LIX_ID_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
         &timestamp,
@@ -127,19 +127,19 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         created_at: timestamp.clone(),
     };
     let global_version_ref_row = untracked_row(
-        EntityIdentity::single(GLOBAL_VERSION_ID),
+        EntityPk::single(GLOBAL_VERSION_ID),
         VERSION_REF_SCHEMA_KEY,
         version_ref_snapshot(GLOBAL_VERSION_ID, &initial_commit_id)?,
         &timestamp,
     );
     let main_version_ref_row = untracked_row(
-        EntityIdentity::single(&main_version_id),
+        EntityPk::single(&main_version_id),
         VERSION_REF_SCHEMA_KEY,
         version_ref_snapshot(&main_version_id, &initial_commit_id)?,
         &timestamp,
     );
     let workspace_version_row = untracked_row(
-        EntityIdentity::single(WORKSPACE_VERSION_KEY),
+        EntityPk::single(WORKSPACE_VERSION_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(WORKSPACE_VERSION_KEY, &main_version_id)?,
         &timestamp,
@@ -219,7 +219,7 @@ where
             .map(|change| TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
-                entity_id: &change.entity_id,
+                entity_pk: &change.entity_pk,
                 change_id: &change.change_id,
                 commit_id: &plan.commit.id,
                 snapshot_ref: change.snapshot_ref.as_ref(),
@@ -232,7 +232,7 @@ where
         deltas.push(TrackedStateDeltaRef {
             schema_key: &commit_row_change.schema_key,
             file_id: commit_row_change.file_id.as_deref(),
-            entity_id: &commit_row_change.entity_id,
+            entity_pk: &commit_row_change.entity_pk,
             change_id: &commit_row_change.change_id,
             commit_id: &plan.commit.id,
             snapshot_ref: commit_row_change.snapshot_ref.as_ref(),
@@ -255,7 +255,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
     ChangeRecord {
         format_version: 1,
         change_id: change.id.clone(),
-        entity_id: change.entity_id.clone(),
+        entity_pk: change.entity_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
         snapshot_ref: Some(JsonRef::for_content(change.snapshot_content.as_bytes())),
@@ -269,7 +269,7 @@ fn seed_commit_row_change_record(commit: &InitSeedCommit) -> Result<ChangeRecord
     Ok(ChangeRecord {
         format_version: 1,
         change_id: commit.change_id.clone(),
-        entity_id: EntityIdentity::single(commit.id.clone()),
+        entity_pk: EntityPk::single(commit.id.clone()),
         schema_key: "lix_commit".to_string(),
         file_id: None,
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
@@ -338,14 +338,14 @@ fn commit_change_ref_from_seed_change(change: &InitSeedChange) -> CommitChangeRe
     CommitChangeRef {
         schema_key: change.schema_key.clone(),
         file_id: None,
-        entity_id: change.entity_id.clone(),
+        entity_pk: change.entity_pk.clone(),
         change_id: change.id.clone(),
     }
 }
 
 fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedStateRow, LixError> {
     Ok(UntrackedStateRow {
-        entity_id: row.entity_id.clone(),
+        entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
         snapshot_content: Some(row.snapshot_content.clone()),
@@ -358,13 +358,13 @@ fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedState
 }
 
 fn untracked_row(
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
     timestamp: &str,
 ) -> InitSeedLiveRow {
     InitSeedLiveRow {
-        entity_id,
+        entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
         created_at: timestamp.to_string(),
@@ -376,14 +376,14 @@ fn untracked_row(
 
 fn canonical_change(
     id: String,
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
     created_at: &str,
 ) -> InitSeedChange {
     InitSeedChange {
         id,
-        entity_id,
+        entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
         created_at: created_at.to_string(),
@@ -541,8 +541,7 @@ mod tests {
             .iter()
             .find(|row| {
                 row.schema_key == KEY_VALUE_SCHEMA_KEY
-                    && row.entity_id
-                        == crate::entity_identity::EntityIdentity::single(WORKSPACE_VERSION_KEY)
+                    && row.entity_pk == crate::entity_pk::EntityPk::single(WORKSPACE_VERSION_KEY)
             })
             .expect("workspace version row should exist");
 

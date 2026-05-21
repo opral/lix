@@ -8,7 +8,7 @@
   "properties": {
     "id": {
       "type": "string",
-      "description": "File/entity identifier (matches lix_file.id) for this binary reference row."
+      "description": "File primary-key value (matches lix_file.id) for this binary reference row."
     },
     "blob_hash": {
       "type": "string",

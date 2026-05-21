@@ -28,12 +28,12 @@ Semantic changes make version control usable inside applications and agent workf
 
 ## How Lix stores them
 
-Lix stores changes as rows in its version-control model. Each row carries the schema, entity id, optional file id, and the entity snapshot after the change.
+Lix stores changes as rows in its version-control model. Each row carries the schema, entity pk, optional file id, and the entity snapshot after the change.
 
 The global journal is `lix_change`:
 
 ```sql
-SELECT created_at, schema_key, entity_id, snapshot_content
+SELECT created_at, schema_key, entity_pk, snapshot_content
 FROM lix_change
 ORDER BY created_at DESC
 LIMIT 20;
@@ -122,7 +122,7 @@ For example:
 ```sql
 SELECT
   f.path,
-  lix_json_get_text(c.entity_id, 0) AS row_id,
+  lix_json_get_text(c.entity_pk, 0) AS row_id,
   c.snapshot_content AS change
 FROM lix_change AS c
 JOIN lix_file AS f

@@ -1,10 +1,9 @@
 use super::types::{
     ChangeRecord, ChangeRecordView, CommitChangeRef, CommitChangeRefChunk,
-    CommitChangeRefChunkView, CommitChangeRefView, CommitRecord, CommitRecordView,
-    EntityIdentityRef,
+    CommitChangeRefChunkView, CommitChangeRefView, CommitRecord, CommitRecordView, EntityPkRef,
 };
 use crate::common::LixError;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 
 const COMMIT_MAGIC: &[u8; 5] = b"LXCM1";
@@ -64,7 +63,7 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
     write_u32(&mut bytes, record.format_version);
     write_str(&mut bytes, &record.change_id)?;
     write_str(&mut bytes, &record.schema_key)?;
-    write_entity_identity(&mut bytes, &record.entity_id)?;
+    write_entity_pk(&mut bytes, &record.entity_pk)?;
     write_optional_str(&mut bytes, record.file_id.as_deref())?;
     write_optional_json_ref(&mut bytes, record.snapshot_ref)?;
     write_optional_json_ref(&mut bytes, record.metadata_ref)?;
@@ -79,7 +78,7 @@ pub(crate) fn view_change_record(bytes: &[u8]) -> Result<ChangeRecordView<'_>, L
         format_version: cursor.read_u32("format_version")?,
         change_id: cursor.read_str("change_id")?,
         schema_key: cursor.read_str("schema_key")?,
-        entity_id: cursor.read_entity_identity("entity_id")?,
+        entity_pk: cursor.read_entity_pk("entity_pk")?,
         file_id: cursor.read_optional_str("file_id")?,
         snapshot_ref: cursor.read_optional_json_ref("snapshot_ref")?,
         metadata_ref: cursor.read_optional_json_ref("metadata_ref")?,
@@ -95,7 +94,7 @@ pub(crate) fn decode_change_record(bytes: &[u8]) -> Result<ChangeRecord, LixErro
         format_version: view.format_version,
         change_id: view.change_id.to_string(),
         schema_key: view.schema_key.to_string(),
-        entity_id: entity_identity_from_ref(view.entity_id)?,
+        entity_pk: entity_pk_from_ref(view.entity_pk)?,
         file_id: view.file_id.map(str::to_string),
         snapshot_ref: view.snapshot_ref,
         metadata_ref: view.metadata_ref,
@@ -141,7 +140,7 @@ pub(crate) fn encode_commit_change_ref_chunk(
         )?;
         write_u16_index(&mut bytes, schema_index, "commit change ref schema index")?;
         write_u16_index(&mut bytes, file_index, "commit change ref file index")?;
-        write_entity_identity_compact(&mut bytes, &entry.entity_id)?;
+        write_entity_pk_compact(&mut bytes, &entry.entity_pk)?;
         write_str(&mut bytes, &entry.change_id)?;
     }
     Ok(bytes)
@@ -175,7 +174,7 @@ pub(crate) fn view_commit_change_ref_chunk<'a>(
                     format!("changelog {context}.file_index is out of bounds"),
                 )
             })?,
-            entity_id: cursor.read_entity_identity_compact(&format!("{context}.entity_id"))?,
+            entity_pk: cursor.read_entity_pk_compact(&format!("{context}.entity_pk"))?,
             change_id: cursor.read_str(&format!("{context}.change_id"))?,
         });
     }
@@ -202,7 +201,7 @@ pub(crate) fn decode_commit_change_ref_chunk(
                 Ok(CommitChangeRef {
                     schema_key: entry.schema_key.to_string(),
                     file_id: entry.file_id.map(str::to_string),
-                    entity_id: entity_identity_from_ref(entry.entity_id.clone())?,
+                    entity_pk: entity_pk_from_ref(entry.entity_pk.clone())?,
                     change_id: entry.change_id.to_string(),
                 })
             })
@@ -265,24 +264,21 @@ fn write_str_vec(out: &mut Vec<u8>, values: &[String]) -> Result<(), LixError> {
     Ok(())
 }
 
-fn write_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) -> Result<(), LixError> {
-    write_len(out, identity.parts.len(), "entity identity parts")?;
+fn write_entity_pk(out: &mut Vec<u8>, identity: &EntityPk) -> Result<(), LixError> {
+    write_len(out, identity.parts.len(), "entity primary key parts")?;
     for part in &identity.parts {
         write_str(out, part)?;
     }
     Ok(())
 }
 
-fn write_entity_identity_compact(
-    out: &mut Vec<u8>,
-    identity: &EntityIdentity,
-) -> Result<(), LixError> {
+fn write_entity_pk_compact(out: &mut Vec<u8>, identity: &EntityPk) -> Result<(), LixError> {
     if identity.parts.len() == 1 {
         out.push(1);
         write_str(out, &identity.parts[0])
     } else {
         out.push(0);
-        write_entity_identity(out, identity)
+        write_entity_pk(out, identity)
     }
 }
 
@@ -342,14 +338,15 @@ fn write_u16_index(out: &mut Vec<u8>, value: usize, context: &str) -> Result<(),
     Ok(())
 }
 
-fn entity_identity_from_ref(value: EntityIdentityRef<'_>) -> Result<EntityIdentity, LixError> {
-    EntityIdentity::from_parts(value.parts.iter().map(|part| (*part).to_string()).collect())
-        .map_err(|error| {
+fn entity_pk_from_ref(value: EntityPkRef<'_>) -> Result<EntityPk, LixError> {
+    EntityPk::from_parts(value.parts.iter().map(|part| (*part).to_string()).collect()).map_err(
+        |error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("changelog entity identity is invalid: {error}"),
+                format!("changelog entity primary key is invalid: {error}"),
             )
-        })
+        },
+    )
 }
 
 #[derive(Clone)]
@@ -392,27 +389,24 @@ impl<'a> ByteCursor<'a> {
         Ok(values)
     }
 
-    fn read_entity_identity(&mut self, context: &str) -> Result<EntityIdentityRef<'a>, LixError> {
+    fn read_entity_pk(&mut self, context: &str) -> Result<EntityPkRef<'a>, LixError> {
         let len = self.read_len(context)?;
         let mut parts = Vec::with_capacity(len);
         for index in 0..len {
             parts.push(self.read_str(&format!("{context}.parts[{index}]"))?);
         }
-        Ok(EntityIdentityRef { parts })
+        Ok(EntityPkRef { parts })
     }
 
-    fn read_entity_identity_compact(
-        &mut self,
-        context: &str,
-    ) -> Result<EntityIdentityRef<'a>, LixError> {
+    fn read_entity_pk_compact(&mut self, context: &str) -> Result<EntityPkRef<'a>, LixError> {
         match self.read_bytes(1, context)?[0] {
-            0 => self.read_entity_identity(context),
-            1 => Ok(EntityIdentityRef {
+            0 => self.read_entity_pk(context),
+            1 => Ok(EntityPkRef {
                 parts: vec![self.read_str(&format!("{context}.part"))?],
             }),
             _ => Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("changelog {context} compact entity identity flag is invalid"),
+                format!("changelog {context} compact entity primary key flag is invalid"),
             )),
         }
     }

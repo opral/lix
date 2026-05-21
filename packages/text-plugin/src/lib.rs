@@ -15,7 +15,7 @@ wit_bindgen::generate!({
 
 pub const LINE_SCHEMA_KEY: &str = "text_line";
 pub const DOCUMENT_SCHEMA_KEY: &str = "text_document";
-pub const DOCUMENT_ENTITY_ID: &str = "__document__";
+pub const DOCUMENT_ENTITY_PK: &str = "__document__";
 const MANIFEST_JSON: &str = include_str!("../manifest.json");
 const LINE_SCHEMA_JSON: &str = include_str!("../schema/text_line.json");
 const DOCUMENT_SCHEMA_JSON: &str = include_str!("../schema/text_document.json");
@@ -56,7 +56,7 @@ impl LineEnding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedLine {
-    entity_id: String,
+    entity_pk: String,
     content: Vec<u8>,
     ending: LineEnding,
 }
@@ -96,11 +96,11 @@ impl Guest for TextLinesPlugin {
 
         let before_ids = before_lines
             .iter()
-            .map(|line| line.entity_id.clone())
+            .map(|line| line.entity_pk.clone())
             .collect::<Vec<_>>();
         let after_ids = after_lines
             .iter()
-            .map(|line| line.entity_id.clone())
+            .map(|line| line.entity_pk.clone())
             .collect::<Vec<_>>();
 
         let before_id_set = before_ids.iter().cloned().collect::<HashSet<_>>();
@@ -110,12 +110,12 @@ impl Guest for TextLinesPlugin {
         if before.is_some() {
             let mut removed_ids = HashSet::<String>::with_capacity(before_lines.len());
             for line in &before_lines {
-                if after_id_set.contains(&line.entity_id) {
+                if after_id_set.contains(&line.entity_pk) {
                     continue;
                 }
-                if removed_ids.insert(line.entity_id.clone()) {
+                if removed_ids.insert(line.entity_pk.clone()) {
                     changes.push(EntityChange {
-                        entity_id: line.entity_id.clone(),
+                        entity_pk: line.entity_pk.clone(),
                         schema_key: LINE_SCHEMA_KEY.to_string(),
                         snapshot_content: None,
                     });
@@ -124,11 +124,11 @@ impl Guest for TextLinesPlugin {
         }
 
         for line in &after_lines {
-            if before_id_set.contains(&line.entity_id) {
+            if before_id_set.contains(&line.entity_pk) {
                 continue;
             }
             changes.push(EntityChange {
-                entity_id: line.entity_id.clone(),
+                entity_pk: line.entity_pk.clone(),
                 schema_key: LINE_SCHEMA_KEY.to_string(),
                 snapshot_content: Some(serialize_line_snapshot(line)?),
             });
@@ -142,7 +142,7 @@ impl Guest for TextLinesPlugin {
                 PluginError::Internal(format!("failed to encode document snapshot: {error}"))
             })?;
             changes.push(EntityChange {
-                entity_id: DOCUMENT_ENTITY_ID.to_string(),
+                entity_pk: DOCUMENT_ENTITY_PK.to_string(),
                 schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
                 snapshot_content: Some(snapshot),
             });
@@ -160,14 +160,14 @@ impl Guest for TextLinesPlugin {
         let mut document_tombstoned = false;
         let mut line_by_id = parse_lines_with_ids(&file.data)
             .into_iter()
-            .map(|line| (line.entity_id.clone(), line))
+            .map(|line| (line.entity_pk.clone(), line))
             .collect::<HashMap<_, _>>();
         line_by_id.reserve(expected_line_changes);
         let mut seen_line_change_ids = HashSet::<String>::with_capacity(expected_line_changes);
 
         for change in changes {
             if change.schema_key == LINE_SCHEMA_KEY {
-                if !seen_line_change_ids.insert(change.entity_id.clone()) {
+                if !seen_line_change_ids.insert(change.entity_pk.clone()) {
                     return Err(PluginError::InvalidInput(
                         "duplicate text_line snapshot in apply_changes input".to_string(),
                     ));
@@ -175,28 +175,28 @@ impl Guest for TextLinesPlugin {
 
                 match change.snapshot_content {
                     Some(snapshot_raw) => {
-                        let snapshot = parse_line_snapshot(&snapshot_raw, &change.entity_id)?;
+                        let snapshot = parse_line_snapshot(&snapshot_raw, &change.entity_pk)?;
                         line_by_id.insert(
-                            change.entity_id.clone(),
+                            change.entity_pk.clone(),
                             ParsedLine {
-                                entity_id: change.entity_id,
+                                entity_pk: change.entity_pk,
                                 content: snapshot.content,
                                 ending: snapshot.ending,
                             },
                         );
                     }
                     None => {
-                        line_by_id.remove(&change.entity_id);
+                        line_by_id.remove(&change.entity_pk);
                     }
                 }
                 continue;
             }
 
             if change.schema_key == DOCUMENT_SCHEMA_KEY {
-                if change.entity_id != DOCUMENT_ENTITY_ID {
+                if change.entity_pk != DOCUMENT_ENTITY_PK {
                     return Err(PluginError::InvalidInput(format!(
-                        "document snapshot entity_id must be '{DOCUMENT_ENTITY_ID}', got '{}'",
-                        change.entity_id
+                        "document snapshot entity_pk must be '{DOCUMENT_ENTITY_PK}', got '{}'",
+                        change.entity_pk
                     )));
                 }
 
@@ -239,7 +239,7 @@ impl Guest for TextLinesPlugin {
         for line_id in document_snapshot.line_ids {
             let Some(line) = line_by_id.get(&line_id) else {
                 return Err(PluginError::InvalidInput(format!(
-                    "document references missing text_line entity_id '{line_id}'"
+                    "document references missing text_line entity_pk '{line_id}'"
                 )));
             };
             output.extend_from_slice(&line.content);
@@ -272,26 +272,26 @@ fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginErr
     Ok(parsed)
 }
 
-fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginError> {
+fn parse_line_snapshot(raw: &str, entity_pk: &str) -> Result<ParsedLine, PluginError> {
     let (content_base64, ending) = parse_line_snapshot_fields(raw).map_err(|error| {
         PluginError::InvalidInput(format!(
-            "invalid text_line snapshot_content for entity_id '{entity_id}': {error}"
+            "invalid text_line snapshot_content for entity_pk '{entity_pk}': {error}"
         ))
     })?;
 
     let content = base64_to_bytes(content_base64).map_err(|error| {
         PluginError::InvalidInput(format!(
-            "invalid text_line.content_base64 for entity_id '{entity_id}': {error}"
+            "invalid text_line.content_base64 for entity_pk '{entity_pk}': {error}"
         ))
     })?;
     let ending = parse_line_ending_literal(ending).map_err(|error| {
         PluginError::InvalidInput(format!(
-            "invalid text_line.ending for entity_id '{entity_id}': {error}"
+            "invalid text_line.ending for entity_pk '{entity_pk}': {error}"
         ))
     })?;
 
     Ok(ParsedLine {
-        entity_id: entity_id.to_string(),
+        entity_pk: entity_pk.to_string(),
         content,
         ending,
     })
@@ -326,11 +326,11 @@ fn parse_lines_with_ids_from_split(split: Vec<(Vec<u8>, LineEnding)>) -> Vec<Par
     for (content, ending) in split {
         let fingerprint = line_fingerprint(&content, ending);
         let occurrence = occurrence_by_key.entry(fingerprint).or_insert(0);
-        let entity_id = format!("line:{}:{}", bytes_to_hex(&fingerprint), occurrence);
+        let entity_pk = format!("line:{}:{}", bytes_to_hex(&fingerprint), occurrence);
         *occurrence += 1;
 
         lines.push(ParsedLine {
-            entity_id,
+            entity_pk,
             content,
             ending,
         });
@@ -355,7 +355,7 @@ fn parse_after_lines_with_histogram_matching(
 
     let mut used_ids = before_lines
         .iter()
-        .map(|line| line.entity_id.clone())
+        .map(|line| line.entity_pk.clone())
         .collect::<HashSet<_>>();
     let mut occurrence_by_key = HashMap::<[u8; 20], u32>::new();
     let mut after_lines = Vec::with_capacity(after_split.len());
@@ -366,20 +366,20 @@ fn parse_after_lines_with_histogram_matching(
         let canonical_occurrence = *occurrence;
         *occurrence += 1;
 
-        let entity_id = if let Some(before_index) = matched_after_to_before.get(&after_index) {
-            before_lines[*before_index].entity_id.clone()
+        let entity_pk = if let Some(before_index) = matched_after_to_before.get(&after_index) {
+            before_lines[*before_index].entity_pk.clone()
         } else {
-            let canonical_entity_id = format!(
+            let canonical_entity_pk = format!(
                 "line:{}:{}",
                 bytes_to_hex(&fingerprint),
                 canonical_occurrence
             );
-            allocate_inserted_line_id(&canonical_entity_id, &used_ids)
+            allocate_inserted_line_id(&canonical_entity_pk, &used_ids)
         };
-        used_ids.insert(entity_id.clone());
+        used_ids.insert(entity_pk.clone());
 
         after_lines.push(ParsedLine {
-            entity_id,
+            entity_pk,
             content,
             ending,
         });

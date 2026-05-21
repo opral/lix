@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::storage::{
     ScanPlan, StorageCoreProjection, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
     StorageScanOptions, StorageValue, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
@@ -123,27 +123,27 @@ where
 }
 
 pub fn untracked_state_row_key_value(
-    entity_id: &str,
+    entity_pk: &str,
     snapshot_content: &str,
 ) -> (StorageKey, StorageValue) {
-    untracked_state_row_key_value_with_payload(entity_id, snapshot_content, false)
+    untracked_state_row_key_value_with_payload(entity_pk, snapshot_content, false)
 }
 
 pub fn untracked_state_full_row_key_value(
-    entity_id: &str,
+    entity_pk: &str,
     snapshot_content: &str,
 ) -> (StorageKey, StorageValue) {
-    untracked_state_row_key_value_with_payload(entity_id, snapshot_content, true)
+    untracked_state_row_key_value_with_payload(entity_pk, snapshot_content, true)
 }
 
 fn untracked_state_row_key_value_with_payload(
-    entity_id: &str,
+    entity_pk: &str,
     snapshot_content: &str,
     include_identity_in_value: bool,
 ) -> (StorageKey, StorageValue) {
-    let entity_id = EntityIdentity::single(entity_id);
+    let entity_pk = EntityPk::single(entity_pk);
     let row = UntrackedStateRowRef {
-        entity_id: &entity_id,
+        entity_pk: &entity_pk,
         schema_key: "json_pointer",
         file_id: Some(""),
         snapshot_content: Some(snapshot_content),

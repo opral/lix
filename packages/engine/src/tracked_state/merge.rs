@@ -122,7 +122,7 @@ fn diff_by_identity(
                 format!(
                     "tracked-state merge received duplicate diff entry for schema '{}' entity '{}'",
                     entry.identity.schema_key,
-                    entry.identity.entity_id.as_json_array_text()?
+                    entry.identity.entity_pk.as_json_array_text()?
                 ),
             ));
         }
@@ -140,7 +140,7 @@ fn source_change_pick(
             format!(
                 "tracked-state merge cannot pick source removal for schema '{}' entity '{}' without a tombstone row",
                 entry.identity.schema_key,
-                entry.identity.entity_id.as_json_array_text()?
+                entry.identity.entity_pk.as_json_array_text()?
             ),
         ));
     };
@@ -173,7 +173,7 @@ fn tracked_row_payload_eq(left: &TrackedStateDiffRow, right: &TrackedStateDiffRo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_identity::EntityIdentity;
+    use crate::entity_pk::EntityPk;
     use crate::json_store::JsonRef;
     use crate::tracked_state::TrackedStateDiffKind;
 
@@ -406,7 +406,7 @@ mod tests {
     }
 
     fn entry(
-        entity_id: &str,
+        entity_pk: &str,
         kind: TrackedStateDiffKind,
         before: Option<TrackedStateDiffRow>,
         after: Option<TrackedStateDiffRow>,
@@ -414,7 +414,7 @@ mod tests {
         TrackedStateDiffEntry {
             identity: TrackedStateDiffIdentity {
                 schema_key: "test_schema".to_string(),
-                entity_id: EntityIdentity::single(entity_id),
+                entity_pk: EntityPk::single(entity_pk),
                 file_id: None,
             },
             kind,
@@ -429,7 +429,7 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity()
-                    .entity_id
+                    .entity_pk
                     .as_single_string_owned()
                     .expect("identity")
             })
@@ -442,28 +442,28 @@ mod tests {
             .map(|entry| {
                 entry
                     .identity
-                    .entity_id
+                    .entity_pk
                     .as_single_string_owned()
                     .expect("identity")
             })
             .collect()
     }
 
-    fn tombstone(entity_id: &str, change_id: &str) -> TrackedStateDiffRow {
-        let mut row = row(entity_id, change_id);
+    fn tombstone(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
+        let mut row = row(entity_pk, change_id);
         row.snapshot_ref = None;
         row.deleted = true;
         row
     }
 
-    fn row(entity_id: &str, change_id: &str) -> TrackedStateDiffRow {
-        row_with_value(entity_id, change_id, "value")
+    fn row(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
+        row_with_value(entity_pk, change_id, "value")
     }
 
-    fn row_with_value(entity_id: &str, change_id: &str, value: &str) -> TrackedStateDiffRow {
+    fn row_with_value(entity_pk: &str, change_id: &str, value: &str) -> TrackedStateDiffRow {
         let snapshot = format!("{{\"value\":\"{value}\"}}");
         TrackedStateDiffRow {
-            entity_id: EntityIdentity::single(entity_id),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: "test_schema".to_string(),
             file_id: None,
             deleted: false,

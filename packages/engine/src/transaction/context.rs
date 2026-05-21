@@ -9,7 +9,7 @@ use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::domain::Domain;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::overlay_scan_rows;
 use crate::live_state::{
@@ -748,7 +748,7 @@ where
             .scan_rows(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
-                    entity_ids: vec![request.entity_id.clone()],
+                    entity_pks: vec![request.entity_pk.clone()],
                     version_ids: vec![request.version_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     ..Default::default()
@@ -783,10 +783,10 @@ fn prepare_state_row(
     Ok(PreparedStateRow {
         schema_plan_id,
         facts,
-        entity_id: row.entity_id.ok_or_else(|| {
+        entity_pk: row.entity_pk.ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "normalized transaction write row is missing entity_id",
+                "normalized transaction write row is missing entity_pk",
             )
         })?,
         schema_key: row.schema_key,
@@ -986,7 +986,7 @@ async fn load_workspace_version_id(
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: EntityIdentity::single(WORKSPACE_VERSION_KEY),
+            entity_pk: EntityPk::single(WORKSPACE_VERSION_KEY),
             file_id: NullableKeyFilter::Null,
         })
         .await?
@@ -1108,7 +1108,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("tracked-programmatic"),
+                entity_pk: crate::entity_pk::EntityPk::single("tracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1134,7 +1134,7 @@ mod tests {
             matches!(
                 changes.entries.as_slice(),
                 [Some(change)]
-                    if change.entity_id.as_single_string_owned().as_deref()
+                    if change.entity_pk.as_single_string_owned().as_deref()
                         == Ok("tracked-programmatic")
             ),
             "tracked staged row should be appended to changelog"
@@ -1161,9 +1161,7 @@ mod tests {
                 &head_commit_id,
                 &[TrackedStateKey {
                     schema_key: "lix_key_value".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single(
-                        "tracked-programmatic",
-                    ),
+                    entity_pk: crate::entity_pk::EntityPk::single("tracked-programmatic"),
                     file_id: None,
                 }],
             )
@@ -1187,7 +1185,7 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("untracked-programmatic"),
+                entity_pk: crate::entity_pk::EntityPk::single("untracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1207,7 +1205,7 @@ mod tests {
             .load_row(&crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("untracked-programmatic"),
+                entity_pk: crate::entity_pk::EntityPk::single("untracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1229,7 +1227,7 @@ mod tests {
         assert!(
             tracked_rows
                 .iter()
-                .all(|row| row.entity_id.as_single_string_owned().as_deref()
+                .all(|row| row.entity_pk.as_single_string_owned().as_deref()
                     != Ok("untracked-programmatic")),
             "untracked staged rows should not be written into tracked state"
         );
@@ -1472,7 +1470,7 @@ mod tests {
                 "additionalProperties": false
             }
         })));
-        row.entity_id = None;
+        row.entity_pk = None;
 
         let error = transaction
             .stage_rows(vec![row])
@@ -1487,25 +1485,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_rows_rejects_primary_key_entity_id_mismatch_without_sql() {
+    async fn stage_rows_rejects_primary_key_entity_pk_mismatch_without_sql() {
         let backend = InMemoryStorageBackend::new();
         let (_live_state, _binary_cas, _version_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("right-id", "value", false);
-        row.entity_id = Some(crate::entity_identity::EntityIdentity::single("wrong-id"));
+        row.entity_pk = Some(crate::entity_pk::EntityPk::single("wrong-id"));
 
         let error = transaction
             .stage_rows(vec![row])
             .await
-            .expect_err("entity id mismatch should be rejected while staging");
+            .expect_err("entity pk mismatch should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
             error
                 .message
-                .contains("does not match x-lix-primary-key derived entity_id"),
-            "error should explain entity id mismatch: {error:?}"
+                .contains("does not match x-lix-primary-key derived entity_pk"),
+            "error should explain entity pk mismatch: {error:?}"
         );
     }
 
@@ -1558,7 +1556,7 @@ mod tests {
                     .expect("seed schema key should derive");
                 let snapshot_content = json!({ "value": schema }).to_string();
                 crate::tracked_state::MaterializedTrackedStateRow {
-                    entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
+                    entity_pk: crate::schema::registered_schema_entity_pk(&key.schema_key)
                         .expect("registered schema identity should derive"),
                     schema_key: "lix_registered_schema".to_string(),
                     file_id: None,
@@ -1604,7 +1602,7 @@ mod tests {
         storage: StorageContext,
         live_state: &LiveStateContext,
         version_ctx: &VersionContext,
-        rejected_entity_id: &str,
+        rejected_entity_pk: &str,
     ) {
         let head = version_ctx
             .ref_reader(
@@ -1629,7 +1627,7 @@ mod tests {
             .load_row(&crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single(rejected_entity_id),
+                entity_pk: crate::entity_pk::EntityPk::single(rejected_entity_pk),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1642,7 +1640,7 @@ mod tests {
 
     fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> TransactionWriteRow {
         TransactionWriteRow {
-            entity_id: Some(crate::entity_identity::EntityIdentity::single(key)),
+            entity_pk: Some(crate::entity_pk::EntityPk::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(json!({

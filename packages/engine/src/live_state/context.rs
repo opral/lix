@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::live_state::{
     expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest, VisibilityVersionScope,
@@ -159,7 +159,7 @@ where
             .scan_rows(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
-                    entity_ids: vec![request.entity_id.clone()],
+                    entity_pks: vec![request.entity_pk.clone()],
                     version_ids: vec![request.version_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     include_tombstones: false,
@@ -232,7 +232,7 @@ async fn scan_commit_derived_rows(
     }
 
     rows.retain(|row| {
-        (request.filter.entity_ids.is_empty() || request.filter.entity_ids.contains(&row.entity_id))
+        (request.filter.entity_pks.is_empty() || request.filter.entity_pks.contains(&row.entity_pk))
             && (request.filter.version_ids.is_empty()
                 || request.filter.version_ids.contains(&row.version_id))
     });
@@ -286,7 +286,7 @@ fn commit_row(
         )
     })?;
     Ok(MaterializedLiveStateRow {
-        entity_id: EntityIdentity::single(commit.commit_id.clone()),
+        entity_pk: EntityPk::single(commit.commit_id.clone()),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content),
@@ -318,7 +318,7 @@ fn commit_edge_row(
         )
     })?;
     Ok(MaterializedLiveStateRow {
-        entity_id: EntityIdentity {
+        entity_pk: EntityPk {
             parts: vec![edge.parent_commit_id.clone(), edge.child_commit_id.clone()],
         },
         schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
@@ -340,7 +340,7 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
     TrackedStateScanRequest {
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
-            entity_ids: request.filter.entity_ids.clone(),
+            entity_pks: request.filter.entity_pks.clone(),
             file_ids: request.filter.file_ids.clone(),
             // Scan tombstones internally so version-local tombstones can hide
             // global fallback rows before the serving facade filters them.
@@ -416,7 +416,7 @@ async fn all_version_ref_ids(
         })
         .await?;
     rows.into_iter()
-        .map(|row| row.entity_id.as_single_string_owned())
+        .map(|row| row.entity_pk.as_single_string_owned())
         .collect()
 }
 
@@ -430,7 +430,7 @@ async fn load_version_ref_commit_id(
         .load_row(&UntrackedStateRowRequest {
             schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single(version_id),
+            entity_pk: crate::entity_pk::EntityPk::single(version_id),
             file_id: crate::NullableKeyFilter::Null,
         })
         .await?
@@ -485,7 +485,7 @@ fn project_tracked_row(
     source: TrackedRowSource,
 ) -> MaterializedLiveStateRow {
     MaterializedLiveStateRow {
-        entity_id: row.entity_id,
+        entity_pk: row.entity_pk,
         schema_key: row.schema_key,
         file_id: row.file_id,
         snapshot_content: row.snapshot_content,
@@ -504,7 +504,7 @@ fn project_tracked_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_identity::EntityIdentity;
+    use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::LiveStateFilter;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
@@ -591,11 +591,11 @@ mod tests {
                 )
                 .expect("commit snapshot should stage");
             let change_id = format!("{commit_id}:commit");
-            let entity_id = EntityIdentity::single(*commit_id);
+            let entity_pk = EntityPk::single(*commit_id);
             let deltas = [TrackedStateDeltaRef {
                 schema_key: COMMIT_SCHEMA_KEY,
                 file_id: None,
-                entity_id: &entity_id,
+                entity_pk: &entity_pk,
                 change_id: &change_id,
                 commit_id,
                 snapshot_ref: Some(&snapshot_ref),
@@ -678,7 +678,7 @@ mod tests {
                 .map(|(change, _, _)| crate::changelog::CommitChangeRef {
                     schema_key: change.schema_key.clone(),
                     file_id: change.file_id.clone(),
-                    entity_id: change.entity_id.clone(),
+                    entity_pk: change.entity_pk.clone(),
                     change_id: change.change_id.clone(),
                 })
                 .collect::<Vec<_>>();
@@ -716,13 +716,13 @@ mod tests {
                     snapshot_ref.clone(),
                 )],
             )?;
-            let commit_entity_id = EntityIdentity::single(&commit_id);
+            let commit_entity_pk = EntityPk::single(&commit_id);
             let mut deltas = rows
                 .iter()
                 .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
-                    entity_id: &change.entity_id,
+                    entity_pk: &change.entity_pk,
                     change_id: &change.change_id,
                     commit_id: &commit_id,
                     snapshot_ref: change.snapshot_ref.as_ref(),
@@ -735,7 +735,7 @@ mod tests {
             deltas.push(TrackedStateDeltaRef {
                 schema_key: COMMIT_SCHEMA_KEY,
                 file_id: None,
-                entity_id: &commit_entity_id,
+                entity_pk: &commit_entity_pk,
                 change_id: &commit_change_id,
                 commit_id: &commit_id,
                 snapshot_ref: Some(&snapshot_ref),
@@ -869,7 +869,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("selected-tab"),
+                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -973,7 +973,7 @@ mod tests {
             let identity = crate::untracked_state::UntrackedStateIdentity {
                 version_id: "global".to_string(),
                 schema_key: "lix_key_value".to_string(),
-                entity_id: EntityIdentity::single("selected-tab"),
+                entity_pk: EntityPk::single("selected-tab"),
                 file_id: None,
             };
             UntrackedStateContext::new()
@@ -1675,7 +1675,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("selected-tab"),
+                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1695,7 +1695,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: version_id.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("selected-tab"),
+                entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1716,9 +1716,7 @@ mod tests {
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_ids: vec![crate::entity_identity::EntityIdentity::single(
-                        "selected-tab",
-                    )],
+                    entity_pks: vec![crate::entity_pk::EntityPk::single("selected-tab")],
                     version_ids: vec![version_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,
@@ -1769,7 +1767,7 @@ mod tests {
         commit_id: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: identity("selected-tab"),
+            entity_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
@@ -1803,7 +1801,7 @@ mod tests {
 
     fn untracked_row_at(version_id: &str, value: &str) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
-            entity_id: identity("selected-tab"),
+            entity_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
@@ -1818,7 +1816,7 @@ mod tests {
 
     fn version_ref_row(version_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
-            entity_id: identity(version_id),
+            entity_pk: identity(version_id),
             schema_key: "lix_version_ref".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1863,7 +1861,7 @@ mod tests {
         snapshot: serde_json::Value,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: identity(commit_id),
+            entity_pk: identity(commit_id),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1881,7 +1879,7 @@ mod tests {
         }
     }
 
-    fn identity(entity_id: &str) -> EntityIdentity {
-        EntityIdentity::single(entity_id)
+    fn identity(entity_pk: &str) -> EntityPk {
+        EntityPk::single(entity_pk)
     }
 }

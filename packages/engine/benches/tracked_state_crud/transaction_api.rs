@@ -628,7 +628,7 @@ fn bench_rows(rows: &[WorkloadRow]) -> Vec<BenchTransactionRow> {
         .map(|row| BenchTransactionRow {
             schema_key: "json_pointer".to_string(),
             file_id: None,
-            entity_id: row.path.clone(),
+            entity_pk: row.path.clone(),
             value: serde_json::from_str(&snapshot_value(&row.path, &row.value_json))
                 .expect("transaction bench value should parse"),
             updated_value: serde_json::from_str(&snapshot_value(

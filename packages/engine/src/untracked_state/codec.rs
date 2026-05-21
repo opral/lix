@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
 use crate::LixError;
 
@@ -15,14 +15,14 @@ const UNTRACKED_STATE_PAYLOAD_VERSION_V1: u8 = 1;
 
 #[cfg_attr(not(feature = "storage-benches"), allow(dead_code))]
 pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
-    let entity_id = row.entity_id.as_json_array_text().map_err(|error| {
+    let entity_pk = row.entity_pk.as_json_array_text().map_err(|error| {
         LixError::unknown(format!(
-            "failed to encode untracked-state entity identity: {error}"
+            "failed to encode untracked-state entity primary key: {error}"
         ))
     })?;
 
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
-    let entity_id = builder.create_string(&entity_id);
+    let entity_pk = builder.create_string(&entity_pk);
     let schema_key = builder.create_string(row.schema_key);
     let file_id = row.file_id.map(|value| builder.create_string(value));
     let snapshot_content = row
@@ -36,7 +36,7 @@ pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, L
     let root = flatbuffer::create_untracked_state_row(
         &mut builder,
         &flatbuffer::UntrackedStateRowArgs {
-            entity_id,
+            entity_pk,
             schema_key,
             file_id,
             snapshot_content,
@@ -95,7 +95,7 @@ pub(crate) fn decode_payload_with_identity(
     }
 
     Ok(UntrackedStateRow {
-        entity_id: identity.entity_id,
+        entity_pk: identity.entity_pk,
         schema_key: identity.schema_key,
         file_id: identity.file_id,
         snapshot_content,
@@ -125,15 +125,15 @@ pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
         )
     })?;
 
-    let entity_id = required_str(row.entity_id(), "entity_id")?;
-    let entity_id = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
+    let entity_pk = required_str(row.entity_pk(), "entity_pk")?;
+    let entity_pk = EntityPk::from_json_array_text(entity_pk).map_err(|error| {
         LixError::unknown(format!(
-            "failed to decode untracked-state entity identity: {error}"
+            "failed to decode untracked-state entity primary key: {error}"
         ))
     })?;
 
     Ok(UntrackedStateRow {
-        entity_id,
+        entity_pk,
         schema_key: required_str(row.schema_key(), "schema_key")?.to_string(),
         file_id: row.file_id().map(ToString::to_string),
         snapshot_content: row.snapshot_content().map(ToString::to_string),
@@ -283,12 +283,12 @@ mod tests {
     use super::*;
 
     fn row_ref<'a>(
-        entity_id: &'a EntityIdentity,
+        entity_pk: &'a EntityPk,
         snapshot_content: Option<&'a str>,
         metadata: Option<&'a str>,
     ) -> UntrackedStateRowRef<'a> {
         UntrackedStateRowRef {
-            entity_id,
+            entity_pk,
             schema_key: "schema.unicode",
             file_id: Some("file-1"),
             snapshot_content,
@@ -300,21 +300,21 @@ mod tests {
         }
     }
 
-    fn identity(entity_id: EntityIdentity) -> UntrackedStateIdentity {
+    fn identity(entity_pk: EntityPk) -> UntrackedStateIdentity {
         UntrackedStateIdentity {
             version_id: "version-1".to_string(),
             schema_key: "schema.unicode".to_string(),
-            entity_id,
+            entity_pk,
             file_id: Some("file-1".to_string()),
         }
     }
 
     #[test]
     fn payload_v1_roundtrips_with_key_identity() {
-        let entity_id = EntityIdentity::tuple(vec!["id-1".to_string(), "東京".to_string()])
-            .expect("entity identity should build");
+        let entity_pk = EntityPk::tuple(vec!["id-1".to_string(), "東京".to_string()])
+            .expect("entity primary key should build");
         let bytes = encode_payload_ref(row_ref(
-            &entity_id,
+            &entity_pk,
             Some("{\"hello\":\"world\"}"),
             Some("{\"meta\":true}"),
         ))
@@ -323,9 +323,9 @@ mod tests {
         assert_eq!(&bytes[..4], b"LXUP");
         assert_eq!(bytes[4], 1);
 
-        let decoded = decode_payload_with_identity(identity(entity_id.clone()), &bytes)
+        let decoded = decode_payload_with_identity(identity(entity_pk.clone()), &bytes)
             .expect("payload should decode");
-        assert_eq!(decoded.entity_id, entity_id);
+        assert_eq!(decoded.entity_pk, entity_pk);
         assert_eq!(decoded.schema_key, "schema.unicode");
         assert_eq!(decoded.file_id.as_deref(), Some("file-1"));
         assert_eq!(
@@ -341,10 +341,10 @@ mod tests {
 
     #[test]
     fn payload_v1_roundtrips_absent_optional_fields() {
-        let entity_id = EntityIdentity::single("id-1");
+        let entity_pk = EntityPk::single("id-1");
         let bytes =
-            encode_payload_ref(row_ref(&entity_id, None, None)).expect("payload should encode");
-        let decoded = decode_payload_with_identity(identity(entity_id), &bytes)
+            encode_payload_ref(row_ref(&entity_pk, None, None)).expect("payload should encode");
+        let decoded = decode_payload_with_identity(identity(entity_pk), &bytes)
             .expect("payload should decode");
         assert_eq!(decoded.snapshot_content, None);
         assert_eq!(decoded.metadata, None);
@@ -352,41 +352,41 @@ mod tests {
 
     #[test]
     fn payload_decode_rejects_invalid_identifier() {
-        let entity_id = EntityIdentity::single("id-1");
-        let error = decode_payload_with_identity(identity(entity_id), b"LXUSnot-payload")
+        let entity_pk = EntityPk::single("id-1");
+        let error = decode_payload_with_identity(identity(entity_pk), b"LXUSnot-payload")
             .expect_err("old full-row values are not accepted in v1 payload storage");
         assert!(error.to_string().contains("invalid payload identifier"));
     }
 
     #[test]
     fn payload_decode_rejects_unknown_version() {
-        let entity_id = EntityIdentity::single("id-1");
-        let mut bytes = encode_payload_ref(row_ref(&entity_id, Some("{}"), None))
+        let entity_pk = EntityPk::single("id-1");
+        let mut bytes = encode_payload_ref(row_ref(&entity_pk, Some("{}"), None))
             .expect("payload should encode");
         bytes[4] = 2;
-        let error = decode_payload_with_identity(identity(entity_id), &bytes)
+        let error = decode_payload_with_identity(identity(entity_pk), &bytes)
             .expect_err("unknown payload version should fail");
         assert!(error.to_string().contains("unsupported version 2"));
     }
 
     #[test]
     fn payload_decode_rejects_trailing_bytes() {
-        let entity_id = EntityIdentity::single("id-1");
-        let mut bytes = encode_payload_ref(row_ref(&entity_id, Some("{}"), None))
+        let entity_pk = EntityPk::single("id-1");
+        let mut bytes = encode_payload_ref(row_ref(&entity_pk, Some("{}"), None))
             .expect("payload should encode");
         bytes.push(0);
-        let error = decode_payload_with_identity(identity(entity_id), &bytes)
+        let error = decode_payload_with_identity(identity(entity_pk), &bytes)
             .expect_err("trailing bytes should fail");
         assert!(error.to_string().contains("trailing bytes"));
     }
 
     #[test]
     fn payload_decode_rejects_truncated_string() {
-        let entity_id = EntityIdentity::single("id-1");
-        let mut bytes = encode_payload_ref(row_ref(&entity_id, Some("{}"), None))
+        let entity_pk = EntityPk::single("id-1");
+        let mut bytes = encode_payload_ref(row_ref(&entity_pk, Some("{}"), None))
             .expect("payload should encode");
         bytes.truncate(bytes.len() - 2);
-        let error = decode_payload_with_identity(identity(entity_id), &bytes)
+        let error = decode_payload_with_identity(identity(entity_pk), &bytes)
             .expect_err("truncated payload should fail");
         assert!(error.to_string().contains("truncated"));
     }
@@ -411,7 +411,7 @@ mod flatbuffer {
     }
 
     impl<'a> UntrackedStateRow<'a> {
-        const VT_ENTITY_ID: flatbuffers::VOffsetT = 4;
+        const VT_ENTITY_PK: flatbuffers::VOffsetT = 4;
         const VT_SCHEMA_KEY: flatbuffers::VOffsetT = 6;
         const VT_FILE_ID: flatbuffers::VOffsetT = 8;
         const VT_SNAPSHOT_CONTENT: flatbuffers::VOffsetT = 10;
@@ -422,10 +422,10 @@ mod flatbuffer {
         const VT_VERSION_ID: flatbuffers::VOffsetT = 20;
 
         #[inline]
-        pub(super) fn entity_id(&self) -> Option<&'a str> {
+        pub(super) fn entity_pk(&self) -> Option<&'a str> {
             unsafe {
                 self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_ENTITY_ID, None)
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_ENTITY_PK, None)
             }
         }
 
@@ -499,8 +499,8 @@ mod flatbuffer {
             verifier
                 .visit_table(position)?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "entity_id",
-                    Self::VT_ENTITY_ID,
+                    "entity_pk",
+                    Self::VT_ENTITY_PK,
                     true,
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
@@ -546,7 +546,7 @@ mod flatbuffer {
 
     #[cfg_attr(not(feature = "storage-benches"), allow(dead_code))]
     pub(super) struct UntrackedStateRowArgs<'a> {
-        pub(super) entity_id: flatbuffers::WIPOffset<&'a str>,
+        pub(super) entity_pk: flatbuffers::WIPOffset<&'a str>,
         pub(super) schema_key: flatbuffers::WIPOffset<&'a str>,
         pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
         pub(super) snapshot_content: Option<flatbuffers::WIPOffset<&'a str>>,
@@ -599,8 +599,8 @@ mod flatbuffer {
             args.schema_key,
         );
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_ENTITY_ID,
-            args.entity_id,
+            UntrackedStateRow::VT_ENTITY_PK,
+            args.entity_pk,
         );
         let offset = builder.end_table(start);
         flatbuffers::WIPOffset::new(offset.value())

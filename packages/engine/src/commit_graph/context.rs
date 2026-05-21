@@ -9,7 +9,7 @@ use crate::commit_graph::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,
     CommitGraphCommit, CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
 };
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::storage::StorageRead;
 use crate::LixError;
 
@@ -283,7 +283,7 @@ where
 fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphChange {
     CommitGraphChange {
         id: change.change_id,
-        entity_id: change.entity_id,
+        entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_ref: change.snapshot_ref,
@@ -330,7 +330,7 @@ fn change_matches_history_request(
     request: &CommitGraphChangeHistoryRequest,
 ) -> bool {
     (request.include_tombstones || change.snapshot_ref.is_some())
-        && (request.entity_ids.is_empty() || request.entity_ids.contains(&change.entity_id))
+        && (request.entity_pks.is_empty() || request.entity_pks.contains(&change.entity_pk))
         && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
         && (request.file_ids.is_empty()
             || change
@@ -361,7 +361,7 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
     .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
         id: record.change_id.clone(),
-        entity_id: EntityIdentity::single(&record.commit_id),
+        entity_pk: EntityPk::single(&record.commit_id),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_ref: Some(crate::json_store::JsonRef::for_content(
@@ -596,7 +596,7 @@ mod tests {
             .change_history_from_commit(
                 "commit-head",
                 &CommitGraphChangeHistoryRequest {
-                    entity_ids: vec![crate::entity_identity::EntityIdentity::single("entity-1")],
+                    entity_pks: vec![crate::entity_pk::EntityPk::single("entity-1")],
                     file_ids: vec!["file-a".to_string()],
                     min_depth: Some(1),
                     max_depth: Some(1),
@@ -679,7 +679,7 @@ mod tests {
             Self {
                 change: CommitGraphChange {
                     id: change_id.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
+                    entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot_ref: None,
@@ -694,7 +694,7 @@ mod tests {
 
         fn entity(
             change_id: &str,
-            entity_id: &str,
+            entity_pk: &str,
             schema_key: &str,
             file_id: Option<&str>,
             snapshot_content: Option<&str>,
@@ -703,7 +703,7 @@ mod tests {
             Self {
                 change: CommitGraphChange {
                     id: change_id.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+                    entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
                     snapshot_ref: snapshot_content.map(|content| {
@@ -744,9 +744,9 @@ mod tests {
             .map(|change| {
                 change
                     .change
-                    .entity_id
+                    .entity_pk
                     .as_single_string()
-                    .expect("commit fixture should use single entity id")
+                    .expect("commit fixture should use single entity pk")
                     .to_string()
             })
             .collect::<BTreeSet<_>>();
@@ -760,9 +760,9 @@ mod tests {
                 change: change.change.clone(),
                 commit_id: change
                     .change
-                    .entity_id
+                    .entity_pk
                     .as_single_string()
-                    .expect("commit fixture should use single entity id")
+                    .expect("commit fixture should use single entity pk")
                     .to_string(),
                 change_ids: change.commit_change_ids.clone(),
                 author_account_ids: change.author_account_ids.clone(),
@@ -828,7 +828,7 @@ mod tests {
         ChangeRecord {
             format_version: 1,
             change_id: change.change.id.clone(),
-            entity_id: change.change.entity_id.clone(),
+            entity_pk: change.change.entity_pk.clone(),
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
             snapshot_ref: change.change.snapshot_ref,
@@ -841,7 +841,7 @@ mod tests {
         CommitChangeRef {
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
-            entity_id: change.change.entity_id.clone(),
+            entity_pk: change.change.entity_pk.clone(),
             change_id: change.change.id.clone(),
         }
     }
@@ -884,13 +884,13 @@ mod tests {
 
     fn entity_change(
         change_id: &str,
-        entity_id: &str,
+        entity_pk: &str,
         schema_key: &str,
         snapshot_content: &str,
     ) -> TestChange {
         entity_change_at(
             change_id,
-            entity_id,
+            entity_pk,
             schema_key,
             snapshot_content,
             "2026-01-01T00:00:00Z",
@@ -899,14 +899,14 @@ mod tests {
 
     fn entity_change_at(
         change_id: &str,
-        entity_id: &str,
+        entity_pk: &str,
         schema_key: &str,
         snapshot_content: &str,
         created_at: &str,
     ) -> TestChange {
         TestChange::entity(
             change_id,
-            entity_id,
+            entity_pk,
             schema_key,
             None,
             Some(snapshot_content),
@@ -916,14 +916,14 @@ mod tests {
 
     fn entity_change_with_file(
         change_id: &str,
-        entity_id: &str,
+        entity_pk: &str,
         schema_key: &str,
         file_id: Option<&str>,
         snapshot_content: &str,
     ) -> TestChange {
         TestChange::entity(
             change_id,
-            entity_id,
+            entity_pk,
             schema_key,
             file_id,
             Some(snapshot_content),
@@ -931,10 +931,10 @@ mod tests {
         )
     }
 
-    fn entity_tombstone(change_id: &str, entity_id: &str, schema_key: &str) -> TestChange {
+    fn entity_tombstone(change_id: &str, entity_pk: &str, schema_key: &str) -> TestChange {
         TestChange::entity(
             change_id,
-            entity_id,
+            entity_pk,
             schema_key,
             None,
             None,

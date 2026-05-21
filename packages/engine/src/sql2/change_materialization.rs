@@ -1,5 +1,5 @@
 use crate::changelog::ChangeRecord;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
 use crate::storage::StorageRead;
 use crate::{parse_row_metadata, LixError};
@@ -13,7 +13,7 @@ use crate::{parse_row_metadata, LixError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedChange {
     pub(crate) id: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
@@ -42,7 +42,7 @@ where
         json_reader,
         crate::commit_graph::CommitGraphChange {
             id: change.change_id,
-            entity_id: change.entity_id,
+            entity_pk: change.entity_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
             snapshot_ref: change.snapshot_ref,
@@ -78,7 +78,7 @@ where
     };
     Ok(MaterializedChange {
         id: change.id,
-        entity_id: change.entity_id,
+        entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,

@@ -34,38 +34,38 @@ simulation_test!(
 
         let registered_schema_row = session
             .execute(
-                "SELECT lixcol_entity_id, value \
+                "SELECT lixcol_entity_pk, value \
                  FROM lix_registered_schema",
                 &[],
             )
             .await
             .expect("registered schema read should succeed");
         let registered_schema_rows = registered_schema_row;
-        let registered_schema_entity_id = registered_schema_rows
+        let registered_schema_entity_pk = registered_schema_rows
             .rows()
             .iter()
             .find_map(|row| match row.values() {
-                [Value::Json(entity_id), Value::Json(value)]
+                [Value::Json(entity_pk), Value::Json(value)]
                     if value.get("x-lix-key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema") =>
                 {
-                    Some(entity_id)
+                    Some(entity_pk)
                 }
-                [Value::Json(entity_id), Value::Text(value)] => {
+                [Value::Json(entity_pk), Value::Text(value)] => {
                     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                     (value.get("x-lix-key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema"))
-                    .then_some(entity_id)
+                    .then_some(entity_pk)
                 }
                 _ => None,
             })
             .expect("registered schema row should be visible");
-        assert_eq!(registered_schema_entity_id, &json!(["engine_dummy_schema"]));
+        assert_eq!(registered_schema_entity_pk, &json!(["engine_dummy_schema"]));
 
         let insert_state_result = session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
              lix_json('[\"dummy-1\"]'), 'engine_dummy_schema', NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), false, true\
              )",
@@ -77,9 +77,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT entity_id, schema_key, snapshot_content \
+                "SELECT entity_pk, schema_key, snapshot_content \
              FROM lix_state \
-             WHERE schema_key = 'engine_dummy_schema' AND entity_id = lix_json('[\"dummy-1\"]')",
+             WHERE schema_key = 'engine_dummy_schema' AND entity_pk = lix_json('[\"dummy-1\"]')",
                 &[],
             )
             .await
@@ -125,7 +125,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
                  lix_json('[\"tracked-1\"]'), 'engine_untracked_only_schema', NULL, lix_json('{\"id\":\"tracked-1\",\"name\":\"Tracked\"}'), false, false\
                  )",
@@ -196,37 +196,37 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
 
     let registered_schema_rows = session
         .execute(
-            "SELECT lixcol_entity_id, value \
+            "SELECT lixcol_entity_pk, value \
                  FROM lix_registered_schema",
             &[],
         )
         .await
         .expect("registered schema read should succeed");
-    let delete_schema_entity_id = registered_schema_rows
+    let delete_schema_entity_pk = registered_schema_rows
         .rows()
         .iter()
         .find_map(|row| match row.values() {
-            [Value::Json(entity_id), Value::Json(value)]
+            [Value::Json(entity_pk), Value::Json(value)]
                 if value.get("x-lix-key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema") =>
             {
-                Some(entity_id.clone())
+                Some(entity_pk.clone())
             }
-            [Value::Json(entity_id), Value::Text(value)] => {
+            [Value::Json(entity_pk), Value::Text(value)] => {
                 let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                 (value.get("x-lix-key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema"))
-                .then_some(entity_id.clone())
+                .then_some(entity_pk.clone())
             }
             _ => None,
         })
-        .expect("registered schema entity id should be discoverable");
+        .expect("registered schema entity pk should be discoverable");
 
     let error = session
         .execute(
             "DELETE FROM lix_registered_schema \
-                 WHERE lixcol_entity_id = $1",
-            &[Value::Json(delete_schema_entity_id)],
+                 WHERE lixcol_entity_pk = $1",
+            &[Value::Json(delete_schema_entity_pk)],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -295,7 +295,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_schema_update_history\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]')",
                 &[Value::Json(amended_schema.clone())],
             )
             .await
@@ -310,10 +310,10 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, lixcol_entity_id, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
                      FROM lix_registered_schema_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
-                       AND lixcol_entity_id = lix_json('[\"engine_schema_update_history\"]') \
+                       AND lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -558,7 +558,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_divergent_schema\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
                 &[],
             )
             .await
@@ -569,7 +569,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_divergent_schema\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_divergent_schema\"]')",
                 &[],
             )
             .await
@@ -654,7 +654,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
                 &[Value::Json(main_schema.clone())],
             )
             .await
@@ -665,7 +665,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_registered_schema \
                  SET value = $1 \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
                 &[Value::Json(draft_schema.clone())],
             )
             .await
@@ -676,7 +676,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
                 &[],
             )
             .await
@@ -687,7 +687,7 @@ simulation_test!(
             .execute(
                 "SELECT value \
                  FROM lix_registered_schema \
-                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"engine_branch_schema_amendment\"]')",
                 &[],
             )
             .await
@@ -813,7 +813,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT lixcol_entity_id, id, name \
+                "SELECT lixcol_entity_pk, id, name \
                  FROM engine_default_id_schema \
                  WHERE name = 'Generated'",
                 &[],
@@ -823,10 +823,10 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Json(entity_id), Value::Text(id), Value::Text(name)] = values else {
+        let [Value::Json(entity_pk), Value::Text(id), Value::Text(name)] = values else {
             panic!("expected generated id row, got {values:?}");
         };
-        assert_eq!(entity_id, &json!([id]));
+        assert_eq!(entity_pk, &json!([id]));
         assert!(!id.is_empty(), "defaulted id should be non-empty");
         assert_eq!(name, "Generated");
     }
@@ -955,7 +955,7 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
         .execute(
             "SELECT id, name, lixcol_version_id, lixcol_global, lixcol_untracked \
                  FROM engine_overlay_schema_by_version \
-                 WHERE lixcol_entity_id = lix_json('[\"entity-global-overlay\"]') \
+                 WHERE lixcol_entity_pk = lix_json('[\"entity-global-overlay\"]') \
                  ORDER BY lixcol_version_id",
             &[],
         )
@@ -1063,7 +1063,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, name, count, lixcol_entity_id \
+                "SELECT id, name, count, lixcol_entity_pk \
                  FROM engine_typed_entity_schema \
                  WHERE id = 'typed-entity-1'",
                 &[],
@@ -1179,7 +1179,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_identity_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_entity_id = '[\"row-1\"]'",
+                 WHERE lixcol_entity_pk = '[\"row-1\"]'",
                 &[],
             )
             .await
@@ -1236,7 +1236,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_identity_in_literal_schema \
                  SET name = 'after' \
-                 WHERE lixcol_entity_id IN ('[\"row-1\"]')",
+                 WHERE lixcol_entity_pk IN ('[\"row-1\"]')",
                 &[],
             )
             .await
@@ -1308,7 +1308,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_base_version_filter_schema \
                  SET name = 'main-updated-draft' \
-                 WHERE lixcol_entity_id = '[\"row-1\"]' \
+                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
                    AND lixcol_version_id = 'base-filter-draft'",
                 &[],
             )
@@ -1320,7 +1320,7 @@ simulation_test!(
             .execute(
                 "SELECT name \
                  FROM engine_base_version_filter_schema_by_version \
-                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_version_id = 'base-filter-draft'",
                 &[],
             )
@@ -1377,7 +1377,7 @@ simulation_test!(
             .execute(
                 "SELECT name \
                  FROM engine_base_insert_version_schema_by_version \
-                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_version_id = 'base-insert-draft'",
                 &[],
             )
@@ -1634,7 +1634,7 @@ simulation_test!(
 
         main.execute(
             "DELETE FROM engine_by_version_delete_scope_schema_by_version \
-             WHERE lixcol_entity_id = '[\"row-1\"]'",
+             WHERE lixcol_entity_pk = '[\"row-1\"]'",
             &[],
         )
         .await
@@ -1645,7 +1645,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_version_id \
                  FROM engine_by_version_delete_scope_schema_by_version \
-                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_version_id IN ('{}', 'by-version-delete-draft') \
                  ORDER BY name",
                     sim.main_version_id()
@@ -1731,7 +1731,7 @@ simulation_test!(
         main.execute(
             "UPDATE engine_by_version_update_scope_schema_by_version \
              SET name = 'updated-all' \
-             WHERE lixcol_entity_id = '[\"row-1\"]'",
+             WHERE lixcol_entity_pk = '[\"row-1\"]'",
             &[],
         )
         .await
@@ -1742,7 +1742,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_version_id \
                  FROM engine_by_version_update_scope_schema_by_version \
-                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_version_id IN ('{}', 'by-version-update-draft') \
                  ORDER BY name",
                     sim.main_version_id()
@@ -1829,7 +1829,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_by_version_alias_scope_schema_by_version \
                  SET name = 'updated-via-alias' \
-                 WHERE lixcol_entity_id = '[\"row-1\"]' \
+                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
                    AND version_id = 'by-version-alias-draft'",
                 &[],
             )
@@ -1840,7 +1840,7 @@ simulation_test!(
         let delete_error = main
             .execute(
                 "DELETE FROM engine_by_version_alias_scope_schema_by_version \
-                 WHERE lixcol_entity_id = '[\"row-1\"]' \
+                 WHERE lixcol_entity_pk = '[\"row-1\"]' \
                    AND version_id = 'by-version-alias-draft'",
                 &[],
             )
@@ -1853,7 +1853,7 @@ simulation_test!(
                 &format!(
                     "SELECT name, lixcol_version_id \
                  FROM engine_by_version_alias_scope_schema_by_version \
-                 WHERE lixcol_entity_id = lix_json('[\"row-1\"]') \
+                 WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
                    AND lixcol_version_id IN ('{}', 'by-version-alias-draft') \
                  ORDER BY name",
                     sim.main_version_id()

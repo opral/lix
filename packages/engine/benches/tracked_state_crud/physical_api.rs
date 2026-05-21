@@ -166,7 +166,7 @@ fn bench_rows(rows: &[WorkloadRow]) -> Vec<BenchTrackedRow> {
         .map(|row| BenchTrackedRow {
             schema_key: "json_pointer".to_string(),
             file_id: Some("pnpm-lock.fixture.json".to_string()),
-            entity_id: row.path.clone(),
+            entity_pk: row.path.clone(),
             value: snapshot_value(&row.path, &row.value_json).into_bytes(),
             updated_value: snapshot_value(&row.path, &row.updated_value_json).into_bytes(),
         })

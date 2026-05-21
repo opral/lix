@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::binary_cas::BinaryCasContext;
 use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
@@ -189,7 +189,7 @@ where
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: EntityIdentity::single("lix_id"),
+            entity_pk: EntityPk::single("lix_id"),
             file_id: NullableKeyFilter::Null,
         })
         .await?

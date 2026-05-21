@@ -507,7 +507,7 @@ async fn transaction_read_can_query_history_surfaces() {
         .expect("transaction should begin");
     let result = tx
         .execute(
-            "SELECT entity_id FROM lix_state_history \
+            "SELECT entity_pk FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
              AND schema_key = 'lix_key_value'",
             &[],

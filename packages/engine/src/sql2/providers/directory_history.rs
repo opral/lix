@@ -30,7 +30,7 @@ use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryId
 use crate::sql2::history_route::{
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
     HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID, HISTORY_COL_FILE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SCHEMA_KEY,
     HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
@@ -270,7 +270,7 @@ struct DirectoryHistoryRecord {
 
 #[derive(Debug, Clone)]
 struct DirectoryHistoryOutputRow {
-    entity_id: String,
+    entity_pk: String,
     id: String,
     path: Option<String>,
     parent_id: Option<String>,
@@ -359,7 +359,7 @@ where
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| visible_descriptor.id.clone());
         output.push(DirectoryHistoryOutputRow {
-            entity_id: visible_descriptor.id.clone(),
+            entity_pk: visible_descriptor.id.clone(),
             id,
             path,
             parent_id: visible_descriptor.parent_id.clone(),
@@ -370,18 +370,18 @@ where
         });
     }
     output.retain(|row| {
-        let entity_id = entity_id_json_array(&row.entity_id).ok();
+        let entity_pk = entity_pk_json_array(&row.entity_pk).ok();
         route.matches_surface_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            entity_id.as_deref().unwrap_or(&row.entity_id),
+            entity_pk.as_deref().unwrap_or(&row.entity_pk),
             None,
             row.event.depth,
         )
     });
 
     output.sort_by(|left, right| {
-        left.entity_id
-            .cmp(&right.entity_id)
+        left.entity_pk
+            .cmp(&right.entity_pk)
             .then(left.event.start_commit_id.cmp(&right.event.start_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
             .then(
@@ -403,7 +403,7 @@ fn parse_directory_history_records(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(DirectoryHistoryRecord {
-                    id: entry.change.entity_id.as_single_string_owned()?,
+                    id: entry.change.entity_pk.as_single_string_owned()?,
                     parent_id: None,
                     name: None,
                     hidden: None,
@@ -543,9 +543,9 @@ fn directory_history_column_array(
         "hidden" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
         )) as ArrayRef,
-        HISTORY_COL_ENTITY_ID => Arc::new(StringArray::from(
+        HISTORY_COL_ENTITY_PK => Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| entity_id_json_array(&row.entity_id).map(Some))
+                .map(|row| entity_pk_json_array(&row.entity_pk).map(Some))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         )) as ArrayRef,
         HISTORY_COL_SCHEMA_KEY => {
@@ -604,7 +604,7 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
         Field::new("hidden", DataType::Boolean, true),
-        json_field(HISTORY_COL_ENTITY_ID, false),
+        json_field(HISTORY_COL_ENTITY_PK, false),
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
         json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
@@ -632,10 +632,10 @@ fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
     crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
-fn entity_id_json_array(entity_id: &str) -> Result<String, LixError> {
-    serde_json::to_string(&[entity_id]).map_err(|error| {
+fn entity_pk_json_array(entity_pk: &str) -> Result<String, LixError> {
+    serde_json::to_string(&[entity_pk]).map_err(|error| {
         LixError::unknown(format!(
-            "failed to encode history entity id as JSON: {error}"
+            "failed to encode history entity pk as JSON: {error}"
         ))
     })
 }

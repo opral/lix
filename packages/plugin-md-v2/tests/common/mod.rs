@@ -2,7 +2,7 @@
 
 use plugin_md_v2::{
     PluginApiError, PluginEntityChange, PluginFile, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY,
-    ROOT_ENTITY_ID,
+    ROOT_ENTITY_PK,
 };
 use std::collections::BTreeMap;
 
@@ -47,7 +47,7 @@ pub fn parse_document_order(change: &PluginEntityChange) -> Vec<String> {
         serde_json::from_str(raw).expect("document snapshot should be valid JSON");
     assert_eq!(
         parsed.get("id").and_then(serde_json::Value::as_str),
-        Some(ROOT_ENTITY_ID)
+        Some(ROOT_ENTITY_PK)
     );
     parsed
         .get("order")
@@ -89,7 +89,7 @@ pub fn assert_invalid_input(error: PluginApiError) {
 
 pub fn apply_delta(state: &mut StateRows, delta: Vec<PluginEntityChange>) {
     for change in delta {
-        let key = (change.schema_key.clone(), change.entity_id.clone());
+        let key = (change.schema_key.clone(), change.entity_pk.clone());
         if change.snapshot_content.is_some() {
             state.insert(key, change);
         } else {
@@ -104,11 +104,11 @@ pub fn collect_state_rows(state: &StateRows) -> Vec<PluginEntityChange> {
 
 pub fn document_change(order: Vec<String>) -> PluginEntityChange {
     PluginEntityChange {
-        entity_id: ROOT_ENTITY_ID.to_string(),
+        entity_pk: ROOT_ENTITY_PK.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
         snapshot_content: Some(
             serde_json::json!({
-                "id": ROOT_ENTITY_ID,
+                "id": ROOT_ENTITY_PK,
                 "order": order,
             })
             .to_string(),
@@ -118,7 +118,7 @@ pub fn document_change(order: Vec<String>) -> PluginEntityChange {
 
 pub fn block_change(id: &str, node_type: &str, markdown: &str) -> PluginEntityChange {
     PluginEntityChange {
-        entity_id: id.to_string(),
+        entity_pk: id.to_string(),
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
         snapshot_content: Some(
             serde_json::json!({
