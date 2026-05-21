@@ -25,6 +25,9 @@ use crate::storage::{
 use crate::LixError;
 
 const COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION: u32 = 1;
+const COMMIT_CHANGE_REF_CHUNK_TARGET_BYTES: usize = 64 * 1024;
+const COMMIT_CHANGE_REF_CHUNK_MAX_BYTES: usize = 128 * 1024;
+const COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES: usize = 2048;
 const SCAN_PAGE_LIMIT: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -330,7 +333,7 @@ where
             self.staged_changes.insert(change.change_id.clone(), change);
         }
 
-        let chunks = chunk_commit_change_refs(append.commit_change_refs);
+        let chunks = chunk_commit_change_refs(append.commit_change_refs)?;
         for commit in append.commits {
             self.writes.put(
                 COMMIT_SPACE,
@@ -838,33 +841,196 @@ fn commit_entry_id(entry: &CommitLoadEntry) -> Option<&str> {
 
 fn chunk_commit_change_refs(
     refs: Vec<CommitChangeRefSet>,
-) -> HashMap<String, Vec<CommitChangeRefChunk>> {
+) -> Result<HashMap<String, Vec<CommitChangeRefChunk>>, LixError> {
     refs.into_iter()
-        .map(|mut refs| {
-            refs.entries.sort_by(|left, right| {
-                (
-                    left.schema_key.as_str(),
-                    left.file_id.as_deref(),
-                    &left.entity_id,
-                    left.change_id.as_str(),
-                )
-                    .cmp(&(
-                        right.schema_key.as_str(),
-                        right.file_id.as_deref(),
-                        &right.entity_id,
-                        right.change_id.as_str(),
-                    ))
-            });
-            (
-                refs.commit_id.clone(),
-                vec![CommitChangeRefChunk {
-                    format_version: COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION,
-                    commit_id: refs.commit_id,
-                    entries: refs.entries,
-                }],
-            )
+        .map(|refs| {
+            let commit_id = refs.commit_id.clone();
+            Ok((
+                commit_id,
+                chunk_one_commit_change_refs(
+                    refs,
+                    COMMIT_CHANGE_REF_CHUNK_TARGET_BYTES,
+                    COMMIT_CHANGE_REF_CHUNK_MAX_BYTES,
+                    COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES,
+                )?,
+            ))
         })
         .collect()
+}
+
+fn chunk_one_commit_change_refs(
+    mut refs: CommitChangeRefSet,
+    target_bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+) -> Result<Vec<CommitChangeRefChunk>, LixError> {
+    refs.entries.sort_by(|left, right| {
+        (
+            left.schema_key.as_str(),
+            left.file_id.as_deref(),
+            &left.entity_id,
+            left.change_id.as_str(),
+        )
+            .cmp(&(
+                right.schema_key.as_str(),
+                right.file_id.as_deref(),
+                &right.entity_id,
+                right.change_id.as_str(),
+            ))
+    });
+
+    let mut chunks = Vec::new();
+    let mut builder = CommitChangeRefChunkBuilder::new(refs.commit_id.clone());
+    for entry in refs.entries {
+        let candidate_size = builder.estimated_size_after(&entry);
+        if !builder.is_empty()
+            && (builder.len() >= max_entries
+                || builder.estimated_size() >= target_bytes
+                || candidate_size > max_bytes)
+        {
+            chunks.push(builder.finish()?);
+            builder = CommitChangeRefChunkBuilder::new(refs.commit_id.clone());
+        }
+
+        builder.push(entry);
+        validate_commit_change_ref_chunk_size(&builder, max_bytes)?;
+    }
+
+    if !builder.is_empty() {
+        chunks.push(builder.finish()?);
+    }
+    Ok(chunks)
+}
+
+fn commit_change_ref_chunk(commit_id: &str, entries: Vec<CommitChangeRef>) -> CommitChangeRefChunk {
+    CommitChangeRefChunk {
+        format_version: COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION,
+        commit_id: commit_id.to_string(),
+        entries,
+    }
+}
+
+fn validate_commit_change_ref_chunk_size(
+    builder: &CommitChangeRefChunkBuilder,
+    max_bytes: usize,
+) -> Result<(), LixError> {
+    let size = builder.estimated_size();
+    if size > max_bytes {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "single changelog commit_change_ref_chunk entry for commit '{}' exceeds {max_bytes} bytes",
+                builder.commit_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+struct CommitChangeRefChunkBuilder {
+    commit_id: String,
+    entries: Vec<CommitChangeRef>,
+    schema_keys: HashSet<String>,
+    file_ids: HashSet<Option<String>>,
+    estimated_size: usize,
+}
+
+impl CommitChangeRefChunkBuilder {
+    fn new(commit_id: String) -> Self {
+        Self {
+            commit_id,
+            entries: Vec::new(),
+            schema_keys: HashSet::new(),
+            file_ids: HashSet::new(),
+            estimated_size: commit_change_ref_chunk_fixed_size(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn estimated_size(&self) -> usize {
+        self.estimated_size
+    }
+
+    fn estimated_size_after(&self, entry: &CommitChangeRef) -> usize {
+        self.estimated_size + self.incremental_size(entry)
+    }
+
+    fn push(&mut self, entry: CommitChangeRef) {
+        self.estimated_size += self.incremental_size(&entry);
+        self.schema_keys.insert(entry.schema_key.clone());
+        self.file_ids.insert(entry.file_id.clone());
+        self.entries.push(entry);
+    }
+
+    fn incremental_size(&self, entry: &CommitChangeRef) -> usize {
+        let schema_dictionary_bytes = if self.schema_keys.contains(&entry.schema_key) {
+            0
+        } else {
+            encoded_str_size(&entry.schema_key)
+        };
+        let file_dictionary_bytes = if self.file_ids.contains(&entry.file_id) {
+            0
+        } else {
+            encoded_optional_str_size(entry.file_id.as_deref())
+        };
+        schema_dictionary_bytes
+            + file_dictionary_bytes
+            + encoded_commit_change_ref_entry_size(entry)
+    }
+
+    fn finish(self) -> Result<CommitChangeRefChunk, LixError> {
+        let chunk = commit_change_ref_chunk(&self.commit_id, self.entries);
+        debug_assert_eq!(
+            self.estimated_size,
+            encode_commit_change_ref_chunk(&chunk)?.len()
+        );
+        Ok(chunk)
+    }
+}
+
+fn commit_change_ref_chunk_fixed_size() -> usize {
+    5 // magic
+        + 4 // format_version
+        + 4 // schema dictionary length
+        + 4 // file dictionary length
+        + 4 // entry count
+}
+
+fn encoded_commit_change_ref_entry_size(entry: &CommitChangeRef) -> usize {
+    2 // schema index
+        + 2 // file index
+        + encoded_entity_identity_compact_size(&entry.entity_id)
+        + encoded_str_size(&entry.change_id)
+}
+
+fn encoded_entity_identity_compact_size(
+    identity: &crate::entity_identity::EntityIdentity,
+) -> usize {
+    if identity.parts.len() == 1 {
+        1 + encoded_str_size(&identity.parts[0])
+    } else {
+        1 + 4
+            + identity
+                .parts
+                .iter()
+                .map(|part| encoded_str_size(part))
+                .sum::<usize>()
+    }
+}
+
+fn encoded_optional_str_size(value: Option<&str>) -> usize {
+    1 + value.map(encoded_str_size).unwrap_or(0)
+}
+
+fn encoded_str_size(value: &str) -> usize {
+    4 + value.len()
 }
 
 fn validate_unique<'a>(
@@ -1023,6 +1189,78 @@ mod tests {
     use crate::entity_identity::EntityIdentity;
 
     use super::*;
+
+    fn test_change_ref(entity: &str, change_id: &str) -> CommitChangeRef {
+        CommitChangeRef {
+            schema_key: "message".to_string(),
+            file_id: None,
+            entity_id: EntityIdentity::single(entity.to_string()),
+            change_id: change_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn chunk_one_commit_change_refs_splits_by_encoded_size() {
+        let refs = CommitChangeRefSet {
+            commit_id: "commit-1".to_string(),
+            entries: (0..8)
+                .map(|index| {
+                    test_change_ref(
+                        &format!("entity-{index:04}-{}", "x".repeat(24)),
+                        &format!("change-{index:04}-{}", "y".repeat(24)),
+                    )
+                })
+                .collect(),
+        };
+
+        let chunks = chunk_one_commit_change_refs(refs, 180, 260, 2048)
+            .expect("refs should chunk under small test limit");
+
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| encode_commit_change_ref_chunk(chunk).unwrap().len() <= 260));
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.entries.iter())
+                .map(|entry| entry.change_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "change-0000-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0001-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0002-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0003-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0004-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0005-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0006-yyyyyyyyyyyyyyyyyyyyyyyy",
+                "change-0007-yyyyyyyyyyyyyyyyyyyyyyyy",
+            ]
+        );
+    }
+
+    #[test]
+    fn chunk_one_commit_change_refs_splits_by_entry_count() {
+        let refs = CommitChangeRefSet {
+            commit_id: "commit-1".to_string(),
+            entries: (0..5)
+                .map(|index| {
+                    test_change_ref(&format!("entity-{index}"), &format!("change-{index}"))
+                })
+                .collect(),
+        };
+
+        let chunks = chunk_one_commit_change_refs(refs, usize::MAX, usize::MAX, 2)
+            .expect("refs should chunk by entry cap");
+
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.entries.len())
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+    }
 
     #[tokio::test]
     async fn stage_append_writes_direct_records_and_change_ref_chunks() {

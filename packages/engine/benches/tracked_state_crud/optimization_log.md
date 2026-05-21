@@ -503,3 +503,70 @@ redb for this fixture.
 | transaction `insert_all` written bytes | 827,460 | 811,445 |  -1.9% |
 | transaction `update_all` written bytes | 941,913 | 925,898 |  -1.7% |
 | transaction `delete_all` written bytes | 508,404 | 492,389 |  -3.2% |
+
+## Bounded Commit Change Ref Chunks: 2026-05-20
+
+Commands:
+
+```sh
+cargo test -p lix_engine changelog --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+```
+
+Notes:
+
+- Added real bounded chunking for `changelog.commit_change_ref_chunk`.
+- The target chunk size is 64 KiB, the hard max is 128 KiB, and the entry cap
+  is 2048 entries.
+- The first implementation measured each candidate chunk by cloning and
+  re-encoding the whole growing chunk. That kept bytes stable, but made the
+  write path effectively quadratic and pushed 1k transaction writes to roughly
+  90-105 ms.
+- The fixed implementation uses an incremental size estimator that mirrors the
+  chunk codec layout, then validates final chunks in debug builds. This keeps
+  the bounded-chunk contract without reintroducing a giant synchronous CPU
+  cost.
+
+### Regression Fix Scorecard
+
+Transaction layer, direct transaction API, Criterion point estimates after the
+incremental estimator fix:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   13.12 ms |  3.17 ms |         191 us |          747 us |   15.17 ms |    2.30 ms |   13.94 ms |    2.35 ms |
+| RocksDB |   10.20 ms |  2.90 ms |        61.9 us |          402 us |   11.86 ms |    1.57 ms |   11.42 ms |    1.64 ms |
+| redb    |   20.96 ms |  2.76 ms |        78.9 us |          378 us |   20.76 ms |    6.04 ms |   19.16 ms |    6.17 ms |
+
+SQL session:
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| in-memory |   17.43 ms |  5.58 ms |        1.26 ms |         1.37 ms |   excluded |   excluded |   14.56 ms |    6.42 ms |
+
+### Delta From Regressed Chunker
+
+The previous bounded-chunk implementation was not kept, but the scorecard made
+the regression obvious:
+
+| Workload                      | Regressed chunker | Fixed chunker | Result |
+| ----------------------------- | ----------------: | ------------: | -----: |
+| SQLite transaction insert 1k  |           ~100 ms |      13.12 ms |  fixed |
+| RocksDB transaction insert 1k |            ~89 ms |      10.20 ms |  fixed |
+| redb transaction insert 1k    |           ~105 ms |      20.96 ms |  fixed |
+| SQL session insert 1k         |           ~100 ms |      17.43 ms |  fixed |
+
+### 1k Smoke Accounting
+
+Accounting was unchanged by the estimator fix. Bounded chunking increases the
+1k fixture's `changelog.commit_change_ref_chunk` rows from 2 to 3 because the
+large commit ref set now splits, while value bytes stay essentially flat versus
+the dictionary codec cut.
+
+| Metric                                | Codec cut | Bounded chunks | Delta |
+| ------------------------------------- | --------: | -------------: | ----: |
+| `commit_change_ref_chunk` rows        |         2 |              3 |    +1 |
+| `commit_change_ref_chunk` key bytes   |        81 |            126 |   +45 |
+| `commit_change_ref_chunk` value bytes |   101,287 |        101,325 |   +38 |
+| transaction `insert_all` puts         |     2,037 |          2,038 |    +1 |
+| transaction `insert_all` bytes        |   811,445 |        811,483 |   +38 |
