@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -68,8 +68,8 @@ pub fn schema_from_registered_snapshot(
     ))
 }
 
-pub(crate) fn registered_schema_entity_id(schema_key: &str) -> Result<EntityIdentity, LixError> {
-    EntityIdentity::from_primary_key_paths(
+pub(crate) fn registered_schema_entity_pk(schema_key: &str) -> Result<EntityPk, LixError> {
+    EntityPk::from_primary_key_paths(
         &serde_json::json!({
             "value": {
                 "x-lix-key": schema_key,

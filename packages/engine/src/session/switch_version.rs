@@ -93,9 +93,7 @@ where
 
 fn workspace_version_stage_row(version_id: &str) -> Result<TransactionWriteRow, LixError> {
     Ok(TransactionWriteRow {
-        entity_id: Some(crate::entity_identity::EntityIdentity::single(
-            WORKSPACE_VERSION_KEY,
-        )),
+        entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_VERSION_KEY)),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({

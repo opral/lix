@@ -106,7 +106,7 @@ macro_rules! canonical_identity_type {
     };
 }
 
-canonical_identity_type!(EntityId, "entity_id");
+canonical_identity_type!(EntityPk, "entity_pk");
 canonical_identity_type!(FileId, "file_id");
 canonical_identity_type!(VersionId, "version_id");
 canonical_identity_type!(CanonicalSchemaKey, "schema_key");

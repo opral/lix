@@ -5,7 +5,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::common::{format_json_pointer, parse_json_pointer};
 use crate::domain::{Domain, DomainSchemaIdentity};
-use crate::entity_identity::canonical_json_text;
+use crate::entity_pk::canonical_json_text;
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{compile_lix_schema, validate_schema_amendment, SchemaKey};
 use crate::LixError;
@@ -447,8 +447,8 @@ struct UnboundForeignKeyPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StateForeignKeyPlan {
-    /// Slot [0] in `x-lix-state-foreign-keys`: local pointer to the target entity_id.
-    pub(crate) entity_id_property: Vec<String>,
+    /// Slot [0] in `x-lix-state-foreign-keys`: local pointer to the target entity_pk.
+    pub(crate) entity_pk_property: Vec<String>,
     /// Slot [1] in `x-lix-state-foreign-keys`: local pointer to the target schema_key.
     pub(crate) schema_key_property: Vec<String>,
     /// Slot [2] in `x-lix-state-foreign-keys`: local pointer to the target file_id.
@@ -458,7 +458,7 @@ pub(crate) struct StateForeignKeyPlan {
 impl StateForeignKeyPlan {
     pub(crate) fn local_properties(&self) -> PointerGroup {
         vec![
-            self.entity_id_property.clone(),
+            self.entity_pk_property.clone(),
             self.schema_key_property.clone(),
             self.file_id_property.clone(),
         ]
@@ -648,7 +648,7 @@ fn bind_foreign_key_plans(
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_id, schema_key, file_id]",
+                        "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_pk, schema_key, file_id]",
                         source_key.schema_key
                     ),
                 ));
@@ -868,12 +868,12 @@ fn state_foreign_key_plans(schema: &JsonValue) -> Result<Vec<StateForeignKeyPlan
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_id, schema_key, file_id]"
+                        "x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_pk, schema_key, file_id]"
                     ),
                 ));
             }
             Ok(StateForeignKeyPlan {
-                entity_id_property: local_properties[0].clone(),
+                entity_pk_property: local_properties[0].clone(),
                 schema_key_property: local_properties[1].clone(),
                 file_id_property: local_properties[2].clone(),
             })

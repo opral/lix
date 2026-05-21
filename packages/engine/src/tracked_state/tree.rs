@@ -2222,7 +2222,7 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
         return Vec::new();
     }
 
-    let can_bind_entity = !request.entity_ids.is_empty()
+    let can_bind_entity = !request.entity_pks.is_empty()
         && !request.file_ids.is_empty()
         && request
             .file_ids
@@ -2238,11 +2238,11 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
                     NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
                     NullableKeyFilter::Any => unreachable!("filtered above"),
                 };
-                for entity_id in &request.entity_ids {
+                for entity_pk in &request.entity_pks {
                     let key = TrackedStateKey {
                         schema_key: schema_key.clone(),
                         file_id: file_id.clone(),
-                        entity_id: entity_id.clone(),
+                        entity_pk: entity_pk.clone(),
                     };
                     ranges.push(exact_scan_range(encode_key(&key)));
                 }
@@ -2281,7 +2281,7 @@ fn scan_key_decode_hint<'a>(
     if ranges.len() != 1 || request.schema_keys.len() != 1 || request.file_ids.len() != 1 {
         return None;
     }
-    if !request.entity_ids.is_empty() {
+    if !request.entity_pks.is_empty() {
         return None;
     }
     let file_id = match request.file_ids.first()? {
@@ -2345,7 +2345,7 @@ fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &Tracked
     if !request.schema_keys.is_empty() && !request.schema_keys.contains(&key.schema_key) {
         return false;
     }
-    if !request.entity_ids.is_empty() && !request.entity_ids.contains(&key.entity_id) {
+    if !request.entity_pks.is_empty() && !request.entity_pks.contains(&key.entity_pk) {
         return false;
     }
     if !request.file_ids.is_empty()
@@ -2366,7 +2366,7 @@ fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_identity::EntityIdentity;
+    use crate::entity_pk::EntityPk;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::encode_value;
@@ -2457,7 +2457,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let identities = rows
             .iter()
-            .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
+            .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
             .collect::<Vec<_>>();
         assert_eq!(identities, vec!["deleted", "visible"]);
 
@@ -2475,7 +2475,7 @@ mod tests {
             .expect("live scan should succeed");
         let live_identities = live_rows
             .iter()
-            .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
+            .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
             .collect::<Vec<_>>();
         assert_eq!(live_identities, vec!["visible"]);
     }
@@ -2520,7 +2520,7 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    entity_ids: vec![crate::entity_identity::EntityIdentity::single("entity-a")],
+                    entity_pks: vec![crate::entity_pk::EntityPk::single("entity-a")],
                     file_ids: vec![crate::NullableKeyFilter::Value("file-a".to_string())],
                     ..Default::default()
                 },
@@ -2533,7 +2533,7 @@ mod tests {
         assert_eq!(
             rows[0]
                 .0
-                .entity_id
+                .entity_pk
                 .as_single_string_owned()
                 .expect("identity"),
             "entity-a"
@@ -2596,7 +2596,7 @@ mod tests {
         ));
         assert_eq!(
             rows.iter()
-                .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
+                .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
                 .collect::<Vec<_>>(),
             vec!["entity-a", "entity-c"]
         );
@@ -2912,9 +2912,9 @@ mod tests {
         let inserts = ["entity-050a", "entity-050b", "entity-050c"]
             .into_iter()
             .enumerate()
-            .map(|(index, entity_id)| {
+            .map(|(index, entity_pk)| {
                 (
-                    key("schema", None, entity_id),
+                    key("schema", None, entity_pk),
                     value(
                         &format!("inserted-{index}"),
                         Some(&format!("{{\"inserted\":{index}}}")),
@@ -3040,11 +3040,11 @@ mod tests {
             .collect()
     }
 
-    fn key(schema_key: &str, file_id: Option<&str>, entity_id: &str) -> TrackedStateKey {
+    fn key(schema_key: &str, file_id: Option<&str>, entity_pk: &str) -> TrackedStateKey {
         TrackedStateKey {
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
-            entity_id: EntityIdentity::single(entity_id),
+            entity_pk: EntityPk::single(entity_pk),
         }
     }
 

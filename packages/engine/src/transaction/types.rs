@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::catalog::SchemaPlanId;
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::untracked_state::MaterializedUntrackedStateRow;
@@ -111,7 +111,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 /// `PreparedStateRow` without serializing already-normalized JSON again.
 ///
 /// SQL providers stage semantic rows, not final storage rows. INSERT providers
-/// may omit defaulted snapshot fields and leave `entity_id` unset when the
+/// may omit defaulted snapshot fields and leave `entity_pk` unset when the
 /// target schema has an `x-lix-primary-key`; transaction normalization applies
 /// schema defaults and derives the final identity. Typed UPDATE providers must
 /// stage full rewritten snapshots after applying column assignments to the
@@ -119,7 +119,7 @@ impl<'de> Deserialize<'de> for TransactionJson {
 /// implicit patches.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TransactionWriteRow {
-    pub(crate) entity_id: Option<EntityIdentity>,
+    pub(crate) entity_pk: Option<EntityPk>,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: Option<TransactionJson>,
@@ -265,7 +265,7 @@ pub(crate) struct PreparedRowFacts {
 pub(crate) struct PreparedStateRow {
     pub(crate) schema_plan_id: SchemaPlanId,
     pub(crate) facts: PreparedRowFacts,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: Option<StageJson>,
@@ -284,7 +284,7 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: PreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
         MaterializedLiveStateRow {
-            entity_id: row.entity_id,
+            entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
@@ -304,7 +304,7 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
 impl From<&PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: &PreparedStateRow) -> Self {
         MaterializedLiveStateRow {
-            entity_id: row.entity_id.clone(),
+            entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
@@ -325,7 +325,7 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
     fn from(row: PreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
         MaterializedUntrackedStateRow {
-            entity_id: row.entity_id,
+            entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
@@ -358,7 +358,7 @@ pub(crate) struct StagedCommitChangeRefs {
 pub(crate) struct StagedCommitChangeRef {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: String,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,

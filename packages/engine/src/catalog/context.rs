@@ -361,7 +361,7 @@ mod tests {
                 .find(|row| {
                     row.schema_key == request.schema_key
                         && row.version_id == request.version_id
-                        && row.entity_id == request.entity_id
+                        && row.entity_pk == request.entity_pk
                 })
                 .cloned())
         }
@@ -369,7 +369,7 @@ mod tests {
 
     fn registered_schema_row(schema_key: &str) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: registered_schema_entity_id(schema_key),
+            entity_pk: registered_schema_entity_pk(schema_key),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
@@ -398,8 +398,8 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_id(schema_key: &str) -> crate::entity_identity::EntityIdentity {
-        crate::entity_identity::EntityIdentity::from_primary_key_paths(
+    fn registered_schema_entity_pk(schema_key: &str) -> crate::entity_pk::EntityPk {
+        crate::entity_pk::EntityPk::from_primary_key_paths(
             &json!({
                 "value": {
                     "x-lix-key": schema_key,

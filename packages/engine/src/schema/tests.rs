@@ -41,7 +41,7 @@ fn validate_lix_schema_definition_rejects_unprojectable_entity_properties() {
 
 #[test]
 fn validate_lix_schema_definition_rejects_reserved_lix_property_prefixes() {
-    for property_name in ["lixcol_entity_id", "lix_internal", "lixfoo"] {
+    for property_name in ["lixcol_entity_pk", "lix_internal", "lixfoo"] {
         let schema = json!({
             "x-lix-key": "test_entity",
             "type": "object",
@@ -196,7 +196,7 @@ fn validate_lix_schema_definition_rejects_missing_primary_key_properties() {
             "value": { "type": "string" }
         },
         "required": ["value"],
-        "x-lix-primary-key": ["/entity_id"],
+        "x-lix-primary-key": ["/entity_pk"],
         "additionalProperties": false
     });
 
@@ -255,7 +255,7 @@ fn validate_lix_schema_definition_rejects_missing_unique_constraint_properties()
         "properties": {
             "value": { "type": "string" }
         },
-        "x-lix-unique": [["/entity_id", "/value"]],
+        "x-lix-unique": [["/entity_pk", "/value"]],
         "additionalProperties": false
     });
 
@@ -641,7 +641,7 @@ fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
         "type": "object",
         "x-lix-key": "label_assignment",
         "x-lix-state-foreign-keys": [
-            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
         ],
         "x-lix-foreign-keys": [
             {
@@ -653,7 +653,7 @@ fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
             }
         ],
         "properties": {
-            "target_entity_id": {
+            "target_entity_pk": {
                 "type": "array",
                 "items": { "type": "string" },
                 "minItems": 1
@@ -662,7 +662,7 @@ fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
             "target_file_id": { "type": ["string", "null"] },
             "label_id": { "type": "string" }
         },
-        "required": ["target_entity_id", "target_schema_key", "target_file_id", "label_id"],
+        "required": ["target_entity_pk", "target_schema_key", "target_file_id", "label_id"],
         "additionalProperties": false
     });
 
@@ -675,10 +675,10 @@ fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
         "type": "object",
         "x-lix-key": "bad_label_assignment",
         "x-lix-state-foreign-keys": [
-            ["/target_schema_key", "/target_entity_id", "/target_file_id"]
+            ["/target_schema_key", "/target_entity_pk", "/target_file_id"]
         ],
         "properties": {
-            "target_entity_id": {
+            "target_entity_pk": {
                 "type": "array",
                 "items": { "type": "string" },
                 "minItems": 1
@@ -686,14 +686,14 @@ fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
             "target_schema_key": { "type": "string" },
             "target_file_id": { "type": ["string", "null"] }
         },
-        "required": ["target_entity_id", "target_schema_key", "target_file_id"],
+        "required": ["target_entity_pk", "target_schema_key", "target_file_id"],
         "additionalProperties": false
     });
 
     let err =
         validate_lix_schema_definition(&schema).expect_err("wrong tuple order should be rejected");
     assert!(
-        err.message.contains("[entity_id, schema_key, file_id]"),
+        err.message.contains("[entity_pk, schema_key, file_id]"),
         "unexpected error: {err:?}"
     );
 }
@@ -704,10 +704,10 @@ fn x_lix_state_foreign_keys_requires_address_tuple_properties() {
         "type": "object",
         "x-lix-key": "optional_label_assignment",
         "x-lix-state-foreign-keys": [
-            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+            ["/target_entity_pk", "/target_schema_key", "/target_file_id"]
         ],
         "properties": {
-            "target_entity_id": {
+            "target_entity_pk": {
                 "type": "array",
                 "items": { "type": "string" },
                 "minItems": 1
@@ -715,7 +715,7 @@ fn x_lix_state_foreign_keys_requires_address_tuple_properties() {
             "target_schema_key": { "type": "string" },
             "target_file_id": { "type": ["string", "null"] }
         },
-        "required": ["target_entity_id", "target_schema_key"],
+        "required": ["target_entity_pk", "target_schema_key"],
         "additionalProperties": false
     });
 

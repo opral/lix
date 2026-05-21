@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_bytes, parse_document_snapshot};
-use text_plugin::{detect_changes, DOCUMENT_ENTITY_ID, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY};
+use text_plugin::{detect_changes, DOCUMENT_ENTITY_PK, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY};
 
 #[test]
 fn creation_returns_full_projection() {
@@ -22,7 +22,7 @@ fn creation_returns_full_projection() {
         .iter()
         .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
         .expect("document snapshot should exist");
-    assert_eq!(document_change.entity_id, DOCUMENT_ENTITY_ID);
+    assert_eq!(document_change.entity_pk, DOCUMENT_ENTITY_PK);
     let doc = parse_document_snapshot(document_change);
     assert_eq!(doc.line_ids.len(), 2);
 }
@@ -101,7 +101,7 @@ fn line_reorder_emits_delete_and_insert() {
 
     assert_eq!(line_inserts.len(), 1);
     assert_eq!(line_tombstones.len(), 1);
-    assert_ne!(line_inserts[0].entity_id, line_tombstones[0].entity_id);
+    assert_ne!(line_inserts[0].entity_pk, line_tombstones[0].entity_pk);
     assert!(changes
         .iter()
         .any(|change| change.schema_key == DOCUMENT_SCHEMA_KEY));

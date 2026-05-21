@@ -185,9 +185,9 @@ simulation_test!(
 					"SELECT id, path, name, lixcol_snapshot_content, lixcol_schema_key, lixcol_start_commit_id, lixcol_depth \
 	                 FROM lix_directory_history \
 	                 WHERE lixcol_start_commit_id = '{delete_commit_id}' \
-	                   AND lixcol_entity_id IN (lix_json('[\"history-delete-docs\"]'), lix_json('[\"history-delete-guides\"]')) \
+	                   AND lixcol_entity_pk IN (lix_json('[\"history-delete-docs\"]'), lix_json('[\"history-delete-guides\"]')) \
 	                   AND lixcol_depth = 0 \
-	                 ORDER BY lixcol_entity_id"
+	                 ORDER BY lixcol_entity_pk"
 				),
                 &[],
             )

@@ -10,7 +10,7 @@ mod common;
 mod detect_changes;
 pub mod schemas;
 
-pub const ROOT_ENTITY_ID: &str = "root";
+pub const ROOT_ENTITY_PK: &str = "root";
 pub const DOCUMENT_SCHEMA_KEY: &str = schemas::DOCUMENT_SCHEMA_KEY;
 pub const BLOCK_SCHEMA_KEY: &str = schemas::BLOCK_SCHEMA_KEY;
 
@@ -75,7 +75,7 @@ fn project_state_context_from_before(
             bootstrap
                 .into_iter()
                 .map(|row| PluginActiveStateRow {
-                    entity_id: row.entity_id,
+                    entity_pk: row.entity_pk,
                     schema_key: Some(row.schema_key),
                     snapshot_content: row.snapshot_content,
                     file_id: None,

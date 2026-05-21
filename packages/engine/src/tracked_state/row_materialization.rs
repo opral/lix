@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
 use crate::storage::StorageRead;
@@ -47,7 +47,7 @@ where
             &mut json_ref_localities,
         );
         row_plans.push(TrackedRowMaterializationPlan {
-            entity_id: key.entity_id,
+            entity_pk: key.entity_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             deleted: value.deleted,
@@ -72,7 +72,7 @@ fn materialize_entry_without_json(
     (key, value): (TrackedStateKey, TrackedStateIndexValue),
 ) -> MaterializedTrackedStateRow {
     MaterializedTrackedStateRow {
-        entity_id: key.entity_id,
+        entity_pk: key.entity_pk,
         schema_key: key.schema_key,
         file_id: key.file_id,
         snapshot_content: None,
@@ -86,7 +86,7 @@ fn materialize_entry_without_json(
 }
 
 struct TrackedRowMaterializationPlan {
-    entity_id: EntityIdentity,
+    entity_pk: EntityPk,
     schema_key: String,
     file_id: Option<String>,
     deleted: bool,
@@ -171,7 +171,7 @@ fn materialize_row_plan(
     json_values: &mut [Option<Vec<u8>>],
 ) -> Result<MaterializedTrackedStateRow, LixError> {
     Ok(MaterializedTrackedStateRow {
-        entity_id: plan.entity_id,
+        entity_pk: plan.entity_pk,
         schema_key: plan.schema_key,
         file_id: plan.file_id,
         snapshot_content: materialized_json_string(

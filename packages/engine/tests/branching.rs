@@ -42,7 +42,7 @@ simulation_test!(create_version_rejects_existing_id, |sim| async move {
     assert!(
         error
             .to_string()
-            .contains("INSERT would duplicate entity_id"),
+            .contains("INSERT would duplicate entity_pk"),
         "error should explain the duplicate version id: {error:?}"
     );
     assert_version_descriptor(&main, "draft-version", "Draft").await;
@@ -112,7 +112,7 @@ simulation_test!(
         let error = main
 		.execute(
 			"DELETE FROM lix_state \
-	             WHERE schema_key = 'lix_version_descriptor' AND entity_id = lix_json('[\"draft-version\"]')",
+	             WHERE schema_key = 'lix_version_descriptor' AND entity_pk = lix_json('[\"draft-version\"]')",
 			&[],
 		)
             .await
@@ -171,7 +171,7 @@ simulation_test!(
         let error = main
 		.execute(
 			"DELETE FROM lix_state \
-	                 WHERE schema_key = 'lix_version_ref' AND entity_id = lix_json('[\"draft-version\"]')",
+	                 WHERE schema_key = 'lix_version_ref' AND entity_pk = lix_json('[\"draft-version\"]')",
 			&[],
 		)
             .await
@@ -864,7 +864,7 @@ simulation_test!(
             "SELECT count(*) \
 	     FROM lix_change \
 	     WHERE schema_key = 'lix_key_value' \
-	       AND entity_id = lix_json('[\"merge-select-change\"]') \
+	       AND entity_pk = lix_json('[\"merge-select-change\"]') \
 	       AND snapshot_content = lix_json('{\"key\":\"merge-select-change\",\"value\":\"source\"}')",
         )
         .await;
@@ -878,7 +878,7 @@ simulation_test!(
                 "SELECT snapshot_content \
 	             FROM lix_state_history \
 	             WHERE start_commit_id = lix_active_version_commit_id() \
-	               AND entity_id = lix_json('[\"merge-select-change\"]') \
+	               AND entity_pk = lix_json('[\"merge-select-change\"]') \
 	             ORDER BY depth",
                 &[],
             )
@@ -1560,7 +1560,7 @@ async fn count_version_refs(
         session,
         &format!(
             "SELECT COUNT(*) FROM lix_state \
-	         WHERE schema_key = 'lix_version_ref' AND entity_id = lix_json('[\"{version_id}\"]')"
+	         WHERE schema_key = 'lix_version_ref' AND entity_pk = lix_json('[\"{version_id}\"]')"
         ),
     )
     .await
@@ -1607,10 +1607,10 @@ fn assert_merge_conflict_error(error: &lix_engine::LixError) {
     );
     assert!(
         conflict
-            .get("entityId")
+            .get("entityPk")
             .and_then(JsonValue::as_array)
             .is_some(),
-        "conflict should include entityId: {conflict:?}"
+        "conflict should include entityPk: {conflict:?}"
     );
     assert!(
         conflict.get("target").is_some(),

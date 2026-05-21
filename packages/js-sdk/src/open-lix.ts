@@ -300,7 +300,7 @@ export type MergeChangeStats = {
 export type MergeConflict = {
 	kind: "sameEntityChanged";
 	schemaKey: string;
-	entityId: string[];
+	entityPk: string[];
 	fileId: string | null;
 	target: MergeConflictSide;
 	source: MergeConflictSide;

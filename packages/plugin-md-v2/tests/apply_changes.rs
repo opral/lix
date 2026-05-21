@@ -24,7 +24,7 @@ fn materializes_markdown_from_document_order_and_blocks() {
 fn document_tombstone_results_in_empty_file() {
     let file = file_from_markdown("f1", "/notes.md", "before");
     let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: plugin_md_v2::ROOT_ENTITY_ID.to_string(),
+        entity_pk: plugin_md_v2::ROOT_ENTITY_PK.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
         snapshot_content: None,
     }];
@@ -70,10 +70,10 @@ fn rejects_duplicate_block_rows() {
 }
 
 #[test]
-fn rejects_unknown_document_entity_id() {
+fn rejects_unknown_document_entity_pk() {
     let file = empty_file("f1", "/notes.md");
     let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: "other".to_string(),
+        entity_pk: "other".to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
         snapshot_content: Some(
             serde_json::json!({
@@ -93,7 +93,7 @@ fn rejects_unknown_document_entity_id() {
 fn rejects_invalid_block_snapshot_json() {
     let file = empty_file("f1", "/notes.md");
     let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: "b1".to_string(),
+        entity_pk: "b1".to_string(),
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
         snapshot_content: Some("{".to_string()),
     }];
@@ -107,7 +107,7 @@ fn rejects_invalid_block_snapshot_json() {
 fn rejects_invalid_document_snapshot_json() {
     let file = empty_file("f1", "/notes.md");
     let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: plugin_md_v2::ROOT_ENTITY_ID.to_string(),
+        entity_pk: plugin_md_v2::ROOT_ENTITY_PK.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
         snapshot_content: Some("{".to_string()),
     }];
@@ -118,10 +118,10 @@ fn rejects_invalid_document_snapshot_json() {
 }
 
 #[test]
-fn rejects_block_snapshot_id_mismatch_with_entity_id() {
+fn rejects_block_snapshot_id_mismatch_with_entity_pk() {
     let file = empty_file("f1", "/notes.md");
     let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: "b1".to_string(),
+        entity_pk: "b1".to_string(),
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
         snapshot_content: Some(
             serde_json::json!({
@@ -143,7 +143,7 @@ fn rejects_block_snapshot_id_mismatch_with_entity_id() {
 fn rejects_document_snapshot_id_mismatch_with_root() {
     let file = empty_file("f1", "/notes.md");
     let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: plugin_md_v2::ROOT_ENTITY_ID.to_string(),
+        entity_pk: plugin_md_v2::ROOT_ENTITY_PK.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
         snapshot_content: Some(
             serde_json::json!({
@@ -164,12 +164,12 @@ fn ignores_unknown_schema_rows() {
     let file = file_from_markdown("f1", "/notes.md", "keep me");
     let changes = vec![
         plugin_md_v2::PluginEntityChange {
-            entity_id: "unknown1".to_string(),
+            entity_pk: "unknown1".to_string(),
             schema_key: "other_schema".to_string(),
             snapshot_content: Some("{\"x\":1}".to_string()),
         },
         plugin_md_v2::PluginEntityChange {
-            entity_id: "unknown2".to_string(),
+            entity_pk: "unknown2".to_string(),
             schema_key: "other_schema".to_string(),
             snapshot_content: None,
         },
@@ -242,7 +242,7 @@ fn tombstoned_block_is_not_rendered_even_if_order_mentions_it() {
         document_change(vec!["b1".to_string(), "b2".to_string()]),
         block_change("b1", "paragraph", "Alive"),
         plugin_md_v2::PluginEntityChange {
-            entity_id: "b2".to_string(),
+            entity_pk: "b2".to_string(),
             schema_key: BLOCK_SCHEMA_KEY.to_string(),
             snapshot_content: None,
         },

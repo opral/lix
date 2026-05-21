@@ -60,7 +60,7 @@
               "items": {
                 "type": "string",
                 "enum": [
-                  "entity_id",
+                  "entity_pk",
                   "schema_key",
                   "snapshot_content",
                   "file_id",
@@ -73,7 +73,7 @@
                 ]
               },
               "contains": {
-                "const": "entity_id"
+                "const": "entity_pk"
               }
             }
           },

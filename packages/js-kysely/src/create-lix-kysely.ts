@@ -15,6 +15,7 @@ type LixQueryResult = {
 	rows?: unknown;
 	columns?: unknown;
 	statements?: unknown;
+	rowsAffected?: unknown;
 };
 
 export type LixExecuteOptions = {
@@ -27,6 +28,19 @@ type LixExecuteLike = {
 		params?: ReadonlyArray<unknown>,
 		options?: LixExecuteOptions,
 	): Promise<LixQueryResult>;
+};
+
+type LixTransactionLike = {
+	execute(
+		sql: string,
+		params?: ReadonlyArray<unknown>,
+	): Promise<LixQueryResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
+};
+
+type LixTransactionalLike = LixExecuteLike & {
+	beginTransaction(): Promise<LixTransactionLike>;
 };
 
 type LixDbLike = {
@@ -60,10 +74,10 @@ class LixConnection implements DatabaseConnection {
 				compiledQuery.parameters,
 			),
 		);
-		const decodedRows = decodeRows(raw.rows);
+		const rawColumnNames = decodeColumnNames(raw.columns);
+		const decodedRows = decodeRows(raw.rows, rawColumnNames);
 		const columnNames =
-			decodeColumnNames(raw.columns) ??
-			(await this.resolveColumnNames(compiledQuery.query));
+			rawColumnNames ?? (await this.resolveColumnNames(compiledQuery.query));
 		const rows =
 			columnNames &&
 			decodedRows.every((row) => row.length === columnNames.length)
@@ -78,10 +92,7 @@ class LixConnection implements DatabaseConnection {
 		let numAffectedRows: bigint | undefined;
 		let insertId: bigint | undefined;
 		if (kind !== "SelectQueryNode") {
-			numAffectedRows = await this.readIntegerResult("SELECT changes()");
-			if (kind === "InsertQueryNode") {
-				insertId = await this.readIntegerResult("SELECT last_insert_rowid()");
-			}
+			numAffectedRows = extractIntegerValue(raw.rowsAffected);
 		}
 
 		return {
@@ -99,7 +110,7 @@ class LixConnection implements DatabaseConnection {
 
 	async readIntegerResult(sql: string): Promise<bigint | undefined> {
 		const raw = normalizeLixQueryResult(await this.#executeSql(sql, undefined));
-		const rows = decodeRows(raw.rows);
+		const rows = decodeRows(raw.rows, decodeColumnNames(raw.columns));
 		if (!rows[0] || rows[0].length === 0) {
 			return undefined;
 		}
@@ -147,7 +158,7 @@ class LixDriver implements Driver {
 	readonly #connection: LixConnection;
 	readonly #options?: LixExecuteOptions;
 	#transactionSlotHeld = false;
-	#transactionActive = false;
+	#transaction: LixTransactionLike | undefined;
 	#waiters: Array<() => void> = [];
 
 	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
@@ -165,10 +176,12 @@ class LixDriver implements Driver {
 	}
 
 	async beginTransaction(): Promise<void> {
+		if (!isLixTransactionalLike(this.#lix)) {
+			throw new Error("This Lix handle does not support transactions");
+		}
 		await this.#acquireTransactionSlot();
 		try {
-			await this.#executeSql("BEGIN", undefined);
-			this.#transactionActive = true;
+			this.#transaction = await this.#lix.beginTransaction();
 		} catch (error) {
 			this.#releaseTransactionSlot();
 			throw error;
@@ -176,25 +189,25 @@ class LixDriver implements Driver {
 	}
 
 	async commitTransaction(): Promise<void> {
-		if (!this.#transactionActive) {
+		if (!this.#transaction) {
 			throw new Error("commitTransaction called without active transaction");
 		}
 		try {
-			await this.#executeSql("COMMIT", undefined);
+			await this.#transaction.commit();
 		} finally {
-			this.#transactionActive = false;
+			this.#transaction = undefined;
 			this.#releaseTransactionSlot();
 		}
 	}
 
 	async rollbackTransaction(): Promise<void> {
-		if (!this.#transactionActive) {
+		if (!this.#transaction) {
 			throw new Error("rollbackTransaction called without active transaction");
 		}
 		try {
-			await this.#executeSql("ROLLBACK", undefined);
+			await this.#transaction.rollback();
 		} finally {
-			this.#transactionActive = false;
+			this.#transaction = undefined;
 			this.#releaseTransactionSlot();
 		}
 	}
@@ -237,6 +250,9 @@ class LixDriver implements Driver {
 		sql: string,
 		params?: ReadonlyArray<unknown>,
 	): Promise<LixQueryResult> {
+		if (this.#transaction) {
+			return this.#transaction.execute(sql, params);
+		}
 		return this.#lix.execute(sql, params, this.#options);
 	}
 
@@ -317,6 +333,17 @@ function isLixExecuteLike(value: unknown): value is LixExecuteLike {
 	return typeof (value as { execute?: unknown }).execute === "function";
 }
 
+function isLixTransactionalLike(value: unknown): value is LixTransactionalLike {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	return (
+		typeof (value as { execute?: unknown }).execute === "function" &&
+		typeof (value as { beginTransaction?: unknown }).beginTransaction ===
+			"function"
+	);
+}
+
 function normalizeWriterKey(value: unknown): string | null | undefined {
 	if (value === undefined) {
 		return undefined;
@@ -351,29 +378,85 @@ function isLixDbLike(value: unknown): value is LixDbLike {
 	);
 }
 
-function decodeRows(rawRows: unknown): unknown[][] {
+function decodeRows(rawRows: unknown, columns?: string[]): unknown[][] {
 	if (!Array.isArray(rawRows)) {
 		return [];
 	}
 	return rawRows.map((row) => {
 		if (!Array.isArray(row)) {
-			return [];
+			return decodeObjectRow(row, columns);
 		}
-		return [...row];
+		return row.map(decodeLixValue);
 	});
+}
+
+function decodeObjectRow(row: unknown, columns?: string[]): unknown[] {
+	if (!row || typeof row !== "object") {
+		return [];
+	}
+	if (typeof (row as { values?: unknown }).values === "function") {
+		const values = (row as { values: () => unknown }).values();
+		return Array.isArray(values) ? values.map(decodeLixValue) : [];
+	}
+	const valuesByIndex = (row as { valuesByIndex?: unknown }).valuesByIndex;
+	if (Array.isArray(valuesByIndex)) {
+		return valuesByIndex.map(decodeLixValue);
+	}
+	if (typeof (row as { toObject?: unknown }).toObject === "function") {
+		const object = (row as { toObject: () => Record<string, unknown> }).toObject();
+		return columns?.map((column) => object[column]) ?? Object.values(object);
+	}
+	return [];
+}
+
+function decodeLixValue(value: unknown): unknown {
+	if (!value || typeof value !== "object") {
+		return value;
+	}
+	const candidate = value as {
+		kind?: unknown;
+		value?: unknown;
+		base64?: unknown;
+		asBlob?: unknown;
+	};
+	switch (candidate.kind) {
+		case "null":
+			return null;
+		case "boolean":
+		case "integer":
+		case "real":
+		case "text":
+		case "json":
+			return candidate.value;
+		case "blob":
+			if (typeof candidate.asBlob === "function") {
+				return candidate.asBlob();
+			}
+			return typeof candidate.base64 === "string"
+				? Uint8Array.from(atob(candidate.base64), (char) => char.charCodeAt(0))
+				: undefined;
+		default:
+			return value;
+	}
 }
 
 function normalizeLixQueryResult(raw: LixQueryResult): {
 	rows?: unknown;
 	columns?: unknown;
+	rowsAffected?: unknown;
 } {
 	if (Array.isArray(raw.statements)) {
 		const [statement] = raw.statements;
 		if (statement && typeof statement === "object") {
-			const candidate = statement as { rows?: unknown; columns?: unknown };
+			const candidate = statement as {
+				rows?: unknown;
+				columns?: unknown;
+				rowsAffected?: unknown;
+			};
 			return {
 				rows: candidate.rows,
 				columns: candidate.columns,
+				rowsAffected: candidate.rowsAffected,
 			};
 		}
 	}

@@ -31,7 +31,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO engine_history_schema \
-                 (lixcol_entity_id, id, count, active, meta, lixcol_untracked) \
+                 (lixcol_entity_pk, id, count, active, meta, lixcol_untracked) \
                  VALUES (lix_json('[\"history-entity\"]'), 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'), false)",
                 &[],
             )
@@ -47,7 +47,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_history_schema \
                  SET count = 2, active = false, meta = lix_json('{\"source\":\"update\"}') \
-                 WHERE lixcol_entity_id = lix_json('[\"history-entity\"]')",
+                 WHERE lixcol_entity_pk = lix_json('[\"history-entity\"]')",
                 &[],
             )
             .await
@@ -62,10 +62,10 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, count, active, meta, lixcol_entity_id, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
                      FROM engine_history_schema_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
-                       AND lixcol_entity_id = lix_json('[\"history-entity\"]') \
+                       AND lixcol_entity_pk = lix_json('[\"history-entity\"]') \
                      ORDER BY lixcol_depth"
                 ),
                 &[],

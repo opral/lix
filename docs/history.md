@@ -19,7 +19,7 @@ Versions don't filter `lix_change` directly; `lix_change` is the raw write log, 
 | Column             | What it is                                                                                              |
 | ------------------ | ------------------------------------------------------------------------------------------------------- |
 | `id`               | Unique change id.                                                                                       |
-| `entity_id`        | JSON array of the changed row's primary-key values, in `x-lix-primary-key` order.                       |
+| `entity_pk`        | JSON array of the changed row's primary-key values, in `x-lix-primary-key` order.                       |
 | `schema_key`       | Which schema (`x-lix-key`).                                                                             |
 | `file_id`          | The file the change belongs to, or `null` for entity-only changes.                                      |
 | `metadata`         | JSON metadata attached to the change.                                                                   |
@@ -28,14 +28,14 @@ Versions don't filter `lix_change` directly; `lix_change` is the raw write log, 
 
 Read JSON cells with `row.value("snapshot_content").asJson()` or `row.get("snapshot_content")`. Don't `JSON.parse` it as text, and handle `null` for tombstones.
 
-`entity_id` is a JSON array even for single-column primary keys. For `x-lix-primary-key: ["/id"]`, the first primary-key value is `lix_json_get_text(entity_id, 0)`. Use numeric path segments for array indexes; `'0'` is a string key, not index `0`. For composite keys, address each part by index:
+`entity_pk` is a JSON array even for single-column primary keys. For `x-lix-primary-key: ["/id"]`, the first primary-key value is `lix_json_get_text(entity_pk, 0)`. Use numeric path segments for array indexes; `'0'` is a string key, not index `0`. For composite keys, address each part by index:
 
 ```sql
 SELECT created_at, snapshot_content
 FROM lix_change
 WHERE schema_key = 'line_item'
-  AND lix_json_get_text(entity_id, 0) = 'order-1'
-  AND lix_json_get_text(entity_id, 1) = 'line-2'
+  AND lix_json_get_text(entity_pk, 0) = 'order-1'
+  AND lix_json_get_text(entity_pk, 1) = 'line-2'
 ORDER BY created_at;
 ```
 
@@ -43,7 +43,7 @@ ORDER BY created_at;
 
 | Column               | What it is                                                                              |
 | -------------------- | --------------------------------------------------------------------------------------- |
-| `entity_id`          | JSON array of the row's primary-key values, in `x-lix-primary-key` order.                |
+| `entity_pk`          | JSON array of the row's primary-key values, in `x-lix-primary-key` order.                |
 | `schema_key`         | Which schema.                                                                           |
 | `file_id`            | The file the row belongs to, or `null`.                                                 |
 | `snapshot_content`   | JSON snapshot at this depth.                                                            |
@@ -65,14 +65,14 @@ ORDER BY created_at;
 SELECT created_at, snapshot_content
 FROM lix_change
 WHERE schema_key = $1
-  AND lix_json_get_text(entity_id, 0) = $2
+  AND lix_json_get_text(entity_pk, 0) = $2
 ORDER BY created_at;
 ```
 
 ### Latest activity for a schema
 
 ```sql
-SELECT created_at, entity_id, snapshot_content
+SELECT created_at, entity_pk, snapshot_content
 FROM lix_change
 WHERE schema_key = $1
 ORDER BY created_at DESC
@@ -84,7 +84,7 @@ LIMIT 20;
 Use the schema's `_by_version` surface (see [Versions & Merging](./versions.md)):
 
 ```sql
-SELECT entity_id, snapshot_content
+SELECT entity_pk, snapshot_content
 FROM acme_section_by_version
 WHERE lixcol_version_id = $1;
 ```
@@ -92,14 +92,14 @@ WHERE lixcol_version_id = $1;
 ### What did this version see, walked back through history
 
 ```sql
-SELECT entity_id, schema_key, snapshot_content, depth, observed_commit_id
+SELECT entity_pk, schema_key, snapshot_content, depth, observed_commit_id
 FROM lix_state_history
 WHERE start_commit_id = lix_active_version_commit_id()
   AND depth >= 0
-ORDER BY depth, schema_key, entity_id;
+ORDER BY depth, schema_key, entity_pk;
 ```
 
-`depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `schema_key` or `entity_id` to narrow.
+`depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `schema_key` or `entity_pk` to narrow.
 
 ### Diff one entity between two versions
 
@@ -120,7 +120,7 @@ const prev = await lix.execute(
   `SELECT snapshot_content
      FROM lix_change
     WHERE schema_key = $1
-      AND lix_json_get_text(entity_id, 0) = $2
+      AND lix_json_get_text(entity_pk, 0) = $2
       AND snapshot_content IS NOT NULL
     ORDER BY created_at DESC
     LIMIT 1 OFFSET 1`,

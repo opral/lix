@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::untracked_state::UntrackedStateRow;
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::{LixError, GLOBAL_VERSION_ID};
@@ -23,7 +23,7 @@ pub(crate) fn prepare_version_ref_row(
 
     Ok(PreparedVersionRefRow {
         row: UntrackedStateRow {
-            entity_id: EntityIdentity::single(version_id),
+            entity_pk: EntityPk::single(version_id),
             schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot.as_str().to_string()),

@@ -1,4 +1,4 @@
-use crate::entity_identity::EntityIdentity;
+use crate::entity_pk::EntityPk;
 use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
@@ -7,7 +7,7 @@ use crate::NullableKeyFilter;
 /// directly, and mutable JSON payloads are stored inline in the sidecar row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UntrackedStateRow {
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
@@ -21,7 +21,7 @@ pub(crate) struct UntrackedStateRow {
 impl UntrackedStateRow {
     pub(crate) fn as_ref(&self) -> UntrackedStateRowRef<'_> {
         UntrackedStateRowRef {
-            entity_id: &self.entity_id,
+            entity_pk: &self.entity_pk,
             schema_key: &self.schema_key,
             file_id: self.file_id.as_deref(),
             snapshot_content: self.snapshot_content.as_deref(),
@@ -40,7 +40,7 @@ impl UntrackedStateRow {
 /// without making untracked_state depend on transaction or live-state types.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UntrackedStateRowRef<'a> {
-    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) entity_pk: &'a EntityPk,
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
     pub(crate) snapshot_content: Option<&'a str>,
@@ -54,7 +54,7 @@ pub(crate) struct UntrackedStateRowRef<'a> {
 /// Hydrated boundary shape for callers that still work with JSON payloads.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedUntrackedStateRow {
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
@@ -71,7 +71,7 @@ pub(crate) struct MaterializedUntrackedStateRow {
 pub(crate) struct UntrackedStateIdentity {
     pub(crate) version_id: String,
     pub(crate) schema_key: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
 }
 
@@ -79,7 +79,7 @@ pub(crate) struct UntrackedStateIdentity {
 pub(crate) struct UntrackedStateIdentityRef<'a> {
     pub(crate) version_id: &'a str,
     pub(crate) schema_key: &'a str,
-    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) entity_pk: &'a EntityPk,
     pub(crate) file_id: Option<&'a str>,
 }
 
@@ -88,7 +88,7 @@ impl UntrackedStateIdentity {
         UntrackedStateIdentityRef {
             version_id: &self.version_id,
             schema_key: &self.schema_key,
-            entity_id: &self.entity_id,
+            entity_pk: &self.entity_pk,
             file_id: self.file_id.as_deref(),
         }
     }
@@ -99,7 +99,7 @@ impl<'a> From<UntrackedStateRowRef<'a>> for UntrackedStateIdentityRef<'a> {
         Self {
             version_id: row.version_id,
             schema_key: row.schema_key,
-            entity_id: row.entity_id,
+            entity_pk: row.entity_pk,
             file_id: row.file_id,
         }
     }
@@ -111,7 +111,7 @@ pub(crate) struct UntrackedStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_ids: Vec<EntityIdentity>,
+    pub(crate) entity_pks: Vec<EntityPk>,
     #[serde(default)]
     pub(crate) version_ids: Vec<String>,
     #[serde(default)]
@@ -141,6 +141,6 @@ pub(crate) struct UntrackedStateScanRequest {
 pub(crate) struct UntrackedStateRowRequest {
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
-    pub(crate) entity_id: EntityIdentity,
+    pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: NullableKeyFilter<String>,
 }

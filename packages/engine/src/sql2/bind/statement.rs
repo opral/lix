@@ -1643,7 +1643,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_entity_insert_select() {
         let statement = parse_statement(
-            "INSERT INTO test_state_schema (lixcol_entity_id, value) SELECT lix_json('[\"a\"]'), 'A'",
+            "INSERT INTO test_state_schema (lixcol_entity_pk, value) SELECT lix_json('[\"a\"]'), 'A'",
         );
         let error = bind_statement(
             &statement,
@@ -1677,7 +1677,7 @@ mod tests {
     fn bind_statement_rejects_duplicate_lix_state_by_version_insert_columns() {
         let statement = parse_statement(
             "INSERT INTO lix_state_by_version (\
-             entity_id, schema_key, snapshot_content, version_id, version_id\
+             entity_pk, schema_key, snapshot_content, version_id, version_id\
              ) VALUES (\
              '[\"entity1\"]', 'lix_key_value', '{\"key\":\"k\",\"value\":\"v\"}', 'version1', 'version2'\
              )",
@@ -1828,7 +1828,7 @@ mod tests {
     #[test]
     fn bind_statement_predecodes_lix_json_literal_values() {
         let statement = parse_statement(
-            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) VALUES (lix_json('[\"e1\"]'), 'app.test', lix_json('{\"id\":\"e1\"}'))",
+            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) VALUES (lix_json('[\"e1\"]'), 'app.test', lix_json('{\"id\":\"e1\"}'))",
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
@@ -1980,7 +1980,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_global_lix_state_insert_scope() {
         let statement = parse_statement(
-            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', true)",
+            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', true)",
         );
         let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
 
@@ -1991,7 +1991,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_parameterized_lix_state_global_scope() {
         let statement = parse_statement(
-            "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
+            "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
         );
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("parameterized global scope should fail closed until scope resolution");
@@ -2005,7 +2005,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_lix_state_by_version_global_true_with_version_id() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'v1', true)",
+            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'v1', true)",
         );
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("global true and version_id select contradictory scopes");
@@ -2019,7 +2019,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_lix_state_by_version_global_true_with_global_version() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', true)",
+            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', true)",
         );
         let bound = bind_statement(&statement, &[], "version1").expect("global row should bind");
 
@@ -2030,7 +2030,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_lix_state_by_version_global_false_with_global_version() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', false)",
+            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', false)",
         );
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("global false cannot target the global version");
@@ -2044,7 +2044,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_parameterized_lix_state_by_version_version_id() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
+            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
         );
         let bound = bind_statement(&statement, &[], "version1")
             .expect("parameterized lix_state_by_version version_id should bind");
@@ -2061,7 +2061,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_parameterized_lix_state_by_version_global_false_version_id() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1, false)",
+            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1, false)",
         );
         let bound = bind_statement(&statement, &[], "version1")
             .expect("parameterized lix_state_by_version non-global row should bind");
@@ -2154,7 +2154,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_negative_numeric_literals() {
         let statement = parse_statement(
-            "UPDATE lix_state SET snapshot_content = -1 WHERE entity_id = '[\"e1\"]'",
+            "UPDATE lix_state SET snapshot_content = -1 WHERE entity_pk = '[\"e1\"]'",
         );
         let bound = bind_statement(&statement, &[], "version1").expect("update should bind");
 
@@ -2203,7 +2203,7 @@ mod tests {
 
     #[test]
     fn bind_statement_rejects_provider_read_only_update_columns() {
-        let statement = parse_statement("UPDATE lix_state SET entity_id = '[\"next\"]'");
+        let statement = parse_statement("UPDATE lix_state SET entity_pk = '[\"next\"]'");
         let error = bind_statement(&statement, &[], "version1")
             .expect_err("lix_state identity columns are insert-only");
 

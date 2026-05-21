@@ -376,14 +376,14 @@ fn entity_history_column_value(
         return Ok(snapshot.get(column_name).cloned());
     }
 
-    let entity_id = row.change.entity_id.as_json_array_text().map_err(|error| {
+    let entity_pk = row.change.entity_pk.as_json_array_text().map_err(|error| {
         DataFusionError::Execution(format!(
-            "sql2 entity history provider failed to project entity id: {error}"
+            "sql2 entity history provider failed to project entity pk: {error}"
         ))
     })?;
     tombstone_identity_column_value(
         column_name,
-        &entity_id,
+        &entity_pk,
         HistoryIdentityProjection::PrimaryKeyPaths(&spec.primary_key_paths),
     )
     .map_err(|error| DataFusionError::Execution(error.to_string()))
@@ -394,14 +394,14 @@ fn entity_history_system_column_array(
     rows: &[EntityHistoryRow],
 ) -> Result<ArrayRef> {
     Ok(match column_name {
-        "entity_id" => Arc::new(StringArray::from(
+        "entity_pk" => Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| {
                     Some(
                         row.change
-                            .entity_id
+                            .entity_pk
                             .as_json_array_text()
-                            .expect("canonical change entity identity should project"),
+                            .expect("canonical change entity primary key should project"),
                     )
                 })
                 .collect::<Vec<_>>(),
