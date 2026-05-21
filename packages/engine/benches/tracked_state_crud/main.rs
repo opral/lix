@@ -1,6 +1,7 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::measurement::WallTime;
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkGroup, Criterion};
 
 mod accounting;
 mod backends;
@@ -57,63 +58,133 @@ fn bench_transaction_api(
     configure_group(&mut group, rows.len());
     let rows = rows.to_vec();
 
-    group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::empty_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.insert_all())),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("read_all_rows/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.read_all())),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.read_one_by_pk())),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.read_many_by_pk(READ_MANY_PK_COUNT))),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.update_all())),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.update_one_by_pk())),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.delete_all())),
-            BatchSize::LargeInput,
-        )
-    });
-    group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
-        b.iter_batched_ref(
-            || runtime.block_on(transaction_api::seeded_fixture(profile, &rows)),
-            |fixture| black_box(runtime.block_on(fixture.delete_one_by_pk())),
-            BatchSize::LargeInput,
-        )
-    });
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("insert_all_rows/{}", row_label(rows.len())),
+        TransactionBenchOp::InsertAll,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("read_all_rows/{}", row_label(rows.len())),
+        TransactionBenchOp::ReadAll,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("read_one_by_pk/{}", row_label(rows.len())),
+        TransactionBenchOp::ReadOneByPk,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("read_many_by_pk/{READ_MANY_PK_COUNT}"),
+        TransactionBenchOp::ReadManyByPk,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("update_all_rows/{}", row_label(rows.len())),
+        TransactionBenchOp::UpdateAll,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("update_one_by_pk/{}", row_label(rows.len())),
+        TransactionBenchOp::UpdateOneByPk,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("delete_all_rows/{}", row_label(rows.len())),
+        TransactionBenchOp::DeleteAll,
+    );
+    bench_transaction_op(
+        &mut group,
+        runtime,
+        profile,
+        &rows,
+        format!("delete_one_by_pk/{}", row_label(rows.len())),
+        TransactionBenchOp::DeleteOneByPk,
+    );
     group.finish();
+}
+
+#[derive(Clone, Copy)]
+enum TransactionBenchOp {
+    InsertAll,
+    ReadAll,
+    ReadOneByPk,
+    ReadManyByPk,
+    UpdateAll,
+    UpdateOneByPk,
+    DeleteAll,
+    DeleteOneByPk,
+}
+
+impl TransactionBenchOp {
+    fn needs_seed(self) -> bool {
+        !matches!(self, Self::InsertAll)
+    }
+
+    async fn run(self, fixture: &mut transaction_api::TransactionFixture) -> usize {
+        match self {
+            Self::InsertAll => fixture.insert_all().await,
+            Self::ReadAll => fixture.read_all().await,
+            Self::ReadOneByPk => fixture.read_one_by_pk().await,
+            Self::ReadManyByPk => fixture.read_many_by_pk(READ_MANY_PK_COUNT).await,
+            Self::UpdateAll => fixture.update_all().await,
+            Self::UpdateOneByPk => fixture.update_one_by_pk().await,
+            Self::DeleteAll => fixture.delete_all().await,
+            Self::DeleteOneByPk => fixture.delete_one_by_pk().await,
+        }
+    }
+}
+
+fn bench_transaction_op(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    runtime: &tokio::runtime::Runtime,
+    profile: BackendProfile,
+    rows: &[WorkloadRow],
+    name: String,
+    op: TransactionBenchOp,
+) {
+    let rows = rows.to_vec();
+    group.bench_function(name, |b| {
+        b.iter_custom(|iterations| {
+            let mut fixtures = Vec::with_capacity(iterations as usize);
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let mut fixture = if op.needs_seed() {
+                    runtime.block_on(transaction_api::seeded_fixture(profile, &rows))
+                } else {
+                    runtime.block_on(transaction_api::empty_fixture(profile, &rows))
+                };
+                let start = Instant::now();
+                let rows = runtime.block_on(op.run(&mut fixture));
+                elapsed += start.elapsed();
+                black_box(rows);
+                fixtures.push(fixture);
+            }
+            drop(fixtures);
+            elapsed
+        })
+    });
 }
 
 fn bench_sql_session(

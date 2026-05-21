@@ -31,6 +31,7 @@ pub struct SqliteBackendFixture {
 pub struct SqliteBackend {
     path: PathBuf,
     read_pool: Arc<Mutex<Vec<Connection>>>,
+    write_pool: Arc<Mutex<Vec<Connection>>>,
     durable_write_lock: DurableWriteLock,
 }
 
@@ -52,7 +53,8 @@ struct SqlitePendingRow {
 }
 
 pub struct SqliteWrite {
-    conn: Connection,
+    conn: Option<Connection>,
+    write_pool: Arc<Mutex<Vec<Connection>>>,
     stats: WriteStats,
 }
 
@@ -103,6 +105,7 @@ impl SqliteBackend {
         Ok(Self {
             path,
             read_pool: Arc::new(Mutex::new(Vec::new())),
+            write_pool: Arc::new(Mutex::new(Vec::new())),
             durable_write_lock,
         })
     }
@@ -156,11 +159,18 @@ impl Backend for SqliteBackend {
     }
 
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        let conn = self.connect()?;
+        let conn = self
+            .write_pool
+            .lock()
+            .map_err(|error| BackendError::Io(format!("sqlite write pool poisoned: {error}")))?
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| self.connect())?;
         conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
             .map_err(sqlite_error)?;
         Ok(SqliteWrite {
-            conn,
+            conn: Some(conn),
+            write_pool: Arc::clone(&self.write_pool),
             stats: WriteStats::default(),
         })
     }
@@ -375,35 +385,43 @@ impl Drop for SqliteRead {
 
 impl BackendWrite for SqliteWrite {
     fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "INSERT INTO entries(key, value)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            )
-            .map_err(sqlite_error)?;
-
-        for entry in entries.entries {
-            let value = stored_value_bytes(entry.value);
-            self.stats.put_entries += 1;
-            self.stats.written_bytes += value.len() as u64;
-            stmt.execute(params![entry.key.0.as_ref(), value.as_ref()])
+        let mut put_entries = 0;
+        let mut written_bytes = 0;
+        {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO entries(key, value)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
                 .map_err(sqlite_error)?;
+
+            for entry in entries.entries {
+                let value = stored_value_bytes(entry.value);
+                put_entries += 1;
+                written_bytes += value.len() as u64;
+                stmt.execute(params![entry.key.0.as_ref(), value.as_ref()])
+                    .map_err(sqlite_error)?;
+            }
         }
+        self.stats.put_entries += put_entries;
+        self.stats.written_bytes += written_bytes;
         self.stats.backend_calls += 1;
         Ok(())
     }
 
     fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
-        let mut stmt = self
-            .conn
-            .prepare("DELETE FROM entries WHERE key = ?1")
-            .map_err(sqlite_error)?;
-
-        for key in keys {
-            stmt.execute(params![key.0.as_ref()])
+        {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare("DELETE FROM entries WHERE key = ?1")
                 .map_err(sqlite_error)?;
+
+            for key in keys {
+                stmt.execute(params![key.0.as_ref()])
+                    .map_err(sqlite_error)?;
+            }
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
@@ -416,7 +434,7 @@ impl BackendWrite for SqliteWrite {
         append_bound_sql(&mut sql, &mut values, "key", ">=", ">", &range.lower);
         append_bound_sql(&mut sql, &mut values, "key", "<=", "<", &range.upper);
         let deleted = self
-            .conn
+            .conn()
             .execute(&sql, rusqlite::params_from_iter(values))
             .map_err(sqlite_error)?;
         self.stats.deleted_entries += deleted as u64;
@@ -425,16 +443,43 @@ impl BackendWrite for SqliteWrite {
         Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
-        self.conn.execute_batch("COMMIT").map_err(sqlite_error)?;
+    fn commit(mut self) -> Result<CommitResult, BackendError> {
+        self.finish("COMMIT")?;
         Ok(CommitResult {
             commit_id: None,
-            stats: self.stats,
+            stats: std::mem::take(&mut self.stats),
         })
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
-        self.conn.execute_batch("ROLLBACK").map_err(sqlite_error)
+    fn rollback(mut self) -> Result<(), BackendError> {
+        self.finish("ROLLBACK")
+    }
+}
+
+impl SqliteWrite {
+    fn conn(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("sqlite write connection should be available")
+    }
+
+    fn finish(&mut self, sql: &str) -> Result<(), BackendError> {
+        let Some(conn) = self.conn.take() else {
+            return Ok(());
+        };
+        let result = execute_cached(&conn, sql);
+        if result.is_ok() {
+            if let Ok(mut pool) = self.write_pool.lock() {
+                pool.push(conn);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for SqliteWrite {
+    fn drop(&mut self) {
+        let _ = self.finish("ROLLBACK");
     }
 }
 

@@ -659,3 +659,72 @@ smoke-run variance or unrelated backend noise. The direct transaction insert
 path remains effectively stable in the full scorecard after the focused
 SQLite-only run showed a significant local improvement against Criterion's
 cached baseline.
+
+## Transaction Bench Harness Excludes Fixture Teardown: 2026-05-20
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+```
+
+Notes:
+
+- Refactored transaction CRUD benchmarks to use `iter_custom` so measured time
+  wraps only the transaction operation.
+- Fixture setup and teardown are now outside the returned Criterion duration.
+  This keeps SQLite connection close/drop out of the transaction insert timing.
+- Added a write-connection pool to the SQLite benchmark/test backend, matching
+  the existing read-pool shape, so committed write handles can be reused.
+- Storage accounting is unchanged. This is a measurement-harness cleanup, not a
+  physical-layout change.
+
+### KV Layout
+
+Criterion point estimates:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.64 ms |   329 us |         150 us |          202 us |    1.55 ms |    89.9 us |     513 us |    48.1 us |
+| RocksDB |     449 us |   164 us |        4.20 us |         10.7 us |     487 us |    16.4 us |    6.63 us |    4.69 us |
+| redb    |    7.37 ms |   174 us |        12.4 us |         27.8 us |    9.18 ms |    4.15 ms |    4.37 ms |    3.91 ms |
+
+### Transaction Layer
+
+Criterion point estimates:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   13.66 ms |  3.28 ms |         246 us |          695 us |   15.39 ms |    1.96 ms |   13.71 ms |    2.23 ms |
+| RocksDB |   10.22 ms |  2.90 ms |        63.7 us |          406 us |   11.58 ms |    1.46 ms |   11.18 ms |    1.55 ms |
+| redb    |   20.17 ms |  2.78 ms |        80.8 us |          399 us |   21.79 ms |    6.34 ms |   20.79 ms |    6.35 ms |
+
+### SQL Session
+
+| Backend   | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| --------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| in-memory |   17.27 ms |  5.73 ms |        1.35 ms |         1.45 ms |   14.74 ms |    6.54 ms |
+
+### Delta From Previous Full Smoke
+
+The previous full smoke was the lazy SQL schema planning entry.
+
+| Workload                          | Previous |  Current |  Delta |
+| --------------------------------- | -------: | -------: | -----: |
+| SQLite transaction insert 1k      | 12.99 ms | 13.66 ms |  +5.2% |
+| RocksDB transaction insert 1k     | 10.40 ms | 10.22 ms |  -1.7% |
+| redb transaction insert 1k        | 21.62 ms | 20.17 ms |  -6.7% |
+| SQL session insert 1k             | 17.92 ms | 17.27 ms |  -3.6% |
+| SQLite transaction update_all 1k  | 16.72 ms | 15.39 ms |  -8.0% |
+| SQLite transaction delete_all 1k  | 14.69 ms | 13.71 ms |  -6.7% |
+| RocksDB transaction delete_all 1k | 13.39 ms | 11.18 ms | -16.5% |
+| SQLite kv_layout insert 1k        |  2.40 ms |  1.64 ms | -31.7% |
+| SQLite kv_layout read_one_by_pk   |   291 us |   150 us | -48.4% |
+
+The biggest visible scorecard shifts are in the SQLite `kv_layout` baselines,
+which now also avoid timing fixture teardown. Transaction-path movement is more
+mixed but mostly neutral-to-positive outside SQLite insert variance. The focused
+SQLite transaction insert run immediately before this full smoke measured
+13.18 ms and Criterion reported an 8.8% improvement; the full smoke's SQLite
+transaction insert sample landed at 13.66 ms and Criterion reported no
+significant change.
