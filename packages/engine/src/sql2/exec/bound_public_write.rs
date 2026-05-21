@@ -811,6 +811,14 @@ fn predicate_matches(
             )?;
             Ok(!left.is_null() && !right.is_null() && left == right)
         }
+        BoundPredicate::IsNull(expr) => {
+            let value = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            Ok(value.is_null())
+        }
+        BoundPredicate::IsNotNull(expr) => {
+            let value = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            Ok(!value.is_null())
+        }
         BoundPredicate::In { expr, values } => {
             let candidate = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
             if candidate.is_null() {
@@ -962,6 +970,9 @@ fn validate_predicate_supported(
             validate_expr_supported(left)?;
             validate_expr_supported(right)
         }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            validate_expr_supported(expr)
+        }
         BoundPredicate::In { expr, values } => {
             validate_expr_supported(expr)?;
             for value in values {
@@ -992,6 +1003,7 @@ fn validate_json_predicate_types(
             Ok(())
         }
         BoundPredicate::Eq(left, right) => validate_json_comparison_operands(left, right, spec),
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(()),
         BoundPredicate::In { expr, values } => {
             if bound_expr_is_json(expr, spec) {
                 for value in values {
