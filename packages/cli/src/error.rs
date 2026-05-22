@@ -43,7 +43,7 @@ impl Display for CliError {
             Self::Message(message) => write!(f, "{message}"),
             Self::Io { context, source } => write!(f, "{context}: {source}"),
             Self::Lix { context, source } => {
-                write!(f, "{context}: {}", source.description)
+                write!(f, "{context}: {}", source.message)
             }
         }
     }

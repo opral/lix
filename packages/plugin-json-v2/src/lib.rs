@@ -852,4 +852,5 @@ pub fn schema_definition() -> &'static Value {
     })
 }
 
+#[cfg(target_arch = "wasm32")]
 export!(JsonPlugin);

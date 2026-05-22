@@ -473,16 +473,8 @@ fn read_entity_tuple(bytes: &[u8], cursor: &mut usize) -> Result<EntityPk, LixEr
     }
 
     let mut parts = Vec::with_capacity(part_count);
-    for index in 0..part_count {
+    for _ in 0..part_count {
         let part = read_key_component(bytes, cursor, "entity_part")?;
-        if part.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "failed to decode untracked-state key: entity primary key part {index} is empty"
-                ),
-            ));
-        }
         parts.push(part);
     }
     Ok(EntityPk { parts })
@@ -534,12 +526,6 @@ fn push_entity_tuple(out: &mut Vec<u8>, entity_pk: &EntityPk) -> Result<(), LixE
     }
     out.extend_from_slice(&part_count.to_be_bytes());
     for part in &entity_pk.parts {
-        if part.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "failed to encode untracked-state key: entity primary key part is empty",
-            ));
-        }
         push_bytes_component(out, part.as_bytes())?;
     }
     Ok(())
@@ -589,6 +575,22 @@ mod tests {
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: Some(String::new()),
+        };
+        let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
+
+        assert_eq!(
+            decode_untracked_state_row_key_ref(&key).expect("key should decode"),
+            identity
+        );
+    }
+
+    #[test]
+    fn key_v1_roundtrips_empty_entity_pk_part() {
+        let identity = UntrackedStateIdentity {
+            version_id: "version-1".to_string(),
+            schema_key: "json_pointer".to_string(),
+            entity_pk: crate::entity_pk::EntityPk::single(""),
+            file_id: Some("file-1".to_string()),
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
 

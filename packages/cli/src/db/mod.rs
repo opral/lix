@@ -1,16 +1,21 @@
 use crate::app::AppContext;
 use crate::error::CliError;
-use async_trait::async_trait;
 use base64::Engine as _;
+use bytes::Bytes;
 use lix_rs_sdk::{
-    open_lix, KvPair, KvScanRange, Lix, LixBackend, LixBackendTransaction, LixError,
-    OpenLixOptions, TransactionBeginMode,
+    open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
+    BackendRead, BackendWrite, CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key,
+    KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+pub type FileLix = Lix<FileBackend>;
 
 pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
     if let Some(path) = &context.lix_path {
@@ -48,13 +53,11 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
     Ok(candidates.remove(0))
 }
 
-pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
+pub fn open_lix_at(path: &Path) -> Result<FileLix, CliError> {
     let backend = FileBackend::from_path(path)?;
 
-    block_on(open_lix(OpenLixOptions {
-        backend: Some(Box::new(backend)),
-    }))
-    .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
+    block_on(open_lix_with_backend(backend))
+        .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
 }
 
 pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
@@ -167,113 +170,213 @@ fn remove_sidecar(path: &Path, suffix: &str) -> Result<(), CliError> {
     }
 }
 
-type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
+type KvMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
 #[derive(Clone)]
-struct FileBackend {
+pub struct FileBackend {
     path: Arc<PathBuf>,
     kv: Arc<Mutex<KvMap>>,
+    durable_write_lock: DurableWriteLock,
 }
 
 impl FileBackend {
     fn from_path(path: &Path) -> Result<Self, CliError> {
         let kv = read_kv_file(path)?;
+        let durable_write_lock = durable_write_lock_for_path(path);
         Ok(Self {
             path: Arc::new(path.to_path_buf()),
             kv: Arc::new(Mutex::new(kv)),
+            durable_write_lock,
         })
     }
 }
 
-#[async_trait]
-impl LixBackend for FileBackend {
-    async fn begin_transaction(
-        &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
-        let snapshot = self
-            .kv
-            .lock()
-            .map_err(|_| lock_error("cli file backend kv"))?
-            .clone();
-        Ok(Box::new(FileBackendTransaction {
-            mode,
-            path: Arc::clone(&self.path),
-            parent: Arc::clone(&self.kv),
-            kv: snapshot,
-        }))
-    }
-
-    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        Ok(self
-            .kv
-            .lock()
-            .map_err(|_| lock_error("cli file backend kv"))?
-            .get(&(namespace.to_string(), key.to_vec()))
-            .cloned())
-    }
-
-    async fn kv_scan(
-        &self,
-        namespace: &str,
-        range: KvScanRange,
-        limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
-        let guard = self
-            .kv
-            .lock()
-            .map_err(|_| lock_error("cli file backend kv"))?;
-        Ok(scan_map(&guard, namespace, &range, limit))
-    }
-}
-
-struct FileBackendTransaction {
-    mode: TransactionBeginMode,
-    path: Arc<PathBuf>,
-    parent: Arc<Mutex<KvMap>>,
+#[derive(Clone)]
+pub struct FileBackendRead {
     kv: KvMap,
 }
 
-#[async_trait]
-impl LixBackendTransaction for FileBackendTransaction {
-    fn mode(&self) -> TransactionBeginMode {
-        self.mode
+pub struct FileBackendRangeScan {
+    rows: Vec<(Key, Vec<u8>)>,
+    position: usize,
+    projection: CoreProjection,
+}
+
+pub struct FileBackendWrite {
+    path: Arc<PathBuf>,
+    parent: Arc<Mutex<KvMap>>,
+    kv: KvMap,
+    stats: WriteStats,
+}
+
+impl Backend for FileBackend {
+    type Read<'a>
+        = FileBackendRead
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = FileBackendWrite
+    where
+        Self: 'a;
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
     }
 
-    async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        Ok(self.kv.get(&(namespace.to_string(), key.to_vec())).cloned())
+    fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        Ok(FileBackendRead {
+            kv: self
+                .kv
+                .lock()
+                .map_err(|_| backend_lock_error("cli file backend kv"))?
+                .clone(),
+        })
     }
 
-    async fn kv_scan(
+    fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        Ok(FileBackendWrite {
+            path: Arc::clone(&self.path),
+            parent: Arc::clone(&self.kv),
+            kv: self
+                .kv
+                .lock()
+                .map_err(|_| backend_lock_error("cli file backend kv"))?
+                .clone(),
+            stats: WriteStats::default(),
+        })
+    }
+
+    fn durable_write_lock(&self) -> DurableWriteLock {
+        self.durable_write_lock.clone()
+    }
+}
+
+impl BackendRead for FileBackendRead {
+    type RangeScan<'cursor> = FileBackendRangeScan;
+
+    fn visit_keys<V>(
+        &self,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        for (index, key) in keys.iter().enumerate() {
+            let value = self
+                .kv
+                .get(key.0.as_ref())
+                .map(|value| project_value_ref(value, opts.projection));
+            visitor.visit(index, key, value)?;
+        }
+        Ok(())
+    }
+
+    fn with_range_scan<T, F>(
+        &self,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+    {
+        let mut rows = self
+            .kv
+            .iter()
+            .filter(|(key, _)| key_matches_range(key, &range, opts.resume_after))
+            .map(|(key, value)| (Key(Bytes::copy_from_slice(key)), value.clone()))
+            .collect::<Vec<_>>();
+        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut scan = FileBackendRangeScan {
+            rows,
+            position: 0,
+            projection: opts.projection,
+        };
+        f(&mut scan)
+    }
+}
+
+impl BackendRangeScan for FileBackendRangeScan {
+    fn visit_next<V>(
         &mut self,
-        namespace: &str,
-        range: KvScanRange,
-        limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
-        Ok(scan_map(&self.kv, namespace, &range, limit))
+        limit_rows: usize,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        if limit_rows == 0 {
+            return Ok(ScanResult {
+                emitted: 0,
+                has_more: self.position < self.rows.len(),
+            });
+        }
+
+        let mut emitted = 0usize;
+        while emitted < limit_rows {
+            let Some((key, value)) = self.rows.get(self.position) else {
+                break;
+            };
+            visitor.visit(key.as_ref(), project_value_ref(value, self.projection))?;
+            self.position += 1;
+            emitted += 1;
+        }
+
+        Ok(ScanResult {
+            emitted,
+            has_more: self.position < self.rows.len(),
+        })
+    }
+}
+
+impl BackendWrite for FileBackendWrite {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        for entry in entries.entries {
+            self.stats.put_entries += 1;
+            self.stats.written_bytes += entry.value.bytes.len() as u64;
+            self.kv
+                .insert(entry.key.0.to_vec(), stored_value_bytes(entry.value));
+        }
+        self.stats.backend_calls += 1;
+        Ok(())
     }
 
-    async fn kv_put(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), LixError> {
+    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+        for key in keys {
+            self.kv.remove(key.0.as_ref());
+        }
+        self.stats.deleted_entries += keys.len() as u64;
+        self.stats.backend_calls += 1;
+        Ok(())
+    }
+
+    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        let before = self.kv.len();
         self.kv
-            .insert((namespace.to_string(), key.to_vec()), value.to_vec());
+            .retain(|key, _| !key_matches_range(key, &range, None));
+        self.stats.deleted_entries += (before - self.kv.len()) as u64;
+        self.stats.deleted_ranges += 1;
+        self.stats.backend_calls += 1;
         Ok(())
     }
 
-    async fn kv_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), LixError> {
-        self.kv.remove(&(namespace.to_string(), key.to_vec()));
-        Ok(())
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), LixError> {
-        write_kv_file(&self.path, &self.kv)?;
+    fn commit(self) -> Result<CommitResult, BackendError> {
+        write_kv_file(&self.path, &self.kv).map_err(lix_to_backend_error)?;
         *self
             .parent
             .lock()
-            .map_err(|_| lock_error("cli file backend kv"))? = self.kv;
-        Ok(())
+            .map_err(|_| backend_lock_error("cli file backend kv"))? = self.kv;
+        Ok(CommitResult {
+            commit_id: None,
+            stats: self.stats,
+        })
     }
 
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+    fn rollback(self) -> Result<(), BackendError> {
         Ok(())
     }
 }
@@ -302,10 +405,14 @@ fn read_kv_file(path: &Path) -> Result<KvMap, CliError> {
         .map_err(|error| CliError::msg(format!("failed to decode lix file: {error}")))?;
     let mut kv = KvMap::new();
     for entry in snapshot.entries {
-        kv.insert(
-            (entry.namespace, decode_bytes(&entry.key)?),
-            decode_bytes(&entry.value)?,
-        );
+        if !entry.namespace.is_empty() {
+            return Err(CliError::msg(format!(
+                "unsupported legacy lix namespace '{}' in {}",
+                entry.namespace,
+                path.display()
+            )));
+        }
+        kv.insert(decode_bytes(&entry.key)?, decode_bytes(&entry.value)?);
     }
     Ok(kv)
 }
@@ -314,8 +421,8 @@ fn write_kv_file(path: &Path, kv: &KvMap) -> Result<(), LixError> {
     let snapshot = FileSnapshot {
         entries: kv
             .iter()
-            .map(|((namespace, key), value)| FileEntry {
-                namespace: namespace.clone(),
+            .map(|(key, value)| FileEntry {
+                namespace: String::new(),
                 key: encode_bytes(key),
                 value: encode_bytes(value),
             })
@@ -335,25 +442,72 @@ fn write_kv_file(path: &Path, kv: &KvMap) -> Result<(), LixError> {
     })
 }
 
-fn scan_map(kv: &KvMap, namespace: &str, range: &KvScanRange, limit: Option<usize>) -> Vec<KvPair> {
-    let mut pairs = kv
-        .iter()
-        .filter(|((candidate_namespace, key), _)| {
-            candidate_namespace == namespace && key_matches_range(key, range)
-        })
-        .map(|((_, key), value)| KvPair::new(key.clone(), value.clone()))
-        .collect::<Vec<_>>();
-    pairs.sort_by(|left, right| left.key.cmp(&right.key));
-    if let Some(limit) = limit {
-        pairs.truncate(limit);
+fn key_matches_range(key: &[u8], range: &KeyRange, resume_after: Option<&Key>) -> bool {
+    if let Some(resume_after) = resume_after {
+        if key <= resume_after.0.as_ref() {
+            return false;
+        }
     }
-    pairs
+
+    let lower_matches = match &range.lower {
+        Bound::Included(lower) => key >= lower.0.as_ref(),
+        Bound::Excluded(lower) => key > lower.0.as_ref(),
+        Bound::Unbounded => true,
+    };
+    let upper_matches = match &range.upper {
+        Bound::Included(upper) => key <= upper.0.as_ref(),
+        Bound::Excluded(upper) => key < upper.0.as_ref(),
+        Bound::Unbounded => true,
+    };
+    lower_matches && upper_matches
 }
 
-fn key_matches_range(key: &[u8], range: &KvScanRange) -> bool {
-    match range {
-        KvScanRange::Prefix(prefix) => key.starts_with(prefix),
-        KvScanRange::Range { start, end } => start.as_slice() <= key && key < end.as_slice(),
+fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
+    match projection {
+        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
+    }
+}
+
+fn stored_value_bytes(value: StoredValue) -> Vec<u8> {
+    value.bytes.to_vec()
+}
+
+fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
+    let key = canonical_lock_key(path);
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("cli file backend write lock registry should not poison");
+    if let Some(lock) = locks.get(&key) {
+        return lock.clone();
+    }
+    let lock = DurableWriteLock::new();
+    locks.insert(key, lock.clone());
+    lock
+}
+
+fn canonical_lock_key(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .expect("current directory should be available")
+            .join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return absolute;
+    };
+    let Ok(parent) = parent.canonicalize() else {
+        return absolute;
+    };
+    match absolute.file_name() {
+        Some(file_name) => parent.join(file_name),
+        None => parent,
     }
 }
 
@@ -367,8 +521,12 @@ fn decode_bytes(value: &str) -> Result<Vec<u8>, CliError> {
         .map_err(|error| CliError::msg(format!("failed to decode lix file bytes: {error}")))
 }
 
-fn lock_error(name: &str) -> LixError {
-    LixError::new("LIX_ERROR_UNKNOWN", format!("{name} mutex was poisoned"))
+fn backend_lock_error(name: &str) -> BackendError {
+    BackendError::Io(format!("{name} mutex was poisoned"))
+}
+
+fn lix_to_backend_error(error: LixError) -> BackendError {
+    BackendError::Io(error.to_string())
 }
 
 #[cfg(test)]

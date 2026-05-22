@@ -1,13 +1,11 @@
 use clap::Parser;
-use lix_engine::wasm::WasmRuntime;
-use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Session, Value};
+use lix_rs_sdk::{open_lix_with_backend, Lix, LixError, Value};
 use serde::Serialize;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use wasmtime_runtime::{JsonPluginRuntime, PluginEntityChange, PluginFile};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -22,6 +20,9 @@ const DIRECT_ENTITY_WRITE_CHUNK_SIZE: usize = 250;
 
 const PLUGIN_KEY: &str = "json";
 const PLUGIN_SCHEMA_KEY: &str = "json_pointer";
+const PLUGIN_WASM_PATH: &str = env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_V2");
+const PLUGIN_ARCHIVE_FILE_ID: &str = "lix_plugin_archive::json";
+const PLUGIN_ARCHIVE_PATH: &str = "/.lix/plugins/json.lixplugin";
 const PLUGIN_ARCHIVE_MANIFEST_JSON: &str = r#"{
   "key": "json",
   "runtime": "wasm-component-v1",
@@ -36,6 +37,8 @@ const JSON_POINTER_SCHEMA_JSON: &str =
     include_str!("../../../packages/plugin-json-v2/schema/json_pointer.json");
 
 type BenchResult<T> = Result<T, String>;
+type BenchBackend = sqlite_backend::BenchSqliteBackend;
+type Session = Lix<BenchBackend>;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,7 +83,7 @@ impl BenchmarkCaseKind {
     fn timed_operation(self) -> &'static str {
         match self {
             Self::FileWriteJson => {
-                "INSERT INTO lix_file for one 10k-prop JSON payload inside a buffered write transaction, then commit"
+                "INSERT INTO lix_file for one 10k-prop JSON payload, run JSON plugin detect-changes, insert derived json_pointer rows, then commit"
             }
             Self::DirectEntityWrites => {
                 "UPDATE the root json_pointer row and INSERT 10k property json_pointer rows inside a buffered write transaction, then commit"
@@ -91,13 +94,14 @@ impl BenchmarkCaseKind {
     fn notes(self) -> Vec<&'static str> {
         match self {
             Self::FileWriteJson => vec![
-                "This is the real file-write path with plugin detect-changes enabled.",
-                "The timed write is one INSERT INTO lix_file statement.",
-                "The semantic layer derives json_pointer rows during commit.",
-                "This case includes plugin detect-changes cost plus direct semantic row commit cost.",
+                "This is the file-write path with JSON plugin detect-changes materialization.",
+                "The JSON wasm plugin archive is installed outside the timer.",
+                "The timed write starts with one INSERT INTO lix_file statement and materializes the plugin output into lix_state.",
+                "The semantic layer derives json_pointer rows during the timed write.",
             ],
             Self::DirectEntityWrites => vec![
-                "This isolates direct semantic writes through the engine without detect-changes.",
+                "This isolates direct semantic writes through the engine.",
+                "The JSON wasm plugin archive is installed outside the timer.",
                 "Outside the timer, the benchmark inserts an empty {} JSON file to establish the file descriptor and root entity.",
                 "Inside the timer, it updates the root json_pointer row and inserts the 10k property rows through chunked lix_state statements.",
                 "This case still includes normal commit, live-state rebuild, and file-cache refresh work for direct entity writes.",
@@ -108,7 +112,9 @@ impl BenchmarkCaseKind {
 
     fn timed_sql(self) -> &'static str {
         match self {
-            Self::FileWriteJson => "INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3)",
+            Self::FileWriteJson => {
+                "INSERT INTO lix_file (...); INSERT INTO lix_state (...) VALUES (... plugin rows)"
+            }
             Self::DirectEntityWrites => {
                 "UPDATE lix_state root row; INSERT INTO lix_state (...) VALUES (... x chunk_size), repeated until props rows are written"
             }
@@ -129,16 +135,16 @@ impl BenchmarkCaseKind {
     fn setup_outside_timer(self) -> Vec<&'static str> {
         match self {
             Self::FileWriteJson => vec![
-                "Build plugin-json-v2 wasm.",
+                "Initialize the JSON wasm plugin runtime.",
                 "Create a fresh SQLite database.",
-                "Boot the engine and install the JSON plugin.",
+                "Initialize the engine, install the JSON plugin archive, and register the json_pointer schema.",
             ],
             Self::DirectEntityWrites => vec![
-                "Build plugin-json-v2 wasm.",
+                "Initialize the JSON wasm plugin runtime.",
                 "Create a fresh SQLite database.",
-                "Boot the engine and install the JSON plugin.",
+                "Initialize the engine, install the JSON plugin archive, and register the json_pointer schema.",
                 "Insert an empty {} JSON file so direct state writes target an existing JSON file.",
-                "Load the committed root json_pointer entity pk for that file.",
+                "Insert the root json_pointer row for that file.",
             ],
         }
     }
@@ -255,16 +261,8 @@ impl Drop for TempSqlitePath {
     }
 }
 
-fn main() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime should initialize");
-
-    if let Err(error) = runtime.block_on(run(Args::parse())) {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    }
+fn main() -> Result<(), String> {
+    pollster::block_on(run(Args::parse()))
 }
 
 async fn run(args: Args) -> BenchResult<()> {
@@ -277,20 +275,18 @@ async fn run(args: Args) -> BenchResult<()> {
 
     fs::create_dir_all(&args.output_dir).map_err(io_err)?;
 
-    let repo_root = repo_root()?;
-    let plugin_wasm_path = build_plugin_json_v2_wasm(&repo_root)?;
+    let plugin_wasm_path = PathBuf::from(PLUGIN_WASM_PATH);
     let plugin_wasm_bytes = fs::read(&plugin_wasm_path).map_err(io_err)?;
     let plugin_archive = build_plugin_archive(&plugin_wasm_bytes)?;
     let payload = build_flat_json_payload(args.props)?;
     let expected_state_rows_after_commit = (args.props + 1) as u64;
 
-    let wasm_runtime: Arc<dyn WasmRuntime> =
-        Arc::new(wasmtime_runtime::TestWasmtimeRuntime::new().map_err(lix_err)?);
+    let plugin_runtime = JsonPluginRuntime::new()?;
 
     let file_write_case = run_case(
         BenchmarkCaseKind::FileWriteJson,
         &args,
-        Arc::clone(&wasm_runtime),
+        &plugin_runtime,
         &plugin_archive,
         &payload,
         expected_state_rows_after_commit,
@@ -299,7 +295,7 @@ async fn run(args: Args) -> BenchResult<()> {
     let direct_entity_case = run_case(
         BenchmarkCaseKind::DirectEntityWrites,
         &args,
-        Arc::clone(&wasm_runtime),
+        &plugin_runtime,
         &plugin_archive,
         &payload,
         expected_state_rows_after_commit,
@@ -313,9 +309,10 @@ async fn run(args: Args) -> BenchResult<()> {
             name: "10k-entities-json-file-vs-direct-state",
             notes: vec![
                 "Both cases use a fresh file-backed SQLite database per run.",
-                "Plugin wasm build, engine init, plugin install, and database setup are outside the timer.",
+                "JSON wasm plugin setup, engine init, json_pointer schema registration, and database setup are outside the timer.",
+                "The wasm component is read and its plugin archive is installed outside the timer.",
                 "Each case reports write_ms, commit_ms, and total_ms separately.",
-                "The goal is to separate file/plugin detect overhead from direct 10k entity write overhead.",
+                "The goal is to separate file/plugin detect overhead from direct 10k json_pointer entity write overhead.",
             ],
         },
         shared_setup: SharedSetupReport {
@@ -348,7 +345,7 @@ async fn run(args: Args) -> BenchResult<()> {
 async fn run_case(
     kind: BenchmarkCaseKind,
     args: &Args,
-    wasm_runtime: Arc<dyn WasmRuntime>,
+    plugin_runtime: &JsonPluginRuntime,
     plugin_archive: &[u8],
     payload: &[u8],
     expected_state_rows_after_commit: u64,
@@ -359,7 +356,7 @@ async fn run_case(
             run_sample(
                 kind,
                 index,
-                Arc::clone(&wasm_runtime),
+                plugin_runtime,
                 plugin_archive,
                 payload,
                 expected_state_rows_after_commit,
@@ -374,7 +371,7 @@ async fn run_case(
             run_sample(
                 kind,
                 index,
-                Arc::clone(&wasm_runtime),
+                plugin_runtime,
                 plugin_archive,
                 payload,
                 expected_state_rows_after_commit,
@@ -390,7 +387,7 @@ async fn run_case(
         notes: kind.notes(),
         setup: CaseSetupReport {
             timed_rows: match kind {
-                BenchmarkCaseKind::FileWriteJson => 1,
+                BenchmarkCaseKind::FileWriteJson => args.props + 2,
                 BenchmarkCaseKind::DirectEntityWrites => args.props + 1,
             },
             timed_sql: kind.timed_sql(),
@@ -406,7 +403,7 @@ async fn run_case(
 async fn run_sample(
     kind: BenchmarkCaseKind,
     index: usize,
-    wasm_runtime: Arc<dyn WasmRuntime>,
+    plugin_runtime: &JsonPluginRuntime,
     plugin_archive: &[u8],
     payload: &[u8],
     expected_state_rows_after_commit: u64,
@@ -415,7 +412,7 @@ async fn run_sample(
         BenchmarkCaseKind::FileWriteJson => {
             run_file_write_sample(
                 index,
-                wasm_runtime,
+                plugin_runtime,
                 plugin_archive,
                 payload,
                 expected_state_rows_after_commit,
@@ -425,7 +422,6 @@ async fn run_sample(
         BenchmarkCaseKind::DirectEntityWrites => {
             run_direct_entity_write_sample(
                 index,
-                wasm_runtime,
                 plugin_archive,
                 payload,
                 expected_state_rows_after_commit,
@@ -437,44 +433,58 @@ async fn run_sample(
 
 async fn run_file_write_sample(
     index: usize,
-    wasm_runtime: Arc<dyn WasmRuntime>,
+    plugin_runtime: &JsonPluginRuntime,
     plugin_archive: &[u8],
     payload: &[u8],
     expected_state_rows_after_commit: u64,
 ) -> BenchResult<RunSample> {
     let sqlite_path = TempSqlitePath::new(&format!("10k-entities-file-write-{index}"));
-    let session = open_prepared_session(sqlite_path.path(), wasm_runtime, plugin_archive).await?;
+    let session = open_prepared_session(sqlite_path.path(), plugin_archive).await?;
 
     let file_id = format!("json-file-write-{index}");
     let file_path = format!("/{file_id}.json");
-    let active_version_id = session.active_version_id();
 
-    let mut transaction = Some(
-        session
-            .begin_transaction_with_options(ExecuteOptions::default())
-            .await
-            .map_err(lix_err)?,
-    );
+    let mut transaction = Some(session.begin_transaction().await.map_err(lix_err)?);
 
     let started_at = Instant::now();
 
     let write_started_at = Instant::now();
-    let write_result = {
+    let write_result = async {
         let transaction = transaction
             .as_mut()
             .expect("transaction should be available during write phase");
+        let file_id = file_id.clone();
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3)",
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
                 &[
-                    Value::Text(file_id.clone()),
-                    Value::Text(file_path),
+                    Value::Text(file_id.to_string()),
+                    Value::Text(file_path.to_string()),
                     Value::Blob(payload.to_vec()),
                 ],
             )
             .await
-            .map_err(lix_err)
-    };
+            .map_err(lix_err)?;
+        let plugin_changes = plugin_runtime.detect_changes(
+            plugin_archive,
+            None,
+            PluginFile {
+                id: file_id.to_string(),
+                path: file_path.to_string(),
+                data: payload.to_vec(),
+            },
+        )?;
+        let plugin_state_sql_batches = build_plugin_state_write_sql_batches(
+            &file_id,
+            &plugin_changes,
+            DIRECT_ENTITY_WRITE_CHUNK_SIZE,
+        )?;
+        for sql in &plugin_state_sql_batches {
+            transaction.execute(sql, &[]).await.map_err(lix_err)?;
+        }
+        Ok(())
+    }
+    .await;
     if let Err(error) = write_result {
         if let Some(transaction) = transaction.take() {
             let _ = transaction.rollback().await;
@@ -498,7 +508,6 @@ async fn run_file_write_sample(
         index,
         &session,
         &file_id,
-        &active_version_id,
         payload,
         expected_state_rows_after_commit,
         true,
@@ -511,34 +520,26 @@ async fn run_file_write_sample(
 
 async fn run_direct_entity_write_sample(
     index: usize,
-    wasm_runtime: Arc<dyn WasmRuntime>,
     plugin_archive: &[u8],
     payload: &[u8],
     expected_state_rows_after_commit: u64,
 ) -> BenchResult<RunSample> {
     let sqlite_path = TempSqlitePath::new(&format!("10k-entities-direct-state-{index}"));
-    let session = open_prepared_session(sqlite_path.path(), wasm_runtime, plugin_archive).await?;
+    let session = open_prepared_session(sqlite_path.path(), plugin_archive).await?;
 
     let file_id = format!("json-direct-state-{index}");
     let file_path = format!("/{file_id}.json");
-    let active_version_id = session.active_version_id();
 
     bootstrap_empty_json_file(&session, &file_id, &file_path).await?;
-    let root_entity_pk =
-        load_root_json_pointer_entity_pk(&session, &file_id, &active_version_id).await?;
+    let root_entity_pk = "";
     let direct_write_sql_batches = build_direct_entity_write_sql_batches(
         &file_id,
-        &root_entity_pk,
+        root_entity_pk,
         payload,
         DIRECT_ENTITY_WRITE_CHUNK_SIZE,
     )?;
 
-    let mut transaction = Some(
-        session
-            .begin_transaction_with_options(ExecuteOptions::default())
-            .await
-            .map_err(lix_err)?,
-    );
+    let mut transaction = Some(session.begin_transaction().await.map_err(lix_err)?);
 
     let started_at = Instant::now();
 
@@ -579,7 +580,6 @@ async fn run_direct_entity_write_sample(
         index,
         &session,
         &file_id,
-        &active_version_id,
         payload,
         expected_state_rows_after_commit,
         false,
@@ -594,7 +594,6 @@ async fn finish_sample(
     index: usize,
     session: &Session,
     file_id: &str,
-    active_version_id: &str,
     expected_payload: &[u8],
     expected_state_rows_after_commit: u64,
     enforce_file_match: bool,
@@ -605,14 +604,12 @@ async fn finish_sample(
     let committed_state_rows = scalar_count(
         session,
         "SELECT COUNT(*) \
-         FROM lix_state_by_version \
-         WHERE file_id = ?1 \
-           AND version_id = ?2 \
-           AND schema_key = ?3 \
+         FROM lix_state \
+         WHERE file_id = $1 \
+           AND schema_key = $2 \
            AND snapshot_content IS NOT NULL",
         &[
             Value::Text(file_id.to_string()),
-            Value::Text(active_version_id.to_string()),
             Value::Text(PLUGIN_SCHEMA_KEY.to_string()),
         ],
     )
@@ -644,24 +641,44 @@ async fn finish_sample(
     })
 }
 
-async fn open_prepared_session(
-    sqlite_path: &Path,
-    wasm_runtime: Arc<dyn WasmRuntime>,
-    plugin_archive: &[u8],
-) -> BenchResult<Session> {
-    let backend = sqlite_backend::BenchSqliteBackend::file_backed(sqlite_path).map_err(lix_err)?;
-    let mut boot_args = BootArgs::new(Box::new(backend), wasm_runtime);
-    boot_args.access_to_internal = true;
+async fn open_prepared_session(sqlite_path: &Path, plugin_archive: &[u8]) -> BenchResult<Session> {
+    let backend = BenchBackend::file_backed(sqlite_path).map_err(lix_err)?;
+    let session = open_lix_with_backend(backend).await.map_err(lix_err)?;
+    install_json_plugin_archive(&session, plugin_archive).await?;
+    Ok(session)
+}
 
-    let engine = Arc::new(boot(boot_args));
-    engine.initialize().await.map_err(lix_err)?;
-    let session = engine.open_session().await.map_err(lix_err)?;
-    session
-        .install_plugin(plugin_archive)
+async fn install_json_plugin_archive(session: &Session, plugin_archive: &[u8]) -> BenchResult<()> {
+    let result = session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+            &[
+                Value::Text(PLUGIN_ARCHIVE_FILE_ID.to_string()),
+                Value::Text(PLUGIN_ARCHIVE_PATH.to_string()),
+                Value::Blob(plugin_archive.to_vec()),
+            ],
+        )
         .await
         .map_err(lix_err)?;
+    match result.rows_affected() {
+        1 => {}
+        rows => {
+            return Err(format!(
+                "plugin archive install affected unexpected row count: {rows}"
+            ));
+        }
+    }
+    register_json_pointer_schema(session).await
+}
 
-    Ok(session)
+async fn register_json_pointer_schema(session: &Session) -> BenchResult<()> {
+    let schema = escape_sql_string(JSON_POINTER_SCHEMA_JSON);
+    let sql = format!(
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+         VALUES (lix_json('{schema}'), false, false)"
+    );
+    session.execute(&sql, &[]).await.map_err(lix_err)?;
+    Ok(())
 }
 
 async fn bootstrap_empty_json_file(
@@ -671,7 +688,7 @@ async fn bootstrap_empty_json_file(
 ) -> BenchResult<()> {
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3)",
+            "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(file_path.to_string()),
@@ -680,50 +697,24 @@ async fn bootstrap_empty_json_file(
         )
         .await
         .map_err(lix_err)?;
+    let snapshot_content = serde_json::json!({
+        "path": "",
+        "value": {},
+    });
+    let entity_pk = serde_json::json!([""]);
+    let sql = format!(
+        "INSERT INTO lix_state (\
+         entity_pk, schema_key, file_id, snapshot_content, global, untracked\
+         ) VALUES (\
+         lix_json('{}'), '{}', '{}', lix_json('{}'), false, false\
+         )",
+        escape_sql_string(&entity_pk.to_string()),
+        PLUGIN_SCHEMA_KEY,
+        escape_sql_string(file_id),
+        escape_sql_string(&snapshot_content.to_string())
+    );
+    session.execute(&sql, &[]).await.map_err(lix_err)?;
     Ok(())
-}
-
-async fn load_root_json_pointer_entity_pk(
-    session: &Session,
-    file_id: &str,
-    active_version_id: &str,
-) -> BenchResult<String> {
-    let result = session
-        .execute(
-            "SELECT entity_pk \
-             FROM lix_state_by_version \
-             WHERE file_id = ?1 \
-               AND version_id = ?2 \
-               AND schema_key = ?3 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY entity_pk ASC \
-             LIMIT 1",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(active_version_id.to_string()),
-                Value::Text(PLUGIN_SCHEMA_KEY.to_string()),
-            ],
-        )
-        .await
-        .map_err(lix_err)?;
-    let value = result
-        .statements
-        .first()
-        .and_then(|statement| statement.rows.first())
-        .and_then(|row| row.first())
-        .ok_or_else(|| format!("query returned no root json_pointer row for '{file_id}'"))?;
-
-    match value {
-        Value::Json(serde_json::Value::Array(parts)) => match parts.as_slice() {
-            [serde_json::Value::String(text)] => Ok(text.clone()),
-            other => Err(format!(
-                "expected single-part entity_pk for root json_pointer row of '{file_id}', got {other:?}"
-            )),
-        },
-        other => Err(format!(
-            "expected JSON-array entity_pk for root json_pointer row of '{file_id}', got {other:?}"
-        )),
-    }
 }
 
 fn build_direct_entity_write_sql_batches(
@@ -751,7 +742,7 @@ fn build_direct_entity_write_sql_batches(
 
     let mut statements = vec![format!(
         "UPDATE lix_state \
-         SET snapshot_content = '{}' \
+         SET snapshot_content = lix_json('{}') \
          WHERE entity_pk = lix_json('{}') \
            AND file_id = '{}' \
            AND schema_key = '{}'",
@@ -773,10 +764,10 @@ fn build_direct_entity_write_sql_batches(
             let entity_pk_json =
                 serde_json::to_string(&serde_json::json!([entity_pk])).map_err(serde_err)?;
             Ok(format!(
-                "(lix_json('{}'), '{}', '{}', '{}')",
+                "(lix_json('{}'), '{}', '{}', lix_json('{}'), false, false)",
                 escape_sql_string(&entity_pk_json),
-                escape_sql_string(file_id),
                 PLUGIN_SCHEMA_KEY,
+                escape_sql_string(file_id),
                 escape_sql_string(&snapshot_content),
             ))
         })
@@ -784,7 +775,56 @@ fn build_direct_entity_write_sql_batches(
 
     for chunk in entries.chunks(chunk_size) {
         statements.push(format!(
-            "INSERT INTO lix_state (entity_pk, file_id, schema_key, snapshot_content) VALUES {}",
+            "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content, global, untracked) VALUES {}",
+            chunk.join(", ")
+        ));
+    }
+
+    Ok(statements)
+}
+
+fn build_plugin_state_write_sql_batches(
+    file_id: &str,
+    changes: &[PluginEntityChange],
+    chunk_size: usize,
+) -> BenchResult<Vec<String>> {
+    if chunk_size == 0 {
+        return Err("plugin state write chunk size must be greater than 0".to_string());
+    }
+
+    let entries = changes
+        .iter()
+        .map(|change| -> BenchResult<String> {
+            if change.schema_key != PLUGIN_SCHEMA_KEY {
+                return Err(format!(
+                    "plugin produced schema_key '{}', expected '{}'",
+                    change.schema_key, PLUGIN_SCHEMA_KEY
+                ));
+            }
+
+            let entity_pk_json =
+                serde_json::to_string(&serde_json::json!([change.entity_pk])).map_err(serde_err)?;
+            let snapshot_content = match &change.snapshot_content {
+                Some(snapshot_content) => {
+                    format!("lix_json('{}')", escape_sql_string(snapshot_content))
+                }
+                None => "NULL".to_string(),
+            };
+
+            Ok(format!(
+                "(lix_json('{}'), '{}', '{}', {}, false, false)",
+                escape_sql_string(&entity_pk_json),
+                escape_sql_string(&change.schema_key),
+                escape_sql_string(file_id),
+                snapshot_content,
+            ))
+        })
+        .collect::<BenchResult<Vec<_>>>()?;
+
+    let mut statements = Vec::new();
+    for chunk in entries.chunks(chunk_size) {
+        statements.push(format!(
+            "INSERT INTO lix_state (entity_pk, schema_key, file_id, snapshot_content, global, untracked) VALUES {}",
             chunk.join(", ")
         ));
     }
@@ -799,16 +839,15 @@ async fn verify_file_json_matches(
 ) -> BenchResult<()> {
     let result = session
         .execute(
-            "SELECT data FROM lix_file WHERE id = ?1 LIMIT 1",
+            "SELECT data FROM lix_file WHERE id = $1 LIMIT 1",
             &[Value::Text(file_id.to_string())],
         )
         .await
         .map_err(lix_err)?;
     let value = result
-        .statements
+        .rows()
         .first()
-        .and_then(|statement| statement.rows.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.get_index(0))
         .ok_or_else(|| format!("query returned no file data row for '{file_id}'"))?;
 
     let actual_bytes = match value {
@@ -863,10 +902,9 @@ fn build_plugin_archive(plugin_wasm_bytes: &[u8]) -> BenchResult<Vec<u8>> {
 async fn scalar_count(session: &Session, sql: &str, params: &[Value]) -> BenchResult<u64> {
     let result = session.execute(sql, params).await.map_err(lix_err)?;
     let value = result
-        .statements
+        .rows()
         .first()
-        .and_then(|statement| statement.rows.first())
-        .and_then(|row| row.first())
+        .and_then(|row| row.get_index(0))
         .ok_or_else(|| format!("query returned no scalar value: {sql}"))?;
 
     match value {
@@ -957,67 +995,6 @@ fn build_flat_json_payload(props: usize) -> BenchResult<Vec<u8>> {
         );
     }
     serde_json::to_vec(&serde_json::Value::Object(root)).map_err(serde_err)
-}
-
-fn build_plugin_json_v2_wasm(repo_root: &Path) -> BenchResult<PathBuf> {
-    let manifest_path = repo_root.join("packages/plugin-json-v2/Cargo.toml");
-    let wasm_path =
-        repo_root.join("packages/plugin-json-v2/target/wasm32-wasip2/release/plugin_json_v2.wasm");
-
-    let build = || {
-        Command::new("cargo")
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(&manifest_path)
-            .arg("--target")
-            .arg("wasm32-wasip2")
-            .arg("--release")
-            .output()
-            .map_err(io_err)
-    };
-
-    let output = build()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("wasm32-wasip2")
-            && (stderr.contains("target may not be installed")
-                || stderr.contains("can't find crate for `core`"))
-        {
-            let rustup = Command::new("rustup")
-                .arg("target")
-                .arg("add")
-                .arg("wasm32-wasip2")
-                .output()
-                .map_err(io_err)?;
-            if !rustup.status.success() {
-                return Err(format!(
-                    "rustup target add wasm32-wasip2 failed:\n{}",
-                    String::from_utf8_lossy(&rustup.stderr)
-                ));
-            }
-            let retry = build()?;
-            if !retry.status.success() {
-                return Err(format!(
-                    "cargo build for plugin_json_v2 failed after installing wasm32-wasip2:\n{}",
-                    String::from_utf8_lossy(&retry.stderr)
-                ));
-            }
-        } else {
-            return Err(format!(
-                "cargo build for plugin_json_v2 failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-    }
-
-    if !wasm_path.exists() {
-        return Err(format!(
-            "plugin wasm build succeeded but output was missing at {}",
-            wasm_path.display()
-        ));
-    }
-
-    Ok(wasm_path)
 }
 
 fn render_markdown_report(report: &Report) -> String {
@@ -1195,13 +1172,6 @@ fn print_summary(report: &Report, report_json_path: &Path, report_markdown_path:
     println!("report_markdown={}", report_markdown_path.display());
 }
 
-fn repo_root() -> BenchResult<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .map_err(io_err)
-}
-
 fn temp_sqlite_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1234,5 +1204,5 @@ fn serde_err(error: impl std::fmt::Display) -> String {
 }
 
 fn lix_err(error: LixError) -> String {
-    format!("{}: {}", error.code, error.description)
+    format!("{}: {}", error.code, error.message)
 }

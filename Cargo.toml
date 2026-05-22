@@ -6,7 +6,6 @@ members = [
 ]
 exclude = [
   "packages/js-kysely",
-  "packages/plugin-json-v2",
   "packages/react-utils",
   "packages/website",
 ]
