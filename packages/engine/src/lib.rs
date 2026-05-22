@@ -72,7 +72,7 @@ pub use backend::{
     KeyRef as BackendKeyRef, PointVisitor, Prefix as BackendPrefix, ProjectedValue,
     ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
     ScanOptions, ScanResult, ScanVisitor, SnapshotRef, SpaceId, StoredValue, Value as BackendValue,
-    WriteOptions, WriteStats,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

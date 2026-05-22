@@ -17,5 +17,6 @@ pub use lix_engine::{
     MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult,
     PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, Row, ScanOptions, ScanResult,
     ScanVisitor, SqlQueryResult, StoredValue, SwitchVersionOptions,
-    SwitchVersionReceipt as SwitchVersionResult, TryFromValue, Value, WriteOptions, WriteStats,
+    SwitchVersionReceipt as SwitchVersionResult, TryFromValue, Value, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
