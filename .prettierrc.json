@@ -1,0 +1,11 @@
+{
+	"useTabs": true,
+	"overrides": [
+		{
+			"files": "packages/website/**/*",
+			"options": {
+				"useTabs": false
+			}
+		}
+	]
+}
