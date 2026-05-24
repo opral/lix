@@ -387,14 +387,14 @@ async function ensureWasmReady(): Promise<void> {
 	await wasmReady;
 }
 
-export async function openLix(
-	options: OpenLixOptions = {},
-): Promise<Lix> {
+export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 	await ensureWasmReady();
 	try {
-		const wasmLix = (await (wasmModule as unknown as {
-			openLix(options: OpenLixOptions): Promise<WasmLix>;
-		}).openLix(options)) as WasmLix;
+		const wasmLix = (await (
+			wasmModule as unknown as {
+				openLix(options: OpenLixOptions): Promise<WasmLix>;
+			}
+		).openLix(options)) as WasmLix;
 		return createLixHandle(wasmLix);
 	} catch (error) {
 		try {
@@ -440,16 +440,12 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			const values = params.map((param, index) =>
 				valueFromExecuteParam(param, index),
 			);
-			const result = await runQueued(() =>
-				wasmLix.execute(sql, values),
-			);
+			const result = await runQueued(() => wasmLix.execute(sql, values));
 			return normalizeExecuteResult(result);
 		},
 
 		async beginTransaction(): Promise<LixTransaction> {
-			const wasmTransaction = await runQueued(() =>
-				wasmLix.beginTransaction(),
-			);
+			const wasmTransaction = await runQueued(() => wasmLix.beginTransaction());
 			return createLixTransactionHandle(wasmTransaction, runQueued);
 		},
 
@@ -475,7 +471,9 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			return await runQueued(() => wasmLix.mergeVersionPreview(options));
 		},
 
-		async mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult> {
+		async mergeVersion(
+			options: MergeVersionOptions,
+		): Promise<MergeVersionResult> {
 			return await runQueued(() => wasmLix.mergeVersion(options));
 		},
 
@@ -617,7 +615,11 @@ function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
 	return {
 		columns,
 		rows: result.rows.map(
-			(row) => new Row(columns, row.map((value) => Value.from(value))),
+			(row) =>
+				new Row(
+					columns,
+					row.map((value) => Value.from(value)),
+				),
 		),
 		rowsAffected: result.rowsAffected,
 		notices: result.notices ?? [],
@@ -660,7 +662,8 @@ function normalizeThrownError(error: unknown): LixError {
 			}
 			return error;
 		}
-		const message = typeof error.message === "string" ? error.message : error.code;
+		const message =
+			typeof error.message === "string" ? error.message : error.code;
 		return createLixError(error.code, message, { hint, details });
 	}
 

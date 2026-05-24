@@ -276,9 +276,7 @@ function existsMany(
 	return {
 		groups: request.groups.map((group) => ({
 			namespace: group.namespace,
-			exists: group.keys.map(
-				(key) => kvGet(db, group.namespace, key) !== null,
-			),
+			exists: group.keys.map((key) => kvGet(db, group.namespace, key) !== null),
 		})),
 	};
 }
@@ -288,21 +286,14 @@ function scanPage(
 	request: BackendKvScanRequest,
 ): { pairs: KvPair[]; resumeAfter: Uint8Array | null } {
 	const scanLimit = request.limit + 1 + (request.after ? 1 : 0);
-	const pairs = kvScan(
-		db,
-		request.namespace,
-		request.range,
-		scanLimit,
-	).filter(
+	const pairs = kvScan(db, request.namespace, request.range, scanLimit).filter(
 		(pair) => !request.after || compareBytes(pair.key, request.after) > 0,
 	);
 	const hasMore = pairs.length > request.limit;
 	const pagePairs = pairs.slice(0, request.limit);
 	return {
 		pairs: pagePairs,
-		resumeAfter: hasMore
-			? (pagePairs.at(-1)?.key ?? null)
-			: null,
+		resumeAfter: hasMore ? (pagePairs.at(-1)?.key ?? null) : null,
 	};
 }
 
@@ -346,7 +337,9 @@ function kvDeleteRange(
 	range: BackendKvScanRange,
 ): void {
 	const { clauses, params } = rangeClauses(namespace, range);
-	db.prepare(`DELETE FROM lix_kv WHERE ${clauses.join(" AND ")}`).run(...params);
+	db.prepare(`DELETE FROM lix_kv WHERE ${clauses.join(" AND ")}`).run(
+		...params,
+	);
 }
 
 function kvScan(
@@ -356,15 +349,18 @@ function kvScan(
 	limit?: number | null,
 ): KvPair[] {
 	const { sql, params } = scanQuery(namespace, range, limit);
-	return db.prepare(sql).all(...params).map((row) => {
-		if (!isObject(row) || !("key" in row) || !("value" in row)) {
-			throw new Error("invalid lix_kv scan row");
-		}
-		return {
-			key: bytesFromUnknown(row.key, "lix_kv.key"),
-			value: bytesFromUnknown(row.value, "lix_kv.value"),
-		};
-	});
+	return db
+		.prepare(sql)
+		.all(...params)
+		.map((row) => {
+			if (!isObject(row) || !("key" in row) || !("value" in row)) {
+				throw new Error("invalid lix_kv scan row");
+			}
+			return {
+				key: bytesFromUnknown(row.key, "lix_kv.key"),
+				value: bytesFromUnknown(row.value, "lix_kv.value"),
+			};
+		});
 }
 
 function scanQuery(

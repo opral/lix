@@ -263,7 +263,7 @@ export type LixDatabaseSchema = {
 	typeof LixKeyValueSchema,
 	"lix_key_value",
 	{ value: LixKeyValue["value"] }
-	> &
+> &
 	EntityViews<typeof LixAccountSchema, "lix_account"> &
 	EntityViews<typeof LixChangeAuthorSchema, "lix_change_author"> &
 	EntityViews<

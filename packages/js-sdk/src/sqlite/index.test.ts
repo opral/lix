@@ -95,10 +95,9 @@ async function registerCrmTaskSchema(lix: Lix) {
 }
 
 async function taskTitle(lix: Lix, taskId: string): Promise<string> {
-	const result = await lix.execute(
-		"SELECT title FROM crm_task WHERE id = $1",
-		[taskId],
-	);
+	const result = await lix.execute("SELECT title FROM crm_task WHERE id = $1", [
+		taskId,
+	]);
 	const rows = expectRows(result);
 	expect(rows.rows).toHaveLength(1);
 	const title = rows.rows[0]?.get("title");
