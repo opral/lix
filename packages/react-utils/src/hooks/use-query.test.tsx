@@ -434,7 +434,7 @@ test("akeFirst updates reference when underlying row changes", async () => {
 	const initialRef = hookResult!.current;
 
 	await act(async () => {
-		await lix.execute("DELETE FROM lix_key_value WHERE key = ?1", [rowKey]);
+		await lix.execute("DELETE FROM lix_key_value WHERE key = $1", [rowKey]);
 		await qb(lix)
 			.insertInto("lix_key_value")
 			.values({ key: rowKey, value: "updated" })
@@ -551,7 +551,7 @@ test("akeFirst re-emits when aggregate result returns to the initial value", asy
 	});
 
 	await act(async () => {
-		await lix.execute("DELETE FROM lix_key_value WHERE key = ?1", [key]);
+		await lix.execute("DELETE FROM lix_key_value WHERE key = $1", [key]);
 	});
 
 	await waitFor(() => {
