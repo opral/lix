@@ -401,7 +401,7 @@ test("INSERT SELECT UNION ALL executes without trapping wasm", async () => {
 				const lix = await openLix();
 				try {
 					const result = await lix.execute("INSERT INTO lix_directory (path) SELECT '/u1/' UNION ALL SELECT '/u2/'");
-					console.log(result.rowsAffected);
+					console.log(String(result.rowsAffected));
 				} finally {
 					await lix.close().catch(() => {});
 				}
