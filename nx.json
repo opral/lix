@@ -39,10 +39,6 @@
 			"cache": true
 		},
 		"lint": {
-			"dependsOn": ["format"],
-			"cache": true
-		},
-		"format": {
 			"cache": true
 		}
 	},

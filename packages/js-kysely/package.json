@@ -17,7 +17,8 @@
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"test:types": "tsc -p tsconfig.type-tests.json --noEmit",
-		"test": "pnpm --filter @lix-js/sdk build && vitest run"
+		"test": "pnpm --filter @lix-js/sdk build && vitest run",
+		"format": "prettier --write --ignore-unknown ."
 	},
 	"dependencies": {
 		"json-schema-to-ts": "^3.1.1",

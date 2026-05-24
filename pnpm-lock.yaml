@@ -20,6 +20,9 @@ importers:
       nx-cloud:
         specifier: ^19.1.0
         version: 19.1.0
+      prettier:
+        specifier: 3.6.2
+        version: 3.6.2
       vitest:
         specifier: ^3.1.1
         version: 3.2.4(@types/debug@4.1.12)(@types/node@24.10.2)(@vitest/browser@3.2.4)(happy-dom@18.0.1)(jiti@2.6.1)(jsdom@27.3.0(postcss@8.5.14))(lightningcss@1.32.0)(msw@2.10.2(@types/node@24.10.2)(typescript@5.9.3))(sass-embedded@1.89.2)(terser@5.36.0)(tsx@4.20.5)(yaml@2.8.1)
@@ -81,9 +84,6 @@ importers:
       oxlint:
         specifier: ^1.14.0
         version: 1.26.0
-      prettier:
-        specifier: ^3.3.3
-        version: 3.6.2
       react:
         specifier: 19.2.0
         version: 19.2.0
@@ -139,9 +139,6 @@ importers:
       '@vitejs/plugin-react':
         specifier: ^6.0.1
         version: 6.0.1(vite@8.0.10(@types/node@22.15.33)(esbuild@0.27.3)(jiti@2.6.1)(sass-embedded@1.89.2)(terser@5.36.0)(tsx@4.20.5)(yaml@2.8.1))
-      prettier:
-        specifier: ^3.6.0
-        version: 3.6.2
       typescript:
         specifier: ^5.7.2
         version: 5.8.3
