@@ -1,5 +1,5 @@
 use crate::error::CliError;
-use lix_rs_sdk::{ExecuteResult, Lix, Value};
+use lix_rs_sdk::{ExecuteResult, Value};
 
 #[derive(Debug)]
 pub struct CommandOutput {
@@ -49,7 +49,7 @@ pub fn hint_from_error(err: &CliError) -> Vec<String> {
 // ── Infrastructure ───────────────────────────────────────────────────
 
 /// Query lix_key_value for 'lix_cli_hints'. Returns true unless value is explicitly "false".
-pub fn are_hints_enabled(lix: &Lix) -> bool {
+pub fn are_hints_enabled(lix: &crate::db::FileLix) -> bool {
     let result = crate::db::block_on(lix.execute(
         "SELECT value FROM lix_key_value WHERE key = 'lix_cli_hints'",
         &[],

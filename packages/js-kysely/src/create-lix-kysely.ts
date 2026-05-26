@@ -69,10 +69,7 @@ class LixConnection implements DatabaseConnection {
 
 	async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
 		const raw = normalizeLixQueryResult(
-			await this.#executeSql(
-				compiledQuery.sql,
-				compiledQuery.parameters,
-			),
+			await this.#executeSql(compiledQuery.sql, compiledQuery.parameters),
 		);
 		const rawColumnNames = decodeColumnNames(raw.columns);
 		const decodedRows = decodeRows(raw.rows, rawColumnNames);
@@ -403,7 +400,9 @@ function decodeObjectRow(row: unknown, columns?: string[]): unknown[] {
 		return valuesByIndex.map(decodeLixValue);
 	}
 	if (typeof (row as { toObject?: unknown }).toObject === "function") {
-		const object = (row as { toObject: () => Record<string, unknown> }).toObject();
+		const object = (
+			row as { toObject: () => Record<string, unknown> }
+		).toObject();
 		return columns?.map((column) => object[column]) ?? Object.values(object);
 	}
 	return [];

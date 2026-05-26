@@ -1,0 +1,48 @@
+{
+    "workbench.settings.enableNaturalLanguageSearch": false,
+    "editor.autoIndent": "brackets",
+    "editor.lightbulb.enabled": "off",
+    "editor.comments.ignoreEmptyLines": false,
+    "editor.formatOnSave": false,
+    "git.mergeEditor": false,
+
+    "files.exclude": {
+        "**/.git": true,
+        "target": true,
+    },
+    // Toggle with "files to exclude" field button
+    "search.exclude": {
+        "**/.git": true,
+        "**/node_modules/*/**": true,
+        "target": true,
+        "artifact": true,
+    },
+    "files.watcherExclude": {
+        "**/node_modules/*/**": true,
+        "target": true,
+        "artifact": true,
+    },
+
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true,
+    },
+
+    "rust-analyzer.server.extraEnv": {
+        "RUSTUP_TOOLCHAIN": "nightly-2026-05-21", // Keep in sync with rust-toolchain.toml
+    },
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.cargo.targetDir": true, // https://rust-analyzer.github.io/book/configuration#cargo.targetDir
+    "rust-analyzer.cargo.extraArgs": [],
+    "rust-analyzer.showUnlinkedFileNotification": false,
+    "rust-analyzer.files.watcher": "server",
+    "rust-analyzer.linkedProjects": ["Cargo.toml"],
+    "rust-analyzer.runnables.extraEnv": {},
+    "rust-analyzer.files.exclude": [
+        ".git",
+        "target",
+        "node_modules",
+    ],
+    "rust-analyzer.check.workspace": false,
+    "rust-analyzer.imports.prefix": "self",
+}

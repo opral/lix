@@ -91,4 +91,5 @@ fn project_state_context_from_before(
     })
 }
 
+#[cfg(target_arch = "wasm32")]
 export!(MarkdownPlugin);

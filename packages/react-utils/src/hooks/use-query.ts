@@ -122,7 +122,7 @@ export function useQuery<TRow>(
 					if (closed || event === undefined) {
 						break;
 					}
-					const nextRows = queryResultToRows<TRow>(event.rows);
+					const nextRows = queryResultToRows<TRow>(event);
 					setRows(nextRows);
 				}
 			} catch (err) {

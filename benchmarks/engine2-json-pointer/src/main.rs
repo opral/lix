@@ -1,5 +1,5 @@
 use clap::Parser;
-use lix_rs_sdk::{open_lix, ExecuteResult, Lix, LixError, OpenLixOptions, Value};
+use lix_rs_sdk::{open_lix_with_backend, Lix, LixError, Value};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -9,6 +9,8 @@ use tokio::runtime::Builder;
 mod sqlite_backend;
 
 use sqlite_backend::Engine2SqliteBackend;
+
+type BenchLix = Lix<Engine2SqliteBackend>;
 
 const DEFAULT_OUTPUT_DIR: &str = "artifact/benchmarks/engine2-json-pointer";
 const DEFAULT_ROWS: usize = 10_000;
@@ -82,11 +84,8 @@ struct PhaseSummary {
     max_ms: f64,
 }
 
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+fn main() -> Result<(), String> {
+    run()
 }
 
 fn run() -> BenchResult<()> {
@@ -155,11 +154,9 @@ async fn run_insert_case(args: &Args, label: &str, index: usize) -> BenchResult<
     cleanup.remove_existing()?;
 
     let backend = Engine2SqliteBackend::file_backed(&db_path).map_err(display_lix_error)?;
-    let lix = open_lix(OpenLixOptions {
-        backend: Some(Box::new(backend)),
-    })
-    .await
-    .map_err(display_lix_error)?;
+    let lix = open_lix_with_backend(backend)
+        .await
+        .map_err(display_lix_error)?;
 
     ensure_benchmark_file_descriptor(&lix).await?;
     register_json_pointer_schema(&lix).await?;
@@ -168,10 +165,7 @@ async fn run_insert_case(args: &Args, label: &str, index: usize) -> BenchResult<
     let insert_started = Instant::now();
     for sql in build_insert_batches(args.rows, args.chunk_size)? {
         let result = lix.execute(&sql, &[]).await.map_err(display_lix_error)?;
-        let ExecuteResult::AffectedRows(affected_rows) = result else {
-            return Err("json pointer insert should return affected rows".to_string());
-        };
-        if affected_rows == 0 {
+        if result.rows_affected() == 0 {
             return Err("json pointer insert unexpectedly affected zero rows".to_string());
         }
     }
@@ -201,42 +195,36 @@ async fn run_insert_case(args: &Args, label: &str, index: usize) -> BenchResult<
     Ok(sample)
 }
 
-async fn register_json_pointer_schema(lix: &Lix) -> BenchResult<()> {
+async fn register_json_pointer_schema(lix: &BenchLix) -> BenchResult<()> {
     let schema = sql_string(JSON_POINTER_SCHEMA_JSON);
     let sql = format!(
         "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-         VALUES (lix_json('{schema}'), true, true)"
+         VALUES (lix_json('{schema}'), false, false)"
     );
-    match lix.execute(&sql, &[]).await.map_err(display_lix_error)? {
-        ExecuteResult::AffectedRows(1) => Ok(()),
-        other => Err(format!(
-            "schema registration returned unexpected result: {other:?}"
+    let result = lix.execute(&sql, &[]).await.map_err(display_lix_error)?;
+    match result.rows_affected() {
+        1 => Ok(()),
+        rows => Err(format!(
+            "schema registration affected unexpected row count: {rows}"
         )),
     }
 }
 
-async fn ensure_benchmark_file_descriptor(lix: &Lix) -> BenchResult<()> {
-    let snapshot = serde_json::json!({
-        "id": "bench.json",
-        "directory_id": null,
-        "name": "bench",
-        "extension": "json",
-        "hidden": false
-    });
-    let entity_pk = serde_json::json!(["bench.json"]);
-    let sql = format!(
-        "INSERT INTO lix_state (\
-         entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-         ) VALUES (\
-         lix_json('{}'), 'lix_file_descriptor', NULL, lix_json('{}'), false, false\
-         )",
-        sql_string(&entity_pk.to_string()),
-        sql_string(&snapshot.to_string())
-    );
-    match lix.execute(&sql, &[]).await.map_err(display_lix_error)? {
-        ExecuteResult::AffectedRows(1) => Ok(()),
-        other => Err(format!(
-            "file descriptor insert returned unexpected result: {other:?}"
+async fn ensure_benchmark_file_descriptor(lix: &BenchLix) -> BenchResult<()> {
+    let result = lix
+        .execute(
+            "INSERT INTO lix_file (id, path) VALUES ($1, $2)",
+            &[
+                Value::Text("bench.json".to_string()),
+                Value::Text("/bench.json".to_string()),
+            ],
+        )
+        .await
+        .map_err(display_lix_error)?;
+    match result.rows_affected() {
+        1 => Ok(()),
+        rows => Err(format!(
+            "file descriptor insert affected unexpected row count: {rows}"
         )),
     }
 }
@@ -280,7 +268,7 @@ fn build_insert_batches(row_count: usize, chunk_size: usize) -> BenchResult<Vec<
     Ok(batches)
 }
 
-async fn count_json_pointer_rows(lix: &Lix) -> BenchResult<usize> {
+async fn count_json_pointer_rows(lix: &BenchLix) -> BenchResult<usize> {
     let result = lix
         .execute(
             "SELECT COUNT(*) \
@@ -292,10 +280,7 @@ async fn count_json_pointer_rows(lix: &Lix) -> BenchResult<usize> {
         )
         .await
         .map_err(display_lix_error)?;
-    let ExecuteResult::Rows(rows) = result else {
-        return Err("COUNT query should return rows".to_string());
-    };
-    let Some(row) = rows.rows().first() else {
+    let Some(row) = result.rows().first() else {
         return Err("COUNT query returned no rows".to_string());
     };
     match row.values().first() {
@@ -374,7 +359,7 @@ fn sql_string(value: &str) -> String {
 }
 
 fn display_lix_error(error: LixError) -> String {
-    format!("{}: {}", error.code, error.description)
+    format!("{}: {}", error.code, error.message)
 }
 
 fn millis(duration: Duration) -> f64 {

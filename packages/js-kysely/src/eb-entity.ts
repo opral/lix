@@ -15,10 +15,7 @@ type LixEntity = {
 	lixcol_entity_pk: LixEntityPk;
 };
 
-const CANONICAL_TABLES = [
-	"lix_state",
-	"lix_state_by_version",
-] as const;
+const CANONICAL_TABLES = ["lix_state", "lix_state_by_version"] as const;
 
 export function ebEntity<
 	TB extends keyof LixDatabaseSchema = keyof LixDatabaseSchema,
@@ -75,7 +72,8 @@ export function ebEntity<
 				"entity_pk" in entity ? entity.entity_pk : entity.lixcol_entity_pk,
 			targetSchemaKey:
 				"schema_key" in entity ? entity.schema_key : entity.lixcol_schema_key,
-			targetFileId: "file_id" in entity ? entity.file_id : entity.lixcol_file_id,
+			targetFileId:
+				"file_id" in entity ? entity.file_id : entity.lixcol_file_id,
 		};
 	};
 

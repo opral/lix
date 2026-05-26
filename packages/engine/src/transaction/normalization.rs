@@ -252,13 +252,6 @@ fn entity_pk_derivation_error(
         EntityPkError::EmptyPrimaryKeyPath { index } => {
             format!("empty x-lix-primary-key pointer at index {index}")
         }
-        EntityPkError::EmptyPrimaryKeyValue { index } => {
-            let pointer = primary_key_paths
-                .get(index)
-                .map(|path| format_json_pointer(path))
-                .unwrap_or_else(|| format!("index {index}"));
-            format!("empty value at primary-key pointer '{pointer}'")
-        }
         EntityPkError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("missing value at primary-key pointer '{pointer}'")

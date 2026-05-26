@@ -71,7 +71,9 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
 	const mainHead = await lix.execute("SELECT lix_active_version_commit_id()");
-	const mainHeadCommitId = mainHead.rows[0]!.get("lix_active_version_commit_id()");
+	const mainHeadCommitId = mainHead.rows[0]!.get(
+		"lix_active_version_commit_id()",
+	);
 	expect(typeof mainHeadCommitId).toBe("string");
 
 	const draft = await lix.createVersion({
@@ -204,13 +206,25 @@ test("custom backend applies ordered deleteRange write ops", () => {
 			{
 				namespace: "n",
 				ops: [
-					{ kind: "put", key: new Uint8Array([1]), value: new Uint8Array([10]) },
-					{ kind: "put", key: new Uint8Array([2]), value: new Uint8Array([20]) },
+					{
+						kind: "put",
+						key: new Uint8Array([1]),
+						value: new Uint8Array([10]),
+					},
+					{
+						kind: "put",
+						key: new Uint8Array([2]),
+						value: new Uint8Array([20]),
+					},
 					{
 						kind: "deleteRange",
 						range: { kind: "prefix", prefix: new Uint8Array([1]) },
 					},
-					{ kind: "put", key: new Uint8Array([1]), value: new Uint8Array([11]) },
+					{
+						kind: "put",
+						key: new Uint8Array([1]),
+						value: new Uint8Array([11]),
+					},
 				],
 			},
 		],
@@ -330,9 +344,7 @@ test("beginTransaction blocks session writes on the same handle", async () => {
 		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
 		["outside-task", "tx-only-task"],
 	);
-	expect(committed.rows.map((row) => row.get("id"))).toEqual([
-		"tx-only-task",
-	]);
+	expect(committed.rows.map((row) => row.get("id"))).toEqual(["tx-only-task"]);
 
 	await lix.close();
 });
@@ -389,7 +401,7 @@ test("INSERT SELECT UNION ALL executes without trapping wasm", async () => {
 				const lix = await openLix();
 				try {
 					const result = await lix.execute("INSERT INTO lix_directory (path) SELECT '/u1/' UNION ALL SELECT '/u2/'");
-					console.log(result.rowsAffected);
+					console.log(String(result.rowsAffected));
 				} finally {
 					await lix.close().catch(() => {});
 				}
@@ -432,10 +444,9 @@ test("createVersion can start from an explicit commit id", async () => {
 	});
 	await lix.switchVersion({ versionId: version.id });
 
-	const projected = await lix.execute(
-		"SELECT id FROM crm_task WHERE id = $1",
-		["after-base"],
-	);
+	const projected = await lix.execute("SELECT id FROM crm_task WHERE id = $1", [
+		"after-base",
+	]);
 	expect(projected.rows).toHaveLength(0);
 
 	await lix.close();
@@ -447,12 +458,7 @@ test("merge conflicts expose structured details", async () => {
 	await registerCrmTaskSchema(lix);
 	await lix.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-		[
-			"conflict-task",
-			"Base",
-			false,
-			JSON.stringify({ priority: "normal" }),
-		],
+		["conflict-task", "Base", false, JSON.stringify({ priority: "normal" })],
 	);
 	const draft = await lix.createVersion({
 		id: "conflict-draft",
@@ -741,10 +747,9 @@ async function registerCrmTaskSchema(lix: Lix) {
 }
 
 async function taskDone(lix: Lix, taskId: string): Promise<boolean> {
-	const result = await lix.execute(
-		"SELECT done FROM crm_task WHERE id = $1",
-		[taskId],
-	);
+	const result = await lix.execute("SELECT done FROM crm_task WHERE id = $1", [
+		taskId,
+	]);
 	const rows = expectRows(result);
 	expect(rows.rows).toHaveLength(1);
 	const done = rows.rows[0]?.get("done");
@@ -770,135 +775,135 @@ function createMemoryBackend(options: MemoryBackendOptions = {}): LixBackend {
 	let rows: StoredKvPair[] = [];
 
 	function createTransaction(): LixBackendWriteTransaction {
-			let transactionRows = rows.map(cloneStoredPair);
-			let closed = false;
+		let transactionRows = rows.map(cloneStoredPair);
+		let closed = false;
 
-			const ensureOpen = () => {
-				if (closed) {
-					throw new Error("transaction is closed");
-				}
-			};
+		const ensureOpen = () => {
+			if (closed) {
+				throw new Error("transaction is closed");
+			}
+		};
 
-			return {
-				getValues(request): BackendKvValueBatch {
-					ensureOpen();
-					return {
-						groups: request.groups.map((group) => ({
-							namespace: group.namespace,
-							values: group.keys.map((key) => {
-								const row = transactionRows.find(
-									(row) =>
-										row.namespace === group.namespace &&
-										compareBytes(row.key, key) === 0,
-								);
-								return row ? new Uint8Array(row.value) : null;
-							}),
-						})),
-					};
-				},
-				existsMany(request): BackendKvExistsBatch {
-					ensureOpen();
-					return {
-						groups: request.groups.map((group) => ({
-							namespace: group.namespace,
-							exists: group.keys.map((key) =>
-								transactionRows.some(
-									(row) =>
-										row.namespace === group.namespace &&
-										compareBytes(row.key, key) === 0,
-								),
+		return {
+			getValues(request): BackendKvValueBatch {
+				ensureOpen();
+				return {
+					groups: request.groups.map((group) => ({
+						namespace: group.namespace,
+						values: group.keys.map((key) => {
+							const row = transactionRows.find(
+								(row) =>
+									row.namespace === group.namespace &&
+									compareBytes(row.key, key) === 0,
+							);
+							return row ? new Uint8Array(row.value) : null;
+						}),
+					})),
+				};
+			},
+			existsMany(request): BackendKvExistsBatch {
+				ensureOpen();
+				return {
+					groups: request.groups.map((group) => ({
+						namespace: group.namespace,
+						exists: group.keys.map((key) =>
+							transactionRows.some(
+								(row) =>
+									row.namespace === group.namespace &&
+									compareBytes(row.key, key) === 0,
 							),
-						})),
-					};
-				},
-				scanKeys(request): BackendKvKeyPage {
-					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(
-						transactionRows,
-						limitScanRequest(request, options.scanPageSize),
-					);
-					return {
-						keys: pairs.map((row) => new Uint8Array(row.key)),
-						resumeAfter,
-					};
-				},
-				scanValues(request): BackendKvValuePage {
-					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(
-						transactionRows,
-						limitScanRequest(request, options.scanPageSize),
-					);
-					return {
-						values: pairs.map((row) => new Uint8Array(row.value)),
-						resumeAfter,
-					};
-				},
-				scanEntries(request): BackendKvEntryPage {
-					ensureOpen();
-					const { pairs, resumeAfter } = scanPage(
-						transactionRows,
-						limitScanRequest(request, options.scanPageSize),
-					);
-					return {
-						keys: pairs.map((row) => new Uint8Array(row.key)),
-						values: pairs.map((row) => new Uint8Array(row.value)),
-						resumeAfter,
-					};
-				},
-				writeKvBatch(batch): BackendKvWriteStats {
-					ensureOpen();
-					const stats: BackendKvWriteStats = {
-						puts: 0,
-						deletes: 0,
-						deleteRanges: 0,
-						bytesWritten: 0,
-					};
-					for (const group of batch.groups) {
-						for (const op of group.ops) {
-							if (op.kind === "put") {
-								stats.puts += 1;
-								stats.bytesWritten += op.key.length + op.value.length;
-								transactionRows = transactionRows.filter(
-									(row) =>
-										row.namespace !== group.namespace ||
-										compareBytes(row.key, op.key) !== 0,
-								);
-								transactionRows.push({
-									namespace: group.namespace,
-									key: new Uint8Array(op.key),
-									value: new Uint8Array(op.value),
-								});
-							} else if (op.kind === "delete") {
-								stats.deletes += 1;
-								stats.bytesWritten += op.key.length;
-								transactionRows = transactionRows.filter(
-									(row) =>
-										row.namespace !== group.namespace ||
-										compareBytes(row.key, op.key) !== 0,
-								);
-							} else {
-								stats.deleteRanges += 1;
-								stats.bytesWritten += deleteRangeBytes(op.range);
-								transactionRows = transactionRows.filter(
-									(row) =>
-										row.namespace !== group.namespace ||
-										!keyMatchesRange(row.key, op.range),
-								);
-							}
+						),
+					})),
+				};
+			},
+			scanKeys(request): BackendKvKeyPage {
+				ensureOpen();
+				const { pairs, resumeAfter } = scanPage(
+					transactionRows,
+					limitScanRequest(request, options.scanPageSize),
+				);
+				return {
+					keys: pairs.map((row) => new Uint8Array(row.key)),
+					resumeAfter,
+				};
+			},
+			scanValues(request): BackendKvValuePage {
+				ensureOpen();
+				const { pairs, resumeAfter } = scanPage(
+					transactionRows,
+					limitScanRequest(request, options.scanPageSize),
+				);
+				return {
+					values: pairs.map((row) => new Uint8Array(row.value)),
+					resumeAfter,
+				};
+			},
+			scanEntries(request): BackendKvEntryPage {
+				ensureOpen();
+				const { pairs, resumeAfter } = scanPage(
+					transactionRows,
+					limitScanRequest(request, options.scanPageSize),
+				);
+				return {
+					keys: pairs.map((row) => new Uint8Array(row.key)),
+					values: pairs.map((row) => new Uint8Array(row.value)),
+					resumeAfter,
+				};
+			},
+			writeKvBatch(batch): BackendKvWriteStats {
+				ensureOpen();
+				const stats: BackendKvWriteStats = {
+					puts: 0,
+					deletes: 0,
+					deleteRanges: 0,
+					bytesWritten: 0,
+				};
+				for (const group of batch.groups) {
+					for (const op of group.ops) {
+						if (op.kind === "put") {
+							stats.puts += 1;
+							stats.bytesWritten += op.key.length + op.value.length;
+							transactionRows = transactionRows.filter(
+								(row) =>
+									row.namespace !== group.namespace ||
+									compareBytes(row.key, op.key) !== 0,
+							);
+							transactionRows.push({
+								namespace: group.namespace,
+								key: new Uint8Array(op.key),
+								value: new Uint8Array(op.value),
+							});
+						} else if (op.kind === "delete") {
+							stats.deletes += 1;
+							stats.bytesWritten += op.key.length;
+							transactionRows = transactionRows.filter(
+								(row) =>
+									row.namespace !== group.namespace ||
+									compareBytes(row.key, op.key) !== 0,
+							);
+						} else {
+							stats.deleteRanges += 1;
+							stats.bytesWritten += deleteRangeBytes(op.range);
+							transactionRows = transactionRows.filter(
+								(row) =>
+									row.namespace !== group.namespace ||
+									!keyMatchesRange(row.key, op.range),
+							);
 						}
 					}
-					return stats;
-				},
-				commit() {
-					ensureOpen();
-					rows = transactionRows.map(cloneStoredPair);
-					closed = true;
-				},
-				rollback() {
-					ensureOpen();
-					closed = true;
-				},
-			};
+				}
+				return stats;
+			},
+			commit() {
+				ensureOpen();
+				rows = transactionRows.map(cloneStoredPair);
+				closed = true;
+			},
+			rollback() {
+				ensureOpen();
+				closed = true;
+			},
+		};
 	}
 
 	return {

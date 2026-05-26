@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
+bytes = "1"
 clap = { version = "4.5.31", features = ["derive"] }
 lix_rs_sdk = { path = "../../packages/rs-sdk" }
 rusqlite = { version = "0.32", features = ["bundled"] }

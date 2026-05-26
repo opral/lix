@@ -1,21 +1,19 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
-  "benchmarks/git-compare",
-  "benchmarks/10k-entities",
-  "benchmarks/engine2-json-pointer",
-  "packages/engine",
-  "packages/js-sdk",
-  "packages/text-plugin",
-  "packages/rs-sdk",
-  "packages/plugin-md-v2",
-  "packages/cli",
+  "benchmarks/*",
+  "packages/*",
 ]
-exclude = ["packages/plugin-json-v2"]
+exclude = [
+  "packages/js-kysely",
+  "packages/react-utils",
+  "packages/website",
+]
 
-[profile.test]
-debug = 1
-
-[profile.bench]
-debug = true
-strip = false
+[workspace.package]
+version = "0.0.0"
+authors = ["Opral Team"]
+edition = "2024"
+license = "LicenseRef-opral"
+publish = false
+rust-version = "1.93"

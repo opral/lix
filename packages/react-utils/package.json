@@ -16,7 +16,7 @@
 		"test:watch": "vitest",
 		"lint": "oxlint --config .oxlintrc.json --tsconfig ./tsconfig.json --format stylish src",
 		"dev": "tsc --watch",
-		"format": "prettier ./src --write"
+		"format": "prettier --write --ignore-unknown ."
 	},
 	"_comment": "Required for tree-shaking https://webpack.js.org/guides/tree-shaking/#mark-the-file-as-side-effect-free",
 	"sideEffects": false,
@@ -33,7 +33,6 @@
 		"https-proxy-agent": "7.0.2",
 		"jsdom": "^26.1.0",
 		"oxlint": "^1.14.0",
-		"prettier": "^3.3.3",
 		"react": "19.2.0",
 		"react-dom": "19.2.0",
 		"typescript": "^5.5.4",

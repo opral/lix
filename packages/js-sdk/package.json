@@ -30,7 +30,8 @@
 		"prepack": "node ./scripts/sync-engine-src.js",
 		"typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
 		"test": "node ./scripts/build.js && vitest run",
-		"test:watch": "node ./scripts/build.js && vitest"
+		"test:watch": "node ./scripts/build.js && vitest",
+		"format": "prettier --write --ignore-unknown ."
 	},
 	"peerDependencies": {
 		"better-sqlite3": "^12.9.0"
@@ -41,7 +42,7 @@
 		}
 	},
 	"devDependencies": {
-		"better-sqlite3": "^12.9.0",
+		"better-sqlite3": "^12.10.0",
 		"typescript": "^5.5.4",
 		"vitest": "^4.0.18"
 	},

@@ -269,11 +269,11 @@ function isJsonValue(value: unknown): value is JsonValue {
 	}
 }
 
-function normalizeJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
-	if (
-		value === null ||
-		typeof value === "boolean"
-	) {
+function normalizeJsonValue(
+	value: unknown,
+	seen = new WeakSet<object>(),
+): JsonValue {
+	if (value === null || typeof value === "boolean") {
 		return value;
 	}
 	if (typeof value === "string") {
@@ -382,10 +382,7 @@ function base64ToBytes(base64: string): Uint8Array {
 	return bytes;
 }
 
-const engineWasmUrl = new URL(
-	"./wasm/lix_engine.wasm",
-	import.meta.url,
-);
+const engineWasmUrl = new URL("./wasm/lix_engine.wasm", import.meta.url);
 
 function isNodeRuntime(): boolean {
 	const processLike = (

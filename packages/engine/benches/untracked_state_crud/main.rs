@@ -39,8 +39,7 @@ use sqlite_backend::SqliteBackend;
 const SMOKE_ROWS: usize = 1_000;
 const REAL_WORKLOAD_ROWS: usize = 10_000;
 const PNPM_LOCK_JSON: &str = include_str!("../fixtures/pnpm-lock.fixture.json");
-const JSON_POINTER_SCHEMA_JSON: &str =
-    include_str!("../optimization9_sql2/json_pointer.schema.json");
+const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../fixtures/json_pointer.schema.json");
 const SESSION_INSERT_CHUNK_SIZE: usize = 500;
 const ROW_SPACE: StorageSpace = StorageSpace::new(SpaceId(0x0001_0002), "untracked_state.row.v1");
 
