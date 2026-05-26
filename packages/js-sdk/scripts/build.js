@@ -74,24 +74,38 @@ async function buildEngineWasm() {
 
 async function normalizeWasmBindgenOutput(outputDir) {
 	const generatedWasm = join(outputDir, `${wasmBindgenOutName}_bg.wasm`);
-	const generatedWasmTypes = join(outputDir, `${wasmBindgenOutName}_bg.wasm.d.ts`);
+	const generatedWasmTypes = join(
+		outputDir,
+		`${wasmBindgenOutName}_bg.wasm.d.ts`,
+	);
 	const normalizedWasm = join(outputDir, `${wasmBindgenOutName}.wasm`);
-	const normalizedWasmTypes = join(outputDir, `${wasmBindgenOutName}.wasm.d.ts`);
+	const normalizedWasmTypes = join(
+		outputDir,
+		`${wasmBindgenOutName}.wasm.d.ts`,
+	);
 	const fsmod = await import("node:fs");
-	if (fsmod.existsSync(generatedWasm)) await rename(generatedWasm, normalizedWasm);
-	if (fsmod.existsSync(generatedWasmTypes)) await rename(generatedWasmTypes, normalizedWasmTypes);
+	if (fsmod.existsSync(generatedWasm))
+		await rename(generatedWasm, normalizedWasm);
+	if (fsmod.existsSync(generatedWasmTypes))
+		await rename(generatedWasmTypes, normalizedWasmTypes);
 
 	const jsPath = join(outputDir, `${wasmBindgenOutName}.js`);
 	const js = await readFile(jsPath, "utf8");
 	await writeFile(
 		jsPath,
-		js.replaceAll(`${wasmBindgenOutName}_bg.wasm`, `${wasmBindgenOutName}.wasm`),
+		js.replaceAll(
+			`${wasmBindgenOutName}_bg.wasm`,
+			`${wasmBindgenOutName}.wasm`,
+		),
 	);
 }
 
 async function stripWasmCustomSections(outputDir) {
 	const wasmPath = join(outputDir, `${wasmBindgenOutName}.wasm`);
-	const strippedWasmPath = join(outputDir, `${wasmBindgenOutName}.stripped.wasm`);
+	const strippedWasmPath = join(
+		outputDir,
+		`${wasmBindgenOutName}.stripped.wasm`,
+	);
 	await run("wasm-tools", ["strip", "--all", wasmPath, "-o", strippedWasmPath]);
 	await rename(strippedWasmPath, wasmPath);
 }

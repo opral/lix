@@ -4,9 +4,10 @@ mod switch;
 
 use crate::app::AppContext;
 use crate::cli::version::{VersionCommand, VersionSubcommand};
+use crate::db::FileLix;
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{ExecuteResult, Lix, Row as LixRow, Value};
+use lix_rs_sdk::{ExecuteResult, Row as LixRow, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VersionLookup<'a> {
@@ -29,7 +30,7 @@ pub fn run(context: &AppContext, command: VersionCommand) -> Result<CommandOutpu
 }
 
 pub(super) fn resolve_version_ref(
-    lix: &Lix,
+    lix: &FileLix,
     lookup: VersionLookup<'_>,
 ) -> Result<ResolvedVersionRef, CliError> {
     match lookup {
@@ -38,13 +39,13 @@ pub(super) fn resolve_version_ref(
     }
 }
 
-pub(super) fn resolve_active_version_ref(lix: &Lix) -> Result<ResolvedVersionRef, CliError> {
+pub(super) fn resolve_active_version_ref(lix: &FileLix) -> Result<ResolvedVersionRef, CliError> {
     let active_id = crate::db::block_on(lix.active_version_id())
         .map_err(|error| CliError::msg(error.to_string()))?;
     resolve_version_by_id(lix, &active_id)
 }
 
-fn resolve_version_by_id(lix: &Lix, id: &str) -> Result<ResolvedVersionRef, CliError> {
+fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_version WHERE id = $1 LIMIT 1",
         &[Value::Text(id.to_string())],
@@ -61,7 +62,7 @@ fn resolve_version_by_id(lix: &Lix, id: &str) -> Result<ResolvedVersionRef, CliE
     })
 }
 
-fn resolve_version_by_name(lix: &Lix, name: &str) -> Result<ResolvedVersionRef, CliError> {
+fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_version WHERE name = $1 ORDER BY id",
         &[Value::Text(name.to_string())],
@@ -247,18 +248,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_version_ref_by_name_rejects_ambiguous_matches() {
+    fn create_version_rejects_duplicate_name() {
         std::thread::Builder::new()
-            .name("resolve_version_ref_by_name_rejects_ambiguous_matches".to_string())
+            .name("create_version_rejects_duplicate_name".to_string())
             .stack_size(32 * 1024 * 1024)
-            .spawn(resolve_version_ref_by_name_rejects_ambiguous_matches_inner)
+            .spawn(create_version_rejects_duplicate_name_inner)
             .expect("test thread should spawn")
             .join()
             .expect("test thread should not panic");
     }
 
-    fn resolve_version_ref_by_name_rejects_ambiguous_matches_inner() {
-        let path = temp_lix_path("ambiguous-version-name");
+    fn create_version_rejects_duplicate_name_inner() {
+        let path = temp_lix_path("duplicate-version-name");
         cleanup_lix_path(&path);
 
         init_lix_at(&path).expect("lix init should succeed");
@@ -269,19 +270,15 @@ mod tests {
             from_commit_id: None,
         }))
         .expect("first version create should succeed");
-        crate::db::block_on(lix.create_version(CreateVersionOptions {
+        let error = crate::db::block_on(lix.create_version(CreateVersionOptions {
             id: Some("feature-b".to_string()),
             name: "feature".to_string(),
             from_commit_id: None,
         }))
-        .expect("second version create should succeed");
-
-        let error = resolve_version_ref(&lix, VersionLookup::Name("feature"))
-            .expect_err("ambiguous version name should fail");
-        assert_eq!(
-            error.to_string(),
-            "version name 'feature' is ambiguous; matching ids: feature-a, feature-b"
-        );
+        .expect_err("duplicate version name should fail");
+        assert_eq!(error.code, "LIX_ERROR_UNIQUE");
+        assert!(error.message.contains("lix_version_descriptor./name"));
+        assert!(error.message.contains("\"feature\""));
 
         cleanup_lix_path(&path);
     }

@@ -9,10 +9,11 @@
     "test": "pnpm test:js && pnpm test:rs",
     "test:js": "pnpm exec nx run-many --target=test --parallel",
     "test:rs": "cargo test --workspace",
-    "lint": "pnpm lint:js && pnpm lint:rs",
+    "lint": "pnpm format:check && pnpm lint:js && pnpm lint:rs",
     "lint:js": "pnpm exec nx run-many --target=lint --parallel",
     "lint:rs": "cargo fmt --all --check && cargo clippy --workspace --all-targets",
-    "format": "pnpm exec nx run-many --target=format --parallel",
+    "format": "pnpm exec nx format --all",
+    "format:check": "pnpm exec nx format:check --all",
     "clean": "pnpm recursive run clean && rm -rf ./.env ./node_modules",
     "----- CI ---- used to test the codebase on every commit": "",
     "ci": "pnpm lint && pnpm test && pnpm build"
@@ -27,6 +28,7 @@
     "@vitest/coverage-v8": "^3.1.1",
     "nx": "^21.0.0",
     "nx-cloud": "^19.1.0",
+    "prettier": "3.6.2",
     "vitest": "^3.1.1"
   }
 }

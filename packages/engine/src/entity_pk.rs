@@ -18,7 +18,6 @@ pub(crate) struct EntityPk {
 pub(crate) enum EntityPkError {
     EmptyPrimaryKey,
     EmptyPrimaryKeyPath { index: usize },
-    EmptyPrimaryKeyValue { index: usize },
     MissingPrimaryKeyValue { index: usize },
     UnsupportedPrimaryKeyValue { index: usize },
     InvalidEncodedEntityPk,
@@ -34,12 +33,6 @@ impl std::fmt::Display for EntityPkError {
                 write!(
                     formatter,
                     "primary-key path at index {index} must not be empty"
-                )
-            }
-            Self::EmptyPrimaryKeyValue { index } => {
-                write!(
-                    formatter,
-                    "primary-key value at index {index} must not be empty"
                 )
             }
             Self::MissingPrimaryKeyValue { index } => {
@@ -165,17 +158,11 @@ fn validate_parts(parts: &[String]) -> Result<(), EntityPkError> {
     if parts.is_empty() {
         return Err(EntityPkError::EmptyPrimaryKey);
     }
-    if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| part.is_empty()) {
-        return Err(EntityPkError::EmptyPrimaryKeyValue { index });
-    }
     Ok(())
 }
 
 fn string_part_from_json_value(value: &JsonValue, index: usize) -> Result<String, EntityPkError> {
     match value {
-        JsonValue::String(value) if value.is_empty() => {
-            Err(EntityPkError::EmptyPrimaryKeyValue { index })
-        }
         JsonValue::String(value) => Ok(value.clone()),
         _ => Err(EntityPkError::UnsupportedPrimaryKeyValue { index }),
     }
@@ -260,18 +247,21 @@ mod tests {
     }
 
     #[test]
-    fn entity_pk_json_array_rejects_empty_string_part() {
+    fn entity_pk_json_array_allows_empty_string_part() {
         assert_eq!(
-            EntityPk::from_json_array_text("[\"\"]"),
-            Err(EntityPkError::EmptyPrimaryKeyValue { index: 0 })
+            EntityPk::from_json_array_text("[\"\"]").expect("empty string is a valid part"),
+            EntityPk::single("")
         );
     }
 
     #[test]
-    fn tuple_rejects_empty_string_part() {
+    fn tuple_allows_empty_string_part() {
         assert_eq!(
-            EntityPk::tuple(vec!["namespace".to_string(), "".to_string()]),
-            Err(EntityPkError::EmptyPrimaryKeyValue { index: 1 })
+            EntityPk::tuple(vec!["namespace".to_string(), "".to_string()])
+                .expect("empty string is a valid part"),
+            EntityPk {
+                parts: vec!["namespace".to_string(), "".to_string()],
+            }
         );
     }
 
@@ -363,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn from_primary_key_paths_rejects_empty_string_parts() {
+    fn from_primary_key_paths_allows_empty_string_parts() {
         let snapshot = json!({
             "namespace": "messages",
             "id": ""
@@ -373,8 +363,11 @@ mod tests {
             EntityPk::from_primary_key_paths(
                 &snapshot,
                 &[vec!["namespace".to_string()], vec!["id".to_string()],],
-            ),
-            Err(EntityPkError::EmptyPrimaryKeyValue { index: 1 })
+            )
+            .expect("empty string is a valid primary-key value"),
+            EntityPk {
+                parts: vec!["messages".to_string(), "".to_string()],
+            }
         );
     }
 

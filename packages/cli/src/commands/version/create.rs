@@ -61,11 +61,11 @@ fn create_confirmation_lines(
     (
         format!(
             "Created version {} from {} ({}).",
-            result.version_id, parent.name, parent.id
+            result.id, parent.name, parent.id
         ),
         format!(
             "Active version is still {} ({}). Use `lix version switch --id {}` to work on it.",
-            active.name, active.id, result.version_id
+            active.name, active.id, result.id
         ),
     )
 }
@@ -79,7 +79,10 @@ mod tests {
     #[test]
     fn create_confirmation_uses_active_version_not_parent_version() {
         let result = CreateVersionResult {
-            version_id: "new-version".to_string(),
+            id: "new-version".to_string(),
+            name: "New Version".to_string(),
+            hidden: false,
+            commit_id: "commit-id".to_string(),
         };
         let parent = ResolvedVersionRef {
             id: "feature-b".to_string(),

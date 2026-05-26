@@ -1,24 +1,24 @@
 use clap::Parser;
-use lix_engine::{
-    boot as boot_engine, BootArgs as EngineConfig, ExecuteOptions, Session, SessionTransaction,
-    Value,
-};
-use lix_rs_sdk::{SqliteBackend, WasmRuntime, WasmtimeRuntime};
+use lix_rs_sdk::{open_lix_with_backend, Lix, LixTransaction, Value};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod sqlite_backend;
+
 const NULL_OID: &str = "0000000000000000000000000000000000000000";
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
+type BenchBackend = sqlite_backend::BenchSqliteBackend;
+type Session = Lix<BenchBackend>;
+type SessionTransaction = LixTransaction<BenchBackend>;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "Benchmark write+commit latency for Git vs Lix on real repo workloads")]
@@ -216,11 +216,8 @@ struct TrialResult {
     verified: bool,
 }
 
-fn main() {
-    if let Err(error) = run_with_large_stack(real_main) {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+fn main() -> Result<(), DynError> {
+    run_with_large_stack(real_main)
 }
 
 fn run_with_large_stack<F>(f: F) -> DynResult<()>
@@ -268,13 +265,7 @@ fn real_main() -> DynResult<()> {
             prepared_workload.workload.subject,
             prepared_workload.workload.changed_paths
         );
-        let trials = run_workload_trials(
-            &repo_path,
-            &args,
-            &tmp_root,
-            prepared_workload,
-            Arc::clone(&prepared.wasm_runtime),
-        )?;
+        let trials = run_workload_trials(&repo_path, &args, &tmp_root, prepared_workload)?;
         let git_trials = filtered_trials(&trials, "git");
         let lix_trials = filtered_trials(&trials, "lix");
         let git_report = build_metric_report(&git_trials);
@@ -359,7 +350,6 @@ fn real_main() -> DynResult<()> {
 
 struct PreparedBenchmark {
     workloads: Vec<PreparedWorkload>,
-    wasm_runtime: Arc<dyn WasmRuntime>,
 }
 
 fn validate_args(args: &Args) -> DynResult<()> {
@@ -499,7 +489,6 @@ fn prepare_workloads(
     tmp_root: &Path,
     workloads: &[Workload],
 ) -> DynResult<PreparedBenchmark> {
-    let wasm_runtime: Arc<dyn WasmRuntime> = Arc::new(WasmtimeRuntime::new()?);
     let git_templates_dir = tmp_root.join("git-templates");
     fs::create_dir_all(&git_templates_dir)?;
     let mut prepared_workloads = Vec::with_capacity(workloads.len());
@@ -518,7 +507,6 @@ fn prepare_workloads(
 
     Ok(PreparedBenchmark {
         workloads: prepared_workloads,
-        wasm_runtime,
     })
 }
 
@@ -527,7 +515,6 @@ fn run_workload_trials(
     args: &Args,
     tmp_root: &Path,
     workload: &PreparedWorkload,
-    wasm_runtime: Arc<dyn WasmRuntime>,
 ) -> DynResult<Vec<TrialResult>> {
     let git_trial_root = tmp_root
         .join("git-runs")
@@ -564,7 +551,6 @@ fn run_workload_trials(
                     iteration,
                     warmup,
                     workload,
-                    Arc::clone(&wasm_runtime),
                     !args.skip_verify,
                 )?,
                 _ => unreachable!(),
@@ -646,37 +632,31 @@ fn run_lix_trial(
     iteration: usize,
     warmup: bool,
     workload: &PreparedWorkload,
-    wasm_runtime: Arc<dyn WasmRuntime>,
     verify_state: bool,
 ) -> DynResult<TrialResult> {
     let db_path = trial_root.join(format!("trial-{iteration}.lix"));
     if db_path.exists() {
         fs::remove_file(&db_path)?;
     }
-    let session = create_initialized_session(&db_path, wasm_runtime)?;
+    let session = create_initialized_session(&db_path)?;
     if !workload.lix_template.seed_rows.is_empty() {
         let seed_rows = workload.lix_template.seed_rows.clone();
-        pollster::block_on(session.transaction(ExecuteOptions::default(), |tx| {
-            Box::pin(async move {
-                for row in seed_rows {
-                    tx.execute(
-                        "INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3)",
-                        &[
-                            Value::Text(row.id),
-                            Value::Text(row.path),
-                            Value::Blob(row.data),
-                        ],
-                    )
-                    .await?;
-                }
-                Ok(())
-            })
-        }))?;
+        let mut seed_transaction = pollster::block_on(session.begin_transaction())?;
+        for row in seed_rows {
+            pollster::block_on(seed_transaction.execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text(row.id),
+                    Value::Text(row.path),
+                    Value::Blob(row.data),
+                ],
+            ))?;
+        }
+        pollster::block_on(seed_transaction.commit())?;
     }
     let mut path_to_id = workload.lix_template.path_to_id.clone();
     let mut next_file_id = next_file_id_from_map(&path_to_id);
-    let mut transaction =
-        pollster::block_on(session.begin_transaction_with_options(ExecuteOptions::default()))?;
+    let mut transaction = pollster::block_on(session.begin_transaction())?;
 
     let write_started = Instant::now();
     for operation in &workload.workload.operations {
@@ -848,7 +828,7 @@ fn set_executable_if_needed(path: &Path, executable: bool) -> DynResult<()> {
 }
 
 fn execute_engine_operation(
-    transaction: &mut SessionTransaction<'_>,
+    transaction: &mut SessionTransaction,
     operation: &FileOperation,
     path_to_id: &mut BTreeMap<String, String>,
     next_file_id: &mut u64,
@@ -864,7 +844,7 @@ fn execute_engine_operation(
             let file_id = allocate_file_id(next_file_id);
             pollster::block_on(
                 transaction.execute(
-                    "INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
                     &[
                         Value::Text(file_id.clone()),
                         Value::Text(path.clone()),
@@ -893,7 +873,7 @@ fn execute_engine_operation(
                 .ok_or_else(|| format!("missing file id for modified path {path}"))?;
             pollster::block_on(
                 transaction.execute(
-                    "UPDATE lix_file SET data = ?1 WHERE id = ?2",
+                    "UPDATE lix_file SET data = $1 WHERE id = $2",
                     &[
                         Value::Blob(
                             operation
@@ -925,7 +905,7 @@ fn execute_engine_operation(
                 .ok_or_else(|| format!("missing file id for renamed path {old_path}"))?;
             pollster::block_on(
                 transaction.execute(
-                    "UPDATE lix_file SET path = ?1, data = ?2 WHERE id = ?3",
+                    "UPDATE lix_file SET path = $1, data = $2 WHERE id = $3",
                     &[
                         Value::Text(new_path.clone()),
                         Value::Blob(
@@ -952,7 +932,7 @@ fn execute_engine_operation(
                 .remove(&old_path)
                 .ok_or_else(|| format!("missing file id for deleted path {old_path}"))?;
             pollster::block_on(transaction.execute(
-                "DELETE FROM lix_file WHERE id = ?1",
+                "DELETE FROM lix_file WHERE id = $1",
                 &[Value::Text(file_id)],
             ))?;
         }
@@ -967,16 +947,39 @@ fn verify_session_state(
     let result =
         pollster::block_on(session.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))?;
     let mut actual = BTreeMap::new();
-    for row in &result.statements[0].rows {
-        let path = expect_text(&row[0])?;
-        let bytes = value_as_bytes(&row[1])?;
+    for row in result.rows() {
+        let path = expect_text(
+            row.get_index(0)
+                .ok_or("lix_file query row is missing path column")?,
+        )?;
+        let bytes = value_as_bytes(
+            row.get_index(1)
+                .ok_or("lix_file query row is missing data column")?,
+        )?;
         actual.insert(path, bytes);
     }
     if &actual != expected_files {
+        let missing = expected_files
+            .keys()
+            .find(|path| !actual.contains_key(*path))
+            .cloned();
+        let unexpected = actual
+            .keys()
+            .find(|path| !expected_files.contains_key(*path))
+            .cloned();
+        let byte_mismatch = expected_files.iter().find_map(|(path, expected)| {
+            actual
+                .get(path)
+                .filter(|actual| *actual != expected)
+                .map(|actual| (path.clone(), expected.len(), actual.len()))
+        });
         return Err(format!(
-            "Lix state verification failed: expected {} files, got {} files",
+            "Lix state verification failed: expected {} files, got {} files; missing={:?}; unexpected={:?}; byte_mismatch={:?}",
             expected_files.len(),
-            actual.len()
+            actual.len(),
+            missing,
+            unexpected,
+            byte_mismatch
         )
         .into());
     }
@@ -984,21 +987,12 @@ fn verify_session_state(
     Ok(())
 }
 
-fn create_initialized_session(
-    path: &Path,
-    wasm_runtime: Arc<dyn WasmRuntime>,
-) -> DynResult<Session> {
+fn create_initialized_session(path: &Path) -> DynResult<Session> {
     if path.exists() {
         fs::remove_file(path)?;
     }
-    let init_backend = SqliteBackend::from_path(path)?;
-    let engine = Arc::new(boot_engine(EngineConfig::new(
-        Box::new(init_backend),
-        Arc::clone(&wasm_runtime),
-    )));
-    let _ = pollster::block_on(engine.initialize_if_needed())?;
-    pollster::block_on(engine.open_existing())?;
-    Ok(pollster::block_on(engine.open_session())?)
+    let backend = BenchBackend::file_backed(path)?;
+    Ok(pollster::block_on(open_lix_with_backend(backend))?)
 }
 
 fn expect_text(value: &Value) -> DynResult<String> {
@@ -1425,13 +1419,35 @@ fn to_lix_path(path: &str) -> String {
 
 fn encode_lix_path_segment(segment: &str) -> String {
     let mut encoded = String::new();
-    for byte in segment.as_bytes() {
-        let ch = *byte as char;
-        let allowed = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '~' | '-');
+    for ch in segment.chars() {
+        let allowed = !ch.is_ascii()
+            || ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '-' | '.'
+                    | '_'
+                    | '~'
+                    | ':'
+                    | '@'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+            );
         if allowed {
             encoded.push(ch);
         } else {
-            encoded.push_str(&format!("%{:02X}", byte));
+            let mut utf8 = [0u8; 4];
+            for byte in ch.encode_utf8(&mut utf8).as_bytes() {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
         }
     }
     encoded
@@ -1492,6 +1508,23 @@ fn unsupported_change_reason(change: &RawChange) -> Option<String> {
             }
         }
         other => Some(format!("unsupported diff status '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_lix_path;
+
+    #[test]
+    fn to_lix_path_preserves_valid_lix_path_punctuation() {
+        assert_eq!(
+            to_lix_path("packages/website/src/routes/blog/$slug.tsx"),
+            "/packages/website/src/routes/blog/$slug.tsx"
+        );
+        assert_eq!(
+            to_lix_path(r#"docs/hello:world@x!$&'()*+,;=.md"#),
+            r#"/docs/hello:world@x!$&'()*+,;=.md"#
+        );
     }
 }
 

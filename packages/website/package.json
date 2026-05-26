@@ -8,7 +8,7 @@
     "postbuild": "node ./scripts/post-build-seo.js",
     "preview": "vite preview",
     "test": "vitest run && tsc --noEmit",
-    "format": "prettier --write ."
+    "format": "prettier --write --ignore-unknown ."
   },
   "dependencies": {
     "@opral/markdown-wc": "0.9.0",
@@ -26,7 +26,6 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.1",
-    "prettier": "^3.6.0",
     "typescript": "^5.7.2",
     "vite": "^8.0.10",
     "vite-plugin-static-copy": "^4.1.0",

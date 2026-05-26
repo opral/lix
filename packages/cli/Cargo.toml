@@ -8,13 +8,15 @@ name = "lix"
 path = "src/main.rs"
 
 [dependencies]
+lix_rs_sdk = { path = "../rs-sdk", version = "0.1.0" }
+
 async-trait = "0.1"
 clap = { version = "4.5.31", features = ["derive"] }
-lix_rs_sdk = { path = "../rs-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 pollster = "0.4"
 comfy-table = "7.1"
 base64 = "0.22"
+bytes = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt"] }

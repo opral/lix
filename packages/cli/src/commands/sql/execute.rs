@@ -243,7 +243,7 @@ mod tests {
                 let args = SqlExecuteArgs {
                     format: SqlOutputFormat::Json,
                     params: Some("[\"left\", \"right\"]".to_string()),
-                    sql: "SELECT ?1 AS first_value, ?2 AS second_value".to_string(),
+                    sql: "SELECT $1 AS first_value, $2 AS second_value".to_string(),
                 };
 
                 let result = run(&context, args);

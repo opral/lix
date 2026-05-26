@@ -1,7 +1,8 @@
 use crate::cli::exp::ExpGitReplayArgs;
 use crate::db;
+use crate::db::FileLix;
 use crate::error::CliError;
-use lix_rs_sdk::{Lix, Value};
+use lix_rs_sdk::Value;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -375,7 +376,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn init_and_open_lix_at_path(path: &Path) -> Result<Lix, CliError> {
+fn init_and_open_lix_at_path(path: &Path) -> Result<FileLix, CliError> {
     db::init_lix_at(path)?;
     let lix = db::open_lix_at(path)?;
     crate::db::block_on(lix.execute(
@@ -387,7 +388,7 @@ fn init_and_open_lix_at_path(path: &Path) -> Result<Lix, CliError> {
 }
 
 fn execute_statements_as_transaction(
-    lix: &Lix,
+    lix: &FileLix,
     statements: &[SqlStatement],
     commit_sha: &str,
 ) -> Result<(), CliError> {
@@ -428,7 +429,7 @@ fn number_sql_parameters(sql: &str, next_param_index: &mut usize) -> String {
     let mut numbered = String::with_capacity(sql.len() + 16);
     for ch in sql.chars() {
         if ch == '?' {
-            numbered.push('?');
+            numbered.push('$');
             numbered.push_str(&next_param_index.to_string());
             *next_param_index += 1;
         } else {
@@ -1019,7 +1020,7 @@ fn apply_prepared_to_expected_state(
 }
 
 fn verify_commit_state_hashes(
-    lix: &Lix,
+    lix: &FileLix,
     expected_state_by_id: &HashMap<String, ExpectedFile>,
     commit_sha: &str,
 ) -> Result<(), CliError> {
@@ -1497,6 +1498,31 @@ mod tests {
         );
 
         fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn build_transaction_script_numbers_parameters_with_datafusion_placeholders() {
+        let statements = vec![
+            SqlStatement {
+                sql: "DELETE FROM lix_file WHERE id IN (?, ?)".to_string(),
+                params: vec![
+                    Value::Text("left".to_string()),
+                    Value::Text("right".to_string()),
+                ],
+            },
+            SqlStatement {
+                sql: "UPDATE lix_file SET data = ? WHERE id = ?".to_string(),
+                params: vec![
+                    Value::Blob(b"hello".to_vec()),
+                    Value::Text("file-id".to_string()),
+                ],
+            },
+        ];
+
+        assert_eq!(
+            build_transaction_script(&statements),
+            "BEGIN; DELETE FROM lix_file WHERE id IN ($1, $2); UPDATE lix_file SET data = $3 WHERE id = $4; COMMIT;"
+        );
     }
 
     #[test]

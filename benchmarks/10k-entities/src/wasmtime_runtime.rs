@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
-use lix_engine::{CanonicalJson, LixError};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use zip::read::ZipArchive;
 
 mod plugin_bindings {
     wasmtime::component::bindgen!({
@@ -16,82 +15,102 @@ mod plugin_bindings {
     });
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct WirePluginFile {
-    id: String,
-    path: String,
-    data: Vec<u8>,
-}
+pub use plugin_bindings::exports::lix::plugin::api::{
+    EntityChange as PluginEntityChange, File as PluginFile, PluginError,
+};
 
-#[derive(Debug, serde::Deserialize)]
-struct WireDetectChangesRequest {
-    before: Option<WirePluginFile>,
-    after: WirePluginFile,
-    state_context: Option<WireDetectStateContext>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct WireDetectStateContext {
-    active_state: Option<Vec<WireActiveStateRow>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct WireActiveStateRow {
-    entity_pk: String,
-    schema_key: Option<String>,
-    snapshot_content: Option<CanonicalJson>,
-    file_id: Option<String>,
-    plugin_key: Option<String>,
-    version_id: Option<String>,
-    change_id: Option<String>,
-    metadata: Option<CanonicalJson>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct WirePluginEntityChange {
-    entity_pk: String,
-    schema_key: String,
-    snapshot_content: Option<CanonicalJson>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct WireApplyChangesRequest {
-    file: WirePluginFile,
-    changes: Vec<WirePluginEntityChange>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct WirePluginEntityChangeOutput {
-    entity_pk: String,
-    schema_key: String,
-    snapshot_content: Option<CanonicalJson>,
-}
-
-pub struct TestWasmtimeRuntime {
+pub struct JsonPluginRuntime {
     engine: Engine,
     component_cache: Mutex<HashMap<ComponentCacheKey, Arc<Component>>>,
 }
 
-impl TestWasmtimeRuntime {
-    pub fn new() -> Result<Self, LixError> {
+impl JsonPluginRuntime {
+    pub fn new() -> Result<Self, String> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(false);
         config.consume_fuel(true);
 
-        let engine = Engine::new(&config).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Failed to initialize wasmtime engine: {error}"),
-            hint: None,
-        })?;
+        let engine = Engine::new(&config)
+            .map_err(|error| format!("failed to initialize wasmtime engine: {error}"))?;
 
         Ok(Self {
             engine,
             component_cache: Mutex::new(HashMap::new()),
         })
     }
+
+    pub fn detect_changes(
+        &self,
+        plugin_archive: &[u8],
+        before: Option<PluginFile>,
+        after: PluginFile,
+    ) -> Result<Vec<PluginEntityChange>, String> {
+        let wasm_bytes = plugin_wasm_bytes_from_archive(plugin_archive)?;
+        let component = self.component_for_bytes(&wasm_bytes)?;
+        let mut store = Store::new(
+            &self.engine,
+            WasiState {
+                table: ResourceTable::new(),
+                ctx: WasiCtxBuilder::new().build(),
+            },
+        );
+        store
+            .set_fuel(u64::MAX)
+            .map_err(|error| format!("failed to configure wasm fuel: {error}"))?;
+
+        let mut linker = Linker::new(&self.engine);
+        wasmtime_wasi::add_to_linker_sync(&mut linker)
+            .map_err(|error| format!("failed to add wasi imports to linker: {error}"))?;
+
+        let bindings =
+            plugin_bindings::Plugin::instantiate(&mut store, component.as_ref(), &linker)
+                .map_err(|error| format!("failed to instantiate wasm component: {error}"))?;
+
+        bindings
+            .lix_plugin_api()
+            .call_detect_changes(&mut store, before.as_ref(), &after, None)
+            .map_err(|error| format!("wasm call failed for detect-changes: {error}"))?
+            .map_err(plugin_error_message)
+    }
+
+    fn component_for_bytes(&self, bytes: &[u8]) -> Result<Arc<Component>, String> {
+        let cache_key = ComponentCacheKey::from_bytes(bytes);
+
+        if let Some(component) = self
+            .component_cache
+            .lock()
+            .map_err(|_| "component cache lock poisoned".to_string())?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(component);
+        }
+
+        let compiled = Arc::new(
+            Component::new(&self.engine, bytes)
+                .map_err(|error| format!("failed to compile wasm component: {error}"))?,
+        );
+
+        let mut cache = self
+            .component_cache
+            .lock()
+            .map_err(|_| "component cache lock poisoned".to_string())?;
+        Ok(cache.entry(cache_key).or_insert_with(|| compiled).clone())
+    }
+}
+
+fn plugin_wasm_bytes_from_archive(plugin_archive: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = ZipArchive::new(Cursor::new(plugin_archive))
+        .map_err(|error| format!("plugin archive is not a valid zip file: {error}"))?;
+    let mut entry = archive
+        .by_name("plugin.wasm")
+        .map_err(|error| format!("plugin archive is missing plugin.wasm: {error}"))?;
+    let mut bytes = Vec::new();
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read plugin.wasm from archive: {error}"))?;
+    Ok(bytes)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -107,11 +126,6 @@ impl ComponentCacheKey {
             wasm_len: bytes.len(),
         }
     }
-}
-
-struct TestWasmtimeInstance {
-    engine: Engine,
-    component: Arc<Component>,
 }
 
 struct WasiState {
@@ -131,251 +145,15 @@ impl WasiView for WasiState {
     }
 }
 
-#[async_trait(?Send)]
-impl WasmRuntime for TestWasmtimeRuntime {
-    async fn init_component(
-        &self,
-        bytes: Vec<u8>,
-        _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        let cache_key = ComponentCacheKey::from_bytes(&bytes);
-
-        if let Some(component) = self
-            .component_cache
-            .lock()
-            .expect("component cache mutex poisoned")
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(Arc::new(TestWasmtimeInstance {
-                engine: self.engine.clone(),
-                component,
-            }));
-        }
-
-        let compiled =
-            Arc::new(
-                Component::new(&self.engine, &bytes).map_err(|error| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!("Failed to compile wasm component: {error}"),
-                    hint: None,
-                })?,
-            );
-
-        let component = {
-            let mut cache = self
-                .component_cache
-                .lock()
-                .expect("component cache mutex poisoned");
-            cache
-                .entry(cache_key)
-                .or_insert_with(|| compiled.clone())
-                .clone()
-        };
-
-        Ok(Arc::new(TestWasmtimeInstance {
-            engine: self.engine.clone(),
-            component,
-        }))
-    }
-}
-
-#[async_trait(?Send)]
-impl WasmComponentInstance for TestWasmtimeInstance {
-    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
-        let mut store = Store::new(
-            &self.engine,
-            WasiState {
-                table: ResourceTable::new(),
-                ctx: WasiCtxBuilder::new().build(),
-            },
-        );
-        store.set_fuel(u64::MAX).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Failed to configure wasm fuel: {error}"),
-            hint: None,
-        })?;
-
-        let mut linker = Linker::new(&self.engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Failed to add wasi imports to linker: {error}"),
-            hint: None,
-        })?;
-
-        let bindings =
-            plugin_bindings::Plugin::instantiate(&mut store, self.component.as_ref(), &linker)
-                .map_err(|error| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!("Failed to instantiate wasm component: {error}"),
-                    hint: None,
-                })?;
-
-        match export {
-            "detect-changes" | "api#detect-changes" => {
-                let request: WireDetectChangesRequest =
-                    serde_json::from_slice(input).map_err(|error| LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!(
-                            "Failed to decode detect-changes request payload: {error}"
-                        ),
-                        hint: None,
-                    })?;
-
-                let before = request.before.map(wire_file_to_binding);
-                let after = wire_file_to_binding(request.after);
-                let state_context = request.state_context.map(wire_state_context_to_binding);
-
-                let result = bindings
-                    .lix_plugin_api()
-                    .call_detect_changes(
-                        &mut store,
-                        before.as_ref(),
-                        &after,
-                        state_context.as_ref(),
-                    )
-                    .map_err(|error| LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!("Wasm call failed for export '{export}': {error}"),
-                        hint: None,
-                    })?;
-
-                match result {
-                    Ok(changes) => {
-                        let wire = changes
-                            .into_iter()
-                            .map(binding_change_to_wire)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        serde_json::to_vec(&wire).map_err(|error| LixError {
-                            code: "LIX_ERROR_UNKNOWN".to_string(),
-                            description: format!(
-                                "Failed to encode detect-changes response payload: {error}"
-                            ),
-                            hint: None,
-                        })
-                    }
-                    Err(error) => Err(map_plugin_error(error)),
-                }
-            }
-            "apply-changes" | "api#apply-changes" => {
-                let request: WireApplyChangesRequest =
-                    serde_json::from_slice(input).map_err(|error| LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!(
-                            "Failed to decode apply-changes request payload: {error}"
-                        ),
-                        hint: None,
-                    })?;
-
-                let file = wire_file_to_binding(request.file);
-                let changes = request
-                    .changes
-                    .into_iter()
-                    .map(wire_change_to_binding)
-                    .collect::<Vec<_>>();
-
-                let result = bindings
-                    .lix_plugin_api()
-                    .call_apply_changes(&mut store, &file, &changes)
-                    .map_err(|error| LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!("Wasm call failed for export '{export}': {error}"),
-                        hint: None,
-                    })?;
-
-                match result {
-                    Ok(output) => Ok(output),
-                    Err(error) => Err(map_plugin_error(error)),
-                }
-            }
-            other => Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("Unsupported export '{other}' for TestWasmtimeRuntime"),
-                hint: None,
-            }),
-        }
-    }
-}
-
 fn wasm_fingerprint(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
 }
 
-fn wire_file_to_binding(file: WirePluginFile) -> plugin_bindings::exports::lix::plugin::api::File {
-    plugin_bindings::exports::lix::plugin::api::File {
-        id: file.id,
-        path: file.path,
-        data: file.data,
-    }
-}
-
-fn wire_change_to_binding(
-    change: WirePluginEntityChange,
-) -> plugin_bindings::exports::lix::plugin::api::EntityChange {
-    plugin_bindings::exports::lix::plugin::api::EntityChange {
-        entity_pk: change.entity_pk,
-        schema_key: change.schema_key,
-        snapshot_content: change.snapshot_content.map(Into::into),
-    }
-}
-
-fn wire_state_context_to_binding(
-    context: WireDetectStateContext,
-) -> plugin_bindings::exports::lix::plugin::api::DetectStateContext {
-    plugin_bindings::exports::lix::plugin::api::DetectStateContext {
-        active_state: context.active_state.map(|rows| {
-            rows.into_iter()
-                .map(wire_active_state_row_to_binding)
-                .collect::<Vec<_>>()
-        }),
-    }
-}
-
-fn wire_active_state_row_to_binding(
-    row: WireActiveStateRow,
-) -> plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
-    plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
-        entity_pk: row.entity_pk,
-        schema_key: row.schema_key,
-        snapshot_content: row.snapshot_content.map(Into::into),
-        file_id: row.file_id,
-        plugin_key: row.plugin_key,
-        version_id: row.version_id,
-        change_id: row.change_id,
-        metadata: row.metadata.map(Into::into),
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    }
-}
-
-fn binding_change_to_wire(
-    change: plugin_bindings::exports::lix::plugin::api::EntityChange,
-) -> Result<WirePluginEntityChangeOutput, LixError> {
-    Ok(WirePluginEntityChangeOutput {
-        entity_pk: change.entity_pk,
-        schema_key: change.schema_key,
-        snapshot_content: change
-            .snapshot_content
-            .map(CanonicalJson::from_text)
-            .transpose()?,
-    })
-}
-
-fn map_plugin_error(error: plugin_bindings::exports::lix::plugin::api::PluginError) -> LixError {
+fn plugin_error_message(error: PluginError) -> String {
     match error {
-        plugin_bindings::exports::lix::plugin::api::PluginError::InvalidInput(message) => {
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("Plugin invalid-input error: {message}"),
-                hint: None,
-            }
-        }
-        plugin_bindings::exports::lix::plugin::api::PluginError::Internal(message) => LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Plugin internal error: {message}"),
-            hint: None,
-        },
+        PluginError::InvalidInput(message) => format!("plugin invalid-input error: {message}"),
+        PluginError::Internal(message) => format!("plugin internal error: {message}"),
     }
 }
