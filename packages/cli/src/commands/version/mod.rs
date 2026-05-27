@@ -80,7 +80,7 @@ fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionR
         rows => {
             let matching_ids = rows
                 .iter()
-                .map(|row| text_at(row, 0, "lix_version.id"))
+                .map(|row| text_at(row, 0, "lix_branch.id"))
                 .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             Err(CliError::msg(format!(
