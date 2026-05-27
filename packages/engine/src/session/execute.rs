@@ -339,6 +339,10 @@ where
         } else {
             Some(self.begin_session_operation()?)
         };
+        // Lock by statement shape, not by a pre-lock mode read. The read
+        // snapshot below is where FunctionContext observes deterministic mode;
+        // checking mode before this point can race with another session
+        // enabling deterministic mode.
         let _deterministic_runtime_guard = if has_durable_runtime_function {
             Some(self.lock_deterministic_runtime().await)
         } else {
