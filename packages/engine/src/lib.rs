@@ -38,6 +38,7 @@ pub(crate) mod sql2;
 pub mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
+pub(crate) mod storage_codec;
 #[cfg_attr(feature = "storage-benches", allow(dead_code))]
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;

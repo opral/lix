@@ -1,11 +1,16 @@
 use bytes::Bytes;
 
+use super::types::{
+    UntrackedBranchPrefixRef, UntrackedBranchSchemaEntityFilePrefixRef,
+    UntrackedBranchSchemaEntityPrefixRef, UntrackedBranchSchemaPrefixRef,
+};
 use crate::entity_pk::EntityPk;
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageRead, StorageScanOptions, StorageSpace, StorageSpaceId,
     StorageValue, StorageWriteSet,
 };
+use crate::storage_codec;
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedMaterializationProjection, UntrackedStateIdentity,
     UntrackedStateIdentityRef, UntrackedStateRow, UntrackedStateRowRef, UntrackedStateRowRequest,
@@ -16,14 +21,6 @@ use crate::{LixError, NullableKeyFilter};
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row.v1";
 pub(crate) const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0001_0002), UNTRACKED_STATE_ROW_NAMESPACE);
-// Durable key bytes:
-//   b"LXUK" | branch:u8 |
-//   branch_id_len:u32be | branch_id:utf8 |
-//   schema_key_len:u32be | schema_key:utf8 |
-//   entity_part_count:u32be | {entity_part_len:u32be | entity_part:utf8}* |
-//   file_id_tag:u8 | [file_id_len:u32be | file_id:utf8]
-const UNTRACKED_STATE_ROW_KEY_IDENTIFIER: &[u8; 4] = b"LXUK";
-const UNTRACKED_STATE_ROW_KEY_BRANCH_V1: u8 = 1;
 
 pub(crate) async fn scan_rows(
     store: &impl StorageRead,
@@ -250,38 +247,38 @@ fn scan_prefixes_for_filter(
 
     let mut prefixes = Vec::new();
     for branch_id in &filter.branch_ids {
-        let mut branch_prefix = key_header();
-        push_component(&mut branch_prefix, branch_id)?;
         if filter.schema_keys.is_empty() {
-            prefixes.push(branch_prefix);
+            prefixes.push(encode_untracked_branch_prefix(branch_id)?);
             continue;
         }
 
         for schema_key in &filter.schema_keys {
-            let mut schema_prefix = branch_prefix.clone();
-            push_component(&mut schema_prefix, schema_key)?;
             if filter.entity_pks.is_empty() {
-                prefixes.push(schema_prefix);
+                prefixes.push(encode_untracked_branch_schema_prefix(
+                    branch_id, schema_key,
+                )?);
                 continue;
             }
 
             for entity_pk in &filter.entity_pks {
-                let mut entity_prefix = schema_prefix.clone();
-                push_entity_component(&mut entity_prefix, entity_pk)?;
-                append_file_prefixes(&mut prefixes, entity_prefix, &filter.file_ids)?;
+                append_file_prefixes(
+                    &mut prefixes,
+                    branch_id,
+                    schema_key,
+                    entity_pk,
+                    &filter.file_ids,
+                )?;
             }
         }
     }
     Ok(prefixes)
 }
 
-fn push_entity_component(out: &mut Vec<u8>, entity_pk: &EntityPk) -> Result<(), LixError> {
-    push_entity_tuple(out, entity_pk)
-}
-
 fn append_file_prefixes(
     prefixes: &mut Vec<Vec<u8>>,
-    entity_prefix: Vec<u8>,
+    branch_id: &str,
+    schema_key: &str,
+    entity_pk: &EntityPk,
     file_filters: &[NullableKeyFilter<String>],
 ) -> Result<(), LixError> {
     if file_filters.is_empty()
@@ -289,21 +286,29 @@ fn append_file_prefixes(
             .iter()
             .any(|filter| matches!(filter, NullableKeyFilter::Any))
     {
-        prefixes.push(entity_prefix);
+        prefixes.push(encode_untracked_branch_schema_entity_prefix(
+            branch_id, schema_key, entity_pk,
+        )?);
         return Ok(());
     }
 
     for filter in file_filters {
-        let mut prefix = entity_prefix.clone();
         match filter {
-            NullableKeyFilter::Null => prefix.push(0),
+            NullableKeyFilter::Null => {
+                prefixes.push(encode_untracked_branch_schema_entity_file_prefix(
+                    branch_id, schema_key, entity_pk, None,
+                )?)
+            }
             NullableKeyFilter::Value(file_id) => {
-                prefix.push(1);
-                push_component(&mut prefix, file_id)?;
+                prefixes.push(encode_untracked_branch_schema_entity_file_prefix(
+                    branch_id,
+                    schema_key,
+                    entity_pk,
+                    Some(file_id),
+                )?)
             }
             NullableKeyFilter::Any => unreachable!("Any handled before exact file prefixes"),
         }
-        prefixes.push(prefix);
     }
     Ok(())
 }
@@ -354,193 +359,65 @@ fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Result<V
 pub(crate) fn encode_untracked_state_row_key_ref(
     identity: UntrackedStateIdentityRef<'_>,
 ) -> Result<Vec<u8>, LixError> {
-    let mut out = key_header();
-    push_component(&mut out, identity.branch_id)?;
-    push_component(&mut out, identity.schema_key)?;
-    push_entity_tuple(&mut out, identity.entity_pk)?;
-    match identity.file_id {
-        Some(file_id) => {
-            out.push(1);
-            push_component(&mut out, file_id)?;
-        }
-        None => out.push(0),
-    }
-    Ok(out)
+    storage_codec::encode("untracked-state key", &identity)
 }
 
-fn decode_untracked_state_row_key_ref(bytes: &[u8]) -> Result<UntrackedStateIdentity, LixError> {
-    if !bytes.starts_with(UNTRACKED_STATE_ROW_KEY_IDENTIFIER) {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: invalid key identifier",
-        ));
-    }
-    let mut cursor = UNTRACKED_STATE_ROW_KEY_IDENTIFIER.len();
-    let branch = bytes.get(cursor).copied().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: missing branch",
-        )
-    })?;
-    cursor += 1;
-    if branch != UNTRACKED_STATE_ROW_KEY_BRANCH_V1 {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: unsupported branch {branch}"),
-        ));
-    }
-    let branch_id = read_key_component(bytes, &mut cursor, "branch_id")?;
-    let schema_key = read_key_component(bytes, &mut cursor, "schema_key")?;
-    let entity_pk = read_entity_tuple(bytes, &mut cursor)?;
-    let file_tag = bytes.get(cursor).copied().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: missing file_id tag",
-        )
-    })?;
-    cursor += 1;
-    let file_id = match file_tag {
-        0 => None,
-        1 => Some(read_key_component(bytes, &mut cursor, "file_id")?),
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "failed to decode untracked-state key: invalid file_id tag",
-            ));
-        }
-    };
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: trailing bytes",
-        ));
-    }
-    Ok(UntrackedStateIdentity {
-        branch_id,
-        schema_key,
-        entity_pk,
-        file_id,
-    })
+pub(crate) fn decode_untracked_state_row_key_ref(
+    bytes: &[u8],
+) -> Result<UntrackedStateIdentity, LixError> {
+    storage_codec::decode("untracked-state key", bytes)
 }
 
-fn read_key_component(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<String, LixError> {
-    let len_end = cursor.checked_add(4).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: `{field}` cursor overflow"),
-        )
-    })?;
-    let len_bytes = bytes.get(*cursor..len_end).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: truncated `{field}` length"),
-        )
-    })?;
-    *cursor = len_end;
-    let len = u32::from_be_bytes(len_bytes.try_into().expect("slice length checked")) as usize;
-    let value_end = cursor.checked_add(len).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: `{field}` length overflow"),
-        )
-    })?;
-    let value = bytes.get(*cursor..value_end).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: truncated `{field}`"),
-        )
-    })?;
-    *cursor = value_end;
-    std::str::from_utf8(value)
-        .map(str::to_string)
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "failed to decode untracked-state key: invalid utf-8 for `{field}`: {error}"
-                ),
-            )
-        })
+fn encode_untracked_branch_prefix(branch_id: &str) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "untracked-state branch key prefix",
+        &UntrackedBranchPrefixRef { branch_id },
+    )
 }
 
-fn read_entity_tuple(bytes: &[u8], cursor: &mut usize) -> Result<EntityPk, LixError> {
-    let part_count = read_key_u32(bytes, cursor, "entity_part_count")? as usize;
-    if part_count == 0 {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: entity primary key has no parts",
-        ));
-    }
-
-    let mut parts = Vec::with_capacity(part_count);
-    for _ in 0..part_count {
-        let part = read_key_component(bytes, cursor, "entity_part")?;
-        parts.push(part);
-    }
-    Ok(EntityPk { parts })
+fn encode_untracked_branch_schema_prefix(
+    branch_id: &str,
+    schema_key: &str,
+) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "untracked-state branch/schema key prefix",
+        &UntrackedBranchSchemaPrefixRef {
+            branch_id,
+            schema_key,
+        },
+    )
 }
 
-fn read_key_u32(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u32, LixError> {
-    let len_end = cursor.checked_add(4).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: `{field}` cursor overflow"),
-        )
-    })?;
-    let len_bytes = bytes.get(*cursor..len_end).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: truncated `{field}`"),
-        )
-    })?;
-    *cursor = len_end;
-    Ok(u32::from_be_bytes(
-        len_bytes.try_into().expect("slice length checked"),
-    ))
+fn encode_untracked_branch_schema_entity_prefix(
+    branch_id: &str,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "untracked-state branch/schema/entity key prefix",
+        &UntrackedBranchSchemaEntityPrefixRef {
+            branch_id,
+            schema_key,
+            entity_pk,
+        },
+    )
 }
 
-fn key_header() -> Vec<u8> {
-    let mut out = Vec::with_capacity(UNTRACKED_STATE_ROW_KEY_IDENTIFIER.len() + 1);
-    out.extend_from_slice(UNTRACKED_STATE_ROW_KEY_IDENTIFIER);
-    out.push(UNTRACKED_STATE_ROW_KEY_BRANCH_V1);
-    out
-}
-
-fn push_component(out: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
-    let bytes = value.as_bytes();
-    push_bytes_component(out, bytes)
-}
-
-fn push_entity_tuple(out: &mut Vec<u8>, entity_pk: &EntityPk) -> Result<(), LixError> {
-    let part_count = u32::try_from(entity_pk.parts.len()).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to encode untracked-state key: entity primary key part count exceeds u32",
-        )
-    })?;
-    if part_count == 0 {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to encode untracked-state key: entity primary key has no parts",
-        ));
-    }
-    out.extend_from_slice(&part_count.to_be_bytes());
-    for part in &entity_pk.parts {
-        push_bytes_component(out, part.as_bytes())?;
-    }
-    Ok(())
-}
-
-fn push_bytes_component(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), LixError> {
-    let len = u32::try_from(bytes.len()).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "failed to encode untracked-state key: component length exceeds u32",
-        )
-    })?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(bytes);
-    Ok(())
+fn encode_untracked_branch_schema_entity_file_prefix(
+    branch_id: &str,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "untracked-state branch/schema/entity/file key prefix",
+        &UntrackedBranchSchemaEntityFilePrefixRef {
+            branch_id,
+            schema_key,
+            entity_pk,
+            file_id,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -551,7 +428,7 @@ mod tests {
     use crate::untracked_state::UntrackedStateContext;
 
     #[test]
-    fn key_v1_roundtrips_null_file_id() {
+    fn key_roundtrips_null_file_id() {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
@@ -560,8 +437,6 @@ mod tests {
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
 
-        assert_eq!(&key[..4], b"LXUK");
-        assert_eq!(key[4], 1);
         assert_eq!(
             decode_untracked_state_row_key_ref(&key).expect("key should decode"),
             identity
@@ -569,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn key_v1_roundtrips_empty_file_id() {
+    fn key_roundtrips_empty_file_id() {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
@@ -585,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn key_v1_roundtrips_empty_entity_pk_part() {
+    fn key_roundtrips_empty_entity_pk_part() {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "json_pointer".to_string(),
@@ -601,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn key_v1_roundtrips_tuple_and_unicode_identity() {
+    fn key_roundtrips_tuple_and_unicode_identity() {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-東京".to_string(),
             schema_key: "schema-1".to_string(),
@@ -621,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn key_v1_encodes_entity_as_binary_tuple_not_json_text() {
+    fn key_encodes_entity_as_binary_tuple_not_json_text() {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
@@ -644,26 +519,12 @@ mod tests {
     }
 
     #[test]
-    fn key_decode_rejects_invalid_identifier() {
+    fn key_decode_rejects_malformed_storage_bytes() {
         let error = decode_untracked_state_row_key_ref(b"LXUQ\x01")
-            .expect_err("invalid key identifier should fail");
-        assert!(error.to_string().contains("invalid key identifier"));
-    }
-
-    #[test]
-    fn key_decode_rejects_unknown_branch() {
-        let identity = UntrackedStateIdentity {
-            branch_id: "branch-1".to_string(),
-            schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
-            file_id: None,
-        };
-        let mut key =
-            encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
-        key[4] = 2;
-        let error =
-            decode_untracked_state_row_key_ref(&key).expect_err("unknown key branch should fail");
-        assert!(error.to_string().contains("unsupported branch 2"));
+            .expect_err("malformed storage key should fail");
+        assert!(error
+            .to_string()
+            .contains("failed to decode untracked-state key"));
     }
 
     #[test]
@@ -679,7 +540,9 @@ mod tests {
         key.push(0);
         let error =
             decode_untracked_state_row_key_ref(&key).expect_err("trailing key bytes should fail");
-        assert!(error.to_string().contains("trailing bytes"));
+        assert!(error
+            .to_string()
+            .contains("failed to decode untracked-state key"));
     }
 
     #[test]
@@ -695,7 +558,28 @@ mod tests {
         key.truncate(key.len() - 2);
         let error =
             decode_untracked_state_row_key_ref(&key).expect_err("truncated key should fail");
-        assert!(error.to_string().contains("truncated"));
+        assert!(error
+            .to_string()
+            .contains("failed to decode untracked-state key"));
+    }
+
+    #[test]
+    fn key_decode_rejects_empty_entity_pk() {
+        let identity = UntrackedStateIdentity {
+            branch_id: "branch-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            entity_pk: crate::entity_pk::EntityPk { parts: Vec::new() },
+            file_id: None,
+        };
+        let key = encode_untracked_state_row_key_ref(identity.as_ref())
+            .expect("invalid key should encode");
+
+        let error =
+            decode_untracked_state_row_key_ref(&key).expect_err("empty entity pk should reject");
+
+        assert!(error
+            .message
+            .contains("entity primary key decoded from storage is invalid"));
     }
 
     async fn write_materialized_rows_to_store(

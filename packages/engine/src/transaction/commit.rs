@@ -582,8 +582,10 @@ fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRow
             .metadata
             .as_ref()
             .map(|metadata| metadata.normalized.as_ref()),
-        created_at: &row.created_at,
-        updated_at: &row.updated_at,
+        created_updated_at: UntrackedStateRowRef::created_updated_at(
+            &row.created_at,
+            &row.updated_at,
+        ),
         global: row.global,
         branch_id: &row.branch_id,
     }
@@ -1098,8 +1100,10 @@ mod tests {
                 file_id: None,
                 snapshot_content: Some(mode_snapshot.to_string()),
                 metadata: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                created_updated_at: crate::untracked_state::UntrackedStateRow::created_updated_at(
+                    "2026-01-01T00:00:00Z".to_string(),
+                    "2026-01-01T00:00:00Z".to_string(),
+                ),
                 global: true,
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
             };

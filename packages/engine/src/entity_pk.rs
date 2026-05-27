@@ -2,6 +2,7 @@ use serde_json::Value as JsonValue;
 
 use crate::common::json_pointer_get;
 use crate::LixError;
+use musli::{Allocator, Context, Decode, Decoder, Encode, Encoder};
 
 /// Logical entity primary key derived from a schema primary key.
 ///
@@ -151,6 +152,43 @@ impl EntityPk {
             parts.push(string_part_from_json_value(value, index)?);
         }
         Ok(Self { parts })
+    }
+}
+
+impl<M> Encode<M> for EntityPk {
+    type Encode = [String];
+
+    fn encode<E>(&self, encoder: E) -> Result<(), E::Error>
+    where
+        E: Encoder<Mode = M>,
+    {
+        encoder.encode(self.parts.as_slice())
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.parts.len())
+    }
+
+    fn as_encode(&self) -> &Self::Encode {
+        self.parts.as_slice()
+    }
+}
+
+impl<'de, M, A> Decode<'de, M, A> for EntityPk
+where
+    A: Allocator,
+{
+    fn decode<D>(decoder: D) -> Result<Self, D::Error>
+    where
+        D: Decoder<'de, Mode = M, Allocator = A>,
+    {
+        let cx = decoder.cx();
+        let parts = Vec::<String>::decode(decoder)?;
+        Self::from_parts(parts).map_err(|error| {
+            cx.message(format_args!(
+                "entity primary key decoded from storage is invalid: {error}"
+            ))
+        })
     }
 }
 
@@ -398,5 +436,32 @@ mod tests {
             EntityPk::from_primary_key_paths(&snapshot, &[vec!["missing".to_string()]]),
             Err(EntityPkError::MissingPrimaryKeyValue { index: 0 })
         );
+    }
+
+    #[test]
+    fn storage_codec_roundtrips_entity_pk() {
+        let identity =
+            EntityPk::tuple(vec!["namespace".to_string(), "id".to_string()]).expect("entity pk");
+        let bytes = crate::storage_codec::encode("entity primary key", &identity)
+            .expect("entity pk should encode");
+
+        let decoded: EntityPk = crate::storage_codec::decode("entity primary key", &bytes)
+            .expect("entity pk should decode");
+
+        assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn storage_codec_rejects_empty_entity_pk() {
+        let empty_parts: &[String] = &[];
+        let bytes = crate::storage_codec::encode("entity primary key parts", empty_parts)
+            .expect("empty parts should encode");
+
+        let error = crate::storage_codec::decode::<EntityPk>("entity primary key", &bytes)
+            .expect_err("empty entity primary key should reject");
+
+        assert!(error
+            .message
+            .contains("entity primary key decoded from storage is invalid"));
     }
 }

@@ -350,8 +350,10 @@ fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedState
         file_id: None,
         snapshot_content: Some(row.snapshot_content.clone()),
         metadata: None,
-        created_at: row.created_at.clone(),
-        updated_at: row.updated_at.clone(),
+        created_updated_at: UntrackedStateRow::created_updated_at(
+            row.created_at.clone(),
+            row.updated_at.clone(),
+        ),
         global: row.global,
         branch_id: row.branch_id.clone(),
     })

@@ -1,56 +1,24 @@
+use musli::{Decode, Encode};
+
+use super::types::BinaryCasChunkView;
+use crate::storage_codec;
 use crate::LixError;
 
-// Binary CAS physical rows:
-// - manifest:       BCM2 | kind:u8 | blob_size:u64 | kind payload
-//   - empty payload:   []
-//   - single payload:  chunk_hash:[u8;32]
-//   - chunked payload: chunk_count:u32
-// - manifest chunk: BCC1 | chunk_hash:[u8;32] | uncompressed_len:u64
-// - chunk:          BCK1 | codec:u8 | uncompressed_len:u64 | payload:[u8]
-const MANIFEST_MAGIC: &[u8; 4] = b"BCM2";
-const MANIFEST_CHUNK_MAGIC: &[u8; 4] = b"BCC1";
-const CHUNK_MAGIC: &[u8; 4] = b"BCK1";
-const MANIFEST_KIND_EMPTY: u8 = 0;
-const MANIFEST_KIND_SINGLE_CHUNK: u8 = 1;
-const MANIFEST_KIND_CHUNKED: u8 = 2;
-const CHUNK_CODEC_RAW_TAG: u8 = 0;
 const HASH_BYTES: usize = 32;
-const MANIFEST_HEADER_BYTES: usize = 4 + 1 + 8;
-const EMPTY_MANIFEST_BYTES: usize = MANIFEST_HEADER_BYTES;
-const SINGLE_CHUNK_MANIFEST_BYTES: usize = MANIFEST_HEADER_BYTES + HASH_BYTES;
-const CHUNKED_MANIFEST_BYTES: usize = MANIFEST_HEADER_BYTES + 4;
-const MANIFEST_CHUNK_BYTES: usize = 4 + HASH_BYTES + 8;
-const CHUNK_HEADER_BYTES: usize = 4 + 1 + 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum BinaryChunkCodec {
     Raw,
 }
 
-impl BinaryChunkCodec {
-    fn tag(self) -> u8 {
-        match self {
-            Self::Raw => CHUNK_CODEC_RAW_TAG,
-        }
-    }
-
-    fn from_tag(tag: u8) -> Result<Self, LixError> {
-        match tag {
-            CHUNK_CODEC_RAW_TAG => Ok(Self::Raw),
-            other => Err(codec_error(format!(
-                "unsupported binary CAS chunk codec tag {other}"
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub(crate) struct EncodedBinaryChunkPayload {
     pub(crate) codec: BinaryChunkCodec,
+    #[musli(bytes)]
     pub(crate) data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum BinaryCasManifest {
     Empty {
         size_bytes: u64,
@@ -63,6 +31,22 @@ pub(crate) enum BinaryCasManifest {
         size_bytes: u64,
         chunk_count: u32,
     },
+}
+
+#[derive(Encode, Decode)]
+#[musli(packed)]
+struct StorageBinaryCasManifestChunk {
+    chunk_hash: [u8; HASH_BYTES],
+    chunk_size: u64,
+}
+
+#[derive(Encode)]
+#[musli(packed)]
+struct BinaryCasChunkRef<'a> {
+    codec: BinaryChunkCodec,
+    uncompressed_len: u64,
+    #[musli(bytes)]
+    payload: &'a [u8],
 }
 
 impl BinaryCasManifest {
@@ -107,101 +91,35 @@ pub(crate) fn hash_bytes_to_hex(bytes: &[u8; HASH_BYTES]) -> String {
 }
 
 pub(crate) fn encode_binary_cas_manifest(manifest: &BinaryCasManifest) -> Vec<u8> {
-    let capacity = match manifest {
-        BinaryCasManifest::Empty { .. } => EMPTY_MANIFEST_BYTES,
-        BinaryCasManifest::SingleChunk { .. } => SINGLE_CHUNK_MANIFEST_BYTES,
-        BinaryCasManifest::Chunked { .. } => CHUNKED_MANIFEST_BYTES,
-    };
-    let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(MANIFEST_MAGIC);
-    match manifest {
-        BinaryCasManifest::Empty { size_bytes } => {
-            out.push(MANIFEST_KIND_EMPTY);
-            out.extend_from_slice(&size_bytes.to_be_bytes());
-        }
-        BinaryCasManifest::SingleChunk {
-            size_bytes,
-            chunk_hash,
-        } => {
-            out.push(MANIFEST_KIND_SINGLE_CHUNK);
-            out.extend_from_slice(&size_bytes.to_be_bytes());
-            out.extend_from_slice(chunk_hash);
-        }
-        BinaryCasManifest::Chunked {
-            size_bytes,
-            chunk_count,
-        } => {
-            out.push(MANIFEST_KIND_CHUNKED);
-            out.extend_from_slice(&size_bytes.to_be_bytes());
-            out.extend_from_slice(&chunk_count.to_be_bytes());
-        }
-    }
-    out
+    storage_codec::encode("binary CAS manifest", manifest)
+        .expect("binary CAS manifest storage encoding should not fail")
 }
 
 pub(crate) fn decode_binary_cas_manifest(bytes: &[u8]) -> Result<BinaryCasManifest, LixError> {
-    if bytes.len() < MANIFEST_HEADER_BYTES {
-        return Err(codec_error(format!(
-            "binary CAS manifest must be at least {MANIFEST_HEADER_BYTES} bytes, got {}",
-            bytes.len()
-        )));
-    }
-    require_magic(bytes, MANIFEST_MAGIC, "binary CAS manifest")?;
-    let size_bytes = u64::from_be_bytes(bytes[5..13].try_into().expect("fixed slice"));
-    match bytes[4] {
-        MANIFEST_KIND_EMPTY => {
-            require_len(bytes, EMPTY_MANIFEST_BYTES, "binary CAS empty manifest")?;
-            Ok(BinaryCasManifest::Empty { size_bytes })
-        }
-        MANIFEST_KIND_SINGLE_CHUNK => {
-            require_len(
-                bytes,
-                SINGLE_CHUNK_MANIFEST_BYTES,
-                "binary CAS single-chunk manifest",
-            )?;
-            let chunk_hash = bytes[13..45].try_into().expect("fixed slice");
-            Ok(BinaryCasManifest::SingleChunk {
-                size_bytes,
-                chunk_hash,
-            })
-        }
-        MANIFEST_KIND_CHUNKED => {
-            require_len(bytes, CHUNKED_MANIFEST_BYTES, "binary CAS chunked manifest")?;
-            let chunk_count = u32::from_be_bytes(bytes[13..17].try_into().expect("fixed slice"));
-            Ok(BinaryCasManifest::Chunked {
-                size_bytes,
-                chunk_count,
-            })
-        }
-        other => Err(codec_error(format!(
-            "unsupported binary CAS manifest kind {other}"
-        ))),
-    }
+    storage_codec::decode("binary CAS manifest", bytes)
 }
 
 pub(crate) fn encode_binary_cas_manifest_chunk(
     chunk_hash: &[u8; HASH_BYTES],
     chunk_size: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(MANIFEST_CHUNK_BYTES);
-    out.extend_from_slice(MANIFEST_CHUNK_MAGIC);
-    out.extend_from_slice(chunk_hash);
-    out.extend_from_slice(&chunk_size.to_be_bytes());
-    out
+    storage_codec::encode(
+        "binary CAS manifest chunk",
+        &StorageBinaryCasManifestChunk {
+            chunk_hash: *chunk_hash,
+            chunk_size,
+        },
+    )
+    .expect("binary CAS manifest chunk storage encoding should not fail")
 }
 
 pub(crate) fn decode_binary_cas_manifest_chunk(
     bytes: &[u8],
 ) -> Result<([u8; HASH_BYTES], u64), LixError> {
-    if bytes.len() != MANIFEST_CHUNK_BYTES {
-        return Err(codec_error(format!(
-            "binary CAS manifest chunk must be {MANIFEST_CHUNK_BYTES} bytes, got {}",
-            bytes.len()
-        )));
-    }
-    require_magic(bytes, MANIFEST_CHUNK_MAGIC, "binary CAS manifest chunk")?;
-    let chunk_hash = bytes[4..36].try_into().expect("fixed slice");
-    let chunk_size = u64::from_be_bytes(bytes[36..44].try_into().expect("fixed slice"));
+    let StorageBinaryCasManifestChunk {
+        chunk_hash,
+        chunk_size,
+    } = storage_codec::decode("binary CAS manifest chunk", bytes)?;
     Ok((chunk_hash, chunk_size))
 }
 
@@ -210,46 +128,26 @@ pub(crate) fn encode_binary_cas_chunk(
     uncompressed_len: u64,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(CHUNK_HEADER_BYTES + payload.len());
-    out.extend_from_slice(CHUNK_MAGIC);
-    out.push(codec.tag());
-    out.extend_from_slice(&uncompressed_len.to_be_bytes());
-    out.extend_from_slice(payload);
-    out
+    storage_codec::encode(
+        "binary CAS chunk",
+        &BinaryCasChunkRef {
+            codec,
+            uncompressed_len,
+            payload,
+        },
+    )
+    .expect("binary CAS chunk storage encoding should not fail")
 }
 
 pub(crate) fn decode_binary_cas_chunk(
     bytes: &[u8],
 ) -> Result<(BinaryChunkCodec, u64, &[u8]), LixError> {
-    if bytes.len() < CHUNK_HEADER_BYTES {
-        return Err(codec_error(format!(
-            "binary CAS chunk must be at least {CHUNK_HEADER_BYTES} bytes, got {}",
-            bytes.len()
-        )));
-    }
-    require_magic(bytes, CHUNK_MAGIC, "binary CAS chunk")?;
-    let codec = BinaryChunkCodec::from_tag(bytes[4])?;
-    let uncompressed_len = u64::from_be_bytes(bytes[5..13].try_into().expect("fixed slice"));
-    Ok((codec, uncompressed_len, &bytes[CHUNK_HEADER_BYTES..]))
-}
-
-fn require_magic(bytes: &[u8], expected: &[u8; 4], label: &str) -> Result<(), LixError> {
-    if &bytes[..4] == expected {
-        return Ok(());
-    }
-    Err(codec_error(format!(
-        "{label} has unsupported binary format"
-    )))
-}
-
-fn require_len(bytes: &[u8], expected: usize, label: &str) -> Result<(), LixError> {
-    if bytes.len() == expected {
-        return Ok(());
-    }
-    Err(codec_error(format!(
-        "{label} must be {expected} bytes, got {}",
-        bytes.len()
-    )))
+    let BinaryCasChunkView {
+        codec,
+        uncompressed_len,
+        payload,
+    } = storage_codec::decode("binary CAS chunk", bytes)?;
+    Ok((codec, uncompressed_len, payload))
 }
 
 fn hex_value(byte: u8, label: &str) -> Result<u8, LixError> {
@@ -276,27 +174,33 @@ pub(crate) fn encode_binary_chunk_payload(chunk_data: &[u8]) -> EncodedBinaryChu
 mod tests {
     use super::*;
 
+    const EMPTY_MANIFEST_STORAGE_BYTES: usize = 4;
+    const SINGLE_CHUNK_MANIFEST_STORAGE_BYTES: usize = 38;
+    const CHUNKED_MANIFEST_STORAGE_BYTES: usize = 6;
+    const MANIFEST_CHUNK_STORAGE_BYTES: usize = 35;
+    const CHUNK_STORAGE_OVERHEAD_BYTES: usize = 3;
+
     #[test]
     fn manifests_roundtrip_fixed_binary_rows() {
         let chunk_hash = binary_blob_hash_bytes(b"chunk");
-        let cases = vec![
+        let cases = [
             (
                 BinaryCasManifest::Empty { size_bytes: 0 },
-                EMPTY_MANIFEST_BYTES,
+                EMPTY_MANIFEST_STORAGE_BYTES,
             ),
             (
                 BinaryCasManifest::SingleChunk {
                     size_bytes: 42,
                     chunk_hash,
                 },
-                SINGLE_CHUNK_MANIFEST_BYTES,
+                SINGLE_CHUNK_MANIFEST_STORAGE_BYTES,
             ),
             (
                 BinaryCasManifest::Chunked {
                     size_bytes: 42,
                     chunk_count: 7,
                 },
-                CHUNKED_MANIFEST_BYTES,
+                CHUNKED_MANIFEST_STORAGE_BYTES,
             ),
         ];
         for (manifest, expected_len) in cases {
@@ -310,7 +214,7 @@ mod tests {
     fn manifest_chunk_roundtrips_fixed_binary_row() {
         let hash = binary_blob_hash_bytes(b"chunk");
         let encoded = encode_binary_cas_manifest_chunk(&hash, 1024);
-        assert_eq!(encoded.len(), MANIFEST_CHUNK_BYTES);
+        assert_eq!(encoded.len(), MANIFEST_CHUNK_STORAGE_BYTES);
         assert_eq!(
             decode_binary_cas_manifest_chunk(&encoded).unwrap(),
             (hash, 1024)
@@ -321,7 +225,7 @@ mod tests {
     fn chunk_roundtrips_payload_as_remaining_bytes() {
         let payload = b"hello payload";
         let encoded = encode_binary_cas_chunk(BinaryChunkCodec::Raw, payload.len() as u64, payload);
-        assert_eq!(&encoded[..4], CHUNK_MAGIC);
+        assert_eq!(encoded.len(), CHUNK_STORAGE_OVERHEAD_BYTES + payload.len());
         let (codec, uncompressed_len, decoded_payload) = decode_binary_cas_chunk(&encoded).unwrap();
         assert_eq!(codec, BinaryChunkCodec::Raw);
         assert_eq!(uncompressed_len, payload.len() as u64);
@@ -329,11 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn wrong_magic_is_rejected() {
+    fn malformed_storage_bytes_are_rejected() {
         let mut encoded = encode_binary_cas_manifest(&BinaryCasManifest::Empty { size_bytes: 0 });
-        encoded[0] = b'X';
+        encoded.truncate(encoded.len() - 1);
         let error = decode_binary_cas_manifest(&encoded).unwrap_err();
-        assert!(error.message.contains("unsupported binary format"));
+        assert!(error
+            .message
+            .contains("failed to decode binary CAS manifest"));
     }
 
     #[test]

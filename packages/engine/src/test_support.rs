@@ -442,8 +442,10 @@ pub(crate) fn untracked_state_row_from_materialized(
         file_id: row.file_id.clone(),
         snapshot_content: row.snapshot_content.clone(),
         metadata: row.metadata.as_ref().map(crate::serialize_row_metadata),
-        created_at: row.created_at.clone(),
-        updated_at: row.updated_at.clone(),
+        created_updated_at: UntrackedStateRow::created_updated_at(
+            row.created_at.clone(),
+            row.updated_at.clone(),
+        ),
         global: row.global,
         branch_id: row.branch_id.clone(),
     })

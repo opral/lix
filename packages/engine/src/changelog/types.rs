@@ -1,6 +1,19 @@
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 
+mod entity_pk_ref_storage {
+    use super::EntityPkRef;
+
+    pub(crate) fn decode<'de, D>(decoder: D) -> Result<EntityPkRef<'de>, D::Error>
+    where
+        D: musli::Decoder<'de>,
+        Vec<&'de str>: musli::Decode<'de, D::Mode, D::Allocator>,
+    {
+        let parts = musli::Decode::decode(decoder)?;
+        Ok(EntityPkRef { parts })
+    }
+}
+
 pub(crate) type CommitId = String;
 pub(crate) type ChangeId = String;
 
@@ -14,7 +27,8 @@ pub(crate) struct ChangelogAppend {
     pub(crate) commit_change_refs: Vec<CommitChangeRefSet>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct CommitRecord {
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
@@ -22,16 +36,6 @@ pub(crate) struct CommitRecord {
     pub(crate) change_id: ChangeId,
     pub(crate) author_account_ids: Vec<String>,
     pub(crate) created_at: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitRecordView<'a> {
-    pub(crate) format_version: u32,
-    pub(crate) commit_id: CommitIdRef<'a>,
-    pub(crate) parent_commit_ids: Vec<CommitIdRef<'a>>,
-    pub(crate) change_id: ChangeIdRef<'a>,
-    pub(crate) author_account_ids: Vec<&'a str>,
-    pub(crate) created_at: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,8 +51,28 @@ pub(crate) struct CommitChangeRefChunk {
     pub(crate) entries: Vec<CommitChangeRef>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct CommitChangeRefChunkRef<'a> {
+    pub(crate) format_version: u32,
+    pub(crate) schema_keys: Vec<&'a str>,
+    #[musli(with = crate::storage_codec::vec_option)]
+    pub(crate) file_ids: Vec<Option<&'a str>>,
+    pub(crate) entries: Vec<CommitChangeRefEntryRef<'a>>,
+}
+
+#[derive(musli::Decode)]
+#[musli(packed)]
 pub(crate) struct CommitChangeRefChunkView<'a> {
+    pub(crate) format_version: u32,
+    pub(crate) schema_keys: Vec<&'a str>,
+    #[musli(with = crate::storage_codec::vec_option)]
+    pub(crate) file_ids: Vec<Option<&'a str>>,
+    pub(crate) entries: Vec<CommitChangeRefEntryView<'a>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExpandedCommitChangeRefChunkView<'a> {
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitIdRef<'a>,
     pub(crate) entries: Vec<CommitChangeRefView<'a>>,
@@ -60,6 +84,24 @@ pub(crate) struct CommitChangeRef {
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: ChangeId,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct CommitChangeRefEntryRef<'a> {
+    pub(crate) schema_index: u16,
+    pub(crate) file_index: u16,
+    pub(crate) entity_pk: &'a [String],
+    pub(crate) change_id: &'a str,
+}
+
+#[derive(musli::Decode)]
+#[musli(packed)]
+pub(crate) struct CommitChangeRefEntryView<'a> {
+    pub(crate) schema_index: u16,
+    pub(crate) file_index: u16,
+    pub(crate) entity_pk: Vec<&'a str>,
+    pub(crate) change_id: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,26 +158,51 @@ pub(crate) enum CommitLoadEntry {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct ChangeRecord {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeId,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_ref: Option<JsonRef>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct ChangeRecordRef<'a> {
+    pub(crate) format_version: u32,
+    pub(crate) change_id: &'a str,
+    pub(crate) schema_key: &'a str,
+    pub(crate) entity_pk: &'a [String],
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) file_id: Option<&'a str>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) created_at: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeIdRef<'a>,
     pub(crate) schema_key: &'a str,
+    #[musli(with = entity_pk_ref_storage)]
     pub(crate) entity_pk: EntityPkRef<'a>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_ref: Option<JsonRef>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: &'a str,
 }

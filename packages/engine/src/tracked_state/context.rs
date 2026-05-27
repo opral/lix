@@ -17,8 +17,9 @@ use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue, TrackedStateKey,
-    TrackedStateKeyRef, TrackedStateMutation, TrackedStateRootId, TrackedStateTreeScanRequest,
+    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
+    TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
@@ -599,7 +600,7 @@ where
                 .next()
                 .flatten();
             if let Some(parent_value) = parent_value {
-                expected_created_at = parent_value.created_at;
+                expected_created_at = parent_value.created_at().to_string();
             }
         }
         if expected_created_at == change_created_at {
@@ -657,7 +658,7 @@ where
                 .flatten();
             if let Some(parent_value) = parent_value {
                 if parent_value.change_id == row.change_id {
-                    return Ok(Some(parent_value.created_at));
+                    return Ok(Some(parent_value.created_at().to_string()));
                 }
             }
         }
@@ -683,7 +684,7 @@ where
             .into_iter()
             .next()
             .flatten();
-        Ok(parent_value.map(|value| value.created_at))
+        Ok(parent_value.map(|value| value.created_at().to_string()))
     }
 
     pub(crate) async fn validate_tree_rows_at_commit_against_changelog(
@@ -904,7 +905,7 @@ where
         for (delta, parent_value) in deltas.iter().zip(parent_values.iter()) {
             let created_at = parent_value
                 .as_ref()
-                .map(|value| value.created_at.as_str())
+                .map(|value| value.created_at())
                 .unwrap_or(delta.created_at);
             let key = TrackedStateKeyRef {
                 schema_key: delta.schema_key,
@@ -915,10 +916,12 @@ where
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
                 deleted: delta.deleted,
-                snapshot_ref: delta.snapshot_ref,
-                metadata_ref: delta.metadata_ref,
-                created_at,
-                updated_at: delta.updated_at,
+                snapshot_ref: delta.snapshot_ref.copied(),
+                metadata_ref: delta.metadata_ref.copied(),
+                created_updated_at: TrackedStateIndexValueRef::created_updated_at(
+                    created_at,
+                    delta.updated_at,
+                ),
             };
             mutations.push(TrackedStateMutation::put_encoded(
                 encode_key_ref(key),
@@ -2718,8 +2721,10 @@ mod tests {
                         metadata_ref: row.metadata.as_ref().map(|metadata| {
                             crate::json_store::JsonRef::for_content(metadata.as_bytes())
                         }),
-                        created_at: row.created_at.clone(),
-                        updated_at: row.updated_at.clone(),
+                        created_updated_at: TrackedStateIndexValue::created_updated_at(
+                            row.created_at.clone(),
+                            row.updated_at.clone(),
+                        ),
                     };
                     TrackedStateMutation::put_encoded(
                         crate::tracked_state::codec::encode_key(&key),
