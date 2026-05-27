@@ -53,12 +53,12 @@ fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
             "public column 'path' must be compared directly to a literal or parameter",
         ));
     }
-    if normalized.contains("lixcol_version_id")
+    if normalized.contains("lixcol_branch_id")
         && (normalized.contains("= lower(") || normalized.contains(" in (lower("))
     {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "public column 'lixcol_version_id' must be compared directly to a literal or parameter",
+            "public column 'lixcol_branch_id' must be compared directly to a literal or parameter",
         ));
     }
     Ok(())

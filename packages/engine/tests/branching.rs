@@ -4,18 +4,18 @@ mod support;
 
 use lix_engine::Value;
 use lix_engine::{
-    CreateVersionOptions, Engine, LixError, MergeChangeStats, MergeVersionOptions,
-    MergeVersionOutcome, MergeVersionPreviewOptions, SwitchVersionOptions,
+    CreateBranchOptions, Engine, LixError, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, MergeChangeStats, SwitchBranchOptions,
 };
 use serde_json::Value as JsonValue;
 
-simulation_test!(create_version_from_main, |sim| async move {
+simulation_test!(create_branch_from_main, |sim| async move {
     let (engine, main, draft) = create_draft_from_main(&sim).await;
 
-    assert_version_descriptor(&main, "draft-version", "Draft").await;
+    assert_branch_descriptor(&main, "draft-branch", "Draft").await;
     assert_eq!(
         engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load"),
         Some(sim.initial_commit_id().to_string())
@@ -26,48 +26,48 @@ simulation_test!(create_version_from_main, |sim| async move {
     drop(engine);
 });
 
-simulation_test!(create_version_rejects_existing_id, |sim| async move {
+simulation_test!(create_branch_rejects_existing_id, |sim| async move {
     let (engine, main, draft) = create_draft_from_main(&sim).await;
 
     let error = main
-        .create_version(CreateVersionOptions {
-            id: Some("draft-version".to_string()),
+        .create_branch(CreateBranchOptions {
+            id: Some("draft-branch".to_string()),
             name: "Overwritten draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect_err("creating a version with an existing id should fail");
+        .expect_err("creating a branch with an existing id should fail");
 
     assert_eq!(error.code, "LIX_ERROR_UNIQUE");
     assert!(
         error
             .to_string()
             .contains("INSERT would duplicate entity_pk"),
-        "error should explain the duplicate version id: {error:?}"
+        "error should explain the duplicate branch id: {error:?}"
     );
-    assert_version_descriptor(&main, "draft-version", "Draft").await;
+    assert_branch_descriptor(&main, "draft-branch", "Draft").await;
 
     drop(draft);
     drop(main);
     drop(engine);
 });
 
-simulation_test!(create_version_rejects_duplicate_name, |sim| async move {
+simulation_test!(create_branch_rejects_duplicate_name, |sim| async move {
     let (engine, main, draft) = create_draft_from_main(&sim).await;
 
     let error = main
-        .create_version(CreateVersionOptions {
-            id: Some("duplicate-name-version".to_string()),
+        .create_branch(CreateBranchOptions {
+            id: Some("duplicate-name-branch".to_string()),
             name: "Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect_err("creating a version with an existing name should fail");
+        .expect_err("creating a branch with an existing name should fail");
 
     assert_eq!(error.code, lix_engine::LixError::CODE_UNIQUE);
     assert!(
         error.to_string().contains("/name"),
-        "error should explain the duplicate version name: {error:?}"
+        "error should explain the duplicate branch name: {error:?}"
     );
 
     drop(draft);
@@ -76,26 +76,26 @@ simulation_test!(create_version_rejects_duplicate_name, |sim| async move {
 });
 
 simulation_test!(
-    version_descriptor_delete_via_entity_surface_is_rejected_when_ref_exists,
+    branch_descriptor_delete_via_entity_surface_is_rejected_when_ref_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
         let error = main
             .execute(
-                "DELETE FROM lix_version_descriptor WHERE id = 'draft-version'",
+                "DELETE FROM lix_branch_descriptor WHERE id = 'draft-branch'",
                 &[],
             )
             .await
             .expect_err("descriptor delete through entity surface should fail");
-        assert_version_pair_delete_restricted(&error);
+        assert_branch_pair_delete_restricted(&error);
 
-        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
-        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
+        assert_eq!(count_branch_refs(&main, "draft-branch").await, 1);
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
-                .expect("version ref head should still load"),
+                .expect("branch ref head should still load"),
             Some(sim.initial_commit_id().to_string())
         );
 
@@ -105,27 +105,27 @@ simulation_test!(
 );
 
 simulation_test!(
-    version_descriptor_delete_via_lix_state_is_rejected_when_ref_exists,
+    branch_descriptor_delete_via_lix_state_is_rejected_when_ref_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
         let error = main
 		.execute(
 			"DELETE FROM lix_state \
-	             WHERE schema_key = 'lix_version_descriptor' AND entity_pk = lix_json('[\"draft-version\"]')",
+	             WHERE schema_key = 'lix_branch_descriptor' AND entity_pk = lix_json('[\"draft-branch\"]')",
 			&[],
 		)
             .await
             .expect_err("descriptor delete through lix_state should fail");
-        assert_version_pair_delete_restricted(&error);
+        assert_branch_pair_delete_restricted(&error);
 
-        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
-        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
+        assert_eq!(count_branch_refs(&main, "draft-branch").await, 1);
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
-                .expect("version ref head should still load"),
+                .expect("branch ref head should still load"),
             Some(sim.initial_commit_id().to_string())
         );
 
@@ -135,26 +135,23 @@ simulation_test!(
 );
 
 simulation_test!(
-    version_ref_delete_via_entity_surface_is_rejected_when_descriptor_exists,
+    branch_ref_delete_via_entity_surface_is_rejected_when_descriptor_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
         let error = main
-            .execute(
-                "DELETE FROM lix_version_ref WHERE id = 'draft-version'",
-                &[],
-            )
+            .execute("DELETE FROM lix_branch_ref WHERE id = 'draft-branch'", &[])
             .await
             .expect_err("ref delete through entity surface should fail");
-        assert_version_pair_delete_restricted(&error);
+        assert_branch_pair_delete_restricted(&error);
 
-        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
-        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
+        assert_eq!(count_branch_refs(&main, "draft-branch").await, 1);
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
-                .expect("version ref head should still load"),
+                .expect("branch ref head should still load"),
             Some(sim.initial_commit_id().to_string())
         );
 
@@ -164,27 +161,27 @@ simulation_test!(
 );
 
 simulation_test!(
-    version_ref_delete_via_lix_state_is_rejected_when_descriptor_exists,
+    branch_ref_delete_via_lix_state_is_rejected_when_descriptor_exists,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
         let error = main
 		.execute(
 			"DELETE FROM lix_state \
-	                 WHERE schema_key = 'lix_version_ref' AND entity_pk = lix_json('[\"draft-version\"]')",
+	                 WHERE schema_key = 'lix_branch_ref' AND entity_pk = lix_json('[\"draft-branch\"]')",
 			&[],
 		)
             .await
             .expect_err("ref delete through lix_state should fail");
-        assert_version_pair_delete_restricted(&error);
+        assert_branch_pair_delete_restricted(&error);
 
-        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
-        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(count_branch_descriptors(&main, "draft-branch").await, 1);
+        assert_eq!(count_branch_refs(&main, "draft-branch").await, 1);
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
-                .expect("version ref head should still load"),
+                .expect("branch ref head should still load"),
             Some(sim.initial_commit_id().to_string())
         );
 
@@ -194,12 +191,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    create_version_can_start_from_explicit_commit,
+    create_branch_can_start_from_explicit_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -214,22 +211,22 @@ simulation_test!(
         assert_key_value(&main, "main-after-initial", Some("\"main\"")).await;
 
         let receipt = main
-            .create_version(CreateVersionOptions {
+            .create_branch(CreateBranchOptions {
                 id: Some("from-initial".to_string()),
                 name: "From initial".to_string(),
                 from_commit_id: Some(sim.initial_commit_id().to_string()),
             })
             .await
-            .expect("version should be created from explicit commit");
+            .expect("branch should be created from explicit commit");
         assert_eq!(receipt.id, "from-initial");
         assert_eq!(receipt.name, "From initial");
         assert!(!receipt.hidden);
         assert_eq!(receipt.commit_id, sim.initial_commit_id());
         assert_eq!(
             engine
-                .load_version_head_commit_id("from-initial")
+                .load_branch_head_commit_id("from-initial")
                 .await
-                .expect("version head should load"),
+                .expect("branch head should load"),
             Some(sim.initial_commit_id().to_string())
         );
 
@@ -237,7 +234,7 @@ simulation_test!(
             engine
                 .open_session("from-initial")
                 .await
-                .expect("explicit commit version session should open"),
+                .expect("explicit commit branch session should open"),
             &engine,
         );
         assert_key_value(&from_initial, "main-after-initial", None).await;
@@ -248,14 +245,49 @@ simulation_test!(
     }
 );
 
-simulation_test!(created_version_sees_inherited_state, |sim| async move {
+simulation_test!(
+    create_branch_rejects_missing_explicit_commit,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_branch_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = main
+            .create_branch(CreateBranchOptions {
+                id: Some("from-missing".to_string()),
+                name: "From missing".to_string(),
+                from_commit_id: Some("missing-commit".to_string()),
+            })
+            .await
+            .expect_err("creating a branch from a missing commit should fail");
+
+        assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("commit_id").and_then(JsonValue::as_str)),
+            Some("missing-commit")
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(created_branch_sees_inherited_state, |sim| async move {
     let (_engine, _main, draft) = create_draft_after_shared_write(&sim).await;
 
     assert_key_value(&draft, "shared-before-branch", Some("\"shared\"")).await;
 });
 
 simulation_test!(
-    open_workspace_session_starts_on_seeded_main_version,
+    open_workspace_session_starts_on_seeded_main_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let workspace = sim.wrap_session(
@@ -268,16 +300,16 @@ simulation_test!(
 
         assert_eq!(
             workspace
-                .active_version_id()
+                .active_branch_id()
                 .await
-                .expect("workspace active version should resolve"),
-            sim.main_version_id()
+                .expect("workspace active branch should resolve"),
+            sim.main_branch_id()
         );
     }
 );
 
 simulation_test!(
-    later_main_changes_do_not_appear_in_created_version,
+    later_main_changes_do_not_appear_in_created_branch,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -294,7 +326,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    later_created_version_changes_do_not_appear_in_main,
+    later_created_branch_changes_do_not_appear_in_main,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -312,7 +344,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    switch_version_returns_session_for_target_version,
+    switch_branch_returns_session_for_target_branch,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         draft
@@ -324,13 +356,13 @@ simulation_test!(
             .expect("draft write should succeed");
 
         let (switched, receipt) = main
-            .switch_version(SwitchVersionOptions {
-                version_id: "draft-version".to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("switch should succeed");
 
-        assert_eq!(receipt.version_id, "draft-version");
+        assert_eq!(receipt.branch_id, "draft-branch");
         assert_key_value(&switched, "switch-draft-only", Some("\"draft\"")).await;
         assert_key_value(&main, "switch-draft-only", None).await;
 
@@ -339,15 +371,15 @@ simulation_test!(
 );
 
 simulation_test!(
-    pinned_switch_version_is_ephemeral_and_does_not_advance_refs,
+    pinned_switch_branch_is_ephemeral_and_does_not_advance_refs,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load");
         let draft_head_before = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load");
         let workspace_before = sim.wrap_session(
@@ -359,35 +391,35 @@ simulation_test!(
         );
         assert_eq!(
             workspace_before
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect("workspace selector should resolve"),
-            sim.main_version_id(),
+            sim.main_branch_id(),
             "pinned session setup should not have moved the workspace selector"
         );
 
         let (_switched, _receipt) = main
-            .switch_version(SwitchVersionOptions {
-                version_id: "draft-version".to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("switch should succeed");
 
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             main_head_before,
-            "switching must not mutate the source session version ref"
+            "switching must not mutate the source session branch ref"
         );
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
                 .expect("draft head should load"),
             draft_head_before,
-            "switching must not mutate the target version ref"
+            "switching must not mutate the target branch ref"
         );
         let workspace_after = sim.wrap_session(
             engine
@@ -398,17 +430,17 @@ simulation_test!(
         );
         assert_eq!(
             workspace_after
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect("workspace selector should resolve"),
-            sim.main_version_id(),
+            sim.main_branch_id(),
             "pinned switching must not mutate the shared workspace selector"
         );
     }
 );
 
 simulation_test!(
-    workspace_switch_version_updates_shared_workspace_selector,
+    workspace_switch_branch_updates_shared_workspace_selector,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         draft
@@ -419,11 +451,11 @@ simulation_test!(
             .await
             .expect("draft write should succeed");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load");
         let draft_head_before = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load");
 
@@ -443,58 +475,58 @@ simulation_test!(
         );
         assert_eq!(
             workspace_a
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect("workspace selector should resolve"),
-            sim.main_version_id()
+            sim.main_branch_id()
         );
 
         let (workspace_switched, receipt) = workspace_a
-            .switch_version(SwitchVersionOptions {
-                version_id: "draft-version".to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("workspace switch should succeed");
 
-        assert_eq!(receipt.version_id, "draft-version");
+        assert_eq!(receipt.branch_id, "draft-branch");
         assert_eq!(
             workspace_switched
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect("switched workspace selector should resolve"),
-            "draft-version"
+            "draft-branch"
         );
         assert_eq!(
             workspace_b
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect("other workspace session should observe selector"),
-            "draft-version",
+            "draft-branch",
             "workspace sessions resolve the shared selector on use"
         );
         assert_key_value(&workspace_b, "workspace-draft-only", Some("\"draft\"")).await;
         assert_key_value(&main, "workspace-draft-only", None).await;
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             main_head_before,
-            "workspace switching must not mutate the old version ref"
+            "workspace switching must not mutate the old branch ref"
         );
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
                 .expect("draft head should load"),
             draft_head_before,
-            "workspace switching must not mutate the new version ref"
+            "workspace switching must not mutate the new branch ref"
         );
     }
 );
 
 simulation_test!(
-    workspace_switch_version_persists_across_reopened_engine,
+    workspace_switch_branch_persists_across_reopened_engine,
     |sim| async move {
         let (engine, _main, draft) = create_draft_from_main(&sim).await;
         draft
@@ -513,8 +545,8 @@ simulation_test!(
             &engine,
         );
         workspace
-            .switch_version(SwitchVersionOptions {
-                version_id: "draft-version".to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("workspace switch should persist");
@@ -533,10 +565,10 @@ simulation_test!(
 
         assert_eq!(
             reopened_workspace
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect("workspace selector should resolve after reopen"),
-            "draft-version",
+            "draft-branch",
             "workspace switch should survive reopening the engine"
         );
         assert_key_value(
@@ -549,7 +581,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    switch_version_errors_when_target_ref_is_missing,
+    switch_branch_errors_when_target_ref_is_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -561,28 +593,28 @@ simulation_test!(
         );
 
         let result = main
-            .switch_version(SwitchVersionOptions {
-                version_id: "missing-version".to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: "missing-branch".to_string(),
             })
             .await;
         let Err(error) = result else {
-            panic!("missing version ref should fail");
+            panic!("missing branch ref should fail");
         };
 
-        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
         assert_eq!(
             error
                 .details
                 .as_ref()
-                .and_then(|details| details.get("version_id")),
-            Some(&JsonValue::String("missing-version".to_string()))
+                .and_then(|details| details.get("branch_id")),
+            Some(&JsonValue::String("missing-branch".to_string()))
         );
         assert_eq!(
             error
                 .details
                 .as_ref()
                 .and_then(|details| details.get("operation")),
-            Some(&JsonValue::String("switch_version".to_string()))
+            Some(&JsonValue::String("switch_branch".to_string()))
         );
         assert_eq!(
             error
@@ -595,27 +627,27 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_resolves_existing_source_and_target_heads,
+    merge_branch_resolves_existing_source_and_target_heads,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("merge head resolution should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::AlreadyUpToDate);
         assert_eq!(receipt.change_stats, MergeChangeStats::default());
         assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(receipt.target_version_id, sim.main_version_id());
-        assert_eq!(receipt.source_version_id, "draft-version");
+        assert_eq!(receipt.target_branch_id, sim.main_branch_id());
+        assert_eq!(receipt.source_branch_id, "draft-branch");
         assert_eq!(
             receipt.target_head_before_commit_id, main_head_before,
             "receipt should expose the target head before the no-op merge"
@@ -626,7 +658,7 @@ simulation_test!(
         );
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             Some(main_head_before)
@@ -635,7 +667,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_fast_forwards_when_target_is_merge_base,
+    merge_branch_fast_forwards_when_target_is_merge_base,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         draft
@@ -647,23 +679,23 @@ simulation_test!(
             .expect("draft write should succeed");
 
         let target_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
         let source_head = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load")
             .expect("draft head should exist");
 
         let preview = main
-            .merge_version_preview(MergeVersionPreviewOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("merge preview should analyze fast-forward");
-        assert_eq!(preview.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(preview.outcome, MergeBranchOutcome::FastForward);
         assert_eq!(preview.target_head_commit_id, target_head_before);
         assert_eq!(preview.source_head_commit_id, source_head);
         assert_eq!(
@@ -678,7 +710,7 @@ simulation_test!(
         assert_eq!(preview.conflicts.len(), 0);
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load")
                 .as_deref(),
@@ -687,12 +719,12 @@ simulation_test!(
         );
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("merge should fast-forward target");
-        assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::FastForward);
         assert_eq!(
             receipt.change_stats,
             MergeChangeStats {
@@ -709,7 +741,7 @@ simulation_test!(
         assert_eq!(receipt.target_head_after_commit_id, source_head);
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load")
                 .as_deref(),
@@ -733,7 +765,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_advances_target_with_two_parent_commit,
+    merge_branch_advances_target_with_two_parent_commit,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         main.execute(
@@ -751,23 +783,23 @@ simulation_test!(
             .expect("draft write should succeed");
 
         let target_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
         let source_head = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load")
             .expect("draft head should exist");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("merge should apply source change");
-        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
         assert_eq!(
             receipt.change_stats,
             MergeChangeStats {
@@ -781,7 +813,7 @@ simulation_test!(
         assert_eq!(receipt.source_head_before_commit_id, source_head);
 
         let target_head_after = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
@@ -797,12 +829,12 @@ simulation_test!(
         assert_ne!(target_head_after, target_head_before);
         assert_eq!(
             engine
-                .load_version_head_commit_id("draft-version")
+                .load_branch_head_commit_id("draft-branch")
                 .await
                 .expect("draft head should load")
                 .as_deref(),
             Some(source_head.as_str()),
-            "merging into main must not move the source version ref"
+            "merging into main must not move the source branch ref"
         );
 
         assert_key_value(&main, "draft-merge-source", Some("\"draft\"")).await;
@@ -824,7 +856,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_selects_source_change_without_minting_equivalent_copy,
+    merge_branch_selects_source_change_without_minting_equivalent_copy,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
         main.execute(
@@ -842,8 +874,8 @@ simulation_test!(
             .expect("draft write should succeed");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("merge should apply source change");
@@ -877,7 +909,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
 	             FROM lix_state_history \
-	             WHERE start_commit_id = lix_active_version_commit_id() \
+	             WHERE start_commit_id = lix_active_branch_commit_id() \
 	               AND entity_pk = lix_json('[\"merge-select-change\"]') \
 	             ORDER BY depth",
                 &[],
@@ -893,7 +925,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_selects_schema_registration_before_schema_rows,
+    merge_branch_selects_schema_registration_before_schema_rows,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -924,15 +956,15 @@ simulation_test!(
             .await
             .expect("draft row using newly registered schema should succeed");
 
-        main.merge_version(MergeVersionOptions {
-            source_version_id: "draft-version".to_string(),
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: "draft-branch".to_string(),
         })
         .await
         .expect("merge should select schema registration before rows that use it");
 
         let reopened_main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should reopen after merge"),
             &engine,
@@ -956,7 +988,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_errors_on_divergent_same_entity_change,
+    merge_branch_errors_on_divergent_same_entity_change,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -974,50 +1006,50 @@ simulation_test!(
             .await
             .expect("draft write should succeed");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
 
         let error = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect_err("divergent same-entity changes should conflict");
         assert_merge_conflict_error(&error);
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             Some(main_head_before),
-            "failed merge should not advance the target version ref"
+            "failed merge should not advance the target branch ref"
         );
         assert_key_value(&main, "merge-conflict", Some("\"main\"")).await;
     }
 );
 
 simulation_test!(
-    merge_version_fast_forwards_source_delete_when_target_unchanged,
+    merge_branch_fast_forwards_source_delete_when_target_unchanged,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
         delete_key_value(&draft, "shared-before-branch").await;
         let source_head = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load")
             .expect("draft head should exist");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("merge should apply source delete");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::FastForward);
         assert_eq!(
             receipt.change_stats,
             MergeChangeStats {
@@ -1034,31 +1066,31 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_records_empty_merge_when_both_sides_delete,
+    merge_branch_records_empty_merge_when_both_sides_delete,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
         delete_key_value(&main, "shared-before-branch").await;
         delete_key_value(&draft, "shared-before-branch").await;
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
         let source_head = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load")
             .expect("draft head should exist");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("convergent delete merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
         assert_eq!(receipt.change_stats, MergeChangeStats::default());
         let merge_commit_id = receipt
             .created_merge_commit_id
@@ -1080,7 +1112,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_conflicts_when_target_deletes_source_modifies,
+    merge_branch_conflicts_when_target_deletes_source_modifies,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -1093,32 +1125,32 @@ simulation_test!(
             .await
             .expect("draft update should succeed");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
 
         let error = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect_err("delete/modify should conflict");
         assert_merge_conflict_error(&error);
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             Some(main_head_before),
-            "failed merge should not advance the target version ref"
+            "failed merge should not advance the target branch ref"
         );
         assert_key_value(&main, "shared-before-branch", None).await;
     }
 );
 
 simulation_test!(
-    merge_version_conflicts_when_target_modifies_source_deletes,
+    merge_branch_conflicts_when_target_modifies_source_deletes,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -1130,32 +1162,32 @@ simulation_test!(
         .expect("main update should succeed");
         delete_key_value(&draft, "shared-before-branch").await;
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
 
         let error = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect_err("modify/delete should conflict");
         assert_merge_conflict_error(&error);
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             Some(main_head_before),
-            "failed merge should not advance the target version ref"
+            "failed merge should not advance the target branch ref"
         );
         assert_key_value(&main, "shared-before-branch", Some("\"main\"")).await;
     }
 );
 
 simulation_test!(
-    merge_version_records_empty_merge_for_same_payload_convergence,
+    merge_branch_records_empty_merge_for_same_payload_convergence,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -1173,24 +1205,24 @@ simulation_test!(
             .await
             .expect("draft update should succeed");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
         let source_head = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load")
             .expect("draft head should exist");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("convergent update merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
         assert_eq!(receipt.change_stats, MergeChangeStats::default());
         let merge_commit_id = receipt
             .created_merge_commit_id
@@ -1212,7 +1244,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_conflicts_on_independent_add_same_identity_different_payload,
+    merge_branch_conflicts_on_independent_add_same_identity_different_payload,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -1230,32 +1262,32 @@ simulation_test!(
             .await
             .expect("draft insert should succeed");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
 
         let error = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect_err("independent adds with different payloads should conflict");
         assert_merge_conflict_error(&error);
         assert_eq!(
             engine
-                .load_version_head_commit_id(sim.main_version_id())
+                .load_branch_head_commit_id(sim.main_branch_id())
                 .await
                 .expect("main head should load"),
             Some(main_head_before),
-            "failed merge should not advance the target version ref"
+            "failed merge should not advance the target branch ref"
         );
         assert_key_value(&main, "merge-independent-add", Some("\"main\"")).await;
     }
 );
 
 simulation_test!(
-    merge_version_records_empty_merge_for_same_identity_same_payload_add,
+    merge_branch_records_empty_merge_for_same_identity_same_payload_add,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -1273,24 +1305,24 @@ simulation_test!(
             .await
             .expect("draft insert should succeed");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
         let source_head = engine
-            .load_version_head_commit_id("draft-version")
+            .load_branch_head_commit_id("draft-branch")
             .await
             .expect("draft head should load")
             .expect("draft head should exist");
 
         let receipt = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "draft-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
             })
             .await
             .expect("convergent independent add merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
         assert_eq!(receipt.change_stats, MergeChangeStats::default());
         let merge_commit_id = receipt
             .created_merge_commit_id
@@ -1312,7 +1344,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_errors_when_source_version_ref_is_missing,
+    merge_branch_errors_when_source_branch_ref_is_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -1324,26 +1356,26 @@ simulation_test!(
         );
 
         let error = main
-            .merge_version(MergeVersionOptions {
-                source_version_id: "missing-version".to_string(),
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "missing-branch".to_string(),
             })
             .await
             .expect_err("missing source ref should fail");
 
-        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
         assert_eq!(
             error
                 .details
                 .as_ref()
-                .and_then(|details| details.get("version_id")),
-            Some(&JsonValue::String("missing-version".to_string()))
+                .and_then(|details| details.get("branch_id")),
+            Some(&JsonValue::String("missing-branch".to_string()))
         );
         assert_eq!(
             error
                 .details
                 .as_ref()
                 .and_then(|details| details.get("operation")),
-            Some(&JsonValue::String("merge_version".to_string()))
+            Some(&JsonValue::String("merge_branch".to_string()))
         );
         assert_eq!(
             error
@@ -1355,7 +1387,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(merge_version_rejects_self_merge, |sim| async move {
+simulation_test!(merge_branch_rejects_self_merge, |sim| async move {
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
         engine
@@ -1366,8 +1398,8 @@ simulation_test!(merge_version_rejects_self_merge, |sim| async move {
     );
 
     let error = main
-        .merge_version(MergeVersionOptions {
-            source_version_id: sim.main_version_id().to_string(),
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: sim.main_branch_id().to_string(),
         })
         .await
         .expect_err("self-merge should fail");
@@ -1378,21 +1410,21 @@ simulation_test!(merge_version_rejects_self_merge, |sim| async move {
             .details
             .as_ref()
             .and_then(|details| details.get("operation")),
-        Some(&JsonValue::String("merge_version".to_string()))
+        Some(&JsonValue::String("merge_branch".to_string()))
     );
     assert_eq!(
         error
             .details
             .as_ref()
-            .and_then(|details| details.get("target_version_id")),
-        Some(&JsonValue::String(sim.main_version_id().to_string()))
+            .and_then(|details| details.get("target_branch_id")),
+        Some(&JsonValue::String(sim.main_branch_id().to_string()))
     );
     assert_eq!(
         error
             .details
             .as_ref()
-            .and_then(|details| details.get("source_version_id")),
-        Some(&JsonValue::String(sim.main_version_id().to_string()))
+            .and_then(|details| details.get("source_branch_id")),
+        Some(&JsonValue::String(sim.main_branch_id().to_string()))
     );
 });
 
@@ -1419,7 +1451,7 @@ async fn create_draft_after_shared_write(
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
         engine
-            .open_session(sim.main_version_id())
+            .open_session(sim.main_branch_id())
             .await
             .expect("main session should open"),
         &engine,
@@ -1445,7 +1477,7 @@ async fn create_draft_from_main(
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
         engine
-            .open_session(sim.main_version_id())
+            .open_session(sim.main_branch_id())
             .await
             .expect("main session should open"),
         &engine,
@@ -1459,31 +1491,31 @@ async fn create_draft(
     main: &crate::support::simulation_test::engine::SimSession,
 ) -> crate::support::simulation_test::engine::SimSession {
     let receipt = main
-        .create_version(CreateVersionOptions {
-            id: Some("draft-version".to_string()),
+        .create_branch(CreateBranchOptions {
+            id: Some("draft-branch".to_string()),
             name: "Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("version should be created");
-    assert_eq!(receipt.id, "draft-version");
-    let version_row = main
+        .expect("branch should be created");
+    assert_eq!(receipt.id, "draft-branch");
+    let branch_row = main
         .execute(
-            "SELECT id, name, hidden, commit_id FROM lix_version WHERE id = 'draft-version'",
+            "SELECT id, name, hidden, commit_id FROM lix_branch WHERE id = 'draft-branch'",
             &[],
         )
         .await
-        .expect("created version should be queryable through lix_version");
-    assert_eq!(version_row.len(), 1);
+        .expect("created branch should be queryable through lix_branch");
+    assert_eq!(branch_row.len(), 1);
     assert_eq!(
-        version_row.rows()[0].values(),
+        branch_row.rows()[0].values(),
         &[
             Value::Text(receipt.id.clone()),
             Value::Text(receipt.name.clone()),
             Value::Boolean(receipt.hidden),
             Value::Text(receipt.commit_id.clone()),
         ],
-        "create_version should return the same public shape as lix_version"
+        "create_branch should return the same public shape as lix_branch"
     );
     main.wrap_session(
         engine
@@ -1518,66 +1550,66 @@ async fn assert_key_value(
     }
 }
 
-async fn assert_version_descriptor(
+async fn assert_branch_descriptor(
     session: &crate::support::simulation_test::engine::SimSession,
-    version_id: &str,
+    branch_id: &str,
     expected_name: &str,
 ) {
     let result = session
         .execute(
-            &format!("SELECT id, name FROM lix_version WHERE id = '{version_id}'"),
+            &format!("SELECT id, name FROM lix_branch WHERE id = '{branch_id}'"),
             &[],
         )
         .await
-        .expect("version query should succeed");
+        .expect("branch query should succeed");
     let rows = result;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows.rows()[0].values(),
         &[
-            Value::Text(version_id.to_string()),
+            Value::Text(branch_id.to_string()),
             Value::Text(expected_name.to_string()),
         ]
     );
 }
 
-async fn count_version_descriptors(
+async fn count_branch_descriptors(
     session: &crate::support::simulation_test::engine::SimSession,
-    version_id: &str,
+    branch_id: &str,
 ) -> i64 {
     select_single_integer(
         session,
-        &format!("SELECT COUNT(*) FROM lix_version_descriptor WHERE id = '{version_id}'"),
+        &format!("SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = '{branch_id}'"),
     )
     .await
 }
 
-async fn count_version_refs(
+async fn count_branch_refs(
     session: &crate::support::simulation_test::engine::SimSession,
-    version_id: &str,
+    branch_id: &str,
 ) -> i64 {
     select_single_integer(
         session,
         &format!(
             "SELECT COUNT(*) FROM lix_state \
-	         WHERE schema_key = 'lix_version_ref' AND entity_pk = lix_json('[\"{version_id}\"]')"
+	         WHERE schema_key = 'lix_branch_ref' AND entity_pk = lix_json('[\"{branch_id}\"]')"
         ),
     )
     .await
 }
 
-fn assert_version_pair_delete_restricted(error: &lix_engine::LixError) {
+fn assert_branch_pair_delete_restricted(error: &lix_engine::LixError) {
     assert_eq!(error.code, lix_engine::LixError::CODE_READ_ONLY);
     assert!(
-        error.to_string().contains("lix_version"),
-        "error should explain the version pair restriction: {error:?}"
+        error.to_string().contains("lix_branch"),
+        "error should explain the branch pair restriction: {error:?}"
     );
     assert!(
         error
             .hint
             .as_deref()
-            .is_some_and(|hint| hint.contains("lix_version")),
-        "error should guide callers to the lix_version surface: {error:?}"
+            .is_some_and(|hint| hint.contains("lix_branch")),
+        "error should guide callers to the lix_branch surface: {error:?}"
     );
 }
 
@@ -1675,18 +1707,18 @@ async fn assert_empty_merge_commit(
     target_head_before: &str,
     source_head: &str,
 ) {
-    let active_version_id = session
-        .active_version_id()
+    let active_branch_id = session
+        .active_branch_id()
         .await
-        .expect("active version should load");
+        .expect("active branch should load");
     assert_eq!(
         engine
-            .load_version_head_commit_id(&active_version_id)
+            .load_branch_head_commit_id(&active_branch_id)
             .await
-            .expect("target version head should load")
+            .expect("target branch head should load")
             .as_deref(),
         Some(merge_commit_id),
-        "empty merge should advance the target version ref"
+        "empty merge should advance the target branch ref"
     );
 
     let global = session.wrap_session(

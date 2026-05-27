@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
+use crate::branch::{BranchHead, BranchRefReader};
 use crate::commit_graph::CommitGraphReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
@@ -15,7 +16,6 @@ use crate::live_state::{
 };
 use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
-use crate::version::{VersionHead, VersionRefReader};
 use crate::LixError;
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
@@ -46,13 +46,13 @@ pub(crate) struct ChangelogQuerySource<S> {
 pub(crate) trait SqlExecutionContext {
     type ReadStore: StorageRead + Clone + Send + Sync + 'static;
 
-    fn active_version_id(&self) -> &str;
+    fn active_branch_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
     fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore>;
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore>;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
-    fn version_ref(&self) -> Arc<dyn VersionRefReader>;
+    fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 }
@@ -66,7 +66,7 @@ pub(crate) trait SqlExecutionContext {
 #[async_trait]
 #[allow(dead_code)]
 pub(crate) trait SqlWriteExecutionContext {
-    fn active_version_id(&self) -> &str;
+    fn active_branch_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 
@@ -77,7 +77,7 @@ pub(crate) trait SqlWriteExecutionContext {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
-    async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError>;
+    async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError>;
 
     async fn stage_write(
         &mut self,
@@ -126,8 +126,8 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().list_visible_schemas() }
     }
 
-    pub(crate) fn active_version_id(&self) -> String {
-        unsafe { self.ptr.0.as_ref().active_version_id().to_string() }
+    pub(crate) fn active_branch_id(&self) -> String {
+        unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
     }
 
     pub(crate) async fn scan_live_state(
@@ -162,9 +162,9 @@ impl SqlWriteContext {
         }
     }
 
-    pub(crate) async fn load_version_head(
+    pub(crate) async fn load_branch_head(
         &self,
-        version_id: &str,
+        branch_id: &str,
     ) -> Result<Option<String>, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
@@ -173,7 +173,7 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .load_version_head(version_id)
+                .load_branch_head(branch_id)
                 .await
         }
     }
@@ -273,7 +273,7 @@ impl LiveStateReader for WriteContextLiveStateReader {
                 filter: LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
-                    version_ids: vec![request.version_id.clone()],
+                    branch_ids: vec![request.branch_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     ..LiveStateFilter::default()
                 },
@@ -285,30 +285,30 @@ impl LiveStateReader for WriteContextLiveStateReader {
     }
 }
 
-pub(crate) struct WriteContextVersionRefReader {
+pub(crate) struct WriteContextBranchRefReader {
     ctx: SqlWriteContext,
 }
 
-impl WriteContextVersionRefReader {
+impl WriteContextBranchRefReader {
     pub(crate) fn new(ctx: SqlWriteContext) -> Self {
         Self { ctx }
     }
 }
 
 #[async_trait]
-impl VersionRefReader for WriteContextVersionRefReader {
-    async fn load_head(&self, version_id: &str) -> Result<Option<VersionHead>, LixError> {
+impl BranchRefReader for WriteContextBranchRefReader {
+    async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
         Ok(self
             .ctx
-            .load_version_head(version_id)
+            .load_branch_head(branch_id)
             .await?
-            .map(|commit_id| VersionHead {
-                version_id: version_id.to_string(),
+            .map(|commit_id| BranchHead {
+                branch_id: branch_id.to_string(),
                 commit_id,
             }))
     }
 
-    async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+    async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
         Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "scan_heads is not available through sql2 write context",

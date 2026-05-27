@@ -5,10 +5,10 @@ mod tests {
     use crate::common::serialize_row_metadata;
     use crate::entity_pk::EntityPk;
     use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
-    use crate::session::CreateVersionOptions;
+    use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
         deterministic_repro_cases, generated_dml_cases, DifferentialExpectation, DifferentialParam,
-        DifferentialProbe, DifferentialSqlCase, ExpectedExecution, ACTIVE_VERSION_PROBE_ID,
+        DifferentialProbe, DifferentialSqlCase, ExpectedExecution, ACTIVE_BRANCH_PROBE_ID,
     };
     use crate::sql2::{WriteExecutorMode, WriteExecutorPath};
     use crate::storage::InMemoryStorageBackend;
@@ -46,7 +46,7 @@ mod tests {
         name: String,
         sql: String,
         params: Vec<Value>,
-        version_column_indexes: &'static [usize],
+        branch_column_indexes: &'static [usize],
     }
 
     #[tokio::test]
@@ -118,11 +118,11 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("workspace session should open");
-        create_probe_versions(&session).await;
-        let active_version_id = session
-            .active_version_id()
+        create_probe_branches(&session).await;
+        let active_branch_id = session
+            .active_branch_id()
             .await
-            .expect("differential session should have an active version");
+            .expect("differential session should have an active branch");
 
         for setup_sql in case.setup_sql {
             session
@@ -169,7 +169,7 @@ mod tests {
             .ok()
             .and_then(|(_result, path)| *path);
         let staged_rows =
-            probe_transaction_state(&mut transaction, case.probes, &active_version_id).await;
+            probe_transaction_state(&mut transaction, case.probes, &active_branch_id).await;
 
         match execution_result {
             Ok(_) => transaction
@@ -182,7 +182,7 @@ mod tests {
                 .expect("failed differential case should rollback"),
         }
 
-        let final_rows = probe_session_state(&session, case.probes, &active_version_id).await;
+        let final_rows = probe_session_state(&session, case.probes, &active_branch_id).await;
         DifferentialOutcome {
             execution,
             executor_path,
@@ -197,11 +197,11 @@ mod tests {
             .open_workspace_session()
             .await
             .expect("workspace session should open");
-        create_probe_versions(&session).await;
-        let active_version_id = session
-            .active_version_id()
+        create_probe_branches(&session).await;
+        let active_branch_id = session
+            .active_branch_id()
             .await
-            .expect("differential session should have an active version");
+            .expect("differential session should have an active branch");
 
         for setup_sql in case.setup_sql {
             session
@@ -240,12 +240,12 @@ mod tests {
         }
 
         let staged_rows =
-            probe_transaction_state(&mut transaction, case.probes, &active_version_id).await;
+            probe_transaction_state(&mut transaction, case.probes, &active_branch_id).await;
         transaction
             .commit()
             .await
             .expect("baseline differential case should commit setup");
-        let final_rows = probe_session_state(&session, case.probes, &active_version_id).await;
+        let final_rows = probe_session_state(&session, case.probes, &active_branch_id).await;
 
         DifferentialOutcome {
             execution: ExecutionSignature::Ok { rows_affected: 0 },
@@ -265,16 +265,16 @@ mod tests {
             .expect("engine should open over initialized unit backend")
     }
 
-    async fn create_probe_versions(session: &crate::SessionContext) {
-        for id in ["version-a", "version-b"] {
+    async fn create_probe_branches(session: &crate::SessionContext) {
+        for id in ["branch-a", "branch-b"] {
             session
-                .create_version(CreateVersionOptions {
+                .create_branch(CreateBranchOptions {
                     id: Some(id.to_string()),
                     name: id.to_string(),
                     from_commit_id: None,
                 })
                 .await
-                .unwrap_or_else(|error| panic!("failed to create probe version {id}: {error:?}"));
+                .unwrap_or_else(|error| panic!("failed to create probe branch {id}: {error:?}"));
         }
     }
 
@@ -340,11 +340,11 @@ mod tests {
     async fn probe_session_state(
         session: &crate::SessionContext,
         probes: &[DifferentialProbe],
-        active_version_id: &str,
+        active_branch_id: &str,
     ) -> Vec<ProbeSnapshot> {
         let mut snapshots = Vec::with_capacity(probes.len());
         for probe in probes {
-            let query = probe_query(probe, active_version_id);
+            let query = probe_query(probe, active_branch_id);
             snapshots.push(ProbeSnapshot {
                 name: query.name,
                 rows: session
@@ -361,8 +361,8 @@ mod tests {
                     .map(|row| {
                         canonical_probe_values(
                             row.values(),
-                            active_version_id,
-                            query.version_column_indexes,
+                            active_branch_id,
+                            query.branch_column_indexes,
                         )
                     })
                     .collect(),
@@ -374,17 +374,17 @@ mod tests {
     async fn probe_transaction_state(
         transaction: &mut crate::session::SessionTransaction,
         probes: &[DifferentialProbe],
-        active_version_id: &str,
+        active_branch_id: &str,
     ) -> Vec<ProbeSnapshot> {
         let mut snapshots = Vec::with_capacity(probes.len());
         for probe in probes {
             if let Some(snapshot) =
-                synthetic_staged_by_version_probe(transaction, probe, active_version_id).await
+                synthetic_staged_by_branch_probe(transaction, probe, active_branch_id).await
             {
                 snapshots.push(snapshot);
                 continue;
             }
-            let query = probe_query(probe, active_version_id);
+            let query = probe_query(probe, active_branch_id);
             snapshots.push(ProbeSnapshot {
                 name: query.name,
                 rows: transaction
@@ -401,8 +401,8 @@ mod tests {
                     .map(|row| {
                         canonical_probe_values(
                             row.values(),
-                            active_version_id,
-                            query.version_column_indexes,
+                            active_branch_id,
+                            query.branch_column_indexes,
                         )
                     })
                     .collect(),
@@ -411,7 +411,7 @@ mod tests {
         snapshots
     }
 
-    fn probe_query(probe: &DifferentialProbe, active_version_id: &str) -> ProbeQuery {
+    fn probe_query(probe: &DifferentialProbe, active_branch_id: &str) -> ProbeQuery {
         match probe {
             DifferentialProbe::LixStateActive {
                 schema_key,
@@ -437,15 +437,15 @@ mod tests {
                          ORDER BY schema_key, entity_pk, file_id"
                     ),
                     params,
-                    version_column_indexes: &[],
+                    branch_column_indexes: &[],
                 }
             }
-            DifferentialProbe::LixStateByVersion {
+            DifferentialProbe::LixStateByBranch {
                 schema_key,
                 entity_pks,
-                version_ids,
+                branch_ids,
             } => {
-                let mut params = Vec::with_capacity(entity_pks.len() + version_ids.len() + 1);
+                let mut params = Vec::with_capacity(entity_pks.len() + branch_ids.len() + 1);
                 params.push(Value::Text((*schema_key).to_string()));
                 let entity_placeholders = entity_pks
                     .iter()
@@ -456,33 +456,33 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let version_offset = params.len();
-                let version_placeholders = version_ids
+                let branch_offset = params.len();
+                let branch_placeholders = branch_ids
                     .iter()
                     .enumerate()
-                    .map(|(index, version_id)| {
-                        params.push(Value::Text(resolve_probe_version_id(
-                            version_id,
-                            active_version_id,
+                    .map(|(index, branch_id)| {
+                        params.push(Value::Text(resolve_probe_branch_id(
+                            branch_id,
+                            active_branch_id,
                         )));
-                        format!("${}", version_offset + index + 1)
+                        format!("${}", branch_offset + index + 1)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 ProbeQuery {
                     name: format!(
-                        "lix_state_by_version:{schema_key}:{entity_pks:?}:{version_ids:?}"
+                        "lix_state_by_branch:{schema_key}:{entity_pks:?}:{branch_ids:?}"
                     ),
                     sql: format!(
-                        "SELECT entity_pk, schema_key, file_id, version_id, snapshot_content, metadata, global, untracked \
-                         FROM lix_state_by_version \
+                        "SELECT entity_pk, schema_key, file_id, branch_id, snapshot_content, metadata, global, untracked \
+                         FROM lix_state_by_branch \
                          WHERE schema_key = $1 \
                            AND entity_pk IN ({entity_placeholders}) \
-                           AND version_id IN ({version_placeholders}) \
-                         ORDER BY schema_key, entity_pk, file_id, version_id"
+                           AND branch_id IN ({branch_placeholders}) \
+                         ORDER BY schema_key, entity_pk, file_id, branch_id"
                     ),
                     params,
-                    version_column_indexes: &[3],
+                    branch_column_indexes: &[3],
                 }
             }
             DifferentialProbe::RegisteredSchemaActive => ProbeQuery {
@@ -492,75 +492,75 @@ mod tests {
                  ORDER BY lixcol_entity_pk"
                     .to_string(),
                 params: Vec::new(),
-                version_column_indexes: &[],
+                branch_column_indexes: &[],
             },
-            DifferentialProbe::RegisteredSchemaByVersion { version_ids } => {
-                let mut params = Vec::with_capacity(version_ids.len());
-                let placeholders = version_ids
+            DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
+                let mut params = Vec::with_capacity(branch_ids.len());
+                let placeholders = branch_ids
                     .iter()
                     .enumerate()
-                    .map(|(index, version_id)| {
-                        params.push(Value::Text(resolve_probe_version_id(
-                            version_id,
-                            active_version_id,
+                    .map(|(index, branch_id)| {
+                        params.push(Value::Text(resolve_probe_branch_id(
+                            branch_id,
+                            active_branch_id,
                         )));
                         format!("${}", index + 1)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 ProbeQuery {
-                    name: format!("lix_registered_schema_by_version:{version_ids:?}"),
+                    name: format!("lix_registered_schema_by_branch:{branch_ids:?}"),
                     sql: format!(
-                        "SELECT lixcol_entity_pk, value, lixcol_version_id, lixcol_metadata, lixcol_global, lixcol_untracked \
-                         FROM lix_registered_schema_by_version \
-                         WHERE lixcol_version_id IN ({placeholders}) \
-                         ORDER BY lixcol_entity_pk, lixcol_version_id"
+                        "SELECT lixcol_entity_pk, value, lixcol_branch_id, lixcol_metadata, lixcol_global, lixcol_untracked \
+                         FROM lix_registered_schema_by_branch \
+                         WHERE lixcol_branch_id IN ({placeholders}) \
+                         ORDER BY lixcol_entity_pk, lixcol_branch_id"
                     ),
                     params,
-                    version_column_indexes: &[2],
+                    branch_column_indexes: &[2],
                 }
             }
         }
     }
 
-    async fn synthetic_staged_by_version_probe(
+    async fn synthetic_staged_by_branch_probe(
         transaction: &mut crate::session::SessionTransaction,
         probe: &DifferentialProbe,
-        active_version_id: &str,
+        active_branch_id: &str,
     ) -> Option<ProbeSnapshot> {
         match probe {
-            DifferentialProbe::LixStateByVersion {
+            DifferentialProbe::LixStateByBranch {
                 schema_key,
                 entity_pks,
-                version_ids,
+                branch_ids,
             } => {
                 let rows = scan_transaction_live_state(
                     transaction,
                     schema_key,
                     *entity_pks,
-                    *version_ids,
-                    active_version_id,
+                    *branch_ids,
+                    active_branch_id,
                 )
                 .await;
                 Some(ProbeSnapshot {
                     name: format!(
-                        "lix_state_by_version_staged:{schema_key}:{entity_pks:?}:{version_ids:?}"
+                        "lix_state_by_branch_staged:{schema_key}:{entity_pks:?}:{branch_ids:?}"
                     ),
-                    rows: lix_state_by_version_rows(rows, active_version_id),
+                    rows: lix_state_by_branch_rows(rows, active_branch_id),
                 })
             }
-            DifferentialProbe::RegisteredSchemaByVersion { version_ids } => {
+            DifferentialProbe::RegisteredSchemaByBranch { branch_ids } => {
                 let rows = scan_transaction_live_state(
                     transaction,
                     "lix_registered_schema",
                     &[],
-                    *version_ids,
-                    active_version_id,
+                    *branch_ids,
+                    active_branch_id,
                 )
                 .await;
                 Some(ProbeSnapshot {
-                    name: format!("lix_registered_schema_by_version_staged:{version_ids:?}"),
-                    rows: registered_schema_by_version_rows(rows, active_version_id),
+                    name: format!("lix_registered_schema_by_branch_staged:{branch_ids:?}"),
+                    rows: registered_schema_by_branch_rows(rows, active_branch_id),
                 })
             }
             _ => None,
@@ -571,8 +571,8 @@ mod tests {
         transaction: &mut crate::session::SessionTransaction,
         schema_key: &str,
         entity_pks: &[&str],
-        version_ids: &[&str],
-        active_version_id: &str,
+        branch_ids: &[&str],
+        active_branch_id: &str,
     ) -> Vec<MaterializedLiveStateRow> {
         let rows = transaction
             .scan_live_state_for_test(&LiveStateScanRequest {
@@ -582,9 +582,9 @@ mod tests {
                         .iter()
                         .map(|entity_pk| EntityPk::single(*entity_pk))
                         .collect(),
-                    version_ids: version_ids
+                    branch_ids: branch_ids
                         .iter()
-                        .map(|version_id| resolve_probe_version_id(version_id, active_version_id))
+                        .map(|branch_id| resolve_probe_branch_id(branch_id, active_branch_id))
                         .collect(),
                     ..LiveStateFilter::default()
                 },
@@ -599,16 +599,16 @@ mod tests {
         rows
     }
 
-    fn lix_state_by_version_rows(
+    fn lix_state_by_branch_rows(
         mut rows: Vec<MaterializedLiveStateRow>,
-        active_version_id: &str,
+        active_branch_id: &str,
     ) -> Vec<Vec<Value>> {
         rows.sort_by_key(|row| {
             (
                 row.schema_key.clone(),
                 row.entity_pk.clone(),
                 row.file_id.clone(),
-                row.version_id.clone(),
+                row.branch_id.clone(),
             )
         });
         rows.iter()
@@ -618,7 +618,7 @@ mod tests {
                         entity_pk_value(row),
                         Value::Text(row.schema_key.clone()),
                         optional_text_value(row.file_id.clone()),
-                        Value::Text(row.version_id.clone()),
+                        Value::Text(row.branch_id.clone()),
                         optional_text_value(row.snapshot_content.clone()),
                         row.metadata
                             .as_ref()
@@ -628,18 +628,18 @@ mod tests {
                         Value::Boolean(row.global),
                         Value::Boolean(row.untracked),
                     ],
-                    active_version_id,
+                    active_branch_id,
                     &[3],
                 )
             })
             .collect()
     }
 
-    fn registered_schema_by_version_rows(
+    fn registered_schema_by_branch_rows(
         mut rows: Vec<MaterializedLiveStateRow>,
-        active_version_id: &str,
+        active_branch_id: &str,
     ) -> Vec<Vec<Value>> {
-        rows.sort_by_key(|row| (row.entity_pk.clone(), row.version_id.clone()));
+        rows.sort_by_key(|row| (row.entity_pk.clone(), row.branch_id.clone()));
         rows.iter()
             .map(|row| {
                 let value = row
@@ -655,7 +655,7 @@ mod tests {
                     &[
                         entity_pk_value(row),
                         value,
-                        Value::Text(row.version_id.clone()),
+                        Value::Text(row.branch_id.clone()),
                         row.metadata
                             .as_ref()
                             .map(serialize_row_metadata)
@@ -664,7 +664,7 @@ mod tests {
                         Value::Boolean(row.global),
                         Value::Boolean(row.untracked),
                     ],
-                    active_version_id,
+                    active_branch_id,
                     &[2],
                 )
             })
@@ -683,27 +683,27 @@ mod tests {
         value.map(Value::Text).unwrap_or(Value::Null)
     }
 
-    fn resolve_probe_version_id(version_id: &str, active_version_id: &str) -> String {
-        if version_id == ACTIVE_VERSION_PROBE_ID {
-            active_version_id.to_string()
+    fn resolve_probe_branch_id(branch_id: &str, active_branch_id: &str) -> String {
+        if branch_id == ACTIVE_BRANCH_PROBE_ID {
+            active_branch_id.to_string()
         } else {
-            version_id.to_string()
+            branch_id.to_string()
         }
     }
 
     fn canonical_probe_values(
         values: &[Value],
-        active_version_id: &str,
-        version_column_indexes: &[usize],
+        active_branch_id: &str,
+        branch_column_indexes: &[usize],
     ) -> Vec<Value> {
         values
             .iter()
             .enumerate()
             .map(|(index, value)| match value {
                 Value::Text(text)
-                    if text == active_version_id && version_column_indexes.contains(&index) =>
+                    if text == active_branch_id && branch_column_indexes.contains(&index) =>
                 {
-                    Value::Text(ACTIVE_VERSION_PROBE_ID.to_string())
+                    Value::Text(ACTIVE_BRANCH_PROBE_ID.to_string())
                 }
                 other => other.clone(),
             })

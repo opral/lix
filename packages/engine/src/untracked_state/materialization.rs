@@ -26,7 +26,7 @@ pub(crate) fn materialize_row(
         created_at: row.created_at,
         updated_at: row.updated_at,
         global: row.global,
-        version_id: row.version_id,
+        branch_id: row.branch_id,
     })
 }
 

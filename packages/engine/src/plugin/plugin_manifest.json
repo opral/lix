@@ -62,10 +62,11 @@
                 "enum": [
                   "entity_pk",
                   "schema_key",
+                  "schema_version",
                   "snapshot_content",
                   "file_id",
                   "plugin_key",
-                  "version_id",
+                  "branch_id",
                   "change_id",
                   "metadata",
                   "created_at",

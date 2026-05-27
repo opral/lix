@@ -15,7 +15,7 @@ pub(crate) struct UntrackedStateRow {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
 }
 
 impl UntrackedStateRow {
@@ -29,7 +29,7 @@ impl UntrackedStateRow {
             created_at: &self.created_at,
             updated_at: &self.updated_at,
             global: self.global,
-            version_id: &self.version_id,
+            branch_id: &self.branch_id,
         }
     }
 }
@@ -48,7 +48,7 @@ pub(crate) struct UntrackedStateRowRef<'a> {
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
     pub(crate) global: bool,
-    pub(crate) version_id: &'a str,
+    pub(crate) branch_id: &'a str,
 }
 
 /// Hydrated boundary shape for callers that still work with JSON payloads.
@@ -63,13 +63,13 @@ pub(crate) struct MaterializedUntrackedStateRow {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
 }
 
 /// Stable identity for one local untracked overlay row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct UntrackedStateIdentity {
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
@@ -77,7 +77,7 @@ pub(crate) struct UntrackedStateIdentity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UntrackedStateIdentityRef<'a> {
-    pub(crate) version_id: &'a str,
+    pub(crate) branch_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a EntityPk,
     pub(crate) file_id: Option<&'a str>,
@@ -86,7 +86,7 @@ pub(crate) struct UntrackedStateIdentityRef<'a> {
 impl UntrackedStateIdentity {
     pub(crate) fn as_ref(&self) -> UntrackedStateIdentityRef<'_> {
         UntrackedStateIdentityRef {
-            version_id: &self.version_id,
+            branch_id: &self.branch_id,
             schema_key: &self.schema_key,
             entity_pk: &self.entity_pk,
             file_id: self.file_id.as_deref(),
@@ -97,7 +97,7 @@ impl UntrackedStateIdentity {
 impl<'a> From<UntrackedStateRowRef<'a>> for UntrackedStateIdentityRef<'a> {
     fn from(row: UntrackedStateRowRef<'a>) -> Self {
         Self {
-            version_id: row.version_id,
+            branch_id: row.branch_id,
             schema_key: row.schema_key,
             entity_pk: row.entity_pk,
             file_id: row.file_id,
@@ -113,7 +113,7 @@ pub(crate) struct UntrackedStateFilter {
     #[serde(default)]
     pub(crate) entity_pks: Vec<EntityPk>,
     #[serde(default)]
-    pub(crate) version_ids: Vec<String>,
+    pub(crate) branch_ids: Vec<String>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
 }
@@ -140,7 +140,7 @@ pub(crate) struct UntrackedStateScanRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UntrackedStateRowRequest {
     pub(crate) schema_key: String,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: NullableKeyFilter<String>,
 }

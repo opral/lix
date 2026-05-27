@@ -24,7 +24,7 @@ simulation_test!(
             .await
             .expect("root directory insert should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first directory commit head should load")
             .expect("first directory commit head should exist");
@@ -38,7 +38,7 @@ simulation_test!(
             .await
             .expect("nested directory insert should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second directory commit head should load")
             .expect("second directory commit head should exist");
@@ -174,7 +174,7 @@ simulation_test!(
             .await
             .expect("recursive directory delete should succeed");
         let delete_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("delete commit head should load")
             .expect("delete commit head should exist");

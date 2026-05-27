@@ -304,7 +304,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_by_version_insert_duplicate_id_reports_lix_directory_by_version,
+    lix_directory_by_branch_insert_duplicate_id_reports_lix_directory_by_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -314,35 +314,35 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let version_id = sim.main_version_id();
+        let branch_id = sim.main_branch_id();
 
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_directory_by_version \
-                     (id, path, lixcol_version_id) \
-                     VALUES ('same-dir', '/a/', '{version_id}')"
+                    "INSERT INTO lix_directory_by_branch \
+                     (id, path, lixcol_branch_id) \
+                     VALUES ('same-dir', '/a/', '{branch_id}')"
                 ),
                 &[],
             )
             .await
-            .expect("first by-version directory insert should succeed");
+            .expect("first by-branch directory insert should succeed");
 
         let error = session
             .execute(
                 &format!(
-                    "INSERT INTO lix_directory_by_version \
-                     (id, path, lixcol_version_id) \
-                     VALUES ('same-dir', '/b/', '{version_id}')"
+                    "INSERT INTO lix_directory_by_branch \
+                     (id, path, lixcol_branch_id) \
+                     VALUES ('same-dir', '/b/', '{branch_id}')"
                 ),
                 &[],
             )
             .await
-            .expect_err("duplicate by-version directory id insert should be rejected");
+            .expect_err("duplicate by-branch directory id insert should be rejected");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
-            error.message.contains("table 'lix_directory_by_version'")
+            error.message.contains("table 'lix_directory_by_branch'")
                 && error.message.contains("id 'same-dir'")
                 && !error.message.contains("table 'lix_directory':")
                 && !error.message.contains("lix_directory_descriptor"),
@@ -634,7 +634,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_allows_version_local_entry_matching_global_file_entry,
+    lix_directory_allows_branch_local_entry_matching_global_file_entry,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -656,33 +656,33 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('version-dir-foo', '/foo/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('branch-dir-foo', '/foo/')",
                 &[],
             )
             .await
-            .expect("version-local directory should be a distinct storage namespace");
+            .expect("branch-local directory should be a distinct storage namespace");
 
         let global_file = session
             .execute(
-                "SELECT id, path, lixcol_version_id, lixcol_global \
-                 FROM lix_file_by_version \
-                 WHERE id = 'global-file-foo' AND lixcol_version_id = 'global'",
+                "SELECT id, path, lixcol_branch_id, lixcol_global \
+                 FROM lix_file_by_branch \
+                 WHERE id = 'global-file-foo' AND lixcol_branch_id = 'global'",
                 &[],
             )
             .await
             .expect("global file should query");
-        let version_directory = session
+        let branch_directory = session
             .execute(
                 "SELECT id, path \
                  FROM lix_directory \
-                 WHERE id = 'version-dir-foo'",
+                 WHERE id = 'branch-dir-foo'",
                 &[],
             )
             .await
-            .expect("version directory should query");
+            .expect("branch directory should query");
 
         assert_eq!(global_file.len(), 1);
-        assert_eq!(version_directory.len(), 1);
+        assert_eq!(branch_directory.len(), 1);
     }
 );
 
@@ -793,7 +793,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_by_version_expands_global_rows,
+    lix_directory_by_branch_expands_global_rows,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -815,21 +815,21 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, lixcol_version_id, lixcol_global, lixcol_untracked \
-                 FROM lix_directory_by_version \
+                "SELECT id, path, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                 FROM lix_directory_by_branch \
                  WHERE id = 'dir-global-overlay' \
-                 ORDER BY lixcol_version_id",
+                 ORDER BY lixcol_branch_id",
                 &[],
             )
             .await
-            .expect("directory by-version read should succeed");
+            .expect("directory by-branch read should succeed");
         assert_rows_eq(
             result,
             vec![
                 vec![
                     Value::Text("dir-global-overlay".to_string()),
                     Value::Text("/shared/".to_string()),
-                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Text(sim.main_branch_id().to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],

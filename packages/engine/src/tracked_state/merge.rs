@@ -7,12 +7,12 @@ use crate::LixError;
 
 /// Planned tracked-state merge result.
 ///
-/// This is intentionally a pure planner. It does not know about versions,
+/// This is intentionally a pure planner. It does not know about branches,
 /// sessions, changelog writes, or live-state overlays. Callers provide two
 /// diffs from the same merge base:
 ///
-/// - `base -> target`: what the destination version changed.
-/// - `base -> source`: what the incoming version changed.
+/// - `base -> target`: what the destination branch changed.
+/// - `base -> source`: what the incoming branch changed.
 ///
 /// The planner returns source-side picks plus first-class conflicts for
 /// identities changed differently on both sides.

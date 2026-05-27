@@ -227,7 +227,7 @@ where
             ),
         )
         .with_hint(format!(
-            "Use WHERE {} = lix_active_version_commit_id() to inspect {} from the active version head.",
+            "Use WHERE {} = lix_active_branch_commit_id() to inspect {} from the active branch head.",
             descriptor.start_commit_column, descriptor.view_name
         )));
     }

@@ -1,7 +1,7 @@
 use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef};
 use super::read::BoundRead;
+use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::sql2::plan::version_scope::VersionScope;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12,35 +12,35 @@ pub(crate) struct BoundWrite {
     pub(crate) predicate: BoundPredicate,
     pub(crate) assignments: Vec<BoundAssignment>,
     pub(crate) params: BoundParamMap,
-    pub(crate) version_scope: VersionScope,
+    pub(crate) branch_scope: BranchScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundWriteTarget {
     LixState,
-    LixStateByVersion,
+    LixStateByBranch,
     Entity(EntityWriteSurface),
     File(FileWriteSurface),
     Directory(DirectoryWriteSurface),
-    Version,
+    Branch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EntityWriteSurface {
     Base { schema_key: String },
-    ByVersion { schema_key: String },
+    ByBranch { schema_key: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FileWriteSurface {
     Base,
-    ByVersion,
+    ByBranch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryWriteSurface {
     Base,
-    ByVersion,
+    ByBranch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

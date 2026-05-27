@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use std::collections::BTreeMap;
 
+use crate::branch::BranchContext;
 use crate::changelog::{
     ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader,
     ChangelogWriter, CommitChangeRef, CommitChangeRefSet, CommitRecord,
@@ -13,51 +14,50 @@ use crate::storage::StorageWriteSet;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
 };
-use crate::transaction::prepare_version_ref_row;
+use crate::transaction::prepare_branch_ref_row;
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRow,
 };
-use crate::version::VersionContext;
 
 fn prepare_json_ref(value: &str) -> crate::json_store::JsonRef {
     crate::json_store::JsonRef::for_content(value.as_bytes())
 }
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "test-empty-root";
 const TEST_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
-/// Seeds a version head and matching tracked root for unit tests.
+/// Seeds a branch head and matching tracked root for unit tests.
 ///
-/// A version ref that points at a commit without a tracked root is invalid for
+/// A branch ref that points at a commit without a tracked root is invalid for
 /// the serving state. This helper keeps that invariant in one place while
 /// still letting low-level tests use synthetic commit ids.
-pub(crate) async fn seed_version_head(storage: StorageContext, version_id: &str, commit_id: &str) {
-    seed_version_head_with_rows(storage, version_id, commit_id, &[]).await;
+pub(crate) async fn seed_branch_head(storage: StorageContext, branch_id: &str, commit_id: &str) {
+    seed_branch_head_with_rows(storage, branch_id, commit_id, &[]).await;
 }
 
-/// Seeds the global version head to an empty tracked root for unit tests.
-pub(crate) async fn seed_global_version_head(storage: StorageContext) {
-    seed_version_head(storage, GLOBAL_VERSION_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
+/// Seeds the global branch head to an empty tracked root for unit tests.
+pub(crate) async fn seed_global_branch_head(storage: StorageContext) {
+    seed_branch_head(storage, GLOBAL_BRANCH_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
 }
 
-/// Seeds a version head and writes the tracked root contents for its commit.
-pub(crate) async fn seed_version_head_with_rows(
+/// Seeds a branch head and writes the tracked root contents for its commit.
+pub(crate) async fn seed_branch_head_with_rows(
     storage: StorageContext,
-    version_id: &str,
+    branch_id: &str,
     commit_id: &str,
     rows: &[MaterializedTrackedStateRow],
 ) {
     let mut read = storage
         .begin_read(crate::storage::StorageReadOptions::default())
         .expect("seed read should open");
-    let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+    let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
     let mut writes = StorageWriteSet::new();
-    let canonical_row = prepare_version_ref_row(version_id, commit_id, TEST_TIMESTAMP)
-        .expect("version ref should canonicalize");
-    version_ctx
+    let canonical_row = prepare_branch_ref_row(branch_id, commit_id, TEST_TIMESTAMP)
+        .expect("branch ref should canonicalize");
+    branch_ctx
         .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])
-        .expect("version ref should stage");
+        .expect("branch ref should stage");
     stage_tracked_root_from_materialized(
         &mut read,
         &mut writes,
@@ -445,6 +445,6 @@ pub(crate) fn untracked_state_row_from_materialized(
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
-        version_id: row.version_id.clone(),
+        branch_id: row.branch_id.clone(),
     })
 }

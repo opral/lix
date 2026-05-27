@@ -1,8 +1,8 @@
 use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
-    CreateVersionOptions, CreateVersionReceipt, Engine, ExecuteResult, InitReceipt,
-    MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
-    SessionContext, SessionTransaction, SwitchVersionOptions, SwitchVersionReceipt,
+    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InitReceipt,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 use lix_engine::{LixError, Value};
 
@@ -84,9 +84,9 @@ impl Simulation {
         &self.receipt.initial_commit_id
     }
 
-    /// Returns the initialized main version id.
-    pub fn main_version_id(&self) -> &str {
-        &self.receipt.main_version_id
+    /// Returns the initialized main branch id.
+    pub fn main_branch_id(&self) -> &str {
+        &self.receipt.main_branch_id
     }
 
     pub(crate) fn finish(&self) {
@@ -111,17 +111,17 @@ impl SimSession {
         }
     }
 
-    pub async fn active_version_id(&self) -> Result<String, LixError> {
-        self.session.active_version_id().await
+    pub async fn active_branch_id(&self) -> Result<String, LixError> {
+        self.session.active_branch_id().await
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         let statement_kind = classify_statement(sql);
         if statement_kind == StatementKind::Read {
-            let active_version_id = self.session.active_version_id().await?;
+            let active_branch_id = self.session.active_branch_id().await?;
             self.sim
                 .rebuild_tracked_state
-                .before_read(&self.engine, &active_version_id)
+                .before_read(&self.engine, &active_branch_id)
                 .await?;
         }
 
@@ -135,10 +135,10 @@ impl SimSession {
     }
 
     pub async fn begin_transaction(&self) -> Result<SimTransaction, LixError> {
-        let active_version_id = self.session.active_version_id().await?;
+        let active_branch_id = self.session.active_branch_id().await?;
         self.sim
             .rebuild_tracked_state
-            .before_read(&self.engine, &active_version_id)
+            .before_read(&self.engine, &active_branch_id)
             .await?;
         let transaction = self.session.begin_transaction().await?;
         Ok(SimTransaction {
@@ -150,40 +150,40 @@ impl SimSession {
         })
     }
 
-    pub async fn create_version(
+    pub async fn create_branch(
         &self,
-        options: CreateVersionOptions,
-    ) -> Result<CreateVersionReceipt, LixError> {
-        let result = self.session.create_version(options).await;
+        options: CreateBranchOptions,
+    ) -> Result<CreateBranchReceipt, LixError> {
+        let result = self.session.create_branch(options).await;
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
         result
     }
 
-    pub async fn merge_version(
+    pub async fn merge_branch(
         &self,
-        options: MergeVersionOptions,
-    ) -> Result<MergeVersionReceipt, LixError> {
-        let result = self.session.merge_version(options).await;
+        options: MergeBranchOptions,
+    ) -> Result<MergeBranchReceipt, LixError> {
+        let result = self.session.merge_branch(options).await;
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
         result
     }
 
-    pub async fn merge_version_preview(
+    pub async fn merge_branch_preview(
         &self,
-        options: MergeVersionPreviewOptions,
-    ) -> Result<MergeVersionPreview, LixError> {
-        self.session.merge_version_preview(options).await
+        options: MergeBranchPreviewOptions,
+    ) -> Result<MergeBranchPreview, LixError> {
+        self.session.merge_branch_preview(options).await
     }
 
-    pub async fn switch_version(
+    pub async fn switch_branch(
         &self,
-        options: SwitchVersionOptions,
-    ) -> Result<(SimSession, SwitchVersionReceipt), LixError> {
-        let (session, receipt) = self.session.switch_version(options).await?;
+        options: SwitchBranchOptions,
+    ) -> Result<(SimSession, SwitchBranchReceipt), LixError> {
+        let (session, receipt) = self.session.switch_branch(options).await?;
         Ok((
             SimSession {
                 sim: self.sim.clone(),
@@ -215,10 +215,10 @@ impl SimTransaction {
         let statement_kind = classify_statement(sql);
         match statement_kind {
             StatementKind::Read => {
-                let active_version_id = self.transaction.active_version_id()?.to_string();
+                let active_branch_id = self.transaction.active_branch_id()?.to_string();
                 self.sim
                     .rebuild_tracked_state
-                    .before_read(&self.engine, &active_version_id)
+                    .before_read(&self.engine, &active_branch_id)
                     .await?;
             }
             StatementKind::Write => {}

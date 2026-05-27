@@ -1,6 +1,6 @@
 {
   "x-lix-key": "lix_binary_blob_ref",
-  "description": "Metadata pointer from a file version to its binary payload in internal CAS storage.",
+  "description": "Metadata pointer from a file row to its binary payload in internal CAS storage.",
   "x-lix-primary-key": [
     "/id"
   ],

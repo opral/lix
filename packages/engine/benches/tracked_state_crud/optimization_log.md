@@ -37,7 +37,7 @@ Notes:
 - `transaction` builds `TransactionWriteRow`s directly and stages them through
   the transaction layer. It bypasses SQL/DataFusion but still exercises
   normalization, validation, changelog segments/indexes, commit visibility,
-  version refs, and tracked-state commit roots.
+  branch refs, and tracked-state commit roots.
 - `sql_session` runs on `InMemoryStorageBackend`; the copied SQLite/RocksDB/redb
   backend support modules do not satisfy the SQL session read bounds.
 - SQL update benches are gated behind `LIX_TRACKED_STATE_CRUD_SQL_UPDATE=1`.

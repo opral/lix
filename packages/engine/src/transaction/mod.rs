@@ -21,4 +21,4 @@ pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;
 pub(crate) use context::Transaction;
 pub(crate) use context::TransactionCommitBoundary;
-pub(crate) use prep::prepare_version_ref_row;
+pub(crate) use prep::prepare_branch_ref_row;

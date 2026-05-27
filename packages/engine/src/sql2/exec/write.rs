@@ -10,11 +10,11 @@ use super::SqlLogicalPlan;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::SqlWriteExecutionContext;
-use crate::{LixError, Value, GLOBAL_VERSION_ID};
+use crate::{LixError, Value, GLOBAL_BRANCH_ID};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +49,7 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
 ) -> Result<SqlLogicalPlan, LixError> {
     let visible_schemas = ctx.list_visible_schemas()?;
     let bound_write =
-        crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;
+        crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_branch_id())?;
     let logical_write = crate::sql2::plan_write(bound_write)?;
     Ok(SqlLogicalPlan::Write(WriteLogicalPlan {
         plan: logical_write,
@@ -112,7 +112,7 @@ async fn execute_write_logical_plan_with_mode_inner(
             "expected SQL write logical plan",
         ));
     };
-    let write_plan = resolve_parameterized_version_scope(write_plan.plan, params)?;
+    let write_plan = resolve_parameterized_branch_scope(write_plan.plan, params)?;
     validate_write_parameter_count(&write_plan, params.len())?;
 
     if mode != WriteExecutorModeInner::ForceDataFusion
@@ -148,119 +148,119 @@ async fn execute_write_logical_plan_with_mode_inner(
     Ok((rows_affected, WriteExecutorPath::DataFusion))
 }
 
-fn resolve_parameterized_version_scope(
+fn resolve_parameterized_branch_scope(
     mut plan: LogicalWritePlan,
     params: &[Value],
 ) -> Result<LogicalWritePlan, LixError> {
-    plan.bound.version_scope = match plan.bound.version_scope {
-        VersionScope::ExplicitDynamic {
-            mut version_ids,
+    plan.bound.branch_scope = match plan.bound.branch_scope {
+        BranchScope::ExplicitDynamic {
+            mut branch_ids,
             param_indexes,
         } => {
-            insert_version_param_values(&mut version_ids, &param_indexes, params)?;
-            if version_ids.is_empty() {
-                VersionScope::Empty
+            insert_branch_param_values(&mut branch_ids, &param_indexes, params)?;
+            if branch_ids.is_empty() {
+                BranchScope::Empty
             } else {
-                VersionScope::Explicit { version_ids }
+                BranchScope::Explicit { branch_ids }
             }
         }
-        VersionScope::ExplicitRequiredDynamic {
-            mut version_ids,
+        BranchScope::ExplicitRequiredDynamic {
+            mut branch_ids,
             param_indexes,
-        } => match version_column_for_target(&plan.bound.target) {
-            Some(version_column) => {
-                match resolved_predicate_version_selector(
+        } => match branch_column_for_target(&plan.bound.target) {
+            Some(branch_column) => {
+                match resolved_predicate_branch_selector(
                     &plan.bound.predicate,
-                    version_column,
+                    branch_column,
                     params,
                 )? {
-                    ResolvedVersionSelector::Static(version_ids) if version_ids.is_empty() => {
-                        VersionScope::Empty
+                    ResolvedBranchSelector::Static(branch_ids) if branch_ids.is_empty() => {
+                        BranchScope::Empty
                     }
-                    ResolvedVersionSelector::Static(version_ids) => {
-                        VersionScope::ExplicitRequired { version_ids }
+                    ResolvedBranchSelector::Static(branch_ids) => {
+                        BranchScope::ExplicitRequired { branch_ids }
                     }
-                    ResolvedVersionSelector::Missing => {
-                        insert_version_param_values(&mut version_ids, &param_indexes, params)?;
-                        if version_ids.is_empty() {
-                            VersionScope::Empty
+                    ResolvedBranchSelector::Missing => {
+                        insert_branch_param_values(&mut branch_ids, &param_indexes, params)?;
+                        if branch_ids.is_empty() {
+                            BranchScope::Empty
                         } else {
-                            VersionScope::ExplicitRequired { version_ids }
+                            BranchScope::ExplicitRequired { branch_ids }
                         }
                     }
                 }
             }
             None => {
-                insert_version_param_values(&mut version_ids, &param_indexes, params)?;
-                if version_ids.is_empty() {
-                    VersionScope::Empty
+                insert_branch_param_values(&mut branch_ids, &param_indexes, params)?;
+                if branch_ids.is_empty() {
+                    BranchScope::Empty
                 } else {
-                    VersionScope::ExplicitRequired { version_ids }
+                    BranchScope::ExplicitRequired { branch_ids }
                 }
             }
         },
         scope => scope,
     };
-    normalize_lix_state_by_version_scope(&mut plan, params)?;
+    normalize_lix_state_by_branch_scope(&mut plan, params)?;
     Ok(plan)
 }
 
-fn version_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
+fn branch_column_for_target(target: &BoundWriteTarget) -> Option<&'static str> {
     match target {
-        BoundWriteTarget::LixStateByVersion => Some("version_id"),
-        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByVersion {
+        BoundWriteTarget::LixStateByBranch => Some("branch_id"),
+        BoundWriteTarget::Entity(crate::sql2::bind::write::EntityWriteSurface::ByBranch {
             ..
         })
-        | BoundWriteTarget::File(crate::sql2::bind::write::FileWriteSurface::ByVersion)
-        | BoundWriteTarget::Directory(crate::sql2::bind::write::DirectoryWriteSurface::ByVersion) => {
-            Some("lixcol_version_id")
+        | BoundWriteTarget::File(crate::sql2::bind::write::FileWriteSurface::ByBranch)
+        | BoundWriteTarget::Directory(crate::sql2::bind::write::DirectoryWriteSurface::ByBranch) => {
+            Some("lixcol_branch_id")
         }
         _ => None,
     }
 }
 
-fn normalize_lix_state_by_version_scope(
+fn normalize_lix_state_by_branch_scope(
     plan: &mut LogicalWritePlan,
     params: &[Value],
 ) -> Result<(), LixError> {
-    if !matches!(plan.bound.target, BoundWriteTarget::LixStateByVersion) {
+    if !matches!(plan.bound.target, BoundWriteTarget::LixStateByBranch) {
         return Ok(());
     }
-    let version_ids = match &plan.bound.version_scope {
-        VersionScope::Explicit { version_ids } | VersionScope::ExplicitRequired { version_ids } => {
-            version_ids
+    let branch_ids = match &plan.bound.branch_scope {
+        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
+            branch_ids
         }
         _ => return Ok(()),
     };
     let explicit_global = explicit_lix_state_global_value(&plan.bound.input, params)?.or(
         predicate_lix_state_global_value(&plan.bound.predicate, params)?,
     );
-    if version_ids.len() > 1 {
-        if explicit_global == Some(true) || version_ids.contains(GLOBAL_VERSION_ID) {
+    if branch_ids.len() > 1 {
+        if explicit_global == Some(true) || branch_ids.contains(GLOBAL_BRANCH_ID) {
             return Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
-                "lix_state_by_version writes cannot mix global and version-specific rows",
+                "lix_state_by_branch writes cannot mix global and branch-specific rows",
             ));
         }
         return Ok(());
     }
-    let is_global_version = version_ids.contains(GLOBAL_VERSION_ID);
-    if explicit_global == Some(true) && !is_global_version {
+    let is_global_branch = branch_ids.contains(GLOBAL_BRANCH_ID);
+    if explicit_global == Some(true) && !is_global_branch {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state_by_version writes cannot combine global = true with non-global version_id",
+            "lix_state_by_branch writes cannot combine global = true with non-global branch_id",
         ));
     }
-    if !is_global_version {
+    if !is_global_branch {
         return Ok(());
     }
     match explicit_global {
         Some(false) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state_by_version writes cannot combine global = false with global version_id",
+            "lix_state_by_branch writes cannot combine global = false with global branch_id",
         )),
         Some(true) | None => {
-            plan.bound.version_scope = VersionScope::Global;
+            plan.bound.branch_scope = BranchScope::Global;
             Ok(())
         }
     }
@@ -286,7 +286,7 @@ fn explicit_lix_state_global_value(
                 Some(_) => {
                     return Err(LixError::new(
                         LixError::CODE_TYPE_MISMATCH,
-                        "lix_state_by_version global selectors must be boolean parameters",
+                        "lix_state_by_branch global selectors must be boolean parameters",
                     ));
                 }
                 None => {
@@ -299,14 +299,14 @@ fn explicit_lix_state_global_value(
             _ => {
                 return Err(LixError::new(
                     LixError::CODE_UNSUPPORTED_SQL,
-                    "lix_state_by_version global selectors must be static booleans",
+                    "lix_state_by_branch global selectors must be static booleans",
                 ));
             }
         };
         if explicit.is_some_and(|prior| prior != value) {
             return Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
-                "lix_state_by_version writes cannot mix global and version-specific rows",
+                "lix_state_by_branch writes cannot mix global and branch-specific rows",
             ));
         }
         explicit = Some(value);
@@ -315,12 +315,12 @@ fn explicit_lix_state_global_value(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ResolvedVersionSelector {
+enum ResolvedBranchSelector {
     Missing,
     Static(BTreeSet<String>),
 }
 
-impl ResolvedVersionSelector {
+impl ResolvedBranchSelector {
     fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::Missing, _) | (_, Self::Missing) => Self::Missing,
@@ -341,111 +341,111 @@ impl ResolvedVersionSelector {
     }
 }
 
-fn resolved_predicate_version_selector(
+fn resolved_predicate_branch_selector(
     predicate: &BoundPredicate,
-    version_column: &str,
+    branch_column: &str,
     params: &[Value],
-) -> Result<ResolvedVersionSelector, LixError> {
+) -> Result<ResolvedBranchSelector, LixError> {
     match predicate {
-        BoundPredicate::True => Ok(ResolvedVersionSelector::Missing),
-        BoundPredicate::False => Ok(ResolvedVersionSelector::Static(BTreeSet::new())),
+        BoundPredicate::True => Ok(ResolvedBranchSelector::Missing),
+        BoundPredicate::False => Ok(ResolvedBranchSelector::Static(BTreeSet::new())),
         BoundPredicate::And(predicates) => {
-            let mut result = ResolvedVersionSelector::Missing;
+            let mut result = ResolvedBranchSelector::Missing;
             for predicate in predicates {
-                result = result.intersect(resolved_predicate_version_selector(
+                result = result.intersect(resolved_predicate_branch_selector(
                     predicate,
-                    version_column,
+                    branch_column,
                     params,
                 )?);
             }
             Ok(result)
         }
         BoundPredicate::Or(predicates) => {
-            let mut result = ResolvedVersionSelector::Static(BTreeSet::new());
+            let mut result = ResolvedBranchSelector::Static(BTreeSet::new());
             for predicate in predicates {
-                result = result.union(resolved_predicate_version_selector(
+                result = result.union(resolved_predicate_branch_selector(
                     predicate,
-                    version_column,
+                    branch_column,
                     params,
                 )?);
             }
             Ok(result)
         }
         BoundPredicate::Eq(left, right) => {
-            resolved_version_selector_from_binary_exprs(left, right, version_column, params)
+            resolved_branch_selector_from_binary_exprs(left, right, branch_column, params)
                 .or_else(|| {
-                    resolved_version_selector_from_binary_exprs(right, left, version_column, params)
+                    resolved_branch_selector_from_binary_exprs(right, left, branch_column, params)
                 })
                 .transpose()
-                .map(|selector| selector.unwrap_or(ResolvedVersionSelector::Missing))
+                .map(|selector| selector.unwrap_or(ResolvedBranchSelector::Missing))
         }
         BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
-            Ok(ResolvedVersionSelector::Missing)
+            Ok(ResolvedBranchSelector::Missing)
         }
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
-                return Ok(ResolvedVersionSelector::Missing);
+                return Ok(ResolvedBranchSelector::Missing);
             };
-            if column.name != version_column {
-                return Ok(ResolvedVersionSelector::Missing);
+            if column.name != branch_column {
+                return Ok(ResolvedBranchSelector::Missing);
             }
-            let mut result = ResolvedVersionSelector::Static(BTreeSet::new());
+            let mut result = ResolvedBranchSelector::Static(BTreeSet::new());
             for value in values {
-                result = result.union(resolved_value_version_selector(value, params)?);
+                result = result.union(resolved_value_branch_selector(value, params)?);
             }
             Ok(result)
         }
     }
 }
 
-fn resolved_version_selector_from_binary_exprs(
+fn resolved_branch_selector_from_binary_exprs(
     column_expr: &BoundExpr,
     value_expr: &BoundExpr,
-    version_column: &str,
+    branch_column: &str,
     params: &[Value],
-) -> Option<Result<ResolvedVersionSelector, LixError>> {
+) -> Option<Result<ResolvedBranchSelector, LixError>> {
     let BoundExpr::Column(column) = column_expr else {
         return None;
     };
-    if column.name != version_column {
+    if column.name != branch_column {
         return None;
     }
-    Some(resolved_value_version_selector(value_expr, params))
+    Some(resolved_value_branch_selector(value_expr, params))
 }
 
-fn resolved_value_version_selector(
+fn resolved_value_branch_selector(
     expr: &BoundExpr,
     params: &[Value],
-) -> Result<ResolvedVersionSelector, LixError> {
+) -> Result<ResolvedBranchSelector, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Text(version_id)) => {
-            Ok(ResolvedVersionSelector::Static(BTreeSet::from([
-                version_id.clone(),
+        BoundExpr::Literal(BoundLiteral::Text(branch_id)) => {
+            Ok(ResolvedBranchSelector::Static(BTreeSet::from([
+                branch_id.clone()
             ])))
         }
         BoundExpr::Literal(BoundLiteral::Null) => {
-            Ok(ResolvedVersionSelector::Static(BTreeSet::new()))
+            Ok(ResolvedBranchSelector::Static(BTreeSet::new()))
         }
         BoundExpr::Param(param) => match params.get(param.index.saturating_sub(1)) {
-            Some(Value::Text(version_id)) => Ok(ResolvedVersionSelector::Static(BTreeSet::from([
-                version_id.clone(),
+            Some(Value::Text(branch_id)) => Ok(ResolvedBranchSelector::Static(BTreeSet::from([
+                branch_id.clone(),
             ]))),
-            Some(Value::Null) => Ok(ResolvedVersionSelector::Static(BTreeSet::new())),
+            Some(Value::Null) => Ok(ResolvedBranchSelector::Static(BTreeSet::new())),
             Some(_) => Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "by-version SQL write selectors require text version-id parameters",
+                "by-branch SQL write selectors require text branch-id parameters",
             )),
             None => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 format!(
-                    "SQL version selector parameter ${} was not provided",
+                    "SQL branch selector parameter ${} was not provided",
                     param.index
                 ),
             )),
         },
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "by-version SQL write predicates require string version ids",
+            "by-branch SQL write predicates require string branch ids",
         )),
     }
 }
@@ -488,7 +488,7 @@ fn predicate_lix_state_global_value(
         ResolvedGlobalSelector::Static(value) => Ok(Some(value)),
         ResolvedGlobalSelector::Mixed => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "lix_state_by_version writes cannot mix global and version-specific rows",
+            "lix_state_by_branch writes cannot mix global and branch-specific rows",
         )),
         ResolvedGlobalSelector::Missing | ResolvedGlobalSelector::Empty => Ok(None),
     }
@@ -591,27 +591,27 @@ fn global_selector_value(
     }
 }
 
-fn insert_version_param_values(
-    version_ids: &mut std::collections::BTreeSet<String>,
+fn insert_branch_param_values(
+    branch_ids: &mut std::collections::BTreeSet<String>,
     param_indexes: &std::collections::BTreeSet<usize>,
     params: &[Value],
 ) -> Result<(), LixError> {
     for index in param_indexes {
         match params.get(index.saturating_sub(1)) {
-            Some(Value::Text(version_id)) => {
-                version_ids.insert(version_id.clone());
+            Some(Value::Text(branch_id)) => {
+                branch_ids.insert(branch_id.clone());
             }
             Some(Value::Null) => {}
             Some(_) => {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    "by-version SQL write selectors require text version-id parameters",
+                    "by-branch SQL write selectors require text branch-id parameters",
                 ));
             }
             None => {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    format!("SQL version selector parameter ${index} was not provided"),
+                    format!("SQL branch selector parameter ${index} was not provided"),
                 ));
             }
         }

@@ -3,41 +3,38 @@
 mod support;
 use lix_engine::Value;
 
-simulation_test!(
-    version_ref_advances_after_tracked_commit,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
-        let initial_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
+simulation_test!(branch_ref_advances_after_tracked_commit, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect("version head should load")
-            .expect("version head should exist");
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('version-ref-advance', 'one')",
-                &[],
-            )
-            .await
-            .expect("tracked write should succeed");
-        let advanced_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
-            .await
-            .expect("version head should load")
-            .expect("version head should exist");
+            .expect("main session should open"),
+        &engine,
+    );
+    let initial_head = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist");
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('branch-ref-advance', 'one')",
+            &[],
+        )
+        .await
+        .expect("tracked write should succeed");
+    let advanced_head = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist");
 
-        assert_ne!(
-            advanced_head, initial_head,
-            "tracked commit should advance the touched version ref"
-        );
-    }
-);
+    assert_ne!(
+        advanced_head, initial_head,
+        "tracked commit should advance the touched branch ref"
+    );
+});
 
 simulation_test!(
     tracked_write_creates_one_commit_without_advancing_global_ref,
@@ -58,12 +55,12 @@ simulation_test!(
             &engine,
         );
         let global_head_before = engine
-            .load_version_head_commit_id("global")
+            .load_branch_head_commit_id("global")
             .await
             .expect("global head should load")
             .expect("global head should exist");
         let main_head_before = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
@@ -77,35 +74,35 @@ simulation_test!(
             .expect("tracked write should succeed");
 
         let global_head_after = engine
-            .load_version_head_commit_id("global")
+            .load_branch_head_commit_id("global")
             .await
             .expect("global head should load")
             .expect("global head should exist");
         let main_head_after = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
 
         assert_eq!(
             global_head_after, global_head_before,
-            "non-global writes must not advance the global version ref"
+            "non-global writes must not advance the global branch ref"
         );
         assert_ne!(
             main_head_after, main_head_before,
-            "tracked write should advance exactly the touched version ref"
+            "tracked write should advance exactly the touched branch ref"
         );
 
         assert_eq!(
             commit_ids(&global_session, &main_head_after).await,
             vec![main_head_after.clone()],
-            "the touched-version commit should still be globally visible through lix_state"
+            "the touched-branch commit should still be globally visible through lix_state"
         );
     }
 );
 
 simulation_test!(
-    second_commit_parents_previous_version_head,
+    second_commit_parents_previous_branch_head,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -131,10 +128,10 @@ simulation_test!(
             .await
             .expect("first tracked write should succeed");
         let first_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
-            .expect("version head should load")
-            .expect("version head should exist");
+            .expect("branch head should load")
+            .expect("branch head should exist");
 
         session
             .execute(
@@ -144,17 +141,17 @@ simulation_test!(
             .await
             .expect("second tracked write should succeed");
         let second_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
-            .expect("version head should load")
-            .expect("version head should exist");
+            .expect("branch head should load")
+            .expect("branch head should exist");
 
         assert_ne!(second_head, first_head);
 
         assert_eq!(
             commit_parent_ids(&global_session, &second_head).await,
             vec![first_head],
-            "second commit should parent to the previous version head"
+            "second commit should parent to the previous branch head"
         );
     }
 );

@@ -4,7 +4,7 @@
 //! - Engine/session APIs provide one process-local durable write lane per
 //!   backend durable target.
 //! - Explicit transactions serialize with implicit session writes on the same
-//!   handle and durable target. The MVP does not promise multi-version snapshot
+//!   handle and durable target. The MVP does not promise multi-branch snapshot
 //!   isolation across concurrent sessions beyond each backend read snapshot.
 //! - `SessionContext::close()` is a lifecycle boundary. It waits for in-flight
 //!   reads, rejects live explicit transactions, cancels queued or pre-boundary
@@ -17,6 +17,7 @@
 
 pub mod backend;
 mod binary_cas;
+pub(crate) mod branch;
 pub(crate) mod catalog;
 pub(crate) mod cel;
 #[allow(dead_code, unused_imports)]
@@ -50,7 +51,6 @@ pub mod transaction;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod transaction;
 pub(crate) mod untracked_state;
-pub(crate) mod version;
 pub mod wasm;
 
 pub use schema::{
@@ -76,17 +76,17 @@ pub use backend::{
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
-pub use common::{CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId, VersionId};
+pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
-    CreateVersionOptions, CreateVersionReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MergeVersionOptions,
-    MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
-    SessionContext, SessionTransaction, SwitchVersionOptions, SwitchVersionReceipt,
+    CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
+    MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
+    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 
-pub(crate) const GLOBAL_VERSION_ID: &str = "global";
+pub(crate) const GLOBAL_BRANCH_ID: &str = "global";

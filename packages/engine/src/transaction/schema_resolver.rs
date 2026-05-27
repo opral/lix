@@ -89,7 +89,7 @@ impl TransactionSchemaResolver {
         match self
             .catalogs_by_domain
             .get_mut(&domain)
-            .expect("catalog cache should contain requested version")
+            .expect("catalog cache should contain requested branch")
         {
             CatalogEntry::Catalog(catalog) => Ok(catalog),
             CatalogEntry::SchemaFacts(_) => {
@@ -109,7 +109,7 @@ impl TransactionSchemaResolver {
         match self
             .catalogs_by_domain
             .get(&domain)
-            .expect("catalog cache should contain requested version")
+            .expect("catalog cache should contain requested branch")
         {
             CatalogEntry::Catalog(catalog) => Ok(catalog),
             CatalogEntry::SchemaFacts(_) => {
@@ -149,7 +149,7 @@ impl LiveStateReader for TransactionSchemaLiveStateReader<'_> {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
-                    version_ids: vec![request.version_id.clone()],
+                    branch_ids: vec![request.branch_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     ..Default::default()
                 },

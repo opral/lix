@@ -28,7 +28,7 @@
         "string",
         "null"
       ],
-      "description": "Filesystem-scoped file identifier when the change belongs to a file; NULL for engine-internal entities (commits, versions, settings)."
+      "description": "Filesystem-scoped file identifier when the change belongs to a file; NULL for engine-internal entities (commits, branches, settings)."
     },
     "metadata": {
       "type": [

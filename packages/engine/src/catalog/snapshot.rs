@@ -48,7 +48,7 @@ impl CatalogSnapshot {
             let key = crate::schema::schema_key_from_definition(schema)?;
             let catalog_key = SchemaCatalogKey::from_schema_key(key);
             let identity = DomainSchemaIdentity::new(
-                Domain::schema_catalog(crate::GLOBAL_VERSION_ID, true),
+                Domain::schema_catalog(crate::GLOBAL_BRANCH_ID, true),
                 catalog_key.schema_key.clone(),
             );
             catalog.remember_schema_identity(identity, catalog_key, schema.clone())?;

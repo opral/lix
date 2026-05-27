@@ -4,18 +4,18 @@ use crate::live_state::{
     LiveStateReader, LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VisibilityRequest {
-    pub(crate) version_scope: VisibilityVersionScope,
+    pub(crate) branch_scope: VisibilityBranchScope,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum VisibilityVersionScope {
-    VersionIds { version_ids: Vec<String> },
+pub(crate) enum VisibilityBranchScope {
+    BranchIds { branch_ids: Vec<String> },
 }
 
 pub(crate) trait StagedLiveStateRows {
@@ -29,26 +29,26 @@ pub(crate) trait StagedLiveStateRows {
 enum OverlayTier {
     BaseGlobal,
     StagedGlobal,
-    BaseVersion,
-    StagedVersion,
+    BaseBranch,
+    StagedBranch,
 }
 
-/// Expands a version-scoped storage read so global candidates are available for
+/// Expands a branch-scoped storage read so global candidates are available for
 /// the visibility overlay.
-pub(crate) fn expanded_version_ids(version_ids: &[String]) -> Vec<String> {
-    if version_ids.is_empty() {
+pub(crate) fn expanded_branch_ids(branch_ids: &[String]) -> Vec<String> {
+    if branch_ids.is_empty() {
         return Vec::new();
     }
 
-    let mut expanded = version_ids.to_vec();
-    if version_ids
+    let mut expanded = branch_ids.to_vec();
+    if branch_ids
         .iter()
-        .any(|version_id| version_id != GLOBAL_VERSION_ID)
+        .any(|branch_id| branch_id != GLOBAL_BRANCH_ID)
         && !expanded
             .iter()
-            .any(|version_id| version_id == GLOBAL_VERSION_ID)
+            .any(|branch_id| branch_id == GLOBAL_BRANCH_ID)
     {
-        expanded.push(GLOBAL_VERSION_ID.to_string());
+        expanded.push(GLOBAL_BRANCH_ID.to_string());
     }
     expanded
 }
@@ -58,11 +58,11 @@ pub(crate) fn resolve_visible_rows(
     staged_rows: Vec<MaterializedLiveStateRow>,
     request: &VisibilityRequest,
 ) -> Vec<MaterializedLiveStateRow> {
-    let requested_version_ids = requested_version_ids(&request.version_scope);
+    let requested_branch_ids = requested_branch_ids(&request.branch_scope);
     resolve_live_state_rows(
         base_rows,
         staged_rows,
-        &requested_version_ids,
+        &requested_branch_ids,
         request.include_tombstones,
         request.limit,
     )
@@ -79,15 +79,15 @@ where
     let mut candidate_request = request.clone();
     candidate_request.limit = None;
     candidate_request.filter.include_tombstones = true;
-    candidate_request.filter.version_ids = expanded_version_ids(&request.filter.version_ids);
+    candidate_request.filter.branch_ids = expanded_branch_ids(&request.filter.branch_ids);
     let staged_rows = staged.staged_rows(&candidate_request)?;
     let rows = base.scan_rows(&candidate_request).await?;
     Ok(resolve_visible_rows(
         rows,
         staged_rows,
         &VisibilityRequest {
-            version_scope: VisibilityVersionScope::VersionIds {
-                version_ids: request.filter.version_ids.clone(),
+            branch_scope: VisibilityBranchScope::BranchIds {
+                branch_ids: request.filter.branch_ids.clone(),
             },
             include_tombstones: request.filter.include_tombstones,
             limit: request.limit,
@@ -97,18 +97,18 @@ where
 
 /// Resolves raw tracked/untracked candidates into the rows visible for a scan.
 ///
-/// Global rows are projected into each requested version scope, but keep
-/// `global = true`. Version-scoped rows win over projected global rows for the
+/// Global rows are projected into each requested branch scope, but keep
+/// `global = true`. Branch-scoped rows win over projected global rows for the
 /// same identity. Tombstones participate in winning and are filtered only after
 /// visibility is resolved. This projection is a read concern; constraint
 /// validation remains exact storage-scope local unless a validator explicitly
 /// opts into overlay semantics.
 fn resolve_scan_rows(
     rows: Vec<MaterializedLiveStateRow>,
-    requested_version_ids: &[String],
+    requested_branch_ids: &[String],
     include_tombstones: bool,
 ) -> Vec<MaterializedLiveStateRow> {
-    let mut rows = project_global_rows_into_requested_versions(rows, requested_version_ids);
+    let mut rows = project_global_rows_into_requested_branches(rows, requested_branch_ids);
     if !include_tombstones {
         rows.retain(|row| !row.deleted);
     }
@@ -118,12 +118,12 @@ fn resolve_scan_rows(
 fn resolve_live_state_rows(
     base_rows: Vec<MaterializedLiveStateRow>,
     staged_rows: Vec<MaterializedLiveStateRow>,
-    requested_version_ids: &[String],
+    requested_branch_ids: &[String],
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<MaterializedLiveStateRow> {
-    let base_rows = resolve_scan_rows(base_rows, requested_version_ids, true);
-    let staged_rows = resolve_scan_rows(staged_rows, requested_version_ids, true);
+    let base_rows = resolve_scan_rows(base_rows, requested_branch_ids, true);
+    let staged_rows = resolve_scan_rows(staged_rows, requested_branch_ids, true);
     let mut rows_by_identity =
         BTreeMap::<LiveStateRowIdentity, (OverlayTier, MaterializedLiveStateRow)>::new();
 
@@ -131,7 +131,7 @@ fn resolve_live_state_rows(
         let tier = if row.global {
             OverlayTier::BaseGlobal
         } else {
-            OverlayTier::BaseVersion
+            OverlayTier::BaseBranch
         };
         insert_overlay_row(&mut rows_by_identity, tier, row);
     }
@@ -139,7 +139,7 @@ fn resolve_live_state_rows(
         let tier = if row.global {
             OverlayTier::StagedGlobal
         } else {
-            OverlayTier::StagedVersion
+            OverlayTier::StagedBranch
         };
         insert_overlay_row(&mut rows_by_identity, tier, row);
     }
@@ -157,38 +157,38 @@ fn resolve_live_state_rows(
     rows
 }
 
-fn requested_version_ids(version_scope: &VisibilityVersionScope) -> Vec<String> {
-    match version_scope {
-        VisibilityVersionScope::VersionIds { version_ids } => version_ids.clone(),
+fn requested_branch_ids(branch_scope: &VisibilityBranchScope) -> Vec<String> {
+    match branch_scope {
+        VisibilityBranchScope::BranchIds { branch_ids } => branch_ids.clone(),
     }
 }
 
-fn project_global_rows_into_requested_versions(
+fn project_global_rows_into_requested_branches(
     rows: Vec<MaterializedLiveStateRow>,
-    requested_version_ids: &[String],
+    requested_branch_ids: &[String],
 ) -> Vec<MaterializedLiveStateRow> {
-    if requested_version_ids.is_empty() {
+    if requested_branch_ids.is_empty() {
         return dedupe_rows(rows);
     }
 
     let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
-    for requested_version_id in requested_version_ids {
+    for requested_branch_id in requested_branch_ids {
         for row in &rows {
-            if row.version_id == GLOBAL_VERSION_ID {
+            if row.branch_id == GLOBAL_BRANCH_ID {
                 let mut projected = row.clone();
-                projected.version_id = requested_version_id.clone();
+                projected.branch_id = requested_branch_id.clone();
                 insert_row_preferring_untracked(&mut rows_by_identity, projected);
             }
         }
-        let mut version_rows_by_identity =
+        let mut branch_rows_by_identity =
             BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
         for row in rows
             .iter()
-            .filter(|row| row.version_id == *requested_version_id)
+            .filter(|row| row.branch_id == *requested_branch_id)
         {
-            insert_row_preferring_untracked(&mut version_rows_by_identity, row.clone());
+            insert_row_preferring_untracked(&mut branch_rows_by_identity, row.clone());
         }
-        rows_by_identity.extend(version_rows_by_identity);
+        rows_by_identity.extend(branch_rows_by_identity);
     }
 
     rows_by_identity.into_values().collect()
@@ -239,19 +239,19 @@ mod tests {
     use async_trait::async_trait;
 
     #[test]
-    fn expands_requested_version_with_global_candidates() {
+    fn expands_requested_branch_with_global_candidates() {
         assert_eq!(
-            expanded_version_ids(&["version-a".to_string()]),
-            vec!["version-a".to_string(), "global".to_string()]
+            expanded_branch_ids(&["branch-a".to_string()]),
+            vec!["branch-a".to_string(), "global".to_string()]
         );
         assert_eq!(
-            expanded_version_ids(&["global".to_string()]),
+            expanded_branch_ids(&["global".to_string()]),
             vec!["global".to_string()]
         );
     }
 
     #[test]
-    fn committed_scan_projects_global_row_into_requested_version() {
+    fn committed_scan_projects_global_row_into_requested_branch() {
         let rows = resolve_scan_rows(
             vec![row_at(
                 "global",
@@ -260,12 +260,12 @@ mod tests {
                 true,
                 Some("change-global"),
             )],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_scan_prefers_requested_version_row_over_projected_global_row() {
+    fn committed_scan_prefers_requested_branch_row_over_projected_global_row() {
         let rows = resolve_scan_rows(
             vec![
                 row_at(
@@ -285,37 +285,37 @@ mod tests {
                     Some("change-global"),
                 ),
                 row_at(
-                    "version-a",
+                    "branch-a",
                     "entity",
-                    "version-value",
+                    "branch-value",
                     false,
-                    Some("change-version"),
+                    Some("change-branch"),
                 ),
             ],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(!rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"version-value\"}")
+            Some("{\"value\":\"branch-value\"}")
         );
     }
 
     #[test]
-    fn empty_version_filter_dedupes_duplicate_base_rows() {
+    fn empty_branch_filter_dedupes_duplicate_base_rows() {
         let mut tracked = row_at(
-            "version-a",
+            "branch-a",
             "entity",
             "tracked",
             false,
             Some("change-tracked"),
         );
         tracked.untracked = false;
-        let mut untracked = row_at("version-a", "entity", "untracked", false, None);
+        let mut untracked = row_at("branch-a", "entity", "untracked", false, None);
         untracked.untracked = true;
 
         let rows = resolve_scan_rows(vec![tracked, untracked], &[], false);
@@ -329,15 +329,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_version_filter_dedupes_duplicate_base_and_staged_overlay_identity() {
-        let base = row_at("version-a", "entity", "base", false, Some("change-base"));
-        let staged = row_at(
-            "version-a",
-            "entity",
-            "staged",
-            false,
-            Some("change-staged"),
-        );
+    fn empty_branch_filter_dedupes_duplicate_base_and_staged_overlay_identity() {
+        let base = row_at("branch-a", "entity", "base", false, Some("change-base"));
+        let staged = row_at("branch-a", "entity", "staged", false, Some("change-staged"));
 
         let rows = resolve_live_state_rows(vec![base], vec![staged], &[], false, None);
 
@@ -349,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn version_tombstone_hides_global_row_after_visibility_resolution() {
+    fn branch_tombstone_hides_global_row_after_visibility_resolution() {
         let rows = resolve_scan_rows(
             vec![
                 row_at(
@@ -359,9 +353,9 @@ mod tests {
                     true,
                     Some("change-global"),
                 ),
-                tombstone_at("version-a", "entity", false, Some("change-tombstone")),
+                tombstone_at("branch-a", "entity", false, Some("change-tombstone")),
             ],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
         );
 
@@ -371,20 +365,20 @@ mod tests {
     #[test]
     fn overlay_prefers_staged_untracked_over_staged_tracked_for_same_visible_identity() {
         let mut tracked = row_at(
-            "version-a",
+            "branch-a",
             "entity",
             "tracked",
             false,
             Some("change-tracked"),
         );
         tracked.untracked = false;
-        let mut untracked = row_at("version-a", "entity", "untracked", false, None);
+        let mut untracked = row_at("branch-a", "entity", "untracked", false, None);
         untracked.untracked = true;
 
         let rows = resolve_live_state_rows(
             Vec::new(),
             vec![untracked.clone(), tracked.clone()],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -399,7 +393,7 @@ mod tests {
         let rows = resolve_live_state_rows(
             Vec::new(),
             vec![tracked, untracked],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -414,10 +408,10 @@ mod tests {
 
     #[test]
     fn overlay_prefers_staged_tracked_over_base_untracked_for_same_visible_identity() {
-        let mut base = row_at("version-a", "entity", "base-untracked", false, None);
+        let mut base = row_at("branch-a", "entity", "base-untracked", false, None);
         base.untracked = true;
         let mut staged = row_at(
-            "version-a",
+            "branch-a",
             "entity",
             "staged-tracked",
             false,
@@ -428,7 +422,7 @@ mod tests {
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -443,7 +437,7 @@ mod tests {
 
     #[test]
     fn staged_global_tombstone_hides_projected_base_global_row() {
-        let mut base = row_at("version-a", "entity", "base", true, Some("change-base"));
+        let mut base = row_at("branch-a", "entity", "base", true, Some("change-base"));
         base.global = true;
 
         let rows = resolve_live_state_rows(
@@ -454,7 +448,7 @@ mod tests {
                 true,
                 Some("change-staged"),
             )],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -463,14 +457,14 @@ mod tests {
     }
 
     #[test]
-    fn base_version_tombstone_hides_staged_global_row() {
-        let base = tombstone_at("version-a", "entity", false, Some("change-base"));
+    fn base_branch_tombstone_hides_staged_global_row() {
+        let base = tombstone_at("branch-a", "entity", false, Some("change-base"));
         let staged = row_at("global", "entity", "staged", true, Some("change-staged"));
 
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -479,8 +473,8 @@ mod tests {
     }
 
     #[test]
-    fn base_tracked_version_tombstone_hides_staged_untracked_global_row() {
-        let mut base = tombstone_at("version-a", "entity", false, Some("change-base"));
+    fn base_tracked_branch_tombstone_hides_staged_untracked_global_row() {
+        let mut base = tombstone_at("branch-a", "entity", false, Some("change-base"));
         base.untracked = false;
         let mut staged = row_at("global", "entity", "staged", true, None);
         staged.untracked = true;
@@ -488,7 +482,7 @@ mod tests {
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -497,20 +491,14 @@ mod tests {
     }
 
     #[test]
-    fn staged_version_row_overrides_base_version_tombstone() {
-        let base = tombstone_at("version-a", "entity", false, Some("change-base"));
-        let staged = row_at(
-            "version-a",
-            "entity",
-            "staged",
-            false,
-            Some("change-staged"),
-        );
+    fn staged_branch_row_overrides_base_branch_tombstone() {
+        let base = tombstone_at("branch-a", "entity", false, Some("change-base"));
+        let staged = row_at("branch-a", "entity", "staged", false, Some("change-staged"));
 
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             false,
             None,
         );
@@ -530,30 +518,30 @@ mod tests {
                     true,
                     Some("change-global"),
                 ),
-                tombstone_at("version-a", "entity", false, Some("change-tombstone")),
+                tombstone_at("branch-a", "entity", false, Some("change-tombstone")),
             ],
-            &["version-a".to_string()],
+            &["branch-a".to_string()],
             true,
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[test]
-    fn resolve_visible_rows_maps_version_scope_and_applies_limit() {
+    fn resolve_visible_rows_maps_branch_scope_and_applies_limit() {
         let request = VisibilityRequest {
-            version_scope: VisibilityVersionScope::VersionIds {
-                version_ids: vec!["version-a".to_string()],
+            branch_scope: VisibilityBranchScope::BranchIds {
+                branch_ids: vec!["branch-a".to_string()],
             },
             include_tombstones: false,
             limit: Some(1),
         };
         let rows = resolve_visible_rows(
             vec![
-                row_at("version-a", "a", "A", false, Some("change-a")),
-                row_at("version-a", "b", "B", false, Some("change-b")),
+                row_at("branch-a", "a", "A", false, Some("change-a")),
+                row_at("branch-a", "b", "B", false, Some("change-b")),
             ],
             Vec::new(),
             &request,
@@ -563,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlay_scan_fetches_base_global_candidates_for_staged_only_version_scope() {
+    async fn overlay_scan_fetches_base_global_candidates_for_staged_only_branch_scope() {
         let base = ExistingGlobalOnlyReader {
             rows: vec![row_at(
                 "global",
@@ -580,7 +568,7 @@ mod tests {
             &staged,
             &LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
-                    version_ids: vec!["staged-version".to_string()],
+                    branch_ids: vec!["staged-branch".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -590,7 +578,7 @@ mod tests {
         .expect("overlay scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "staged-version");
+        assert_eq!(rows[0].branch_id, "staged-branch");
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -599,7 +587,7 @@ mod tests {
     }
 
     fn row_at(
-        version_id: &str,
+        branch_id: &str,
         entity_pk: &str,
         value: &str,
         global: bool,
@@ -618,12 +606,12 @@ mod tests {
             change_id: change_id.map(str::to_string),
             commit_id: Some("commit".to_string()),
             untracked: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
         }
     }
 
     fn tombstone_at(
-        version_id: &str,
+        branch_id: &str,
         entity_pk: &str,
         global: bool,
         change_id: Option<&str>,
@@ -631,7 +619,7 @@ mod tests {
         MaterializedLiveStateRow {
             snapshot_content: None,
             deleted: true,
-            ..row_at(version_id, entity_pk, "ignored", global, change_id)
+            ..row_at(branch_id, entity_pk, "ignored", global, change_id)
         }
     }
 
@@ -658,9 +646,9 @@ mod tests {
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             if request
                 .filter
-                .version_ids
+                .branch_ids
                 .iter()
-                .any(|version_id| version_id == GLOBAL_VERSION_ID)
+                .any(|branch_id| branch_id == GLOBAL_BRANCH_ID)
             {
                 Ok(self.rows.clone())
             } else {

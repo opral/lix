@@ -116,7 +116,7 @@
         },
         "x-lix-state-foreign-keys": {
           "type": "array",
-          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly three required local JSON Pointers ordered as `[entity_pk, schema_key, file_id]`: index 0 points to the local entity_pk JSON array, index 1 points to the local schema_key string, and index 2 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same version.",
+          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly three required local JSON Pointers ordered as `[entity_pk, schema_key, file_id]`: index 0 points to the local entity_pk JSON array, index 1 points to the local schema_key string, and index 2 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same branch.",
           "items": {
             "type": "array",
             "minItems": 3,

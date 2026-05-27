@@ -17,13 +17,13 @@ pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row.v1";
 pub(crate) const UNTRACKED_STATE_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0001_0002), UNTRACKED_STATE_ROW_NAMESPACE);
 // Durable key bytes:
-//   b"LXUK" | version:u8 |
-//   version_id_len:u32be | version_id:utf8 |
+//   b"LXUK" | branch:u8 |
+//   branch_id_len:u32be | branch_id:utf8 |
 //   schema_key_len:u32be | schema_key:utf8 |
 //   entity_part_count:u32be | {entity_part_len:u32be | entity_part:utf8}* |
 //   file_id_tag:u8 | [file_id_len:u32be | file_id:utf8]
 const UNTRACKED_STATE_ROW_KEY_IDENTIFIER: &[u8; 4] = b"LXUK";
-const UNTRACKED_STATE_ROW_KEY_VERSION_V1: u8 = 1;
+const UNTRACKED_STATE_ROW_KEY_BRANCH_V1: u8 = 1;
 
 pub(crate) async fn scan_rows(
     store: &impl StorageRead,
@@ -82,7 +82,7 @@ pub(super) async fn existing_identities<'a>(
         .into_iter()
         .map(|identity| {
             let owned = UntrackedStateIdentity {
-                version_id: identity.version_id.to_string(),
+                branch_id: identity.branch_id.to_string(),
                 schema_key: identity.schema_key.to_string(),
                 entity_pk: identity.entity_pk.clone(),
                 file_id: identity.file_id.map(str::to_string),
@@ -244,21 +244,21 @@ fn scan_plans_for_request(request: &UntrackedStateScanRequest) -> Result<Vec<Sca
 fn scan_prefixes_for_filter(
     filter: &crate::untracked_state::UntrackedStateFilter,
 ) -> Result<Vec<Vec<u8>>, LixError> {
-    if filter.version_ids.is_empty() {
+    if filter.branch_ids.is_empty() {
         return Ok(vec![Vec::new()]);
     }
 
     let mut prefixes = Vec::new();
-    for version_id in &filter.version_ids {
-        let mut version_prefix = key_header();
-        push_component(&mut version_prefix, version_id)?;
+    for branch_id in &filter.branch_ids {
+        let mut branch_prefix = key_header();
+        push_component(&mut branch_prefix, branch_id)?;
         if filter.schema_keys.is_empty() {
-            prefixes.push(version_prefix);
+            prefixes.push(branch_prefix);
             continue;
         }
 
         for schema_key in &filter.schema_keys {
-            let mut schema_prefix = version_prefix.clone();
+            let mut schema_prefix = branch_prefix.clone();
             push_component(&mut schema_prefix, schema_key)?;
             if filter.entity_pks.is_empty() {
                 prefixes.push(schema_prefix);
@@ -319,8 +319,8 @@ fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest
     (request.filter.schema_keys.is_empty() || request.filter.schema_keys.contains(&row.schema_key))
         && (request.filter.entity_pks.is_empty()
             || request.filter.entity_pks.contains(&row.entity_pk))
-        && (request.filter.version_ids.is_empty()
-            || request.filter.version_ids.contains(&row.version_id))
+        && (request.filter.branch_ids.is_empty()
+            || request.filter.branch_ids.contains(&row.branch_id))
         && nullable_matches_filters(&row.file_id, &request.filter.file_ids)
 }
 
@@ -340,7 +340,7 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
         NullableKeyFilter::Any => return None,
     };
     Some(UntrackedStateIdentity {
-        version_id: request.version_id.clone(),
+        branch_id: request.branch_id.clone(),
         schema_key: request.schema_key.clone(),
         entity_pk: request.entity_pk.clone(),
         file_id,
@@ -355,7 +355,7 @@ pub(crate) fn encode_untracked_state_row_key_ref(
     identity: UntrackedStateIdentityRef<'_>,
 ) -> Result<Vec<u8>, LixError> {
     let mut out = key_header();
-    push_component(&mut out, identity.version_id)?;
+    push_component(&mut out, identity.branch_id)?;
     push_component(&mut out, identity.schema_key)?;
     push_entity_tuple(&mut out, identity.entity_pk)?;
     match identity.file_id {
@@ -376,20 +376,20 @@ fn decode_untracked_state_row_key_ref(bytes: &[u8]) -> Result<UntrackedStateIden
         ));
     }
     let mut cursor = UNTRACKED_STATE_ROW_KEY_IDENTIFIER.len();
-    let version = bytes.get(cursor).copied().ok_or_else(|| {
+    let branch = bytes.get(cursor).copied().ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "failed to decode untracked-state key: missing version",
+            "failed to decode untracked-state key: missing branch",
         )
     })?;
     cursor += 1;
-    if version != UNTRACKED_STATE_ROW_KEY_VERSION_V1 {
+    if branch != UNTRACKED_STATE_ROW_KEY_BRANCH_V1 {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("failed to decode untracked-state key: unsupported version {version}"),
+            format!("failed to decode untracked-state key: unsupported branch {branch}"),
         ));
     }
-    let version_id = read_key_component(bytes, &mut cursor, "version_id")?;
+    let branch_id = read_key_component(bytes, &mut cursor, "branch_id")?;
     let schema_key = read_key_component(bytes, &mut cursor, "schema_key")?;
     let entity_pk = read_entity_tuple(bytes, &mut cursor)?;
     let file_tag = bytes.get(cursor).copied().ok_or_else(|| {
@@ -416,7 +416,7 @@ fn decode_untracked_state_row_key_ref(bytes: &[u8]) -> Result<UntrackedStateIden
         ));
     }
     Ok(UntrackedStateIdentity {
-        version_id,
+        branch_id,
         schema_key,
         entity_pk,
         file_id,
@@ -502,7 +502,7 @@ fn read_key_u32(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u32, Li
 fn key_header() -> Vec<u8> {
     let mut out = Vec::with_capacity(UNTRACKED_STATE_ROW_KEY_IDENTIFIER.len() + 1);
     out.extend_from_slice(UNTRACKED_STATE_ROW_KEY_IDENTIFIER);
-    out.push(UNTRACKED_STATE_ROW_KEY_VERSION_V1);
+    out.push(UNTRACKED_STATE_ROW_KEY_BRANCH_V1);
     out
 }
 
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn key_v1_roundtrips_null_file_id() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn key_v1_roundtrips_empty_file_id() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: Some(String::new()),
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn key_v1_roundtrips_empty_entity_pk_part() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "json_pointer".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single(""),
             file_id: Some("file-1".to_string()),
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn key_v1_roundtrips_tuple_and_unicode_identity() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-東京".to_string(),
+            branch_id: "branch-東京".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::tuple(vec![
                 "entity-1".to_string(),
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn key_v1_encodes_entity_as_binary_tuple_not_json_text() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::tuple(vec![
                 "entity/1".to_string(),
@@ -651,9 +651,9 @@ mod tests {
     }
 
     #[test]
-    fn key_decode_rejects_unknown_version() {
+    fn key_decode_rejects_unknown_branch() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
@@ -662,14 +662,14 @@ mod tests {
             encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
         key[4] = 2;
         let error =
-            decode_untracked_state_row_key_ref(&key).expect_err("unknown key version should fail");
-        assert!(error.to_string().contains("unsupported version 2"));
+            decode_untracked_state_row_key_ref(&key).expect_err("unknown key branch should fail");
+        assert!(error.to_string().contains("unsupported branch 2"));
     }
 
     #[test]
     fn key_decode_rejects_trailing_bytes() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn key_decode_rejects_truncated_component() {
         let identity = UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: None,
@@ -734,7 +734,7 @@ mod tests {
             reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
-                    version_id: "global".to_string(),
+                    branch_id: "global".to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_filters_by_schema_and_version() {
+    async fn scan_filters_by_schema_and_branch() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let context = UntrackedStateContext::new();
         write_materialized_rows_to_store(
@@ -753,8 +753,8 @@ mod tests {
             &storage,
             &[
                 untracked_row("global", "lix_key_value", "global-ui"),
-                untracked_row("version-a", "lix_key_value", "version-ui"),
-                untracked_row("version-a", "other_schema", "other"),
+                untracked_row("branch-a", "lix_key_value", "branch-ui"),
+                untracked_row("branch-a", "other_schema", "other"),
             ],
         )
         .await;
@@ -768,7 +768,7 @@ mod tests {
                 .scan_rows(&UntrackedStateScanRequest {
                     filter: crate::untracked_state::UntrackedStateFilter {
                         schema_keys: vec!["lix_key_value".to_string()],
-                        version_ids: vec!["version-a".to_string()],
+                        branch_ids: vec!["branch-a".to_string()],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].entity_pk,
-            crate::entity_pk::EntityPk::single("version-ui")
+            crate::entity_pk::EntityPk::single("branch-ui")
         );
     }
 
@@ -790,7 +790,7 @@ mod tests {
         let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
         let identity = UntrackedStateIdentity {
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
@@ -814,7 +814,7 @@ mod tests {
             reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
-                    version_id: "global".to_string(),
+                    branch_id: "global".to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
@@ -849,7 +849,7 @@ mod tests {
             reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
-                    version_id: "global".to_string(),
+                    branch_id: "global".to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single("legacy-row-key"),
                     file_id: NullableKeyFilter::Null,
                 })
@@ -866,7 +866,7 @@ mod tests {
             reader
                 .scan_rows(&UntrackedStateScanRequest {
                     filter: crate::untracked_state::UntrackedStateFilter {
-                        version_ids: vec!["global".to_string()],
+                        branch_ids: vec!["global".to_string()],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -878,7 +878,7 @@ mod tests {
     }
 
     fn untracked_row(
-        version_id: &str,
+        branch_id: &str,
         schema_key: &str,
         entity_pk: &str,
     ) -> MaterializedUntrackedStateRow {
@@ -891,8 +891,8 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: version_id == "global",
-            version_id: version_id.to_string(),
+            global: branch_id == "global",
+            branch_id: branch_id.to_string(),
         }
     }
 }

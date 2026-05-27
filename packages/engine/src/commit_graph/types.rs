@@ -58,7 +58,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 /// Canonical change observed while walking commit history from a start commit.
 ///
 /// `start_commit_id` is the traversal anchor requested by the caller. It is not
-/// necessarily a graph root or a version head.
+/// necessarily a graph root or a branch head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
     pub(crate) change: CommitGraphChange,

@@ -1,4 +1,5 @@
 mod bind;
+mod branch_scope;
 mod catalog;
 mod change_materialization;
 mod context;
@@ -24,7 +25,6 @@ pub(crate) mod storage;
 #[cfg(test)]
 mod test_support;
 mod udfs;
-mod version_scope;
 mod write_normalization;
 
 pub(crate) use bind::{
@@ -34,7 +34,7 @@ pub(crate) use bind::{
 pub(crate) use context::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource, SqlJsonReader, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextLiveStateReader, WriteContextVersionRefReader,
+    WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 #[allow(unused_imports)]
 pub(crate) use exec::{

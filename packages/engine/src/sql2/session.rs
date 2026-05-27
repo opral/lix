@@ -12,12 +12,12 @@ where
     C: SqlExecutionContext + ?Sized,
 {
     let session = new_sql_session_context();
-    let version_ref = ctx.version_ref();
-    let active_version_commit_id = version_ref
-        .load_head(ctx.active_version_id())
+    let branch_ref = ctx.branch_ref();
+    let active_branch_commit_id = branch_ref
+        .load_head(ctx.active_branch_id())
         .await?
         .map(|head| head.commit_id);
-    register_sql2_functions(&session, ctx.functions(), active_version_commit_id);
+    register_sql2_functions(&session, ctx.functions(), active_branch_commit_id);
     providers::register_read(&session, ctx).await?;
 
     Ok(session)
@@ -47,21 +47,21 @@ pub(crate) async fn build_write_session_with_options(
 ) -> Result<SessionContext, LixError> {
     let session = new_sql_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
-    let active_version_id = write_ctx.active_version_id();
-    let active_version_commit_id = write_ctx
-        .load_version_head(&active_version_id)
+    let active_branch_id = write_ctx.active_branch_id();
+    let active_branch_commit_id = write_ctx
+        .load_branch_head(&active_branch_id)
         .await?
         .ok_or_else(|| {
-            LixError::version_not_found(
-                active_version_id.clone(),
+            LixError::branch_not_found(
+                active_branch_id.clone(),
                 "build SQL write session",
-                "active version",
+                "active branch",
             )
         })?;
     register_sql2_functions(
         &session,
         write_ctx.functions(),
-        Some(active_version_commit_id),
+        Some(active_branch_commit_id),
     );
     providers::register_write(&session, write_ctx, options).await?;
 

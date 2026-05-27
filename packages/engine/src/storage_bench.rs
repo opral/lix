@@ -11,7 +11,7 @@ use crate::untracked_state::UntrackedStateRowRef;
 
 static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
-static TRANSACTION_VALIDATION_VERSIONS: AtomicU64 = AtomicU64::new(0);
+static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -23,8 +23,8 @@ pub(crate) fn record_transaction_untracked_rows(count: usize) {
     TRANSACTION_UNTRACKED_ROWS.fetch_add(count as u64, Ordering::Relaxed);
 }
 
-pub(crate) fn record_transaction_validation_version() {
-    TRANSACTION_VALIDATION_VERSIONS.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn record_transaction_validation_branch() {
+    TRANSACTION_VALIDATION_BRANCHS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_transaction_schema_catalog_load() {
@@ -151,7 +151,7 @@ fn untracked_state_row_key_value_with_payload(
         created_at: "2026-01-01T00:00:00.000Z",
         updated_at: "2026-01-01T00:00:00.000Z",
         global: false,
-        version_id: "bench-version",
+        branch_id: "bench-branch",
     };
     let value = if include_identity_in_value {
         crate::untracked_state::codec::encode_row_ref(row).expect("encode untracked bench row")

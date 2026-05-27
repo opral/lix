@@ -4,6 +4,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::LixError;
 
+mod branch;
 mod change;
 mod directory;
 mod directory_history;
@@ -13,7 +14,6 @@ mod file;
 mod file_history;
 mod history;
 mod lix_state;
-mod version;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceKind};
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -23,7 +23,7 @@ pub(crate) async fn register_read<C>(session: &SessionContext, ctx: &C) -> Resul
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let version_ref = ctx.version_ref();
+    let branch_ref = ctx.branch_ref();
     let history_query_source = ctx.history_query_source();
     let changelog_query_source = ctx.changelog_query_source();
     let catalog = PublicCatalog::from_visible_schemas(&ctx.list_visible_schemas()?)?;
@@ -33,27 +33,27 @@ where
                 lix_state::register_lix_state_active_provider(
                     session,
                     &surface.name,
-                    ctx.active_version_id(),
+                    ctx.active_branch_id(),
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
-            PublicSurfaceKind::LixStateByVersion => {
-                lix_state::register_lix_state_by_version_provider(
+            PublicSurfaceKind::LixStateByBranch => {
+                lix_state::register_lix_state_by_branch_provider(
                     session,
                     &surface.name,
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
-            PublicSurfaceKind::Version => {
-                version::register_lix_version_read_provider(
+            PublicSurfaceKind::Branch => {
+                branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                 )
                 .await?;
             }
@@ -78,20 +78,20 @@ where
                 file::register_lix_file_active_provider(
                     session,
                     &surface.name,
-                    ctx.active_version_id(),
+                    ctx.active_branch_id(),
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                     ctx.blob_reader(),
                     ctx.functions(),
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileByVersion => {
-                file::register_lix_file_by_version_provider(
+            PublicSurfaceKind::FileByBranch => {
+                file::register_lix_file_by_branch_provider(
                     session,
                     &surface.name,
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                     ctx.blob_reader(),
                     ctx.functions(),
                 )
@@ -111,19 +111,19 @@ where
                 directory::register_lix_directory_active_provider(
                     session,
                     &surface.name,
-                    ctx.active_version_id(),
+                    ctx.active_branch_id(),
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                     ctx.functions(),
                 )
                 .await?;
             }
-            PublicSurfaceKind::DirectoryByVersion => {
-                directory::register_lix_directory_by_version_provider(
+            PublicSurfaceKind::DirectoryByBranch => {
+                directory::register_lix_directory_by_branch_provider(
                     session,
                     &surface.name,
                     ctx.live_state(),
-                    Arc::clone(&version_ref),
+                    Arc::clone(&branch_ref),
                     ctx.functions(),
                 )
                 .await?;
@@ -138,15 +138,15 @@ where
                 .await?;
             }
             PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByVersion { .. }
+            | PublicSurfaceKind::EntityByBranch { .. }
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
     entity::register_entity_providers(
         session,
-        ctx.active_version_id(),
+        ctx.active_branch_id(),
         ctx.live_state(),
-        Arc::clone(&version_ref),
+        Arc::clone(&branch_ref),
         Arc::new(tokio::sync::Mutex::new(ctx.commit_graph())),
         history_query_source,
         &catalog,
@@ -173,18 +173,18 @@ pub(crate) async fn register_write(
                 )
                 .await?;
             }
-            PublicSurfaceKind::LixStateByVersion => {
+            PublicSurfaceKind::LixStateByBranch => {
                 replace_registered_table(session, &surface.name)?;
-                lix_state::register_lix_state_by_version_write_provider(
+                lix_state::register_lix_state_by_branch_write_provider(
                     session,
                     &surface.name,
                     write_ctx.clone(),
                 )
                 .await?;
             }
-            PublicSurfaceKind::Version => {
+            PublicSurfaceKind::Branch => {
                 replace_registered_table(session, &surface.name)?;
-                version::register_write_provider(session, &surface.name, write_ctx.clone()).await?;
+                branch::register_write_provider(session, &surface.name, write_ctx.clone()).await?;
             }
             PublicSurfaceKind::File => {
                 replace_registered_table(session, &surface.name)?;
@@ -196,9 +196,9 @@ pub(crate) async fn register_write(
                 )
                 .await?;
             }
-            PublicSurfaceKind::FileByVersion => {
+            PublicSurfaceKind::FileByBranch => {
                 replace_registered_table(session, &surface.name)?;
-                file::register_by_version_write_provider(
+                file::register_by_branch_write_provider(
                     session,
                     &surface.name,
                     write_ctx.clone(),
@@ -215,9 +215,9 @@ pub(crate) async fn register_write(
                 )
                 .await?;
             }
-            PublicSurfaceKind::DirectoryByVersion => {
+            PublicSurfaceKind::DirectoryByBranch => {
                 replace_registered_table(session, &surface.name)?;
-                directory::register_by_version_write_provider(
+                directory::register_by_branch_write_provider(
                     session,
                     &surface.name,
                     write_ctx.clone(),
@@ -229,14 +229,14 @@ pub(crate) async fn register_write(
             | PublicSurfaceKind::FileHistory
             | PublicSurfaceKind::DirectoryHistory => {}
             PublicSurfaceKind::EntityBase { .. }
-            | PublicSurfaceKind::EntityByVersion { .. }
+            | PublicSurfaceKind::EntityByBranch { .. }
             | PublicSurfaceKind::EntityHistory { .. } => {}
         }
     }
     for surface in catalog.surfaces() {
         if matches!(
             surface.kind,
-            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByVersion { .. }
+            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
         ) {
             replace_registered_table(session, &surface.name)?;
         }
@@ -266,6 +266,7 @@ mod tests {
     use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::prelude::SessionContext;
 
+    use crate::branch::{BranchHead, BranchRefReader};
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphReader, ReachableCommitGraphCommit,
@@ -280,12 +281,11 @@ mod tests {
         InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
         StorageReadScope,
     };
-    use crate::version::{VersionHead, VersionRefReader};
     use crate::LixError;
 
     use super::{
-        change, directory, directory_history, entity, file, file_history, history, lix_state,
-        version,
+        branch, change, directory, directory_history, entity, file, file_history, history,
+        lix_state,
     };
 
     #[test]
@@ -299,8 +299,8 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_state_by_version",
-            lix_state::lix_state_by_version_schema(),
+            "lix_state_by_branch",
+            lix_state::lix_state_by_branch_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -309,8 +309,8 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_file_by_version",
-            file::lix_file_by_version_schema(),
+            "lix_file_by_branch",
+            file::lix_file_by_branch_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -319,13 +319,13 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_directory_by_version",
-            directory::lix_directory_by_version_schema(),
+            "lix_directory_by_branch",
+            directory::lix_directory_by_branch_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_version",
-            version::lix_version_schema(),
+            "lix_branch",
+            branch::lix_branch_schema(),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
@@ -367,9 +367,9 @@ mod tests {
         let session = SessionContext::new();
         entity::register_entity_providers(
             &session,
-            "version-a",
+            "branch-a",
             Arc::new(EmptyLiveStateReader),
-            Arc::new(EmptyVersionRefReader),
+            Arc::new(EmptyBranchRefReader),
             Arc::new(tokio::sync::Mutex::new(Box::new(EmptyCommitGraphReader))),
             empty_history_query_source().await,
             &catalog,
@@ -381,7 +381,7 @@ mod tests {
         assert_registered_table_schema_matches_catalog(
             &session,
             &catalog,
-            "phase8_entity_by_version",
+            "phase8_entity_by_branch",
         )
         .await;
         assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_entity_history")
@@ -463,18 +463,18 @@ mod tests {
         }
     }
 
-    struct EmptyVersionRefReader;
+    struct EmptyBranchRefReader;
 
     #[async_trait]
-    impl VersionRefReader for EmptyVersionRefReader {
-        async fn load_head(&self, version_id: &str) -> Result<Option<VersionHead>, LixError> {
-            Ok(Some(VersionHead {
-                version_id: version_id.to_string(),
-                commit_id: format!("commit-{version_id}"),
+    impl BranchRefReader for EmptyBranchRefReader {
+        async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+            Ok(Some(BranchHead {
+                branch_id: branch_id.to_string(),
+                commit_id: format!("commit-{branch_id}"),
             }))
         }
 
-        async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             Ok(Vec::new())
         }
     }

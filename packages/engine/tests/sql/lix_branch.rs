@@ -2,7 +2,7 @@ use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
 
-simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
+simulation_test!(lix_branch_lists_descriptors_with_refs, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -14,11 +14,11 @@ simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, name, hidden, commit_id FROM lix_version ORDER BY id",
+            "SELECT id, name, hidden, commit_id FROM lix_branch ORDER BY id",
             &[],
         )
         .await
-        .expect("lix_version should read");
+        .expect("lix_branch should read");
     let rows = result;
     assert_eq!(rows.len(), 2);
 
@@ -34,7 +34,7 @@ simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
         Value::Text(sim.initial_commit_id().to_string()),
     ]));
     assert!(values.contains(&vec![
-        Value::Text(sim.main_version_id().to_string()),
+        Value::Text(sim.main_branch_id().to_string()),
         Value::Text("main".to_string()),
         Value::Boolean(false),
         Value::Text(sim.initial_commit_id().to_string()),
@@ -42,7 +42,7 @@ simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
 });
 
 simulation_test!(
-    lix_version_count_star_handles_empty_projection,
+    lix_branch_count_star_handles_empty_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -54,13 +54,13 @@ simulation_test!(
         );
 
         assert_eq!(
-            count_rows(&session, "SELECT COUNT(*) FROM lix_version").await,
+            count_rows(&session, "SELECT COUNT(*) FROM lix_branch").await,
             2
         );
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version WHERE name = 'main'",
+                "SELECT COUNT(*) FROM lix_branch WHERE name = 'main'",
             )
             .await,
             1
@@ -69,7 +69,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_version_insert_creates_descriptor_and_ref,
+    lix_branch_insert_creates_descriptor_and_ref,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -82,17 +82,17 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_version (id, name) \
-                 VALUES ('sql-version-insert', 'SQL Insert')",
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-insert', 'SQL Insert')",
                 &[],
             )
             .await
-            .expect("lix_version insert should create descriptor and ref");
+            .expect("lix_branch insert should create descriptor and ref");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
-        assert_single_version_row(
+        assert_single_branch_row(
             &session,
-            "sql-version-insert",
+            "sql-branch-insert",
             "SQL Insert",
             false,
             sim.initial_commit_id(),
@@ -101,7 +101,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version_descriptor WHERE id = 'sql-version-insert'",
+                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = 'sql-branch-insert'",
             )
             .await,
             1
@@ -109,7 +109,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version_ref WHERE id = 'sql-version-insert'",
+                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = 'sql-branch-insert'",
             )
             .await,
             1
@@ -118,7 +118,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_version_insert_accepts_explicit_hidden_and_commit_id,
+    lix_branch_insert_accepts_explicit_hidden_and_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -132,19 +132,19 @@ simulation_test!(
         let insert_result = session
             .execute(
                 &format!(
-                    "INSERT INTO lix_version (id, name, hidden, commit_id) \
-                     VALUES ('sql-version-explicit', 'Explicit', true, '{}')",
+                    "INSERT INTO lix_branch (id, name, hidden, commit_id) \
+                     VALUES ('sql-branch-explicit', 'Explicit', true, '{}')",
                     sim.initial_commit_id()
                 ),
                 &[],
             )
             .await
-            .expect("lix_version insert should accept hidden and commit_id");
+            .expect("lix_branch insert should accept hidden and commit_id");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
-        assert_single_version_row(
+        assert_single_branch_row(
             &session,
-            "sql-version-explicit",
+            "sql-branch-explicit",
             "Explicit",
             true,
             sim.initial_commit_id(),
@@ -154,7 +154,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_version_update_splits_descriptor_and_ref_changes,
+    lix_branch_update_splits_descriptor_and_ref_changes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -167,26 +167,26 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_version (id, name) \
-                 VALUES ('sql-version-update', 'Before')",
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-update', 'Before')",
                 &[],
             )
             .await
-            .expect("version insert should succeed");
+            .expect("branch insert should succeed");
 
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('sql-version-update-head', 'after')",
+                 VALUES ('sql-branch-update-head', 'after')",
                 &[],
             )
             .await
-            .expect("tracked write should advance active version head");
+            .expect("tracked write should advance active branch head");
         let new_head = select_single_text(
             &session,
             &format!(
-                "SELECT commit_id FROM lix_version WHERE id = '{}'",
-                sim.main_version_id()
+                "SELECT commit_id FROM lix_branch WHERE id = '{}'",
+                sim.main_branch_id()
             ),
         )
         .await;
@@ -194,21 +194,21 @@ simulation_test!(
         let update_result = session
             .execute(
                 &format!(
-                    "UPDATE lix_version \
+                    "UPDATE lix_branch \
                      SET name = 'After', hidden = true, commit_id = '{new_head}' \
-                     WHERE id = 'sql-version-update'"
+                     WHERE id = 'sql-branch-update'"
                 ),
                 &[],
             )
             .await
-            .expect("lix_version update should split descriptor and ref changes");
+            .expect("lix_branch update should split descriptor and ref changes");
         assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
 
-        assert_single_version_row(&session, "sql-version-update", "After", true, &new_head).await;
+        assert_single_branch_row(&session, "sql-branch-update", "After", true, &new_head).await;
         assert_eq!(
             select_single_text(
                 &session,
-                "SELECT commit_id FROM lix_version_ref WHERE id = 'sql-version-update'",
+                "SELECT commit_id FROM lix_branch_ref WHERE id = 'sql-branch-update'",
             )
             .await,
             new_head
@@ -217,7 +217,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_version_delete_removes_descriptor_and_ref_atomically,
+    lix_branch_delete_removes_descriptor_and_ref_atomically,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -230,26 +230,23 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_version (id, name) \
-                 VALUES ('sql-version-delete', 'Delete Me')",
+                "INSERT INTO lix_branch (id, name) \
+                 VALUES ('sql-branch-delete', 'Delete Me')",
                 &[],
             )
             .await
-            .expect("version insert should succeed");
+            .expect("branch insert should succeed");
 
         let delete_result = session
-            .execute(
-                "DELETE FROM lix_version WHERE id = 'sql-version-delete'",
-                &[],
-            )
+            .execute("DELETE FROM lix_branch WHERE id = 'sql-branch-delete'", &[])
             .await
-            .expect("lix_version delete should remove descriptor and ref atomically");
+            .expect("lix_branch delete should remove descriptor and ref atomically");
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
 
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version WHERE id = 'sql-version-delete'",
+                "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-delete'",
             )
             .await,
             0
@@ -257,7 +254,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version_descriptor WHERE id = 'sql-version-delete'",
+                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = 'sql-branch-delete'",
             )
             .await,
             0
@@ -265,7 +262,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version_ref WHERE id = 'sql-version-delete'",
+                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = 'sql-branch-delete'",
             )
             .await,
             0
@@ -274,7 +271,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_version_delete_rejects_active_and_global_versions,
+    lix_branch_delete_rejects_active_and_global_branches,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -288,24 +285,24 @@ simulation_test!(
         let active_error = session
             .execute(
                 &format!(
-                    "DELETE FROM lix_version WHERE id = '{}'",
-                    sim.main_version_id()
+                    "DELETE FROM lix_branch WHERE id = '{}'",
+                    sim.main_branch_id()
                 ),
                 &[],
             )
             .await
-            .expect_err("delete should reject active version");
+            .expect_err("delete should reject active branch");
         assert!(
-            active_error.to_string().contains("active version"),
+            active_error.to_string().contains("active branch"),
             "active delete error should explain the restriction: {active_error:?}"
         );
 
         let global_error = session
-            .execute("DELETE FROM lix_version WHERE id = 'global'", &[])
+            .execute("DELETE FROM lix_branch WHERE id = 'global'", &[])
             .await
-            .expect_err("delete should reject global version");
+            .expect_err("delete should reject global branch");
         assert!(
-            global_error.to_string().contains("global version"),
+            global_error.to_string().contains("global branch"),
             "global delete error should explain the restriction: {global_error:?}"
         );
 
@@ -313,8 +310,8 @@ simulation_test!(
             count_rows(
                 &session,
                 &format!(
-                    "SELECT COUNT(*) FROM lix_version WHERE id = '{}'",
-                    sim.main_version_id()
+                    "SELECT COUNT(*) FROM lix_branch WHERE id = '{}'",
+                    sim.main_branch_id()
                 ),
             )
             .await,
@@ -323,7 +320,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version WHERE id = 'global'"
+                "SELECT COUNT(*) FROM lix_branch WHERE id = 'global'"
             )
             .await,
             1
@@ -331,7 +328,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_version_duplicate_insert_rejects, |sim| async move {
+simulation_test!(lix_branch_duplicate_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -343,116 +340,110 @@ simulation_test!(lix_version_duplicate_insert_rejects, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-duplicate', 'First')",
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-duplicate', 'First')",
             &[],
         )
         .await
-        .expect("initial version insert should succeed");
+        .expect("initial branch insert should succeed");
 
     let error = session
         .execute(
-            "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-duplicate', 'Second')",
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-duplicate', 'Second')",
             &[],
         )
         .await
-        .expect_err("duplicate version id should be rejected");
+        .expect_err("duplicate branch id should be rejected");
     assert_eq!(error.code, LixError::CODE_UNIQUE);
     assert!(
-        error.message.contains("table 'lix_version'")
-            && error.message.contains("id 'sql-version-duplicate'")
-            && !error.message.contains("lix_version_descriptor")
-            && !error.message.contains("lix_version_ref"),
+        error.message.contains("table 'lix_branch'")
+            && error.message.contains("id 'sql-branch-duplicate'")
+            && !error.message.contains("lix_branch_descriptor")
+            && !error.message.contains("lix_branch_ref"),
         "unexpected error: {error:?}"
     );
 });
 
-simulation_test!(
-    lix_version_duplicate_name_insert_rejects,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        session
-            .execute(
-                "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-name-a', 'Duplicate Name')",
-                &[],
-            )
+simulation_test!(lix_branch_duplicate_name_insert_rejects, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect("initial version insert should succeed");
+            .expect("workspace session should open"),
+        &engine,
+    );
 
-        let error = session
-            .execute(
-                "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-name-b', 'Duplicate Name')",
-                &[],
-            )
+    session
+        .execute(
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-name-a', 'Duplicate Name')",
+            &[],
+        )
+        .await
+        .expect("initial branch insert should succeed");
+
+    let error = session
+        .execute(
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-name-b', 'Duplicate Name')",
+            &[],
+        )
+        .await
+        .expect_err("duplicate branch name should be rejected");
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
+    assert!(
+        error.to_string().contains("/name"),
+        "error should explain duplicate branch name: {error:?}"
+    );
+});
+
+simulation_test!(lix_branch_duplicate_name_update_rejects, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect_err("duplicate version name should be rejected");
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert!(
-            error.to_string().contains("/name"),
-            "error should explain duplicate version name: {error:?}"
-        );
-    }
-);
+            .expect("workspace session should open"),
+        &engine,
+    );
 
-simulation_test!(
-    lix_version_duplicate_name_update_rejects,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
+    session
+        .execute(
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-name-update-a', 'Name A')",
+            &[],
+        )
+        .await
+        .expect("first branch insert should succeed");
+    session
+        .execute(
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-name-update-b', 'Name B')",
+            &[],
+        )
+        .await
+        .expect("second branch insert should succeed");
 
-        session
-            .execute(
-                "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-name-update-a', 'Name A')",
-                &[],
-            )
-            .await
-            .expect("first version insert should succeed");
-        session
-            .execute(
-                "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-name-update-b', 'Name B')",
-                &[],
-            )
-            .await
-            .expect("second version insert should succeed");
-
-        let error = session
-            .execute(
-                "UPDATE lix_version \
+    let error = session
+        .execute(
+            "UPDATE lix_branch \
              SET name = 'Name A' \
-             WHERE id = 'sql-version-name-update-b'",
-                &[],
-            )
-            .await
-            .expect_err("updating to a duplicate version name should fail");
-        assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert!(
-            error.to_string().contains("/name"),
-            "error should explain duplicate version name: {error:?}"
-        );
-    }
-);
+             WHERE id = 'sql-branch-name-update-b'",
+            &[],
+        )
+        .await
+        .expect_err("updating to a duplicate branch name should fail");
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
+    assert!(
+        error.to_string().contains("/name"),
+        "error should explain duplicate branch name: {error:?}"
+    );
+});
 
 simulation_test!(
-    lix_version_insert_rejects_invalid_commit_id,
+    lix_branch_insert_rejects_invalid_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -465,18 +456,18 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_version (id, name, commit_id) \
-                 VALUES ('sql-version-invalid-commit', 'Invalid Commit', 'missing-commit')",
+                "INSERT INTO lix_branch (id, name, commit_id) \
+                 VALUES ('sql-branch-invalid-commit', 'Invalid Commit', 'missing-commit')",
                 &[],
             )
             .await
-            .expect_err("version ref commit_id should reference an existing commit");
-        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+            .expect_err("branch ref commit_id should reference an existing commit");
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
 
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_version WHERE id = 'sql-version-invalid-commit'",
+                "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-invalid-commit'",
             )
             .await,
             0
@@ -484,7 +475,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_version_update_rejects_id_change, |sim| async move {
+simulation_test!(lix_branch_update_rejects_id_change, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -496,22 +487,22 @@ simulation_test!(lix_version_update_rejects_id_change, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_version (id, name) \
-             VALUES ('sql-version-id-update', 'Before')",
+            "INSERT INTO lix_branch (id, name) \
+             VALUES ('sql-branch-id-update', 'Before')",
             &[],
         )
         .await
-        .expect("version insert should succeed");
+        .expect("branch insert should succeed");
 
     let error = session
         .execute(
-            "UPDATE lix_version \
-             SET id = 'sql-version-id-update-renamed' \
-             WHERE id = 'sql-version-id-update'",
+            "UPDATE lix_branch \
+             SET id = 'sql-branch-id-update-renamed' \
+             WHERE id = 'sql-branch-id-update'",
             &[],
         )
         .await
-        .expect_err("version id should be immutable through UPDATE");
+        .expect_err("branch id should be immutable through UPDATE");
     assert!(
         error.to_string().contains("immutable column 'id'"),
         "id update error should explain the restriction: {error:?}"
@@ -520,7 +511,7 @@ simulation_test!(lix_version_update_rejects_id_change, |sim| async move {
     assert_eq!(
         count_rows(
             &session,
-            "SELECT COUNT(*) FROM lix_version WHERE id = 'sql-version-id-update'",
+            "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-id-update'",
         )
         .await,
         1
@@ -528,46 +519,43 @@ simulation_test!(lix_version_update_rejects_id_change, |sim| async move {
     assert_eq!(
         count_rows(
             &session,
-            "SELECT COUNT(*) FROM lix_version WHERE id = 'sql-version-id-update-renamed'",
+            "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-id-update-renamed'",
         )
         .await,
         0
     );
 });
 
-simulation_test!(
-    lix_version_update_rejects_global_version,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        let error = session
-            .execute(
-                "UPDATE lix_version SET name = 'mutated-global' WHERE id = 'global'",
-                &[],
-            )
+simulation_test!(lix_branch_update_rejects_global_branch, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
             .await
-            .expect_err("global version should be immutable through UPDATE");
-        assert!(
-            error.to_string().contains("global version"),
-            "global update error should explain the restriction: {error:?}"
-        );
+            .expect("workspace session should open"),
+        &engine,
+    );
 
-        assert_eq!(
-            select_single_text(&session, "SELECT name FROM lix_version WHERE id = 'global'").await,
-            "global"
-        );
-    }
-);
+    let error = session
+        .execute(
+            "UPDATE lix_branch SET name = 'mutated-global' WHERE id = 'global'",
+            &[],
+        )
+        .await
+        .expect_err("global branch should be immutable through UPDATE");
+    assert!(
+        error.to_string().contains("global branch"),
+        "global update error should explain the restriction: {error:?}"
+    );
+
+    assert_eq!(
+        select_single_text(&session, "SELECT name FROM lix_branch WHERE id = 'global'").await,
+        "global"
+    );
+});
 
 simulation_test!(
-    lix_version_delete_missing_returns_zero_rows_affected,
+    lix_branch_delete_missing_returns_zero_rows_affected,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -580,18 +568,18 @@ simulation_test!(
 
         let delete_result = session
             .execute(
-                "DELETE FROM lix_version WHERE id = 'sql-version-missing-delete'",
+                "DELETE FROM lix_branch WHERE id = 'sql-branch-missing-delete'",
                 &[],
             )
             .await
-            .expect("missing version delete should be a no-op");
+            .expect("missing branch delete should be a no-op");
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(0));
     }
 );
 
-async fn assert_single_version_row(
+async fn assert_single_branch_row(
     session: &crate::support::simulation_test::engine::SimSession,
-    version_id: &str,
+    branch_id: &str,
     name: &str,
     hidden: bool,
     commit_id: &str,
@@ -600,18 +588,18 @@ async fn assert_single_version_row(
         .execute(
             &format!(
                 "SELECT id, name, hidden, commit_id \
-                 FROM lix_version \
-                 WHERE id = '{version_id}'"
+                 FROM lix_branch \
+                 WHERE id = '{branch_id}'"
             ),
             &[],
         )
         .await
-        .expect("version row should be selectable");
+        .expect("branch row should be selectable");
     assert_eq!(result.len(), 1);
     assert_eq!(
         result.rows()[0].values(),
         &[
-            Value::Text(version_id.to_string()),
+            Value::Text(branch_id.to_string()),
             Value::Text(name.to_string()),
             Value::Boolean(hidden),
             Value::Text(commit_id.to_string()),
