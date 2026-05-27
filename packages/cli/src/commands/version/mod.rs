@@ -112,7 +112,7 @@ mod tests {
     use crate::app::AppContext;
     use crate::cli::version::{CreateVersionCommand, MergeVersionCommand, SwitchVersionCommand};
     use crate::db::{init_lix_at, open_lix_at};
-    use lix_rs_sdk::{CreateVersionOptions, ExecuteResult, Value};
+    use lix_rs_sdk::{CreateBranchOptions, ExecuteResult, Value};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -205,10 +205,9 @@ mod tests {
         .expect("feature insert should succeed");
 
         let lix = open_lix_at(&path).expect("open for id lookup should succeed");
-        let main_id_result = crate::db::block_on(lix.execute(
-            "SELECT id FROM lix_version WHERE name = 'main' LIMIT 1",
-            &[],
-        ))
+        let main_id_result = crate::db::block_on(
+            lix.execute("SELECT id FROM lix_branch WHERE name = 'main' LIMIT 1", &[]),
+        )
         .expect("main id lookup should succeed");
         let main_id = text_at(&main_id_result, 0, 0);
 
@@ -264,20 +263,20 @@ mod tests {
 
         init_lix_at(&path).expect("lix init should succeed");
         let lix = open_lix_at(&path).expect("open should succeed");
-        crate::db::block_on(lix.create_version(CreateVersionOptions {
+        crate::db::block_on(lix.create_branch(CreateBranchOptions {
             id: Some("feature-a".to_string()),
             name: "feature".to_string(),
             from_commit_id: None,
         }))
         .expect("first version create should succeed");
-        let error = crate::db::block_on(lix.create_version(CreateVersionOptions {
+        let error = crate::db::block_on(lix.create_branch(CreateBranchOptions {
             id: Some("feature-b".to_string()),
             name: "feature".to_string(),
             from_commit_id: None,
         }))
         .expect_err("duplicate version name should fail");
         assert_eq!(error.code, "LIX_ERROR_UNIQUE");
-        assert!(error.message.contains("lix_version_descriptor./name"));
+        assert!(error.message.contains("lix_branch_descriptor./name"));
         assert!(error.message.contains("\"feature\""));
 
         cleanup_lix_path(&path);

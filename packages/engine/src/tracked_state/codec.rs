@@ -1,34 +1,32 @@
+use musli::{Decode, Encode};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
+use crate::storage_codec;
 use crate::tracked_state::types::{
-    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TRACKED_STATE_HASH_BYTES,
+    TrackedSchemaFilePrefixRef, TrackedSchemaKeyPrefixRef, TrackedStateIndexValue,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
-const NODE_BRANCH: u8 = 2;
-const VALUE_BRANCH: u8 = 8;
-const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
-const VALUE_BRANCH_MASK: u8 = 0b0111_1111;
-const TIMESTAMP_UPDATED_SAME: u8 = 0;
-const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
-const NODE_KIND_LEAF: u8 = 1;
-const NODE_KIND_INTERNAL: u8 = 2;
-const WEIBULL_K: i32 = 4;
-const ENTITY_PKENTITY_END: u8 = 0;
-const ENTITY_PKENTITY_STRING: u8 = 1;
+#[cfg(test)]
+use crate::json_store::JsonRef;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const WEIBULL_K: i32 = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct EncodedLeafEntry {
+    #[musli(bytes)]
     pub(crate) key: Vec<u8>,
+    #[musli(bytes)]
     pub(crate) value: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
+#[musli(packed)]
 pub(crate) struct EncodedLeafEntryRef<'a> {
+    #[musli(bytes)]
     pub(crate) key: &'a [u8],
+    #[musli(bytes)]
     pub(crate) value: &'a [u8],
 }
 
@@ -41,23 +39,29 @@ impl EncodedLeafEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct PendingChunkWrite {
     pub(crate) hash: [u8; TRACKED_STATE_HASH_BYTES],
+    #[musli(bytes)]
     pub(crate) data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct ChildSummary {
+    #[musli(bytes)]
     pub(crate) first_key: Vec<u8>,
+    #[musli(bytes)]
     pub(crate) last_key: Vec<u8>,
     pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
     pub(crate) subtree_count: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
+#[musli(packed)]
 pub(crate) struct ChildSummaryRef<'a> {
+    #[musli(bytes)]
     pub(crate) first_key: &'a [u8],
+    #[musli(bytes)]
     pub(crate) last_key: &'a [u8],
     pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
     pub(crate) subtree_count: u64,
@@ -99,45 +103,20 @@ impl DecodedLeafNode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedLeafNodeRef<'a> {
-    bytes: &'a [u8],
-    payload_start: usize,
-    offsets: Vec<usize>,
+    entries: Vec<EncodedLeafEntryRef<'a>>,
 }
 
 impl<'a> DecodedLeafNodeRef<'a> {
     pub(crate) fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+        self.entries.len()
     }
 
     pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'a>>, LixError> {
-        if index >= self.len() {
-            return Ok(None);
-        }
-        let start = self.payload_start + self.offsets[index];
-        let end = self.payload_start + self.offsets[index + 1];
-        let record = self.bytes.get(start..end).ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state leaf offset points outside node payload",
-            )
-        })?;
-        let mut cursor = 0usize;
-        let key = read_sized_slice(record, &mut cursor, "leaf key")?;
-        let value = read_sized_slice(record, &mut cursor, "leaf value")?;
-        if cursor != record.len() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state leaf entry decode found trailing bytes",
-            ));
-        }
-        Ok(Some(EncodedLeafEntryRef { key, value }))
+        Ok(self.entries.get(index).copied())
     }
 
     pub(crate) fn key(&self, index: usize) -> Result<Option<&'a [u8]>, LixError> {
-        let Some(entry) = self.entry(index)? else {
-            return Ok(None);
-        };
-        Ok(Some(entry.key))
+        Ok(self.entries.get(index).map(|entry| entry.key))
     }
 }
 
@@ -152,79 +131,47 @@ impl DecodedInternalNode {
     }
 }
 
+#[derive(Encode, Decode)]
+enum StorageDecodedNode<'a> {
+    Leaf(Vec<EncodedLeafEntryRef<'a>>),
+    Internal(Vec<ChildSummaryRef<'a>>),
+}
+
 pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
     *blake3::hash(bytes).as_bytes()
 }
 
 pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
-    encode_key_ref(TrackedStateKeyRef {
-        schema_key: &key.schema_key,
-        file_id: key.file_id.as_deref(),
-        entity_pk: &key.entity_pk,
-    })
+    storage_codec::encode("tracked-state key", key)
+        .expect("tracked-state key storage encoding should not fail")
 }
 
 pub(crate) fn encode_key_ref(key: TrackedStateKeyRef<'_>) -> Vec<u8> {
-    let mut out = Vec::new();
-    append_key_ref(&mut out, key);
-    out
-}
-
-fn append_key_ref(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>) {
-    push_sized_bytes(out, key.schema_key.as_bytes());
-    match key.file_id {
-        Some(file_id) => {
-            out.push(1);
-            push_sized_bytes(out, file_id.as_bytes());
-        }
-        None => out.push(0),
-    }
-    push_entity_pk(out, key.entity_pk);
+    storage_codec::encode("tracked-state key", &key)
+        .expect("tracked-state key storage encoding should not fail")
 }
 
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_sized_bytes(&mut out, schema_key.as_bytes());
-    out
+    storage_codec::encode(
+        "tracked-state schema key prefix",
+        &TrackedSchemaKeyPrefixRef { schema_key },
+    )
+    .expect("tracked-state schema key prefix storage encoding should not fail")
 }
 
 pub(crate) fn encode_schema_file_prefix(schema_key: &str, file_id: Option<&str>) -> Vec<u8> {
-    let mut out = encode_schema_key_prefix(schema_key);
-    match file_id {
-        Some(file_id) => {
-            out.push(1);
-            push_sized_bytes(&mut out, file_id.as_bytes());
-        }
-        None => out.push(0),
-    }
-    out
+    storage_codec::encode(
+        "tracked-state schema/file prefix",
+        &TrackedSchemaFilePrefixRef {
+            schema_key,
+            file_id,
+        },
+    )
+    .expect("tracked-state schema/file prefix storage encoding should not fail")
 }
 
 pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
-    let mut cursor = 0usize;
-    let schema_key = read_sized_string(bytes, &mut cursor, "schema_key")?;
-    let file_id = match read_u8(bytes, &mut cursor, "file_id presence")? {
-        0 => None,
-        1 => Some(read_sized_string(bytes, &mut cursor, "file_id")?),
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state tree key has invalid file_id presence byte {other}"),
-            ))
-        }
-    };
-    let entity_pk = read_entity_pk(bytes, &mut cursor)?;
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state tree key decode found trailing bytes",
-        ));
-    }
-    Ok(TrackedStateKey {
-        schema_key,
-        file_id,
-        entity_pk,
-    })
+    storage_codec::decode("tracked-state key", bytes)
 }
 
 /// Decodes a key after the caller has already proven the schema/file prefix.
@@ -237,14 +184,13 @@ pub(crate) fn decode_key_with_trusted_prefix(
     file_id: Option<&str>,
     prefix_len: usize,
 ) -> Result<TrackedStateKey, LixError> {
-    let mut cursor = prefix_len;
-    let entity_pk = read_entity_pk(bytes, &mut cursor)?;
-    if cursor != bytes.len() {
-        return Err(LixError::new(
+    let suffix = bytes.get(prefix_len..).ok_or_else(|| {
+        LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "tracked-state tree key decode found trailing bytes",
-        ));
-    }
+            "tracked-state tree trusted key prefix is longer than encoded key",
+        )
+    })?;
+    let entity_pk = storage_codec::decode("tracked-state key entity primary key", suffix)?;
     Ok(TrackedStateKey {
         schema_key: schema_key.to_string(),
         file_id: file_id.map(str::to_string),
@@ -254,103 +200,69 @@ pub(crate) fn decode_key_with_trusted_prefix(
 
 #[cfg(test)]
 pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
-    encode_value_ref(TrackedStateIndexValueRef {
-        change_id: &value.change_id,
-        commit_id: &value.commit_id,
-        deleted: value.deleted,
-        snapshot_ref: value.snapshot_ref.as_ref(),
-        metadata_ref: value.metadata_ref.as_ref(),
-        created_at: &value.created_at,
-        updated_at: &value.updated_at,
-    })
+    storage_codec::encode("tracked-state value", value)
+        .expect("tracked-state value storage encoding should not fail")
 }
 
 pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
-    let mut out = Vec::new();
-    append_value_ref(&mut out, value);
-    out
-}
-
-fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
-    out.push(VALUE_BRANCH | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
-    push_sized_bytes(out, value.change_id.as_bytes());
-    push_sized_bytes(out, value.commit_id.as_bytes());
-    push_timestamp_pair(out, value.created_at, value.updated_at);
-    push_optional_json_ref(out, value.snapshot_ref);
-    push_optional_json_ref(out, value.metadata_ref);
+    storage_codec::encode("tracked-state value", &value)
+        .expect("tracked-state value storage encoding should not fail")
 }
 
 #[cfg(test)]
 pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
-    1 + sized_bytes_len(value.change_id.as_bytes())
-        + sized_bytes_len(value.commit_id.as_bytes())
-        + timestamp_pair_len(&value.created_at, &value.updated_at)
-        + optional_json_ref_len(value.snapshot_ref.as_ref())
-        + optional_json_ref_len(value.metadata_ref.as_ref())
+    encode_value(value).len()
 }
 
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixError> {
-    let mut cursor = 0usize;
-    let value_header = read_u8(bytes, &mut cursor, "value header")?;
-    let deleted = decode_value_header(value_header)?;
-    decode_value_after_header(bytes, cursor, deleted)
+    decode_value_view(bytes).map(tracked_value_from_storage)
 }
 
 pub(crate) fn decode_visible_value(
     bytes: &[u8],
     include_tombstones: bool,
 ) -> Result<Option<TrackedStateIndexValue>, LixError> {
-    let mut cursor = 0usize;
-    let value_header = read_u8(bytes, &mut cursor, "value header")?;
-    let deleted = decode_value_header(value_header)?;
-    if deleted && !include_tombstones {
+    let view = decode_value_view(bytes)?;
+    if view.deleted && !include_tombstones {
         return Ok(None);
     }
-    decode_value_after_header(bytes, cursor, deleted).map(Some)
+    Ok(Some(tracked_value_from_storage(view)))
 }
 
-fn decode_value_header(value_header: u8) -> Result<bool, LixError> {
-    let branch = value_header & VALUE_BRANCH_MASK;
-    let deleted = value_header & VALUE_DELETED_FLAG != 0;
-    if branch != VALUE_BRANCH {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("unsupported tracked-state tree value branch {branch}"),
-        ));
-    }
-    Ok(deleted)
+fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixError> {
+    storage_codec::decode("tracked-state value", bytes)
 }
 
-fn decode_value_after_header(
-    bytes: &[u8],
-    mut cursor: usize,
-    deleted: bool,
-) -> Result<TrackedStateIndexValue, LixError> {
-    let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
-    let commit_id = read_sized_string(bytes, &mut cursor, "commit_id")?;
-    let (created_at, updated_at) = read_timestamp_pair(bytes, &mut cursor)?;
-    let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
-    let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state tree value decode found trailing bytes",
-        ));
-    }
-    Ok(TrackedStateIndexValue {
+fn tracked_value_from_storage(value: TrackedStateIndexValueRef<'_>) -> TrackedStateIndexValue {
+    let TrackedStateIndexValueRef {
         change_id,
         commit_id,
         deleted,
         snapshot_ref,
         metadata_ref,
-        created_at,
-        updated_at,
-    })
-}
-
-#[cfg(test)]
-fn sized_bytes_len(bytes: &[u8]) -> usize {
-    4 + bytes.len()
+        created_updated_at,
+    } = value;
+    TrackedStateIndexValue {
+        change_id: change_id.to_string(),
+        commit_id: commit_id.to_string(),
+        deleted,
+        snapshot_ref,
+        metadata_ref,
+        created_updated_at: match created_updated_at {
+            crate::storage_codec::Either::Left(timestamp) => {
+                TrackedStateIndexValue::created_updated_at(
+                    timestamp.to_string(),
+                    timestamp.to_string(),
+                )
+            }
+            crate::storage_codec::Either::Right((created_at, updated_at)) => {
+                TrackedStateIndexValue::created_updated_at(
+                    created_at.to_string(),
+                    updated_at.to_string(),
+                )
+            }
+        },
+    }
 }
 
 pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
@@ -362,24 +274,11 @@ pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
 }
 
 pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(NODE_KIND_LEAF);
-    out.push(NODE_BRANCH);
-    push_u32(&mut out, entries.len());
-
-    let mut offsets = Vec::with_capacity(entries.len().saturating_add(1));
-    let mut payload = Vec::new();
-    offsets.push(0usize);
-    for entry in entries {
-        push_sized_bytes(&mut payload, entry.key);
-        push_sized_bytes(&mut payload, entry.value);
-        offsets.push(payload.len());
-    }
-    for offset in offsets {
-        push_u32(&mut out, offset);
-    }
-    out.extend_from_slice(&payload);
-    out
+    storage_codec::encode(
+        "tracked-state leaf node",
+        &StorageDecodedNode::Leaf(entries.to_vec()),
+    )
+    .expect("tracked-state leaf node storage encoding should not fail")
 }
 
 pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
@@ -391,17 +290,11 @@ pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
 }
 
 pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(NODE_KIND_INTERNAL);
-    out.push(NODE_BRANCH);
-    push_u32(&mut out, children.len());
-    for child in children {
-        push_sized_bytes(&mut out, child.first_key);
-        push_sized_bytes(&mut out, child.last_key);
-        out.extend_from_slice(&child.child_hash);
-        out.extend_from_slice(&child.subtree_count.to_be_bytes());
-    }
-    out
+    storage_codec::encode(
+        "tracked-state internal node",
+        &StorageDecodedNode::Internal(children.to_vec()),
+    )
+    .expect("tracked-state internal node storage encoding should not fail")
 }
 
 pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
@@ -427,141 +320,24 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
 }
 
 pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixError> {
-    let mut cursor = 0usize;
-    let kind = read_u8(bytes, &mut cursor, "node kind")?;
-    let branch = read_u8(bytes, &mut cursor, "node branch")?;
-    if branch != NODE_BRANCH {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("unsupported tracked-state tree node branch {branch}"),
-        ));
-    }
-    let count = read_u32(bytes, &mut cursor, "entry count")?;
-    let node = match kind {
-        NODE_KIND_LEAF => {
-            let leaf = decode_leaf_node_ref_after_count(bytes, &mut cursor, count)?;
-            DecodedNodeRef::Leaf(leaf)
+    match storage_codec::decode("tracked-state tree node", bytes)? {
+        StorageDecodedNode::Leaf(entries) => {
+            Ok(DecodedNodeRef::Leaf(DecodedLeafNodeRef { entries }))
         }
-        NODE_KIND_INTERNAL => {
-            ensure_counted_records_fit_remaining(
-                bytes,
-                cursor,
-                count,
-                internal_child_min_len(),
-                "internal children",
-            )?;
-            let mut children = Vec::with_capacity(count);
-            for _ in 0..count {
-                let first_key = read_sized_bytes(bytes, &mut cursor, "internal first_key")?;
-                let last_key = read_sized_bytes(bytes, &mut cursor, "internal last_key")?;
-                let child_hash = read_fixed_hash(bytes, &mut cursor, "internal child_hash")?;
-                let subtree_count = read_u64(bytes, &mut cursor, "internal subtree_count")?;
-                children.push(ChildSummary {
-                    first_key,
-                    last_key,
-                    child_hash,
-                    subtree_count,
-                });
-            }
-            DecodedNodeRef::Internal(DecodedInternalNode { children })
-        }
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("unknown tracked-state tree node kind {other}"),
-            ))
-        }
-    };
-    if cursor != bytes.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state tree node decode found trailing bytes",
-        ));
-    }
-    Ok(node)
-}
-
-fn decode_leaf_node_ref_after_count<'a>(
-    bytes: &'a [u8],
-    cursor: &mut usize,
-    count: usize,
-) -> Result<DecodedLeafNodeRef<'a>, LixError> {
-    let offset_count = count.checked_add(1).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state leaf offset count overflows",
-        )
-    })?;
-    ensure_counted_records_fit_remaining(bytes, *cursor, offset_count, 4, "leaf offsets")?;
-    let mut offsets = Vec::with_capacity(offset_count);
-    for _ in 0..=count {
-        offsets.push(read_u32(bytes, cursor, "leaf entry offset")?);
-    }
-    if offsets.first().copied() != Some(0) {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state leaf offset table must start at zero",
-        ));
-    }
-    for window in offsets.windows(2) {
-        if window[0] > window[1] {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked-state leaf offsets must be monotonic",
-            ));
+        StorageDecodedNode::Internal(children) => {
+            Ok(DecodedNodeRef::Internal(DecodedInternalNode {
+                children: children
+                    .into_iter()
+                    .map(|child| ChildSummary {
+                        first_key: child.first_key.to_vec(),
+                        last_key: child.last_key.to_vec(),
+                        child_hash: child.child_hash,
+                        subtree_count: child.subtree_count,
+                    })
+                    .collect(),
+            }))
         }
     }
-    let payload_len = bytes.len().checked_sub(*cursor).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state leaf payload start is past node end",
-        )
-    })?;
-    if offsets.last().copied().unwrap_or_default() != payload_len {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state leaf offset table does not cover full payload",
-        ));
-    }
-    let payload_start = *cursor;
-    *cursor = bytes.len();
-    Ok(DecodedLeafNodeRef {
-        bytes,
-        payload_start,
-        offsets,
-    })
-}
-
-fn ensure_counted_records_fit_remaining(
-    bytes: &[u8],
-    cursor: usize,
-    count: usize,
-    record_min_len: usize,
-    field_name: &str,
-) -> Result<(), LixError> {
-    let required = count.checked_mul(record_min_len).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' byte count overflows"),
-        )
-    })?;
-    let remaining = bytes.len().checked_sub(cursor).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' starts past node end"),
-        )
-    })?;
-    if required > remaining {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' exceeds remaining node bytes"),
-        ));
-    }
-    Ok(())
-}
-
-fn internal_child_min_len() -> usize {
-    4 + 4 + TRACKED_STATE_HASH_BYTES + 8
 }
 
 pub(crate) fn child_summary_from_node(
@@ -623,230 +399,10 @@ fn level_salt(level: usize) -> u64 {
     value ^ (value >> 31)
 }
 
-fn push_entity_pk(out: &mut Vec<u8>, identity: &EntityPk) {
-    assert!(
-        !identity.parts.is_empty(),
-        "tracked-state key entity primary key must contain at least one part"
-    );
-    for part in &identity.parts {
-        out.push(ENTITY_PKENTITY_STRING);
-        push_sized_bytes(out, part.as_bytes());
-    }
-    out.push(ENTITY_PKENTITY_END);
-}
-
-fn read_entity_pk(bytes: &[u8], cursor: &mut usize) -> Result<EntityPk, LixError> {
-    let mut parts = Vec::new();
-    loop {
-        let tag = read_u8(bytes, cursor, "entity primary key part tag")?;
-        match tag {
-            ENTITY_PKENTITY_END => break,
-            ENTITY_PKENTITY_STRING => {
-                parts.push(read_sized_string(
-                    bytes,
-                    cursor,
-                    "entity primary key string part",
-                )?);
-            }
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "tracked-state tree key has invalid entity primary key part tag {other}"
-                    ),
-                ))
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state tree key entity primary key must contain at least one part",
-        ));
-    }
-    Ok(EntityPk { parts })
-}
-
-fn push_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    push_u32(out, bytes.len());
-    out.extend_from_slice(bytes);
-}
-
-fn push_optional_json_ref(out: &mut Vec<u8>, json_ref: Option<&JsonRef>) {
-    match json_ref {
-        Some(json_ref) => {
-            out.push(1);
-            out.extend_from_slice(json_ref.as_hash_bytes());
-        }
-        None => out.push(0),
-    }
-}
-
-#[cfg(test)]
-fn optional_json_ref_len(json_ref: Option<&JsonRef>) -> usize {
-    1 + json_ref.map_or(0, |_| TRACKED_STATE_HASH_BYTES)
-}
-
-fn push_timestamp_pair(out: &mut Vec<u8>, created_at: &str, updated_at: &str) {
-    push_sized_bytes(out, created_at.as_bytes());
-    if updated_at == created_at {
-        out.push(TIMESTAMP_UPDATED_SAME);
-    } else {
-        out.push(TIMESTAMP_UPDATED_DISTINCT);
-        push_sized_bytes(out, updated_at.as_bytes());
-    }
-}
-
-#[cfg(test)]
-fn timestamp_pair_len(created_at: &str, updated_at: &str) -> usize {
-    sized_bytes_len(created_at.as_bytes())
-        + 1
-        + if updated_at == created_at {
-            0
-        } else {
-            sized_bytes_len(updated_at.as_bytes())
-        }
-}
-
-fn read_timestamp_pair(bytes: &[u8], cursor: &mut usize) -> Result<(String, String), LixError> {
-    let created_at = read_sized_string(bytes, cursor, "created_at")?;
-    let updated_at = match read_u8(bytes, cursor, "updated_at tag")? {
-        TIMESTAMP_UPDATED_SAME => created_at.clone(),
-        TIMESTAMP_UPDATED_DISTINCT => read_sized_string(bytes, cursor, "updated_at")?,
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state timestamp pair has invalid updated_at tag {other}"),
-            ))
-        }
-    };
-    Ok((created_at, updated_at))
-}
-
-fn push_u32(out: &mut Vec<u8>, value: usize) {
-    out.extend_from_slice(&(value as u32).to_be_bytes());
-}
-
-fn read_sized_string(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<String, LixError> {
-    String::from_utf8(read_sized_bytes(bytes, cursor, field_name)?).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' is invalid UTF-8: {error}"),
-        )
-    })
-}
-
-fn read_sized_bytes(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<Vec<u8>, LixError> {
-    read_sized_slice(bytes, cursor, field_name).map(<[u8]>::to_vec)
-}
-
-fn read_sized_slice<'a>(
-    bytes: &'a [u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<&'a [u8], LixError> {
-    let len = read_u32(bytes, cursor, field_name)?;
-    let end = cursor.checked_add(len).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' length overflow"),
-        )
-    })?;
-    let slice = bytes.get(*cursor..end).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' is truncated"),
-        )
-    })?;
-    *cursor = end;
-    Ok(slice)
-}
-
-fn read_fixed_hash(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<[u8; TRACKED_STATE_HASH_BYTES], LixError> {
-    let end = *cursor + TRACKED_STATE_HASH_BYTES;
-    let slice = bytes.get(*cursor..end).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' is truncated"),
-        )
-    })?;
-    let mut out = [0_u8; TRACKED_STATE_HASH_BYTES];
-    out.copy_from_slice(slice);
-    *cursor = end;
-    Ok(out)
-}
-
-fn read_optional_json_ref(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<Option<JsonRef>, LixError> {
-    match read_u8(bytes, cursor, field_name)? {
-        0 => Ok(None),
-        1 => Ok(Some(JsonRef::from_hash_bytes(read_fixed_hash(
-            bytes, cursor, field_name,
-        )?))),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' has invalid JSON ref tag {other}"),
-        )),
-    }
-}
-
-fn read_u8(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u8, LixError> {
-    let value = *bytes.get(*cursor).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' is truncated"),
-        )
-    })?;
-    *cursor += 1;
-    Ok(value)
-}
-
-fn read_u32(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<usize, LixError> {
-    let end = *cursor + 4;
-    let slice = bytes.get(*cursor..end).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' is truncated"),
-        )
-    })?;
-    let mut out = [0_u8; 4];
-    out.copy_from_slice(slice);
-    *cursor = end;
-    Ok(u32::from_be_bytes(out) as usize)
-}
-
-fn read_u64(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u64, LixError> {
-    let end = *cursor + 8;
-    let slice = bytes.get(*cursor..end).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree field '{field_name}' is truncated"),
-        )
-    })?;
-    let mut out = [0_u8; 8];
-    out.copy_from_slice(slice);
-    *cursor = end;
-    Ok(u64::from_be_bytes(out))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity_pk::EntityPk;
 
     fn test_value(commit_id: &str, change_id: &str) -> TrackedStateIndexValue {
         TrackedStateIndexValue {
@@ -855,9 +411,18 @@ mod tests {
             deleted: false,
             snapshot_ref: None,
             metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            created_updated_at: TrackedStateIndexValue::created_updated_at(
+                "2026-01-01T00:00:00Z".to_string(),
+                "2026-01-02T00:00:00Z".to_string(),
+            ),
         }
+    }
+
+    fn set_timestamps(value: &mut TrackedStateIndexValue, created_at: &str, updated_at: &str) {
+        value.created_updated_at = TrackedStateIndexValue::created_updated_at(
+            created_at.to_string(),
+            updated_at.to_string(),
+        );
     }
 
     #[test]
@@ -931,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn key_codec_rejects_non_string_identity_part_tags() {
+    fn key_codec_rejects_malformed_storage_bytes() {
         let mut encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
@@ -939,15 +504,27 @@ mod tests {
                 parts: vec!["true".to_string()],
             },
         });
-        let schema_key_len = "schema".len();
-        let file_scope_offset = 4 + schema_key_len;
-        let entity_tag_offset = file_scope_offset + 1;
-        encoded[entity_tag_offset] = 2;
+        encoded.truncate(encoded.len() - 1);
 
-        let error = decode_key(&encoded).expect_err("non-string identity tag should reject");
+        let error = decode_key(&encoded).expect_err("truncated key should reject");
         assert!(error
             .to_string()
-            .contains("invalid entity primary key part tag 2"));
+            .contains("failed to decode tracked-state key"));
+    }
+
+    #[test]
+    fn key_codec_rejects_empty_entity_pk() {
+        let encoded = encode_key(&TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: None,
+            entity_pk: EntityPk { parts: Vec::new() },
+        });
+
+        let error = decode_key(&encoded).expect_err("empty entity pk should reject");
+
+        assert!(error
+            .message
+            .contains("entity primary key decoded from storage is invalid"));
     }
 
     #[test]
@@ -978,8 +555,10 @@ mod tests {
             deleted: false,
             snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
             metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            created_updated_at: TrackedStateIndexValue::created_updated_at(
+                "2026-01-01T00:00:00Z".to_string(),
+                "2026-01-02T00:00:00Z".to_string(),
+            ),
         };
 
         let encoded = encode_value(&value);
@@ -994,8 +573,10 @@ mod tests {
             deleted: true,
             snapshot_ref: None,
             metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            created_updated_at: TrackedStateIndexValue::created_updated_at(
+                "2026-01-01T00:00:00Z".to_string(),
+                "2026-01-02T00:00:00Z".to_string(),
+            ),
         };
 
         let encoded = encode_value(&value);
@@ -1005,21 +586,46 @@ mod tests {
     #[test]
     fn value_codec_compacts_matching_timestamps() {
         let mut compact = test_value("commit", "change");
-        compact.updated_at = compact.created_at.clone();
+        set_timestamps(&mut compact, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
         let compact_len = encode_value(&compact).len();
         assert_eq!(
             decode_value(&encode_value(&compact)).expect("value"),
             compact
         );
 
-        compact.updated_at = "2026-01-02T00:00:00Z".to_string();
+        set_timestamps(&mut compact, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
         let distinct_len = encode_value(&compact).len();
 
         assert!(compact_len < distinct_len);
-        assert_eq!(
-            distinct_len - compact_len,
-            sized_bytes_len(compact.updated_at.as_bytes())
+    }
+
+    #[test]
+    fn owned_value_codec_matches_borrowed_value_codec() {
+        let mut compact = test_value("commit", "change");
+        set_timestamps(&mut compact, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+
+        let compact_owned = storage_codec::encode("tracked-state owned value", &compact)
+            .expect("owned value should encode");
+        assert_eq!(compact_owned, encode_value(&compact));
+        let compact_decoded: TrackedStateIndexValue =
+            storage_codec::decode("tracked-state owned value", &compact_owned)
+                .expect("owned value should decode");
+        assert_eq!(compact_decoded, compact);
+
+        let mut distinct = compact.clone();
+        set_timestamps(
+            &mut distinct,
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
         );
+
+        let distinct_owned = storage_codec::encode("tracked-state owned value", &distinct)
+            .expect("owned value should encode");
+        assert_eq!(distinct_owned, encode_value(&distinct));
+        let distinct_decoded: TrackedStateIndexValue =
+            storage_codec::decode("tracked-state owned value", &distinct_owned)
+                .expect("owned value should decode");
+        assert_eq!(distinct_decoded, distinct);
     }
 
     #[test]
@@ -1031,8 +637,10 @@ mod tests {
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                created_updated_at: TrackedStateIndexValue::created_updated_at(
+                    "2026-01-01T00:00:00Z".to_string(),
+                    "2026-01-02T00:00:00Z".to_string(),
+                ),
             },
             TrackedStateIndexValue {
                 change_id: "change-2".to_string(),
@@ -1040,8 +648,10 @@ mod tests {
                 deleted: true,
                 snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
                 metadata_ref: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                created_updated_at: TrackedStateIndexValue::created_updated_at(
+                    "2026-01-01T00:00:00Z".to_string(),
+                    "2026-01-02T00:00:00Z".to_string(),
+                ),
             },
             TrackedStateIndexValue {
                 change_id: "change-3".to_string(),
@@ -1049,8 +659,10 @@ mod tests {
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                created_updated_at: TrackedStateIndexValue::created_updated_at(
+                    "2026-01-01T00:00:00Z".to_string(),
+                    "2026-01-02T00:00:00Z".to_string(),
+                ),
             },
         ];
 
@@ -1060,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_node_codec_uses_indexable_offset_table() {
+    fn leaf_node_codec_roundtrips_borrowed_entries() {
         let entries = vec![
             EncodedLeafEntry {
                 key: b"alpha".to_vec(),
@@ -1073,11 +685,6 @@ mod tests {
         ];
 
         let encoded = encode_leaf_node(&entries);
-        assert_eq!(encoded[0], NODE_KIND_LEAF);
-        assert_eq!(encoded[1], NODE_BRANCH);
-        assert_eq!(&encoded[2..6], 2u32.to_be_bytes().as_slice());
-        assert_eq!(&encoded[6..10], 0u32.to_be_bytes().as_slice());
-
         let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded).expect("leaf ref") else {
             panic!("expected leaf node");
         };
@@ -1099,7 +706,6 @@ mod tests {
     #[test]
     fn leaf_node_codec_roundtrips_empty_leaf() {
         let encoded = encode_leaf_node(&[]);
-        assert_eq!(encoded.len(), 10);
 
         let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded).expect("leaf ref") else {
             panic!("expected leaf node");
@@ -1109,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_node_codec_rejects_malformed_offsets() {
+    fn leaf_node_codec_rejects_malformed_storage_bytes() {
         let entries = vec![
             EncodedLeafEntry {
                 key: b"alpha".to_vec(),
@@ -1120,53 +726,14 @@ mod tests {
                 value: b"two".to_vec(),
             },
         ];
-        let encoded = encode_leaf_node(&entries);
+        let mut encoded = encode_leaf_node(&entries);
+        encoded.truncate(encoded.len() - 1);
 
-        let mut non_zero_first = encoded.clone();
-        non_zero_first[6..10].copy_from_slice(&1u32.to_be_bytes());
-        assert!(decode_node_ref(&non_zero_first)
-            .expect_err("non-zero first offset should reject")
-            .to_string()
-            .contains("offset table must start at zero"));
-
-        let mut non_monotonic = encoded.clone();
-        non_monotonic[10..14].copy_from_slice(&100u32.to_be_bytes());
-        assert!(decode_node_ref(&non_monotonic)
-            .expect_err("non-monotonic offsets should reject")
-            .to_string()
-            .contains("offsets must be monotonic"));
-
-        let mut short_coverage = encoded;
-        let payload_len = short_coverage.len() - 18;
-        short_coverage[14..18].copy_from_slice(&((payload_len - 1) as u32).to_be_bytes());
-        assert!(decode_node_ref(&short_coverage)
-            .expect_err("short offset coverage should reject")
-            .to_string()
-            .contains("offset table does not cover full payload"));
-    }
-
-    #[test]
-    fn leaf_node_codec_rejects_count_that_exceeds_remaining_bytes_before_allocating() {
-        let mut encoded = vec![NODE_KIND_LEAF, NODE_BRANCH];
-        encoded.extend_from_slice(&u32::MAX.to_be_bytes());
-
-        let error = decode_node_ref(&encoded).expect_err("impossible leaf count should reject");
+        let error = decode_node_ref(&encoded).expect_err("truncated leaf should reject");
 
         assert!(error
             .to_string()
-            .contains("field 'leaf offsets' exceeds remaining node bytes"));
-    }
-
-    #[test]
-    fn internal_node_codec_rejects_count_that_exceeds_remaining_bytes_before_allocating() {
-        let mut encoded = vec![NODE_KIND_INTERNAL, NODE_BRANCH];
-        encoded.extend_from_slice(&u32::MAX.to_be_bytes());
-
-        let error = decode_node_ref(&encoded).expect_err("impossible internal count should reject");
-
-        assert!(error
-            .to_string()
-            .contains("field 'internal children' exceeds remaining node bytes"));
+            .contains("failed to decode tracked-state tree node"));
     }
 
     #[test]

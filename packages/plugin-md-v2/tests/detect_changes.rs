@@ -110,7 +110,7 @@ fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginD
                     snapshot_content: row.snapshot_content.clone(),
                     file_id: None,
                     plugin_key: None,
-                    version_id: None,
+                    branch_id: None,
                     change_id: None,
                     metadata: None,
                     created_at: None,

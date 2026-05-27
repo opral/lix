@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::codec::{
-    decode_change_record, decode_commit_change_ref_chunk, decode_commit_record,
-    encode_change_record, encode_commit_change_ref_chunk, encode_commit_record,
+    decode_change_record, decode_commit_change_ref_chunk, encode_change_record,
+    encode_commit_change_ref_chunk, encode_commit_record,
 };
 use super::store::{
     change_key, commit_change_ref_chunk_key, commit_change_ref_chunk_prefix, commit_key,
@@ -22,7 +22,7 @@ use crate::storage::{
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
     StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
 };
-use crate::LixError;
+use crate::{storage_codec, LixError};
 
 const COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION: u32 = 1;
 const COMMIT_CHANGE_REF_CHUNK_TARGET_BYTES: usize = 64 * 1024;
@@ -647,7 +647,7 @@ async fn load_commits_from_store(
             entries.push(None);
             continue;
         };
-        let record = decode_commit_record(&value)?;
+        let record = storage_codec::decode("commit record", &value)?;
         let chunks = match request.projection {
             CommitProjection::Record => Vec::new(),
             CommitProjection::ChangeRefs | CommitProjection::Full => {
@@ -691,7 +691,7 @@ async fn scan_commits_from_store(
         .await?;
     let mut entries = Vec::with_capacity(page.values.len());
     for (key, value) in page.keys.iter().zip(page.values.iter()) {
-        let record = decode_commit_record(value)?;
+        let record: CommitRecord = storage_codec::decode("commit record", value)?;
         if key.as_slice() != commit_key(&record.commit_id).as_slice() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -986,12 +986,7 @@ impl CommitChangeRefChunkBuilder {
     }
 
     fn finish(self) -> Result<CommitChangeRefChunk, LixError> {
-        let chunk = commit_change_ref_chunk(&self.commit_id, self.entries);
-        debug_assert_eq!(
-            self.estimated_size,
-            encode_commit_change_ref_chunk(&chunk)?.len()
-        );
-        Ok(chunk)
+        Ok(commit_change_ref_chunk(&self.commit_id, self.entries))
     }
 }
 
