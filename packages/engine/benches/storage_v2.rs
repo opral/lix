@@ -16,10 +16,9 @@ use criterion::{
 use lix_engine::backend::{
     get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
     BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
-    CoreProjection, DurableWriteLock, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef,
-    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix,
+    ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage::{
     PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
@@ -2850,7 +2849,6 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
 #[derive(Clone, Default)]
 struct CountingBackend {
     state: Rc<CountingState>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Default)]
@@ -2877,10 +2875,6 @@ impl Backend for CountingBackend {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {

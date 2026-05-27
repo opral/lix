@@ -174,7 +174,7 @@ impl SessionTransactionManager {
     pub(super) async fn close(&self) -> Result<(), LixError> {
         let mut commit_rx = self.inner.commit_boundary.subscribe();
         loop {
-            if let Some(_commit_gate) = self.inner.commit_boundary.try_lock_durable_commit() {
+            if let Some(_commit_gate) = self.inner.commit_boundary.try_lock_commit() {
                 {
                     let mut state = self.lock_state();
                     if state.has_explicit_transaction() {

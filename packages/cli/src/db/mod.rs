@@ -4,16 +4,16 @@ use base64::Engine as _;
 use bytes::Bytes;
 use lix_rs_sdk::{
     open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
-    BackendRead, BackendWrite, CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key,
-    KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions, Key, KeyRange, Lix,
+    LixError, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
+    ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 pub type FileLix = Lix<FileBackend>;
 
@@ -176,17 +176,14 @@ type KvMap = BTreeMap<Vec<u8>, Vec<u8>>;
 pub struct FileBackend {
     path: Arc<PathBuf>,
     kv: Arc<Mutex<KvMap>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 impl FileBackend {
     fn from_path(path: &Path) -> Result<Self, CliError> {
         let kv = read_kv_file(path)?;
-        let durable_write_lock = durable_write_lock_for_path(path);
         Ok(Self {
             path: Arc::new(path.to_path_buf()),
             kv: Arc::new(Mutex::new(kv)),
-            durable_write_lock,
         })
     }
 }
@@ -245,10 +242,6 @@ impl Backend for FileBackend {
                 .clone(),
             stats: WriteStats::default(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 }
 
@@ -471,44 +464,6 @@ fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValue
 
 fn stored_value_bytes(value: StoredValue) -> Vec<u8> {
     value.bytes.to_vec()
-}
-
-fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
-    let key = canonical_lock_key(path);
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .expect("cli file backend write lock registry should not poison");
-    if let Some(lock) = locks.get(&key) {
-        return lock.clone();
-    }
-    let lock = DurableWriteLock::new();
-    locks.insert(key, lock.clone());
-    lock
-}
-
-fn canonical_lock_key(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return path;
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .expect("current directory should be available")
-            .join(path)
-    };
-    let Some(parent) = absolute.parent() else {
-        return absolute;
-    };
-    let Ok(parent) = parent.canonicalize() else {
-        return absolute;
-    };
-    match absolute.file_name() {
-        Some(file_name) => parent.join(file_name),
-        None => parent,
-    }
 }
 
 fn encode_bytes(bytes: &[u8]) -> String {

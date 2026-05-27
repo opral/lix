@@ -4,7 +4,7 @@ use crate::commands::version::{resolve_version_ref, VersionLookup};
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::SwitchVersionOptions;
+use lix_rs_sdk::SwitchBranchOptions;
 
 pub fn run(context: &AppContext, command: SwitchVersionCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
@@ -21,8 +21,8 @@ pub fn run(context: &AppContext, command: SwitchVersionCommand) -> Result<Comman
             }
         },
     )?;
-    crate::db::block_on(lix.switch_version(SwitchVersionOptions {
-        version_id: resolved.id.clone(),
+    crate::db::block_on(lix.switch_branch(SwitchBranchOptions {
+        branch_id: resolved.id.clone(),
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
 

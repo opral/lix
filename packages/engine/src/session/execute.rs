@@ -328,7 +328,8 @@ where
         }
 
         let runtime_write_access = if sql2::statement_has_durable_runtime_function(&statement) {
-            Some(self.begin_session_write_access().await?)
+            let write_access = self.begin_session_write_access().await?;
+            Some(write_access)
         } else {
             None
         };
@@ -442,9 +443,11 @@ where
         }
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
+        let prepared_commit = self
+            .storage
+            .prepare_write_set(writes, StorageWriteOptions::default())?;
         commit_at_boundary(Some(&commit_boundary), || {
-            self.storage
-                .commit_write_set(writes, StorageWriteOptions::default())?;
+            prepared_commit.commit()?;
             Ok(())
         })?;
         Ok(())

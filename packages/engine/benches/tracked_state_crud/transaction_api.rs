@@ -6,8 +6,8 @@ use lix_engine::transaction::bench::{
 };
 use lix_engine::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, DurableWriteLock, Key, KeyRange, PointVisitor, ProjectedValue,
-    PutBatch, ReadEntry, ReadOptions, ScanOptions, StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, Key, KeyRange, PointVisitor, ProjectedValue, PutBatch, ReadEntry,
+    ReadOptions, ScanOptions, StoredValue, WriteOptions, WriteStats,
 };
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use std::sync::{Arc, Mutex};
@@ -84,10 +84,6 @@ where
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.inner.begin_write(opts)
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.inner.durable_write_lock()
     }
 }
 
@@ -285,7 +281,6 @@ impl TransactionFixture {
 #[derive(Clone)]
 pub(crate) struct OwnedRocksDbBackend {
     db: Arc<DB>,
-    durable_write_lock: DurableWriteLock,
 }
 
 impl OwnedRocksDbBackend {
@@ -295,10 +290,7 @@ impl OwnedRocksDbBackend {
         options.set_use_fsync(false);
         options.set_write_buffer_size(64 * 1024 * 1024);
         let db = DB::open(&options, path).expect("open owned rocksdb transaction bench");
-        Self {
-            db: Arc::new(db),
-            durable_write_lock: DurableWriteLock::new(),
-        }
+        Self { db: Arc::new(db) }
     }
 }
 
@@ -330,10 +322,6 @@ impl Backend for OwnedRocksDbBackend {
             staged_put_keys: Vec::new(),
             stats: WriteStats::default(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 }
 

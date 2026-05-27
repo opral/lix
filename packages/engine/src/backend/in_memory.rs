@@ -9,9 +9,9 @@ use bytes::Bytes;
 use crate::backend::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    BufferedRangeScan, CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange,
-    KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
-    ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    BufferedRangeScan, CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
@@ -31,7 +31,6 @@ enum EntriesState {
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryBackend {
     entries: Arc<Mutex<Arc<EntriesState>>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -40,7 +39,6 @@ pub struct InMemoryBackendFactory;
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryBackendFixture {
     entries: Arc<Mutex<Arc<EntriesState>>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -80,7 +78,6 @@ impl InMemoryBackend {
     pub fn fork_snapshot(&self) -> Result<Self, BackendError> {
         Ok(Self {
             entries: Arc::new(Mutex::new(self.snapshot()?)),
-            durable_write_lock: DurableWriteLock::new(),
         })
     }
 
@@ -115,7 +112,6 @@ impl BackendFixture for InMemoryBackendFixture {
     fn open(&self) -> Self::Backend {
         InMemoryBackend {
             entries: Arc::clone(&self.entries),
-            durable_write_lock: self.durable_write_lock.clone(),
         }
     }
 }
@@ -148,10 +144,6 @@ impl Backend for InMemoryBackend {
             overlay: EntriesOverlay::default(),
             stats: WriteStats::default(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 }
 

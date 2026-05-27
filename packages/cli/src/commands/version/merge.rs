@@ -4,7 +4,7 @@ use crate::commands::version::{resolve_version_ref, VersionLookup};
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{MergeVersionOptions, MergeVersionOutcome, SwitchVersionOptions};
+use lix_rs_sdk::{MergeBranchOptions, MergeBranchOutcome, SwitchBranchOptions};
 
 pub fn run(context: &AppContext, command: MergeVersionCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
@@ -33,31 +33,31 @@ pub fn run(context: &AppContext, command: MergeVersionCommand) -> Result<Command
             }
         },
     )?;
-    crate::db::block_on(lix.switch_version(SwitchVersionOptions {
-        version_id: target.id.clone(),
+    crate::db::block_on(lix.switch_branch(SwitchBranchOptions {
+        branch_id: target.id.clone(),
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
-    let result = crate::db::block_on(lix.merge_version(MergeVersionOptions {
-        source_version_id: source.id.clone(),
+    let result = crate::db::block_on(lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id.clone(),
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
 
     match result.outcome {
-        MergeVersionOutcome::AlreadyUpToDate => {
+        MergeBranchOutcome::AlreadyUpToDate => {
             println!(
                 "{} ({}) already contains {} ({})",
                 target.name, target.id, source.name, source.id
             );
         }
-        MergeVersionOutcome::FastForward => {
+        MergeBranchOutcome::FastForward => {
             println!(
                 "Fast-forwarded {} ({}) to {} ({}) at {}",
                 target.name, target.id, source.name, source.id, result.target_head_after_commit_id
             );
         }
-        MergeVersionOutcome::MergeCommitted => {
+        MergeBranchOutcome::MergeCommitted => {
             let commit_id = result.created_merge_commit_id.ok_or_else(|| {
-                CliError::msg("merge_version returned MergeCommitted without a merge commit id")
+                CliError::msg("merge_branch returned MergeCommitted without a merge commit id")
             })?;
             println!(
                 "Merged {} ({}) into {} ({}) with commit {}",

@@ -7,8 +7,8 @@ use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    DurableWriteLock, GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, SpaceId, WriteOptions,
+    GetOptions, Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    SpaceId, WriteOptions,
 };
 use lix_engine::storage::{
     InMemoryStorageBackend, PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection,
@@ -187,10 +187,6 @@ where
 
     fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities()
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.inner.durable_write_lock()
     }
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {

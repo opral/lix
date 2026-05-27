@@ -354,7 +354,7 @@ Notes:
   `changelog.commit`, direct `changelog.change`,
   `changelog.commit_change_ref_chunk`, and `tracked_state.commit_root`.
 - The scorecard also required finishing the backend support `open(path)` API so
-  the bench backends derive their durable write lock internally.
+  the bench backends own their persistence handles internally.
 - Criterion: 10 samples, 250 ms warmup, 1 s measurement for smoke groups.
 - Values below are Criterion point estimates.
 

@@ -3,51 +3,6 @@ use crate::backend::{
     KeyRef, ProjectedValue, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions,
     ScanResult, WriteOptions,
 };
-use std::sync::Arc;
-
-/// Process-local write lane for one backend durable target.
-///
-/// This type intentionally hides the async mutex implementation from the
-/// public `Backend` contract while preserving a cloneable handle that backend
-/// implementations can share across cloned or reopened handles.
-#[derive(Clone)]
-pub struct DurableWriteLock {
-    inner: Arc<tokio::sync::Mutex<()>>,
-}
-
-impl std::fmt::Debug for DurableWriteLock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DurableWriteLock").finish_non_exhaustive()
-    }
-}
-
-impl DurableWriteLock {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(tokio::sync::Mutex::new(())),
-        }
-    }
-
-    pub async fn lock_owned(&self) -> DurableWriteGuard {
-        DurableWriteGuard {
-            _guard: Arc::clone(&self.inner).lock_owned().await,
-        }
-    }
-
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
-    }
-}
-
-impl Default for DurableWriteLock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct DurableWriteGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-}
 
 pub trait Backend {
     type Read<'a>: BackendRead + 'a
@@ -63,17 +18,6 @@ pub trait Backend {
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError>;
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError>;
-
-    /// Serializes engine-level durable writes for this backend's durable target.
-    ///
-    /// Clones or independently opened handles for the same durable target must
-    /// return the same lock. Handles for independent targets may return
-    /// independent locks.
-    ///
-    /// This lock is a process-local write lane, not a durability mechanism.
-    /// Crash recovery, fsync policy, and cross-process serialization are backend
-    /// responsibilities in the MVP.
-    fn durable_write_lock(&self) -> DurableWriteLock;
 }
 
 pub trait BackendRead {

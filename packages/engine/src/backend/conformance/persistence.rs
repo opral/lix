@@ -11,10 +11,6 @@ pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
     F: BackendFactory,
 {
-    report.run(
-        "persistence::durable_write_lock_is_shared_across_reopen",
-        || durable_write_lock_is_shared_across_reopen(factory),
-    );
     report.run("persistence::committed_data_survives_reopen", || {
         committed_data_survives_reopen(factory)
     });
@@ -26,28 +22,6 @@ where
         "persistence::overwrite_and_delete_final_state_survives_reopen",
         || overwrite_and_delete_final_state_survives_reopen(factory),
     );
-}
-
-fn durable_write_lock_is_shared_across_reopen<F>(factory: &F) -> ConformanceResult
-where
-    F: BackendFactory,
-{
-    let fixture = factory.create_fixture();
-    let first_lock = {
-        let first = fixture.open();
-        first.durable_write_lock()
-    };
-    let second_lock = {
-        let second = fixture.open();
-        second.durable_write_lock()
-    };
-    if !first_lock.ptr_eq(&second_lock) {
-        return Err(
-            "durable_write_lock must return the same lock for reopened handles to one durable target"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 fn committed_data_survives_reopen<F>(factory: &F) -> ConformanceResult

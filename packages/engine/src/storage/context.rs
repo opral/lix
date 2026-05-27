@@ -14,6 +14,14 @@ pub struct StorageContext<B = InMemoryBackend> {
     backend: B,
 }
 
+pub struct PreparedStorageCommit<'a, B>
+where
+    B: Backend + 'a,
+{
+    write: Option<B::Write<'a>>,
+    stats: Option<StorageWriteSetStats>,
+}
+
 impl<B> StorageContext<B>
 where
     B: Backend,
@@ -55,11 +63,30 @@ where
         write_set: StorageWriteSet,
         opts: WriteOptions,
     ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
-        write_set.commit(&self.backend, opts)
+        let prepared = self.prepare_write_set(write_set, opts)?;
+        prepared.commit().map_err(StorageWriteSetError::Backend)
     }
 
-    pub fn durable_write_lock(&self) -> crate::backend::DurableWriteLock {
-        self.backend.durable_write_lock()
+    pub fn prepare_write_set(
+        &self,
+        write_set: StorageWriteSet,
+        opts: WriteOptions,
+    ) -> Result<PreparedStorageCommit<'_, B>, StorageWriteSetError> {
+        let mut write = self
+            .backend
+            .begin_write(opts)
+            .map_err(StorageWriteSetError::Backend)?;
+        let stats = match write_set.lower_into(&mut write) {
+            Ok(stats) => stats,
+            Err(error) => {
+                let _ = write.rollback();
+                return Err(error);
+            }
+        };
+        Ok(PreparedStorageCommit {
+            write: Some(write),
+            stats: Some(stats),
+        })
     }
 
     pub fn delete_range(
@@ -99,6 +126,42 @@ where
             },
             opts,
         )
+    }
+}
+
+impl<'a, B> PreparedStorageCommit<'a, B>
+where
+    B: Backend + 'a,
+{
+    pub fn commit(mut self) -> Result<(CommitResult, StorageWriteSetStats), BackendError> {
+        let write = self
+            .write
+            .take()
+            .expect("prepared storage commit should contain a backend write");
+        let result = write.commit()?;
+        let stats = self
+            .stats
+            .take()
+            .expect("prepared storage commit should contain stats");
+        Ok((result, stats))
+    }
+
+    pub fn rollback(mut self) -> Result<(), BackendError> {
+        match self.write.take() {
+            Some(write) => write.rollback(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a, B> Drop for PreparedStorageCommit<'a, B>
+where
+    B: Backend + 'a,
+{
+    fn drop(&mut self) {
+        if let Some(write) = self.write.take() {
+            let _ = write.rollback();
+        }
     }
 }
 
@@ -176,8 +239,8 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend::{
-        DurableWriteLock, GetOptions, InMemoryBackend, Key, ProjectedValue, ReadOptions, SpaceId,
-        StoredValue, WriteOptions,
+        GetOptions, InMemoryBackend, Key, ProjectedValue, ReadOptions, SpaceId, StoredValue,
+        WriteOptions,
     };
     use crate::storage::{PointReadPlan, StorageContext, StorageSpace};
 
@@ -274,9 +337,9 @@ mod shape_tests {
 
     use crate::backend::{
         Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, DurableWriteLock, GetOptions, Key, KeyRange, PointVisitor,
-        ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
-        ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+        BufferedRangeScan, CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
+        ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+        StoredValue, WriteConcurrency, WriteOptions, WriteStats,
     };
     use crate::storage::{PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
@@ -493,10 +556,6 @@ mod shape_tests {
                 put_batches: Vec::new(),
                 delete_ranges: Vec::new(),
             })
-        }
-
-        fn durable_write_lock(&self) -> DurableWriteLock {
-            DurableWriteLock::new()
         }
     }
 
