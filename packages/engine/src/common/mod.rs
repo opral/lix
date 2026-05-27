@@ -19,5 +19,5 @@ pub(crate) use json_pointer::{format_json_pointer, parse_json_pointer, top_level
 pub(crate) use metadata::{
     parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
-pub use types::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
+pub use types::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use wire::{WireQueryResult, WireValue};

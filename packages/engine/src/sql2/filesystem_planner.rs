@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
@@ -53,6 +51,7 @@ pub(crate) struct FilesystemRowContext {
 }
 
 impl FilesystemRowContext {
+    #[cfg(test)]
     pub(crate) fn active_branch(branch_id: impl Into<String>) -> Self {
         Self {
             branch_id: branch_id.into(),
@@ -162,6 +161,7 @@ pub(crate) struct DirectoryPathResolver {
 }
 
 impl DirectoryPathResolver {
+    #[cfg(test)]
     pub(crate) fn from_existing(
         existing_directories: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, LixError> {
@@ -223,26 +223,9 @@ impl DirectoryPathResolver {
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        self.ensure_directory_path_with_leaf_id(
-            directory_path,
-            None,
-            context,
-            hidden,
-            generate_directory_id,
-        )
-    }
-
-    pub(crate) fn ensure_directory_path_with_leaf_id(
-        &mut self,
-        directory_path: &str,
-        leaf_id: Option<String>,
-        context: FilesystemRowContext,
-        hidden: bool,
-        generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
         self.plan_directory_path(
             directory_path,
-            leaf_id,
+            None,
             context,
             hidden,
             generate_directory_id,
@@ -565,7 +548,6 @@ pub(crate) fn plan_file_path_update(
     existing_file_id: String,
     new_path: String,
     existing_hidden: bool,
-    _existing_data: Option<Vec<u8>>,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -870,12 +852,10 @@ fn collect_recursive_directory_delete(
         .files_by_directory_id
         .get(&Some(directory_id.to_string()))
     {
-        for file_id in files.keys() {
+        for file_id in files {
             let plan = plan_file_delete(FileDeleteInput {
                 file_id: file_id.clone(),
-                has_blob_ref: visible_filesystem
-                    .blob_refs_by_file_id
-                    .contains_key(file_id),
+                has_blob_ref: visible_filesystem.blob_refs_by_file_id.contains(file_id),
                 context: context.clone(),
             });
             rows.extend(plan.rows);
@@ -903,9 +883,7 @@ mod tests {
         DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput, FilePathWriteInput,
         FilesystemRowContext,
     };
-    use crate::sql2::filesystem_visibility::{
-        VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
-    };
+    use crate::sql2::filesystem_visibility::VisibleFilesystem;
     use crate::{entity_pk::EntityPk, live_state::MaterializedLiveStateRow};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -1044,7 +1022,7 @@ mod tests {
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
 
         let rows = resolver
-            .ensure_directory_path_with_leaf_id(
+            .create_directory_path_with_leaf_id(
                 "/docs/nested/",
                 Some("dir-nested".to_string()),
                 FilesystemRowContext::active_branch("branch-a"),
@@ -1191,7 +1169,6 @@ mod tests {
             "file-readme".to_string(),
             "/docs/renamed.md".to_string(),
             false,
-            Some(b"hello".to_vec()),
             FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
@@ -1222,7 +1199,6 @@ mod tests {
             "file-readme".to_string(),
             "/docs/guides/readme.md".to_string(),
             true,
-            Some(b"hello".to_vec()),
             FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
@@ -1352,16 +1328,6 @@ mod tests {
     #[test]
     fn recursive_directory_delete_plans_files_blobs_and_deepest_directories_first() {
         let context = FilesystemRowContext::active_branch("branch-a");
-        let mut directories_by_id = BTreeMap::new();
-        directories_by_id.insert(
-            "dir-docs".to_string(),
-            visible_directory("dir-docs", None, "docs", context.clone()),
-        );
-        directories_by_id.insert(
-            "dir-guides".to_string(),
-            visible_directory("dir-guides", Some("dir-docs"), "guides", context.clone()),
-        );
-
         let mut directory_children_by_parent_id = BTreeMap::new();
         directory_children_by_parent_id.insert(
             Some("dir-docs".to_string()),
@@ -1371,27 +1337,17 @@ mod tests {
         let mut files_by_directory_id = BTreeMap::new();
         files_by_directory_id.insert(
             Some("dir-guides".to_string()),
-            BTreeMap::from([(
-                "file-readme".to_string(),
-                visible_file("file-readme", Some("dir-guides"), "readme", context.clone()),
-            )]),
+            BTreeSet::from(["file-readme".to_string()]),
         );
         files_by_directory_id.insert(
             Some("dir-docs".to_string()),
-            BTreeMap::from([(
-                "file-index".to_string(),
-                visible_file("file-index", Some("dir-docs"), "index", context.clone()),
-            )]),
+            BTreeSet::from(["file-index".to_string()]),
         );
 
         let visible_filesystem = VisibleFilesystem {
-            directories_by_id,
             directory_children_by_parent_id,
             files_by_directory_id,
-            blob_refs_by_file_id: BTreeMap::from([(
-                "file-readme".to_string(),
-                visible_blob_ref("file-readme", context.clone()),
-            )]),
+            blob_refs_by_file_id: BTreeSet::from(["file-readme".to_string()]),
         };
 
         let plan = super::plan_recursive_directory_delete("dir-docs", &visible_filesystem, context);
@@ -1420,45 +1376,6 @@ mod tests {
             ]
         );
         assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));
-    }
-
-    fn visible_directory(
-        id: &str,
-        parent_id: Option<&str>,
-        name: &str,
-        context: FilesystemRowContext,
-    ) -> VisibleDirectory {
-        VisibleDirectory {
-            id: id.to_string(),
-            parent_id: parent_id.map(ToOwned::to_owned),
-            name: name.to_string(),
-            hidden: false,
-            context,
-        }
-    }
-
-    fn visible_file(
-        id: &str,
-        directory_id: Option<&str>,
-        name: &str,
-        context: FilesystemRowContext,
-    ) -> VisibleFile {
-        VisibleFile {
-            id: id.to_string(),
-            directory_id: directory_id.map(ToOwned::to_owned),
-            name: name.to_string(),
-            hidden: false,
-            context,
-        }
-    }
-
-    fn visible_blob_ref(file_id: &str, context: FilesystemRowContext) -> VisibleBlobRef {
-        VisibleBlobRef {
-            file_id: file_id.to_string(),
-            blob_hash: format!("hash-{file_id}"),
-            size_bytes: Some(1),
-            context,
-        }
     }
 
     fn live_directory_row(

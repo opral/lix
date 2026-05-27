@@ -488,7 +488,6 @@ fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 struct LixDirectoryDeleteExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
@@ -641,7 +640,6 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
     }
 }
 
-#[allow(dead_code)]
 struct LixDirectoryUpdateExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,

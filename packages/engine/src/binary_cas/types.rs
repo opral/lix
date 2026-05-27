@@ -45,27 +45,6 @@ pub(crate) struct BlobMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BlobExistsBatch {
-    entries: Vec<bool>,
-}
-
-impl BlobExistsBatch {
-    pub(crate) fn new(entries: Vec<bool>) -> Self {
-        Self { entries }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, index: usize) -> bool {
-        self.entries.get(index).copied().unwrap_or(false)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn into_vec(self) -> Vec<bool> {
-        self.entries
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobMetadataBatch {
     entries: Vec<Option<BlobMetadata>>,
 }
@@ -73,11 +52,6 @@ pub(crate) struct BlobMetadataBatch {
 impl BlobMetadataBatch {
     pub(crate) fn new(entries: Vec<Option<BlobMetadata>>) -> Self {
         Self { entries }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, index: usize) -> Option<&BlobMetadata> {
-        self.entries.get(index).and_then(Option::as_ref)
     }
 
     pub(crate) fn into_vec(self) -> Vec<Option<BlobMetadata>> {
@@ -93,14 +67,6 @@ pub(crate) struct BlobBytesBatch {
 impl BlobBytesBatch {
     pub(crate) fn new(entries: Vec<Option<Vec<u8>>>) -> Self {
         Self { entries }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, index: usize) -> Option<&[u8]> {
-        self.entries
-            .get(index)
-            .and_then(Option::as_ref)
-            .map(Vec::as_slice)
     }
 
     pub(crate) fn into_vec(self) -> Vec<Option<Vec<u8>>> {

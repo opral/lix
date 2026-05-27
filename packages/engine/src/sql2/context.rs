@@ -42,7 +42,6 @@ pub(crate) struct ChangelogQuerySource<S> {
 /// `SqlWriteExecutionContext` so transaction-scoped reads and staging stay in
 /// the transaction capability instead of flowing through committed read
 /// sources.
-#[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
     type ReadStore: StorageRead + Clone + Send + Sync + 'static;
 
@@ -64,7 +63,6 @@ pub(crate) trait SqlExecutionContext {
 /// payloads stay in the existing engine forms so this boundary centralizes
 /// authority without adding another translation layer.
 #[async_trait]
-#[allow(dead_code)]
 pub(crate) trait SqlWriteExecutionContext {
     fn active_branch_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;

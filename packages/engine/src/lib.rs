@@ -77,7 +77,7 @@ pub use backend::{
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
-pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
+pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;
 pub use init::InitReceipt;

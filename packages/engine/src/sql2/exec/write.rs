@@ -9,7 +9,6 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use super::SqlLogicalPlan;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
-use crate::sql2::parse::parse_statement;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::sql2::plan::LogicalWritePlan;
@@ -34,12 +33,12 @@ pub(crate) struct WriteLogicalPlan {
     pub(super) plan: LogicalWritePlan,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
-    let statement = parse_statement(sql)?;
+    let statement = crate::sql2::parse::parse_statement(sql)?;
     create_write_logical_plan_from_parsed(ctx, statement).await
 }
 

@@ -243,23 +243,6 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ScanResumeKey {
-    pub last_key: Option<Key>,
-}
-
-impl ScanResumeKey {
-    pub fn start() -> Self {
-        Self { last_key: None }
-    }
-
-    pub fn from_last_key(last_key: Key) -> Self {
-        Self {
-            last_key: Some(last_key),
-        }
-    }
-}
-
 pub(crate) fn scan_prefix<R>(
     read: &R,
     space: SpaceId,
@@ -498,20 +481,6 @@ where
     R: BackendRead,
 {
     scan_range_into(read, space, prefix.to_range()?, opts, buffer)
-}
-
-pub(crate) fn visit_scan_prefix<R, V>(
-    read: &R,
-    space: SpaceId,
-    prefix: Prefix,
-    opts: ScanOptions<'_>,
-    visitor: &mut V,
-) -> Result<ScanResult, BackendError>
-where
-    R: BackendRead,
-    V: ScanVisitor + ?Sized,
-{
-    Ok(visit_scan_prefix_with_stats(read, space, prefix, opts, visitor)?.value)
 }
 
 pub(crate) fn visit_scan_prefix_with_stats<R, V>(

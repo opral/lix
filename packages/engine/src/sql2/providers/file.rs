@@ -438,7 +438,6 @@ impl TableProvider for LixFileProvider {
     }
 }
 
-#[allow(dead_code)]
 struct LixFileInsertSink {
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
@@ -560,7 +559,6 @@ fn lix_file_surface_name(branch_binding: &BranchBinding) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 struct LixFileDeleteExec {
     blob_reader: Arc<dyn BlobDataReader>,
     write_ctx: SqlWriteContext,
@@ -715,7 +713,6 @@ impl ExecutionPlan for LixFileDeleteExec {
     }
 }
 
-#[allow(dead_code)]
 struct LixFileUpdateExec {
     blob_reader: Arc<dyn BlobDataReader>,
     write_ctx: SqlWriteContext,
@@ -1379,7 +1376,6 @@ fn lix_file_path_update_stage_from_batch(
             id.clone(),
             path,
             hidden,
-            None,
             context.clone(),
             generate_directory_id,
         )

@@ -298,7 +298,6 @@ where
     /// Commit owns the execution boundary: prepared rows become changelog
     /// facts, branch-ref updates, and visible live_state rows before the
     /// backend transaction is committed.
-    #[allow(dead_code)]
     pub(crate) async fn commit(
         self,
         runtime_functions: &FunctionContext,
@@ -353,7 +352,6 @@ where
     /// This is the explicit failure path for a write execution. Dropping the
     /// buffered transaction without commit is not the API we want callers to
     /// rely on.
-    #[allow(dead_code)]
     pub(crate) async fn rollback(self) -> Result<(), LixError> {
         Ok(())
     }
@@ -364,7 +362,6 @@ where
     /// transaction still owns preparation from `TransactionWriteRow` into
     /// `PreparedStateRow`, so generated timestamps, change ids, commit ids, and
     /// commit change refs stay in one place.
-    #[allow(dead_code)]
     pub(crate) async fn stage_write(
         &mut self,
         write: TransactionWrite,
@@ -497,7 +494,6 @@ where
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
-    #[allow(dead_code)]
     pub(crate) async fn stage_rows(
         &mut self,
         rows: Vec<TransactionWriteRow>,
