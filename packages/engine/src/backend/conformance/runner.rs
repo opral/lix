@@ -1,6 +1,4 @@
-use crate::backend::conformance::{
-    baseline, model_based, persistence, projection, pushdown, scan, write, BackendFactory,
-};
+use crate::backend::conformance::{baseline, model_based, persistence, BackendFactory};
 
 pub type ConformanceResult = Result<(), String>;
 
@@ -33,22 +31,10 @@ where
     if !factory.config().ephemeral {
         persistence::register(&mut report, factory);
     }
-    scan::register(&mut report, factory);
-    write::register(&mut report, factory);
-    projection::register(&mut report, factory);
-    pushdown::register(&mut report, factory);
-
     report
 }
 
 impl ConformanceReport {
-    pub(crate) fn add_pending(&mut self, name: &'static str) {
-        self.tests.push(ConformanceTest {
-            name,
-            status: ConformanceStatus::Pending,
-        });
-    }
-
     pub(crate) fn run(&mut self, name: &'static str, test: impl FnOnce() -> ConformanceResult) {
         let status = match test() {
             Ok(()) => ConformanceStatus::Passed,

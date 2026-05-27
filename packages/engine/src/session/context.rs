@@ -51,6 +51,7 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -67,6 +68,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -76,6 +78,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            deterministic_runtime_gate,
         );
         session.active_branch_id().await?;
         Ok(session)
@@ -89,6 +92,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -100,6 +104,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            deterministic_runtime_gate,
         ))
     }
 
@@ -111,6 +116,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self::new_with_transaction_manager(
             mode,
@@ -120,6 +126,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            deterministic_runtime_gate,
             SessionTransactionManager::new(),
         )
     }
@@ -132,6 +139,7 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
+        deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
         transaction_manager: SessionTransactionManager,
     ) -> Self {
         Self {
@@ -142,6 +150,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            deterministic_runtime_gate,
             transaction_manager,
         }
     }
@@ -177,6 +186,20 @@ where
 
     pub(crate) fn ensure_open(&self) -> Result<(), LixError> {
         self.transaction_manager.ensure_open()
+    }
+
+    pub(super) async fn deterministic_mode_enabled(&self) -> Result<bool, LixError> {
+        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let live_state = self.live_state.reader(&read);
+        crate::functions::deterministic_mode_enabled(&live_state).await
+    }
+
+    pub(super) async fn lock_deterministic_runtime(
+        &self,
+    ) -> crate::functions::DeterministicRuntimeGuard {
+        Arc::clone(&self.deterministic_runtime_gate)
+            .lock_owned()
+            .await
     }
 
     pub(super) fn begin_session_operation(&self) -> Result<SessionOperationGuard, LixError> {
@@ -327,6 +350,11 @@ where
             &'tx mut Transaction<B>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        let _deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
+            Some(self.lock_deterministic_runtime().await)
+        } else {
+            None
+        };
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -446,8 +474,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::backend::{
-        Backend, BackendCapabilities, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite,
-        ReadOptions, WriteOptions,
+        Backend, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions,
+        WriteOptions,
     };
     use crate::Engine;
     use futures_util::task::noop_waker_ref;
@@ -778,11 +806,6 @@ mod tests {
             = InMemoryWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            self.inner.capabilities()
-        }
-
         fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             self.gate.maybe_block();
             self.inner.begin_read(opts)
@@ -822,11 +845,6 @@ mod tests {
             = InMemoryWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            self.inner.capabilities()
-        }
-
         fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             self.inner.begin_read(opts)
         }

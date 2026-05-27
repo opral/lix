@@ -1,8 +1,11 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use lix_engine::ExecuteResult;
-use lix_engine::{CreateBranchOptions, Engine, MergeBranchOptions, SwitchBranchOptions, Value};
+use std::collections::BTreeSet;
+
+use lix_engine::{
+    CreateBranchOptions, Engine, ExecuteResult, MergeBranchOptions, SwitchBranchOptions, Value,
+};
 use serde_json::json;
 
 simulation_test!(engine_new_rejects_uninitialized_backend, |sim| async move {
@@ -436,6 +439,123 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    concurrent_sessions_do_not_duplicate_deterministic_runtime_values,
+    options = support::simulation_test::engine::SimulationOptions {
+        deterministic: false,
+    },
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open first session"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('lix_deterministic_mode', \
+                 lix_json('{\"enabled\":true}'), true, true)",
+                &[],
+            )
+            .await
+            .expect("deterministic mode insert should succeed");
+
+        let second_session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open second session"),
+            &engine,
+        );
+
+        let (first, second) = tokio::join!(
+            session.execute("SELECT lix_uuid_v7()", &[]),
+            second_session.execute("SELECT lix_uuid_v7()", &[])
+        );
+        let values = BTreeSet::from([
+            single_text(first.expect("first deterministic uuid should succeed")),
+            single_text(second.expect("second deterministic uuid should succeed")),
+        ]);
+        assert_eq!(
+            values,
+            BTreeSet::from([
+                "01920000-0000-7000-8000-000000000000".to_string(),
+                "01920000-0000-7000-8000-000000000001".to_string(),
+            ])
+        );
+
+        assert_single_text(
+            session
+                .execute("SELECT lix_uuid_v7()", &[])
+                .await
+                .expect("third deterministic uuid should continue"),
+            "01920000-0000-7000-8000-000000000002",
+        );
+    }
+);
+
+simulation_test!(
+    explicit_transaction_runtime_read_blocks_concurrent_sequence_read,
+    options = support::simulation_test::engine::SimulationOptions {
+        deterministic: false,
+    },
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open first session"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('lix_deterministic_mode', \
+                 lix_json('{\"enabled\":true}'), true, true)",
+                &[],
+            )
+            .await
+            .expect("deterministic mode insert should succeed");
+        let second_session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open second session"),
+            &engine,
+        );
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        assert_single_text(
+            transaction
+                .execute("SELECT lix_uuid_v7()", &[])
+                .await
+                .expect("transaction deterministic uuid should succeed"),
+            "01920000-0000-7000-8000-000000000000",
+        );
+
+        let concurrent_read = second_session.execute("SELECT lix_uuid_v7()", &[]);
+        let commit_after_yield = async {
+            tokio::task::yield_now().await;
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        };
+        let (_, second_result) = tokio::join!(commit_after_yield, concurrent_read);
+        assert_single_text(
+            second_result.expect("concurrent deterministic uuid should succeed"),
+            "01920000-0000-7000-8000-000000000001",
+        );
+    }
+);
+
 fn assert_single_text(result: ExecuteResult, expected: &str) {
     let row_set = result;
     assert_eq!(row_set.len(), 1);
@@ -443,6 +563,15 @@ fn assert_single_text(result: ExecuteResult, expected: &str) {
         row_set.rows()[0].values(),
         &[Value::Text(expected.to_string())]
     );
+}
+
+fn single_text(result: ExecuteResult) -> String {
+    let row_set = result;
+    assert_eq!(row_set.len(), 1);
+    match &row_set.rows()[0].values()[0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected a text result, got {other:?}"),
+    }
 }
 
 fn assert_single_integer(result: ExecuteResult, expected: i64) {

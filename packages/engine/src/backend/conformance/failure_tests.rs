@@ -8,10 +8,10 @@ use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
 use crate::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions,
+    WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -25,7 +25,6 @@ enum BrokenMode {
     DeleteManyIgnoresExistingKeys,
     DeleteRangeIgnoresUpperBound,
     KeyOnlyScanReturnsFullValues,
-    AdvertisesPendingCapability,
     RollbackCommits,
     BadByteOrdering,
     KeyResumeRepeatsLastKey,
@@ -122,27 +121,6 @@ fn detects_key_only_scan_projection_violation() {
     assert_failed(
         BrokenMode::KeyOnlyScanReturnsFullValues,
         "baseline::full_value_and_key_only_are_core",
-    );
-}
-
-#[test]
-fn detects_advertised_pending_capability() {
-    let report = run_backend_conformance(&BrokenBackendFactory {
-        mode: BrokenMode::AdvertisesPendingCapability,
-    });
-    let pending = report.tests.iter().any(|test| {
-        test.name == "projection::header_returns_header_without_payload"
-            && matches!(test.status, ConformanceStatus::Pending)
-    });
-    assert!(
-        pending,
-        "expected advertised projection capability to create pending test, got {report:#?}"
-    );
-
-    let panic = std::panic::catch_unwind(|| report.assert_no_failures());
-    assert!(
-        panic.is_err(),
-        "assert_no_failures should fail when advertised capabilities are pending"
     );
 }
 
@@ -266,17 +244,6 @@ impl Backend for BrokenBackend {
         = BrokenWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        let mut capabilities = BackendCapabilities::v0(WriteConcurrency::SingleWriter);
-        if matches!(self.mode, BrokenMode::AdvertisesPendingCapability) {
-            capabilities.projection = ProjectionCapabilities {
-                header: true,
-                ..ProjectionCapabilities::default()
-            };
-        }
-        capabilities
-    }
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(BrokenRead {

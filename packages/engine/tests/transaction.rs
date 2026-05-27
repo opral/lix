@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor,
-    PutBatch, ReadOptions, ScanOptions, WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
+    InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
+    WriteOptions,
 };
 use lix_engine::Engine;
 
@@ -465,7 +465,7 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
 }
 
 #[tokio::test]
-async fn close_during_transaction_commit_aborts_before_backend_commit() {
+async fn close_during_transaction_commit_waits_after_commit_boundary() {
     let backend = BlockingBeginReadBackend::new();
     let gate = backend.gate();
     let _receipt = Engine::initialize(backend.clone())
@@ -509,31 +509,28 @@ async fn close_during_transaction_commit_aborts_before_backend_commit() {
             .expect("test runtime should build");
         runtime.block_on(async move { close_session.close().await })
     });
-    wait_until("session to be marked closed", || session.is_closed());
     assert!(
         !closer.is_finished(),
-        "close should wait for the blocked commit to exit"
+        "close should wait for the blocked commit boundary to exit"
     );
     gate.release();
-    join_thread(closer, "close while commit waits before backend commit")
-        .expect("session close should succeed");
-
-    let error = join_thread(committer, "committer waiting before backend commit")
-        .expect_err("commit should observe the close before backend commit");
-    assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
+    join_thread(committer, "committer waiting after commit boundary")
+        .expect("commit past the boundary should finish before close");
+    join_thread(closer, "close while commit waits after commit boundary")
+        .expect("session close should succeed after commit exits");
 
     let delta = backend.stats().delta_since(&before);
     assert_eq!(
         delta.write_opened, 1,
-        "commit preparation may open a backend write before the final close check"
+        "commit preparation should open a backend write"
     );
     assert_eq!(
-        delta.write_rolled_back, 1,
-        "closed transaction commit must roll back the prepared backend write"
+        delta.write_committed, 1,
+        "commit past the boundary should commit backend writes"
     );
     assert_eq!(
-        delta.write_committed, 0,
-        "closed transaction commit must not commit backend writes"
+        delta.write_rolled_back, 0,
+        "commit past the boundary should not roll back backend writes"
     );
 }
 
@@ -755,11 +752,6 @@ impl Backend for BlockingBeginWriteBackend {
         = <RecordingBackend as Backend>::Write<'a>
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.inner.begin_read(opts)
     }
@@ -780,11 +772,6 @@ impl Backend for BlockingBeginReadBackend {
         = <RecordingBackend as Backend>::Write<'a>
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.gate.maybe_block();
         self.inner.begin_read(opts)
@@ -805,11 +792,6 @@ impl Backend for BlockingCommitBackend {
         = BlockingCommitWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.inner.begin_read(opts)
     }
@@ -967,11 +949,6 @@ impl Backend for RecordingBackend {
         = RecordingWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {

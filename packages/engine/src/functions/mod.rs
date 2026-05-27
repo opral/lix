@@ -16,3 +16,11 @@ pub(crate) use provider::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 pub(crate) use types::{DeterministicMode, DeterministicSequence};
+
+pub(crate) type DeterministicRuntimeGuard = tokio::sync::OwnedMutexGuard<()>;
+
+pub(crate) async fn deterministic_mode_enabled(
+    live_state: &dyn crate::live_state::LiveStateReader,
+) -> Result<bool, crate::LixError> {
+    Ok(state::load_mode(live_state).await?.enabled)
+}

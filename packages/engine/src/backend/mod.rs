@@ -3,7 +3,6 @@
 //! This module is intentionally isolated from the current `backend` module
 //! while the ordered byte-key API and its conformance suite settle.
 
-mod capabilities;
 pub mod conformance;
 mod error;
 mod in_memory;
@@ -11,10 +10,6 @@ mod predicate;
 mod traits;
 mod types;
 
-pub use capabilities::{
-    BackendCapabilities, BackendProfile, ProjectionCapabilities, PushdownCapabilities,
-    ScanCapabilities, WriteCapabilities, WriteConcurrency,
-};
 pub use error::{
     BackendError, Capability, Precondition, PreconditionFailure, PreconditionItemSupport,
     PreconditionSupportReport,

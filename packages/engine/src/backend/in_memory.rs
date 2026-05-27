@@ -8,10 +8,10 @@ use bytes::Bytes;
 
 use crate::backend::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    BufferedRangeScan, CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
+    WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
@@ -126,11 +126,6 @@ impl Backend for InMemoryBackend {
         = InMemoryWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(InMemoryRead {
             entries: self.snapshot()?,

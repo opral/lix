@@ -1,14 +1,10 @@
-use crate::backend::{Backend, BackendCapabilities, BackendError, ReadOptions, WriteOptions};
+use crate::backend::{Backend, BackendError, ReadOptions, WriteOptions};
 
 pub trait BackendFactory {
     type Backend: Backend;
     type Fixture: BackendFixture<Backend = Self::Backend>;
 
     fn create_fixture(&self) -> Self::Fixture;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.create_fixture().open().capabilities()
-    }
 
     fn config(&self) -> BackendTestConfig {
         BackendTestConfig::default()
@@ -53,10 +49,6 @@ where
         = <F::Backend as Backend>::Write<'a>
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.backend.capabilities()
-    }
 
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.backend.begin_read(opts)

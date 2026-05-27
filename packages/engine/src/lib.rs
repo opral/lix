@@ -63,15 +63,14 @@ pub use backend::conformance::{
     ConformanceStatus as BackendConformanceStatus, ConformanceTest as BackendConformanceTest,
 };
 pub use backend::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
-    BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
-    CoreProjection, Durability, GetManyResult, GetOptions, InMemoryBackend, InMemoryBackendFactory,
+    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
+    BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult, CoreProjection,
+    Durability, GetManyResult, GetOptions, InMemoryBackend, InMemoryBackendFactory,
     InMemoryBackendFixture, InMemoryRangeScan, InMemoryRead, InMemoryScanVisitResult,
     InMemoryWrite, Key, Key as BackendKey, KeyRange, KeyRef as BackendKeyRef, PointVisitor,
     Prefix as BackendPrefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry,
     ReadConsistency, ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
-    SnapshotRef, SpaceId, StoredValue, Value as BackendValue, WriteConcurrency, WriteOptions,
-    WriteStats,
+    SnapshotRef, SpaceId, StoredValue, Value as BackendValue, WriteOptions, WriteStats,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
