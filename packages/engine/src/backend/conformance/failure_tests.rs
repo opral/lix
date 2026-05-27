@@ -9,9 +9,9 @@ use super::{
 };
 use crate::backend::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -30,7 +30,6 @@ enum BrokenMode {
     BadByteOrdering,
     KeyResumeRepeatsLastKey,
     LoseCommittedDataOnReopen,
-    ReopenReturnsFreshDurableWriteLock,
     CorruptOpaqueBytes,
 }
 
@@ -45,7 +44,6 @@ struct BrokenBackendFixture {
     entries: Arc<Mutex<BrokenMap>>,
     commit_count: Arc<Mutex<u64>>,
     open_count: Arc<Mutex<u64>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +51,6 @@ struct BrokenBackend {
     mode: BrokenMode,
     entries: Arc<Mutex<BrokenMap>>,
     commit_count: Arc<Mutex<u64>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -198,14 +195,6 @@ fn detects_persistent_commit_lost_on_reopen_violation() {
 }
 
 #[test]
-fn detects_fresh_durable_write_lock_on_reopen_violation() {
-    assert_failed(
-        BrokenMode::ReopenReturnsFreshDurableWriteLock,
-        "persistence::durable_write_lock_is_shared_across_reopen",
-    );
-}
-
-#[test]
 fn detects_persistent_rollback_on_reopen_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
@@ -236,7 +225,6 @@ impl BackendFactory for BrokenBackendFactory {
             entries: Arc::new(Mutex::new(BrokenMap::new())),
             commit_count: Arc::new(Mutex::new(0)),
             open_count: Arc::new(Mutex::new(0)),
-            durable_write_lock: DurableWriteLock::new(),
         }
     }
 
@@ -260,17 +248,10 @@ impl BackendFixture for BrokenBackendFixture {
                 .clear();
         }
         *open_count += 1;
-        let durable_write_lock =
-            if matches!(self.mode, BrokenMode::ReopenReturnsFreshDurableWriteLock) {
-                DurableWriteLock::new()
-            } else {
-                self.durable_write_lock.clone()
-            };
         BrokenBackend {
             mode: self.mode,
             entries: Arc::clone(&self.entries),
             commit_count: Arc::clone(&self.commit_count),
-            durable_write_lock,
         }
     }
 }
@@ -317,10 +298,6 @@ impl Backend for BrokenBackend {
             commit_count: Arc::clone(&self.commit_count),
             staged: self.snapshot()?,
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 }
 

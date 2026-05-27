@@ -40,14 +40,14 @@ pub(super) fn resolve_version_ref(
 }
 
 pub(super) fn resolve_active_version_ref(lix: &FileLix) -> Result<ResolvedVersionRef, CliError> {
-    let active_id = crate::db::block_on(lix.active_version_id())
+    let active_id = crate::db::block_on(lix.active_branch_id())
         .map_err(|error| CliError::msg(error.to_string()))?;
     resolve_version_by_id(lix, &active_id)
 }
 
 fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
-        "SELECT id, name FROM lix_version WHERE id = $1 LIMIT 1",
+        "SELECT id, name FROM lix_branch WHERE id = $1 LIMIT 1",
         &[Value::Text(id.to_string())],
     ))
     .map_err(|error| CliError::msg(error.to_string()))?;
@@ -57,14 +57,14 @@ fn resolve_version_by_id(lix: &FileLix, id: &str) -> Result<ResolvedVersionRef, 
     };
 
     Ok(ResolvedVersionRef {
-        id: text_at(row, 0, "lix_version.id")?,
-        name: text_at(row, 1, "lix_version.name")?,
+        id: text_at(row, 0, "lix_branch.id")?,
+        name: text_at(row, 1, "lix_branch.name")?,
     })
 }
 
 fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionRef, CliError> {
     let result = crate::db::block_on(lix.execute(
-        "SELECT id, name FROM lix_version WHERE name = $1 ORDER BY id",
+        "SELECT id, name FROM lix_branch WHERE name = $1 ORDER BY id",
         &[Value::Text(name.to_string())],
     ))
     .map_err(|error| CliError::msg(error.to_string()))?;
@@ -74,8 +74,8 @@ fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionR
             "no version exists with name '{name}'"
         ))),
         [row] => Ok(ResolvedVersionRef {
-            id: text_at(row, 0, "lix_version.id")?,
-            name: text_at(row, 1, "lix_version.name")?,
+            id: text_at(row, 0, "lix_branch.id")?,
+            name: text_at(row, 1, "lix_branch.name")?,
         }),
         rows => {
             let matching_ids = rows

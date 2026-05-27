@@ -18,9 +18,7 @@ use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
 };
-use crate::storage::{
-    DurableWriteGuard, DurableWriteLock, InMemoryStorageBackend, StorageBackend, StorageReadOptions,
-};
+use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{StorageContext, StorageRead, StorageReadScope};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
@@ -53,7 +51,6 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
-    pub(super) write_lock: DurableWriteLock,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -70,7 +67,6 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: DurableWriteLock,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -80,7 +76,6 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
-            write_lock,
         );
         session.active_branch_id().await?;
         Ok(session)
@@ -94,7 +89,6 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: DurableWriteLock,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -106,7 +100,6 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
-            write_lock,
         ))
     }
 
@@ -118,7 +111,6 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: DurableWriteLock,
     ) -> Self {
         Self::new_with_transaction_manager(
             mode,
@@ -128,7 +120,6 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
-            write_lock,
             SessionTransactionManager::new(),
         )
     }
@@ -141,7 +132,6 @@ where
         binary_cas: Arc<BinaryCasContext>,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
-        write_lock: DurableWriteLock,
         transaction_manager: SessionTransactionManager,
     ) -> Self {
         Self {
@@ -152,7 +142,6 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
-            write_lock,
             transaction_manager,
         }
     }
@@ -220,10 +209,8 @@ where
         &self,
         write_lease: SessionWriteLease,
     ) -> Result<SessionWriteAccess, LixError> {
-        let write_guard = self.write_lock.lock_owned().await;
         let write_access = SessionWriteAccess {
             _write_lease: write_lease,
-            _write_guard: write_guard,
         };
         self.ensure_open()?;
         Ok(write_access)
@@ -378,7 +365,6 @@ where
 }
 
 pub(super) struct SessionWriteAccess {
-    _write_guard: DurableWriteGuard,
     _write_lease: SessionWriteLease,
 }
 
@@ -460,8 +446,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::backend::{
-        Backend, BackendCapabilities, BackendError, DurableWriteLock, InMemoryBackend,
-        InMemoryRead, InMemoryWrite, ReadOptions, WriteOptions,
+        Backend, BackendCapabilities, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite,
+        ReadOptions, WriteOptions,
     };
     use crate::Engine;
     use futures_util::task::noop_waker_ref;
@@ -649,87 +635,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_open_waits_for_write_lock() {
-        let session = open_session().await;
-        let write_guard = session.write_lock.lock_owned().await;
-
-        let opener_session = std::sync::Arc::clone(&session);
-        let opener = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("test runtime should build");
-            runtime.block_on(async move { opener_session.begin_transaction().await })
-        });
-        wait_until("explicit transaction open to reserve the session", || {
-            session.operation_in_progress_count_for_test() > 0
-                && session.active_transaction_for_test()
-                && !opener.is_finished()
-        });
-
-        assert!(
-            !opener.is_finished(),
-            "transaction open should wait for the write lock"
-        );
-        assert!(session.active_transaction_for_test());
-
-        drop(write_guard);
-        let transaction = join_thread(opener, "queued transaction opener")
-            .expect("transaction should begin after write lock is released");
-        transaction
-            .rollback()
-            .await
-            .expect("transaction rollback should succeed");
-    }
-
-    #[tokio::test]
-    async fn close_waits_for_session_write_queued_on_write_lock() {
-        let session = open_session().await;
-        let write_guard = session.write_lock.lock_owned().await;
-
-        let writer_session = std::sync::Arc::clone(&session);
-        let writer = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("test runtime should build");
-            runtime.block_on(async move {
-                writer_session
-                    .execute(
-                        "INSERT INTO lix_key_value (key, value) VALUES ('queued-write-close', 'value')",
-                        &[],
-                    )
-                    .await
-            })
-        });
-        wait_until("queued session write to reserve the session", || {
-            session.operation_in_progress_count_for_test() > 0
-                && session.active_transaction_for_test()
-        });
-
-        let mut close = Box::pin(session.close());
-        assert_close_pending(close.as_mut());
-
-        drop(write_guard);
-        let write_error =
-            join_thread(writer, "queued writer").expect_err("queued write should observe close");
-        assert_eq!(write_error.code, crate::LixError::CODE_CLOSED);
-        assert_close_finishes(close.as_mut(), "close after queued write exits").await;
-    }
-
-    #[tokio::test]
-    async fn session_read_does_not_wait_for_write_lock() {
-        let session = open_session().await;
-        let write_guard = session.write_lock.lock_owned().await;
-
-        let result = tokio::time::timeout(TEST_WAIT_TIMEOUT, session.execute("SELECT 1", &[]))
-            .await
-            .expect("read should not wait for the write lock")
-            .expect("read should succeed");
-
-        assert_eq!(result.len(), 1);
-        drop(write_guard);
-    }
-
-    #[tokio::test]
     async fn explicit_transaction_commit_sets_commit_guard() {
         let session = open_session().await;
         let mut transaction = session
@@ -748,40 +653,6 @@ mod tests {
             .await
             .expect("transaction commit should succeed");
         assert!(!session.commit_in_progress_for_test());
-    }
-
-    #[tokio::test]
-    async fn close_waits_for_explicit_transaction_open_queued_on_write_lock() {
-        let session = open_session().await;
-        let write_guard = session.write_lock.lock_owned().await;
-
-        let opener_session = std::sync::Arc::clone(&session);
-        let opener = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .expect("test runtime should build");
-            runtime.block_on(async move { opener_session.begin_transaction().await })
-        });
-        wait_until("explicit transaction open to queue on write lock", || {
-            session.operation_in_progress_count_for_test() > 0
-                && session.active_transaction_for_test()
-                && !opener.is_finished()
-        });
-        assert!(
-            !opener.is_finished(),
-            "transaction open should still be queued on write lock"
-        );
-
-        let mut close = Box::pin(session.close());
-        assert_close_pending(close.as_mut());
-
-        drop(write_guard);
-        let open_error = match join_thread(opener, "queued explicit transaction opener") {
-            Ok(_) => panic!("queued explicit transaction open should observe close"),
-            Err(error) => error,
-        };
-        assert_eq!(open_error.code, crate::LixError::CODE_CLOSED);
-        assert_close_finishes(close.as_mut(), "close after queued explicit open exits").await;
     }
 
     #[tokio::test]
@@ -920,10 +791,6 @@ mod tests {
         fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
             self.inner.begin_write(opts)
         }
-
-        fn durable_write_lock(&self) -> DurableWriteLock {
-            self.inner.durable_write_lock()
-        }
     }
 
     #[derive(Clone)]
@@ -967,10 +834,6 @@ mod tests {
         fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
             self.gate.maybe_block();
             self.inner.begin_write(opts)
-        }
-
-        fn durable_write_lock(&self) -> DurableWriteLock {
-            self.inner.durable_write_lock()
         }
     }
 

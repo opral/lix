@@ -79,7 +79,6 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
-            self.write_lock.clone(),
             self.transaction_manager(),
         );
         Ok((

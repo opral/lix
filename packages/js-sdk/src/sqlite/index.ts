@@ -96,10 +96,7 @@ class BetterSqlite3Backend implements LixBackend {
 	beginWriteTransaction(): LixBackendWriteTransaction {
 		this.#ensureOpen();
 		if (this.#db.inTransaction) {
-			return new BetterSqlite3Transaction(this.#db, {
-				ownsTransaction: false,
-				writable: true,
-			});
+			throw new Error("better-sqlite3 Lix backend write transaction already active");
 		}
 		this.#db.exec("BEGIN IMMEDIATE");
 		this.#transactionMode = "write";

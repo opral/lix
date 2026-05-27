@@ -1,6 +1,4 @@
-use crate::backend::{
-    Backend, BackendCapabilities, BackendError, DurableWriteLock, ReadOptions, WriteOptions,
-};
+use crate::backend::{Backend, BackendCapabilities, BackendError, ReadOptions, WriteOptions};
 
 pub trait BackendFactory {
     type Backend: Backend;
@@ -66,10 +64,6 @@ where
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.backend.begin_write(opts)
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.backend.durable_write_lock()
     }
 }
 

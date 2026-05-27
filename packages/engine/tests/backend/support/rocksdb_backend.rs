@@ -1,15 +1,14 @@
-use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend::{
     Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rocksdb::{DBIteratorWithThreadMode, Snapshot};
@@ -31,7 +30,6 @@ pub struct RocksDbBackendFixture {
 pub struct RocksDbBackend {
     path: PathBuf,
     db: Arc<DB>,
-    durable_write_lock: DurableWriteLock,
 }
 
 pub struct RocksDbRead<'a> {
@@ -95,13 +93,8 @@ impl BackendFixture for RocksDbBackendFixture {
 impl RocksDbBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
-        let durable_write_lock = durable_write_lock_for_path(&path);
         let db = Arc::new(open_rocksdb(&path)?);
-        Ok(Self {
-            path,
-            db,
-            durable_write_lock,
-        })
+        Ok(Self { path, db })
     }
 
     #[allow(dead_code)]
@@ -143,48 +136,6 @@ impl Backend for RocksDbBackend {
             staged_put_keys: Vec::new(),
             stats: WriteStats::default(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
-    }
-}
-
-fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
-    let key = canonical_lock_key(path);
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .expect("rocksdb durable write lock registry should not poison");
-    if let Some(lock) = locks.get(&key) {
-        return lock.clone();
-    }
-    let lock = DurableWriteLock::new();
-    locks.insert(key, lock.clone());
-    lock
-}
-
-fn canonical_lock_key(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return path;
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .expect("current directory should be available")
-            .join(path)
-    };
-    let Some(parent) = absolute.parent() else {
-        return absolute;
-    };
-    let Ok(parent) = parent.canonicalize() else {
-        return absolute;
-    };
-    match absolute.file_name() {
-        Some(file_name) => parent.join(file_name),
-        None => parent,
     }
 }
 
