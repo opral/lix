@@ -2,7 +2,7 @@
 mod support;
 
 use lix_engine::ExecuteResult;
-use lix_engine::{CreateVersionOptions, Engine, MergeVersionOptions, SwitchVersionOptions, Value};
+use lix_engine::{CreateBranchOptions, Engine, MergeBranchOptions, SwitchBranchOptions, Value};
 use serde_json::json;
 
 simulation_test!(engine_new_rejects_uninitialized_backend, |sim| async move {
@@ -31,30 +31,30 @@ simulation_test!(
             &engine,
         );
 
-        let version_result = session
+        let branch_result = session
             .execute(
                 "SELECT entity_pk, snapshot_content \
              FROM lix_state \
-             WHERE schema_key = 'lix_version_descriptor' \
+             WHERE schema_key = 'lix_branch_descriptor' \
              ORDER BY entity_pk",
                 &[],
             )
             .await
-            .expect("version descriptors should be readable");
-        let version_rows = version_result;
-        assert_eq!(version_rows.len(), 2);
-        let version_values = version_rows
+            .expect("branch descriptors should be readable");
+        let branch_rows = branch_result;
+        assert_eq!(branch_rows.len(), 2);
+        let branch_values = branch_rows
             .rows()
             .iter()
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
-        assert!(version_values.contains(&vec![
+        assert!(branch_values.contains(&vec![
             Value::Json(json!(["global"])),
             Value::Json(json!({"hidden": true, "id": "global", "name": "global"})),
         ]));
-        assert!(version_values.contains(&vec![
-            Value::Json(json!([sim.main_version_id()])),
-            Value::Json(json!({"hidden": false, "id": sim.main_version_id(), "name": "main"})),
+        assert!(branch_values.contains(&vec![
+            Value::Json(json!([sim.main_branch_id()])),
+            Value::Json(json!({"hidden": false, "id": sim.main_branch_id(), "name": "main"})),
         ]));
 
         let lix_id_result = session
@@ -67,12 +67,12 @@ simulation_test!(
             .execute(
                 "SELECT entity_pk, snapshot_content, untracked \
              FROM lix_state \
-             WHERE schema_key = 'lix_version_ref' \
+             WHERE schema_key = 'lix_branch_ref' \
              ORDER BY entity_pk",
                 &[],
             )
             .await
-            .expect("version refs should be readable");
+            .expect("branch refs should be readable");
         let ref_rows = refs_result;
         assert_eq!(ref_rows.len(), 2);
         let ref_values = ref_rows
@@ -86,8 +86,8 @@ simulation_test!(
             Value::Boolean(true),
         ]));
         assert!(ref_values.contains(&vec![
-            Value::Json(json!([sim.main_version_id()])),
-            Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": sim.main_version_id()})),
+            Value::Json(json!([sim.main_branch_id()])),
+            Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": sim.main_branch_id()})),
             Value::Boolean(true),
         ]));
 
@@ -212,36 +212,36 @@ simulation_test!(
         );
         assert_closed(
             session
-                .active_version_id()
+                .active_branch_id()
                 .await
-                .expect_err("active_version_id after close should fail"),
+                .expect_err("active_branch_id after close should fail"),
         );
         assert_closed(
             session
-                .create_version(CreateVersionOptions {
-                    id: Some("closed-version".to_string()),
+                .create_branch(CreateBranchOptions {
+                    id: Some("closed-branch".to_string()),
                     name: "Closed".to_string(),
                     from_commit_id: None,
                 })
                 .await
-                .expect_err("create_version after close should fail"),
+                .expect_err("create_branch after close should fail"),
         );
         match session
-            .switch_version(SwitchVersionOptions {
-                version_id: sim.main_version_id().to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_string(),
             })
             .await
         {
-            Ok(_) => panic!("switch_version after close should fail"),
+            Ok(_) => panic!("switch_branch after close should fail"),
             Err(error) => assert_closed(error),
         }
         assert_closed(
             session
-                .merge_version(MergeVersionOptions {
-                    source_version_id: sim.main_version_id().to_string(),
+                .merge_branch(MergeBranchOptions {
+                    source_branch_id: sim.main_branch_id().to_string(),
                 })
                 .await
-                .expect_err("merge_version after close should fail"),
+                .expect_err("merge_branch after close should fail"),
         );
     }
 );
@@ -279,17 +279,17 @@ simulation_test!(
             .await
             .expect("backend should open a session");
         let (switched_session, _) = session
-            .switch_version(SwitchVersionOptions {
-                version_id: sim.main_version_id().to_string(),
+            .switch_branch(SwitchBranchOptions {
+                branch_id: sim.main_branch_id().to_string(),
             })
             .await
-            .expect("switch_version should succeed before close");
+            .expect("switch_branch should succeed before close");
 
         session.close().await.expect("close should succeed");
 
         assert_closed(
             switched_session
-                .active_version_id()
+                .active_branch_id()
                 .await
                 .expect_err("derived session should observe closed state"),
         );

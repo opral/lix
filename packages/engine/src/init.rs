@@ -1,3 +1,4 @@
+use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
     CommitChangeRefSet, CommitRecord,
@@ -15,20 +16,19 @@ use crate::storage::StorageBackend;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
-use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ID_KEY: &str = "lix_id";
-const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
+const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Pure seed plan for initializing an engine repository.
 ///
 /// Tracked bootstrap facts go to the changelog. Moving refs such as
-/// `lix_version_ref` are seeded as untracked local state so repository heads
+/// `lix_branch_ref` are seeded as untracked local state so repository heads
 /// can advance without becoming commit members.
 pub(crate) struct InitSeedPlan {
     commit: InitSeedCommit,
@@ -63,24 +63,24 @@ struct InitSeedLiveRow {
     created_at: String,
     updated_at: String,
     global: bool,
-    version_id: String,
+    branch_id: String,
 }
 
 /// Values generated while planning the initial repository seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitReceipt {
     pub lix_id: String,
-    pub global_version_id: String,
-    pub main_version_id: String,
+    pub global_branch_id: String,
+    pub main_branch_id: String,
     pub initial_commit_id: String,
 }
 
 /// Builds the canonical bootstrap changes for a new engine repository.
 ///
-/// The initial commit tracks durable content rows. Version refs are moving
+/// The initial commit tracks durable content rows. Branch refs are moving
 /// pointers and therefore live in untracked local state instead of the commit.
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
-    let main_version_id = functions.call_uuid_v7();
+    let main_branch_id = functions.call_uuid_v7();
     let lix_id = functions.call_uuid_v7();
     let initial_commit_id = functions.call_uuid_v7();
     let timestamp = functions.call_timestamp();
@@ -97,18 +97,18 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         ));
     }
 
-    let global_version_descriptor_change = canonical_change(
-        GLOBAL_VERSION_ID.to_string(),
-        EntityPk::single(GLOBAL_VERSION_ID),
-        VERSION_DESCRIPTOR_SCHEMA_KEY,
-        version_descriptor_snapshot(GLOBAL_VERSION_ID, "global", true)?,
+    let global_branch_descriptor_change = canonical_change(
+        GLOBAL_BRANCH_ID.to_string(),
+        EntityPk::single(GLOBAL_BRANCH_ID),
+        BRANCH_DESCRIPTOR_SCHEMA_KEY,
+        branch_descriptor_snapshot(GLOBAL_BRANCH_ID, "global", true)?,
         &timestamp,
     );
-    let main_version_descriptor_change = canonical_change(
+    let main_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(&main_version_id),
-        VERSION_DESCRIPTOR_SCHEMA_KEY,
-        version_descriptor_snapshot(&main_version_id, "main", false)?,
+        EntityPk::single(&main_branch_id),
+        BRANCH_DESCRIPTOR_SCHEMA_KEY,
+        branch_descriptor_snapshot(&main_branch_id, "main", false)?,
         &timestamp,
     );
     let kv_lix_id_change = canonical_change(
@@ -126,22 +126,22 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         author_account_ids: Vec::new(),
         created_at: timestamp.clone(),
     };
-    let global_version_ref_row = untracked_row(
-        EntityPk::single(GLOBAL_VERSION_ID),
-        VERSION_REF_SCHEMA_KEY,
-        version_ref_snapshot(GLOBAL_VERSION_ID, &initial_commit_id)?,
+    let global_branch_ref_row = untracked_row(
+        EntityPk::single(GLOBAL_BRANCH_ID),
+        BRANCH_REF_SCHEMA_KEY,
+        branch_ref_snapshot(GLOBAL_BRANCH_ID, &initial_commit_id)?,
         &timestamp,
     );
-    let main_version_ref_row = untracked_row(
-        EntityPk::single(&main_version_id),
-        VERSION_REF_SCHEMA_KEY,
-        version_ref_snapshot(&main_version_id, &initial_commit_id)?,
+    let main_branch_ref_row = untracked_row(
+        EntityPk::single(&main_branch_id),
+        BRANCH_REF_SCHEMA_KEY,
+        branch_ref_snapshot(&main_branch_id, &initial_commit_id)?,
         &timestamp,
     );
-    let workspace_version_row = untracked_row(
-        EntityPk::single(WORKSPACE_VERSION_KEY),
+    let workspace_branch_row = untracked_row(
+        EntityPk::single(WORKSPACE_BRANCH_KEY),
         KEY_VALUE_SCHEMA_KEY,
-        key_value_snapshot(WORKSPACE_VERSION_KEY, &main_version_id)?,
+        key_value_snapshot(WORKSPACE_BRANCH_KEY, &main_branch_id)?,
         &timestamp,
     );
 
@@ -150,20 +150,20 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         changes: registered_schema_changes
             .into_iter()
             .chain([
-                global_version_descriptor_change,
-                main_version_descriptor_change,
+                global_branch_descriptor_change,
+                main_branch_descriptor_change,
                 kv_lix_id_change,
             ])
             .collect(),
         untracked_rows: vec![
-            global_version_ref_row,
-            main_version_ref_row,
-            workspace_version_row,
+            global_branch_ref_row,
+            main_branch_ref_row,
+            workspace_branch_row,
         ],
         receipt: InitReceipt {
             lix_id,
-            global_version_id: GLOBAL_VERSION_ID.to_string(),
-            main_version_id,
+            global_branch_id: GLOBAL_BRANCH_ID.to_string(),
+            main_branch_id,
             initial_commit_id,
         },
     })
@@ -353,7 +353,7 @@ fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedState
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
-        version_id: row.version_id.clone(),
+        branch_id: row.branch_id.clone(),
     })
 }
 
@@ -370,7 +370,7 @@ fn untracked_row(
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,
-        version_id: GLOBAL_VERSION_ID.to_string(),
+        branch_id: GLOBAL_BRANCH_ID.to_string(),
     }
 }
 
@@ -390,7 +390,7 @@ fn canonical_change(
     }
 }
 
-fn version_descriptor_snapshot(id: &str, name: &str, hidden: bool) -> Result<String, LixError> {
+fn branch_descriptor_snapshot(id: &str, name: &str, hidden: bool) -> Result<String, LixError> {
     encode_snapshot(json!({
         "id": id,
         "name": name,
@@ -411,7 +411,7 @@ fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixE
     }))
 }
 
-fn version_ref_snapshot(id: &str, commit_id: &str) -> Result<String, LixError> {
+fn branch_ref_snapshot(id: &str, commit_id: &str) -> Result<String, LixError> {
     encode_snapshot(json!({
         "id": id,
         "commit_id": commit_id,
@@ -445,8 +445,8 @@ mod tests {
 
         assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 3);
         assert_eq!(plan.untracked_rows.len(), 3);
-        assert_eq!(plan.receipt.global_version_id, GLOBAL_VERSION_ID);
-        assert_eq!(plan.receipt.main_version_id, "test-uuid-1");
+        assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
+        assert_eq!(plan.receipt.main_branch_id, "test-uuid-1");
         assert_eq!(plan.receipt.lix_id, "test-uuid-2");
         assert_eq!(plan.receipt.initial_commit_id, "test-uuid-3");
     }
@@ -509,22 +509,22 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_version_refs_point_to_initial_commit() {
+    fn plan_init_seed_branch_refs_point_to_initial_commit() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        let version_refs = plan
+        let branch_refs = plan
             .untracked_rows
             .iter()
-            .filter(|row| row.schema_key == VERSION_REF_SCHEMA_KEY)
+            .filter(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
             .collect::<Vec<_>>();
 
-        assert_eq!(version_refs.len(), 2);
+        assert_eq!(branch_refs.len(), 2);
         assert!(plan
             .changes
             .iter()
-            .all(|change| change.schema_key != VERSION_REF_SCHEMA_KEY));
-        for row in version_refs {
-            assert_eq!(row.schema_key, VERSION_REF_SCHEMA_KEY);
-            assert_eq!(row.version_id, GLOBAL_VERSION_ID);
+            .all(|change| change.schema_key != BRANCH_REF_SCHEMA_KEY));
+        for row in branch_refs {
+            assert_eq!(row.schema_key, BRANCH_REF_SCHEMA_KEY);
+            assert_eq!(row.branch_id, GLOBAL_BRANCH_ID);
             let snapshot = untracked_snapshot(row);
             assert_eq!(
                 snapshot.get("commit_id").and_then(JsonValue::as_str),
@@ -534,27 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_workspace_version_points_to_main_version() {
+    fn plan_init_seed_workspace_branch_points_to_main_branch() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
         let workspace_row = plan
             .untracked_rows
             .iter()
             .find(|row| {
                 row.schema_key == KEY_VALUE_SCHEMA_KEY
-                    && row.entity_pk == crate::entity_pk::EntityPk::single(WORKSPACE_VERSION_KEY)
+                    && row.entity_pk == crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)
             })
-            .expect("workspace version row should exist");
+            .expect("workspace branch row should exist");
 
-        assert_eq!(workspace_row.version_id, GLOBAL_VERSION_ID);
+        assert_eq!(workspace_row.branch_id, GLOBAL_BRANCH_ID);
         assert!(workspace_row.global);
         let snapshot = untracked_snapshot(workspace_row);
         assert_eq!(
             snapshot.get("key").and_then(JsonValue::as_str),
-            Some(WORKSPACE_VERSION_KEY)
+            Some(WORKSPACE_BRANCH_KEY)
         );
         assert_eq!(
             snapshot.get("value").and_then(JsonValue::as_str),
-            Some(plan.receipt.main_version_id.as_str())
+            Some(plan.receipt.main_branch_id.as_str())
         );
     }
 

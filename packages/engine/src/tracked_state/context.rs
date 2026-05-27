@@ -34,7 +34,7 @@ struct TrackedStateIdentity {
 
 /// Factory for tracked-state readers, root writers, and commit-root rebuilders.
 ///
-/// Tracked state is stored as content-addressed roots. Version refs
+/// Tracked state is stored as content-addressed roots. Branch refs
 /// choose which commit/root to read; this context only owns root operations.
 #[derive(Clone)]
 pub(crate) struct TrackedStateContext {

@@ -25,17 +25,17 @@ impl PublicSurfaceContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PublicSurfaceKind {
     LixState,
-    LixStateByVersion,
+    LixStateByBranch,
     EntityBase { schema_key: String },
-    EntityByVersion { schema_key: String },
+    EntityByBranch { schema_key: String },
     EntityHistory { schema_key: String },
     File,
-    FileByVersion,
+    FileByBranch,
     FileHistory,
     Directory,
-    DirectoryByVersion,
+    DirectoryByBranch,
     DirectoryHistory,
-    Version,
+    Branch,
     Change,
     History,
 }

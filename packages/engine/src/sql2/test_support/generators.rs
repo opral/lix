@@ -47,14 +47,14 @@ pub(crate) enum DifferentialProbe {
         schema_key: &'static str,
         entity_pks: &'static [&'static str],
     },
-    LixStateByVersion {
+    LixStateByBranch {
         schema_key: &'static str,
         entity_pks: &'static [&'static str],
-        version_ids: &'static [&'static str],
+        branch_ids: &'static [&'static str],
     },
     RegisteredSchemaActive,
-    RegisteredSchemaByVersion {
-        version_ids: &'static [&'static str],
+    RegisteredSchemaByBranch {
+        branch_ids: &'static [&'static str],
     },
 }
 
@@ -68,7 +68,7 @@ const SETUP_SEED_LIX_STATE_ROW: &[&str] = &[SEED_LIX_STATE_ROW_SQL];
 const EMPTY_PARAMS: &[DifferentialParam] = &[];
 
 #[cfg(test)]
-pub(crate) const ACTIVE_VERSION_PROBE_ID: &str = "__active_version__";
+pub(crate) const ACTIVE_BRANCH_PROBE_ID: &str = "__active_branch__";
 
 #[cfg(test)]
 const LIX_KEY_VALUE_PROBE: &[DifferentialProbe] = &[DifferentialProbe::LixStateActive {
@@ -77,23 +77,23 @@ const LIX_KEY_VALUE_PROBE: &[DifferentialProbe] = &[DifferentialProbe::LixStateA
 }];
 
 #[cfg(test)]
-const LIX_KEY_VALUE_VERSIONED_PROBE: &[DifferentialProbe] = &[
+const LIX_KEY_VALUE_BRANCHED_PROBE: &[DifferentialProbe] = &[
     DifferentialProbe::LixStateActive {
         schema_key: "lix_key_value",
         entity_pks: &["diff-key", "global-diff", "tx-diff", "dup"],
     },
-    DifferentialProbe::LixStateByVersion {
+    DifferentialProbe::LixStateByBranch {
         schema_key: "lix_key_value",
         entity_pks: &["diff-key", "global-diff", "tx-diff", "dup"],
-        version_ids: &[ACTIVE_VERSION_PROBE_ID, "global", "version-a", "version-b"],
+        branch_ids: &[ACTIVE_BRANCH_PROBE_ID, "global", "branch-a", "branch-b"],
     },
 ];
 
 #[cfg(test)]
 const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[
     DifferentialProbe::RegisteredSchemaActive,
-    DifferentialProbe::RegisteredSchemaByVersion {
-        version_ids: &[ACTIVE_VERSION_PROBE_ID, "global", "version-a", "version-b"],
+    DifferentialProbe::RegisteredSchemaByBranch {
+        branch_ids: &[ACTIVE_BRANCH_PROBE_ID, "global", "branch-a", "branch-b"],
     },
 ];
 
@@ -138,10 +138,10 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/base-entity-version-override".into(),
+            seed: "known/base-entity-branch-override".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_registered_schema SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}') WHERE lixcol_version_id = 'version-b'".into(),
+            sql: "UPDATE lix_registered_schema SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}') WHERE lixcol_branch_id = 'branch-b'".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -150,10 +150,10 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/base-entity-insert-hidden-version-column".into(),
+            seed: "known/base-entity-insert-hidden-branch-column".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_registered_schema (value, lixcol_version_id) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'version-b')".into(),
+            sql: "INSERT INTO lix_registered_schema (value, lixcol_branch_id) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'branch-b')".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -174,10 +174,10 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/by-version-update-without-version-predicate".into(),
+            seed: "known/by-branch-update-without-branch-predicate".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_registered_schema_by_version SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}')".into(),
+            sql: "UPDATE lix_registered_schema_by_branch SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}')".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -186,10 +186,10 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             },
         },
         DifferentialSqlCase {
-            seed: "known/by-version-delete-without-version-predicate".into(),
+            seed: "known/by-branch-delete-without-branch-predicate".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "DELETE FROM lix_registered_schema_by_version".into(),
+            sql: "DELETE FROM lix_registered_schema_by_branch".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -254,7 +254,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             expected_execution: ExpectedExecution::Ok,
         },
         DifferentialSqlCase {
-            seed: "known/empty-version-filter-base-staged-dedupe".into(),
+            seed: "known/empty-branch-filter-base-staged-dedupe".into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,
             transaction_setup_sql: &[],
             sql: "UPDATE lix_state SET snapshot_content = lix_json('{\"key\":\"diff-key\",\"value\":\"staged\"}') WHERE schema_key IN ('lix_key_value') AND entity_pk = lix_json('[\"diff-key\"]')".into(),
@@ -290,14 +290,14 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
 pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
     let mut cases = Vec::new();
 
-    for target in ["lix_state", "lix_state_by_version"] {
+    for target in ["lix_state", "lix_state_by_branch"] {
         cases.push(DifferentialSqlCase {
             seed: format!("generated/{target}/delete-false").into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,
             transaction_setup_sql: &[],
             sql: format!("DELETE FROM {target} WHERE false").into(),
             params: EMPTY_PARAMS,
-            probes: LIX_KEY_VALUE_VERSIONED_PROBE,
+            probes: LIX_KEY_VALUE_BRANCHED_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
             expected_execution: ExpectedExecution::Ok,
         });
@@ -307,7 +307,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             transaction_setup_sql: &[],
             sql: format!("UPDATE {target} SET metadata = NULL WHERE false").into(),
             params: EMPTY_PARAMS,
-            probes: LIX_KEY_VALUE_VERSIONED_PROBE,
+            probes: LIX_KEY_VALUE_BRANCHED_PROBE,
             expectation: DifferentialExpectation::FastRequiredParity,
             expected_execution: ExpectedExecution::Ok,
         });
@@ -315,22 +315,22 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
 
     cases.extend([
         DifferentialSqlCase {
-            seed: "generated/lix-state-by-version/update-explicit-miss".into(),
+            seed: "generated/lix-state-by-branch/update-explicit-miss".into(),
             setup_sql: SETUP_SEED_LIX_STATE_ROW,
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_state_by_version SET metadata = NULL WHERE version_id = 'version-b' AND schema_key = 'lix_key_value'".into(),
+            sql: "UPDATE lix_state_by_branch SET metadata = NULL WHERE branch_id = 'branch-b' AND schema_key = 'lix_key_value'".into(),
             params: EMPTY_PARAMS,
-            probes: LIX_KEY_VALUE_VERSIONED_PROBE,
+            probes: LIX_KEY_VALUE_BRANCHED_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
             expected_execution: ExpectedExecution::Err {
                 code: "LIX_ERROR_INVALID_STORAGE_SCOPE",
             },
         },
         DifferentialSqlCase {
-            seed: "generated/entity-base/reject-hidden-version".into(),
+            seed: "generated/entity-base/reject-hidden-branch".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "DELETE FROM lix_registered_schema WHERE lixcol_version_id = 'version-a'".into(),
+            sql: "DELETE FROM lix_registered_schema WHERE lixcol_branch_id = 'branch-a'".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,

@@ -23,23 +23,23 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
+use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
+use crate::sql2::branch_scope::{resolve_provider_branch_ids, BranchBinding};
 use crate::sql2::catalog::{
     entity_surface_schema, EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog,
     PublicSurfaceKind,
 };
-use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
-use crate::version::VersionRefReader;
 use crate::{serialize_row_metadata, LixError};
 
 use crate::sql2::{
-    SqlHistoryQuerySource, SqlWriteContext, WriteContextLiveStateReader,
-    WriteContextVersionRefReader,
+    SqlHistoryQuerySource, SqlWriteContext, WriteContextBranchRefReader,
+    WriteContextLiveStateReader,
 };
 
 use super::entity_history::EntityHistoryProvider;
@@ -47,9 +47,9 @@ use crate::storage::StorageRead;
 
 pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
-    active_version_id: &str,
+    active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     catalog: &PublicCatalog,
@@ -66,20 +66,20 @@ where
                     Arc::new(EntityProvider::active(
                         spec,
                         Arc::clone(&live_state),
-                        Arc::clone(&version_ref),
-                        active_version_id.to_string(),
+                        Arc::clone(&branch_ref),
+                        active_branch_id.to_string(),
                     )),
                 )
                 .map_err(datafusion_error_to_lix_error)?;
             }
-            PublicSurfaceKind::EntityByVersion { schema_key } => {
+            PublicSurfaceKind::EntityByBranch { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 ctx.register_table(
                     &surface.name,
-                    Arc::new(EntityProvider::by_version(
+                    Arc::new(EntityProvider::by_branch(
                         spec,
                         Arc::clone(&live_state),
-                        Arc::clone(&version_ref),
+                        Arc::clone(&branch_ref),
                     )),
                 )
                 .map_err(datafusion_error_to_lix_error)?;
@@ -118,11 +118,11 @@ pub(crate) async fn register_entity_write_providers(
                 )
                 .map_err(datafusion_error_to_lix_error)?;
             }
-            PublicSurfaceKind::EntityByVersion { schema_key } => {
+            PublicSurfaceKind::EntityByBranch { schema_key } => {
                 let spec = catalog_entity_spec(catalog, schema_key)?;
                 ctx.register_table(
                     &surface.name,
-                    Arc::new(EntityProvider::by_version_with_write(
+                    Arc::new(EntityProvider::by_branch_with_write(
                         spec,
                         write_ctx.clone(),
                     )),
@@ -155,10 +155,10 @@ fn catalog_entity_spec(
 pub(crate) struct EntityProvider {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
     variant: EntitySurfaceShape,
-    version_binding: VersionBinding,
+    branch_binding: BranchBinding,
 }
 
 impl std::fmt::Debug for EntityProvider {
@@ -174,58 +174,58 @@ impl EntityProvider {
     fn active(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
-        version_ref: Arc<dyn VersionRefReader>,
-        active_version_id: String,
+        branch_ref: Arc<dyn BranchRefReader>,
+        active_branch_id: String,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
             spec,
             live_state,
-            version_ref,
+            branch_ref,
             variant: EntitySurfaceShape::Active,
-            version_binding: VersionBinding::active(active_version_id),
+            branch_binding: BranchBinding::active(active_branch_id),
         }
     }
 
     fn active_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
-        let active_version_id = write_ctx.active_version_id();
+        let active_branch_id = write_ctx.active_branch_id();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         Self {
             schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
             spec,
             live_state,
-            version_ref,
+            branch_ref,
             variant: EntitySurfaceShape::Active,
-            version_binding: VersionBinding::active(active_version_id),
+            branch_binding: BranchBinding::active(active_branch_id),
         }
     }
 
-    fn by_version(
+    fn by_branch(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
-        version_ref: Arc<dyn VersionRefReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         Self {
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByVersion),
+            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
             spec,
             live_state,
-            version_ref,
-            variant: EntitySurfaceShape::ByVersion,
-            version_binding: VersionBinding::explicit(),
+            branch_ref,
+            variant: EntitySurfaceShape::ByBranch,
+            branch_binding: BranchBinding::explicit(),
         }
     }
 
-    fn by_version_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
+    fn by_branch_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         Self {
-            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByVersion),
+            schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
             spec,
             live_state,
-            version_ref,
-            variant: EntitySurfaceShape::ByVersion,
-            version_binding: VersionBinding::explicit(),
+            branch_ref,
+            variant: EntitySurfaceShape::ByBranch,
+            branch_binding: BranchBinding::explicit(),
         }
     }
 }
@@ -252,7 +252,7 @@ impl TableProvider for EntityProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if ExactVersionIdFilterAnalyzer.supports(filter) || analyzer.supports(filter) {
+                if ExactBranchIdFilterAnalyzer.supports(filter) || analyzer.supports(filter) {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -271,18 +271,18 @@ impl TableProvider for EntityProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
-            self.version_binding.active_version_id(),
+            self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
             limit,
         );
-        request.filter.version_ids = resolve_provider_version_ids(
-            self.version_ref.as_ref(),
-            &self.version_binding,
-            request.filter.version_ids,
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        apply_exact_version_id_filter(&mut request, exact_version_ids_from_filters(filters)?);
+        apply_exact_branch_id_filter(&mut request, exact_branch_ids_from_filters(filters)?);
         apply_exact_entity_pk_filters(&mut request, &self.spec, filters)?;
 
         Ok(Arc::new(EntityScanExec::new(
@@ -353,30 +353,30 @@ fn apply_exact_entity_pk_filters(
     Ok(())
 }
 
-fn exact_version_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
-    let analyzer = ExactVersionIdFilterAnalyzer;
-    let mut version_ids: Option<BTreeSet<String>> = None;
+fn exact_branch_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
+    let analyzer = ExactBranchIdFilterAnalyzer;
+    let mut branch_ids: Option<BTreeSet<String>> = None;
     for filter in filters {
         let Some(filter_ids) = analyzer.analyze(filter)? else {
             continue;
         };
-        version_ids = Some(match version_ids {
+        branch_ids = Some(match branch_ids {
             Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
             None => filter_ids,
         });
     }
-    Ok(version_ids.map(|ids| ids.into_iter().collect()))
+    Ok(branch_ids.map(|ids| ids.into_iter().collect()))
 }
 
-fn apply_exact_version_id_filter(
+fn apply_exact_branch_id_filter(
     request: &mut LiveStateScanRequest,
-    version_ids: Option<Vec<String>>,
+    branch_ids: Option<Vec<String>>,
 ) {
-    if let Some(version_ids) = version_ids {
-        if version_ids.is_empty() {
+    if let Some(branch_ids) = branch_ids {
+        if branch_ids.is_empty() {
             request.filter.rows = LiveStateRowFilter::None;
         }
-        request.filter.version_ids = version_ids;
+        request.filter.branch_ids = branch_ids;
     }
 }
 
@@ -384,9 +384,9 @@ struct EntityPrimaryKeyFilterAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
 }
 
-struct ExactVersionIdFilterAnalyzer;
+struct ExactBranchIdFilterAnalyzer;
 
-impl ExactVersionIdFilterAnalyzer {
+impl ExactBranchIdFilterAnalyzer {
     fn supports(&self, expr: &Expr) -> bool {
         self.analyze(expr)
             .is_ok_and(|constraint| constraint.is_some())
@@ -414,10 +414,10 @@ impl ExactVersionIdFilterAnalyzer {
                 Ok(Some(left))
             }
             Expr::BinaryExpr(binary_expr) => {
-                Ok(version_id_from_binary_filter(binary_expr).map(|value| BTreeSet::from([value])))
+                Ok(branch_id_from_binary_filter(binary_expr).map(|value| BTreeSet::from([value])))
             }
             Expr::InList(in_list) => {
-                Ok(version_ids_from_in_list_filter(in_list)
+                Ok(branch_ids_from_in_list_filter(in_list)
                     .map(|values| values.into_iter().collect()))
             }
             _ => Ok(None),
@@ -425,23 +425,23 @@ impl ExactVersionIdFilterAnalyzer {
     }
 }
 
-fn version_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+fn branch_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
     if binary_expr.op != Operator::Eq {
         return None;
     }
 
-    version_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
-        .or_else(|| version_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
+    branch_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
+        .or_else(|| branch_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
 }
 
-fn version_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
+fn branch_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
     if in_list.negated {
         return None;
     }
     let Expr::Column(column) = in_list.expr.as_ref() else {
         return None;
     };
-    if column.name != "lixcol_version_id" {
+    if column.name != "lixcol_branch_id" {
         return None;
     }
 
@@ -456,14 +456,11 @@ fn version_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
     Some(values)
 }
 
-fn version_id_from_column_literal_filter(
-    column_expr: &Expr,
-    literal_expr: &Expr,
-) -> Option<String> {
+fn branch_id_from_column_literal_filter(column_expr: &Expr, literal_expr: &Expr) -> Option<String> {
     let Expr::Column(column) = column_expr else {
         return None;
     };
-    if column.name != "lixcol_version_id" {
+    if column.name != "lixcol_branch_id" {
         return None;
     }
     string_expr_literal(literal_expr)
@@ -844,15 +841,15 @@ impl ExecutionPlan for EntityScanExec {
 
 fn entity_live_state_scan_request(
     schema_key: &str,
-    active_version_id: Option<&str>,
+    active_branch_id: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![schema_key.to_string()],
-            version_ids: active_version_id
-                .map(|version_id| vec![version_id.to_string()])
+            branch_ids: active_branch_id
+                .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
@@ -996,7 +993,7 @@ fn entity_system_column_array(
         "untracked" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
         )) as ArrayRef,
-        "version_id" => string_array(rows.iter().map(|row| Some(row.version_id.as_str()))),
+        "branch_id" => string_array(rows.iter().map(|row| Some(row.branch_id.as_str()))),
         other => {
             return Err(DataFusionError::Execution(format!(
                 "sql2 entity provider does not support system column 'lixcol_{other}'"
@@ -1091,6 +1088,7 @@ mod tests {
     use serde_json::json;
 
     use super::entity_record_batch;
+    use crate::branch::{BranchHead, BranchRefReader};
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
@@ -1098,11 +1096,10 @@ mod tests {
         derive_entity_surface_spec_from_schema, entity_surface_schema,
         schema_exposed_as_entity_surface, EntityColumnType, EntitySurfaceShape,
     };
-    use crate::version::{VersionHead, VersionRefReader};
     use crate::LixError;
 
     struct EmptyLiveStateReader;
-    struct EmptyVersionRefReader;
+    struct EmptyBranchRefReader;
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
@@ -1122,18 +1119,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl VersionRefReader for EmptyVersionRefReader {
-        async fn load_head(&self, _version_id: &str) -> Result<Option<VersionHead>, LixError> {
+    impl BranchRefReader for EmptyBranchRefReader {
+        async fn load_head(&self, _branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             Ok(None)
         }
 
-        async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             Ok(Vec::new())
         }
     }
 
-    fn empty_version_ref() -> Arc<dyn VersionRefReader> {
-        Arc::new(EmptyVersionRefReader)
+    fn empty_branch_ref() -> Arc<dyn BranchRefReader> {
+        Arc::new(EmptyBranchRefReader)
     }
 
     fn live_row() -> MaterializedLiveStateRow {
@@ -1147,7 +1144,7 @@ mod tests {
             ),
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
-            version_id: "version-a".to_string(),
+            branch_id: "branch-a".to_string(),
             change_id: Some("change-a".to_string()),
             commit_id: Some("commit-a".to_string()),
             global: false,
@@ -1253,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn by_version_schema_includes_version_system_column() {
+    fn by_branch_schema_includes_branch_system_column() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
             "type": "object",
@@ -1263,14 +1260,14 @@ mod tests {
         }))
         .expect("schema should derive entity surface spec");
 
-        let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByVersion);
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
         assert!(schema.field_with_name("body").is_ok());
         assert!(schema.field_with_name("lixcol_entity_pk").is_ok());
-        assert!(schema.field_with_name("lixcol_version_id").is_ok());
+        assert!(schema.field_with_name("lixcol_branch_id").is_ok());
     }
 
     #[test]
-    fn active_schema_excludes_version_system_column() {
+    fn active_schema_excludes_branch_system_column() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
             "type": "object",
@@ -1283,7 +1280,7 @@ mod tests {
         let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
         assert!(schema.field_with_name("body").is_ok());
         assert!(schema.field_with_name("lixcol_entity_pk").is_ok());
-        assert!(schema.field_with_name("lixcol_version_id").is_err());
+        assert!(schema.field_with_name("lixcol_branch_id").is_err());
     }
 
     #[test]
@@ -1332,7 +1329,7 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByVersion);
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
 
         let batch =
             entity_record_batch(&spec, schema, &[live_row()]).expect("entity batch should build");
@@ -1380,13 +1377,13 @@ mod tests {
         );
         assert_eq!(
             batch
-                .column_by_name("lixcol_version_id")
-                .expect("version id column")
+                .column_by_name("lixcol_branch_id")
+                .expect("branch id column")
                 .as_any()
                 .downcast_ref::<datafusion::arrow::array::StringArray>()
-                .expect("version id is string")
+                .expect("branch id is string")
                 .value(0),
-            "version-a"
+            "branch-a"
         );
     }
 
@@ -1402,13 +1399,13 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         );
-        let provider = super::EntityProvider::by_version(
+        let provider = super::EntityProvider::by_branch(
             spec,
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
-            empty_version_ref(),
+            empty_branch_ref(),
         );
 
-        assert!(provider.schema.field_with_name("lixcol_version_id").is_ok());
+        assert!(provider.schema.field_with_name("lixcol_branch_id").is_ok());
     }
 
     #[test]

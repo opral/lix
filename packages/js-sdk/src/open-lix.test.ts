@@ -29,7 +29,7 @@ const jsSdkRoot = fileURLToPath(new URL("..", import.meta.url));
 
 test("openLix exposes the rs-sdk e2e flow", async () => {
 	const lix = await openLix();
-	const mainVersionId = await lix.activeVersionId();
+	const mainBranchId = await lix.activeBranchId();
 
 	await registerCrmTaskSchema(lix);
 
@@ -70,24 +70,24 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
-	const mainHead = await lix.execute("SELECT lix_active_version_commit_id()");
+	const mainHead = await lix.execute("SELECT lix_active_branch_commit_id()");
 	const mainHeadCommitId = mainHead.rows[0]!.get(
-		"lix_active_version_commit_id()",
+		"lix_active_branch_commit_id()",
 	);
 	expect(typeof mainHeadCommitId).toBe("string");
 
-	const draft = await lix.createVersion({
-		id: "draft-version",
+	const draft = await lix.createBranch({
+		id: "draft-branch",
 		name: "Draft",
 	});
 	expect(draft).toMatchObject({
-		id: "draft-version",
+		id: "draft-branch",
 		name: "Draft",
 		hidden: false,
 		commitId: mainHeadCommitId,
 	});
 
-	await lix.switchVersion({ versionId: draft.id });
+	await lix.switchBranch({ branchId: draft.id });
 
 	await lix.execute("UPDATE crm_task SET done = $1 WHERE id = $2", [
 		true,
@@ -96,16 +96,16 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
-	await lix.switchVersion({ versionId: mainVersionId });
+	await lix.switchBranch({ branchId: mainBranchId });
 
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
-	const preview = await lix.mergeVersionPreview({
-		sourceVersionId: draft.id,
+	const preview = await lix.mergeBranchPreview({
+		sourceBranchId: draft.id,
 	});
 	expect(preview.outcome).toBe("fastForward");
-	expect(preview.targetVersionId).toBe(mainVersionId);
-	expect(preview.sourceVersionId).toBe(draft.id);
+	expect(preview.targetBranchId).toBe(mainBranchId);
+	expect(preview.sourceBranchId).toBe(draft.id);
 	expect(preview.changeStats).toEqual({
 		total: 1,
 		added: 0,
@@ -115,12 +115,12 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	expect(preview.conflicts).toEqual([]);
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
-	const merge = await lix.mergeVersion({
-		sourceVersionId: draft.id,
+	const merge = await lix.mergeBranch({
+		sourceBranchId: draft.id,
 	});
 
 	expect(merge.outcome).toBe("fastForward");
-	expect(merge.targetVersionId).toBe(mainVersionId);
+	expect(merge.targetBranchId).toBe(mainBranchId);
 	expect(merge.changeStats).toEqual({
 		total: 1,
 		added: 0,
@@ -132,7 +132,7 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 
 	await lix.close();
 	await lix.close();
-	await expect(lix.activeVersionId()).rejects.toMatchObject({
+	await expect(lix.activeBranchId()).rejects.toMatchObject({
 		code: "LIX_ERROR_CLOSED",
 	});
 	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
@@ -413,12 +413,12 @@ test("INSERT SELECT UNION ALL executes without trapping wasm", async () => {
 	expect(stdout.trim()).toBe("2");
 });
 
-test("createVersion can start from an explicit commit id", async () => {
+test("createBranch can start from an explicit commit id", async () => {
 	const lix = await openLix();
 
 	await registerCrmTaskSchema(lix);
-	const baseHead = await lix.execute("SELECT lix_active_version_commit_id()");
-	const fromCommitId = baseHead.rows[0]!.get("lix_active_version_commit_id()");
+	const baseHead = await lix.execute("SELECT lix_active_branch_commit_id()");
+	const fromCommitId = baseHead.rows[0]!.get("lix_active_branch_commit_id()");
 	expect(typeof fromCommitId).toBe("string");
 
 	await lix.execute(
@@ -431,18 +431,18 @@ test("createVersion can start from an explicit commit id", async () => {
 		],
 	);
 
-	const version = await lix.createVersion({
+	const branch = await lix.createBranch({
 		id: "from-explicit-commit",
 		name: "From explicit commit",
 		fromCommitId: fromCommitId as string,
 	});
-	expect(version).toMatchObject({
+	expect(branch).toMatchObject({
 		id: "from-explicit-commit",
 		name: "From explicit commit",
 		hidden: false,
 		commitId: fromCommitId,
 	});
-	await lix.switchVersion({ versionId: version.id });
+	await lix.switchBranch({ branchId: branch.id });
 
 	const projected = await lix.execute("SELECT id FROM crm_task WHERE id = $1", [
 		"after-base",
@@ -454,31 +454,31 @@ test("createVersion can start from an explicit commit id", async () => {
 
 test("merge conflicts expose structured details", async () => {
 	const lix = await openLix();
-	const mainVersionId = await lix.activeVersionId();
+	const mainBranchId = await lix.activeBranchId();
 	await registerCrmTaskSchema(lix);
 	await lix.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
 		["conflict-task", "Base", false, JSON.stringify({ priority: "normal" })],
 	);
-	const draft = await lix.createVersion({
+	const draft = await lix.createBranch({
 		id: "conflict-draft",
 		name: "Conflict draft",
 	});
 
-	await lix.switchVersion({ versionId: draft.id });
+	await lix.switchBranch({ branchId: draft.id });
 	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
 		"Draft",
 		"conflict-task",
 	]);
 
-	await lix.switchVersion({ versionId: mainVersionId });
+	await lix.switchBranch({ branchId: mainBranchId });
 	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
 		"Main",
 		"conflict-task",
 	]);
 
 	try {
-		await lix.mergeVersion({ sourceVersionId: draft.id });
+		await lix.mergeBranch({ sourceBranchId: draft.id });
 		throw new Error("expected merge conflict");
 	} catch (error) {
 		expect(isLixError(error)).toBe(true);
@@ -536,7 +536,7 @@ test("engine errors expose structured hints", async () => {
 		expect(isLixError(error)).toBe(true);
 		if (!isLixError(error)) throw error;
 		expect(error.code).toBe("LIX_HISTORY_FILTER_REQUIRED");
-		expect(error.hint).toContain("lix_active_version_commit_id()");
+		expect(error.hint).toContain("lix_active_branch_commit_id()");
 	}
 
 	await lix.close();
@@ -711,7 +711,7 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	const result = await lix.execute(
 		"SELECT schema_key, snapshot_content \
 		 FROM lix_state_history \
-		 WHERE start_commit_id = lix_active_version_commit_id()",
+		 WHERE start_commit_id = lix_active_branch_commit_id()",
 	);
 	const directoryRow = result.rows.find(
 		(row) => row.get("schema_key") === "lix_directory_descriptor",

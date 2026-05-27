@@ -8,10 +8,10 @@ use crate::tracked_state::types::{
 };
 use crate::LixError;
 
-const NODE_VERSION: u8 = 2;
-const VALUE_VERSION: u8 = 8;
+const NODE_BRANCH: u8 = 2;
+const VALUE_BRANCH: u8 = 8;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
-const VALUE_VERSION_MASK: u8 = 0b0111_1111;
+const VALUE_BRANCH_MASK: u8 = 0b0111_1111;
 const TIMESTAMP_UPDATED_SAME: u8 = 0;
 const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
@@ -272,7 +272,7 @@ pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> 
 }
 
 fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
-    out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
+    out.push(VALUE_BRANCH | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
     push_sized_bytes(out, value.change_id.as_bytes());
     push_sized_bytes(out, value.commit_id.as_bytes());
     push_timestamp_pair(out, value.created_at, value.updated_at);
@@ -310,12 +310,12 @@ pub(crate) fn decode_visible_value(
 }
 
 fn decode_value_header(value_header: u8) -> Result<bool, LixError> {
-    let version = value_header & VALUE_VERSION_MASK;
+    let branch = value_header & VALUE_BRANCH_MASK;
     let deleted = value_header & VALUE_DELETED_FLAG != 0;
-    if version != VALUE_VERSION {
+    if branch != VALUE_BRANCH {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("unsupported tracked-state tree value version {version}"),
+            format!("unsupported tracked-state tree value branch {branch}"),
         ));
     }
     Ok(deleted)
@@ -364,7 +364,7 @@ pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
 pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(NODE_KIND_LEAF);
-    out.push(NODE_VERSION);
+    out.push(NODE_BRANCH);
     push_u32(&mut out, entries.len());
 
     let mut offsets = Vec::with_capacity(entries.len().saturating_add(1));
@@ -393,7 +393,7 @@ pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
 pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(NODE_KIND_INTERNAL);
-    out.push(NODE_VERSION);
+    out.push(NODE_BRANCH);
     push_u32(&mut out, children.len());
     for child in children {
         push_sized_bytes(&mut out, child.first_key);
@@ -429,11 +429,11 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
 pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixError> {
     let mut cursor = 0usize;
     let kind = read_u8(bytes, &mut cursor, "node kind")?;
-    let version = read_u8(bytes, &mut cursor, "node version")?;
-    if version != NODE_VERSION {
+    let branch = read_u8(bytes, &mut cursor, "node branch")?;
+    if branch != NODE_BRANCH {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("unsupported tracked-state tree node version {version}"),
+            format!("unsupported tracked-state tree node branch {branch}"),
         ));
     }
     let count = read_u32(bytes, &mut cursor, "entry count")?;
@@ -1074,7 +1074,7 @@ mod tests {
 
         let encoded = encode_leaf_node(&entries);
         assert_eq!(encoded[0], NODE_KIND_LEAF);
-        assert_eq!(encoded[1], NODE_VERSION);
+        assert_eq!(encoded[1], NODE_BRANCH);
         assert_eq!(&encoded[2..6], 2u32.to_be_bytes().as_slice());
         assert_eq!(&encoded[6..10], 0u32.to_be_bytes().as_slice());
 
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[test]
     fn leaf_node_codec_rejects_count_that_exceeds_remaining_bytes_before_allocating() {
-        let mut encoded = vec![NODE_KIND_LEAF, NODE_VERSION];
+        let mut encoded = vec![NODE_KIND_LEAF, NODE_BRANCH];
         encoded.extend_from_slice(&u32::MAX.to_be_bytes());
 
         let error = decode_node_ref(&encoded).expect_err("impossible leaf count should reject");
@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn internal_node_codec_rejects_count_that_exceeds_remaining_bytes_before_allocating() {
-        let mut encoded = vec![NODE_KIND_INTERNAL, NODE_VERSION];
+        let mut encoded = vec![NODE_KIND_INTERNAL, NODE_BRANCH];
         encoded.extend_from_slice(&u32::MAX.to_be_bytes());
 
         let error = decode_node_ref(&encoded).expect_err("impossible internal count should reject");

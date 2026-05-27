@@ -24,7 +24,7 @@ simulation_test!(
             .await
             .expect("file insert should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first file commit head should load")
             .expect("first file commit head should exist");
@@ -39,7 +39,7 @@ simulation_test!(
             .await
             .expect("file path update should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second file commit head should load")
             .expect("second file commit head should exist");
@@ -181,7 +181,7 @@ simulation_test!(
             .await
             .expect("file data update should succeed");
         let commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("file commit head should load")
             .expect("file commit head should exist");

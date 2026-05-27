@@ -15,7 +15,7 @@ use crate::LixError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EntitySurfaceShape {
     Active,
-    ByVersion,
+    ByBranch,
     History,
 }
 
@@ -169,8 +169,8 @@ pub(crate) fn entity_system_fields(shape: EntitySurfaceShape) -> Vec<Field> {
         Field::new("lixcol_commit_id", DataType::Utf8, true),
         Field::new("lixcol_untracked", DataType::Boolean, true),
     ];
-    if shape == EntitySurfaceShape::ByVersion {
-        fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
+    if shape == EntitySurfaceShape::ByBranch {
+        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     }
     fields
 }

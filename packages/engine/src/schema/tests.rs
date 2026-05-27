@@ -420,7 +420,7 @@ fn x_lix_entity_views_is_rejected() {
     let schema = json!({
         "type": "object",
         "x-lix-key": "mock",
-        "x-lix-entity-views": ["lix_state", "lix_state_by_version"],
+        "x-lix-entity-views": ["lix_state", "lix_state_by_branch"],
         "properties": {
             "name": { "type": "string" }
         },
@@ -453,13 +453,13 @@ fn x_lix_primary_key_must_be_array_of_strings_when_present() {
     let schema = json!({
         "type": "object",
         "x-lix-key": "mock",
-        "x-lix-primary-key": ["/id", "/version"],
+        "x-lix-primary-key": ["/id", "/branch"],
         "properties": {
             "id": { "type": "string" },
-            "version": { "type": "string" },
+            "branch": { "type": "string" },
             "name": { "type": "string" }
         },
-        "required": ["id", "version", "name"],
+        "required": ["id", "branch", "name"],
         "additionalProperties": false
     });
 
@@ -525,7 +525,7 @@ fn x_lix_foreign_keys_reject_duplicate_pointers() {
                 "properties": ["/local", "/local"],
                 "references": {
                     "schemaKey": "remote_schema",
-                    "properties": ["/id", "/version"]
+                    "properties": ["/id", "/branch"]
                 }
             }
         ],

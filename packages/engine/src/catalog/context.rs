@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use crate::catalog::SchemaCatalogFact;
-use crate::domain::{committed_row_is_exact_version_scoped, Domain};
+use crate::domain::{committed_row_is_exact_branch_scoped, Domain};
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::schema::schema_key_from_definition;
@@ -23,7 +23,7 @@ impl CatalogContext {
         Self
     }
 
-    /// Loads schema definitions for SQL surface planning at `version_id`.
+    /// Loads schema definitions for SQL surface planning at `branch_id`.
     ///
     /// SQL surfaces are a read-planning projection over the active untracked
     /// schema catalog. Validation must use `schema_facts_for_domain` instead so
@@ -31,13 +31,13 @@ impl CatalogContext {
     pub(crate) async fn schema_jsons_for_sql_read_planning<R>(
         &self,
         live_state: &R,
-        version_id: &str,
+        branch_id: &str,
     ) -> Result<Vec<JsonValue>, LixError>
     where
         R: LiveStateReader + ?Sized,
     {
         let facts = self
-            .schema_facts_for_domain(live_state, &Domain::schema_catalog(version_id, true))
+            .schema_facts_for_domain(live_state, &Domain::schema_catalog(branch_id, true))
             .await?;
         let mut schemas = BTreeMap::<String, JsonValue>::new();
         for fact in facts {
@@ -74,7 +74,7 @@ impl CatalogContext {
                 .scan_rows(&LiveStateScanRequest {
                     filter: LiveStateFilter {
                         schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        version_ids: vec![schema_domain.version_id().to_string()],
+                        branch_ids: vec![schema_domain.branch_id().to_string()],
                         file_ids: vec![NullableKeyFilter::Null],
                         untracked: Some(schema_domain.untracked()),
                         include_tombstones: false,
@@ -101,9 +101,9 @@ fn row_belongs_to_schema_catalog_domain(row: &MaterializedLiveStateRow, domain: 
     row.schema_key == REGISTERED_SCHEMA_KEY
         && row.file_id.is_none()
         && row.snapshot_content.is_some()
-        && row.version_id == domain.version_id()
+        && row.branch_id == domain.branch_id()
         && row.untracked == domain.untracked()
-        && committed_row_is_exact_version_scoped(row, domain.version_id())
+        && committed_row_is_exact_branch_scoped(row, domain.branch_id())
 }
 
 fn decode_registered_schema_row(
@@ -146,7 +146,7 @@ mod tests {
 
     use super::*;
     use crate::live_state::LiveStateRowRequest;
-    use crate::GLOBAL_VERSION_ID;
+    use crate::GLOBAL_BRANCH_ID;
 
     #[tokio::test]
     async fn visible_schemas_are_loaded_from_registered_schema_rows() {
@@ -257,11 +257,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn visible_schemas_ignore_projected_global_schema_rows_for_version_scope() {
+    async fn visible_schemas_ignore_projected_global_schema_rows_for_branch_scope() {
         let context = CatalogContext::new();
         let mut global_only = registered_schema_row("global_only_schema");
         global_only.global = true;
-        global_only.version_id = "main".to_string();
+        global_only.branch_id = "main".to_string();
 
         let schemas = context
             .schema_jsons_for_sql_read_planning(
@@ -338,8 +338,8 @@ mod tests {
                         || request.filter.schema_keys.contains(&row.schema_key)
                 })
                 .filter(|row| {
-                    request.filter.version_ids.is_empty()
-                        || request.filter.version_ids.contains(&row.version_id)
+                    request.filter.branch_ids.is_empty()
+                        || request.filter.branch_ids.contains(&row.branch_id)
                 })
                 .filter(|row| {
                     request
@@ -360,7 +360,7 @@ mod tests {
                 .iter()
                 .find(|row| {
                     row.schema_key == request.schema_key
-                        && row.version_id == request.version_id
+                        && row.branch_id == request.branch_id
                         && row.entity_pk == request.entity_pk
                 })
                 .cloned())
@@ -372,7 +372,7 @@ mod tests {
             entity_pk: registered_schema_entity_pk(schema_key),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
             metadata: None,
             deleted: false,
             change_id: Some("change-registered-schema".to_string()),

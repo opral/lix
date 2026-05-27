@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::catalog::{
     CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
     StateForeignKeyPlan,
@@ -31,7 +32,6 @@ use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidation
 #[cfg(test)]
 use crate::transaction::types::PreparedStateRow;
 use crate::transaction::types::TransactionWriteOrigin;
-use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -91,7 +91,7 @@ async fn scan_committed_constraint_rows(
             filter: LiveStateFilter {
                 schema_keys: schema_keys.clone(),
                 entity_pks: entity_pks.clone(),
-                version_ids: vec![domain.version_id().to_string()],
+                branch_ids: vec![domain.branch_id().to_string()],
                 file_ids: domain.file_filters(),
                 untracked: Some(domain.untracked()),
                 include_tombstones,
@@ -188,7 +188,7 @@ pub(crate) async fn validate_prepared_writes(
     validate_committed_delete_restrictions(&input, input.schema_catalog, &pending_constraints)
         .await?;
     validate_file_descriptor_delete_restrictions(&input, &pending_constraints).await?;
-    validate_version_ref_delete_restrictions(&input, &pending_constraints).await?;
+    validate_branch_ref_delete_restrictions(&input, &pending_constraints).await?;
     validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
     validate_directory_descriptor_parent_graph(&input, &staged_rows, &constraint_rows).await?;
@@ -483,8 +483,8 @@ async fn validate_filesystem_namespace(
     staged_rows: &[PreparedValidationRow<'_>],
 ) -> Result<(), LixError> {
     // Filesystem namespace constraints are storage-scope local. Global rows are
-    // validated in the global scope and may be projected into version reads, but
-    // projected globals do not participate in version-local constraint checks.
+    // validated in the global scope and may be projected into branch reads, but
+    // projected globals do not participate in branch-local constraint checks.
     let domains = staged_filesystem_namespace_domains(staged_rows);
     for domain in domains {
         let mut occupants =
@@ -703,8 +703,8 @@ fn filesystem_namespace_conflict_error(
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "filesystem namespace conflict in version '{}' for parent {parent:?} entry {entry_name:?}: {} '{}' conflicts with {} '{}'",
-            domain.version_id(),
+            "filesystem namespace conflict in branch '{}' for parent {parent:?} entry {entry_name:?}: {} '{}' conflicts with {} '{}'",
+            domain.branch_id(),
             existing.kind(),
             existing_id,
             conflicting.kind(),
@@ -756,8 +756,8 @@ fn directory_parent_cycle_error(
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!(
-            "lix_directory_descriptor parent_id cycle in version '{}': directory '{}' reaches ancestor '{}' twice",
-            scope.domain.version_id(), start_id, repeated_id
+            "lix_directory_descriptor parent_id cycle in branch '{}': directory '{}' reaches ancestor '{}' twice",
+            scope.domain.branch_id(), start_id, repeated_id
         ),
     )
     .with_hint("Set parent_id to null or to an existing directory outside the directory's descendants.")
@@ -771,8 +771,8 @@ fn directory_parent_missing_error(
     LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "lix_directory_descriptor parent_id chain in version '{}' for directory '{}' references missing directory '{}'",
-            scope.domain.version_id(), start_id, missing_id
+            "lix_directory_descriptor parent_id chain in branch '{}' for directory '{}' references missing directory '{}'",
+            scope.domain.branch_id(), start_id, missing_id
         ),
     )
 }
@@ -781,8 +781,8 @@ fn directory_parent_depth_error(scope: &DirectoryDescriptorScope, start_id: &str
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!(
-            "lix_directory_descriptor parent_id chain in version '{}' for directory '{}' exceeds maximum depth {}",
-            scope.domain.version_id(), start_id, MAX_DIRECTORY_PARENT_DEPTH
+            "lix_directory_descriptor parent_id chain in branch '{}' for directory '{}' exceeds maximum depth {}",
+            scope.domain.branch_id(), start_id, MAX_DIRECTORY_PARENT_DEPTH
         ),
     )
 }
@@ -849,30 +849,30 @@ async fn validate_committed_insert_identities(
     Ok(())
 }
 
-async fn validate_version_ref_delete_restrictions(
+async fn validate_branch_ref_delete_restrictions(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
     for tombstone in &pending_constraints.tombstones {
-        if tombstone.identity.schema_key() != VERSION_REF_SCHEMA_KEY {
+        if tombstone.identity.schema_key() != BRANCH_REF_SCHEMA_KEY {
             continue;
         }
 
         for source_domain in tombstone
             .identity
             .domain()
-            .version_descriptor_domains_for_ref_delete()
+            .branch_descriptor_domains_for_ref_delete()
         {
             let descriptor_identity = DomainRowIdentity::in_domain(
                 source_domain,
-                VERSION_DESCRIPTOR_SCHEMA_KEY,
+                BRANCH_DESCRIPTOR_SCHEMA_KEY,
                 tombstone.identity.entity_pk_owned(),
             );
             if pending_constraints.tombstones_target_identity(&descriptor_identity) {
                 continue;
             }
             if pending_constraints.has_identity_target(&descriptor_identity) {
-                return Err(version_ref_delete_restriction_error(
+                return Err(branch_ref_delete_restriction_error(
                     &tombstone.identity,
                     &descriptor_identity,
                 )?);
@@ -892,7 +892,7 @@ async fn validate_version_ref_delete_restrictions(
             if descriptor_row.snapshot_content.is_some()
                 && !pending_constraints.tombstones_identity(&descriptor_row)
             {
-                return Err(version_ref_delete_restriction_error(
+                return Err(branch_ref_delete_restriction_error(
                     &tombstone.identity,
                     &descriptor_identity,
                 )?);
@@ -902,17 +902,17 @@ async fn validate_version_ref_delete_restrictions(
     Ok(())
 }
 
-fn version_ref_delete_restriction_error(
+fn branch_ref_delete_restriction_error(
     ref_identity: &DomainRowIdentity,
     descriptor_identity: &DomainRowIdentity,
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "cannot delete '{}' row '{}' in version '{}' because matching '{}' row '{}' would remain without a version ref",
+            "cannot delete '{}' row '{}' in branch '{}' because matching '{}' row '{}' would remain without a branch ref",
             ref_identity.schema_key(),
             ref_identity.entity_pk().as_single_string_owned()?,
-            ref_identity.domain().version_id(),
+            ref_identity.domain().branch_id(),
             descriptor_identity.schema_key(),
             descriptor_identity.entity_pk().as_single_string_owned()?,
         ),
@@ -1029,11 +1029,11 @@ fn missing_file_owner_reference_error(
     Ok(LixError::new(
         LixError::CODE_FILE_NOT_FOUND,
             format!(
-                "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
+                "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for branch '{}'",
                 row.schema_key(),
                 row.entity_pk().as_json_array_text()?,
                 file_id,
-                row.version_id()
+                row.branch_id()
             ),
     )
     .with_hint("Insert a row into lix_file with this id first, or use null for a global entity."))
@@ -1051,7 +1051,7 @@ fn validate_staged_row_shape(row: PreparedValidationRow<'_>) -> Result<(), LixEr
             LixError::CODE_SCHEMA_DEFINITION,
             "lix_registered_schema rows must not be scoped to a file",
         )
-        .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
+        .with_hint("Schema definitions are scoped by branch and durability only; write them with null file_id."));
     }
     Ok(())
 }
@@ -1412,7 +1412,7 @@ impl PendingConstraintIndexes {
     fn has_fk_reference_to_key(
         &self,
         schema_key: &str,
-        version_id: &str,
+        branch_id: &str,
         file_id: Option<&str>,
         pointer_group: &[&str],
         value: UniqueConstraintValue,
@@ -1423,7 +1423,7 @@ impl PendingConstraintIndexes {
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
             schema_key: schema_key.to_string(),
-            domain: Domain::exact_file(version_id.to_string(), false, file_id.map(str::to_string)),
+            domain: Domain::exact_file(branch_id.to_string(), false, file_id.map(str::to_string)),
             pointer_group,
             value,
         });
@@ -1442,7 +1442,7 @@ impl PendingConstraintIndexes {
     fn has_fk_target(
         &self,
         schema_key: &str,
-        version_id: &str,
+        branch_id: &str,
         file_id: Option<&str>,
         pointer_group: &[&str],
         value: UniqueConstraintValue,
@@ -1453,7 +1453,7 @@ impl PendingConstraintIndexes {
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyTargetKey {
             schema_key: schema_key.to_string(),
-            domain: Domain::exact_file(version_id.to_string(), false, file_id.map(str::to_string)),
+            domain: Domain::exact_file(branch_id.to_string(), false, file_id.map(str::to_string)),
             pointer_group,
             value,
         };
@@ -1582,10 +1582,10 @@ fn reject_pending_delete_references(
     Err(LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "cannot delete '{}' row '{}' in version '{}' because pending row '{}' references it{}",
+            "cannot delete '{}' row '{}' in branch '{}' because pending row '{}' references it{}",
             deleted_identity.schema_key(),
             deleted_identity.entity_pk().as_json_array_text()?,
-            deleted_identity.domain().version_id(),
+            deleted_identity.domain().branch_id(),
             reference.identity.entity_pk().as_json_array_text()?,
             pending_foreign_key_reference_target_description(target)?
         ),
@@ -1694,9 +1694,9 @@ async fn validate_file_descriptor_delete_restrictions(
                 return Err(LixError::new(
                     LixError::CODE_FOREIGN_KEY,
                     format!(
-                        "cannot delete file descriptor '{}' in version '{}' because committed row '{}' in schema '{}' is still scoped to that file",
+                        "cannot delete file descriptor '{}' in branch '{}' because committed row '{}' in schema '{}' is still scoped to that file",
                         file_id,
-                        tombstone.identity.domain().version_id(),
+                        tombstone.identity.domain().branch_id(),
                         row.entity_pk.as_json_array_text()?,
                         row.schema_key,
                     ),
@@ -1835,10 +1835,10 @@ fn committed_delete_restriction_error(
     Ok(LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "cannot delete '{}' row '{}' in version '{}' because committed row '{}' references it through {}",
+            "cannot delete '{}' row '{}' in branch '{}' because committed row '{}' references it through {}",
             deleted_identity.schema_key(),
             deleted_identity.entity_pk().as_json_array_text()?,
-            deleted_identity.domain().version_id(),
+            deleted_identity.domain().branch_id(),
             referencing_row.entity_pk.as_json_array_text()?,
             format_pointer_group(local_properties)
         ),
@@ -1993,11 +1993,11 @@ fn reject_unresolved_foreign_keys(
     Err(LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "foreign key on schema '{}' row '{}' via {} has no matching target in version '{}'{}",
+            "foreign key on schema '{}' row '{}' via {} has no matching target in branch '{}'{}",
             check.source_schema_key,
             check.source_identity.entity_pk().as_json_array_text()?,
             format_pointer_group(&check.source_pointer_group),
-            check.source_identity.domain().version_id(),
+            check.source_identity.domain().branch_id(),
             unresolved_foreign_key_target_description(&check.target)?
         ),
     ))
@@ -2275,8 +2275,8 @@ fn committed_row_is_in_exact_unique_scope(
     scope: &PendingUniqueConstraintScope,
 ) -> bool {
     // LiveStateReader may return serving projections such as global rows
-    // projected into a requested version. Constraint validation is root-local:
-    // only rows authored in the exact version participate.
+    // projected into a requested branch. Constraint validation is root-local:
+    // only rows authored in the exact branch participate.
     scope.domain.contains(row) && row.schema_key == scope.schema_key
 }
 
@@ -2774,7 +2774,7 @@ mod tests {
                 .chain(test_file_descriptor_rows())
                 .find(|row| {
                     row.schema_key == request.schema_key
-                        && row.version_id == request.version_id
+                        && row.branch_id == request.branch_id
                         && row.entity_pk == request.entity_pk
                         && request.file_id.matches(row.file_id.as_ref())
                 }))
@@ -2825,7 +2825,7 @@ mod tests {
                     filter: LiveStateFilter {
                         schema_keys: vec![request.schema_key.clone()],
                         entity_pks: vec![request.entity_pk.clone()],
-                        version_ids: vec![request.version_id.clone()],
+                        branch_ids: vec![request.branch_id.clone()],
                         file_ids: vec![request.file_id.clone()],
                         ..Default::default()
                     },
@@ -2935,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_catalog_indexes_visible_schemas_by_key_and_version() {
+    fn schema_catalog_indexes_visible_schemas_by_key_and_branch() {
         let visible_schemas = vec![json!({
             "x-lix-key": "visible_schema",
             "type": "object",
@@ -3367,7 +3367,7 @@ mod tests {
         ];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                staged_file_descriptor_row("file-a", "version-a"),
+                staged_file_descriptor_row("file-a", "branch-a"),
                 unique_row("post-1", "hello-world", "first"),
             ],
             ..empty_staged_write_set()
@@ -3389,7 +3389,7 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -3422,7 +3422,7 @@ mod tests {
         mark_prepared_row_untracked(&mut untracked_row);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                staged_file_descriptor_row("file-a", "version-a"),
+                staged_file_descriptor_row("file-a", "branch-a"),
                 untracked_row,
             ],
             ..empty_staged_write_set()
@@ -3444,7 +3444,7 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "version-a");
+        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "branch-a");
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -3475,7 +3475,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![committed_file_descriptor_row("file-a", "version-a")],
+            rows: vec![committed_file_descriptor_row("file-a", "branch-a")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -3494,7 +3494,7 @@ mod tests {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let mut untracked_file_descriptor = committed_file_descriptor_row("file-a", "version-a");
+        let mut untracked_file_descriptor = committed_file_descriptor_row("file-a", "branch-a");
         mark_live_row_untracked(&mut untracked_file_descriptor);
         let live_state = StrictStaticLiveStateReader {
             rows: vec![untracked_file_descriptor],
@@ -3523,7 +3523,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StrictStaticLiveStateReader {
-            rows: vec![committed_file_descriptor_row("file-a", "version-a")],
+            rows: vec![committed_file_descriptor_row("file-a", "branch-a")],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -3542,8 +3542,8 @@ mod tests {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let tracked_file_descriptor = committed_file_descriptor_row("file-a", "version-a");
-        let mut untracked_tombstone = committed_file_descriptor_row("file-a", "version-a");
+        let tracked_file_descriptor = committed_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_tombstone = committed_file_descriptor_row("file-a", "branch-a");
         untracked_tombstone.snapshot_content = None;
         mark_live_row_untracked(&mut untracked_tombstone);
         let live_state = OverlayingStaticLiveStateReader {
@@ -3566,7 +3566,7 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "version-a");
+        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "branch-a");
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![file_descriptor_delete],
@@ -3596,7 +3596,7 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "version-a");
+        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "branch-a");
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![file_descriptor_delete],
@@ -3607,7 +3607,7 @@ mod tests {
         mark_live_row_untracked(&mut untracked_row);
         let live_state = StrictStaticLiveStateReader {
             rows: vec![
-                committed_file_descriptor_row("file-a", "version-a"),
+                committed_file_descriptor_row("file-a", "branch-a"),
                 untracked_row,
             ],
         };
@@ -3627,9 +3627,9 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_untracked_directory_parent_to_tracked_directory() {
         let visible_schemas = vec![directory_descriptor_schema()];
-        let tracked_parent = directory_descriptor_row("dir-parent", None, "parent", "version-a");
+        let tracked_parent = directory_descriptor_row("dir-parent", None, "parent", "branch-a");
         let mut untracked_child =
-            directory_descriptor_row("dir-child", Some("dir-parent"), "child", "version-a");
+            directory_descriptor_row("dir-child", Some("dir-parent"), "child", "branch-a");
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![tracked_parent, untracked_child],
@@ -3651,7 +3651,7 @@ mod tests {
         let live_state = StrictStaticLiveStateReader {
             rows: vec![committed_file_descriptor_row(
                 "file-a",
-                crate::GLOBAL_VERSION_ID,
+                crate::GLOBAL_BRANCH_ID,
             )],
         };
 
@@ -3662,7 +3662,7 @@ mod tests {
                 &live_state,
             ))
             .await
-            .expect_err("global file descriptor should not satisfy a version-local row");
+            .expect_err("global file descriptor should not satisfy a branch-local row");
 
         assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
     }
@@ -3721,10 +3721,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_pending_unique_same_value_in_same_version() {
+    async fn validation_rejects_pending_unique_same_value_in_same_branch() {
         let visible_schemas = vec![unique_schema()];
         let mut duplicate = unique_row("post-2", "hello-world", "second");
-        duplicate.version_id = "version-a".to_string();
+        duplicate.branch_id = "branch-a".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), duplicate],
             ..empty_staged_write_set()
@@ -3732,24 +3732,24 @@ mod tests {
 
         let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect_err("same unique value in the same version should fail");
+            .expect_err("same unique value in the same branch should fail");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
 
     #[tokio::test]
-    async fn validation_allows_pending_unique_same_value_in_different_versions() {
+    async fn validation_allows_pending_unique_same_value_in_different_branches() {
         let visible_schemas = vec![unique_schema()];
-        let mut version_b = unique_row("post-2", "hello-world", "second");
-        version_b.version_id = "version-b".to_string();
+        let mut branch_b = unique_row("post-2", "hello-world", "second");
+        branch_b.branch_id = "branch-b".to_string();
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![unique_row("post-1", "hello-world", "first"), version_b],
+            state_rows: vec![unique_row("post-1", "hello-world", "first"), branch_b],
             ..empty_staged_write_set()
         };
 
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect("unique values should be scoped to the exact version_id");
+            .expect("unique values should be scoped to the exact branch_id");
     }
 
     #[tokio::test]
@@ -3784,24 +3784,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_scopes_pending_unique_values_by_file_and_version() {
+    async fn validation_scopes_pending_unique_values_by_file_and_branch() {
         let visible_schemas = vec![unique_schema()];
         let mut different_file = unique_row("post-2", "hello-world", "second");
         different_file.file_id = Some("file-b".to_string());
-        let mut different_version = unique_row("post-3", "hello-world", "third");
-        different_version.version_id = "version-b".to_string();
+        let mut different_branch = unique_row("post-3", "hello-world", "third");
+        different_branch.branch_id = "branch-b".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 unique_row("post-1", "hello-world", "first"),
                 different_file,
-                different_version,
+                different_branch,
             ],
             ..empty_staged_write_set()
         };
 
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect("unique values are scoped by file and version");
+            .expect("unique values are scoped by file and branch");
     }
 
     #[tokio::test]
@@ -3907,7 +3907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_committed_unique_same_value_in_same_version() {
+    async fn validation_rejects_committed_unique_same_value_in_same_branch() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
@@ -3924,18 +3924,18 @@ mod tests {
                 &live_state,
             ))
             .await
-            .expect_err("same unique value in the same version should conflict");
+            .expect_err("same unique value in the same branch should conflict");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
 
     #[tokio::test]
-    async fn validation_allows_committed_unique_same_value_in_different_versions() {
+    async fn validation_allows_committed_unique_same_value_in_different_branches() {
         let visible_schemas = vec![unique_schema()];
-        let mut version_b = unique_row("post-2", "hello-world", "second");
-        version_b.version_id = "version-b".to_string();
+        let mut branch_b = unique_row("post-2", "hello-world", "second");
+        branch_b.branch_id = "branch-b".to_string();
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![version_b],
+            state_rows: vec![branch_b],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3948,7 +3948,7 @@ mod tests {
             &live_state,
         ))
         .await
-        .expect("committed unique values should be scoped to the exact version_id");
+        .expect("committed unique values should be scoped to the exact branch_id");
     }
 
     #[tokio::test]
@@ -3959,7 +3959,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
-        projected_overlay_row.version_id = "version-a".to_string();
+        projected_overlay_row.branch_id = "branch-a".to_string();
         projected_overlay_row.global = true;
         let live_state = StaticLiveStateReader {
             rows: vec![projected_overlay_row],
@@ -4048,14 +4048,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_allows_committed_unique_same_value_in_different_file_or_version() {
+    async fn validation_allows_committed_unique_same_value_in_different_file_or_branch() {
         let visible_schemas = vec![unique_schema()];
         let mut different_file = unique_row("post-2", "hello-world", "second");
         different_file.file_id = Some("file-b".to_string());
-        let mut different_version = unique_row("post-3", "hello-world", "third");
-        different_version.version_id = "version-b".to_string();
+        let mut different_branch = unique_row("post-3", "hello-world", "third");
+        different_branch.branch_id = "branch-b".to_string();
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![different_file, different_version],
+            state_rows: vec![different_file, different_branch],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -4068,38 +4068,38 @@ mod tests {
             &live_state,
         ))
         .await
-        .expect("committed uniqueness is scoped by file and version");
+        .expect("committed uniqueness is scoped by file and branch");
     }
 
     #[tokio::test]
-    async fn validation_rejects_foreign_key_target_missing_in_same_version() {
+    async fn validation_rejects_foreign_key_target_missing_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
             ..empty_staged_write_set()
         };
 
         let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect_err("foreign key must resolve in the same version");
+            .expect_err("foreign key must resolve in the same branch");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[tokio::test]
-    async fn validation_allows_foreign_key_target_in_same_version() {
+    async fn validation_allows_foreign_key_target_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                fk_parent_row("parent-1", "version-a"),
-                fk_child_row("child-1", "parent-1", "version-a"),
+                fk_parent_row("parent-1", "branch-a"),
+                fk_child_row("child-1", "parent-1", "branch-a"),
             ],
             ..empty_staged_write_set()
         };
 
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect("foreign key should resolve against pending rows in the same version");
+            .expect("foreign key should resolve against pending rows in the same branch");
     }
 
     #[tokio::test]
@@ -4110,15 +4110,15 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_parent = fk_parent_row("parent-1", "version-a");
+        let mut untracked_parent = fk_parent_row("parent-1", "branch-a");
         mark_prepared_row_untracked(&mut untracked_parent);
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 untracked_file_descriptor,
                 untracked_parent,
-                fk_child_row("child-1", "parent-1", "version-a"),
+                fk_child_row("child-1", "parent-1", "branch-a"),
             ],
             ..empty_staged_write_set()
         };
@@ -4138,11 +4138,11 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let tracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
-        let tracked_parent = fk_parent_row("parent-1", "version-a");
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
+        let tracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let tracked_parent = fk_parent_row("parent-1", "branch-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_child = fk_child_row("child-1", "parent-1", "version-a");
+        let mut untracked_child = fk_child_row("child-1", "parent-1", "branch-a");
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -4160,34 +4160,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_foreign_key_target_that_exists_only_in_different_version() {
+    async fn validation_rejects_foreign_key_target_that_exists_only_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                fk_parent_row("parent-1", "version-b"),
-                fk_child_row("child-1", "parent-1", "version-a"),
+                fk_parent_row("parent-1", "branch-b"),
+                fk_child_row("child-1", "parent-1", "branch-a"),
             ],
             ..empty_staged_write_set()
         };
 
         let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect_err("foreign key target in another version should not satisfy this version");
+            .expect_err("foreign key target in another branch should not satisfy this branch");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[tokio::test]
-    async fn validation_allows_foreign_key_target_committed_in_same_version() {
+    async fn validation_allows_foreign_key_target_committed_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-a",
+                "parent-1", "branch-a",
             ))],
         };
 
@@ -4197,18 +4196,18 @@ mod tests {
             &live_state,
         ))
         .await
-        .expect("foreign key should resolve against committed rows in the same version");
+        .expect("foreign key should resolve against committed rows in the same branch");
     }
 
     #[tokio::test]
     async fn validation_rejects_tracked_foreign_key_target_committed_only_as_untracked() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
             ..empty_staged_write_set()
         };
         let mut untracked_parent =
-            MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
+            MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
         mark_live_row_untracked(&mut untracked_parent);
         let live_state = StaticLiveStateReader {
             rows: vec![untracked_parent],
@@ -4234,9 +4233,9 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_child = fk_child_row("child-1", "parent-1", "version-a");
+        let mut untracked_child = fk_child_row("child-1", "parent-1", "branch-a");
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![untracked_file_descriptor, untracked_child],
@@ -4244,8 +4243,8 @@ mod tests {
         };
         let live_state = StaticLiveStateReader {
             rows: vec![
-                committed_file_descriptor_row("file-a", "version-a"),
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
+                committed_file_descriptor_row("file-a", "branch-a"),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
             ],
         };
 
@@ -4262,12 +4261,12 @@ mod tests {
     async fn validation_allows_tracked_foreign_key_target_committed_behind_untracked_overlay() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
+        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
         let mut untracked_overlay =
-            MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
+            MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
         mark_live_row_untracked(&mut untracked_overlay);
         let live_state = OverlayingStaticLiveStateReader {
             rows: vec![tracked_parent, untracked_overlay],
@@ -4287,17 +4286,17 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_deleting_tracked_fk_target_referenced_behind_untracked_overlay() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
+        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
         let tracked_child =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a"));
+            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a"));
         let mut untracked_child_overlay =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "other-parent", "version-a"));
+            MaterializedLiveStateRow::from(fk_child_row("child-1", "other-parent", "branch-a"));
         mark_live_row_untracked(&mut untracked_child_overlay);
         let live_state = OverlayingStaticLiveStateReader {
             rows: vec![tracked_parent, tracked_child, untracked_child_overlay],
@@ -4318,15 +4317,15 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_deleting_tracked_fk_target_referenced_by_committed_untracked_row() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a"));
+        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
         let mut untracked_child =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a"));
+            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a"));
         mark_live_row_untracked(&mut untracked_child);
         let live_state = StaticLiveStateReader {
             rows: vec![tracked_parent, untracked_child],
@@ -4345,16 +4344,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_foreign_key_target_committed_only_in_different_version() {
+    async fn validation_rejects_foreign_key_target_committed_only_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-b",
+                "parent-1", "branch-b",
             ))],
         };
 
@@ -4366,7 +4364,7 @@ mod tests {
             ))
             .await
             .expect_err(
-                "foreign key target in another committed version should not satisfy this version",
+                "foreign key target in another committed branch should not satisfy this branch",
             );
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
@@ -4375,19 +4373,18 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_foreign_key_target_tombstoned_by_transaction() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
-                fk_child_row("child-1", "parent-1", "version-a"),
+                fk_child_row("child-1", "parent-1", "branch-a"),
             ],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-a",
+                "parent-1", "branch-a",
             ))],
         };
 
@@ -4406,20 +4403,19 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_tracked_fk_target_when_untracked_tombstone_shadows_same_identity() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut untracked_parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut untracked_parent_delete = fk_parent_row("parent-1", "branch-a");
         untracked_parent_delete.snapshot = None;
         mark_prepared_row_untracked(&mut untracked_parent_delete);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 untracked_parent_delete,
-                fk_child_row("child-1", "parent-1", "version-a"),
+                fk_child_row("child-1", "parent-1", "branch-a"),
             ],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-a",
+                "parent-1", "branch-a",
             ))],
         };
 
@@ -4435,19 +4431,18 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_pending_reference_to_deleted_identity() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
-                fk_child_row("child-1", "parent-1", "version-a"),
+                fk_child_row("child-1", "parent-1", "branch-a"),
             ],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-a",
+                "parent-1", "branch-a",
             ))],
         };
 
@@ -4464,22 +4459,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_allows_delete_with_pending_reference_in_different_version() {
+    async fn validation_allows_delete_with_pending_reference_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
-                fk_parent_row("parent-1", "version-b"),
-                fk_child_row("child-1", "parent-1", "version-b"),
+                fk_parent_row("parent-1", "branch-b"),
+                fk_child_row("child-1", "parent-1", "branch-b"),
             ],
             ..empty_staged_write_set()
         };
 
         validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
-            .expect("pending references in another version should not block this delete");
+            .expect("pending references in another branch should not block this delete");
     }
 
     #[tokio::test]
@@ -4496,8 +4491,7 @@ mod tests {
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "target-1",
-                "version-a",
+                "target-1", "branch-a",
             ))],
         };
 
@@ -4518,9 +4512,9 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_target = fk_parent_row("target-1", "version-a");
+        let mut untracked_target = fk_parent_row("target-1", "branch-a");
         mark_prepared_row_untracked(&mut untracked_target);
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -4553,7 +4547,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         let mut untracked_target =
-            MaterializedLiveStateRow::from(fk_parent_row("target-1", "version-a"));
+            MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a"));
         mark_live_row_untracked(&mut untracked_target);
         let live_state = StaticLiveStateReader {
             rows: vec![untracked_target],
@@ -4581,7 +4575,7 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "version-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let mut untracked_ref =
             state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
@@ -4592,8 +4586,8 @@ mod tests {
         };
         let live_state = StaticLiveStateReader {
             rows: vec![
-                committed_file_descriptor_row("file-a", "version-a"),
-                MaterializedLiveStateRow::from(fk_parent_row("target-1", "version-a")),
+                committed_file_descriptor_row("file-a", "branch-a"),
+                MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a")),
             ],
         };
 
@@ -4619,9 +4613,9 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let tracked_target = MaterializedLiveStateRow::from(fk_parent_row("target-1", "version-a"));
+        let tracked_target = MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a"));
         let mut untracked_overlay =
-            MaterializedLiveStateRow::from(fk_parent_row("target-1", "version-a"));
+            MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a"));
         mark_live_row_untracked(&mut untracked_overlay);
         let live_state = OverlayingStaticLiveStateReader {
             rows: vec![tracked_target, untracked_overlay],
@@ -4654,7 +4648,7 @@ mod tests {
             rows: vec![MaterializedLiveStateRow::from(composite_message_row(
                 "welcome.title",
                 "en",
-                "version-a",
+                "branch-a",
             ))],
         };
 
@@ -4668,14 +4662,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_delete_when_same_version_reference_exists() {
+    async fn validation_rejects_delete_when_same_branch_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a")),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -4690,20 +4684,20 @@ mod tests {
                 &live_state,
             ))
             .await
-            .expect_err("delete should be restricted by same-version references");
+            .expect_err("delete should be restricted by same-branch references");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[tokio::test]
-    async fn validation_allows_delete_when_only_different_version_reference_exists() {
+    async fn validation_allows_delete_when_only_different_branch_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-b")),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-b")),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -4717,20 +4711,20 @@ mod tests {
             &live_state,
         ))
         .await
-        .expect("references in another version should not restrict this version");
+        .expect("references in another branch should not restrict this branch");
     }
 
     #[tokio::test]
     async fn validation_allows_delete_when_committed_reference_is_also_deleted() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
-        let mut child_delete = fk_child_row("child-1", "parent-1", "version-a");
+        let mut child_delete = fk_child_row("child-1", "parent-1", "branch-a");
         child_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a")),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -4767,7 +4761,7 @@ mod tests {
     #[test]
     fn pending_indexes_record_primary_key_fk_targets_by_exact_scope() {
         let mut indexes = PendingConstraintIndexes::default();
-        let row = fk_parent_row("parent-1", "version-a");
+        let row = fk_parent_row("parent-1", "branch-a");
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -4787,7 +4781,7 @@ mod tests {
         assert!(indexes
             .has_fk_target(
                 "fk_parent_schema",
-                "version-a",
+                "branch-a",
                 Some("file-a"),
                 &["/id"],
                 UniqueConstraintValue::string_values(["parent-1"]),
@@ -4796,7 +4790,7 @@ mod tests {
         assert!(!indexes
             .has_fk_target(
                 "fk_parent_schema",
-                "version-b",
+                "branch-b",
                 Some("file-a"),
                 &["/id"],
                 UniqueConstraintValue::string_values(["parent-1"]),
@@ -4827,7 +4821,7 @@ mod tests {
         assert!(indexes
             .has_fk_target(
                 "unique_schema",
-                "version-a",
+                "branch-a",
                 Some("file-a"),
                 &["/slug"],
                 UniqueConstraintValue::string_values(["hello-world"]),
@@ -4838,7 +4832,7 @@ mod tests {
     #[test]
     fn pending_indexes_record_normal_fk_references_by_exact_scope() {
         let mut indexes = PendingConstraintIndexes::default();
-        let row = fk_child_row("child-1", "parent-1", "version-a");
+        let row = fk_child_row("child-1", "parent-1", "branch-a");
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -4862,7 +4856,7 @@ mod tests {
         assert!(indexes
             .has_fk_reference_to_key(
                 "fk_parent_schema",
-                "version-a",
+                "branch-a",
                 Some("file-a"),
                 &["/id"],
                 UniqueConstraintValue::string_values(["parent-1"]),
@@ -4871,7 +4865,7 @@ mod tests {
         assert!(!indexes
             .has_fk_reference_to_key(
                 "fk_parent_schema",
-                "version-b",
+                "branch-b",
                 Some("file-a"),
                 &["/id"],
                 UniqueConstraintValue::string_values(["parent-1"]),
@@ -4905,7 +4899,7 @@ mod tests {
 
         assert!(
             indexes.has_fk_reference_to_identity(DomainRowIdentity::exact(
-                "version-a",
+                "branch-a",
                 false,
                 Some("file-a".to_string()),
                 "fk_parent_schema",
@@ -4917,11 +4911,11 @@ mod tests {
     #[test]
     fn pending_delete_restrictions_ignore_tombstoned_referencing_rows() {
         let mut indexes = PendingConstraintIndexes::default();
-        let mut parent_delete = fk_parent_row("parent-1", "version-a");
+        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
         parent_delete.snapshot = None;
         indexes.remember_tombstone(PreparedValidationRow::State(&parent_delete));
 
-        let child = fk_child_row("child-1", "parent-1", "version-a");
+        let child = fk_child_row("child-1", "parent-1", "branch-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -4942,7 +4936,7 @@ mod tests {
             )
             .expect("child row should index FK reference");
 
-        let mut child_delete = fk_child_row("child-1", "parent-1", "version-a");
+        let mut child_delete = fk_child_row("child-1", "parent-1", "branch-a");
         child_delete.snapshot = None;
         indexes.remember_tombstone(PreparedValidationRow::State(&child_delete));
 
@@ -4953,7 +4947,7 @@ mod tests {
     #[test]
     fn pending_fk_validation_collects_unresolved_normal_fk_check() {
         let indexes = PendingConstraintIndexes::default();
-        let row = fk_child_row("child-1", "parent-1", "version-a");
+        let row = fk_child_row("child-1", "parent-1", "branch-a");
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -4980,7 +4974,7 @@ mod tests {
         assert_eq!(
             unresolved[0].source_identity,
             DomainRowIdentity::exact(
-                "version-a",
+                "branch-a",
                 false,
                 Some("file-a".to_string()),
                 "fk_child_schema",
@@ -4996,7 +4990,7 @@ mod tests {
             panic!("normal FK should produce key target");
         };
         assert_eq!(target.schema_key, "fk_parent_schema");
-        assert_eq!(target.domain.version_id(), "version-a");
+        assert_eq!(target.domain.branch_id(), "branch-a");
         assert_eq!(
             target.domain.file_scope(),
             &DomainFileScope::Exact(Some("file-a".to_string()))
@@ -5011,7 +5005,7 @@ mod tests {
     #[test]
     fn pending_fk_validation_resolves_normal_fk_against_pending_target() {
         let mut indexes = PendingConstraintIndexes::default();
-        let parent = fk_parent_row("parent-1", "version-a");
+        let parent = fk_parent_row("parent-1", "branch-a");
         let parent_snapshot = serde_json::from_str::<JsonValue>(
             parent
                 .snapshot
@@ -5028,7 +5022,7 @@ mod tests {
             )
             .expect("parent should index as pending FK target");
 
-        let child = fk_child_row("child-1", "parent-1", "version-a");
+        let child = fk_child_row("child-1", "parent-1", "branch-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -5054,14 +5048,14 @@ mod tests {
 
         assert!(
             unresolved.is_empty(),
-            "same-version pending parent should satisfy the child FK"
+            "same-branch pending parent should satisfy the child FK"
         );
     }
 
     #[test]
-    fn pending_fk_validation_keeps_normal_fk_unresolved_across_versions() {
+    fn pending_fk_validation_keeps_normal_fk_unresolved_across_branches() {
         let mut indexes = PendingConstraintIndexes::default();
-        let parent = fk_parent_row("parent-1", "version-b");
+        let parent = fk_parent_row("parent-1", "branch-b");
         let parent_snapshot = serde_json::from_str::<JsonValue>(
             parent
                 .snapshot
@@ -5078,7 +5072,7 @@ mod tests {
             )
             .expect("parent should index as pending FK target");
 
-        let child = fk_child_row("child-1", "parent-1", "version-a");
+        let child = fk_child_row("child-1", "parent-1", "branch-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -5107,9 +5101,9 @@ mod tests {
             panic!("normal FK should produce key target");
         };
         assert_eq!(
-            target.domain.version_id(),
-            "version-a",
-            "FK checks are exact-version scoped, not overlay scoped"
+            target.domain.branch_id(),
+            "branch-a",
+            "FK checks are exact-branch scoped, not overlay scoped"
         );
     }
 
@@ -5143,7 +5137,7 @@ mod tests {
         assert_eq!(
             unresolved[0].source_identity,
             DomainRowIdentity::exact(
-                "version-a",
+                "branch-a",
                 false,
                 Some("file-a".to_string()),
                 "state_surface_ref_schema",
@@ -5162,7 +5156,7 @@ mod tests {
         let UnresolvedForeignKeyTarget::StateSurfaceIdentity(target) = &unresolved[0].target else {
             panic!("state FK should produce state-surface identity target");
         };
-        assert_eq!(target.domain().version_id(), "version-a");
+        assert_eq!(target.domain().branch_id(), "branch-a");
         assert_eq!(target.schema_key(), "fk_parent_schema");
         assert_eq!(target.entity_pk(), &EntityPk::single("target-1"));
         assert_eq!(
@@ -5174,7 +5168,7 @@ mod tests {
     #[tokio::test]
     async fn committed_fk_lookup_resolves_normal_fk_in_exact_scope() {
         let indexes = PendingConstraintIndexes::default();
-        let child = fk_child_row("child-1", "parent-1", "version-a");
+        let child = fk_child_row("child-1", "parent-1", "branch-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -5198,8 +5192,7 @@ mod tests {
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-a",
+                "parent-1", "branch-a",
             ))],
         };
 
@@ -5217,14 +5210,14 @@ mod tests {
 
         assert!(
             still_unresolved.is_empty(),
-            "same-version committed parent should satisfy unresolved FK"
+            "same-branch committed parent should satisfy unresolved FK"
         );
     }
 
     #[tokio::test]
-    async fn committed_fk_lookup_keeps_normal_fk_unresolved_across_versions() {
+    async fn committed_fk_lookup_keeps_normal_fk_unresolved_across_branches() {
         let indexes = PendingConstraintIndexes::default();
-        let child = fk_child_row("child-1", "parent-1", "version-a");
+        let child = fk_child_row("child-1", "parent-1", "branch-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -5248,8 +5241,7 @@ mod tests {
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1",
-                "version-b",
+                "parent-1", "branch-b",
             ))],
         };
 
@@ -5268,7 +5260,7 @@ mod tests {
         assert_eq!(
             still_unresolved.len(),
             1,
-            "committed FK lookup is exact-version scoped"
+            "committed FK lookup is exact-branch scoped"
         );
     }
 
@@ -5298,8 +5290,7 @@ mod tests {
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "target-1",
-                "version-a",
+                "target-1", "branch-a",
             ))],
         };
 
@@ -5325,8 +5316,8 @@ mod tests {
         PreparedWriteSet {
             state_rows: Vec::new(),
             insert_identities: BTreeMap::new(),
-            commit_change_refs_by_version: BTreeMap::new(),
-            extra_commit_parents_by_version: BTreeMap::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
             file_data_writes: Vec::new(),
         }
     }
@@ -5344,8 +5335,8 @@ mod tests {
         }
         (request.filter.schema_keys.is_empty()
             || request.filter.schema_keys.contains(&row.schema_key))
-            && (request.filter.version_ids.is_empty()
-                || request.filter.version_ids.contains(&row.version_id))
+            && (request.filter.branch_ids.is_empty()
+                || request.filter.branch_ids.contains(&row.branch_id))
             && (request.filter.file_ids.is_empty()
                 || request
                     .filter
@@ -5359,17 +5350,17 @@ mod tests {
         request: &LiveStateRowRequest,
     ) -> bool {
         row.schema_key == request.schema_key
-            && row.version_id == request.version_id
+            && row.branch_id == request.branch_id
             && row.entity_pk == request.entity_pk
             && request.file_id.matches(row.file_id.as_ref())
     }
 
     fn test_file_descriptor_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
-            committed_file_descriptor_row("file-a", "version-a"),
-            committed_file_descriptor_row("file-a", "version-b"),
-            committed_file_descriptor_row("file-b", "version-a"),
-            committed_file_descriptor_row("file-b", "version-b"),
+            committed_file_descriptor_row("file-a", "branch-a"),
+            committed_file_descriptor_row("file-a", "branch-b"),
+            committed_file_descriptor_row("file-b", "branch-a"),
+            committed_file_descriptor_row("file-b", "branch-b"),
         ]
     }
 
@@ -5402,7 +5393,7 @@ mod tests {
             change_id: Some("change-registered-schema".to_string()),
             commit_id: Some("commit-registered-schema".to_string()),
             untracked: false,
-            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }
     }
 
@@ -5560,7 +5551,7 @@ mod tests {
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
-        row.version_id = "version-a".to_string();
+        row.branch_id = "branch-a".to_string();
         row.global = false;
         row
     }
@@ -5579,36 +5570,36 @@ mod tests {
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
-        row.version_id = "version-a".to_string();
+        row.branch_id = "branch-a".to_string();
         row.global = false;
         row
     }
 
-    fn fk_parent_row(entity_pk: &str, version_id: &str) -> PreparedStateRow {
+    fn fk_parent_row(entity_pk: &str, branch_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "fk_parent_schema",
             Some(json!({ "id": entity_pk }).to_string()),
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
-        row.version_id = version_id.to_string();
+        row.branch_id = branch_id.to_string();
         row.global = false;
         row
     }
 
-    fn fk_child_row(entity_pk: &str, parent_id: &str, version_id: &str) -> PreparedStateRow {
+    fn fk_child_row(entity_pk: &str, parent_id: &str, branch_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "fk_child_schema",
             Some(json!({ "id": entity_pk, "parent_id": parent_id }).to_string()),
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
-        row.version_id = version_id.to_string();
+        row.branch_id = branch_id.to_string();
         row.global = false;
         row
     }
 
-    fn composite_message_row(key: &str, locale: &str, version_id: &str) -> PreparedStateRow {
+    fn composite_message_row(key: &str, locale: &str, branch_id: &str) -> PreparedStateRow {
         let snapshot = json!({
             "key": key,
             "locale": locale,
@@ -5621,7 +5612,7 @@ mod tests {
         )
         .expect("composite message identity should derive");
         row.file_id = Some("file-a".to_string());
-        row.version_id = version_id.to_string();
+        row.branch_id = branch_id.to_string();
         row.global = false;
         row
     }
@@ -5660,7 +5651,7 @@ mod tests {
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
-        row.version_id = "version-a".to_string();
+        row.branch_id = "branch-a".to_string();
         row.global = false;
         row
     }
@@ -5677,7 +5668,7 @@ mod tests {
         row.commit_id = None;
     }
 
-    fn staged_file_descriptor_row(file_id: &str, version_id: &str) -> PreparedStateRow {
+    fn staged_file_descriptor_row(file_id: &str, branch_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
             Some(
@@ -5692,20 +5683,20 @@ mod tests {
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(file_id);
         row.file_id = None;
-        row.version_id = version_id.to_string();
-        row.global = version_id == crate::GLOBAL_VERSION_ID;
+        row.branch_id = branch_id.to_string();
+        row.global = branch_id == crate::GLOBAL_BRANCH_ID;
         row
     }
 
-    fn committed_file_descriptor_row(file_id: &str, version_id: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow::from(staged_file_descriptor_row(file_id, version_id))
+    fn committed_file_descriptor_row(file_id: &str, branch_id: &str) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow::from(staged_file_descriptor_row(file_id, branch_id))
     }
 
     fn directory_descriptor_row(
         directory_id: &str,
         parent_id: Option<&str>,
         name: &str,
-        version_id: &str,
+        branch_id: &str,
     ) -> PreparedStateRow {
         let mut row = staged_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -5721,8 +5712,8 @@ mod tests {
         );
         row.entity_pk = crate::entity_pk::EntityPk::single(directory_id);
         row.file_id = None;
-        row.version_id = version_id.to_string();
-        row.global = version_id == crate::GLOBAL_VERSION_ID;
+        row.branch_id = branch_id.to_string();
+        row.global = branch_id == crate::GLOBAL_BRANCH_ID;
         row
     }
 
@@ -5741,7 +5732,7 @@ mod tests {
             change_id: row.change_id,
             commit_id: row.commit_id,
             untracked: row.untracked,
-            version_id: row.version_id,
+            branch_id: row.branch_id,
         }
     }
 
@@ -5769,7 +5760,7 @@ mod tests {
             change_id: Some("change-1".to_string()),
             commit_id: Some("commit-1".to_string()),
             untracked: false,
-            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }
     }
 }

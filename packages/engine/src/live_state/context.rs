@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
-    expanded_version_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityRequest, VisibilityVersionScope,
+    expanded_branch_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope, VisibilityRequest,
 };
 use crate::storage::StorageRead;
 use crate::tracked_state::{
@@ -15,10 +16,9 @@ use crate::tracked_state::{
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
-use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -83,14 +83,14 @@ where
             scan_commit_derived_rows(&*store, &self.commit_graph, request, &scope).await?;
         let mut tracked_rows = Vec::new();
         if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
-            for version_id in &scope.storage_version_ids {
+            for branch_id in &scope.storage_branch_ids {
                 let Some(commit_id) =
-                    load_version_ref_commit_id(&*store, &self.untracked_state, version_id).await?
+                    load_branch_ref_commit_id(&*store, &self.untracked_state, branch_id).await?
                 else {
                     continue;
                 };
                 let tracked_request = tracked_scan_request_from_live(request);
-                let source = tracked_source_from_version_id(version_id);
+                let source = tracked_source_from_branch_id(branch_id);
                 let store = &*store;
                 tracked_rows.extend(
                     self.tracked_state
@@ -98,7 +98,7 @@ where
                         .scan_rows_at_commit(&commit_id, &tracked_request)
                         .await?
                         .into_iter()
-                        .map(|row| project_tracked_row(row, version_id, source)),
+                        .map(|row| project_tracked_row(row, branch_id, source)),
                 );
             }
         }
@@ -109,7 +109,7 @@ where
                 .reader(store)
                 .scan_rows(&untracked_scan_request_from_live(
                     request,
-                    &scope.storage_version_ids,
+                    &scope.storage_branch_ids,
                 ))
                 .await?
                 .into_iter()
@@ -135,8 +135,8 @@ where
             rows,
             Vec::new(),
             &VisibilityRequest {
-                version_scope: VisibilityVersionScope::VersionIds {
-                    version_ids: scope.projection_version_ids.clone(),
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids.clone(),
                 },
                 include_tombstones: request.filter.include_tombstones,
                 limit: request.limit,
@@ -151,7 +151,7 @@ where
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         {
             let store = self.store.lock().await;
-            if !version_ref_exists(&*store, &self.untracked_state, &request.version_id).await? {
+            if !branch_ref_exists(&*store, &self.untracked_state, &request.branch_id).await? {
                 return Ok(None);
             }
         }
@@ -160,7 +160,7 @@ where
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
-                    version_ids: vec![request.version_id.clone()],
+                    branch_ids: vec![request.branch_id.clone()],
                     file_ids: vec![request.file_id.clone()],
                     include_tombstones: false,
                     ..Default::default()
@@ -206,10 +206,10 @@ async fn scan_commit_derived_rows(
         return Ok(Vec::new());
     }
 
-    let version_ids = if scope.projection_version_ids.is_empty() {
-        vec![GLOBAL_VERSION_ID.to_string()]
+    let branch_ids = if scope.projection_branch_ids.is_empty() {
+        vec![GLOBAL_BRANCH_ID.to_string()]
     } else {
-        scope.projection_version_ids.clone()
+        scope.projection_branch_ids.clone()
     };
     let mut graph = commit_graph.reader(store);
     let commits = graph.all_commits().await?;
@@ -218,23 +218,23 @@ async fn scan_commit_derived_rows(
         schema_filter_allows(&request.filter.schema_keys, COMMIT_EDGE_SCHEMA_KEY);
 
     let mut rows = Vec::new();
-    for version_id in &version_ids {
+    for branch_id in &branch_ids {
         if include_commit {
             for commit in &commits {
-                rows.push(commit_row(commit, version_id)?);
+                rows.push(commit_row(commit, branch_id)?);
             }
         }
         if include_commit_edge {
             for edge in graph.commit_edges(&commits) {
-                rows.push(commit_edge_row(&edge, version_id)?);
+                rows.push(commit_edge_row(&edge, branch_id)?);
             }
         }
     }
 
     rows.retain(|row| {
         (request.filter.entity_pks.is_empty() || request.filter.entity_pks.contains(&row.entity_pk))
-            && (request.filter.version_ids.is_empty()
-                || request.filter.version_ids.contains(&row.version_id))
+            && (request.filter.branch_ids.is_empty()
+                || request.filter.branch_ids.contains(&row.branch_id))
     });
     Ok(rows)
 }
@@ -274,7 +274,7 @@ fn file_filter_allows_null(file_ids: &[NullableKeyFilter<String>]) -> bool {
 
 fn commit_row(
     commit: &crate::commit_graph::CommitGraphCommit,
-    version_id: &str,
+    branch_id: &str,
 ) -> Result<MaterializedLiveStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": commit.commit_id,
@@ -298,13 +298,13 @@ fn commit_row(
         change_id: Some(commit.change.id.clone()),
         commit_id: Some(commit.commit_id.clone()),
         untracked: false,
-        version_id: version_id.to_string(),
+        branch_id: branch_id.to_string(),
     })
 }
 
 fn commit_edge_row(
     edge: &crate::commit_graph::CommitGraphEdge,
-    version_id: &str,
+    branch_id: &str,
 ) -> Result<MaterializedLiveStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "parent_id": edge.parent_commit_id,
@@ -332,7 +332,7 @@ fn commit_edge_row(
         change_id: None,
         commit_id: Some(edge.child_commit_id.clone()),
         untracked: false,
-        version_id: version_id.to_string(),
+        branch_id: branch_id.to_string(),
     })
 }
 
@@ -342,7 +342,7 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
             schema_keys: request.filter.schema_keys.clone(),
             entity_pks: request.filter.entity_pks.clone(),
             file_ids: request.filter.file_ids.clone(),
-            // Scan tombstones internally so version-local tombstones can hide
+            // Scan tombstones internally so branch-local tombstones can hide
             // global fallback rows before the serving facade filters them.
             include_tombstones: true,
         },
@@ -355,10 +355,10 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
 
 fn untracked_scan_request_from_live(
     request: &LiveStateScanRequest,
-    version_ids: &[String],
+    branch_ids: &[String],
 ) -> UntrackedStateScanRequest {
     let mut filter: crate::untracked_state::UntrackedStateFilter = request.filter.clone().into();
-    filter.version_ids = version_ids.to_vec();
+    filter.branch_ids = branch_ids.to_vec();
     UntrackedStateScanRequest {
         filter,
         projection: crate::untracked_state::UntrackedStateProjection {
@@ -370,8 +370,8 @@ fn untracked_scan_request_from_live(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveStateScanScope {
-    storage_version_ids: Vec<String>,
-    projection_version_ids: Vec<String>,
+    storage_branch_ids: Vec<String>,
+    projection_branch_ids: Vec<String>,
 }
 
 async fn scan_scope(
@@ -379,28 +379,28 @@ async fn scan_scope(
     untracked_state: &UntrackedStateContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
-    if request.filter.version_ids.is_empty() {
+    if request.filter.branch_ids.is_empty() {
         return Ok(LiveStateScanScope {
-            storage_version_ids: all_version_ref_ids(store, untracked_state).await?,
-            projection_version_ids: Vec::new(),
+            storage_branch_ids: all_branch_ref_ids(store, untracked_state).await?,
+            projection_branch_ids: Vec::new(),
         });
     }
 
-    let mut projection_version_ids = Vec::new();
-    for version_id in &request.filter.version_ids {
-        if version_ref_exists(store, untracked_state, version_id).await? {
-            projection_version_ids.push(version_id.clone());
+    let mut projection_branch_ids = Vec::new();
+    for branch_id in &request.filter.branch_ids {
+        if branch_ref_exists(store, untracked_state, branch_id).await? {
+            projection_branch_ids.push(branch_id.clone());
         }
     }
 
-    let storage_version_ids = expanded_version_ids(&projection_version_ids);
+    let storage_branch_ids = expanded_branch_ids(&projection_branch_ids);
     Ok(LiveStateScanScope {
-        storage_version_ids,
-        projection_version_ids,
+        storage_branch_ids,
+        projection_branch_ids,
     })
 }
 
-async fn all_version_ref_ids(
+async fn all_branch_ref_ids(
     store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
 ) -> Result<Vec<String>, LixError> {
@@ -408,8 +408,8 @@ async fn all_version_ref_ids(
         .reader(store)
         .scan_rows(&UntrackedStateScanRequest {
             filter: crate::untracked_state::UntrackedStateFilter {
-                schema_keys: vec![VERSION_REF_SCHEMA_KEY.to_string()],
-                version_ids: vec![GLOBAL_VERSION_ID.to_string()],
+                schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
+                branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                 ..Default::default()
             },
             ..Default::default()
@@ -420,17 +420,17 @@ async fn all_version_ref_ids(
         .collect()
 }
 
-async fn load_version_ref_commit_id(
+async fn load_branch_ref_commit_id(
     store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
-    version_id: &str,
+    branch_id: &str,
 ) -> Result<Option<String>, LixError> {
     let Some(row) = untracked_state
         .reader(store)
         .load_row(&UntrackedStateRowRequest {
-            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single(version_id),
+            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            entity_pk: crate::entity_pk::EntityPk::single(branch_id),
             file_id: crate::NullableKeyFilter::Null,
         })
         .await?
@@ -444,7 +444,7 @@ async fn load_version_ref_commit_id(
         serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                format!("live_state version-ref snapshot parse failed: {error}"),
+                format!("live_state branch-ref snapshot parse failed: {error}"),
             )
         })?;
     Ok(snapshot
@@ -453,35 +453,33 @@ async fn load_version_ref_commit_id(
         .map(str::to_string))
 }
 
-async fn version_ref_exists(
+async fn branch_ref_exists(
     store: &(impl StorageRead + Send + Sync + ?Sized),
     untracked_state: &UntrackedStateContext,
-    version_id: &str,
+    branch_id: &str,
 ) -> Result<bool, LixError> {
-    Ok(
-        load_version_ref_commit_id(store, untracked_state, version_id)
-            .await?
-            .is_some(),
-    )
+    Ok(load_branch_ref_commit_id(store, untracked_state, branch_id)
+        .await?
+        .is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackedRowSource {
     Global,
-    Version,
+    Branch,
 }
 
-fn tracked_source_from_version_id(version_id: &str) -> TrackedRowSource {
-    if version_id == GLOBAL_VERSION_ID {
+fn tracked_source_from_branch_id(branch_id: &str) -> TrackedRowSource {
+    if branch_id == GLOBAL_BRANCH_ID {
         TrackedRowSource::Global
     } else {
-        TrackedRowSource::Version
+        TrackedRowSource::Branch
     }
 }
 
 fn project_tracked_row(
     row: MaterializedTrackedStateRow,
-    view_version_id: &str,
+    view_branch_id: &str,
     source: TrackedRowSource,
 ) -> MaterializedLiveStateRow {
     MaterializedLiveStateRow {
@@ -497,7 +495,7 @@ fn project_tracked_row(
         change_id: Some(row.change_id),
         commit_id: Some(row.commit_id),
         untracked: false,
-        version_id: view_version_id.to_string(),
+        branch_id: view_branch_id.to_string(),
     }
 }
 
@@ -843,7 +841,7 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-tracked"),
+                branch_ref_row("global", "commit-tracked"),
                 untracked_row("untracked-value"),
             ],
         )
@@ -868,7 +866,7 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                version_id: "global".to_string(),
+                branch_id: "global".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -914,7 +912,7 @@ mod tests {
         write_untracked_rows_to_store(
             &storage,
             &read,
-            &[version_ref_row("global", "commit-tracked")],
+            &[branch_ref_row("global", "commit-tracked")],
         )
         .await;
 
@@ -963,7 +961,7 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-tracked"),
+                branch_ref_row("global", "commit-tracked"),
                 untracked_row("untracked-value"),
             ],
         )
@@ -971,7 +969,7 @@ mod tests {
         {
             let mut writes = StorageWriteSet::new();
             let identity = crate::untracked_state::UntrackedStateIdentity {
-                version_id: "global".to_string(),
+                branch_id: "global".to_string(),
                 schema_key: "lix_key_value".to_string(),
                 entity_pk: EntityPk::single("selected-tab"),
                 file_id: None,
@@ -998,7 +996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_row_falls_back_to_global_tracked_row_for_requested_version() {
+    async fn load_row_falls_back_to_global_tracked_row_for_requested_branch() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -1026,19 +1024,19 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("version-a", "commit-version-a"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch-a"),
             ],
         )
         .await;
-        write_empty_commits_to_store(&storage, &read, &["commit-version-a"]).await;
+        write_empty_commits_to_store(&storage, &read, &["commit-branch-a"]).await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
             .await
             .expect("load should succeed")
-            .expect("global row should be visible for requested version");
+            .expect("global row should be visible for requested branch");
 
-        assert_eq!(loaded.version_id, "version-a");
+        assert_eq!(loaded.branch_id, "branch-a");
         assert!(loaded.global);
         assert!(!loaded.untracked);
         assert_eq!(
@@ -1081,8 +1079,8 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("main", "commit-main"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("main", "commit-main"),
             ],
         )
         .await;
@@ -1092,7 +1090,7 @@ mod tests {
             .await
             .expect("load should succeed")
             .expect("global row should be projected into main");
-        assert_eq!(loaded.version_id, "main");
+        assert_eq!(loaded.branch_id, "main");
         assert!(loaded.global);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -1109,7 +1107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_row_prefers_requested_version_over_global() {
+    async fn load_row_prefers_requested_branch_over_global() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -1120,10 +1118,10 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
-                    "version-a",
-                    "version-tracked",
-                    Some("change-version"),
-                    "commit-version",
+                    "branch-a",
+                    "branch-tracked",
+                    Some("change-branch"),
+                    "commit-branch",
                 ),
             ];
             let mut writes = StorageWriteSet::new();
@@ -1141,22 +1139,22 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("version-a", "commit-version"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch"),
             ],
         )
         .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
             .await
             .expect("load should succeed")
-            .expect("version row should be visible");
+            .expect("branch row should be visible");
 
-        assert_eq!(loaded.version_id, "version-a");
+        assert_eq!(loaded.branch_id, "branch-a");
         assert!(!loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
-            Some("{\"value\":\"version-tracked\"}")
+            Some("{\"value\":\"branch-tracked\"}")
         );
     }
 
@@ -1193,8 +1191,8 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("main", "commit-main"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("main", "commit-main"),
             ],
         )
         .await;
@@ -1204,7 +1202,7 @@ mod tests {
             .expect("load should succeed")
             .expect("main row should be visible");
 
-        assert_eq!(loaded.version_id, "main");
+        assert_eq!(loaded.branch_id, "main");
         assert!(!loaded.global);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -1224,10 +1222,10 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
-                    "version-a",
-                    "version-tracked",
-                    Some("change-version"),
-                    "commit-version",
+                    "branch-a",
+                    "branch-tracked",
+                    Some("change-branch"),
+                    "commit-branch",
                 ),
             ];
             let mut writes = StorageWriteSet::new();
@@ -1245,29 +1243,29 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("version-a", "commit-version"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch"),
                 untracked_row_at("global", "global-untracked"),
-                untracked_row_at("version-a", "version-untracked"),
+                untracked_row_at("branch-a", "branch-untracked"),
             ],
         )
         .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
             .await
             .expect("load should succeed")
-            .expect("version untracked row should be visible");
+            .expect("branch untracked row should be visible");
 
-        assert_eq!(loaded.version_id, "version-a");
+        assert_eq!(loaded.branch_id, "branch-a");
         assert!(loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
-            Some("{\"value\":\"version-untracked\"}")
+            Some("{\"value\":\"branch-untracked\"}")
         );
     }
 
     #[tokio::test]
-    async fn scan_rows_overlays_requested_version_over_global() {
+    async fn scan_rows_overlays_requested_branch_over_global() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -1278,10 +1276,10 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
-                    "version-a",
-                    "version-tracked",
-                    Some("change-version"),
-                    "commit-version",
+                    "branch-a",
+                    "branch-tracked",
+                    Some("change-branch"),
+                    "commit-branch",
                 ),
             ];
             let mut writes = StorageWriteSet::new();
@@ -1299,26 +1297,26 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("version-a", "commit-version"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch"),
             ],
         )
         .await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "version-a", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "branch-a", false)
             .await
             .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"value\":\"version-tracked\"}")
+            Some("{\"value\":\"branch-tracked\"}")
         );
     }
 
     #[tokio::test]
-    async fn scan_rows_projects_global_row_into_requested_version() {
+    async fn scan_rows_projects_global_row_into_requested_branch() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -1346,19 +1344,19 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("version-a", "commit-version-a"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch-a"),
             ],
         )
         .await;
-        write_empty_commits_to_store(&storage, &read, &["commit-version-a"]).await;
+        write_empty_commits_to_store(&storage, &read, &["commit-branch-a"]).await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "version-a", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "branch-a", false)
             .await
             .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -1367,7 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_rows_does_not_project_global_rows_into_missing_version() {
+    async fn scan_rows_does_not_project_global_rows_into_missing_branch() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
 
@@ -1394,18 +1392,18 @@ mod tests {
         write_untracked_rows_to_store(
             &storage,
             &read,
-            &[version_ref_row("global", "commit-global")],
+            &[branch_ref_row("global", "commit-global")],
         )
         .await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "missing-version", false)
+        let rows = scan_selected_tab_at(&live_state, &storage, "missing-branch", false)
             .await
             .expect("scan should succeed");
 
         assert_eq!(
             rows.len(),
             0,
-            "global rows must not be projected into a missing version scope"
+            "global rows must not be projected into a missing branch scope"
         );
     }
 
@@ -1421,9 +1419,9 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tombstone_tracked_row_at_with_commit(
-                    "version-a",
+                    "branch-a",
                     Some("change-tombstone"),
-                    "commit-version",
+                    "commit-branch",
                 ),
             ];
             let mut writes = StorageWriteSet::new();
@@ -1441,22 +1439,22 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("version-a", "commit-version"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("branch-a", "commit-branch"),
             ],
         )
         .await;
 
-        let hidden = scan_selected_tab_at(&live_state, &storage, "version-a", false)
+        let hidden = scan_selected_tab_at(&live_state, &storage, "branch-a", false)
             .await
             .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let with_tombstone = scan_selected_tab_at(&live_state, &storage, "version-a", true)
+        let with_tombstone = scan_selected_tab_at(&live_state, &storage, "branch-a", true)
             .await
             .expect("scan should succeed");
         assert_eq!(with_tombstone.len(), 1);
-        assert_eq!(with_tombstone[0].version_id, "version-a");
+        assert_eq!(with_tombstone[0].branch_id, "branch-a");
         assert_eq!(with_tombstone[0].snapshot_content, None);
     }
 
@@ -1492,8 +1490,8 @@ mod tests {
             &storage,
             &read,
             &[
-                version_ref_row("global", "commit-global"),
-                version_ref_row("main", "commit-main"),
+                branch_ref_row("global", "commit-global"),
+                branch_ref_row("main", "commit-main"),
             ],
         )
         .await;
@@ -1507,13 +1505,13 @@ mod tests {
             .await
             .expect("scan should succeed");
         assert_eq!(tombstones.len(), 1);
-        assert_eq!(tombstones[0].version_id, "main");
+        assert_eq!(tombstones[0].branch_id, "main");
         assert!(!tombstones[0].global);
         assert_eq!(tombstones[0].snapshot_content, None);
     }
 
     #[tokio::test]
-    async fn writer_allows_commit_fact_to_share_the_touched_version_commit_id() {
+    async fn writer_allows_commit_fact_to_share_the_touched_branch_commit_id() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
         let read = storage
@@ -1523,12 +1521,12 @@ mod tests {
         {
             let rows = [
                 tracked_row_at_with_commit(
-                    "version-a",
-                    "version-row",
-                    Some("change-version"),
-                    "commit-version",
+                    "branch-a",
+                    "branch-row",
+                    Some("change-branch"),
+                    "commit-branch",
                 ),
-                commit_live_state_row("commit-version"),
+                commit_live_state_row("commit-branch"),
             ];
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
@@ -1544,17 +1542,17 @@ mod tests {
         write_untracked_rows_to_store(
             &storage,
             &read,
-            &[version_ref_row("version-a", "commit-version")],
+            &[branch_ref_row("branch-a", "commit-branch")],
         )
         .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "version-a")
+        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
             .await
             .expect("load should succeed")
-            .expect("version row should be visible");
+            .expect("branch row should be visible");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
-            Some("{\"value\":\"version-row\"}")
+            Some("{\"value\":\"branch-row\"}")
         );
     }
 
@@ -1582,9 +1580,9 @@ mod tests {
         {
             let rows = [
                 tracked_row_at_with_commit(
-                    "version-a",
-                    "version-row",
-                    Some("change-version"),
+                    "branch-a",
+                    "branch-row",
+                    Some("change-branch"),
                     "commit-merge",
                 ),
                 commit_live_state_row_with_parents(
@@ -1674,7 +1672,7 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                version_id: "global".to_string(),
+                branch_id: "global".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -1684,7 +1682,7 @@ mod tests {
     async fn load_selected_tab_at(
         live_state: &LiveStateContext,
         storage: &StorageContext,
-        version_id: &str,
+        branch_id: &str,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
             .reader(
@@ -1694,7 +1692,7 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                version_id: version_id.to_string(),
+                branch_id: branch_id.to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -1704,7 +1702,7 @@ mod tests {
     async fn scan_selected_tab_at(
         live_state: &LiveStateContext,
         storage: &StorageContext,
-        version_id: &str,
+        branch_id: &str,
         include_tombstones: bool,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         live_state
@@ -1717,7 +1715,7 @@ mod tests {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![crate::entity_pk::EntityPk::single("selected-tab")],
-                    version_ids: vec![version_id.to_string()],
+                    branch_ids: vec![branch_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,
                     ..LiveStateFilter::default()
@@ -1761,7 +1759,7 @@ mod tests {
     }
 
     fn tracked_row_at_with_commit(
-        version_id: &str,
+        branch_id: &str,
         value: &str,
         change_id: Option<&str>,
         commit_id: &str,
@@ -1775,23 +1773,23 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: version_id == "global",
+            global: branch_id == "global",
             change_id: change_id.map(str::to_string),
             commit_id: Some(commit_id.to_string()),
             untracked: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
         }
     }
 
     fn tombstone_tracked_row_at_with_commit(
-        version_id: &str,
+        branch_id: &str,
         change_id: Option<&str>,
         commit_id: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             snapshot_content: None,
             deleted: true,
-            ..tracked_row_at_with_commit(version_id, "ignored", change_id, commit_id)
+            ..tracked_row_at_with_commit(branch_id, "ignored", change_id, commit_id)
         }
     }
 
@@ -1799,7 +1797,7 @@ mod tests {
         untracked_row_at("global", value)
     }
 
-    fn untracked_row_at(version_id: &str, value: &str) -> MaterializedUntrackedStateRow {
+    fn untracked_row_at(branch_id: &str, value: &str) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
             entity_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
@@ -1809,29 +1807,29 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: version_id == "global",
-            version_id: version_id.to_string(),
+            global: branch_id == "global",
+            branch_id: branch_id.to_string(),
         }
     }
 
-    fn version_ref_row(version_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
+    fn branch_ref_row(branch_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
-            entity_pk: identity(version_id),
-            schema_key: "lix_version_ref".to_string(),
+            entity_pk: identity(branch_id),
+            schema_key: "lix_branch_ref".to_string(),
             file_id: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({
-                    "id": version_id,
+                    "id": branch_id,
                     "commit_id": commit_id,
                 }))
-                .expect("version ref should serialize"),
+                .expect("branch ref should serialize"),
             ),
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
-            version_id: "global".to_string(),
+            branch_id: "global".to_string(),
         }
     }
 
@@ -1875,7 +1873,7 @@ mod tests {
             change_id: Some(format!("change-{commit_id}")),
             commit_id: Some(commit_id.to_string()),
             untracked: false,
-            version_id: "global".to_string(),
+            branch_id: "global".to_string(),
         }
     }
 

@@ -44,7 +44,7 @@ const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 pub(crate) struct PluginInstallWriteContext {
     function_bindings: PreparedWriteFunctionBindings,
     public_surface_registry: SurfaceRegistry,
-    target_version_id: String,
+    target_branch_id: String,
     active_account_ids: Vec<String>,
     origin_key: Option<String>,
 }
@@ -53,21 +53,21 @@ impl PluginInstallWriteContext {
     pub(crate) fn new(
         function_bindings: PreparedWriteFunctionBindings,
         public_surface_registry: SurfaceRegistry,
-        target_version_id: impl Into<String>,
+        target_branch_id: impl Into<String>,
         active_account_ids: Vec<String>,
         origin_key: Option<String>,
     ) -> Self {
         Self {
             function_bindings,
             public_surface_registry,
-            target_version_id: target_version_id.into(),
+            target_branch_id: target_branch_id.into(),
             active_account_ids,
             origin_key,
         }
     }
 
-    fn target_version_id(&self) -> &str {
-        &self.target_version_id
+    fn target_branch_id(&self) -> &str {
+        &self.target_branch_id
     }
 }
 
@@ -152,7 +152,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
 ) -> Result<WriteCommand, LixError> {
     let target = require_resolved_surface(
         &context.public_surface_registry,
-        "lix_registered_schema_by_version",
+        "lix_registered_schema_by_branch",
     )?;
     let schema_rows = schemas
         .iter()
@@ -160,7 +160,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
         .collect::<Result<Vec<_>, _>>()?;
     let intended_post_state = schema_rows
         .iter()
-        .map(|row| registered_schema_planned_row(row, context.target_version_id()))
+        .map(|row| registered_schema_planned_row(row, context.target_branch_id()))
         .collect::<Vec<_>>();
     let changes = schema_rows
         .iter()
@@ -171,7 +171,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
             plugin_key: None,
             snapshot_content: Some(row.snapshot.to_string()),
             metadata: None,
-            version_id: context.target_version_id().to_string(),
+            branch_id: context.target_branch_id().to_string(),
             origin_key: context.origin_key.clone(),
         })
         .collect::<Vec<_>>();
@@ -186,7 +186,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
     prepare_public_tracked_write_statement(
         context,
         target,
-        "lix_registered_schema_by_version",
+        "lix_registered_schema_by_branch",
         intended_post_state,
         PlannedFilesystemState::default(),
         changes,
@@ -211,7 +211,7 @@ fn prepare_plugin_archive_write_statement(
     plugin_directory_id: &str,
     context: &PluginInstallWriteContext,
 ) -> Result<WriteCommand, LixError> {
-    let target = require_resolved_surface(&context.public_surface_registry, "lix_file_by_version")?;
+    let target = require_resolved_surface(&context.public_surface_registry, "lix_file_by_branch")?;
     let archive_id = plugin_storage_archive_file_id(parsed.manifest.key.as_str());
     let archive_path = plugin_storage_archive_path(parsed.manifest.key.as_str())?;
     let parsed_path = ParsedFilePath::try_from_path(&archive_path)?;
@@ -221,13 +221,13 @@ fn prepare_plugin_archive_write_statement(
         metadata: None,
         hidden: false,
     };
-    let target_version_id = context.target_version_id();
+    let target_branch_id = context.target_branch_id();
     let filesystem_state = PlannedFilesystemState {
         files: [(
-            (archive_id.clone(), target_version_id.to_string()),
+            (archive_id.clone(), target_branch_id.to_string()),
             PlannedFilesystemFile {
                 file_id: archive_id.clone(),
-                version_id: target_version_id.to_string(),
+                branch_id: target_branch_id.to_string(),
                 untracked: false,
                 descriptor: Some(descriptor.clone()),
                 metadata_patch: OptionalTextPatch::Unchanged,
@@ -239,8 +239,8 @@ fn prepare_plugin_archive_write_statement(
         .collect(),
     };
     let intended_post_state = vec![
-        plugin_archive_file_descriptor_row(&archive_id, target_version_id, &descriptor),
-        plugin_archive_binary_blob_ref_row(&archive_id, target_version_id, archive_bytes)?,
+        plugin_archive_file_descriptor_row(&archive_id, target_branch_id, &descriptor),
+        plugin_archive_binary_blob_ref_row(&archive_id, target_branch_id, archive_bytes)?,
     ];
     let changes = intended_post_state
         .iter()
@@ -250,7 +250,7 @@ fn prepare_plugin_archive_write_statement(
     prepare_public_tracked_write_statement(
         context,
         target,
-        "lix_file_by_version",
+        "lix_file_by_branch",
         intended_post_state,
         filesystem_state,
         changes,
@@ -275,7 +275,7 @@ fn registered_schema_row_spec_from_json(
 
 fn registered_schema_planned_row(
     row: &RegisteredSchemaRowSpec,
-    target_version_id: &str,
+    target_branch_id: &str,
 ) -> PlannedStateRow {
     let mut values = BTreeMap::new();
     values.insert("entity_pk".to_string(), Value::Text(row.entity_pk.clone()));
@@ -290,13 +290,13 @@ fn registered_schema_planned_row(
         Value::Json(row.snapshot.clone()),
     );
     values.insert(
-        "version_id".to_string(),
-        Value::Text(target_version_id.to_string()),
+        "branch_id".to_string(),
+        Value::Text(target_branch_id.to_string()),
     );
     PlannedStateRow {
         entity_pk: row.entity_pk.clone(),
         schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
-        version_id: Some(target_version_id.to_string()),
+        branch_id: Some(target_branch_id.to_string()),
         values,
         origin_key: None,
         tombstone: false,
@@ -305,7 +305,7 @@ fn registered_schema_planned_row(
 
 fn plugin_archive_file_descriptor_row(
     archive_id: &str,
-    target_version_id: &str,
+    target_branch_id: &str,
     descriptor: &PlannedFilesystemDescriptor,
 ) -> PlannedStateRow {
     let snapshot_content = json!({
@@ -328,13 +328,13 @@ fn plugin_archive_file_descriptor_row(
         Value::Text(snapshot_content),
     );
     values.insert(
-        "version_id".to_string(),
-        Value::Text(target_version_id.to_string()),
+        "branch_id".to_string(),
+        Value::Text(target_branch_id.to_string()),
     );
     PlannedStateRow {
         entity_pk: archive_id.to_string(),
         schema_key: FILESYSTEM_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        version_id: Some(target_version_id.to_string()),
+        branch_id: Some(target_branch_id.to_string()),
         values,
         origin_key: None,
         tombstone: false,
@@ -343,7 +343,7 @@ fn plugin_archive_file_descriptor_row(
 
 fn plugin_archive_binary_blob_ref_row(
     archive_id: &str,
-    target_version_id: &str,
+    target_branch_id: &str,
     archive_bytes: &[u8],
 ) -> Result<PlannedStateRow, LixError> {
     let size_bytes = u64::try_from(archive_bytes.len()).map_err(|_| {
@@ -374,13 +374,13 @@ fn plugin_archive_binary_blob_ref_row(
         Value::Text(snapshot_content),
     );
     values.insert(
-        "version_id".to_string(),
-        Value::Text(target_version_id.to_string()),
+        "branch_id".to_string(),
+        Value::Text(target_branch_id.to_string()),
     );
     Ok(PlannedStateRow {
         entity_pk: archive_id.to_string(),
         schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
-        version_id: Some(target_version_id.to_string()),
+        branch_id: Some(target_branch_id.to_string()),
         values,
         origin_key: None,
         tombstone: false,
@@ -414,7 +414,7 @@ fn prepare_public_tracked_write_statement(
                     operation_kind: PreparedWriteOperationKind::Insert,
                     target,
                     on_conflict_action: None,
-                    requested_version_id: Some(context.target_version_id().to_string()),
+                    requested_branch_id: Some(context.target_branch_id().to_string()),
                     active_account_ids: context.active_account_ids.clone(),
                     origin_key: context.origin_key.clone(),
                     resolved_write_plan: Some(PreparedResolvedWritePlan {
@@ -480,7 +480,7 @@ fn semantic_effect_markers_from_changes(changes: &[PublicChange]) -> Vec<Semanti
             effect_key: "state.upsert".to_string(),
             target: format!(
                 "{}:{}@{}",
-                change.schema_key, change.entity_pk, change.version_id
+                change.schema_key, change.entity_pk, change.branch_id
             ),
         })
         .collect()
@@ -498,14 +498,14 @@ fn planned_row_to_public_change(row: &PlannedStateRow) -> Result<PublicChange, L
             planned_row_json_text_value(row, "snapshot_content")
         },
         metadata: planned_row_json_text_value(row, "metadata"),
-        version_id: row
-            .version_id
+        branch_id: row
+            .branch_id
             .clone()
-            .or_else(|| planned_row_text_value(row, "version_id"))
+            .or_else(|| planned_row_text_value(row, "branch_id"))
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "semantic tracked write requires a concrete version_id",
+                    "semantic tracked write requires a concrete branch_id",
                 )
             })?,
         origin_key: row.origin_key.clone(),
@@ -554,7 +554,7 @@ fn summarize_change(change: &PublicChange) -> JsonValue {
         "schema_key": change.schema_key,
         "file_id": change.file_id,
         "plugin_key": change.plugin_key,
-        "version_id": change.version_id,
+        "branch_id": change.branch_id,
         "origin_key": change.origin_key,
         "snapshot_content": change.snapshot_content.as_ref().map(|snapshot| {
             stable_content_fingerprint_hex(snapshot.as_bytes())
@@ -566,7 +566,7 @@ fn summarize_planned_row(row: &PlannedStateRow) -> JsonValue {
     json!({
         "entity_pk": row.entity_pk,
         "schema_key": row.schema_key,
-        "version_id": row.version_id,
+        "branch_id": row.branch_id,
         "tombstone": row.tombstone,
         "values": row
             .values

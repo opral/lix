@@ -18,7 +18,7 @@ interface api {
   /// any ordering of `changes`.
   ///
   /// Uniqueness: callers provide at most one row per
-  /// (`schema-key`, `entity-pk`) for the same (`file.id`, version).
+  /// (`schema-key`, `entity-pk`) for the same (`file.id`, branch).
   record entity-change {
     entity-pk: string,
     schema-key: string,
@@ -37,7 +37,7 @@ interface api {
     snapshot-content: option<canonical-json>,
     file-id: option<string>,
     plugin-key: option<string>,
-    version-id: option<string>,
+    branch-id: option<string>,
     change-id: option<string>,
     /// Deterministically encoded JSON text.
     metadata: option<canonical-json>,

@@ -8,7 +8,7 @@ use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveSt
 use crate::storage::StorageWriteSet;
 use crate::untracked_state::UntrackedStateContext;
 use crate::untracked_state::UntrackedStateRow;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
@@ -78,7 +78,7 @@ async fn load_key_value_row(
     live_state
         .load_row(&LiveStateRowRequest {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         })
@@ -162,7 +162,7 @@ fn deterministic_key_value_row(
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,
-        version_id: GLOBAL_VERSION_ID.to_string(),
+        branch_id: GLOBAL_BRANCH_ID.to_string(),
     })
 }
 
@@ -203,7 +203,7 @@ mod tests {
     async fn valid_mode_decodes_flags() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(storage.clone()).await;
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_test_key_value(
             storage.clone(),
             DETERMINISTIC_MODE_KEY,
@@ -251,7 +251,7 @@ mod tests {
     async fn valid_sequence_decodes_highest_seen() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(storage.clone()).await;
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_test_key_value(
             storage.clone(),
             DETERMINISTIC_SEQUENCE_KEY,
@@ -276,7 +276,7 @@ mod tests {
     async fn write_sequence_persists_untracked_global_key_value() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(storage.clone()).await;
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
 
         let mut writes = storage.new_write_set();
         stage_sequence(
@@ -298,7 +298,7 @@ mod tests {
         let row = reader
             .load_row(&LiveStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })

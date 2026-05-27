@@ -25,10 +25,15 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 
+use crate::branch::BranchRefReader;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+};
+use crate::sql2::branch_scope::{
+    explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids, resolve_write_branch_scope,
+    BranchBinding,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::filesystem_predicates::{
@@ -37,16 +42,11 @@ use crate::sql2::filesystem_predicates::{
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
-use crate::sql2::version_scope::{
-    explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
-    resolve_write_version_scope, VersionBinding,
-};
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
 };
-use crate::version::VersionRefReader;
 use crate::{parse_row_metadata_value, serialize_row_metadata, LixError};
 
 use crate::sql2::filesystem_planner::{
@@ -57,7 +57,7 @@ use crate::sql2::filesystem_planner::{
 use crate::sql2::filesystem_visibility::VisibleFilesystem;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
+    SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
@@ -67,18 +67,18 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(super) async fn register_lix_directory_active_provider(
     session: &SessionContext,
     surface_name: &str,
-    active_version_id: &str,
+    active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     session
         .register_table(
             surface_name,
-            Arc::new(LixDirectoryProvider::active_version(
-                active_version_id,
+            Arc::new(LixDirectoryProvider::active_branch(
+                active_branch_id,
                 live_state,
-                version_ref,
+                branch_ref,
                 functions,
             )),
         )
@@ -86,27 +86,25 @@ pub(super) async fn register_lix_directory_active_provider(
     Ok(())
 }
 
-pub(super) async fn register_lix_directory_by_version_provider(
+pub(super) async fn register_lix_directory_by_branch_provider(
     session: &SessionContext,
     surface_name: &str,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     session
         .register_table(
             surface_name,
-            Arc::new(LixDirectoryProvider::by_version(
-                live_state,
-                version_ref,
-                functions,
+            Arc::new(LixDirectoryProvider::by_branch(
+                live_state, branch_ref, functions,
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
 
-pub(super) async fn register_by_version_write_provider(
+pub(super) async fn register_by_branch_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
@@ -114,7 +112,7 @@ pub(super) async fn register_by_version_write_provider(
     session
         .register_table(
             surface_name,
-            Arc::new(LixDirectoryProvider::by_version_with_write(write_ctx)),
+            Arc::new(LixDirectoryProvider::by_branch_with_write(write_ctx)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
@@ -128,7 +126,7 @@ pub(super) async fn register_active_write_provider(
     session
         .register_table(
             surface_name,
-            Arc::new(LixDirectoryProvider::active_version_with_write(write_ctx)),
+            Arc::new(LixDirectoryProvider::active_branch_with_write(write_ctx)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
@@ -137,10 +135,10 @@ pub(super) async fn register_active_write_provider(
 pub(crate) struct LixDirectoryProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     write_access: WriteAccess,
     functions: FunctionProviderHandle,
-    version_binding: VersionBinding,
+    branch_binding: BranchBinding,
 }
 
 impl std::fmt::Debug for LixDirectoryProvider {
@@ -150,63 +148,63 @@ impl std::fmt::Debug for LixDirectoryProvider {
 }
 
 impl LixDirectoryProvider {
-    fn active_version(
-        active_version_id: impl Into<String>,
+    fn active_branch(
+        active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
-        version_ref: Arc<dyn VersionRefReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_directory_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::read_only(),
             functions,
-            version_binding: VersionBinding::active(active_version_id),
+            branch_binding: BranchBinding::active(active_branch_id),
         }
     }
 
-    fn active_version_with_write(write_ctx: SqlWriteContext) -> Self {
-        let active_version_id = write_ctx.active_version_id();
+    fn active_branch_with_write(write_ctx: SqlWriteContext) -> Self {
+        let active_branch_id = write_ctx.active_branch_id();
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         Self {
             schema: lix_directory_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::write(write_ctx),
             functions,
-            version_binding: VersionBinding::active(active_version_id),
+            branch_binding: BranchBinding::active(active_branch_id),
         }
     }
 
-    fn by_version(
+    fn by_branch(
         live_state: Arc<dyn LiveStateReader>,
-        version_ref: Arc<dyn VersionRefReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
-            schema: lix_directory_by_version_schema(),
+            schema: lix_directory_by_branch_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::read_only(),
             functions,
-            version_binding: VersionBinding::explicit(),
+            branch_binding: BranchBinding::explicit(),
         }
     }
 
-    fn by_version_with_write(write_ctx: SqlWriteContext) -> Self {
+    fn by_branch_with_write(write_ctx: SqlWriteContext) -> Self {
         let functions = write_ctx.functions();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         Self {
-            schema: lix_directory_by_version_schema(),
+            schema: lix_directory_by_branch_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::write(write_ctx),
             functions,
-            version_binding: VersionBinding::explicit(),
+            branch_binding: BranchBinding::explicit(),
         }
     }
 }
@@ -245,14 +243,14 @@ impl TableProvider for LixDirectoryProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let scan_limit = if filters.is_empty() { limit } else { None };
         let mut request = lix_directory_scan_request(
-            self.version_binding.active_version_id(),
+            self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
             scan_limit,
         );
-        request.filter.version_ids = resolve_provider_version_ids(
-            self.version_ref.as_ref(),
-            &self.version_binding,
-            request.filter.version_ids,
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
@@ -291,7 +289,7 @@ impl TableProvider for LixDirectoryProvider {
         let sink = LixDirectoryInsertSink::new(
             write_ctx,
             self.functions.clone(),
-            self.version_binding.clone(),
+            self.branch_binding.clone(),
         );
         Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
@@ -314,19 +312,19 @@ impl TableProvider for LixDirectoryProvider {
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
         let mut request =
-            lix_directory_scan_request(self.version_binding.active_version_id(), None, None);
-        request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
-        request.filter.version_ids = resolve_provider_version_ids(
-            self.version_ref.as_ref(),
-            &self.version_binding,
-            request.filter.version_ids,
+            lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
+        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixDirectoryDeleteExec::new(
             write_ctx,
             Arc::clone(&self.schema),
-            self.version_binding.clone(),
+            self.branch_binding.clone(),
             request,
             physical_filters,
         )))
@@ -359,19 +357,19 @@ impl TableProvider for LixDirectoryProvider {
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
         let mut request =
-            lix_directory_scan_request(self.version_binding.active_version_id(), None, None);
-        request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
-        request.filter.version_ids = resolve_provider_version_ids(
-            self.version_ref.as_ref(),
-            &self.version_binding,
-            request.filter.version_ids,
+            lix_directory_scan_request(self.branch_binding.active_branch_id(), None, None);
+        request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixDirectoryUpdateExec::new(
             write_ctx,
             Arc::clone(&self.schema),
-            self.version_binding.clone(),
+            self.branch_binding.clone(),
             request,
             physical_assignments,
             physical_filters,
@@ -382,7 +380,7 @@ impl TableProvider for LixDirectoryProvider {
 struct LixDirectoryInsertSink {
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
-    version_binding: VersionBinding,
+    branch_binding: BranchBinding,
     surface_name: &'static str,
 }
 
@@ -396,13 +394,13 @@ impl LixDirectoryInsertSink {
     fn new(
         write_ctx: SqlWriteContext,
         functions: FunctionProviderHandle,
-        version_binding: VersionBinding,
+        branch_binding: BranchBinding,
     ) -> Self {
-        let surface_name = lix_directory_surface_name(&version_binding);
+        let surface_name = lix_directory_surface_name(&branch_binding);
         Self {
             write_ctx,
             functions,
-            version_binding,
+            branch_binding,
             surface_name,
         }
     }
@@ -434,7 +432,7 @@ impl InsertSink for LixDirectoryInsertSink {
                 path_resolvers = Some(
                     directory_path_resolvers_from_live_state(
                         Arc::new(WriteContextLiveStateReader::new(self.write_ctx.clone())),
-                        self.version_binding.active_version_id(),
+                        self.branch_binding.active_branch_id(),
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?,
@@ -450,7 +448,7 @@ impl InsertSink for LixDirectoryInsertSink {
             if record_batch_has_non_null_column(&batch, "path")? {
                 rows.extend(lix_directory_write_rows_from_batch_with_path_resolvers(
                     &batch,
-                    self.version_binding.active_version_id(),
+                    self.branch_binding.active_branch_id(),
                     self.surface_name,
                     path_resolvers
                         .as_mut()
@@ -461,7 +459,7 @@ impl InsertSink for LixDirectoryInsertSink {
                 rows.extend(
                     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                         &batch,
-                        self.version_binding.active_version_id(),
+                        self.branch_binding.active_branch_id(),
                         self.surface_name,
                         true,
                         path_resolvers.as_mut(),
@@ -483,10 +481,10 @@ impl InsertSink for LixDirectoryInsertSink {
     }
 }
 
-fn lix_directory_surface_name(version_binding: &VersionBinding) -> &'static str {
-    match version_binding {
-        VersionBinding::Active { .. } => "lix_directory",
-        VersionBinding::Explicit => "lix_directory_by_version",
+fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
+    match branch_binding {
+        BranchBinding::Active { .. } => "lix_directory",
+        BranchBinding::Explicit => "lix_directory_by_branch",
     }
 }
 
@@ -494,7 +492,7 @@ fn lix_directory_surface_name(version_binding: &VersionBinding) -> &'static str 
 struct LixDirectoryDeleteExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    version_binding: VersionBinding,
+    branch_binding: BranchBinding,
     request: LiveStateScanRequest,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
@@ -511,7 +509,7 @@ impl LixDirectoryDeleteExec {
     fn new(
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        version_binding: VersionBinding,
+        branch_binding: BranchBinding,
         request: LiveStateScanRequest,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -525,7 +523,7 @@ impl LixDirectoryDeleteExec {
         Self {
             write_ctx,
             table_schema,
-            version_binding,
+            branch_binding,
             request,
             filters,
             result_schema,
@@ -586,7 +584,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
         }
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let version_binding = self.version_binding.clone();
+        let branch_binding = self.branch_binding.clone();
         let request = self.request.clone();
         let filters = self.filters.clone();
         let result_schema = Arc::clone(&self.result_schema);
@@ -600,17 +598,15 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
             let source_batch = lix_directory_record_batch(&table_schema, rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_directory_batch(source_batch, &filters)?;
-            let version_ids = directory_version_ids_from_batch(
-                &matched_batch,
-                version_binding.active_version_id(),
-            )?;
+            let branch_ids =
+                directory_branch_ids_from_batch(&matched_batch, branch_binding.active_branch_id())?;
             let mut visible_filesystems = BTreeMap::new();
-            for version_id in version_ids {
+            for branch_id in branch_ids {
                 visible_filesystems.insert(
-                    version_id.clone(),
+                    branch_id.clone(),
                     VisibleFilesystem::load(
                         Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                        &version_id,
+                        &branch_id,
                     )
                     .await
                     .map_err(lix_error_to_datafusion_error)?,
@@ -618,7 +614,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
             }
             let (write_rows, count) = lix_directory_recursive_delete_rows_from_batch(
                 &matched_batch,
-                version_binding.active_version_id(),
+                branch_binding.active_branch_id(),
                 &visible_filesystems,
             )?;
 
@@ -649,7 +645,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 struct LixDirectoryUpdateExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    version_binding: VersionBinding,
+    branch_binding: BranchBinding,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -667,7 +663,7 @@ impl LixDirectoryUpdateExec {
     fn new(
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        version_binding: VersionBinding,
+        branch_binding: BranchBinding,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -682,7 +678,7 @@ impl LixDirectoryUpdateExec {
         Self {
             write_ctx,
             table_schema,
-            version_binding,
+            branch_binding,
             request,
             assignments,
             filters,
@@ -749,7 +745,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
         }
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let version_binding = self.version_binding.clone();
+        let branch_binding = self.branch_binding.clone();
         let request = self.request.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
@@ -766,14 +762,14 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
             let matched_batch = filter_lix_directory_batch(source_batch, &filters)?;
             let mut path_resolvers = directory_path_resolvers_from_live_state(
                 Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                version_binding.active_version_id(),
+                branch_binding.active_branch_id(),
             )
             .await
             .map_err(lix_error_to_datafusion_error)?;
             let write_rows = lix_directory_update_write_rows_from_batch(
                 &matched_batch,
                 &assignments,
-                version_binding.active_version_id(),
+                branch_binding.active_branch_id(),
                 &mut path_resolvers,
             )?;
             let count = u64::try_from(write_rows.len()).map_err(|_| {
@@ -954,21 +950,21 @@ struct DirectoryDescriptorSnapshot {
 #[cfg(test)]
 fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>> {
-    lix_directory_write_rows_from_batch_with_options(batch, version_binding, "lix_directory", true)
+    lix_directory_write_rows_from_batch_with_options(batch, branch_binding, "lix_directory", true)
 }
 
 fn lix_directory_write_rows_from_batch_with_path_resolvers(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     surface_name: &str,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<Vec<TransactionWriteRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
-        version_binding,
+        branch_binding,
         surface_name,
         true,
         Some(path_resolvers),
@@ -979,7 +975,7 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
 fn lix_directory_update_write_rows_from_batch(
     batch: &RecordBatch,
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
 ) -> Result<Vec<TransactionWriteRow>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
@@ -990,7 +986,7 @@ fn lix_directory_update_write_rows_from_batch(
             batch,
             &assignment_values,
             row_index,
-            version_binding,
+            branch_binding,
         )?;
         let parent_id =
             update_optional_string_value(batch, &assignment_values, row_index, "parent_id")?;
@@ -1016,22 +1012,21 @@ fn lix_directory_update_write_rows_from_batch(
     Ok(rows)
 }
 
-fn directory_version_ids_from_batch(
+fn directory_branch_ids_from_batch(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> Result<BTreeSet<String>> {
-    let mut version_ids = BTreeSet::new();
+    let mut branch_ids = BTreeSet::new();
     for row_index in 0..batch.num_rows() {
-        version_ids.insert(
-            directory_row_context_from_batch(batch, row_index, version_binding)?.version_id,
-        );
+        branch_ids
+            .insert(directory_row_context_from_batch(batch, row_index, branch_binding)?.branch_id);
     }
-    Ok(version_ids)
+    Ok(branch_ids)
 }
 
 fn lix_directory_recursive_delete_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     visible_filesystems: &BTreeMap<String, VisibleFilesystem>,
 ) -> Result<(Vec<TransactionWriteRow>, u64)> {
     let mut rows = Vec::new();
@@ -1039,15 +1034,13 @@ fn lix_directory_recursive_delete_rows_from_batch(
     let mut count = 0u64;
     for row_index in 0..batch.num_rows() {
         let directory_id = required_string_value(batch, row_index, "id")?;
-        let context = directory_row_context_from_batch(batch, row_index, version_binding)?;
-        let visible_filesystem = visible_filesystems
-            .get(&context.version_id)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "DELETE FROM lix_directory missing visible filesystem for version '{}'",
-                    context.version_id
-                ))
-            })?;
+        let context = directory_row_context_from_batch(batch, row_index, branch_binding)?;
+        let visible_filesystem = visible_filesystems.get(&context.branch_id).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "DELETE FROM lix_directory missing visible filesystem for branch '{}'",
+                context.branch_id
+            ))
+        })?;
         append_deduped_delete_plan(
             &mut rows,
             &mut seen,
@@ -1086,7 +1079,7 @@ struct StateRowDedupeKey {
     entity_pk: String,
     schema_key: String,
     file_id: Option<String>,
-    version_id: String,
+    branch_id: String,
     global: bool,
     untracked: bool,
 }
@@ -1102,7 +1095,7 @@ impl From<&TransactionWriteRow> for StateRowDedupeKey {
                 .expect("directory provider staged row entity primary key should project"),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
             global: row.global,
             untracked: row.untracked,
         }
@@ -1112,13 +1105,13 @@ impl From<&TransactionWriteRow> for StateRowDedupeKey {
 #[cfg(test)]
 fn lix_directory_write_rows_from_batch_with_options(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     surface_name: &str,
     reject_read_only_fields: bool,
 ) -> Result<Vec<TransactionWriteRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
-        version_binding,
+        branch_binding,
         surface_name,
         reject_read_only_fields,
         None,
@@ -1128,7 +1121,7 @@ fn lix_directory_write_rows_from_batch_with_options(
 
 fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     surface_name: &str,
     reject_read_only_fields: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
@@ -1148,7 +1141,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         let path = optional_string_value(batch, row_index, "path")?;
         let id = optional_string_value(batch, row_index, "id")?;
         let hidden = optional_bool_value(batch, row_index, "hidden")?;
-        let context = directory_row_context_from_batch(batch, row_index, version_binding)?;
+        let context = directory_row_context_from_batch(batch, row_index, branch_binding)?;
 
         if let Some(path) = path.filter(|_| reject_read_only_fields) {
             reject_read_only_lix_directory_insert_field(batch, row_index, "parent_id")?;
@@ -1248,18 +1241,18 @@ fn lix_directory_insert_origin(surface_name: &str, directory_id: &str) -> Transa
 fn directory_row_context_from_batch(
     batch: &RecordBatch,
     row_index: usize,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
-    let scope = resolve_write_version_scope(
+    let scope = resolve_write_branch_scope(
         optional_bool_value(batch, row_index, "lixcol_global")?,
-        optional_string_value(batch, row_index, "lixcol_version_id")?,
-        version_binding,
-        "INSERT into lix_directory_by_version",
+        optional_string_value(batch, row_index, "lixcol_branch_id")?,
+        branch_binding,
+        "INSERT into lix_directory_by_branch",
         "lix_directory",
     )?;
 
     Ok(FilesystemRowContext {
-        version_id: scope.version_id,
+        branch_id: scope.branch_id,
         global: scope.global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
@@ -1271,18 +1264,18 @@ fn directory_row_context_from_update(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
     row_index: usize,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
-    let scope = resolve_write_version_scope(
+    let scope = resolve_write_branch_scope(
         optional_bool_value(batch, row_index, "lixcol_global")?,
-        optional_string_value(batch, row_index, "lixcol_version_id")?,
-        version_binding,
-        "UPDATE into lix_directory_by_version",
+        optional_string_value(batch, row_index, "lixcol_branch_id")?,
+        branch_binding,
+        "UPDATE into lix_directory_by_branch",
         "lix_directory",
     )?;
 
     Ok(FilesystemRowContext {
-        version_id: scope.version_id,
+        branch_id: scope.branch_id,
         global: scope.global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
@@ -1298,7 +1291,7 @@ fn directory_row_context_from_update(
 
 fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
     filesystem_storage_scope_key(
-        &context.version_id,
+        &context.branch_id,
         context.global,
         context.untracked,
         context.file_id.as_deref(),
@@ -1307,7 +1300,7 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
 
 async fn directory_path_resolvers_from_live_state(
     live_state: Arc<dyn LiveStateReader>,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let rows = live_state
         .scan_rows(&LiveStateScanRequest {
@@ -1316,8 +1309,8 @@ async fn directory_path_resolvers_from_live_state(
                     DIRECTORY_SCHEMA_KEY.to_string(),
                     FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 ],
-                version_ids: version_binding
-                    .map(|version_id| vec![version_id.to_string()])
+                branch_ids: branch_binding
+                    .map(|branch_id| vec![branch_id.to_string()])
                     .unwrap_or_default(),
                 ..Default::default()
             },
@@ -1325,8 +1318,8 @@ async fn directory_path_resolvers_from_live_state(
         })
         .await?;
     let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
-    if let Some(version_id) = version_binding {
-        let key = filesystem_storage_scope_key(version_id, false, false, None);
+    if let Some(branch_id) = branch_binding {
+        let key = filesystem_storage_scope_key(branch_id, false, false, None);
         resolvers
             .entry(key)
             .or_insert_with(DirectoryPathResolver::default);
@@ -1379,13 +1372,13 @@ fn lix_directory_record_batch(
     let mut commit_ids = Vec::new();
     let mut untracked_values = Vec::new();
     let mut metadata_values = Vec::new();
-    let mut version_ids = Vec::new();
+    let mut branch_ids = Vec::new();
 
     for directory in directory_rows {
         ids.push(Some(directory.id.clone()));
         paths.push(
             directory_paths
-                .get(&(directory.live.version_id.clone(), directory.id.clone()))
+                .get(&(directory.live.branch_id.clone(), directory.id.clone()))
                 .cloned(),
         );
         parent_ids.push(directory.parent_id);
@@ -1401,7 +1394,7 @@ fn lix_directory_record_batch(
         commit_ids.push(directory.live.commit_id);
         untracked_values.push(Some(directory.live.untracked));
         metadata_values.push(directory.live.metadata.as_ref().map(serialize_row_metadata));
-        version_ids.push(Some(directory.live.version_id));
+        branch_ids.push(Some(directory.live.branch_id));
     }
 
     let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
@@ -1422,7 +1415,7 @@ fn lix_directory_record_batch(
             "lixcol_commit_id" => Arc::new(StringArray::from(commit_ids.clone())),
             "lixcol_untracked" => Arc::new(BooleanArray::from(untracked_values.clone())),
             "lixcol_metadata" => Arc::new(StringArray::from(metadata_values.clone())),
-            "lixcol_version_id" => Arc::new(StringArray::from(version_ids.clone())),
+            "lixcol_branch_id" => Arc::new(StringArray::from(branch_ids.clone())),
             other => {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -1447,19 +1440,19 @@ fn lix_directory_record_batch(
 fn derive_directory_paths(
     rows: &[DirectoryDescriptorRecord],
 ) -> std::result::Result<BTreeMap<(String, String), String>, LixError> {
-    let mut by_version = BTreeMap::<String, BTreeMap<String, &DirectoryDescriptorRecord>>::new();
+    let mut by_branch = BTreeMap::<String, BTreeMap<String, &DirectoryDescriptorRecord>>::new();
     for row in rows {
-        by_version
-            .entry(row.live.version_id.clone())
+        by_branch
+            .entry(row.live.branch_id.clone())
             .or_default()
             .insert(row.id.clone(), row);
     }
 
     let mut paths = BTreeMap::<(String, String), String>::new();
-    for (version_id, records) in by_version {
+    for (branch_id, records) in by_branch {
         for directory_id in records.keys() {
             derive_directory_path_for(
-                &version_id,
+                &branch_id,
                 directory_id,
                 &records,
                 &mut paths,
@@ -1471,17 +1464,17 @@ fn derive_directory_paths(
 }
 
 fn derive_directory_path_for(
-    version_id: &str,
+    branch_id: &str,
     directory_id: &str,
     records: &BTreeMap<String, &DirectoryDescriptorRecord>,
     paths: &mut BTreeMap<(String, String), String>,
     visiting: &mut BTreeSet<String>,
 ) -> std::result::Result<Option<String>, LixError> {
-    if let Some(path) = paths.get(&(version_id.to_string(), directory_id.to_string())) {
+    if let Some(path) = paths.get(&(branch_id.to_string(), directory_id.to_string())) {
         return Ok(Some(path.clone()));
     }
     if !visiting.insert(directory_id.to_string()) {
-        return Err(directory_parent_cycle_error(version_id, directory_id));
+        return Err(directory_parent_cycle_error(branch_id, directory_id));
     }
     let Some(row) = records.get(directory_id) else {
         visiting.remove(directory_id);
@@ -1490,7 +1483,7 @@ fn derive_directory_path_for(
     let path = match row.parent_id.as_deref() {
         Some(parent_id) => {
             let Some(parent_path) =
-                derive_directory_path_for(version_id, parent_id, records, paths, visiting)?
+                derive_directory_path_for(branch_id, parent_id, records, paths, visiting)?
             else {
                 visiting.remove(directory_id);
                 return Ok(None);
@@ -1501,17 +1494,17 @@ fn derive_directory_path_for(
     };
     visiting.remove(directory_id);
     paths.insert(
-        (version_id.to_string(), directory_id.to_string()),
+        (branch_id.to_string(), directory_id.to_string()),
         path.clone(),
     );
     Ok(Some(path))
 }
 
-fn directory_parent_cycle_error(version_id: &str, directory_id: &str) -> LixError {
+fn directory_parent_cycle_error(branch_id: &str, directory_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!(
-            "lix_directory_descriptor parent_id cycle in version '{version_id}' while resolving directory '{directory_id}'"
+            "lix_directory_descriptor parent_id cycle in branch '{branch_id}' while resolving directory '{directory_id}'"
         ),
     )
 }
@@ -1532,15 +1525,15 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
 }
 
 fn lix_directory_scan_request(
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![DIRECTORY_SCHEMA_KEY.to_string()],
-            version_ids: version_binding
-                .map(|version_id| vec![version_id.to_string()])
+            branch_ids: branch_binding
+                .map(|branch_id| vec![branch_id.to_string()])
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
@@ -1846,13 +1839,13 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
     ]))
 }
 
-pub(super) fn lix_directory_by_version_schema() -> SchemaRef {
+pub(super) fn lix_directory_by_branch_schema() -> SchemaRef {
     let mut fields = lix_directory_schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
+    fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     Arc::new(Schema::new(fields))
 }
 
@@ -1891,10 +1884,10 @@ mod tests {
 
     use super::{
         derive_directory_path_for, directory_path_resolvers_from_state_rows,
-        lix_directory_by_version_schema, lix_directory_insert_origin, lix_directory_record_batch,
+        lix_directory_by_branch_schema, lix_directory_insert_origin, lix_directory_record_batch,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
-        lix_directory_write_rows_from_batch_with_path_resolvers, DirectoryDescriptorRecord,
-        LixDirectoryInsertSink, VersionBinding,
+        lix_directory_write_rows_from_batch_with_path_resolvers, BranchBinding,
+        DirectoryDescriptorRecord, LixDirectoryInsertSink,
     };
     use crate::sql2::filesystem_visibility::VisibleFilesystem;
 
@@ -1930,8 +1923,8 @@ mod tests {
 
     #[async_trait]
     impl SqlWriteExecutionContext for CapturingWriteContext {
-        fn active_version_id(&self) -> &str {
-            "version-a"
+        fn active_branch_id(&self) -> &str {
+            "branch-a"
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -1956,14 +1949,11 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_version_head(
-            &mut self,
-            version_id: &str,
-        ) -> Result<Option<String>, LixError> {
-            if version_id == "ghost-version" {
+        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+            if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{version_id}")))
+            Ok(Some(format!("commit-{branch_id}")))
         }
 
         async fn stage_write(
@@ -1977,14 +1967,14 @@ mod tests {
 
     fn live_row(
         entity_pk: &str,
-        version_id: &str,
+        branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         live_filesystem_row(
             entity_pk,
             super::DIRECTORY_SCHEMA_KEY,
             None,
-            version_id,
+            branch_id,
             snapshot_content,
         )
     }
@@ -1993,7 +1983,7 @@ mod tests {
         entity_pk: &str,
         schema_key: &str,
         file_id: Option<&str>,
-        version_id: &str,
+        branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
@@ -2003,7 +1993,7 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
@@ -2019,35 +2009,35 @@ mod tests {
                 "dir-docs",
                 "lix_directory_descriptor",
                 None,
-                "version-a",
+                "branch-a",
                 r#"{"id":"dir-docs","parent_id":null,"name":"docs","hidden":false}"#,
             ),
             live_filesystem_row(
                 "dir-guides",
                 "lix_directory_descriptor",
                 None,
-                "version-a",
+                "branch-a",
                 r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides","hidden":false}"#,
             ),
             live_filesystem_row(
                 "file-index",
                 "lix_file_descriptor",
                 None,
-                "version-a",
+                "branch-a",
                 r#"{"id":"file-index","directory_id":"dir-docs","name":"index.md","hidden":false}"#,
             ),
             live_filesystem_row(
                 "file-readme",
                 "lix_file_descriptor",
                 None,
-                "version-a",
+                "branch-a",
                 r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md","hidden":false}"#,
             ),
             live_filesystem_row(
                 "file-readme",
                 "lix_binary_blob_ref",
                 Some("file-readme"),
-                "version-a",
+                "branch-a",
                 r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
             ),
         ]
@@ -2057,7 +2047,7 @@ mod tests {
         Arc::new(StringArray::from(values)) as ArrayRef
     }
 
-    fn directory_insert_batch(include_version: bool, global: bool) -> RecordBatch {
+    fn directory_insert_batch(include_branch: bool, global: bool) -> RecordBatch {
         let mut fields = vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("parent_id", DataType::Utf8, true),
@@ -2074,9 +2064,9 @@ mod tests {
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"directory\"}")]),
         ];
-        if include_version {
-            fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
-            columns.push(string_column(vec![Some("version-a")]));
+        if include_branch {
+            fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
+            columns.push(string_column(vec![Some("branch-a")]));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .expect("directory insert batch should build")
@@ -2088,13 +2078,13 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, true),
                 Field::new("hidden", DataType::Boolean, false),
-                Field::new("lixcol_version_id", DataType::Utf8, false),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("dir-nested")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
-                string_column(vec![Some("version-a")]),
+                string_column(vec![Some("branch-a")]),
             ],
         )
         .expect("directory path insert batch should build")
@@ -2104,11 +2094,11 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
-                Field::new("lixcol_version_id", DataType::Utf8, false),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(ids.iter().copied().map(Some).collect::<Vec<_>>()),
-                string_column(vec![Some("version-a"); ids.len()]),
+                string_column(vec![Some("branch-a"); ids.len()]),
             ],
         )
         .expect("directory delete batch should build")
@@ -2123,7 +2113,7 @@ mod tests {
             hidden: false,
             live: live_row(
                 "dir-docs",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
             ),
         };
@@ -2134,7 +2124,7 @@ mod tests {
             hidden: false,
             live: live_row(
                 "dir-guides",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\",\"hidden\":false}",
             ),
         };
@@ -2145,7 +2135,7 @@ mod tests {
 
         assert_eq!(
             derive_directory_path_for(
-                "version-a",
+                "branch-a",
                 "dir-guides",
                 &records,
                 &mut paths,
@@ -2161,17 +2151,17 @@ mod tests {
         let rows = vec![
             live_row(
                 "dir-docs",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
             ),
             live_row(
                 "dir-guides",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\",\"hidden\":true}",
             ),
         ];
 
-        let batch = lix_directory_record_batch(&lix_directory_by_version_schema(), rows)
+        let batch = lix_directory_record_batch(&lix_directory_by_branch_schema(), rows)
             .expect("directory batch should build");
 
         assert_eq!(batch.num_rows(), 2);
@@ -2187,13 +2177,13 @@ mod tests {
         );
         assert_eq!(
             batch
-                .column_by_name("lixcol_version_id")
-                .expect("version column")
+                .column_by_name("lixcol_branch_id")
+                .expect("branch column")
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .expect("version is string")
+                .expect("branch is string")
                 .value(1),
-            "version-a"
+            "branch-a"
         );
     }
 
@@ -2221,43 +2211,43 @@ mod tests {
                 change_id: None,
                 commit_id: None,
                 untracked: false,
-                version_id: "version-a".to_string(),
+                branch_id: "branch-a".to_string(),
             }]
         );
     }
 
     #[test]
-    fn active_directory_insert_defaults_version_id() {
+    fn active_directory_insert_defaults_branch_id() {
         let rows = lix_directory_write_rows_from_batch(
             &directory_insert_batch(false, false),
-            Some("version-active"),
+            Some("branch-active"),
         )
         .expect("active directory batch should decode");
 
-        assert_eq!(rows[0].version_id, "version-active");
+        assert_eq!(rows[0].branch_id, "branch-active");
     }
 
     #[test]
-    fn by_version_directory_insert_requires_version_id_for_non_global_rows() {
+    fn by_branch_directory_insert_requires_branch_id_for_non_global_rows() {
         let error =
             lix_directory_write_rows_from_batch(&directory_insert_batch(false, false), None)
-                .expect_err("by-version insert should require version id");
+                .expect_err("by-branch insert should require branch id");
 
         assert!(
-            error.to_string().contains("requires lixcol_version_id"),
+            error.to_string().contains("requires lixcol_branch_id"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn directory_insert_rejects_global_with_non_global_version_id() {
+    fn directory_insert_rejects_global_with_non_global_branch_id() {
         let error = lix_directory_write_rows_from_batch(&directory_insert_batch(true, true), None)
-            .expect_err("global directory write should reject conflicting version id");
+            .expect_err("global directory write should reject conflicting branch id");
 
         assert!(
             error
                 .to_string()
-                .contains("cannot set lixcol_global=true with non-global lixcol_version_id"),
+                .contains("cannot set lixcol_global=true with non-global lixcol_branch_id"),
             "unexpected error: {error}"
         );
     }
@@ -2266,7 +2256,7 @@ mod tests {
     fn directory_path_insert_reuses_existing_parent_descriptor() {
         let existing_rows = vec![live_row(
             "dir-docs",
-            "version-a",
+            "branch-a",
             "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
         )];
         let mut resolvers = directory_path_resolvers_from_state_rows(existing_rows)
@@ -2293,7 +2283,7 @@ mod tests {
         let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
             .expect("visible filesystem should build");
         let mut visible_filesystems = BTreeMap::new();
-        visible_filesystems.insert("version-a".to_string(), visible_filesystem);
+        visible_filesystems.insert("branch-a".to_string(), visible_filesystem);
 
         let (rows, count) = lix_directory_recursive_delete_rows_from_batch(
             &directory_delete_batch(&["dir-docs"]),
@@ -2332,7 +2322,7 @@ mod tests {
         let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
             .expect("visible filesystem should build");
         let mut visible_filesystems = BTreeMap::new();
-        visible_filesystems.insert("version-a".to_string(), visible_filesystem);
+        visible_filesystems.insert("branch-a".to_string(), visible_filesystem);
 
         let (rows, count) = lix_directory_recursive_delete_rows_from_batch(
             &directory_delete_batch(&["dir-docs", "dir-guides"]),
@@ -2349,7 +2339,7 @@ mod tests {
                     row.schema_key.clone(),
                     row.entity_pk.clone(),
                     row.file_id.clone(),
-                    row.version_id.clone(),
+                    row.branch_id.clone(),
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
@@ -2363,7 +2353,7 @@ mod tests {
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_insert_batch(true, false);
         let sink =
-            LixDirectoryInsertSink::new(write_ctx, test_functions(), VersionBinding::explicit());
+            LixDirectoryInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit());
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
@@ -2385,7 +2375,7 @@ mod tests {
                         json!({"source": "directory"})
                     )),
                     origin: Some(lix_directory_insert_origin(
-                        "lix_directory_by_version",
+                        "lix_directory_by_branch",
                         "dir-docs"
                     )),
                     created_at: None,
@@ -2394,7 +2384,7 @@ mod tests {
                     change_id: None,
                     commit_id: None,
                     untracked: false,
-                    version_id: "version-a".to_string(),
+                    branch_id: "branch-a".to_string(),
                 }]
             }]
         );
@@ -2405,7 +2395,7 @@ mod tests {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
                 "dir-docs",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
             )],
             writes: Vec::new(),
@@ -2413,7 +2403,7 @@ mod tests {
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = directory_path_insert_batch("/docs/nested/");
         let sink =
-            LixDirectoryInsertSink::new(write_ctx, test_functions(), VersionBinding::explicit());
+            LixDirectoryInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit());
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await

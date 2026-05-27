@@ -11,8 +11,8 @@ use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
 use crate::sql2::catalog::{
     derive_entity_surface_spec_from_schema, EntityColumnType, EntitySurfaceSpec,
 };
+use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::FilterSet;
-use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::SqlWriteExecutionContext;
@@ -47,7 +47,7 @@ async fn execute_entity_write(
     params: &[Value],
 ) -> Result<u64, LixError> {
     let schema_key = match surface {
-        EntityWriteSurface::Base { schema_key } | EntityWriteSurface::ByVersion { schema_key } => {
+        EntityWriteSurface::Base { schema_key } | EntityWriteSurface::ByBranch { schema_key } => {
             schema_key
         }
     };
@@ -63,71 +63,44 @@ async fn execute_entity_write(
 
     let spec = entity_spec(ctx, schema_key)?;
     validate_bound_write_supported(plan, &spec)?;
-    let active_version_commit_id = load_active_version_commit_id(ctx).await?;
-    let no_op = matches!(plan.bound.version_scope, VersionScope::Empty)
+    let active_branch_commit_id = load_active_branch_commit_id(ctx).await?;
+    let no_op = matches!(plan.bound.branch_scope, BranchScope::Empty)
         || matches!(plan.filters.rows, FilterSet::None);
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                entity_insert_rows(
-                    ctx,
-                    plan,
-                    &spec,
-                    params,
-                    active_version_commit_id.as_deref(),
-                )?;
+                entity_insert_rows(ctx, plan, &spec, params, active_branch_commit_id.as_deref())?;
                 return Ok(0);
             }
-            entity_insert(
-                ctx,
-                plan,
-                &spec,
-                params,
-                active_version_commit_id.as_deref(),
-            )
-            .await
+            entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_deref()).await
         }
         BoundWriteOp::Update => {
             if no_op {
                 return Ok(0);
             }
-            entity_update(
-                ctx,
-                plan,
-                &spec,
-                params,
-                active_version_commit_id.as_deref(),
-            )
-            .await
+            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_deref()).await
         }
         BoundWriteOp::Delete => {
             if no_op {
                 return Ok(0);
             }
-            entity_delete(
-                ctx,
-                plan,
-                &spec,
-                params,
-                active_version_commit_id.as_deref(),
-            )
-            .await
+            entity_delete(ctx, plan, &spec, params, active_branch_commit_id.as_deref()).await
         }
     }
 }
 
-async fn load_active_version_commit_id(
+async fn load_active_branch_commit_id(
     ctx: &mut dyn SqlWriteExecutionContext,
 ) -> Result<Option<String>, LixError> {
-    let active_version_id = ctx.active_version_id().to_string();
-    ctx.load_version_head(&active_version_id)
+    let active_branch_id = ctx.active_branch_id().to_string();
+    ctx.load_branch_head(&active_branch_id)
         .await?
         .map(Some)
         .ok_or_else(|| {
-            LixError::version_not_found(
-                active_version_id,
+            LixError::branch_not_found(
+                active_branch_id,
                 "execute bound public write",
-                "active version",
+                "active branch",
             )
         })
 }
@@ -137,9 +110,9 @@ async fn entity_insert(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<u64, LixError> {
-    let write_rows = entity_insert_rows(ctx, plan, spec, params, active_version_commit_id)?;
+    let write_rows = entity_insert_rows(ctx, plan, spec, params, active_branch_commit_id)?;
     stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await
 }
 
@@ -148,7 +121,7 @@ fn entity_insert_rows(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>, LixError> {
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
@@ -166,7 +139,7 @@ fn entity_insert_rows(
             &layout,
             row,
             params,
-            active_version_commit_id,
+            active_branch_commit_id,
         )?);
     }
     Ok(write_rows)
@@ -177,7 +150,7 @@ async fn entity_update(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<u64, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec).await?;
     let mut write_rows = Vec::new();
@@ -192,7 +165,7 @@ async fn entity_update(
             spec,
             ctx,
             params,
-            active_version_commit_id,
+            active_branch_commit_id,
         )? {
             continue;
         }
@@ -207,7 +180,7 @@ async fn entity_update(
                     &original_context,
                     ctx,
                     params,
-                    active_version_commit_id,
+                    active_branch_commit_id,
                 )?;
                 visible_assignments.push((
                     column.name.clone(),
@@ -235,7 +208,7 @@ async fn entity_update(
             Some(updated),
             plan,
             params,
-            active_version_commit_id,
+            active_branch_commit_id,
         )?);
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
@@ -246,7 +219,7 @@ async fn entity_delete(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<u64, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec).await?;
     let mut write_rows = Vec::new();
@@ -261,7 +234,7 @@ async fn entity_delete(
             spec,
             ctx,
             params,
-            active_version_commit_id,
+            active_branch_commit_id,
         )? {
             reject_projected_global_write(plan, &candidate, "DELETE")?;
             write_rows.push(entity_replace_row_from_live(
@@ -271,7 +244,7 @@ async fn entity_delete(
                 None,
                 plan,
                 params,
-                active_version_commit_id,
+                active_branch_commit_id,
             )?);
         }
     }
@@ -297,11 +270,11 @@ async fn scan_entity_candidates(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
 ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
-    let version_ids = scan_version_ids(&plan.bound.version_scope)?;
+    let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
     let request = LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
-            version_ids,
+            branch_ids,
             include_tombstones: false,
             ..LiveStateFilter::default()
         },
@@ -329,7 +302,7 @@ enum InsertColumnTarget {
     Metadata,
     Global,
     Untracked,
-    VersionId,
+    BranchId,
 }
 
 impl InsertRowLayout {
@@ -359,7 +332,7 @@ impl InsertRowLayout {
                     "lixcol_metadata" => InsertColumnTarget::Metadata,
                     "lixcol_global" => InsertColumnTarget::Global,
                     "lixcol_untracked" => InsertColumnTarget::Untracked,
-                    "lixcol_version_id" => InsertColumnTarget::VersionId,
+                    "lixcol_branch_id" => InsertColumnTarget::BranchId,
                     _ => {
                         return Err(LixError::new(
                             LixError::CODE_UNSUPPORTED_SQL,
@@ -388,7 +361,7 @@ fn entity_insert_row(
     layout: &InsertRowLayout,
     row: &[BoundExpr],
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<TransactionWriteRow, LixError> {
     if row.len() != layout.columns.len() {
         return Err(LixError::new(
@@ -403,14 +376,14 @@ fn entity_insert_row(
     let mut metadata = None;
     let mut global = None;
     let mut untracked = None;
-    let mut explicit_version_id = None;
+    let mut explicit_branch_id = None;
     let context = EntityEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
 
     for (expr, target) in row.iter().zip(layout.columns.iter()) {
         if let InsertColumnTarget::Visible { column_type, .. } = target {
             reject_direct_blob_json_value(expr, *column_type, params)?;
         }
-        let eval_value = eval_expr_value(expr, &context, ctx, params, active_version_commit_id)?;
+        let eval_value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
         if matches!(target, InsertColumnTarget::Metadata) {
             metadata = optional_metadata_from_eval_value(
                 eval_value,
@@ -435,22 +408,24 @@ fn entity_insert_row(
             InsertColumnTarget::FileId => {
                 file_id = text_value(value, "lixcol_file_id")?;
             }
-            InsertColumnTarget::Metadata => unreachable!("metadata handled before JSON conversion"),
+            InsertColumnTarget::Metadata => {
+                unreachable!("metadata handled before JSON value coercion")
+            }
             InsertColumnTarget::Global => {
                 global = bool_value(value, "lixcol_global")?;
             }
             InsertColumnTarget::Untracked => {
                 untracked = bool_value(value, "lixcol_untracked")?;
             }
-            InsertColumnTarget::VersionId => {
-                explicit_version_id = text_value(value, "lixcol_version_id")?;
+            InsertColumnTarget::BranchId => {
+                explicit_branch_id = text_value(value, "lixcol_branch_id")?;
             }
         }
     }
 
     let snapshot = JsonValue::Object(snapshot);
     let global = global.unwrap_or(false);
-    let version_id = entity_row_version_id(plan, explicit_version_id, global)?;
+    let branch_id = entity_row_branch_id(plan, explicit_branch_id, global)?;
     Ok(TransactionWriteRow {
         entity_pk,
         schema_key: layout.schema_key.clone(),
@@ -467,7 +442,7 @@ fn entity_insert_row(
         change_id: None,
         commit_id: None,
         untracked: untracked.unwrap_or(false),
-        version_id,
+        branch_id,
     })
 }
 
@@ -476,15 +451,15 @@ fn reject_projected_global_write(
     row: &crate::live_state::MaterializedLiveStateRow,
     action: &str,
 ) -> Result<(), LixError> {
-    let target_is_by_version = matches!(
+    let target_is_by_branch = matches!(
         &plan.bound.target,
-        BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
+        BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
     );
-    if target_is_by_version && row.global && row.version_id != crate::GLOBAL_VERSION_ID {
+    if target_is_by_branch && row.global && row.branch_id != crate::GLOBAL_BRANCH_ID {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!(
-                "{action} through an entity by-version surface cannot mutate a projected global row"
+                "{action} through an entity by-branch surface cannot mutate a projected global row"
             ),
         ));
     }
@@ -498,12 +473,12 @@ fn entity_replace_row_from_live(
     snapshot: Option<JsonValue>,
     plan: &LogicalWritePlan,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<TransactionWriteRow, LixError> {
     let metadata = if let Some(expr) = assignment_value(plan, "lixcol_metadata") {
         let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
         let context = EntityEvalContext::live(&snapshot_for_eval, row, spec);
-        let value = eval_expr_value(expr, &context, ctx, params, active_version_commit_id)?;
+        let value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
         optional_metadata_from_eval_value(value, "lixcol_metadata", &spec.schema_key)?
     } else {
         inherited_metadata(row, spec)?
@@ -529,10 +504,10 @@ fn entity_replace_row_from_live(
         change_id: None,
         commit_id: None,
         untracked: row.untracked,
-        version_id: if row.global {
-            crate::GLOBAL_VERSION_ID.to_string()
+        branch_id: if row.global {
+            crate::GLOBAL_BRANCH_ID.to_string()
         } else {
-            row.version_id.clone()
+            row.branch_id.clone()
         },
     })
 }
@@ -616,9 +591,9 @@ fn eval_expr(
     context: &EntityEvalContext<'_>,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<JsonValue, LixError> {
-    eval_expr_value(expr, context, ctx, params, active_version_commit_id)
+    eval_expr_value(expr, context, ctx, params, active_branch_commit_id)
         .map(EntityEvalValue::into_json)
 }
 
@@ -627,7 +602,7 @@ fn eval_expr_value(
     context: &EntityEvalContext<'_>,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<EntityEvalValue, LixError> {
     match expr {
         BoundExpr::Literal(BoundLiteral::Null) => Ok(EntityEvalValue::SqlNull),
@@ -646,7 +621,7 @@ fn eval_expr_value(
             }),
         BoundExpr::Column(column) => column_eval_value(context, &column.name),
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
-            let raw = eval_expr_value(&args[0], context, ctx, params, active_version_commit_id)?;
+            let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let raw = match raw {
                 EntityEvalValue::SqlNull => return Ok(EntityEvalValue::Json(JsonValue::Null)),
                 EntityEvalValue::SqlText(value) => JsonValue::String(value),
@@ -677,16 +652,16 @@ fn eval_expr_value(
             Ok(EntityEvalValue::Json(JsonValue::Array(Vec::new())))
         }
         BoundExpr::Function { name, args }
-            if name == "lix_active_version_commit_id" && args.is_empty() =>
+            if name == "lix_active_branch_commit_id" && args.is_empty() =>
         {
-            Ok(active_version_commit_id
+            Ok(active_branch_commit_id
                 .map(|commit_id| EntityEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(EntityEvalValue::SqlNull))
         }
         BoundExpr::Function { name, args }
             if (name == "lix_json_get" || name == "lix_json_get_text") && args.len() >= 2 =>
         {
-            let root = eval_expr_value(&args[0], context, ctx, params, active_version_commit_id)?;
+            let root = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let mut current = match root {
                 EntityEvalValue::SqlNull => return Ok(EntityEvalValue::SqlNull),
                 EntityEvalValue::SqlText(raw) => {
@@ -705,7 +680,7 @@ fn eval_expr_value(
                 },
             };
             for arg in &args[1..] {
-                let segment = eval_expr(arg, context, ctx, params, active_version_commit_id)?;
+                let segment = eval_expr(arg, context, ctx, params, active_branch_commit_id)?;
                 let Some(next) = json_path_get(&current, &segment, name)? else {
                     return Ok(EntityEvalValue::SqlNull);
                 };
@@ -726,11 +701,11 @@ fn eval_expr_value(
         {
             if args.len() == 2 {
                 validate_utf8_encoding(
-                    eval_expr(&args[1], context, ctx, params, active_version_commit_id)?,
+                    eval_expr(&args[1], context, ctx, params, active_branch_commit_id)?,
                     name,
                 )?;
             }
-            let value = eval_expr(&args[0], context, ctx, params, active_version_commit_id)?;
+            let value = eval_expr(&args[0], context, ctx, params, active_branch_commit_id)?;
             if name == "lix_text_encode" {
                 Ok(EntityEvalValue::Json(JsonValue::Array(
                     text_like_bytes(&value, name)?
@@ -763,7 +738,7 @@ fn predicate_matches(
     spec: &EntitySurfaceSpec,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<bool, LixError> {
     use crate::sql2::plan::predicate::BoundPredicate;
     match predicate {
@@ -777,7 +752,7 @@ fn predicate_matches(
                     spec,
                     ctx,
                     params,
-                    active_version_commit_id,
+                    active_branch_commit_id,
                 )? {
                     return Ok(false);
                 }
@@ -792,7 +767,7 @@ fn predicate_matches(
                     spec,
                     ctx,
                     params,
-                    active_version_commit_id,
+                    active_branch_commit_id,
                 )? {
                     return Ok(true);
                 }
@@ -807,25 +782,25 @@ fn predicate_matches(
                 spec,
                 ctx,
                 params,
-                active_version_commit_id,
+                active_branch_commit_id,
             )?;
             Ok(!left.is_null() && !right.is_null() && left == right)
         }
         BoundPredicate::IsNull(expr) => {
-            let value = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            let value = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
             Ok(value.is_null())
         }
         BoundPredicate::IsNotNull(expr) => {
-            let value = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            let value = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
             Ok(!value.is_null())
         }
         BoundPredicate::In { expr, values } => {
-            let candidate = eval_expr(expr, context, ctx, params, active_version_commit_id)?;
+            let candidate = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
             if candidate.is_null() {
                 return Ok(false);
             }
             for value_expr in values {
-                let value = eval_expr(value_expr, context, ctx, params, active_version_commit_id)?;
+                let value = eval_expr(value_expr, context, ctx, params, active_branch_commit_id)?;
                 let (candidate, value) = normalize_comparison_operands(
                     expr,
                     candidate.clone(),
@@ -849,10 +824,10 @@ fn eval_comparison_operands(
     spec: &EntitySurfaceSpec,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_version_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&str>,
 ) -> Result<(JsonValue, JsonValue), LixError> {
-    let left_value = eval_expr(left, context, ctx, params, active_version_commit_id)?;
-    let right_value = eval_expr(right, context, ctx, params, active_version_commit_id)?;
+    let left_value = eval_expr(left, context, ctx, params, active_branch_commit_id)?;
+    let right_value = eval_expr(right, context, ctx, params, active_branch_commit_id)?;
     normalize_comparison_operands(left, left_value, right, right_value, spec)
 }
 
@@ -1105,7 +1080,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 "lix_empty_blob"
                 | "lix_uuid_v7"
                 | "lix_timestamp"
-                | "lix_active_version_commit_id"
+                | "lix_active_branch_commit_id"
                     if args.is_empty() => {}
                 "lix_json_get" | "lix_json_get_text" if args.len() >= 2 => {}
                 "lix_text_encode" | "lix_text_decode" if (1..=2).contains(&args.len()) => {}
@@ -1404,8 +1379,8 @@ fn column_eval_value(
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
         "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
-        "lixcol_version_id" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.version_id.clone(),
+        "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.branch_id.clone(),
         ))),
         _ => Ok(EntityEvalValue::SqlNull),
     }
@@ -1423,126 +1398,126 @@ fn visible_column_eval_value(
     }
 }
 
-fn scan_version_ids(scope: &VersionScope) -> Result<Vec<String>, LixError> {
+fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
     Ok(match scope {
-        VersionScope::Active { version_id } => vec![version_id.clone()],
-        VersionScope::Explicit { version_ids } | VersionScope::ExplicitRequired { version_ids } => {
-            version_ids.iter().cloned().collect()
+        BranchScope::Active { branch_id } => vec![branch_id.clone()],
+        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
+            branch_ids.iter().cloned().collect()
         }
-        VersionScope::ExplicitDynamic { .. } | VersionScope::ExplicitRequiredDynamic { .. } => {
+        BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "parameterized version scope was not resolved before write execution",
+                "parameterized branch scope was not resolved before write execution",
             ));
         }
-        VersionScope::Global => vec![crate::GLOBAL_VERSION_ID.to_string()],
-        VersionScope::Empty => Vec::new(),
+        BranchScope::Global => vec![crate::GLOBAL_BRANCH_ID.to_string()],
+        BranchScope::Empty => Vec::new(),
     })
 }
 
-fn entity_row_version_id(
+fn entity_row_branch_id(
     plan: &LogicalWritePlan,
-    explicit_version_id: Option<String>,
+    explicit_branch_id: Option<String>,
     global: bool,
 ) -> Result<String, LixError> {
     if global {
-        let target_version_ids = insert_target_version_ids(&plan.bound.version_scope);
-        let target_is_by_version = matches!(
+        let target_branch_ids = insert_target_branch_ids(&plan.bound.branch_scope);
+        let target_is_by_branch = matches!(
             &plan.bound.target,
-            BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
+            BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
         );
-        if explicit_version_id
+        if explicit_branch_id
             .as_deref()
-            .is_some_and(|version_id| version_id != crate::GLOBAL_VERSION_ID)
+            .is_some_and(|branch_id| branch_id != crate::GLOBAL_BRANCH_ID)
         {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "entity INSERT cannot combine lixcol_global = true with a non-global lixcol_version_id",
+                "entity INSERT cannot combine lixcol_global = true with a non-global lixcol_branch_id",
             ));
         }
-        if target_is_by_version
-            && target_version_ids.iter().any(|version_ids| {
-                !version_ids
+        if target_is_by_branch
+            && target_branch_ids.iter().any(|branch_ids| {
+                !branch_ids
                     .iter()
-                    .any(|version_id| version_id == crate::GLOBAL_VERSION_ID)
+                    .any(|branch_id| branch_id == crate::GLOBAL_BRANCH_ID)
             })
         {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                "entity INSERT cannot combine lixcol_global = true with a non-global target version",
+                "entity INSERT cannot combine lixcol_global = true with a non-global target branch",
             ));
         }
-        return Ok(crate::GLOBAL_VERSION_ID.to_string());
+        return Ok(crate::GLOBAL_BRANCH_ID.to_string());
     }
-    if explicit_version_id.as_deref() == Some(crate::GLOBAL_VERSION_ID) {
+    if explicit_branch_id.as_deref() == Some(crate::GLOBAL_BRANCH_ID) {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
-            "entity INSERT with lixcol_version_id = 'global' must also set lixcol_global = true",
+            "entity INSERT with lixcol_branch_id = 'global' must also set lixcol_global = true",
         ));
     }
-    let target_is_by_version = matches!(
+    let target_is_by_branch = matches!(
         &plan.bound.target,
-        BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
+        BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
     );
-    if target_is_by_version && matches!(plan.bound.version_scope, VersionScope::Global) {
+    if target_is_by_branch && matches!(plan.bound.branch_scope, BranchScope::Global) {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
             "entity INSERT into the global scope must set lixcol_global = true",
         ));
     }
-    if let Some(version_id) = explicit_version_id {
-        if target_is_by_version {
-            let target_version_ids = insert_target_version_ids(&plan.bound.version_scope);
-            if let Some(target_version_ids) = &target_version_ids {
-                if !target_version_ids.contains(&version_id) {
+    if let Some(branch_id) = explicit_branch_id {
+        if target_is_by_branch {
+            let target_branch_ids = insert_target_branch_ids(&plan.bound.branch_scope);
+            if let Some(target_branch_ids) = &target_branch_ids {
+                if !target_branch_ids.contains(&branch_id) {
                     return Err(LixError::new(
                         LixError::CODE_TYPE_MISMATCH,
                         format!(
-                            "entity INSERT lixcol_version_id '{version_id}' does not match the target version scope"
+                            "entity INSERT lixcol_branch_id '{branch_id}' does not match the target branch scope"
                         ),
                     ));
                 }
             } else {
                 return Err(LixError::new(
                     LixError::CODE_TYPE_MISMATCH,
-                    "entity INSERT has no target version scope",
+                    "entity INSERT has no target branch scope",
                 ));
             }
         }
-        return Ok(version_id);
+        return Ok(branch_id);
     }
-    match &plan.bound.version_scope {
-        VersionScope::Active { version_id } => Ok(version_id.clone()),
-        VersionScope::ExplicitRequired { version_ids } if version_ids.len() == 1 => {
-            Ok(version_ids.iter().next().expect("len checked").clone())
+    match &plan.bound.branch_scope {
+        BranchScope::Active { branch_id } => Ok(branch_id.clone()),
+        BranchScope::ExplicitRequired { branch_ids } if branch_ids.len() == 1 => {
+            Ok(branch_ids.iter().next().expect("len checked").clone())
         }
-        VersionScope::Explicit { version_ids } if version_ids.len() == 1 => {
-            Ok(version_ids.iter().next().expect("len checked").clone())
+        BranchScope::Explicit { branch_ids } if branch_ids.len() == 1 => {
+            Ok(branch_ids.iter().next().expect("len checked").clone())
         }
-        VersionScope::ExplicitDynamic { .. } | VersionScope::ExplicitRequiredDynamic { .. } => {
+        BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => {
             Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "parameterized version scope was not resolved before write execution",
+                "parameterized branch scope was not resolved before write execution",
             ))
         }
-        VersionScope::Global => Ok(crate::GLOBAL_VERSION_ID.to_string()),
-        VersionScope::Empty => Ok(crate::GLOBAL_VERSION_ID.to_string()),
+        BranchScope::Global => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
+        BranchScope::Empty => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "entity write requires exactly one target version",
+            "entity write requires exactly one target branch",
         )),
     }
 }
 
-fn insert_target_version_ids(scope: &VersionScope) -> Option<Vec<String>> {
+fn insert_target_branch_ids(scope: &BranchScope) -> Option<Vec<String>> {
     match scope {
-        VersionScope::Active { version_id } => Some(vec![version_id.clone()]),
-        VersionScope::Explicit { version_ids } | VersionScope::ExplicitRequired { version_ids } => {
-            Some(version_ids.iter().cloned().collect())
+        BranchScope::Active { branch_id } => Some(vec![branch_id.clone()]),
+        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
+            Some(branch_ids.iter().cloned().collect())
         }
-        VersionScope::ExplicitDynamic { .. } | VersionScope::ExplicitRequiredDynamic { .. } => None,
-        VersionScope::Global => Some(vec![crate::GLOBAL_VERSION_ID.to_string()]),
-        VersionScope::Empty => Some(Vec::new()),
+        BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => None,
+        BranchScope::Global => Some(vec![crate::GLOBAL_BRANCH_ID.to_string()]),
+        BranchScope::Empty => Some(Vec::new()),
     }
 }
 

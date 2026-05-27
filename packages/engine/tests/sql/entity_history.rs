@@ -38,7 +38,7 @@ simulation_test!(
             .await
             .expect("entity insert should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first head should load")
             .expect("first head should exist");
@@ -53,7 +53,7 @@ simulation_test!(
             .await
             .expect("entity update should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second head should load")
             .expect("second head should exist");
@@ -179,7 +179,7 @@ simulation_test!(
             .execute(
                 "SELECT id \
                  FROM engine_history_bare_error_schema_history \
-                 WHERE start_commit_id = lix_active_version_commit_id()",
+                 WHERE start_commit_id = lix_active_branch_commit_id()",
                 &[],
             )
             .await

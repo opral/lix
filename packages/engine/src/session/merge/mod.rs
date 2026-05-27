@@ -1,10 +1,10 @@
 mod analysis;
+mod branch;
 mod conflicts;
 mod stats;
-mod version;
 
-pub use version::{
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    MergeVersionOptions, MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions,
-    MergeVersionReceipt,
+pub use branch::{
+    MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
+    MergeConflictKind, MergeConflictSide,
 };

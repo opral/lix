@@ -12,7 +12,7 @@ use crate::common::{
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 
 use super::filesystem_visibility::VisibleFilesystem;
 use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
@@ -45,7 +45,7 @@ pub(crate) struct FilesystemDeletePlan {
 /// Common state-row lane fields shared by filesystem descriptor/blob rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemRowContext {
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
     pub(crate) global: bool,
     pub(crate) untracked: bool,
     pub(crate) file_id: Option<String>,
@@ -53,9 +53,9 @@ pub(crate) struct FilesystemRowContext {
 }
 
 impl FilesystemRowContext {
-    pub(crate) fn active_version(version_id: impl Into<String>) -> Self {
+    pub(crate) fn active_branch(branch_id: impl Into<String>) -> Self {
         Self {
-            version_id: version_id.into(),
+            branch_id: branch_id.into(),
             global: false,
             untracked: false,
             file_id: None,
@@ -479,8 +479,8 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "binary blob size exceeds supported range for file '{}' version '{}'",
-                input.file_id, input.context.version_id
+                "binary blob size exceeds supported range for file '{}' branch '{}'",
+                input.file_id, input.context.branch_id
             ),
         )
     })?;
@@ -547,7 +547,7 @@ pub(crate) fn plan_file_path_write(
         })?);
         file_data.push(TransactionFileData {
             file_id,
-            version_id: input.context.version_id,
+            branch_id: input.context.branch_id,
             untracked: input.context.untracked,
             data,
         });
@@ -676,13 +676,13 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
         let Some(snapshot_content) = row.snapshot_content.as_deref() else {
             continue;
         };
-        let storage_version_id = if row.global {
-            GLOBAL_VERSION_ID
+        let storage_branch_id = if row.global {
+            GLOBAL_BRANCH_ID
         } else {
-            row.version_id.as_str()
+            row.branch_id.as_str()
         };
         let resolver_key = filesystem_storage_scope_key(
-            storage_version_id,
+            storage_branch_id,
             row.global,
             row.untracked,
             row.file_id.as_deref(),
@@ -724,7 +724,7 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
     }
 
     let mut resolvers = BTreeMap::new();
-    for (version_id, records) in directory_rows {
+    for (branch_id, records) in directory_rows {
         let mut paths = BTreeMap::<String, String>::new();
         for directory_id in records.keys() {
             resolve_directory_seed_path(directory_id, &records, &mut paths, &mut BTreeSet::new())?;
@@ -733,15 +733,15 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
             .into_iter()
             .map(|(directory_id, path)| (path, directory_id))
             .collect::<Vec<_>>();
-        let files = file_rows.remove(&version_id).unwrap_or_default();
+        let files = file_rows.remove(&branch_id).unwrap_or_default();
         resolvers.insert(
-            version_id,
+            branch_id,
             DirectoryPathResolver::from_existing_filesystem(seeds, files)?,
         );
     }
-    for (version_id, files) in file_rows {
+    for (branch_id, files) in file_rows {
         resolvers.insert(
-            version_id,
+            branch_id,
             DirectoryPathResolver::from_existing_filesystem(std::iter::empty(), files)?,
         );
     }
@@ -749,13 +749,13 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
 }
 
 pub(crate) fn filesystem_storage_scope_key(
-    version_id: &str,
+    branch_id: &str,
     global: bool,
     untracked: bool,
     file_id: Option<&str>,
 ) -> String {
     format!(
-        "version={version_id}\0global={global}\0untracked={untracked}\0file_id={}",
+        "branch={branch_id}\0global={global}\0untracked={untracked}\0file_id={}",
         file_id.unwrap_or("<null>")
     )
 }
@@ -838,7 +838,7 @@ fn partial_state_row(
         change_id: None,
         commit_id: None,
         untracked: context.untracked,
-        version_id: context.version_id,
+        branch_id: context.branch_id,
     }
 }
 
@@ -920,7 +920,7 @@ mod tests {
             parent_id: None,
             name: "docs".to_string(),
             hidden: false,
-            context: FilesystemRowContext::active_version("version-a"),
+            context: FilesystemRowContext::active_branch("branch-a"),
         });
 
         assert_eq!(
@@ -928,7 +928,7 @@ mod tests {
             Some(&crate::entity_pk::EntityPk::single("dir-docs"))
         );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
-        assert_eq!(row.version_id, "version-a");
+        assert_eq!(row.branch_id, "branch-a");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-docs");
         assert_eq!(snapshot["parent_id"], JsonValue::Null);
@@ -943,7 +943,7 @@ mod tests {
             directory_id: Some("dir-docs".to_string()),
             name: "readme.md".to_string(),
             hidden: false,
-            context: FilesystemRowContext::active_version("version-a"),
+            context: FilesystemRowContext::active_branch("branch-a"),
         });
 
         assert_eq!(
@@ -961,7 +961,7 @@ mod tests {
         let row = blob_ref_row(BlobRefRowInput {
             file_id: "file-readme".to_string(),
             data: b"Hello".to_vec(),
-            context: FilesystemRowContext::active_version("version-a"),
+            context: FilesystemRowContext::active_branch("branch-a"),
         })
         .expect("blob ref row should build");
 
@@ -988,7 +988,7 @@ mod tests {
         let rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_version("version-a"),
+                FilesystemRowContext::active_branch("branch-a"),
                 false,
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
@@ -1015,7 +1015,7 @@ mod tests {
         let docs_rows = resolver
             .ensure_directory_path(
                 "/docs/",
-                FilesystemRowContext::active_version("version-a"),
+                FilesystemRowContext::active_branch("branch-a"),
                 false,
                 &mut test_id_generator(&["dir-generated-docs"]),
             )
@@ -1025,7 +1025,7 @@ mod tests {
         let nested_rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_version("version-a"),
+                FilesystemRowContext::active_branch("branch-a"),
                 false,
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
@@ -1047,7 +1047,7 @@ mod tests {
             .ensure_directory_path_with_leaf_id(
                 "/docs/nested/",
                 Some("dir-nested".to_string()),
-                FilesystemRowContext::active_version("version-a"),
+                FilesystemRowContext::active_branch("branch-a"),
                 false,
                 &mut test_id_generator(&["dir-generated-docs"]),
             )
@@ -1077,7 +1077,7 @@ mod tests {
         let rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_version("version-a"),
+                FilesystemRowContext::active_branch("branch-a"),
                 false,
                 &mut test_id_generator(&["dir-generated-docs", "dir-generated-nested"]),
             )
@@ -1087,7 +1087,7 @@ mod tests {
         let rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_version("version-a"),
+                FilesystemRowContext::active_branch("branch-a"),
                 false,
                 &mut test_id_generator(&["should-not-be-used"]),
             )
@@ -1107,7 +1107,7 @@ mod tests {
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
                 hidden: Some(false),
-                context: FilesystemRowContext::active_version("version-a"),
+                context: FilesystemRowContext::active_branch("branch-a"),
             },
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.file_data.len(), 1);
         assert_eq!(plan.file_data[0].file_id, "file-readme");
-        assert_eq!(plan.file_data[0].version_id, "version-a");
+        assert_eq!(plan.file_data[0].branch_id, "branch-a");
         assert_eq!(plan.file_data[0].data, b"hello");
         assert_eq!(plan.rows.len(), 4);
         assert_eq!(
@@ -1157,7 +1157,7 @@ mod tests {
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
                 hidden: Some(false),
-                context: FilesystemRowContext::active_version("version-a"),
+                context: FilesystemRowContext::active_branch("branch-a"),
             },
             &mut test_id_generator(&["should-not-be-used"]),
         )
@@ -1192,7 +1192,7 @@ mod tests {
             "/docs/renamed.md".to_string(),
             false,
             Some(b"hello".to_vec()),
-            FilesystemRowContext::active_version("version-a"),
+            FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("file path update should plan");
@@ -1223,7 +1223,7 @@ mod tests {
             "/docs/guides/readme.md".to_string(),
             true,
             Some(b"hello".to_vec()),
-            FilesystemRowContext::active_version("version-a"),
+            FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
         .expect("file path update should plan");
@@ -1259,12 +1259,12 @@ mod tests {
         let resolvers = super::directory_path_resolvers_from_state_rows(vec![
             live_directory_row(
                 "dir-docs",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row(
                 "dir-guides",
-                "version-a",
+                "branch-a",
                 "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
             ),
         ])
@@ -1272,10 +1272,7 @@ mod tests {
 
         let resolver = resolvers
             .get(&super::filesystem_storage_scope_key(
-                "version-a",
-                false,
-                false,
-                None,
+                "branch-a", false, false, None,
             ))
             .expect("storage-scope resolver should exist");
         assert_eq!(resolver.directory_id("/docs/").unwrap(), Some("dir-docs"));
@@ -1290,7 +1287,7 @@ mod tests {
         let plan = super::plan_file_delete(FileDeleteInput {
             file_id: "file-readme".to_string(),
             has_blob_ref: true,
-            context: FilesystemRowContext::active_version("version-a"),
+            context: FilesystemRowContext::active_branch("branch-a"),
         });
 
         assert_eq!(plan.count, 1);
@@ -1325,7 +1322,7 @@ mod tests {
         let plan = super::plan_file_delete(FileDeleteInput {
             file_id: "file-readme".to_string(),
             has_blob_ref: false,
-            context: FilesystemRowContext::active_version("version-a"),
+            context: FilesystemRowContext::active_branch("branch-a"),
         });
 
         assert_eq!(plan.count, 1);
@@ -1338,7 +1335,7 @@ mod tests {
     fn directory_delete_plans_descriptor_tombstone() {
         let plan = super::plan_directory_delete(DirectoryDeleteInput {
             directory_id: "dir-docs".to_string(),
-            context: FilesystemRowContext::active_version("version-a"),
+            context: FilesystemRowContext::active_branch("branch-a"),
         });
 
         assert_eq!(plan.count, 1);
@@ -1354,7 +1351,7 @@ mod tests {
 
     #[test]
     fn recursive_directory_delete_plans_files_blobs_and_deepest_directories_first() {
-        let context = FilesystemRowContext::active_version("version-a");
+        let context = FilesystemRowContext::active_branch("branch-a");
         let mut directories_by_id = BTreeMap::new();
         directories_by_id.insert(
             "dir-docs".to_string(),
@@ -1466,7 +1463,7 @@ mod tests {
 
     fn live_directory_row(
         entity_pk: &str,
-        version_id: &str,
+        branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
@@ -1476,7 +1473,7 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,

@@ -1,7 +1,7 @@
 use lix_engine::{LixError, Value};
 
 simulation_test!(
-    read_only_version_components_reject_direct_entity_writes,
+    read_only_branch_components_reject_direct_entity_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -15,42 +15,42 @@ simulation_test!(
         assert_read_only_error(
             session
                 .execute(
-                    "INSERT INTO lix_version_descriptor (id, name, hidden) \
+                    "INSERT INTO lix_branch_descriptor (id, name, hidden) \
                      VALUES ('orphan-descriptor', 'Orphan', false)",
                     &[],
                 )
                 .await
                 .expect_err("descriptor insert should be read-only"),
-            "lix_version_descriptor",
-            "lix_version",
+            "lix_branch_descriptor",
+            "lix_branch",
         );
 
         assert_read_only_error(
             session
                 .execute(
-                    "UPDATE lix_version_descriptor SET name = 'Renamed' \
+                    "UPDATE lix_branch_descriptor SET name = 'Renamed' \
                      WHERE id = 'main'",
                     &[],
                 )
                 .await
                 .expect_err("descriptor update should be read-only"),
-            "lix_version_descriptor",
-            "lix_version",
+            "lix_branch_descriptor",
+            "lix_branch",
         );
 
         assert_read_only_error(
             session
-                .execute("DELETE FROM lix_version_ref WHERE id = 'main'", &[])
+                .execute("DELETE FROM lix_branch_ref WHERE id = 'main'", &[])
                 .await
                 .expect_err("ref delete should be read-only"),
-            "lix_version_ref",
-            "lix_version",
+            "lix_branch_ref",
+            "lix_branch",
         );
     }
 );
 
 simulation_test!(
-    read_only_version_components_reject_lix_state_writes,
+    read_only_branch_components_reject_lix_state_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -65,19 +65,19 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) \
-                     VALUES (lix_json('[\"orphan-descriptor\"]'), 'lix_version_descriptor', \
+                     VALUES (lix_json('[\"orphan-descriptor\"]'), 'lix_branch_descriptor', \
                        lix_json('{\"id\":\"orphan-descriptor\",\"name\":\"Orphan\"}'))",
                     &[],
                 )
                 .await
                 .expect_err("descriptor insert via lix_state should be read-only"),
-            "lix_version_descriptor",
-            "lix_version",
+            "lix_branch_descriptor",
+            "lix_branch",
         );
 
         let descriptor_count = session
             .execute(
-                "SELECT COUNT(*) FROM lix_version_descriptor WHERE id = 'orphan-descriptor'",
+                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = 'orphan-descriptor'",
                 &[],
             )
             .await

@@ -5,7 +5,7 @@ use crate::live_state::{LiveStateRowIdentity, MaterializedLiveStateRow};
 /// Applies the local untracked overlay to tracked live-state rows.
 ///
 /// The visible live-state contract is "latest local untracked row wins" for
-/// the same version/schema/entity/file identity. This keeps SQL providers from
+/// the same branch/schema/entity/file identity. This keeps SQL providers from
 /// knowing whether a visible row came from tracked changelog projection or from
 /// local untracked state.
 pub(crate) fn overlay_untracked_rows(
@@ -69,7 +69,7 @@ mod tests {
             change_id: change_id.map(str::to_string),
             commit_id: None,
             untracked,
-            version_id: "global".to_string(),
+            branch_id: "global".to_string(),
         }
     }
 }
