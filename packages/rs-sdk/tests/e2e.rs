@@ -1,12 +1,12 @@
 use lix_rs_sdk::{
-    open_lix, CreateVersionOptions, InMemoryBackend, LixError, MergeVersionOptions,
-    MergeVersionOutcome, OpenLixOptions, SwitchVersionOptions, Value,
+    open_lix, CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
 };
 
 #[tokio::test]
-async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
+async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-    let main_version_id = lix.active_version_id().await.unwrap();
+    let main_branch_id = lix.active_branch_id().await.unwrap();
 
     register_crm_task_schema(&lix).await;
 
@@ -34,19 +34,19 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
     assert_eq!(task_done(&lix, "task-1").await, false);
 
     let draft = lix
-        .create_version(CreateVersionOptions {
-            id: Some("draft-version".to_string()),
+        .create_branch(CreateBranchOptions {
+            id: Some("draft-branch".to_string()),
             name: "Draft".to_string(),
             from_commit_id: None,
         })
         .await
         .unwrap();
-    assert_eq!(draft.id, "draft-version");
+    assert_eq!(draft.id, "draft-branch");
     assert_eq!(draft.name, "Draft");
     assert!(!draft.hidden);
 
-    lix.switch_version(SwitchVersionOptions {
-        version_id: draft.id.clone(),
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: draft.id.clone(),
     })
     .await
     .unwrap();
@@ -60,8 +60,8 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
 
     assert_eq!(task_done(&lix, "task-1").await, true);
 
-    lix.switch_version(SwitchVersionOptions {
-        version_id: main_version_id.clone(),
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: main_branch_id.clone(),
     })
     .await
     .unwrap();
@@ -69,14 +69,14 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
     assert_eq!(task_done(&lix, "task-1").await, false);
 
     let merge = lix
-        .merge_version(MergeVersionOptions {
-            source_version_id: draft.id,
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: draft.id,
         })
         .await
         .unwrap();
 
-    assert_eq!(merge.outcome, MergeVersionOutcome::FastForward);
-    assert_eq!(merge.target_version_id, main_version_id);
+    assert_eq!(merge.outcome, MergeBranchOutcome::FastForward);
+    assert_eq!(merge.target_branch_id, main_branch_id);
     assert_eq!(merge.change_stats.total, 1);
     assert_eq!(merge.change_stats.modified, 1);
     assert_eq!(merge.created_merge_commit_id, None);
@@ -103,9 +103,9 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     assert_closed(error);
 
     let error = lix
-        .active_version_id()
+        .active_branch_id()
         .await
-        .expect_err("active_version_id after close should fail");
+        .expect_err("active_branch_id after close should fail");
     assert_closed(error);
 }
 

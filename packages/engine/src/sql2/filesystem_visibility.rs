@@ -28,11 +28,11 @@ pub(crate) struct VisibleFilesystem {
 }
 
 impl VisibleFilesystem {
-    /// Loads filesystem rows for a single version from execution-visible live
+    /// Loads filesystem rows for a single branch from execution-visible live
     /// state and builds lookup indexes used by filesystem write planning.
     pub(crate) async fn load(
         live_state: Arc<dyn LiveStateReader>,
-        version_id: &str,
+        branch_id: &str,
     ) -> Result<Self, LixError> {
         let rows = live_state
             .scan_rows(&LiveStateScanRequest {
@@ -42,7 +42,7 @@ impl VisibleFilesystem {
                         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                         BLOB_REF_SCHEMA_KEY.to_string(),
                     ],
-                    version_ids: vec![version_id.to_string()],
+                    branch_ids: vec![branch_id.to_string()],
                     ..LiveStateFilter::default()
                 },
                 ..LiveStateScanRequest::default()
@@ -185,7 +185,7 @@ fn filesystem_row_context(
     row: &MaterializedLiveStateRow,
 ) -> Result<FilesystemRowContext, LixError> {
     Ok(FilesystemRowContext {
-        version_id: row.version_id.clone(),
+        branch_id: row.branch_id.clone(),
         global: row.global,
         untracked: row.untracked,
         file_id: row.file_id.clone(),
@@ -232,7 +232,7 @@ mod tests {
                     r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides","hidden":false}"#,
                 ),
             ]),
-            "version-a",
+            "branch-a",
         )
         .await
         .expect("visible filesystem should load");
@@ -261,7 +261,7 @@ mod tests {
                 "file-readme",
                 r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md","hidden":false}"#,
             )]),
-            "version-a",
+            "branch-a",
         )
         .await
         .expect("visible filesystem should load");
@@ -283,7 +283,7 @@ mod tests {
                 "file-readme",
                 r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
             )]),
-            "version-a",
+            "branch-a",
         )
         .await
         .expect("visible filesystem should load");
@@ -316,8 +316,8 @@ mod tests {
                 .filter(|row| {
                     (request.filter.schema_keys.is_empty()
                         || request.filter.schema_keys.contains(&row.schema_key))
-                        && (request.filter.version_ids.is_empty()
-                            || request.filter.version_ids.contains(&row.version_id))
+                        && (request.filter.branch_ids.is_empty()
+                            || request.filter.branch_ids.contains(&row.branch_id))
                 })
                 .cloned()
                 .collect())
@@ -371,7 +371,7 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            version_id: "version-a".to_string(),
+            branch_id: "branch-a".to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,

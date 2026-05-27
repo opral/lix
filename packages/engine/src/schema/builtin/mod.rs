@@ -12,8 +12,8 @@ const LIX_LABEL_ASSIGNMENT_SCHEMA_KEY: &str = "lix_label_assignment";
 const LIX_CHANGE_SCHEMA_KEY: &str = "lix_change";
 const LIX_CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const LIX_COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const LIX_VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
-const LIX_VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
+const LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY: &str = "lix_branch_descriptor";
+const LIX_BRANCH_REF_SCHEMA_KEY: &str = "lix_branch_ref";
 const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -28,8 +28,8 @@ const LIX_LABEL_ASSIGNMENT_SCHEMA_JSON: &str = include_str!("lix_label_assignmen
 const LIX_CHANGE_SCHEMA_JSON: &str = include_str!("lix_change.json");
 const LIX_CHANGE_AUTHOR_SCHEMA_JSON: &str = include_str!("lix_change_author.json");
 const LIX_COMMIT_SCHEMA_JSON: &str = include_str!("lix_commit.json");
-const LIX_VERSION_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_version_descriptor.json");
-const LIX_VERSION_REF_SCHEMA_JSON: &str = include_str!("lix_version_ref.json");
+const LIX_BRANCH_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_branch_descriptor.json");
+const LIX_BRANCH_REF_SCHEMA_JSON: &str = include_str!("lix_branch_ref.json");
 const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
 const LIX_FILE_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_file_descriptor.json");
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_directory_descriptor.json");
@@ -44,8 +44,8 @@ static LIX_LABEL_ASSIGNMENT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_AUTHOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static LIX_VERSION_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
-static LIX_VERSION_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_BRANCH_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_BRANCH_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_EDGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_FILE_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_DIRECTORY_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -61,8 +61,8 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_CHANGE_SCHEMA_KEY,
     LIX_CHANGE_AUTHOR_SCHEMA_KEY,
     LIX_COMMIT_SCHEMA_KEY,
-    LIX_VERSION_DESCRIPTOR_SCHEMA_KEY,
-    LIX_VERSION_REF_SCHEMA_KEY,
+    LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY,
+    LIX_BRANCH_REF_SCHEMA_KEY,
     LIX_COMMIT_EDGE_SCHEMA_KEY,
     LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
     LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -121,16 +121,14 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
             LIX_COMMIT_SCHEMA
                 .get_or_init(|| parse_builtin_schema("lix_commit.json", LIX_COMMIT_SCHEMA_JSON)),
         ),
-        LIX_VERSION_DESCRIPTOR_SCHEMA_KEY => {
-            Some(LIX_VERSION_DESCRIPTOR_SCHEMA.get_or_init(|| {
-                parse_builtin_schema(
-                    "lix_version_descriptor.json",
-                    LIX_VERSION_DESCRIPTOR_SCHEMA_JSON,
-                )
-            }))
-        }
-        LIX_VERSION_REF_SCHEMA_KEY => Some(LIX_VERSION_REF_SCHEMA.get_or_init(|| {
-            parse_builtin_schema("lix_version_ref.json", LIX_VERSION_REF_SCHEMA_JSON)
+        LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY => Some(LIX_BRANCH_DESCRIPTOR_SCHEMA.get_or_init(|| {
+            parse_builtin_schema(
+                "lix_branch_descriptor.json",
+                LIX_BRANCH_DESCRIPTOR_SCHEMA_JSON,
+            )
+        })),
+        LIX_BRANCH_REF_SCHEMA_KEY => Some(LIX_BRANCH_REF_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_branch_ref.json", LIX_BRANCH_REF_SCHEMA_JSON)
         })),
         LIX_COMMIT_EDGE_SCHEMA_KEY => Some(LIX_COMMIT_EDGE_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_commit_edge.json", LIX_COMMIT_EDGE_SCHEMA_JSON)
@@ -165,8 +163,8 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
         LIX_CHANGE_SCHEMA_KEY => Some(LIX_CHANGE_SCHEMA_JSON),
         LIX_CHANGE_AUTHOR_SCHEMA_KEY => Some(LIX_CHANGE_AUTHOR_SCHEMA_JSON),
         LIX_COMMIT_SCHEMA_KEY => Some(LIX_COMMIT_SCHEMA_JSON),
-        LIX_VERSION_DESCRIPTOR_SCHEMA_KEY => Some(LIX_VERSION_DESCRIPTOR_SCHEMA_JSON),
-        LIX_VERSION_REF_SCHEMA_KEY => Some(LIX_VERSION_REF_SCHEMA_JSON),
+        LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY => Some(LIX_BRANCH_DESCRIPTOR_SCHEMA_JSON),
+        LIX_BRANCH_REF_SCHEMA_KEY => Some(LIX_BRANCH_REF_SCHEMA_JSON),
         LIX_COMMIT_EDGE_SCHEMA_KEY => Some(LIX_COMMIT_EDGE_SCHEMA_JSON),
         LIX_FILE_DESCRIPTOR_SCHEMA_KEY => Some(LIX_FILE_DESCRIPTOR_SCHEMA_JSON),
         LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY => Some(LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON),

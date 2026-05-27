@@ -83,9 +83,9 @@ pub(crate) fn require_writable_column(
         BoundWriteOp::Delete => false,
     };
     if !allowed {
-        if table.name == "lix_version" && column_name == "id" && op == BoundWriteOp::Update {
+        if table.name == "lix_branch" && column_name == "id" && op == BoundWriteOp::Update {
             return Err(super::error::unsupported(
-                "UPDATE lix_version cannot change immutable column 'id'",
+                "UPDATE lix_branch cannot change immutable column 'id'",
             ));
         }
         return Err(super::error::unsupported(format!(
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn base_entity_table_does_not_expose_version_column() {
+    fn base_entity_table_does_not_expose_branch_column() {
         let catalog = catalog();
         let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
             .expect("base entity table should bind");
@@ -152,27 +152,27 @@ mod tests {
             PublicSurfaceKind::EntityBase { .. }
         ));
         assert!(require_public_column(&table, "name").is_ok());
-        let error = require_public_column(&table, "lixcol_version_id")
-            .expect_err("base entity surface should not expose version column");
+        let error = require_public_column(&table, "lixcol_branch_id")
+            .expect_err("base entity surface should not expose branch column");
         assert!(error.message.contains("does not exist"));
     }
 
     #[test]
-    fn by_version_entity_exposes_lixcol_version_id_without_version_id_alias() {
+    fn by_branch_entity_exposes_lixcol_branch_id_without_branch_id_alias() {
         let catalog = catalog();
         let table = bind_public_table(
             &catalog,
-            &table_name("SELECT * FROM test_state_schema_by_version"),
+            &table_name("SELECT * FROM test_state_schema_by_branch"),
         )
-        .expect("by-version entity table should bind");
+        .expect("by-branch entity table should bind");
 
         assert!(matches!(
             table.surface.kind,
-            PublicSurfaceKind::EntityByVersion { .. }
+            PublicSurfaceKind::EntityByBranch { .. }
         ));
-        assert!(require_public_column(&table, "lixcol_version_id").is_ok());
-        let error = require_public_column(&table, "version_id")
-            .expect_err("by-version entity surface should not alias version_id");
+        assert!(require_public_column(&table, "lixcol_branch_id").is_ok());
+        let error = require_public_column(&table, "branch_id")
+            .expect_err("by-branch entity surface should not alias branch_id");
         assert!(error.message.contains("does not exist"));
     }
 

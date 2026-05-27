@@ -16,7 +16,7 @@ use crate::transaction::types::{
     TransactionWriteOutcome,
 };
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRefs};
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local write buffer after transaction-boundary preparation.
@@ -30,8 +30,8 @@ pub(crate) struct TransactionWriteBuffer {
     rows: Mutex<Vec<Option<PreparedStateRow>>>,
     by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
     insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>>,
-    commit_change_refs_by_version: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
-    extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
+    commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
+    extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<String>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
 }
 
@@ -45,8 +45,8 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) state_rows: Vec<PreparedStateRow>,
     pub(crate) insert_identities:
         BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>,
-    pub(crate) commit_change_refs_by_version: BTreeMap<String, StagedCommitChangeRefs>,
-    pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
+    pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
+    pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<String>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
 }
 
@@ -140,15 +140,15 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
-    pub(crate) fn version_id(&self) -> &str {
+    pub(crate) fn branch_id(&self) -> &str {
         match self {
-            Self::State(row) => &row.version_id,
+            Self::State(row) => &row.branch_id,
         }
     }
 
     pub(crate) fn domain(&self) -> Domain {
         Domain::exact_file(
-            self.version_id().to_string(),
+            self.branch_id().to_string(),
             self.untracked(),
             self.file_id().clone(),
         )
@@ -272,8 +272,8 @@ impl TransactionWriteBuffer {
             rows: Mutex::new(Vec::new()),
             by_identity: Mutex::new(HashMap::new()),
             insert_identities: Mutex::new(BTreeMap::new()),
-            commit_change_refs_by_version: Mutex::new(BTreeMap::new()),
-            extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
+            commit_change_refs_by_branch: Mutex::new(BTreeMap::new()),
+            extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
     }
@@ -305,51 +305,50 @@ impl TransactionWriteBuffer {
             )
         })?;
         let mut commit_change_refs_guard =
-            self.commit_change_refs_by_version.lock().map_err(|_| {
+            self.commit_change_refs_by_branch.lock().map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     "failed to acquire transaction staged commit change refs lock",
                 )
             })?;
-        let mut extra_parents_guard =
-            self.extra_commit_parents_by_version.lock().map_err(|_| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "failed to acquire transaction staged extra commit parents lock",
-                )
-            })?;
+        let mut extra_parents_guard = self.extra_commit_parents_by_branch.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged extra commit parents lock",
+            )
+        })?;
         let result = Ok(PreparedWriteSet {
             state_rows: std::mem::take(&mut *rows_guard)
                 .into_iter()
                 .flatten()
                 .collect(),
             insert_identities: std::mem::take(&mut *insert_identities_guard),
-            commit_change_refs_by_version: std::mem::take(&mut *commit_change_refs_guard),
-            extra_commit_parents_by_version: std::mem::take(&mut *extra_parents_guard),
+            commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
+            extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         });
         by_identity_guard.clear();
         result
     }
 
-    /// Records an additional parent for the commit generated for `version_id`.
+    /// Records an additional parent for the commit generated for `branch_id`.
     ///
-    /// Normal writes parent the new commit to the version's previous head.
-    /// Merges add the source version head as an extra parent so the commit graph
+    /// Normal writes parent the new commit to the branch's previous head.
+    /// Merges add the source branch head as an extra parent so the commit graph
     /// preserves branch ancestry while tracked-state roots still apply source
     /// rows onto the target root.
     pub(crate) fn add_commit_parent(
         &self,
-        version_id: String,
+        branch_id: String,
         parent_commit_id: String,
     ) -> Result<(), LixError> {
-        let mut guard = self.extra_commit_parents_by_version.lock().map_err(|_| {
+        let mut guard = self.extra_commit_parents_by_branch.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged extra commit parents lock",
             )
         })?;
-        let parents = guard.entry(version_id).or_default();
+        let parents = guard.entry(branch_id).or_default();
         if !parents.contains(&parent_commit_id) {
             parents.push(parent_commit_id);
         }
@@ -358,17 +357,17 @@ impl TransactionWriteBuffer {
 
     pub(crate) fn stage_selected_commit_change_refs(
         &self,
-        version_id: String,
+        branch_id: String,
         selected_change_refs: impl IntoIterator<Item = StagedCommitChangeRef>,
     ) -> Result<String, LixError> {
         let mut functions = self.functions.clone();
-        let mut guard = self.commit_change_refs_by_version.lock().map_err(|_| {
+        let mut guard = self.commit_change_refs_by_branch.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged commit change refs lock",
             )
         })?;
-        let change_refs = guard.entry(version_id).or_insert_with(|| {
+        let change_refs = guard.entry(branch_id).or_insert_with(|| {
             StagedCommitChangeRefs::new(
                 functions.uuid_v7(),
                 functions.uuid_v7(),
@@ -418,7 +417,7 @@ impl TransactionWriteBuffer {
             )
         })?;
         let mut commit_change_refs_guard =
-            self.commit_change_refs_by_version.lock().map_err(|_| {
+            self.commit_change_refs_by_branch.lock().map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     "failed to acquire transaction staged commit change refs lock",
@@ -431,10 +430,10 @@ impl TransactionWriteBuffer {
             )
         })?;
         for mut row in rows {
-            if row.global && row.version_id != GLOBAL_VERSION_ID {
+            if row.global && row.branch_id != GLOBAL_BRANCH_ID {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    "global staged rows must use the global version id",
+                    "global staged rows must use the global branch id",
                 ));
             }
             let identity = PreparedStateRowIdentity::from(&row);
@@ -523,8 +522,8 @@ impl PreparedStateRowOverlay {
             self.scan_parts(request)?.rows,
             Vec::new(),
             &crate::live_state::VisibilityRequest {
-                version_scope: crate::live_state::VisibilityVersionScope::VersionIds {
-                    version_ids: request.filter.version_ids.clone(),
+                branch_scope: crate::live_state::VisibilityBranchScope::BranchIds {
+                    branch_ids: request.filter.branch_ids.clone(),
                 },
                 include_tombstones: request.filter.include_tombstones,
                 limit: None,
@@ -632,7 +631,7 @@ pub(crate) struct PreparedStateRowIdentity {
     schema_key: String,
     entity_pk: crate::entity_pk::EntityPk,
     file_id: Option<String>,
-    version_id: String,
+    branch_id: String,
 }
 
 impl PreparedStateRowIdentity {
@@ -642,7 +641,7 @@ impl PreparedStateRowIdentity {
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
         }
     }
 
@@ -659,7 +658,7 @@ impl PreparedStateRowIdentity {
             schema_key: request.schema_key.clone(),
             entity_pk: request.entity_pk.clone(),
             file_id,
-            version_id: request.version_id.clone(),
+            branch_id: request.branch_id.clone(),
         })
     }
 
@@ -672,11 +671,7 @@ impl PreparedStateRowIdentity {
     }
 
     pub(crate) fn domain(&self) -> Domain {
-        Domain::exact_file(
-            self.version_id.clone(),
-            self.untracked,
-            self.file_id.clone(),
-        )
+        Domain::exact_file(self.branch_id.clone(), self.untracked, self.file_id.clone())
     }
 }
 
@@ -693,7 +688,7 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
         }
     }
 }
@@ -720,13 +715,13 @@ fn duplicate_staged_present_row_error(
     let message = logical_primary_key_violation_message(row.origin.as_ref())
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_pk '{}' in version '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_pk '{}' in branch '{}'",
                 row.schema_key,
                 previous
                     .entity_pk
                     .as_json_array_text()
                     .unwrap_or_else(|_| "<invalid entity_pk>".to_string()),
-                row.version_id
+                row.branch_id
             )
         });
     LixError::new(LixError::CODE_UNIQUE, message)
@@ -735,7 +730,7 @@ fn duplicate_staged_present_row_error(
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
     entity_pk: &crate::entity_pk::EntityPk,
-    version_id: Option<&str>,
+    branch_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
 ) -> String {
     if let Some(message) = logical_primary_key_violation_message(origin) {
@@ -744,9 +739,9 @@ pub(crate) fn duplicate_insert_identity_message(
     let entity_pk = entity_pk
         .as_json_array_text()
         .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
-    match version_id {
-        Some(version_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}' in version '{version_id}'"
+    match branch_id {
+        Some(branch_id) => format!(
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}' in branch '{branch_id}'"
         ),
         None => format!(
             "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_pk '{entity_pk}'"
@@ -758,7 +753,7 @@ fn duplicate_insert_identity_error(row: &PreparedStateRow) -> LixError {
     let message = duplicate_insert_identity_message(
         &row.schema_key,
         &row.entity_pk,
-        Some(&row.version_id),
+        Some(&row.branch_id),
         row.origin.as_ref(),
     );
     LixError::new(LixError::CODE_UNIQUE, message)
@@ -797,7 +792,7 @@ fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
 }
 
 fn add_row_to_commit_change_refs(
-    change_refs_by_version: &mut BTreeMap<String, StagedCommitChangeRefs>,
+    change_refs_by_branch: &mut BTreeMap<String, StagedCommitChangeRefs>,
     row: &mut PreparedStateRow,
     functions: &mut dyn FunctionProvider,
 ) {
@@ -808,8 +803,8 @@ fn add_row_to_commit_change_refs(
         .change_id
         .clone()
         .expect("tracked staged rows must carry change_id for commit change refs");
-    let change_refs = change_refs_by_version
-        .entry(row.version_id.clone())
+    let change_refs = change_refs_by_branch
+        .entry(row.branch_id.clone())
         .or_insert_with(|| {
             StagedCommitChangeRefs::new(
                 functions.uuid_v7(),
@@ -822,13 +817,13 @@ fn add_row_to_commit_change_refs(
 }
 
 fn remove_row_from_commit_change_refs(
-    change_refs_by_version: &mut BTreeMap<String, StagedCommitChangeRefs>,
+    change_refs_by_branch: &mut BTreeMap<String, StagedCommitChangeRefs>,
     row: &PreparedStateRow,
 ) {
     if row.untracked {
         return;
     }
-    let Some(change_refs) = change_refs_by_version.get_mut(&row.version_id) else {
+    let Some(change_refs) = change_refs_by_branch.get_mut(&row.branch_id) else {
         return;
     };
     let Some(change_id) = row.change_id.as_deref() else {
@@ -836,7 +831,7 @@ fn remove_row_from_commit_change_refs(
     };
     change_refs.remove_change_id(change_id);
     if change_refs.is_empty() {
-        change_refs_by_version.remove(&row.version_id);
+        change_refs_by_branch.remove(&row.branch_id);
     }
 }
 
@@ -853,7 +848,7 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !staged_version_matches_scan(&row.version_id, request) {
+    if !staged_branch_matches_scan(&row.branch_id, request) {
         return false;
     }
     if request
@@ -876,19 +871,19 @@ fn nullable_key_matches_filters(
             .any(|filter| nullable_key_matches_filter(value, filter))
 }
 
-fn staged_version_matches_scan(version_id: &str, request: &LiveStateScanRequest) -> bool {
-    request.filter.version_ids.is_empty()
+fn staged_branch_matches_scan(branch_id: &str, request: &LiveStateScanRequest) -> bool {
+    request.filter.branch_ids.is_empty()
         || request
             .filter
-            .version_ids
+            .branch_ids
             .iter()
-            .any(|requested| requested == version_id)
-        || (version_id == GLOBAL_VERSION_ID
+            .any(|requested| requested == branch_id)
+        || (branch_id == GLOBAL_BRANCH_ID
             && request
                 .filter
-                .version_ids
+                .branch_ids
                 .iter()
-                .any(|requested| requested != GLOBAL_VERSION_ID))
+                .any(|requested| requested != GLOBAL_BRANCH_ID))
 }
 
 fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilter<String>) -> bool {
@@ -928,7 +923,7 @@ mod tests {
         let row = overlay
             .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                version_id: "global".to_string(),
+                branch_id: "global".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("sql2-duplicate-key"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -1095,7 +1090,7 @@ mod tests {
                 rows: vec![state_row("file-readme", "descriptor")],
                 file_data: vec![TransactionFileData {
                     file_id: "file-readme".to_string(),
-                    version_id: "global".to_string(),
+                    branch_id: "global".to_string(),
                     untracked: true,
                     data: b"hello".to_vec(),
                 }],
@@ -1124,7 +1119,7 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
-            .commit_change_refs_by_version
+            .commit_change_refs_by_branch
             .get("global")
             .expect("global commit change_refs should exist");
         assert_eq!(
@@ -1145,7 +1140,7 @@ mod tests {
             .expect("untracked row should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
-        assert!(drained.commit_change_refs_by_version.is_empty());
+        assert!(drained.commit_change_refs_by_branch.is_empty());
     }
 
     #[tokio::test]
@@ -1171,7 +1166,7 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
-            .commit_change_refs_by_version
+            .commit_change_refs_by_branch
             .get("global")
             .expect("global commit change_refs should exist");
         assert_eq!(
@@ -1208,7 +1203,7 @@ mod tests {
             .iter()
             .any(|row| { row.change_id.as_deref() == Some("change-untracked") && row.untracked }));
         let change_refs = drained
-            .commit_change_refs_by_version
+            .commit_change_refs_by_branch
             .get("global")
             .expect("tracked commit member should remain in tracked domain");
         assert_eq!(
@@ -1265,23 +1260,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_track_active_version_members_separately() {
+    async fn staged_writes_track_active_branch_members_separately() {
         let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![state_row("active-version-key", "value")
+                rows: vec![state_row("active-branch-key", "value")
                     .with_tracked()
-                    .with_version("version-a")],
+                    .with_branch("branch-a")],
             })
-            .expect("active-version tracked staging should accumulate change_refs");
+            .expect("active-branch tracked staging should accumulate change_refs");
 
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
-            .commit_change_refs_by_version
-            .get("version-a")
-            .expect("active-version commit change_refs should exist");
+            .commit_change_refs_by_branch
+            .get("branch-a")
+            .expect("active-branch commit change_refs should exist");
         assert_eq!(
             change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
             vec!["test-change-id".to_string()]
@@ -1289,7 +1284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_reject_global_rows_with_non_global_version_id() {
+    async fn staged_writes_reject_global_rows_with_non_global_branch_id() {
         let staged_writes = test_staged_writes();
 
         let error = staged_writes
@@ -1297,15 +1292,15 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![{
                     let mut row = state_row("invalid-global-key", "value");
-                    row.version_id = "version-a".to_string();
+                    row.branch_id = "branch-a".to_string();
                     row
                 }],
             })
-            .expect_err("global row with non-global version should fail");
+            .expect_err("global row with non-global branch should fail");
 
         assert!(error
             .message
-            .contains("global staged rows must use the global version id"));
+            .contains("global staged rows must use the global branch id"));
     }
 
     #[tokio::test]
@@ -1323,7 +1318,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("shared-entity", "base"),
-                    state_row("shared-entity", "other-version").with_version("version-b"),
+                    state_row("shared-entity", "other-branch").with_branch("branch-b"),
                     state_row("shared-entity", "other-schema").with_schema("other_schema"),
                     state_row("shared-entity", "other-file").with_file_id("file-a"),
                     state_row("shared-entity", "tracked").with_tracked(),
@@ -1350,7 +1345,7 @@ mod tests {
             rows.iter()
                 .filter(
                     |row| row.entity_pk == crate::entity_pk::EntityPk::single("shared-entity")
-                        && row.version_id == "global"
+                        && row.branch_id == "global"
                         && row.schema_key == "lix_key_value"
                         && row.file_id.is_none()
                 )
@@ -1376,7 +1371,7 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
-            .commit_change_refs_by_version
+            .commit_change_refs_by_branch
             .get("global")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.commit_id, "test-uuid-1");
@@ -1403,7 +1398,7 @@ mod tests {
         );
         assert_eq!(
             drained
-                .commit_change_refs_by_version
+                .commit_change_refs_by_branch
                 .get("global")
                 .expect("global commit change_refs should exist")
                 .commit_id,
@@ -1456,7 +1451,7 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked: true,
-            version_id: "global".to_string(),
+            branch_id: "global".to_string(),
         }
     }
 
@@ -1469,7 +1464,7 @@ mod tests {
     fn exact_request_for_key(key: &str) -> LiveStateRowRequest {
         LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
-            version_id: "global".to_string(),
+            branch_id: "global".to_string(),
             entity_pk: crate::entity_pk::EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
@@ -1480,7 +1475,7 @@ mod tests {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 entity_pks: vec![crate::entity_pk::EntityPk::single(key)],
-                version_ids: vec!["global".to_string()],
+                branch_ids: vec!["global".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,
                 ..LiveStateFilter::default()
@@ -1493,7 +1488,7 @@ mod tests {
         fn with_schema(self, schema_key: &str) -> Self;
         fn with_file_id(self, file_id: &str) -> Self;
         fn with_tracked(self) -> Self;
-        fn with_version(self, version_id: &str) -> Self;
+        fn with_branch(self, branch_id: &str) -> Self;
         fn with_change_id(self, change_id: &str) -> Self;
     }
 
@@ -1516,9 +1511,9 @@ mod tests {
             self
         }
 
-        fn with_version(mut self, version_id: &str) -> Self {
-            self.version_id = version_id.to_string();
-            self.global = version_id == GLOBAL_VERSION_ID;
+        fn with_branch(mut self, branch_id: &str) -> Self {
+            self.branch_id = branch_id.to_string();
+            self.global = branch_id == GLOBAL_BRANCH_ID;
             self
         }
 

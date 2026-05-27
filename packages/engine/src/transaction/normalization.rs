@@ -87,10 +87,10 @@ pub(crate) fn normalize_transaction_write_row(
                 LixError::CODE_SCHEMA_DEFINITION,
                 "lix_registered_schema rows must not be scoped to a file",
             )
-            .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
+            .with_hint("Schema definitions are scoped by branch and durability only; write them with null file_id."));
         }
         let schema_domain =
-            Domain::schema_catalog(row.schema_scope_version_id().to_string(), row.untracked);
+            Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked);
         remember_pending_registered_schema(
             normalized_snapshot.as_ref().map(TransactionJson::value),
             schema_domain,
@@ -736,7 +736,7 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked: false,
-            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }
     }
 

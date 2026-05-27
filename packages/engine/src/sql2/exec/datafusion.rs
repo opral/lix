@@ -17,10 +17,10 @@ use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
-use crate::{LixError, LixNotice, SqlQueryResult, Value, GLOBAL_VERSION_ID};
+use crate::{LixError, LixNotice, SqlQueryResult, Value, GLOBAL_BRANCH_ID};
 
 use crate::sql2::predicate_typecheck::{
     json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
@@ -250,7 +250,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
             let input =
                 insert_input_plan(&session, std::sync::Arc::clone(&table_schema), plan, params)
                     .await?;
-            if plan.bound.version_scope == VersionScope::Empty {
+            if plan.bound.branch_scope == BranchScope::Empty {
                 return Ok(0);
             }
             table.insert_into(&state, input, InsertOp::Append).await
@@ -259,14 +259,14 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
             let assignments =
                 datafusion_assignments(&session, table_schema.as_ref(), plan, params)?;
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
-            if plan.bound.version_scope == VersionScope::Empty {
+            if plan.bound.branch_scope == BranchScope::Empty {
                 return Ok(0);
             }
             table.update(&state, assignments, filters).await
         }
         BoundWriteOp::Delete => {
             let filters = datafusion_write_filters(&session, table_schema.as_ref(), plan, params)?;
-            if plan.bound.version_scope == VersionScope::Empty {
+            if plan.bound.branch_scope == BranchScope::Empty {
                 return Ok(0);
             }
             table.delete_from(&state, filters).await
@@ -513,7 +513,7 @@ fn insert_column_is_omitted(values: &BoundInsertValues, field_name: &str) -> boo
 fn validate_bound_write_input(plan: &LogicalWritePlan, params: &[Value]) -> Result<(), LixError> {
     if !matches!(
         plan.bound.target,
-        BoundWriteTarget::File(FileWriteSurface::Base | FileWriteSurface::ByVersion)
+        BoundWriteTarget::File(FileWriteSurface::Base | FileWriteSurface::ByBranch)
     ) || plan.bound.op != BoundWriteOp::Insert
     {
         return Ok(());
@@ -572,7 +572,7 @@ fn insert_field_expr(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Expr, LixError> {
-    if plan.bound.version_scope == VersionScope::Global && field_name == "global" {
+    if plan.bound.branch_scope == BranchScope::Global && field_name == "global" {
         let has_explicit_global = source_index.is_some();
         if !has_explicit_global {
             return Ok(Expr::Literal(ScalarValue::Boolean(Some(true)), None));
@@ -618,15 +618,15 @@ fn datafusion_write_filters(
 ) -> Result<Vec<Expr>, LixError> {
     let mut filters =
         datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?;
-    if plan.bound.version_scope == VersionScope::Global {
-        let version_column = if schema.field_with_name("version_id").is_ok() {
-            Some("version_id")
-        } else if schema.field_with_name("lixcol_version_id").is_ok() {
-            Some("lixcol_version_id")
+    if plan.bound.branch_scope == BranchScope::Global {
+        let branch_column = if schema.field_with_name("branch_id").is_ok() {
+            Some("branch_id")
+        } else if schema.field_with_name("lixcol_branch_id").is_ok() {
+            Some("lixcol_branch_id")
         } else {
             None
         };
-        let Some(version_column) = version_column else {
+        let Some(branch_column) = branch_column else {
             let df_schema =
                 DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
             for filter in &filters {
@@ -635,10 +635,10 @@ fn datafusion_write_filters(
             return Ok(filters);
         };
         filters.push(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(Column::from_name(version_column))),
+            Box::new(Expr::Column(Column::from_name(branch_column))),
             Operator::Eq,
             Box::new(Expr::Literal(
-                ScalarValue::Utf8(Some(GLOBAL_VERSION_ID.to_string())),
+                ScalarValue::Utf8(Some(GLOBAL_BRANCH_ID.to_string())),
                 None,
             )),
         )));
@@ -891,20 +891,20 @@ fn canonical_json_text(raw: &str) -> Result<String, LixError> {
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<&'static str, LixError> {
     match &plan.bound.target {
         BoundWriteTarget::LixState
-            if plan.bound.version_scope == VersionScope::Global
+            if plan.bound.branch_scope == BranchScope::Global
                 && plan.bound.op != BoundWriteOp::Insert =>
         {
-            Ok("lix_state_by_version")
+            Ok("lix_state_by_branch")
         }
         BoundWriteTarget::LixState => Ok("lix_state"),
-        BoundWriteTarget::LixStateByVersion => Ok("lix_state_by_version"),
+        BoundWriteTarget::LixStateByBranch => Ok("lix_state_by_branch"),
         BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file"),
-        BoundWriteTarget::File(FileWriteSurface::ByVersion) => Ok("lix_file_by_version"),
+        BoundWriteTarget::File(FileWriteSurface::ByBranch) => Ok("lix_file_by_branch"),
         BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory"),
-        BoundWriteTarget::Directory(DirectoryWriteSurface::ByVersion) => {
-            Ok("lix_directory_by_version")
+        BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch) => {
+            Ok("lix_directory_by_branch")
         }
-        BoundWriteTarget::Version => Ok("lix_version"),
+        BoundWriteTarget::Branch => Ok("lix_branch"),
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer currently supports only lix_state writes",
@@ -1025,7 +1025,7 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
                 "DDL statements are not supported by Lix SQL",
             )
             .with_hint(
-                "Use Lix entity surfaces such as lix_registered_schema, lix_version, lix_file, and lix_key_value instead of CREATE/DROP statements.",
+                "Use Lix entity surfaces such as lix_registered_schema, lix_branch, lix_file, and lix_key_value instead of CREATE/DROP statements.",
             ));
         }
         LogicalPlan::Statement(_) => {
@@ -1307,6 +1307,7 @@ mod tests {
 
     use super::{execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
     use crate::binary_cas::BlobDataReader;
+    use crate::branch::BranchRefReader;
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphReader, ReachableCommitGraphCommit,
@@ -1332,9 +1333,8 @@ mod tests {
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
-    use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
-    use crate::{LixError, NullableKeyFilter, Value, GLOBAL_VERSION_ID};
+    use crate::{LixError, NullableKeyFilter, Value, GLOBAL_BRANCH_ID};
 
     struct DummyBlobReader;
     struct StaticBlobReader {
@@ -1345,7 +1345,7 @@ mod tests {
         rows: Vec<MaterializedLiveStateRow>,
     }
     struct DummyCommitGraphReader;
-    struct DummyVersionRefReader;
+    struct DummyBranchRefReader;
     fn test_read_scope(
         storage: &StorageContext<InMemoryStorageBackend>,
     ) -> StorageReadScope<InMemoryStorageRead> {
@@ -1408,7 +1408,7 @@ mod tests {
     struct CapturedStageRow {
         entity_pk: String,
         schema_key: String,
-        version_id: String,
+        branch_id: String,
         file_id: Option<String>,
         snapshot_content: Option<String>,
         metadata: Option<String>,
@@ -1426,7 +1426,7 @@ mod tests {
                     .as_json_array_text()
                     .expect("captured staged row should project entity_pk"),
                 schema_key: row.schema_key,
-                version_id: row.version_id,
+                branch_id: row.branch_id,
                 file_id: row.file_id,
                 global: row.global,
                 untracked: row.untracked,
@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     struct DummySqlExecutionContext<'a> {
-        active_version_id: &'a str,
+        active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateReader>,
         schema_definitions: Vec<JsonValue>,
@@ -1447,8 +1447,8 @@ mod tests {
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
         type ReadStore = StorageReadScope<InMemoryStorageRead>;
 
-        fn active_version_id(&self) -> &str {
-            self.active_version_id
+        fn active_branch_id(&self) -> &str {
+            self.active_branch_id
         }
 
         fn live_state(&self) -> Arc<dyn LiveStateReader> {
@@ -1484,8 +1484,8 @@ mod tests {
             Box::new(DummyCommitGraphReader)
         }
 
-        fn version_ref(&self) -> Arc<dyn VersionRefReader> {
-            Arc::new(DummyVersionRefReader)
+        fn branch_ref(&self) -> Arc<dyn BranchRefReader> {
+            Arc::new(DummyBranchRefReader)
         }
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
@@ -1494,7 +1494,7 @@ mod tests {
     }
 
     struct DummySqlWriteExecutionContext<'a> {
-        active_version_id: &'a str,
+        active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateReader>,
         staged_writes: Arc<Mutex<CapturingStagedWrites>>,
@@ -1503,8 +1503,8 @@ mod tests {
 
     #[async_trait]
     impl SqlWriteExecutionContext for DummySqlWriteExecutionContext<'_> {
-        fn active_version_id(&self) -> &str {
-            self.active_version_id
+        fn active_branch_id(&self) -> &str {
+            self.active_branch_id
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -1529,14 +1529,11 @@ mod tests {
             self.live_state.scan_rows(request).await
         }
 
-        async fn load_version_head(
-            &mut self,
-            version_id: &str,
-        ) -> Result<Option<String>, LixError> {
-            if version_id == "missing-version" {
+        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+            if branch_id == "missing-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{version_id}")))
+            Ok(Some(format!("commit-{branch_id}")))
         }
 
         async fn stage_write(
@@ -1575,26 +1572,26 @@ mod tests {
     }
 
     #[async_trait]
-    impl VersionRefReader for DummyVersionRefReader {
+    impl BranchRefReader for DummyBranchRefReader {
         async fn load_head(
             &self,
-            version_id: &str,
-        ) -> Result<Option<crate::version::VersionHead>, LixError> {
-            if version_id == "missing-version" {
+            branch_id: &str,
+        ) -> Result<Option<crate::branch::BranchHead>, LixError> {
+            if branch_id == "missing-branch" {
                 return Ok(None);
             }
-            Ok(Some(crate::version::VersionHead {
-                version_id: version_id.to_string(),
-                commit_id: format!("commit-{version_id}"),
+            Ok(Some(crate::branch::BranchHead {
+                branch_id: branch_id.to_string(),
+                commit_id: format!("commit-{branch_id}"),
             }))
         }
 
-        async fn scan_heads(&self) -> Result<Vec<crate::version::VersionHead>, LixError> {
-            Ok(["version-a", "version-b"]
+        async fn scan_heads(&self) -> Result<Vec<crate::branch::BranchHead>, LixError> {
+            Ok(["branch-a", "branch-b"]
                 .into_iter()
-                .map(|version_id| crate::version::VersionHead {
-                    version_id: version_id.to_string(),
-                    commit_id: format!("commit-{version_id}"),
+                .map(|branch_id| crate::branch::BranchHead {
+                    branch_id: branch_id.to_string(),
+                    commit_id: format!("commit-{branch_id}"),
                 })
                 .collect())
         }
@@ -1662,8 +1659,8 @@ mod tests {
                         || request.filter.schema_keys.contains(&row.schema_key))
                         && (request.filter.entity_pks.is_empty()
                             || request.filter.entity_pks.contains(&row.entity_pk))
-                        && (request.filter.version_ids.is_empty()
-                            || request.filter.version_ids.contains(&row.version_id))
+                        && (request.filter.branch_ids.is_empty()
+                            || request.filter.branch_ids.contains(&row.branch_id))
                         && request
                             .filter
                             .untracked
@@ -1730,7 +1727,7 @@ mod tests {
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
             deleted: false,
-            version_id: "version-a".to_string(),
+            branch_id: "branch-a".to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
@@ -1742,12 +1739,12 @@ mod tests {
 
     fn global_lix_state_row(entity_pk: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
         let mut row = live_lix_state_row(entity_pk, metadata);
-        row.version_id = GLOBAL_VERSION_ID.to_string();
+        row.branch_id = GLOBAL_BRANCH_ID.to_string();
         row.global = true;
         row
     }
 
-    fn live_entity_row(entity_pk: &str, version_id: &str, value: &str) -> MaterializedLiveStateRow {
+    fn live_entity_row(entity_pk: &str, branch_id: &str, value: &str) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "test_state_schema".to_string(),
@@ -1755,7 +1752,7 @@ mod tests {
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
@@ -1767,7 +1764,7 @@ mod tests {
 
     fn live_directory_row(
         entity_pk: &str,
-        version_id: &str,
+        branch_id: &str,
         parent_id: Option<&str>,
         name: &str,
         hidden: bool,
@@ -1787,7 +1784,7 @@ mod tests {
             ),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
@@ -1799,7 +1796,7 @@ mod tests {
 
     fn live_file_row(
         entity_pk: &str,
-        version_id: &str,
+        branch_id: &str,
         directory_id: Option<&str>,
         name: &str,
         hidden: bool,
@@ -1819,7 +1816,7 @@ mod tests {
             ),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
@@ -1831,7 +1828,7 @@ mod tests {
 
     fn live_blob_ref_row(
         entity_pk: &str,
-        version_id: &str,
+        branch_id: &str,
         bytes: &[u8],
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
@@ -1848,7 +1845,7 @@ mod tests {
             ),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(format!("change-{entity_pk}-blob")),
             commit_id: Some(format!("commit-{entity_pk}-blob")),
             global: false,
@@ -1863,7 +1860,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader: Arc::clone(&blob_reader),
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateReader>,
             schema_definitions: vec![],
@@ -1871,7 +1868,7 @@ mod tests {
 
         let actual = ctx.live_state();
         let expected = live_state as Arc<dyn LiveStateReader>;
-        assert_eq!(ctx.active_version_id(), "version-a");
+        assert_eq!(ctx.active_branch_id(), "branch-a");
         assert!(Arc::ptr_eq(&actual, &expected));
         assert!(Arc::ptr_eq(&ctx.blob_reader(), &blob_reader));
     }
@@ -1881,7 +1878,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             schema_definitions: vec![],
@@ -1898,7 +1895,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             schema_definitions: vec![],
@@ -1918,7 +1915,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             schema_definitions: vec![],
@@ -1953,7 +1950,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             schema_definitions: vec![],
@@ -1988,7 +1985,7 @@ mod tests {
         let backend = crate::storage::InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone()).await?;
         let engine = Engine::new(backend).await?;
-        let session = engine.open_session(init_receipt.main_version_id).await?;
+        let session = engine.open_session(init_receipt.main_branch_id).await?;
 
         session
             .execute(
@@ -2024,14 +2021,14 @@ mod tests {
             )
             .await?;
 
-        let active_version_id = session.active_version_id().await?;
+        let active_branch_id = session.active_branch_id().await?;
         let head_commit_id = engine
-            .load_version_head_commit_id(&active_version_id)
+            .load_branch_head_commit_id(&active_branch_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "history fixture expected the session version to have a head commit",
+                    "history fixture expected the session branch to have a head commit",
                 )
             })?;
         Ok((session, head_commit_id))
@@ -2045,7 +2042,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_version_id)
+            .open_session(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -2150,7 +2147,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_version_id)
+            .open_session(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -2183,7 +2180,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_version_id)
+            .open_session(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -2237,7 +2234,7 @@ mod tests {
             .expect("engine should initialize");
         let engine = Engine::new(backend).await.expect("engine should open");
         let session = engine
-            .open_session(init_receipt.main_version_id)
+            .open_session(init_receipt.main_branch_id)
             .await
             .expect("session should open");
 
@@ -2484,7 +2481,7 @@ mod tests {
             let live_state = Arc::new(DummyLiveStateReader);
             let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
             let mut ctx = DummySqlWriteExecutionContext {
-                active_version_id: "version-a",
+                active_branch_id: "branch-a",
                 blob_reader,
                 live_state,
                 staged_writes,
@@ -2509,7 +2506,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2539,7 +2536,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
@@ -2550,12 +2547,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_stages_explicit_version_write() {
+    async fn execute_sql_insert_into_lix_state_by_branch_stages_explicit_branch_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2564,15 +2561,15 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, global\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, global\
              ) VALUES (\
-             lix_json('[\"entity-b\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-b\"}', 'version-b', false\
+             lix_json('[\"entity-b\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"branch-b\"}', 'branch-b', false\
              )",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_state_by_version should stage explicit-version write");
+        .expect("INSERT INTO lix_state_by_branch should stage explicit-branch write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -2585,21 +2582,21 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(!rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"key\":\"hello\",\"value\":\"version-b\"}")
+            Some("{\"key\":\"hello\",\"value\":\"branch-b\"}")
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_global_version_defaults_global_true() {
+    async fn execute_sql_insert_into_lix_state_by_branch_global_branch_defaults_global_true() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2608,15 +2605,15 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id\
              ) VALUES (\
              lix_json('[\"entity-global\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global\"}', 'global'\
              )",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_state_by_version with global version should stage global row");
+        .expect("INSERT INTO lix_state_by_branch with global branch should stage global row");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -2629,18 +2626,18 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-global\"]");
-        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert_eq!(rows[0].branch_id, GLOBAL_BRANCH_ID);
         assert!(rows[0].global);
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_parameterized_global_version_defaults_global_true(
+    async fn execute_sql_insert_into_lix_state_by_branch_parameterized_global_branch_defaults_global_true(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2649,15 +2646,15 @@ mod tests {
 
         execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id\
              ) VALUES (\
              lix_json('[\"entity-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param\"}', $1\
              )",
-            &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+            &[Value::Text(GLOBAL_BRANCH_ID.to_string())],
         )
         .await
-        .expect("parameterized global version should stage global row");
+        .expect("parameterized global branch should stage global row");
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         let overlay = staged_writes.deltas[0]
@@ -2666,17 +2663,17 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-global-param\"]");
-        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert_eq!(rows[0].branch_id, GLOBAL_BRANCH_ID);
         assert!(rows[0].global);
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_parameterized_version_stays_non_global() {
+    async fn execute_sql_insert_into_lix_state_by_branch_parameterized_branch_stays_non_global() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2685,15 +2682,15 @@ mod tests {
 
         execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id\
              ) VALUES (\
-             lix_json('[\"entity-version-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param\"}', $1\
+             lix_json('[\"entity-branch-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"branch-param\"}', $1\
              )",
-            &[Value::Text("version-b".to_string())],
+            &[Value::Text("branch-b".to_string())],
         )
         .await
-        .expect("parameterized non-global version should stage non-global row");
+        .expect("parameterized non-global branch should stage non-global row");
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         let overlay = staged_writes.deltas[0]
@@ -2701,19 +2698,18 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_pk, "[\"entity-version-param\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].entity_pk, "[\"entity-branch-param\"]");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(!rows[0].global);
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_parameterized_multi_version_global_false()
-    {
+    async fn execute_sql_insert_into_lix_state_by_branch_parameterized_multi_branch_global_false() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2722,20 +2718,20 @@ mod tests {
 
         execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, global\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, global\
              ) VALUES (\
-             lix_json('[\"entity-version-param-b\"]'), 'lix_key_value', '{\"key\":\"hello-b\",\"value\":\"version-b\"}', $1, false\
+             lix_json('[\"entity-branch-param-b\"]'), 'lix_key_value', '{\"key\":\"hello-b\",\"value\":\"branch-b\"}', $1, false\
              ), (\
-             lix_json('[\"entity-version-param-c\"]'), 'lix_key_value', '{\"key\":\"hello-c\",\"value\":\"version-c\"}', $2, false\
+             lix_json('[\"entity-branch-param-c\"]'), 'lix_key_value', '{\"key\":\"hello-c\",\"value\":\"branch-c\"}', $2, false\
              )",
             &[
-                Value::Text("version-b".to_string()),
-                Value::Text("version-c".to_string()),
+                Value::Text("branch-b".to_string()),
+                Value::Text("branch-c".to_string()),
             ],
         )
         .await
-        .expect("all-non-global parameterized versions should be accepted");
+        .expect("all-non-global parameterized branches should be accepted");
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         let overlay = staged_writes.deltas[0]
@@ -2743,18 +2739,18 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| row.version_id == "version-b"));
-        assert!(rows.iter().any(|row| row.version_id == "version-c"));
+        assert!(rows.iter().any(|row| row.branch_id == "branch-b"));
+        assert!(rows.iter().any(|row| row.branch_id == "branch-c"));
         assert!(rows.iter().all(|row| !row.global));
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_parameterized_global_selector() {
+    async fn execute_sql_insert_into_lix_state_by_branch_parameterized_global_selector() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2763,12 +2759,12 @@ mod tests {
 
         execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, global\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, global\
              ) VALUES (\
-             lix_json('[\"entity-version-param-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param\"}', $1, $2\
+             lix_json('[\"entity-branch-param-global-param\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"branch-param\"}', $1, $2\
              )",
-            &[Value::Text("version-b".to_string()), Value::Boolean(false)],
+            &[Value::Text("branch-b".to_string()), Value::Boolean(false)],
         )
         .await
         .expect("parameterized global=false selector should stage non-global row");
@@ -2779,18 +2775,18 @@ mod tests {
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(!rows[0].global);
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_rejects_parameterized_global_null_global_version(
+    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_null_global_branch(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -2799,12 +2795,12 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, global\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, global\
              ) VALUES (\
              lix_json('[\"entity-global-param-null\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param-null\"}', $1, $2\
              )",
-            &[Value::Text(GLOBAL_VERSION_ID.to_string()), Value::Null],
+            &[Value::Text(GLOBAL_BRANCH_ID.to_string()), Value::Null],
         )
         .await
         .expect_err("explicit parameterized NULL global selector should be rejected");
@@ -2816,13 +2812,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_rejects_parameterized_global_false_global_version(
+    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_false_global_branch(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -2831,30 +2827,30 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, global\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, global\
              ) VALUES (\
              lix_json('[\"entity-global-param-false\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global-param-false\"}', $1, false\
              )",
-            &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+            &[Value::Text(GLOBAL_BRANCH_ID.to_string())],
         )
         .await
-        .expect_err("global=false cannot target parameterized global version");
+        .expect_err("global=false cannot target parameterized global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = false with global version_id"));
+            .contains("cannot combine global = false with global branch_id"));
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_version_rejects_parameterized_global_true_non_global_version(
+    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_true_non_global_branch(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -2863,36 +2859,36 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, global\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, global\
              ) VALUES (\
-             lix_json('[\"entity-version-param-true\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-param-true\"}', $1, true\
+             lix_json('[\"entity-branch-param-true\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"branch-param-true\"}', $1, true\
              )",
-            &[Value::Text("version-b".to_string())],
+            &[Value::Text("branch-b".to_string())],
         )
         .await
-        .expect_err("global=true cannot target parameterized non-global version");
+        .expect_err("global=true cannot target parameterized non-global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = true with non-global version_id"));
+            .contains("cannot combine global = true with non-global branch_id"));
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_version_rejects_parameterized_global_mixed_versions() {
+    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_mixed_branches() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
-        version_b_row.version_id = "version-b".to_string();
+        let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
+        branch_b_row.branch_id = "branch-b".to_string();
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
-                version_b_row,
+                branch_b_row,
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -2901,12 +2897,12 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_state_by_version \
+            "UPDATE lix_state_by_branch \
              SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
-             WHERE version_id IN ($1, $2) AND schema_key = 'lix_key_value'",
+             WHERE branch_id IN ($1, $2) AND schema_key = 'lix_key_value'",
             &[
-                Value::Text(GLOBAL_VERSION_ID.to_string()),
-                Value::Text("version-b".to_string()),
+                Value::Text(GLOBAL_BRANCH_ID.to_string()),
+                Value::Text("branch-b".to_string()),
             ],
         )
         .await
@@ -2915,23 +2911,23 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot mix global and version-specific rows"));
+            .contains("cannot mix global and branch-specific rows"));
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_version_rejects_parameterized_global_mixed_versions() {
+    async fn execute_sql_delete_lix_state_by_branch_rejects_parameterized_global_mixed_branches() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
-        version_b_row.version_id = "version-b".to_string();
+        let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
+        branch_b_row.branch_id = "branch-b".to_string();
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
-                version_b_row,
+                branch_b_row,
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -2940,11 +2936,11 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_state_by_version \
-             WHERE version_id IN ($1, $2) AND schema_key = 'lix_key_value'",
+            "DELETE FROM lix_state_by_branch \
+             WHERE branch_id IN ($1, $2) AND schema_key = 'lix_key_value'",
             &[
-                Value::Text(GLOBAL_VERSION_ID.to_string()),
-                Value::Text("version-b".to_string()),
+                Value::Text(GLOBAL_BRANCH_ID.to_string()),
+                Value::Text("branch-b".to_string()),
             ],
         )
         .await
@@ -2953,23 +2949,23 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot mix global and version-specific rows"));
+            .contains("cannot mix global and branch-specific rows"));
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_version_parameterized_conjunctive_mismatch_is_noop() {
+    async fn execute_sql_delete_lix_state_by_branch_parameterized_conjunctive_mismatch_is_noop() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
-        version_b_row.version_id = "version-b".to_string();
+        let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
+        branch_b_row.branch_id = "branch-b".to_string();
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
-                version_b_row,
+                branch_b_row,
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -2978,15 +2974,15 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_state_by_version \
-             WHERE version_id = $1 AND version_id = $2 AND schema_key = 'lix_key_value'",
+            "DELETE FROM lix_state_by_branch \
+             WHERE branch_id = $1 AND branch_id = $2 AND schema_key = 'lix_key_value'",
             &[
-                Value::Text(GLOBAL_VERSION_ID.to_string()),
-                Value::Text("version-b".to_string()),
+                Value::Text(GLOBAL_BRANCH_ID.to_string()),
+                Value::Text("branch-b".to_string()),
             ],
         )
         .await
-        .expect("conjunctive parameterized version mismatch should be a no-op");
+        .expect("conjunctive parameterized branch mismatch should be a no-op");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
         assert!(staged_writes
@@ -2997,7 +2993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_version_parameterized_null_version_is_noop() {
+    async fn execute_sql_delete_lix_state_by_branch_parameterized_null_branch_is_noop() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![global_lix_state_row(
@@ -3007,7 +3003,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3016,12 +3012,12 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_state_by_version \
-             WHERE version_id = $1 AND schema_key = 'lix_key_value'",
+            "DELETE FROM lix_state_by_branch \
+             WHERE branch_id = $1 AND schema_key = 'lix_key_value'",
             &[Value::Null],
         )
         .await
-        .expect("NULL parameterized version predicate should be a no-op");
+        .expect("NULL parameterized branch predicate should be a no-op");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
         assert!(staged_writes
@@ -3032,17 +3028,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_version_rejects_parameterized_global_true_non_global_predicate(
+    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_true_non_global_predicate(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
-        version_b_row.version_id = "version-b".to_string();
+        let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
+        branch_b_row.branch_id = "branch-b".to_string();
         let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![version_b_row],
+            rows: vec![branch_b_row],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -3051,32 +3047,32 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_state_by_version \
+            "UPDATE lix_state_by_branch \
              SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
-             WHERE version_id = $1 AND global = true AND schema_key = 'lix_key_value'",
-            &[Value::Text("version-b".to_string())],
+             WHERE branch_id = $1 AND global = true AND schema_key = 'lix_key_value'",
+            &[Value::Text("branch-b".to_string())],
         )
         .await
-        .expect_err("global=true predicate cannot target parameterized non-global version");
+        .expect_err("global=true predicate cannot target parameterized non-global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = true with non-global version_id"));
+            .contains("cannot combine global = true with non-global branch_id"));
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_version_rejects_parameterized_global_predicate_true_non_global_version(
+    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_predicate_true_non_global_branch(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"version\"}"));
-        version_b_row.version_id = "version-b".to_string();
+        let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
+        branch_b_row.branch_id = "branch-b".to_string();
         let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![version_b_row],
+            rows: vec![branch_b_row],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -3085,22 +3081,22 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_state_by_version \
+            "UPDATE lix_state_by_branch \
              SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
-             WHERE version_id = $1 AND global = $2 AND schema_key = 'lix_key_value'",
-            &[Value::Text("version-b".to_string()), Value::Boolean(true)],
+             WHERE branch_id = $1 AND global = $2 AND schema_key = 'lix_key_value'",
+            &[Value::Text("branch-b".to_string()), Value::Boolean(true)],
         )
         .await
-        .expect_err("global=true parameter cannot target parameterized non-global version");
+        .expect_err("global=true parameter cannot target parameterized non-global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = true with non-global version_id"));
+            .contains("cannot combine global = true with non-global branch_id"));
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_version_rejects_parameterized_global_false_global_predicate(
+    async fn execute_sql_delete_lix_state_by_branch_rejects_parameterized_global_false_global_predicate(
     ) {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
@@ -3111,7 +3107,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -3120,17 +3116,17 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_state_by_version \
-             WHERE version_id = $1 AND global = false AND schema_key = 'lix_key_value'",
-            &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+            "DELETE FROM lix_state_by_branch \
+             WHERE branch_id = $1 AND global = false AND schema_key = 'lix_key_value'",
+            &[Value::Text(GLOBAL_BRANCH_ID.to_string())],
         )
         .await
-        .expect_err("global=false predicate cannot target parameterized global version");
+        .expect_err("global=false predicate cannot target parameterized global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = false with global version_id"));
+            .contains("cannot combine global = false with global branch_id"));
     }
 
     #[tokio::test]
@@ -3139,7 +3135,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3169,7 +3165,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-defaults\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
     }
@@ -3180,7 +3176,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3219,7 +3215,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3260,7 +3256,7 @@ mod tests {
             Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
         );
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
     }
 
     #[tokio::test]
@@ -3269,7 +3265,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3305,7 +3301,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -3338,7 +3334,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -3370,7 +3366,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3393,16 +3389,16 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"file-from-select\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_entity_by_version_stages_write() {
+    async fn execute_sql_insert_into_entity_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3417,13 +3413,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema_by_version (\
-	     lixcol_entity_pk, lixcol_version_id, value\
-	     ) VALUES (lix_json('[\"entity-c\"]'), 'version-b', 'C')",
+            "INSERT INTO test_state_schema_by_branch (\
+	     lixcol_entity_pk, lixcol_branch_id, value\
+	     ) VALUES (lix_json('[\"entity-c\"]'), 'branch-b', 'C')",
             &[],
         )
         .await
-        .expect("INSERT INTO entity by-version surface should stage write");
+        .expect("INSERT INTO entity by-branch surface should stage write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -3436,7 +3432,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
@@ -3446,12 +3442,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_entity_by_version_accepts_parameterized_version_id() {
+    async fn execute_sql_insert_into_entity_by_branch_accepts_parameterized_branch_id() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3466,13 +3462,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO test_state_schema_by_version (\
-             lixcol_entity_pk, lixcol_version_id, value\
+            "INSERT INTO test_state_schema_by_branch (\
+             lixcol_entity_pk, lixcol_branch_id, value\
              ) VALUES (lix_json('[\"entity-c\"]'), $1, 'C')",
-            &[Value::Text("version-b".to_string())],
+            &[Value::Text("branch-b".to_string())],
         )
         .await
-        .expect("parameterized by-version entity insert should stage write");
+        .expect("parameterized by-branch entity insert should stage write");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
@@ -3483,16 +3479,16 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_entity_defaults_active_version() {
+    async fn execute_sql_insert_into_active_entity_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3525,7 +3521,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-c\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
@@ -3540,7 +3536,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "missing-version",
+            active_branch_id: "missing-branch",
             blob_reader,
             live_state,
             staged_writes,
@@ -3562,10 +3558,10 @@ mod tests {
         .await
         .expect_err("missing active head should fail before staging");
 
-        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
         assert!(error
             .message
-            .contains("version 'missing-version' was not found"));
+            .contains("branch 'missing-branch' was not found"));
     }
 
     #[tokio::test]
@@ -3574,7 +3570,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "missing-version",
+            active_branch_id: "missing-branch",
             blob_reader,
             live_state,
             staged_writes,
@@ -3595,11 +3591,11 @@ mod tests {
                 .await
                 .expect_err("missing active head should fail even for no-op writes");
 
-            assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND, "{sql}");
+            assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND, "{sql}");
             assert!(
                 error
                     .message
-                    .contains("version 'missing-version' was not found"),
+                    .contains("branch 'missing-branch' was not found"),
                 "{sql}: {}",
                 error.message
             );
@@ -3607,12 +3603,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_directory_by_version_stages_write() {
+    async fn execute_sql_insert_into_directory_by_branch_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3621,13 +3617,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_directory_by_version (\
-             id, parent_id, name, hidden, lixcol_version_id\
-             ) VALUES ('dir-docs', NULL, 'docs', false, 'version-b')",
+            "INSERT INTO lix_directory_by_branch (\
+             id, parent_id, name, hidden, lixcol_branch_id\
+             ) VALUES ('dir-docs', NULL, 'docs', false, 'branch-b')",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_directory_by_version should stage write");
+        .expect("INSERT INTO lix_directory_by_branch should stage write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -3640,7 +3636,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         assert_eq!(
@@ -3650,12 +3646,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_directory_defaults_active_version() {
+    async fn execute_sql_insert_into_active_directory_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3682,7 +3678,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
     }
@@ -3692,13 +3688,13 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "version-a", None, "docs", false),
-                live_directory_row("dir-guides", "version-a", Some("dir-docs"), "guides", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs", false),
+                live_directory_row("dir-guides", "branch-a", Some("dir-docs"), "guides", false),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3726,7 +3722,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"hidden\":true,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
@@ -3742,16 +3738,12 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_directory_row(
-                "dir-docs",
-                "version-a",
-                None,
-                "docs",
-                false,
+                "dir-docs", "branch-a", None, "docs", false,
             )],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3779,17 +3771,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_directory_by_version_stages_tombstone() {
+    async fn execute_sql_delete_directory_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "version-a", None, "docs", false),
-                live_directory_row("dir-guides", "version-b", Some("dir-docs"), "guides", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs", false),
+                live_directory_row("dir-guides", "branch-b", Some("dir-docs"), "guides", false),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3798,12 +3790,12 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_directory_by_version \
-             WHERE id = 'dir-guides' AND lixcol_version_id = 'version-b'",
+            "DELETE FROM lix_directory_by_branch \
+             WHERE id = 'dir-guides' AND lixcol_branch_id = 'branch-b'",
             &[],
         )
         .await
-        .expect("DELETE lix_directory_by_version should stage tombstone");
+        .expect("DELETE lix_directory_by_branch should stage tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -3816,18 +3808,18 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"dir-guides\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_file_by_version_stages_descriptor_write() {
+    async fn execute_sql_insert_into_file_by_branch_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3836,13 +3828,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_file_by_version (\
-             id, directory_id, name, hidden, lixcol_version_id\
-             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, 'version-b')",
+            "INSERT INTO lix_file_by_branch (\
+             id, directory_id, name, hidden, lixcol_branch_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, 'branch-b')",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_file_by_version should stage descriptor write");
+        .expect("INSERT INTO lix_file_by_branch should stage descriptor write");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -3855,7 +3847,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"file-readme\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
         let snapshot: JsonValue =
@@ -3868,12 +3860,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_file_defaults_active_version() {
+    async fn execute_sql_insert_into_active_file_defaults_active_branch() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3900,7 +3892,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"file-readme\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
     }
@@ -3911,7 +3903,7 @@ mod tests {
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -3920,13 +3912,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_file_by_version (\
-             id, directory_id, name, hidden, data, lixcol_version_id\
-             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, X'4142', 'version-b')",
+            "INSERT INTO lix_file_by_branch (\
+             id, directory_id, name, hidden, data, lixcol_branch_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, X'4142', 'branch-b')",
             &[],
         )
         .await
-        .expect("INSERT INTO lix_file_by_version should stage descriptor and data writes");
+        .expect("INSERT INTO lix_file_by_branch should stage descriptor and data writes");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -3943,7 +3935,7 @@ mod tests {
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(blob_ref_rows[0].entity_pk, "[\"file-readme\"]");
         assert_eq!(blob_ref_rows[0].file_id.as_deref(), Some("file-readme"));
-        assert_eq!(blob_ref_rows[0].version_id, "version-b");
+        assert_eq!(blob_ref_rows[0].branch_id, "branch-b");
         let snapshot: JsonValue =
             serde_json::from_str(blob_ref_rows[0].snapshot_content.as_deref().unwrap())
                 .expect("blob ref snapshot JSON");
@@ -3959,17 +3951,17 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs", false),
                 live_file_row(
                     "file-readme",
-                    "version-a",
+                    "branch-a",
                     Some("dir-docs"),
                     "readme.md",
                     false,
                 ),
                 live_file_row(
                     "file-guide",
-                    "version-a",
+                    "branch-a",
                     Some("dir-docs"),
                     "guide.md",
                     false,
@@ -3978,7 +3970,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4006,7 +3998,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"file-readme\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
@@ -4025,10 +4017,10 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs", false),
                 live_file_row(
                     "file-readme",
-                    "version-a",
+                    "branch-a",
                     Some("dir-docs"),
                     "readme.md",
                     false,
@@ -4037,7 +4029,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4078,10 +4070,10 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs", false),
                 live_file_row(
                     "file-readme",
-                    "version-a",
+                    "branch-a",
                     Some("dir-docs"),
                     "readme.md",
                     false,
@@ -4090,7 +4082,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4123,22 +4115,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_file_by_version_stages_descriptor_tombstone() {
+    async fn execute_sql_delete_file_by_branch_stages_descriptor_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "version-a", None, "docs", false),
-                live_directory_row("dir-docs", "version-b", None, "docs", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs", false),
+                live_directory_row("dir-docs", "branch-b", None, "docs", false),
                 live_file_row(
                     "file-readme",
-                    "version-a",
+                    "branch-a",
                     Some("dir-docs"),
                     "readme.md",
                     false,
                 ),
                 live_file_row(
                     "file-guide",
-                    "version-b",
+                    "branch-b",
                     Some("dir-docs"),
                     "guide.md",
                     false,
@@ -4147,7 +4139,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4156,12 +4148,12 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_file_by_version \
-             WHERE id = 'file-guide' AND lixcol_version_id = 'version-b'",
+            "DELETE FROM lix_file_by_branch \
+             WHERE id = 'file-guide' AND lixcol_branch_id = 'branch-b'",
             &[],
         )
         .await
-        .expect("DELETE lix_file_by_version should stage descriptor tombstone");
+        .expect("DELETE lix_file_by_branch should stage descriptor tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -4174,7 +4166,7 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"file-guide\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
     }
@@ -4184,13 +4176,13 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_entity_row("entity-a", "version-a", "A"),
-                live_entity_row("entity-b", "version-a", "B"),
+                live_entity_row("entity-a", "branch-a", "A"),
+                live_entity_row("entity-b", "branch-a", "B"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4224,7 +4216,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-a\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"updated\"}")
@@ -4236,17 +4228,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_entity_by_version_stages_tombstone() {
+    async fn execute_sql_delete_entity_by_branch_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_entity_row("entity-a", "version-a", "A"),
-                live_entity_row("entity-b", "version-b", "B"),
+                live_entity_row("entity-a", "branch-a", "A"),
+                live_entity_row("entity-b", "branch-b", "B"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4261,12 +4253,12 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "DELETE FROM test_state_schema_by_version \
-             WHERE lixcol_version_id = $1",
-            &[Value::Text("version-b".to_string())],
+            "DELETE FROM test_state_schema_by_branch \
+             WHERE lixcol_branch_id = $1",
+            &[Value::Text("branch-b".to_string())],
         )
         .await
-        .expect("parameterized DELETE entity by-version surface should stage tombstone");
+        .expect("parameterized DELETE entity by-branch surface should stage tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -4279,7 +4271,7 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
     }
@@ -4295,7 +4287,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4324,7 +4316,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-1\"]");
-        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(rows[0].branch_id, "branch-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"updated\"}")
@@ -4342,7 +4334,7 @@ mod tests {
                  metadata = '{\"schema_key\":\"lix_key_value\"}' \
              WHERE metadata = lix_json('{ \"source\" : \"match\" }')";
         let statement = parse_statement(sql).expect("SQL parses");
-        let bound_write = bind_statement(&statement, &[], "version-a").expect("SQL binds");
+        let bound_write = bind_statement(&statement, &[], "branch-a").expect("SQL binds");
         let plan = plan_write(bound_write).expect("write plans");
         assert_eq!(
             crate::sql2::optimize::simple_write::try_make_fast_write_plan(&plan)
@@ -4359,7 +4351,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4388,7 +4380,7 @@ mod tests {
         let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4434,7 +4426,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4479,7 +4471,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4524,7 +4516,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4566,7 +4558,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4594,19 +4586,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_version_stages_explicit_version_rows() {
+    async fn execute_sql_update_lix_state_by_branch_stages_explicit_branch_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"match\"}"));
-        version_b_row.version_id = "version-b".to_string();
+        let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"match\"}"));
+        branch_b_row.branch_id = "branch-b".to_string();
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_lix_state_row("entity-a", Some("{\"source\":\"skip\"}")),
-                version_b_row,
+                branch_b_row,
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4615,13 +4607,13 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_state_by_version \
+            "UPDATE lix_state_by_branch \
              SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
-             WHERE version_id = 'version-b' AND schema_key = 'lix_key_value'",
+             WHERE branch_id = 'branch-b' AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
-        .expect("UPDATE lix_state_by_version should stage explicit-version rows");
+        .expect("UPDATE lix_state_by_branch should stage explicit-branch rows");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -4634,7 +4626,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-b\"]");
-        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(rows[0].branch_id, "branch-b");
         assert_eq!(
             rows[0].metadata.as_deref(),
             Some("{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}")
@@ -4652,7 +4644,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4680,7 +4672,7 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-global\"]");
-        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert_eq!(rows[0].branch_id, GLOBAL_BRANCH_ID);
         assert!(rows[0].global);
         assert_eq!(
             rows[0].metadata.as_deref(),
@@ -4689,7 +4681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_version_global_predicate_stages_global_tombstone() {
+    async fn execute_sql_delete_lix_state_by_branch_global_predicate_stages_global_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
@@ -4699,7 +4691,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4708,12 +4700,12 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "DELETE FROM lix_state_by_version \
+            "DELETE FROM lix_state_by_branch \
              WHERE global = true AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
-        .expect("DELETE lix_state_by_version global predicate should stage global tombstone");
+        .expect("DELETE lix_state_by_branch global predicate should stage global tombstone");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
@@ -4726,14 +4718,14 @@ mod tests {
         let rows = overlay.visible_all_semantic_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_pk, "[\"entity-global\"]");
-        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert_eq!(rows[0].branch_id, GLOBAL_BRANCH_ID);
         assert!(rows[0].global);
         assert!(rows[0].tombstone);
         assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_version_false_predicate_is_noop() {
+    async fn execute_sql_delete_lix_state_by_branch_false_predicate_is_noop() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_lix_state_row(
@@ -4743,20 +4735,17 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_write_sql(
-            &mut ctx,
-            "DELETE FROM lix_state_by_version WHERE false",
-            &[],
-        )
-        .await
-        .expect("empty by-version scope should execute as a no-op");
+        let result =
+            execute_write_sql(&mut ctx, "DELETE FROM lix_state_by_branch WHERE false", &[])
+                .await
+                .expect("empty by-branch scope should execute as a no-op");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
@@ -4773,7 +4762,7 @@ mod tests {
         let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4813,7 +4802,7 @@ mod tests {
         let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4850,7 +4839,7 @@ mod tests {
         let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4881,7 +4870,7 @@ mod tests {
         let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4906,12 +4895,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_version_empty_scope_still_validates_json_predicates() {
+    async fn execute_sql_update_lix_state_by_branch_empty_scope_still_validates_json_predicates() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes,
@@ -4920,15 +4909,15 @@ mod tests {
 
         let error = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_state_by_version \
+            "UPDATE lix_state_by_branch \
              SET metadata = lix_json('{}') \
-             WHERE version_id = 'version-a' \
-               AND version_id = 'version-b' \
+             WHERE branch_id = 'branch-a' \
+               AND branch_id = 'branch-b' \
                AND metadata = 'not-json-typed'",
             &[],
         )
         .await
-        .expect_err("empty version scope should not bypass JSON predicate validation");
+        .expect_err("empty branch scope should not bypass JSON predicate validation");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
         assert!(error
@@ -4947,7 +4936,7 @@ mod tests {
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader,
             live_state,
             staged_writes: Arc::clone(&staged_writes),
@@ -4986,17 +4975,17 @@ mod tests {
             "additionalProperties": false
         });
         Ok(DummySqlExecutionContext {
-            active_version_id: "version-a",
+            active_branch_id: "branch-a",
             blob_reader: Arc::new(StaticBlobReader {
                 bytes: vec![0x41, 0x42],
             }),
             live_state: Arc::new(RowsLiveStateReader {
                 rows: vec![
-                    live_entity_row("entity-a", "version-a", "A"),
-                    live_entity_row("entity-b", "version-b", "B"),
-                    live_directory_row("dir-docs", "version-a", None, "docs", false),
-                    live_file_row("file-a", "version-a", Some("dir-docs"), "readme.md", false),
-                    live_blob_ref_row("file-a", "version-a", &[0x41, 0x42]),
+                    live_entity_row("entity-a", "branch-a", "A"),
+                    live_entity_row("entity-b", "branch-b", "B"),
+                    live_directory_row("dir-docs", "branch-a", None, "docs", false),
+                    live_file_row("file-a", "branch-a", Some("dir-docs"), "readme.md", false),
+                    live_blob_ref_row("file-a", "branch-a", &[0x41, 0x42]),
                 ],
             }),
             schema_definitions: vec![schema_definition],
@@ -5022,7 +5011,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_reads_lix_state_by_version() {
+    fn execute_sql_reads_lix_state_by_branch() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5031,21 +5020,21 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT entity_pk, version_id, snapshot_content, commit_id \
-                     FROM lix_state_by_version \
-                     WHERE version_id = 'version-b' AND schema_key = 'test_state_schema'",
+                    "SELECT entity_pk, branch_id, snapshot_content, commit_id \
+                     FROM lix_state_by_branch \
+                     WHERE branch_id = 'branch-b' AND schema_key = 'test_state_schema'",
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read lix_state_by_version");
+                .expect("sql2 execute should read lix_state_by_branch");
 
                 assert_eq!(
                     result.columns,
-                    vec!["entity_pk", "version_id", "snapshot_content", "commit_id"]
+                    vec!["entity_pk", "branch_id", "snapshot_content", "commit_id"]
                 );
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Json(json!(["entity-b"])));
-                assert_eq!(result.rows[0][1], Value::Text("version-b".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("branch-b".to_string()));
                 assert_eq!(result.rows[0][2], Value::Json(json!({"value": "B"})));
                 match &result.rows[0][3] {
                     Value::Text(commit_id) => assert!(!commit_id.is_empty()),
@@ -5056,7 +5045,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_supports_broad_lix_state_by_version_reads() {
+    fn execute_sql_supports_broad_lix_state_by_branch_reads() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5065,16 +5054,16 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT entity_pk FROM lix_state_by_version WHERE schema_key = 'test_state_schema'",
+                    "SELECT entity_pk FROM lix_state_by_branch WHERE schema_key = 'test_state_schema'",
                     &[],
                 )
                 .await
-                .expect("broad by-version read should succeed");
+                .expect("broad by-branch read should succeed");
 
                 assert!(
 					result.rows.iter().any(|row| row[0] == Value::Json(json!(["entity-a"])))
 						&& result.rows.iter().any(|row| row[0] == Value::Json(json!(["entity-b"]))),
-					"expected broad by-version read to include rows from multiple visible versions: {:?}",
+					"expected broad by-branch read to include rows from multiple visible branches: {:?}",
 					result.rows
 				);
             })
@@ -5082,7 +5071,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_reads_lix_state_from_active_version() {
+    fn execute_sql_reads_lix_state_from_active_branch() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5108,7 +5097,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_reads_entity_view_from_active_version() {
+    fn execute_sql_reads_entity_view_from_active_branch() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5133,7 +5122,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_reads_entity_by_version_view() {
+    fn execute_sql_reads_entity_by_branch_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5142,24 +5131,24 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT value, lixcol_version_id \
-                     FROM test_state_schema_by_version \
-                     WHERE lixcol_version_id = 'version-b'",
+                    "SELECT value, lixcol_branch_id \
+                     FROM test_state_schema_by_branch \
+                     WHERE lixcol_branch_id = 'branch-b'",
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read entity by-version view");
+                .expect("sql2 execute should read entity by-branch view");
 
-                assert_eq!(result.columns, vec!["value", "lixcol_version_id"]);
+                assert_eq!(result.columns, vec!["value", "lixcol_branch_id"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("B".to_string()));
-                assert_eq!(result.rows[0][1], Value::Text("version-b".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("branch-b".to_string()));
             })
         });
     }
 
     #[test]
-    fn execute_sql_reads_lix_directory_by_version_view() {
+    fn execute_sql_reads_lix_directory_by_branch_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5168,25 +5157,25 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT path, name, lixcol_version_id \
-                     FROM lix_directory_by_version \
-                     WHERE id = 'dir-docs' AND lixcol_version_id = 'version-a'",
+                    "SELECT path, name, lixcol_branch_id \
+                     FROM lix_directory_by_branch \
+                     WHERE id = 'dir-docs' AND lixcol_branch_id = 'branch-a'",
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read lix_directory_by_version");
+                .expect("sql2 execute should read lix_directory_by_branch");
 
-                assert_eq!(result.columns, vec!["path", "name", "lixcol_version_id"]);
+                assert_eq!(result.columns, vec!["path", "name", "lixcol_branch_id"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("/docs/".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
-                assert_eq!(result.rows[0][2], Value::Text("version-a".to_string()));
+                assert_eq!(result.rows[0][2], Value::Text("branch-a".to_string()));
             })
         });
     }
 
     #[test]
-    fn execute_sql_reads_lix_directory_from_active_version() {
+    fn execute_sql_reads_lix_directory_from_active_branch() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5212,7 +5201,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_sql_reads_lix_file_by_version_view() {
+    fn execute_sql_reads_lix_file_by_branch_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()
@@ -5221,17 +5210,17 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT path, name, data, lixcol_version_id \
-                     FROM lix_file_by_version \
-                     WHERE id = 'file-a' AND lixcol_version_id = 'version-a'",
+                    "SELECT path, name, data, lixcol_branch_id \
+                     FROM lix_file_by_branch \
+                     WHERE id = 'file-a' AND lixcol_branch_id = 'branch-a'",
                     &[],
                 )
                 .await
-                .expect("sql2 execute should read lix_file_by_version");
+                .expect("sql2 execute should read lix_file_by_branch");
 
                 assert_eq!(
                     result.columns,
-                    vec!["path", "name", "data", "lixcol_version_id"]
+                    vec!["path", "name", "data", "lixcol_branch_id"]
                 );
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(
@@ -5240,13 +5229,13 @@ mod tests {
                 );
                 assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
                 assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42]));
-                assert_eq!(result.rows[0][3], Value::Text("version-a".to_string()));
+                assert_eq!(result.rows[0][3], Value::Text("branch-a".to_string()));
             })
         });
     }
 
     #[test]
-    fn execute_sql_reads_lix_file_from_active_version() {
+    fn execute_sql_reads_lix_file_from_active_branch() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let ctx = setup_sql2_state_fixture()

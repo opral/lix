@@ -106,7 +106,7 @@ pub enum StateContextColumn {
     SnapshotContent,
     FileId,
     PluginKey,
-    VersionId,
+    BranchId,
     ChangeId,
     Metadata,
     CreatedAt,

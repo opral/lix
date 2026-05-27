@@ -7,29 +7,29 @@ use datafusion::logical_expr::{
 };
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) struct LixActiveVersionCommitId {
+pub(super) struct LixActiveBranchCommitId {
     commit_id: Option<String>,
 }
 
-impl LixActiveVersionCommitId {
+impl LixActiveBranchCommitId {
     pub(super) fn new(commit_id: Option<String>) -> Self {
         Self { commit_id }
     }
 }
 
-impl std::fmt::Debug for LixActiveVersionCommitId {
+impl std::fmt::Debug for LixActiveBranchCommitId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixActiveVersionCommitId").finish()
+        f.debug_struct("LixActiveBranchCommitId").finish()
     }
 }
 
-impl ScalarUDFImpl for LixActiveVersionCommitId {
+impl ScalarUDFImpl for LixActiveBranchCommitId {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn name(&self) -> &str {
-        "lix_active_version_commit_id"
+        "lix_active_branch_commit_id"
     }
 
     fn signature(&self) -> &Signature {
@@ -44,7 +44,7 @@ impl ScalarUDFImpl for LixActiveVersionCommitId {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if !args.args.is_empty() {
-            return plan_err!("lix_active_version_commit_id requires no arguments");
+            return plan_err!("lix_active_branch_commit_id requires no arguments");
         }
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
             self.commit_id.clone(),

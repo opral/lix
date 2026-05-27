@@ -85,7 +85,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("history table")
     {
         return LixError::new(LixError::CODE_HISTORY_FILTER_REQUIRED, message)
-            .with_hint("Add a commit/version range predicate before querying history tables.");
+            .with_hint("Add a commit/branch range predicate before querying history tables.");
     }
 
     if lower.contains("table not found")

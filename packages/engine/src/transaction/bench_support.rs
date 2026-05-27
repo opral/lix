@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::{json, Value as JsonValue};
 
 use crate::binary_cas::BinaryCasContext;
+use crate::branch::BranchContext;
 use crate::catalog::CatalogContext;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
@@ -17,12 +18,11 @@ use crate::storage::{
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::untracked_state::UntrackedStateContext;
-use crate::version::VersionContext;
-use crate::{NullableKeyFilter, GLOBAL_VERSION_ID};
+use crate::{NullableKeyFilter, GLOBAL_BRANCH_ID};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "tracked-crud-schema-fixture";
 const TIMESTAMP: &str = "2026-05-19T00:00:00.000Z";
-const BENCH_VERSION_ID: &str = "tracked-crud-version";
+const BENCH_BRANCH_ID: &str = "tracked-crud-branch";
 
 #[derive(Clone)]
 pub struct BenchTransactionRow {
@@ -38,7 +38,7 @@ pub struct BenchTransactionFixture<B: StorageBackend> {
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
-    version_ctx: Arc<VersionContext>,
+    branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     rows: Vec<BenchTransactionRow>,
 }
@@ -101,14 +101,14 @@ where
             UntrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         ));
-        let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
+        let branch_ctx = Arc::new(BranchContext::new(Arc::new(UntrackedStateContext::new())));
         seed_visible_schema_rows(storage.clone(), tracked_state.as_ref()).await;
         Self {
             storage,
             live_state,
             tracked_state,
             binary_cas: Arc::new(BinaryCasContext::new()),
-            version_ctx,
+            branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             rows,
         }
@@ -183,7 +183,7 @@ where
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["json_pointer".to_string()],
-                    version_ids: vec![BENCH_VERSION_ID.to_string()],
+                    branch_ids: vec![BENCH_BRANCH_ID.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: false,
                     ..LiveStateFilter::default()
@@ -228,7 +228,7 @@ where
             .reader(&read)
             .load_row(&LiveStateRowRequest {
                 schema_key: "json_pointer".to_string(),
-                version_id: BENCH_VERSION_ID.to_string(),
+                branch_id: BENCH_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(row.entity_pk.clone()),
                 file_id: NullableKeyFilter::Null,
             })
@@ -242,13 +242,13 @@ where
         let logical_rows = rows.len();
         let opened = super::open_transaction(
             &SessionMode::Pinned {
-                version_id: BENCH_VERSION_ID.to_string(),
+                branch_id: BENCH_BRANCH_ID.to_string(),
             },
             self.storage.clone(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.version_ctx),
+            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
         )
         .await
@@ -310,7 +310,7 @@ fn transaction_row(row: &BenchTransactionRow, value: &JsonValue) -> TransactionW
         change_id: None,
         commit_id: None,
         untracked: false,
-        version_id: BENCH_VERSION_ID.to_string(),
+        branch_id: BENCH_BRANCH_ID.to_string(),
     }
 }
 
@@ -354,18 +354,18 @@ async fn seed_visible_schema_rows<B>(
             }
         })
         .collect::<Vec<_>>();
-    let global_version_ref_row = crate::transaction::prepare_version_ref_row(
-        GLOBAL_VERSION_ID,
+    let global_branch_ref_row = crate::transaction::prepare_branch_ref_row(
+        GLOBAL_BRANCH_ID,
         SCHEMA_FIXTURE_COMMIT_ID,
         TIMESTAMP,
     )
-    .expect("schema fixture version ref should stage");
-    let bench_version_ref_row = crate::transaction::prepare_version_ref_row(
-        BENCH_VERSION_ID,
+    .expect("schema fixture branch ref should stage");
+    let bench_branch_ref_row = crate::transaction::prepare_branch_ref_row(
+        BENCH_BRANCH_ID,
         SCHEMA_FIXTURE_COMMIT_ID,
         TIMESTAMP,
     )
-    .expect("bench fixture version ref should stage");
+    .expect("bench fixture branch ref should stage");
     let mut read = BenchRead::new(
         storage
             .begin_read(StorageReadOptions::default())
@@ -384,10 +384,10 @@ async fn seed_visible_schema_rows<B>(
     UntrackedStateContext::new()
         .writer(&mut writes)
         .stage_rows([
-            global_version_ref_row.row.as_ref(),
-            bench_version_ref_row.row.as_ref(),
+            global_branch_ref_row.row.as_ref(),
+            bench_branch_ref_row.row.as_ref(),
         ])
-        .expect("schema fixture version ref should stage");
+        .expect("schema fixture branch ref should stage");
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .expect("schema fixture transaction should commit");
 }

@@ -36,14 +36,14 @@ simulation_test!(
         assert!(
             error
                 .hint()
-                .is_some_and(|hint| hint.contains("lix_active_version_commit_id()")),
-            "expected active-version-head hint: {error}"
+                .is_some_and(|hint| hint.contains("lix_active_branch_commit_id()")),
+            "expected active-branch-head hint: {error}"
         );
     }
 );
 
 simulation_test!(
-    lix_state_history_accepts_active_version_commit_id_filter,
+    lix_state_history_accepts_active_branch_commit_id_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -64,7 +64,7 @@ simulation_test!(
 
         let rows = select_history_rows(
             &session,
-            "SELECT entity_pk FROM lix_state_history WHERE start_commit_id = lix_active_version_commit_id()",
+            "SELECT entity_pk FROM lix_state_history WHERE start_commit_id = lix_active_branch_commit_id()",
         )
         .await;
 
@@ -100,7 +100,7 @@ simulation_test!(
             .execute(
                 "SELECT entity_pk \
                  FROM lix_state_history \
-                 WHERE lixcol_start_commit_id = lix_active_version_commit_id()",
+                 WHERE lixcol_start_commit_id = lix_active_branch_commit_id()",
                 &[],
             )
             .await
@@ -134,7 +134,7 @@ simulation_test!(
             .await
             .expect("initial tracked write should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first head should load")
             .expect("first head should exist");
@@ -147,7 +147,7 @@ simulation_test!(
             .await
             .expect("second tracked write should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second head should load")
             .expect("second head should exist");
@@ -160,7 +160,7 @@ simulation_test!(
             .await
             .expect("tombstone write should succeed");
         let third_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("third head should load")
             .expect("third head should exist");
@@ -271,7 +271,7 @@ simulation_test!(
             .await
             .expect("file insert should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first head should load")
             .expect("first head should exist");
@@ -284,7 +284,7 @@ simulation_test!(
             .await
             .expect("file update should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second head should load")
             .expect("second head should exist");
@@ -391,7 +391,7 @@ simulation_test!(
             .await
             .expect("delete should succeed");
         let delete_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("delete head should load")
             .expect("delete head should exist");
@@ -404,7 +404,7 @@ simulation_test!(
             .await
             .expect("unrelated later write should succeed");
         let later_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("later head should load")
             .expect("later head should exist");
@@ -454,7 +454,7 @@ simulation_test!(
             .await
             .expect("first write should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first head should load")
             .expect("first head should exist");
@@ -467,7 +467,7 @@ simulation_test!(
             .await
             .expect("second write should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second head should load")
             .expect("second head should exist");
@@ -552,7 +552,7 @@ simulation_test!(
             .await
             .expect("second write should succeed");
         let head_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("head should load")
             .expect("head should exist");

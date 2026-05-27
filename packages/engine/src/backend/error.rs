@@ -49,7 +49,7 @@ pub enum Precondition {
         space: SpaceId,
         range: KeyRange,
     },
-    VersionEquals {
+    BranchEquals {
         ref_key: Key,
         expected: Bytes,
     },

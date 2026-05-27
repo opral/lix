@@ -30,7 +30,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_by_version_read_rejects_dynamic_version_id_operand,
+    lix_file_by_branch_read_rejects_dynamic_branch_id_operand,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -43,14 +43,14 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT id FROM lix_file_by_version WHERE lixcol_version_id = lower('main')",
+                "SELECT id FROM lix_file_by_branch WHERE lixcol_branch_id = lower('main')",
                 &[],
             )
             .await
-            .expect_err("public version id predicate should only accept literal/param operands");
+            .expect_err("public branch id predicate should only accept literal/param operands");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("public column 'lixcol_version_id'"));
+        assert!(error.message.contains("public column 'lixcol_branch_id'"));
     }
 );
 
@@ -989,7 +989,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_by_version_insert_duplicate_id_reports_lix_file_by_version,
+    lix_file_by_branch_insert_duplicate_id_reports_lix_file_by_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -999,35 +999,35 @@ simulation_test!(
                 .expect("main session should open"),
             &engine,
         );
-        let version_id = sim.main_version_id();
+        let branch_id = sim.main_branch_id();
 
         session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file_by_version \
-                     (id, path, data, lixcol_version_id) \
-                     VALUES ('same-file', '/a.bin', X'01', '{version_id}')"
+                    "INSERT INTO lix_file_by_branch \
+                     (id, path, data, lixcol_branch_id) \
+                     VALUES ('same-file', '/a.bin', X'01', '{branch_id}')"
                 ),
                 &[],
             )
             .await
-            .expect("first by-version file insert should succeed");
+            .expect("first by-branch file insert should succeed");
 
         let error = session
             .execute(
                 &format!(
-                    "INSERT INTO lix_file_by_version \
-                     (id, path, data, lixcol_version_id) \
-                     VALUES ('same-file', '/b.bin', X'02', '{version_id}')"
+                    "INSERT INTO lix_file_by_branch \
+                     (id, path, data, lixcol_branch_id) \
+                     VALUES ('same-file', '/b.bin', X'02', '{branch_id}')"
                 ),
                 &[],
             )
             .await
-            .expect_err("duplicate by-version file id insert should be rejected");
+            .expect_err("duplicate by-branch file id insert should be rejected");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
-            error.message.contains("table 'lix_file_by_version'")
+            error.message.contains("table 'lix_file_by_branch'")
                 && error.message.contains("id 'same-file'")
                 && !error.message.contains("table 'lix_file':")
                 && !error.message.contains("lix_binary_blob_ref"),
@@ -1680,7 +1680,7 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
     assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
 });
 
-simulation_test!(lix_file_by_version_expands_global_rows, |sim| async move {
+simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -1701,21 +1701,21 @@ simulation_test!(lix_file_by_version_expands_global_rows, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, path, lixcol_version_id, lixcol_global, lixcol_untracked \
-             FROM lix_file_by_version \
+            "SELECT id, path, lixcol_branch_id, lixcol_global, lixcol_untracked \
+             FROM lix_file_by_branch \
              WHERE id = 'file-global-overlay' \
-             ORDER BY lixcol_version_id",
+             ORDER BY lixcol_branch_id",
             &[],
         )
         .await
-        .expect("file by-version read should succeed");
+        .expect("file by-branch read should succeed");
     assert_rows_eq(
         result,
         vec![
             vec![
                 Value::Text("file-global-overlay".to_string()),
                 Value::Text("/global.txt".to_string()),
-                Value::Text(sim.main_version_id().to_string()),
+                Value::Text(sim.main_branch_id().to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ],

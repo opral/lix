@@ -70,7 +70,7 @@ impl LixError {
     /// A SQL write targeted a read-only internal/component surface.
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
-    /// A history table was queried without an explicit commit/version range.
+    /// A history table was queried without an explicit commit/branch range.
     pub const CODE_HISTORY_FILTER_REQUIRED: &'static str = "LIX_HISTORY_FILTER_REQUIRED";
 
     /// SQL syntax is valid, but the feature is intentionally outside the Lix
@@ -99,7 +99,7 @@ impl LixError {
     pub const CODE_FOREIGN_KEY: &'static str = "LIX_ERROR_FOREIGN_KEY";
 
     /// A row references a non-null `file_id` that has no matching `lix_file`
-    /// descriptor in the same effective version scope.
+    /// descriptor in the same effective branch scope.
     pub const CODE_FILE_NOT_FOUND: &'static str = "LIX_ERROR_FILE_NOT_FOUND";
 
     /// A primary-key or `x-lix-unique` constraint was violated — another
@@ -126,18 +126,21 @@ impl LixError {
     /// A merge found incompatible changes to the same tracked-state identity.
     pub const CODE_MERGE_CONFLICT: &'static str = "LIX_MERGE_CONFLICT";
 
-    /// A caller referenced a version id that has no matching version ref.
-    pub const CODE_VERSION_NOT_FOUND: &'static str = "LIX_VERSION_NOT_FOUND";
+    /// A caller referenced a branch id that has no matching branch ref.
+    pub const CODE_BRANCH_NOT_FOUND: &'static str = "LIX_BRANCH_NOT_FOUND";
+
+    /// A caller referenced a commit id that has no matching commit record.
+    pub const CODE_COMMIT_NOT_FOUND: &'static str = "LIX_COMMIT_NOT_FOUND";
 
     /// A staged row's storage scope flags disagree, such as a global row not
-    /// using the reserved global version id.
+    /// using the reserved global branch id.
     pub const CODE_INVALID_STORAGE_SCOPE: &'static str = "LIX_ERROR_INVALID_STORAGE_SCOPE";
 
     /// Merge graph analysis found multiple equally valid merge bases.
     pub const CODE_AMBIGUOUS_MERGE_BASE: &'static str = "LIX_AMBIGUOUS_MERGE_BASE";
 
     /// A merge request is well-formed but nonsensical for the commit graph,
-    /// such as merging a version into itself.
+    /// such as merging a branch into itself.
     pub const CODE_INVALID_MERGE: &'static str = "LIX_INVALID_MERGE";
 
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -153,20 +156,39 @@ impl LixError {
         Self::new("LIX_ERROR_UNKNOWN", message)
     }
 
-    pub fn version_not_found(
-        version_id: impl Into<String>,
+    pub fn branch_not_found(
+        branch_id: impl Into<String>,
         operation: impl Into<String>,
         role: impl Into<String>,
     ) -> Self {
-        let version_id = version_id.into();
+        let branch_id = branch_id.into();
         let operation = operation.into();
         let role = role.into();
         Self::new(
-            Self::CODE_VERSION_NOT_FOUND,
-            format!("version '{version_id}' was not found"),
+            Self::CODE_BRANCH_NOT_FOUND,
+            format!("branch '{branch_id}' was not found"),
         )
         .with_details(json!({
-            "version_id": version_id,
+            "branch_id": branch_id,
+            "operation": operation,
+            "role": role,
+        }))
+    }
+
+    pub fn commit_not_found(
+        commit_id: impl Into<String>,
+        operation: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Self {
+        let commit_id = commit_id.into();
+        let operation = operation.into();
+        let role = role.into();
+        Self::new(
+            Self::CODE_COMMIT_NOT_FOUND,
+            format!("commit '{commit_id}' was not found"),
+        )
+        .with_details(json!({
+            "commit_id": commit_id,
             "operation": operation,
             "role": role,
         }))
@@ -190,16 +212,16 @@ impl LixError {
         }))
     }
 
-    pub fn invalid_self_merge(version_id: impl Into<String>) -> Self {
-        let version_id = version_id.into();
+    pub fn invalid_self_merge(branch_id: impl Into<String>) -> Self {
+        let branch_id = branch_id.into();
         Self::new(
             Self::CODE_INVALID_MERGE,
-            format!("cannot merge version '{version_id}' into itself"),
+            format!("cannot merge branch '{branch_id}' into itself"),
         )
         .with_details(json!({
-            "operation": "merge_version",
-            "target_version_id": version_id,
-            "source_version_id": version_id,
+            "operation": "merge_branch",
+            "target_branch_id": branch_id,
+            "source_branch_id": branch_id,
         }))
     }
 

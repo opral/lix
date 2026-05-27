@@ -4,14 +4,14 @@ use crate::LixError;
 
 const UNTRACKED_STATE_FILE_IDENTIFIER: &str = "LXUS";
 // Durable payload bytes:
-//   b"LXUP" | version:u8 |
+//   b"LXUP" | branch:u8 |
 //   snapshot_content_tag:u8 | [snapshot_content_len:u32be | snapshot_content:utf8] |
 //   metadata_tag:u8 | [metadata_len:u32be | metadata:utf8] |
 //   created_at_len:u32be | created_at:utf8 |
 //   updated_at_len:u32be | updated_at:utf8 |
 //   global:u8
 const UNTRACKED_STATE_PAYLOAD_IDENTIFIER: &[u8; 4] = b"LXUP";
-const UNTRACKED_STATE_PAYLOAD_VERSION_V1: u8 = 1;
+const UNTRACKED_STATE_PAYLOAD_BRANCH_V1: u8 = 1;
 
 #[cfg_attr(not(feature = "storage-benches"), allow(dead_code))]
 pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
@@ -31,7 +31,7 @@ pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, L
     let metadata = row.metadata.map(|value| builder.create_string(value));
     let created_at = builder.create_string(row.created_at);
     let updated_at = builder.create_string(row.updated_at);
-    let version_id = builder.create_string(row.version_id);
+    let branch_id = builder.create_string(row.branch_id);
 
     let root = flatbuffer::create_untracked_state_row(
         &mut builder,
@@ -44,7 +44,7 @@ pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, L
             created_at,
             updated_at,
             global: row.global,
-            version_id,
+            branch_id,
         },
     );
     builder.finish(root, Some(UNTRACKED_STATE_FILE_IDENTIFIER));
@@ -54,7 +54,7 @@ pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, L
 pub(crate) fn encode_payload_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
     let mut out = Vec::with_capacity(payload_capacity(row));
     out.extend_from_slice(UNTRACKED_STATE_PAYLOAD_IDENTIFIER);
-    out.push(UNTRACKED_STATE_PAYLOAD_VERSION_V1);
+    out.push(UNTRACKED_STATE_PAYLOAD_BRANCH_V1);
     push_optional_string(&mut out, row.snapshot_content)?;
     push_optional_string(&mut out, row.metadata)?;
     push_string(&mut out, row.created_at)?;
@@ -75,11 +75,11 @@ pub(crate) fn decode_payload_with_identity(
     }
 
     let mut cursor = UNTRACKED_STATE_PAYLOAD_IDENTIFIER.len();
-    let version = read_u8(bytes, &mut cursor, "version")?;
-    if version != UNTRACKED_STATE_PAYLOAD_VERSION_V1 {
+    let branch = read_u8(bytes, &mut cursor, "branch")?;
+    if branch != UNTRACKED_STATE_PAYLOAD_BRANCH_V1 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state payload: unsupported version {version}"),
+            format!("failed to decode untracked-state payload: unsupported branch {branch}"),
         ));
     }
     let snapshot_content = read_optional_string(bytes, &mut cursor, "snapshot_content")?;
@@ -103,7 +103,7 @@ pub(crate) fn decode_payload_with_identity(
         created_at,
         updated_at,
         global,
-        version_id: identity.version_id,
+        branch_id: identity.branch_id,
     })
 }
 
@@ -141,7 +141,7 @@ pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
         created_at: required_str(row.created_at(), "created_at")?.to_string(),
         updated_at: required_str(row.updated_at(), "updated_at")?.to_string(),
         global: row.global(),
-        version_id: required_str(row.version_id(), "version_id")?.to_string(),
+        branch_id: required_str(row.branch_id(), "branch_id")?.to_string(),
     })
 }
 
@@ -296,13 +296,13 @@ mod tests {
             created_at: "2026-05-19T00:00:00.000Z",
             updated_at: "2026-05-19T00:00:01.000Z",
             global: false,
-            version_id: "version-1",
+            branch_id: "branch-1",
         }
     }
 
     fn identity(entity_pk: EntityPk) -> UntrackedStateIdentity {
         UntrackedStateIdentity {
-            version_id: "version-1".to_string(),
+            branch_id: "branch-1".to_string(),
             schema_key: "schema.unicode".to_string(),
             entity_pk,
             file_id: Some("file-1".to_string()),
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(decoded.created_at, "2026-05-19T00:00:00.000Z");
         assert_eq!(decoded.updated_at, "2026-05-19T00:00:01.000Z");
         assert!(!decoded.global);
-        assert_eq!(decoded.version_id, "version-1");
+        assert_eq!(decoded.branch_id, "branch-1");
     }
 
     #[test]
@@ -359,14 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn payload_decode_rejects_unknown_version() {
+    fn payload_decode_rejects_unknown_branch() {
         let entity_pk = EntityPk::single("id-1");
         let mut bytes = encode_payload_ref(row_ref(&entity_pk, Some("{}"), None))
             .expect("payload should encode");
         bytes[4] = 2;
         let error = decode_payload_with_identity(identity(entity_pk), &bytes)
-            .expect_err("unknown payload version should fail");
-        assert!(error.to_string().contains("unsupported version 2"));
+            .expect_err("unknown payload branch should fail");
+        assert!(error.to_string().contains("unsupported branch 2"));
     }
 
     #[test]
@@ -419,7 +419,7 @@ mod flatbuffer {
         const VT_CREATED_AT: flatbuffers::VOffsetT = 14;
         const VT_UPDATED_AT: flatbuffers::VOffsetT = 16;
         const VT_GLOBAL: flatbuffers::VOffsetT = 18;
-        const VT_VERSION_ID: flatbuffers::VOffsetT = 20;
+        const VT_BRANCH_ID: flatbuffers::VOffsetT = 20;
 
         #[inline]
         pub(super) fn entity_pk(&self) -> Option<&'a str> {
@@ -482,10 +482,10 @@ mod flatbuffer {
         }
 
         #[inline]
-        pub(super) fn version_id(&self) -> Option<&'a str> {
+        pub(super) fn branch_id(&self) -> Option<&'a str> {
             unsafe {
                 self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_VERSION_ID, None)
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_BRANCH_ID, None)
             }
         }
     }
@@ -535,8 +535,8 @@ mod flatbuffer {
                 )?
                 .visit_field::<bool>("global", Self::VT_GLOBAL, false)?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "version_id",
-                    Self::VT_VERSION_ID,
+                    "branch_id",
+                    Self::VT_BRANCH_ID,
                     true,
                 )?
                 .finish();
@@ -554,7 +554,7 @@ mod flatbuffer {
         pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
         pub(super) updated_at: flatbuffers::WIPOffset<&'a str>,
         pub(super) global: bool,
-        pub(super) version_id: flatbuffers::WIPOffset<&'a str>,
+        pub(super) branch_id: flatbuffers::WIPOffset<&'a str>,
     }
 
     #[cfg_attr(not(feature = "storage-benches"), allow(dead_code))]
@@ -564,8 +564,8 @@ mod flatbuffer {
     ) -> flatbuffers::WIPOffset<UntrackedStateRow<'bldr>> {
         let start = builder.start_table();
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_VERSION_ID,
-            args.version_id,
+            UntrackedStateRow::VT_BRANCH_ID,
+            args.branch_id,
         );
         builder.push_slot::<bool>(UntrackedStateRow::VT_GLOBAL, args.global, false);
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(

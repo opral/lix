@@ -51,7 +51,7 @@ where
 ///
 /// `lix_change` is the unscoped durable change surface: it scans direct
 /// `changelog.change` records and unions derived `lix_commit` changes from
-/// `changelog.commit`. It does not prove version reachability. History
+/// `changelog.commit`. It does not prove branch reachability. History
 /// providers are the reachability-aware SQL surfaces.
 struct LixChangeProvider<S> {
     schema: SchemaRef,

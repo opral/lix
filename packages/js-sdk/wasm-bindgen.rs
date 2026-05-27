@@ -7,11 +7,11 @@ mod wasm {
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
         open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
-        BackendRead, BackendWrite, CommitResult, CoreProjection, CreateVersionOptions,
+        BackendRead, BackendWrite, CommitResult, CoreProjection, CreateBranchOptions,
         DurableWriteLock, ExecuteResult, GetOptions, InMemoryBackend, Key, KeyRange, Lix as RsLix,
-        LixError, LixTransaction as RsLixTransaction, MergeVersionOptions,
-        MergeVersionPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
-        ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchVersionOptions, Value,
+        LixError, LixTransaction as RsLixTransaction, MergeBranchOptions,
+        MergeBranchPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
+        ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchBranchOptions, Value,
         WriteOptions, WriteStats,
     };
     use serde::Serialize;
@@ -150,40 +150,40 @@ export type OpenLixOptions = {
   backend?: Backend;
 };
 
-export type CreateVersionOptions = {
+export type CreateBranchOptions = {
   id?: string;
   name: string;
   fromCommitId?: string;
 };
 
-export type CreateVersionResult = {
+export type CreateBranchResult = {
   id: string;
   name: string;
   hidden: boolean;
   commitId: string;
 };
 
-export type SwitchVersionOptions = {
-  versionId: string;
+export type SwitchBranchOptions = {
+  branchId: string;
 };
 
-export type SwitchVersionResult = {
-  versionId: string;
+export type SwitchBranchResult = {
+  branchId: string;
 };
 
-export type MergeVersionOptions = {
-  sourceVersionId: string;
+export type MergeBranchOptions = {
+  sourceBranchId: string;
 };
 
-export type MergeVersionOutcome =
+export type MergeBranchOutcome =
   | "alreadyUpToDate"
   | "fastForward"
   | "mergeCommitted";
 
-export type MergeVersionResult = {
-  outcome: MergeVersionOutcome;
-  targetVersionId: string;
-  sourceVersionId: string;
+export type MergeBranchResult = {
+  outcome: MergeBranchOutcome;
+  targetBranchId: string;
+  sourceBranchId: string;
   baseCommitId: string;
   targetHeadBeforeCommitId: string;
   sourceHeadBeforeCommitId: string;
@@ -192,10 +192,10 @@ export type MergeVersionResult = {
   changeStats: MergeChangeStats;
 };
 
-export type MergeVersionPreviewResult = {
-  outcome: MergeVersionOutcome;
-  targetVersionId: string;
-  sourceVersionId: string;
+export type MergeBranchPreviewResult = {
+  outcome: MergeBranchOutcome;
+  targetBranchId: string;
+  sourceBranchId: string;
   baseCommitId: string;
   targetHeadCommitId: string;
   sourceHeadCommitId: string;
@@ -266,50 +266,50 @@ export type MergeConflictSide = {
             }
         }
 
-        async fn active_version_id(&self) -> Result<String, LixError> {
+        async fn active_branch_id(&self) -> Result<String, LixError> {
             match self {
-                LixInner::InMemory(inner) => inner.active_version_id().await,
-                LixInner::Js(inner) => inner.active_version_id().await,
+                LixInner::InMemory(inner) => inner.active_branch_id().await,
+                LixInner::Js(inner) => inner.active_branch_id().await,
             }
         }
 
-        async fn create_version(
+        async fn create_branch(
             &self,
-            options: CreateVersionOptions,
-        ) -> Result<lix_rs_sdk::CreateVersionResult, LixError> {
+            options: CreateBranchOptions,
+        ) -> Result<lix_rs_sdk::CreateBranchResult, LixError> {
             match self {
-                LixInner::InMemory(inner) => inner.create_version(options).await,
-                LixInner::Js(inner) => inner.create_version(options).await,
+                LixInner::InMemory(inner) => inner.create_branch(options).await,
+                LixInner::Js(inner) => inner.create_branch(options).await,
             }
         }
 
-        async fn switch_version(
+        async fn switch_branch(
             &self,
-            options: SwitchVersionOptions,
-        ) -> Result<lix_rs_sdk::SwitchVersionResult, LixError> {
+            options: SwitchBranchOptions,
+        ) -> Result<lix_rs_sdk::SwitchBranchResult, LixError> {
             match self {
-                LixInner::InMemory(inner) => inner.switch_version(options).await,
-                LixInner::Js(inner) => inner.switch_version(options).await,
+                LixInner::InMemory(inner) => inner.switch_branch(options).await,
+                LixInner::Js(inner) => inner.switch_branch(options).await,
             }
         }
 
-        async fn merge_version_preview(
+        async fn merge_branch_preview(
             &self,
-            options: MergeVersionPreviewOptions,
-        ) -> Result<lix_rs_sdk::MergeVersionPreview, LixError> {
+            options: MergeBranchPreviewOptions,
+        ) -> Result<lix_rs_sdk::MergeBranchPreview, LixError> {
             match self {
-                LixInner::InMemory(inner) => inner.merge_version_preview(options).await,
-                LixInner::Js(inner) => inner.merge_version_preview(options).await,
+                LixInner::InMemory(inner) => inner.merge_branch_preview(options).await,
+                LixInner::Js(inner) => inner.merge_branch_preview(options).await,
             }
         }
 
-        async fn merge_version(
+        async fn merge_branch(
             &self,
-            options: MergeVersionOptions,
-        ) -> Result<lix_rs_sdk::MergeVersionResult, LixError> {
+            options: MergeBranchOptions,
+        ) -> Result<lix_rs_sdk::MergeBranchResult, LixError> {
             match self {
-                LixInner::InMemory(inner) => inner.merge_version(options).await,
-                LixInner::Js(inner) => inner.merge_version(options).await,
+                LixInner::InMemory(inner) => inner.merge_branch(options).await,
+                LixInner::Js(inner) => inner.merge_branch(options).await,
             }
         }
 
@@ -384,15 +384,15 @@ export type MergeConflictSide = {
             Ok(LixTransaction { inner: Some(inner) })
         }
 
-        #[wasm_bindgen(js_name = activeVersionId)]
-        pub async fn active_version_id(&self) -> Result<String, JsValue> {
-            self.inner.active_version_id().await.map_err(js_error)
+        #[wasm_bindgen(js_name = activeBranchId)]
+        pub async fn active_branch_id(&self) -> Result<String, JsValue> {
+            self.inner.active_branch_id().await.map_err(js_error)
         }
 
-        #[wasm_bindgen(js_name = createVersion)]
-        pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let options = parse_create_version_options(args).map_err(js_error)?;
-            let result = self.inner.create_version(options).await.map_err(js_error)?;
+        #[wasm_bindgen(js_name = createBranch)]
+        pub async fn create_branch(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_create_branch_options(args).map_err(js_error)?;
+            let result = self.inner.create_branch(options).await.map_err(js_error)?;
             let object = Object::new();
             set_string(&object, "id", &result.id).map_err(js_error)?;
             set_string(&object, "name", &result.name).map_err(js_error)?;
@@ -406,39 +406,39 @@ export type MergeConflictSide = {
             Ok(object.into())
         }
 
-        #[wasm_bindgen(js_name = switchVersion)]
-        pub async fn switch_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let options = parse_switch_version_options(args).map_err(js_error)?;
-            let result = self.inner.switch_version(options).await.map_err(js_error)?;
+        #[wasm_bindgen(js_name = switchBranch)]
+        pub async fn switch_branch(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_switch_branch_options(args).map_err(js_error)?;
+            let result = self.inner.switch_branch(options).await.map_err(js_error)?;
             let object = Object::new();
-            set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
+            set_string(&object, "branchId", &result.branch_id).map_err(js_error)?;
             Ok(object.into())
         }
 
-        #[wasm_bindgen(js_name = mergeVersionPreview)]
-        pub async fn merge_version_preview(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let options = parse_merge_version_preview_options(args).map_err(js_error)?;
+        #[wasm_bindgen(js_name = mergeBranchPreview)]
+        pub async fn merge_branch_preview(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_merge_branch_preview_options(args).map_err(js_error)?;
             let result = self
                 .inner
-                .merge_version_preview(options)
+                .merge_branch_preview(options)
                 .await
                 .map_err(js_error)?;
-            merge_version_preview_to_js(result).map_err(js_error)
+            merge_branch_preview_to_js(result).map_err(js_error)
         }
 
-        #[wasm_bindgen(js_name = mergeVersion)]
-        pub async fn merge_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let options = parse_merge_version_options(args).map_err(js_error)?;
-            let result = self.inner.merge_version(options).await.map_err(js_error)?;
+        #[wasm_bindgen(js_name = mergeBranch)]
+        pub async fn merge_branch(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_merge_branch_options(args).map_err(js_error)?;
+            let result = self.inner.merge_branch(options).await.map_err(js_error)?;
             let object = Object::new();
             let outcome = match result.outcome {
-                lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
-                lix_rs_sdk::MergeVersionOutcome::FastForward => "fastForward",
-                lix_rs_sdk::MergeVersionOutcome::MergeCommitted => "mergeCommitted",
+                lix_rs_sdk::MergeBranchOutcome::AlreadyUpToDate => "alreadyUpToDate",
+                lix_rs_sdk::MergeBranchOutcome::FastForward => "fastForward",
+                lix_rs_sdk::MergeBranchOutcome::MergeCommitted => "mergeCommitted",
             };
             set_string(&object, "outcome", outcome).map_err(js_error)?;
-            set_string(&object, "targetVersionId", &result.target_version_id).map_err(js_error)?;
-            set_string(&object, "sourceVersionId", &result.source_version_id).map_err(js_error)?;
+            set_string(&object, "targetBranchId", &result.target_branch_id).map_err(js_error)?;
+            set_string(&object, "sourceBranchId", &result.source_branch_id).map_err(js_error)?;
             set_string(&object, "baseCommitId", &result.base_commit_id).map_err(js_error)?;
             set_string(
                 &object,
@@ -1553,36 +1553,36 @@ export type MergeConflictSide = {
         error
     }
 
-    fn parse_create_version_options(value: JsValue) -> Result<CreateVersionOptions, LixError> {
-        let object = expect_object(value, "createVersion")?;
-        let id = optional_string(&object, "id", "createVersion")?;
-        let name = required_string(&object, "name", "createVersion")?;
-        let from_commit_id = optional_string(&object, "fromCommitId", "createVersion")?;
-        Ok(CreateVersionOptions {
+    fn parse_create_branch_options(value: JsValue) -> Result<CreateBranchOptions, LixError> {
+        let object = expect_object(value, "createBranch")?;
+        let id = optional_string(&object, "id", "createBranch")?;
+        let name = required_string(&object, "name", "createBranch")?;
+        let from_commit_id = optional_string(&object, "fromCommitId", "createBranch")?;
+        Ok(CreateBranchOptions {
             id,
             name,
             from_commit_id,
         })
     }
 
-    fn parse_switch_version_options(value: JsValue) -> Result<SwitchVersionOptions, LixError> {
-        let object = expect_object(value, "switchVersion")?;
-        let version_id = required_string(&object, "versionId", "switchVersion")?;
-        Ok(SwitchVersionOptions { version_id })
+    fn parse_switch_branch_options(value: JsValue) -> Result<SwitchBranchOptions, LixError> {
+        let object = expect_object(value, "switchBranch")?;
+        let branch_id = required_string(&object, "branchId", "switchBranch")?;
+        Ok(SwitchBranchOptions { branch_id })
     }
 
-    fn parse_merge_version_options(value: JsValue) -> Result<MergeVersionOptions, LixError> {
-        let object = expect_object(value, "mergeVersion")?;
-        let source_version_id = required_string(&object, "sourceVersionId", "mergeVersion")?;
-        Ok(MergeVersionOptions { source_version_id })
+    fn parse_merge_branch_options(value: JsValue) -> Result<MergeBranchOptions, LixError> {
+        let object = expect_object(value, "mergeBranch")?;
+        let source_branch_id = required_string(&object, "sourceBranchId", "mergeBranch")?;
+        Ok(MergeBranchOptions { source_branch_id })
     }
 
-    fn parse_merge_version_preview_options(
+    fn parse_merge_branch_preview_options(
         value: JsValue,
-    ) -> Result<MergeVersionPreviewOptions, LixError> {
-        let object = expect_object(value, "mergeVersionPreview")?;
-        let source_version_id = required_string(&object, "sourceVersionId", "mergeVersionPreview")?;
-        Ok(MergeVersionPreviewOptions { source_version_id })
+    ) -> Result<MergeBranchPreviewOptions, LixError> {
+        let object = expect_object(value, "mergeBranchPreview")?;
+        let source_branch_id = required_string(&object, "sourceBranchId", "mergeBranchPreview")?;
+        Ok(MergeBranchPreviewOptions { source_branch_id })
     }
 
     fn expect_object(value: JsValue, method: &str) -> Result<Object, LixError> {
@@ -1803,18 +1803,18 @@ export type MergeConflictSide = {
         Ok(object.into())
     }
 
-    fn merge_version_preview_to_js(
-        result: lix_rs_sdk::MergeVersionPreview,
+    fn merge_branch_preview_to_js(
+        result: lix_rs_sdk::MergeBranchPreview,
     ) -> Result<JsValue, LixError> {
         let object = Object::new();
         let outcome = match result.outcome {
-            lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
-            lix_rs_sdk::MergeVersionOutcome::FastForward => "fastForward",
-            lix_rs_sdk::MergeVersionOutcome::MergeCommitted => "mergeCommitted",
+            lix_rs_sdk::MergeBranchOutcome::AlreadyUpToDate => "alreadyUpToDate",
+            lix_rs_sdk::MergeBranchOutcome::FastForward => "fastForward",
+            lix_rs_sdk::MergeBranchOutcome::MergeCommitted => "mergeCommitted",
         };
         set_string(&object, "outcome", outcome)?;
-        set_string(&object, "targetVersionId", &result.target_version_id)?;
-        set_string(&object, "sourceVersionId", &result.source_version_id)?;
+        set_string(&object, "targetBranchId", &result.target_branch_id)?;
+        set_string(&object, "sourceBranchId", &result.source_branch_id)?;
         set_string(&object, "baseCommitId", &result.base_commit_id)?;
         set_string(&object, "targetHeadCommitId", &result.target_head_commit_id)?;
         set_string(&object, "sourceHeadCommitId", &result.source_head_commit_id)?;

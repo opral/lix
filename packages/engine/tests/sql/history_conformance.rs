@@ -194,7 +194,7 @@ simulation_test!(
             &session,
             "SELECT id, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM engine_history_conformance_history \
-             WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
+             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
              ORDER BY lixcol_depth",
         )
@@ -215,7 +215,7 @@ simulation_test!(
             &session,
             "SELECT snapshot_content, depth \
              FROM lix_state_history \
-             WHERE start_commit_id = lix_active_version_commit_id() \
+             WHERE start_commit_id = lix_active_branch_commit_id() \
                AND schema_key = 'engine_history_conformance' \
                AND entity_pk = lix_json('[\"history-conformance-entity\"]') \
                AND snapshot_content IS NULL",
@@ -257,7 +257,7 @@ simulation_test!(
             &session,
             "SELECT key, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM lix_key_value_history \
-             WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
+             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
         )
@@ -335,7 +335,7 @@ simulation_test!(
             &session,
             "SELECT namespace, id, value, lixcol_snapshot_content, lixcol_depth \
              FROM engine_history_composite_pk_history \
-             WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
+             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND namespace = 'messages' \
                AND id = '7' \
              ORDER BY lixcol_depth",
@@ -407,7 +407,7 @@ simulation_test!(
             &session,
             "SELECT id, path, name, data, lixcol_entity_pk, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
              FROM lix_file_history \
-             WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
+             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND id = 'history-conformance-file' \
                AND lixcol_depth = 0",
         )
@@ -430,7 +430,7 @@ simulation_test!(
             &session,
             "SELECT snapshot_content, depth \
              FROM lix_state_history \
-             WHERE start_commit_id = lix_active_version_commit_id() \
+             WHERE start_commit_id = lix_active_branch_commit_id() \
                AND schema_key = 'lix_file_descriptor' \
                AND entity_pk = lix_json('[\"history-conformance-file\"]') \
                AND snapshot_content IS NULL",
@@ -480,7 +480,7 @@ simulation_test!(
             &session,
             "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
              FROM lix_directory_history \
-             WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
+             WHERE lixcol_start_commit_id = lix_active_branch_commit_id() \
                AND id = 'history-conformance-dir' \
                AND lixcol_depth = 0",
         )
@@ -502,7 +502,7 @@ simulation_test!(
             &session,
             "SELECT snapshot_content, depth \
              FROM lix_state_history \
-             WHERE start_commit_id = lix_active_version_commit_id() \
+             WHERE start_commit_id = lix_active_branch_commit_id() \
                AND schema_key = 'lix_directory_descriptor' \
                AND entity_pk = lix_json('[\"history-conformance-dir\"]') \
                AND snapshot_content IS NULL",

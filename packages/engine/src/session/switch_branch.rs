@@ -2,26 +2,26 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage::StorageBackend;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 
-use super::context::{SessionContext, SessionMode, WORKSPACE_VERSION_KEY};
+use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
-/// Options for switching a session to another version.
+/// Options for switching a session to another branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SwitchVersionOptions {
-    pub version_id: String,
+pub struct SwitchBranchOptions {
+    pub branch_id: String,
 }
 
-/// Receipt returned after switching to another version.
+/// Receipt returned after switching to another branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SwitchVersionReceipt {
-    pub version_id: String,
+pub struct SwitchBranchReceipt {
+    pub branch_id: String,
 }
 
 impl<B> SessionContext<B>
@@ -30,39 +30,39 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
-    /// Switches the session's active version selector.
+    /// Switches the session's active branch selector.
     ///
     /// Pinned sessions switch in memory and return a new pinned session.
     /// Workspace sessions update the shared workspace selector so other
-    /// workspace sessions observe the new active version on their next use.
-    pub async fn switch_version(
+    /// workspace sessions observe the new active branch on their next use.
+    pub async fn switch_branch(
         &self,
-        options: SwitchVersionOptions,
-    ) -> Result<(SessionContext<B>, SwitchVersionReceipt), LixError> {
-        let version_id = options.version_id;
-        let receipt_version_id = version_id.clone();
+        options: SwitchBranchOptions,
+    ) -> Result<(SessionContext<B>, SwitchBranchReceipt), LixError> {
+        let branch_id = options.branch_id;
+        let receipt_branch_id = branch_id.clone();
         let current_mode = self.mode.clone();
         let next_mode = self
             .with_write_transaction(|transaction| {
                 Box::pin(async move {
                     {
-                        let reader = transaction.version_ref_reader();
-                        VersionLifecycle::new(&reader)
+                        let reader = transaction.branch_ref_reader();
+                        BranchLifecycle::new(&reader)
                             .require_existing_commit_id(
-                                &version_id,
-                                VersionOperation::SwitchVersion,
-                                VersionReferenceRole::Target,
+                                &branch_id,
+                                BranchOperation::SwitchBranch,
+                                BranchReferenceRole::Target,
                             )
                             .await?
                     };
 
                     match current_mode {
                         SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
-                            version_id: version_id.clone(),
+                            branch_id: branch_id.clone(),
                         }),
                         SessionMode::Workspace => {
                             transaction
-                                .stage_rows(vec![workspace_version_stage_row(&version_id)?])
+                                .stage_rows(vec![workspace_branch_stage_row(&branch_id)?])
                                 .await?;
                             Ok(SessionMode::Workspace)
                         }
@@ -77,28 +77,28 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.version_ctx),
+            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             self.write_lock.clone(),
             self.transaction_manager(),
         );
         Ok((
             session,
-            SwitchVersionReceipt {
-                version_id: receipt_version_id,
+            SwitchBranchReceipt {
+                branch_id: receipt_branch_id,
             },
         ))
     }
 }
 
-fn workspace_version_stage_row(version_id: &str) -> Result<TransactionWriteRow, LixError> {
+fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
     Ok(TransactionWriteRow {
-        entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_VERSION_KEY)),
+        entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
-            "key": WORKSPACE_VERSION_KEY,
-            "value": version_id,
+            "key": WORKSPACE_BRANCH_KEY,
+            "value": branch_id,
         }))),
         metadata: None,
         origin: None,
@@ -108,6 +108,6 @@ fn workspace_version_stage_row(version_id: &str) -> Result<TransactionWriteRow, 
         change_id: None,
         commit_id: None,
         untracked: true,
-        version_id: GLOBAL_VERSION_ID.to_string(),
+        branch_id: GLOBAL_BRANCH_ID.to_string(),
     })
 }

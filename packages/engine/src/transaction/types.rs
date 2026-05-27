@@ -131,15 +131,15 @@ pub(crate) struct TransactionWriteRow {
     pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
 }
 
 impl TransactionWriteRow {
-    pub(crate) fn schema_scope_version_id(&self) -> &str {
+    pub(crate) fn schema_scope_branch_id(&self) -> &str {
         if self.global {
-            crate::GLOBAL_VERSION_ID
+            crate::GLOBAL_BRANCH_ID
         } else {
-            self.version_id.as_str()
+            self.branch_id.as_str()
         }
     }
 }
@@ -174,7 +174,7 @@ pub(crate) struct LogicalPrimaryKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransactionFileData {
     pub(crate) file_id: String,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
     pub(crate) untracked: bool,
     pub(crate) data: Vec<u8>,
 }
@@ -277,7 +277,7 @@ pub(crate) struct PreparedStateRow {
     pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
 }
 
 impl From<PreparedStateRow> for MaterializedLiveStateRow {
@@ -296,7 +296,7 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
             change_id: row.change_id,
             commit_id: row.commit_id,
             untracked: row.untracked,
-            version_id: row.version_id,
+            branch_id: row.branch_id,
         }
     }
 }
@@ -316,7 +316,7 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
             change_id: row.change_id.clone(),
             commit_id: row.commit_id.clone(),
             untracked: row.untracked,
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
         }
     }
 }
@@ -334,7 +334,7 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
-            version_id: row.version_id,
+            branch_id: row.branch_id,
         }
     }
 }
@@ -343,7 +343,7 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
 ///
 /// Final commit row materialization owns commit ids, parent heads, and commit
 /// row timestamps. Staging only tracks which hydrated tracked changes the
-/// future commit introduces for a version.
+/// future commit introduces for a branch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_id: String,

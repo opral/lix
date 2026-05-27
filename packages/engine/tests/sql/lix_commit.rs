@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lix_engine::{CreateVersionOptions, Value};
+use lix_engine::{CreateBranchOptions, Value};
 
 use super::select_rows;
 
@@ -17,10 +17,10 @@ simulation_test!(
         );
 
         let initial_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
-            .expect("version head should load")
-            .expect("version head should exist");
+            .expect("branch head should load")
+            .expect("branch head should exist");
 
         session
             .execute(
@@ -30,10 +30,10 @@ simulation_test!(
             .await
             .expect("first tracked write should succeed");
         let first_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
-            .expect("version head should load")
-            .expect("version head should exist");
+            .expect("branch head should load")
+            .expect("branch head should exist");
 
         session
             .execute(
@@ -43,10 +43,10 @@ simulation_test!(
             .await
             .expect("second tracked write should succeed");
         let second_head = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
-            .expect("version head should load")
-            .expect("version head should exist");
+            .expect("branch head should load")
+            .expect("branch head should exist");
 
         let commit_rows = select_rows(
             &session,
@@ -84,71 +84,71 @@ simulation_test!(
             ]]
         );
 
-        let by_version_rows = select_rows(
+        let by_branch_rows = select_rows(
             &session,
             &format!(
-                "SELECT id, lixcol_version_id, lixcol_global, lixcol_untracked \
-                 FROM lix_commit_by_version \
+                "SELECT id, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                 FROM lix_commit_by_branch \
                  WHERE id IN ('{initial_head}', '{first_head}', '{second_head}') \
-                 ORDER BY id, lixcol_version_id"
+                 ORDER BY id, lixcol_branch_id"
             ),
         )
         .await;
-        assert!(by_version_rows.contains(&vec![
+        assert!(by_branch_rows.contains(&vec![
             Value::Text(initial_head.clone()),
-            Value::Text(sim.main_version_id().to_string()),
+            Value::Text(sim.main_branch_id().to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
-        assert!(by_version_rows.contains(&vec![
+        assert!(by_branch_rows.contains(&vec![
             Value::Text(initial_head),
             Value::Text("global".to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
-        assert!(by_version_rows.contains(&vec![
+        assert!(by_branch_rows.contains(&vec![
             Value::Text(first_head.clone()),
-            Value::Text(sim.main_version_id().to_string()),
+            Value::Text(sim.main_branch_id().to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
-        assert!(by_version_rows.contains(&vec![
+        assert!(by_branch_rows.contains(&vec![
             Value::Text(first_head.clone()),
             Value::Text("global".to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
-        assert!(by_version_rows.contains(&vec![
+        assert!(by_branch_rows.contains(&vec![
             Value::Text(second_head.clone()),
-            Value::Text(sim.main_version_id().to_string()),
+            Value::Text(sim.main_branch_id().to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
-        assert!(by_version_rows.contains(&vec![
+        assert!(by_branch_rows.contains(&vec![
             Value::Text(second_head.clone()),
             Value::Text("global".to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
 
-        let edge_by_version_rows = select_rows(
+        let edge_by_branch_rows = select_rows(
             &session,
             &format!(
-                "SELECT parent_id, child_id, parent_order, lixcol_version_id, lixcol_global, lixcol_untracked \
-                 FROM lix_commit_edge_by_version \
+                "SELECT parent_id, child_id, parent_order, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                 FROM lix_commit_edge_by_branch \
                  WHERE child_id = '{second_head}' \
-                 ORDER BY lixcol_version_id"
+                 ORDER BY lixcol_branch_id"
             ),
         )
         .await;
         assert_eq!(
-            edge_by_version_rows,
+            edge_by_branch_rows,
             vec![
                 vec![
                     Value::Text(first_head.clone()),
                     Value::Text(second_head.clone()),
                     Value::Integer(0),
-                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Text(sim.main_branch_id().to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],
@@ -184,13 +184,13 @@ simulation_test!(
         .await
         .expect("main write should succeed");
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("commit-branch".to_string()),
             name: "Commit branch".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("branch version should be created");
+        .expect("branch branch should be created");
 
         let branch = sim.wrap_session(
             engine
@@ -208,7 +208,7 @@ simulation_test!(
             .expect("branch write should succeed");
 
         let branch_head = engine
-            .load_version_head_commit_id("commit-branch")
+            .load_branch_head_commit_id("commit-branch")
             .await
             .expect("branch head should load")
             .expect("branch head should exist");
@@ -225,7 +225,7 @@ simulation_test!(
         .await;
         assert_eq!(
             main_commit_rows, branch_commit_rows,
-            "lix_commit should not depend on the active version"
+            "lix_commit should not depend on the active branch"
         );
         assert_eq!(
             main_commit_rows,
@@ -251,7 +251,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_commit_derived_by_version_surfaces_match_commit_entity_projection,
+    lix_commit_derived_by_branch_surfaces_match_commit_entity_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -269,14 +269,14 @@ simulation_test!(
         .await
         .expect("main write should succeed");
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("edge-probe-a".to_string()),
             name: "Edge Probe A".to_string(),
             from_commit_id: Some(sim.initial_commit_id().to_string()),
         })
         .await
         .expect("edge-probe-a should be created from the initial commit");
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("edge-probe-b".to_string()),
             name: "Edge Probe B".to_string(),
             from_commit_id: Some(sim.initial_commit_id().to_string()),
@@ -314,12 +314,12 @@ simulation_test!(
             .await
             .expect("edge-probe-b write should succeed");
 
-        let global_edges = commit_edges_by_version(&main, "global").await;
-        for version_id in [sim.main_version_id(), "edge-probe-a", "edge-probe-b"] {
-            let actual_edges = commit_edges_by_version(&main, version_id).await;
+        let global_edges = commit_edges_by_branch(&main, "global").await;
+        for branch_id in [sim.main_branch_id(), "edge-probe-a", "edge-probe-b"] {
+            let actual_edges = commit_edges_by_branch(&main, branch_id).await;
             assert_eq!(
                 actual_edges, global_edges,
-                "lix_commit_edge_by_version should project derived global edges for {version_id}"
+                "lix_commit_edge_by_branch should project derived global edges for {branch_id}"
             );
         }
     }
@@ -338,10 +338,10 @@ simulation_test!(
         );
 
         for (schema_key, tables) in [
-            ("lix_commit", vec!["lix_commit", "lix_commit_by_version"]),
+            ("lix_commit", vec!["lix_commit", "lix_commit_by_branch"]),
             (
                 "lix_commit_edge",
-                vec!["lix_commit_edge", "lix_commit_edge_by_version"],
+                vec!["lix_commit_edge", "lix_commit_edge_by_branch"],
             ),
         ] {
             let schema_properties = builtin_schema_property_names(schema_key);
@@ -370,9 +370,9 @@ simulation_test!(
 
         for table in [
             "lix_commit",
-            "lix_commit_by_version",
+            "lix_commit_by_branch",
             "lix_commit_edge",
-            "lix_commit_edge_by_version",
+            "lix_commit_edge_by_branch",
         ] {
             let rows = select_rows(&session, &format!("SELECT count(*) FROM {table}")).await;
             assert_single_count(rows, table);
@@ -399,16 +399,16 @@ fn text_value(value: &Value) -> String {
     value.clone()
 }
 
-async fn commit_edges_by_version(
+async fn commit_edges_by_branch(
     session: &crate::support::simulation_test::engine::SimSession,
-    version_id: &str,
+    branch_id: &str,
 ) -> BTreeSet<(String, String)> {
     select_rows(
         session,
         &format!(
             "SELECT parent_id, child_id \
-             FROM lix_commit_edge_by_version \
-             WHERE lixcol_version_id = '{version_id}'"
+             FROM lix_commit_edge_by_branch \
+             WHERE lixcol_branch_id = '{branch_id}'"
         ),
     )
     .await

@@ -11,20 +11,20 @@
 //! commit completion. Durability itself is the backend's responsibility.
 
 mod context;
-mod create_version;
+mod create_branch;
 mod execute;
 mod merge;
-mod switch_version;
+mod switch_branch;
 mod transaction;
 
 pub use context::SessionContext;
-pub(crate) use context::{SessionMode, WORKSPACE_VERSION_KEY};
-pub use create_version::{CreateVersionOptions, CreateVersionReceipt};
+pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
+pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{ExecuteResult, Row, RowRef, TryFromValue};
 pub use merge::{
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    MergeVersionOptions, MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions,
-    MergeVersionReceipt,
+    MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
+    MergeConflictKind, MergeConflictSide,
 };
-pub use switch_version::{SwitchVersionOptions, SwitchVersionReceipt};
+pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;

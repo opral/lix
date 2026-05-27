@@ -1,8 +1,8 @@
 use lix_engine::{
-    Backend, CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, Engine,
-    ExecuteResult, InMemoryBackend, LixError, MergeVersionOptions, MergeVersionPreview,
-    MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult, SessionContext,
-    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, Value,
+    Backend, CreateBranchOptions, CreateBranchReceipt as CreateBranchResult, Engine, ExecuteResult,
+    InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt as MergeBranchResult, SessionContext, SwitchBranchOptions,
+    SwitchBranchReceipt as SwitchBranchResult, Value,
 };
 
 /// Options for opening a Lix workspace session.
@@ -70,37 +70,37 @@ where
         })
     }
 
-    pub async fn active_version_id(&self) -> Result<String, LixError> {
-        self.session.active_version_id().await
+    pub async fn active_branch_id(&self) -> Result<String, LixError> {
+        self.session.active_branch_id().await
     }
 
-    pub async fn create_version(
+    pub async fn create_branch(
         &self,
-        options: CreateVersionOptions,
-    ) -> Result<CreateVersionResult, LixError> {
-        self.session.create_version(options).await
+        options: CreateBranchOptions,
+    ) -> Result<CreateBranchResult, LixError> {
+        self.session.create_branch(options).await
     }
 
-    pub async fn switch_version(
+    pub async fn switch_branch(
         &self,
-        options: SwitchVersionOptions,
-    ) -> Result<SwitchVersionResult, LixError> {
-        let (_session, receipt) = self.session.switch_version(options).await?;
+        options: SwitchBranchOptions,
+    ) -> Result<SwitchBranchResult, LixError> {
+        let (_session, receipt) = self.session.switch_branch(options).await?;
         Ok(receipt)
     }
 
-    pub async fn merge_version(
+    pub async fn merge_branch(
         &self,
-        options: MergeVersionOptions,
-    ) -> Result<MergeVersionResult, LixError> {
-        self.session.merge_version(options).await
+        options: MergeBranchOptions,
+    ) -> Result<MergeBranchResult, LixError> {
+        self.session.merge_branch(options).await
     }
 
-    pub async fn merge_version_preview(
+    pub async fn merge_branch_preview(
         &self,
-        options: MergeVersionPreviewOptions,
-    ) -> Result<MergeVersionPreview, LixError> {
-        self.session.merge_version_preview(options).await
+        options: MergeBranchPreviewOptions,
+    ) -> Result<MergeBranchPreview, LixError> {
+        self.session.merge_branch_preview(options).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::binary_cas::BinaryCasContext;
+use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
@@ -12,8 +13,7 @@ use crate::storage::{DurableWriteLock, StorageBackend, StorageReadOptions, Stora
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
-use crate::version::{VersionContext, VersionRefReader};
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     storage: StorageContext<B>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
-    version_ctx: Arc<VersionContext>,
+    branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
     write_lock: DurableWriteLock,
@@ -65,7 +65,7 @@ where
             *untracked_state,
             commit_graph,
         ));
-        let version_ctx = Arc::new(VersionContext::new(Arc::clone(&untracked_state)));
+        let branch_ctx = Arc::new(BranchContext::new(Arc::clone(&untracked_state)));
         assert_initialized(storage.clone(), live_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
@@ -78,7 +78,7 @@ where
             storage,
             tracked_state,
             live_state,
-            version_ctx,
+            branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
         })
     }
@@ -87,35 +87,35 @@ where
         self.storage.clone()
     }
 
-    /// Loads the current commit head for a version.
+    /// Loads the current commit head for a branch.
     ///
-    /// This is the public engine-level form of the typed `version_ref` context:
-    /// callers should not need to know that version heads are represented as
-    /// untracked `lix_version_ref` rows in live_state.
-    pub async fn load_version_head_commit_id(
+    /// This is the public engine-level form of the typed `branch_ref` context:
+    /// callers should not need to know that branch heads are represented as
+    /// untracked `lix_branch_ref` rows in live_state.
+    pub async fn load_branch_head_commit_id(
         &self,
-        version_id: &str,
+        branch_id: &str,
     ) -> Result<Option<String>, LixError> {
         let read = self.storage.begin_read(StorageReadOptions::default())?;
         let result = self
-            .version_ctx
+            .branch_ctx
             .ref_reader(&read)
-            .load_head_commit_id(version_id)
+            .load_head_commit_id(branch_id)
             .await;
         result
     }
 
     pub async fn open_session(
         &self,
-        active_version_id: impl Into<String>,
+        active_branch_id: impl Into<String>,
     ) -> Result<SessionContext<B>, LixError> {
         SessionContext::open(
-            active_version_id.into(),
+            active_branch_id.into(),
             self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.version_ctx),
+            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             self.write_lock.clone(),
         )
@@ -128,31 +128,28 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.version_ctx),
+            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             self.write_lock.clone(),
         )
         .await
     }
 
-    /// Rebuilds the tracked serving commit root for one version from changelog.
+    /// Rebuilds the tracked serving commit root for one branch from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
-    /// state. The current version head is read from the live-state facade so
+    /// state. The current branch head is read from the live-state facade so
     /// rebuild uses the same moving-ref visibility as normal execution.
-    pub async fn rebuild_tracked_state_for_version(
-        &self,
-        version_id: &str,
-    ) -> Result<(), LixError> {
+    pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
         let _write_guard = self.write_lock.lock_owned().await;
         let head_commit_id = self
-            .load_version_head_commit_id(version_id)
+            .load_branch_head_commit_id(branch_id)
             .await?
             .ok_or_else(|| {
-                LixError::version_not_found(
-                    version_id.to_string(),
-                    "rebuild_tracked_state_for_version",
+                LixError::branch_not_found(
+                    branch_id.to_string(),
+                    "rebuild_tracked_state_for_branch",
                     "target",
                 )
             })?;
@@ -188,7 +185,7 @@ where
     let initialized = reader
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single("lix_id"),
             file_id: NullableKeyFilter::Null,
         })

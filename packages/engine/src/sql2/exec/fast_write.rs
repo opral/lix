@@ -42,7 +42,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SqlWriteExecutionContext for PanicWriteContext {
-        fn active_version_id(&self) -> &str {
+        fn active_branch_id(&self) -> &str {
             panic!("fast no-match execution should not inspect context")
         }
 
@@ -68,10 +68,7 @@ mod tests {
             panic!("fast no-match execution should not inspect context")
         }
 
-        async fn load_version_head(
-            &mut self,
-            _version_id: &str,
-        ) -> Result<Option<String>, LixError> {
+        async fn load_branch_head(&mut self, _branch_id: &str) -> Result<Option<String>, LixError> {
             panic!("fast no-match execution should not inspect context")
         }
 

@@ -68,12 +68,12 @@ impl PublicCatalog {
         let surface = self.surface(table_name)?;
         Some(match &surface.kind {
             PublicSurfaceKind::LixState => lix_state_schema(false),
-            PublicSurfaceKind::LixStateByVersion => lix_state_schema(true),
+            PublicSurfaceKind::LixStateByBranch => lix_state_schema(true),
             PublicSurfaceKind::File => filesystem_schema(false, true),
-            PublicSurfaceKind::FileByVersion => filesystem_schema(true, true),
+            PublicSurfaceKind::FileByBranch => filesystem_schema(true, true),
             PublicSurfaceKind::Directory => filesystem_schema(false, false),
-            PublicSurfaceKind::DirectoryByVersion => filesystem_schema(true, false),
-            PublicSurfaceKind::Version => Arc::new(Schema::new(vec![
+            PublicSurfaceKind::DirectoryByBranch => filesystem_schema(true, false),
+            PublicSurfaceKind::Branch => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("name", DataType::Utf8, false),
                 Field::new("hidden", DataType::Boolean, false),
@@ -105,8 +105,8 @@ impl PublicCatalog {
             PublicSurfaceKind::EntityBase { schema_key } => {
                 entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::Active)
             }
-            PublicSurfaceKind::EntityByVersion { schema_key } => {
-                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::ByVersion)
+            PublicSurfaceKind::EntityByBranch { schema_key } => {
+                entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::ByBranch)
             }
             PublicSurfaceKind::EntityHistory { schema_key } => {
                 entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::History)
@@ -134,8 +134,8 @@ impl PublicCatalog {
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
-            "lix_state_by_version",
-            PublicSurfaceKind::LixStateByVersion,
+            "lix_state_by_branch",
+            PublicSurfaceKind::LixStateByBranch,
             lix_state_columns(true),
             SurfaceCapabilities::read_write(),
         ))?;
@@ -146,8 +146,8 @@ impl PublicCatalog {
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
-            "lix_file_by_version",
-            PublicSurfaceKind::FileByVersion,
+            "lix_file_by_branch",
+            PublicSurfaceKind::FileByBranch,
             filesystem_columns(true),
             SurfaceCapabilities::read_write(),
         ))?;
@@ -158,14 +158,14 @@ impl PublicCatalog {
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
-            "lix_directory_by_version",
-            PublicSurfaceKind::DirectoryByVersion,
+            "lix_directory_by_branch",
+            PublicSurfaceKind::DirectoryByBranch,
             directory_columns(true),
             SurfaceCapabilities::read_write(),
         ))?;
         self.insert(surface(
-            "lix_version",
-            PublicSurfaceKind::Version,
+            "lix_branch",
+            PublicSurfaceKind::Branch,
             vec![
                 PublicColumn::public_insert_only("id"),
                 PublicColumn::public("name"),
@@ -231,15 +231,15 @@ impl PublicCatalog {
             SurfaceCapabilities::read_write(),
         ))?;
 
-        let mut by_version_columns = entity_columns(&spec);
-        by_version_columns.extend(entity_hidden_columns(true));
+        let mut by_branch_columns = entity_columns(&spec);
+        by_branch_columns.extend(entity_hidden_columns(true));
 
         self.insert(surface(
-            format!("{}_by_version", spec.schema_key),
-            PublicSurfaceKind::EntityByVersion {
+            format!("{}_by_branch", spec.schema_key),
+            PublicSurfaceKind::EntityByBranch {
                 schema_key: spec.schema_key.clone(),
             },
-            by_version_columns,
+            by_branch_columns,
             SurfaceCapabilities::read_write(),
         ))?;
 
@@ -267,7 +267,7 @@ impl PublicCatalog {
 }
 
 #[cfg(test)]
-fn lix_state_schema(by_version: bool) -> SchemaRef {
+fn lix_state_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
@@ -281,14 +281,14 @@ fn lix_state_schema(by_version: bool) -> SchemaRef {
         Field::new("commit_id", DataType::Utf8, true),
         Field::new("untracked", DataType::Boolean, true),
     ];
-    if by_version {
-        fields.push(Field::new("version_id", DataType::Utf8, false));
+    if by_branch {
+        fields.push(Field::new("branch_id", DataType::Utf8, false));
     }
     Arc::new(Schema::new(fields))
 }
 
 #[cfg(test)]
-fn filesystem_schema(by_version: bool, include_data: bool) -> SchemaRef {
+fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
     let mut fields = if include_data {
         vec![
             Field::new("id", DataType::Utf8, true),
@@ -319,8 +319,8 @@ fn filesystem_schema(by_version: bool, include_data: bool) -> SchemaRef {
         Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
     ]);
-    if by_version {
-        fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
+    if by_branch {
+        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     }
     Arc::new(Schema::new(fields))
 }
@@ -403,7 +403,7 @@ fn entity_columns(spec: &EntitySurfaceSpec) -> Vec<PublicColumn> {
         .collect()
 }
 
-fn lix_state_columns(by_version: bool) -> Vec<PublicColumn> {
+fn lix_state_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::public_insert_only("entity_pk"),
         PublicColumn::public_insert_only("schema_key"),
@@ -417,13 +417,13 @@ fn lix_state_columns(by_version: bool) -> Vec<PublicColumn> {
         PublicColumn::public_insert_only("commit_id"),
         PublicColumn::public_insert_only("untracked"),
     ];
-    if by_version {
-        columns.push(PublicColumn::public_insert_only("version_id"));
+    if by_branch {
+        columns.push(PublicColumn::public_insert_only("branch_id"));
     }
     columns
 }
 
-fn filesystem_columns(by_version: bool) -> Vec<PublicColumn> {
+fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::public_insert_only("id"),
         PublicColumn::public("path"),
@@ -432,11 +432,11 @@ fn filesystem_columns(by_version: bool) -> Vec<PublicColumn> {
         PublicColumn::public("hidden"),
         PublicColumn::public("data"),
     ];
-    columns.extend(filesystem_hidden_columns(by_version));
+    columns.extend(filesystem_hidden_columns(by_branch));
     columns
 }
 
-fn directory_columns(by_version: bool) -> Vec<PublicColumn> {
+fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::public_insert_only("id"),
         PublicColumn::public_insert_only("path"),
@@ -444,19 +444,19 @@ fn directory_columns(by_version: bool) -> Vec<PublicColumn> {
         PublicColumn::public("name"),
         PublicColumn::public("hidden"),
     ];
-    columns.extend(filesystem_hidden_columns(by_version));
+    columns.extend(filesystem_hidden_columns(by_branch));
     columns
 }
 
-fn entity_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
-    entity_system_columns(if by_version {
-        EntitySurfaceShape::ByVersion
+fn entity_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
+    entity_system_columns(if by_branch {
+        EntitySurfaceShape::ByBranch
     } else {
         EntitySurfaceShape::Active
     })
 }
 
-fn filesystem_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
+fn filesystem_hidden_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::hidden("lixcol_entity_pk"),
         PublicColumn::hidden("lixcol_schema_key"),
@@ -469,8 +469,8 @@ fn filesystem_hidden_columns(by_version: bool) -> Vec<PublicColumn> {
         PublicColumn::public_insert_only("lixcol_untracked"),
         PublicColumn::public("lixcol_metadata"),
     ];
-    if by_version {
-        columns.push(PublicColumn::public_insert_only("lixcol_version_id"));
+    if by_branch {
+        columns.push(PublicColumn::public_insert_only("lixcol_branch_id"));
     }
     columns
 }
@@ -490,7 +490,7 @@ fn entity_system_columns(variant: EntitySurfaceShape) -> Vec<PublicColumn> {
             | "lixcol_updated_at" | "lixcol_commit_id" => {
                 PublicColumn::public_read_only(field.name().as_str())
             }
-            "lixcol_entity_pk" | "lixcol_global" | "lixcol_untracked" | "lixcol_version_id" => {
+            "lixcol_entity_pk" | "lixcol_global" | "lixcol_untracked" | "lixcol_branch_id" => {
                 PublicColumn::public_insert_only(field.name().as_str())
             }
             "lixcol_metadata" => PublicColumn::public(field.name().as_str()),
