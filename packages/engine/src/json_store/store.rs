@@ -35,10 +35,6 @@ fn raw_json_ref_for_content(json: &str) -> JsonRef {
     JsonRef::from_hash(blake3::hash(json.as_bytes()))
 }
 
-pub(crate) fn json_ref_for_content(bytes: &[u8]) -> JsonRef {
-    JsonRef::for_content(bytes)
-}
-
 #[cfg(test)]
 fn encode_json(json: &str) -> Result<EncodedJson<'_>, LixError> {
     encode_json_for_storage(json)
@@ -89,17 +85,6 @@ pub(crate) fn encode_json_str_with_ref(
 
 pub(crate) fn encode_direct_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
     encode_stored_json_payload(encoded_json)
-}
-
-pub(crate) fn encode_json_bytes_for_storage(bytes: &[u8]) -> Result<(JsonRef, Vec<u8>), LixError> {
-    let json = std::str::from_utf8(bytes).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("json bytes are invalid UTF-8: {error}"),
-        )
-    })?;
-    let json_ref = JsonRef::from_hash(blake3::hash(bytes));
-    encode_json_str_for_storage_with_ref(json, json_ref)
 }
 
 pub(crate) fn encode_json_str_for_storage_with_ref(

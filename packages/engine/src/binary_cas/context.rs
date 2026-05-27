@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 
-use crate::binary_cas::{
-    BlobBytesBatch, BlobExistsBatch, BlobHash, BlobMetadataBatch, BlobWrite, BlobWriteReceipt,
-};
+use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobWrite, BlobWriteReceipt};
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::LixError;
 use std::collections::HashSet;
@@ -62,32 +60,11 @@ impl<S> BinaryCasStoreReader<S>
 where
     S: StorageRead,
 {
-    #[allow(dead_code)]
-    pub(crate) async fn exists_many(
-        &mut self,
-        hashes: &[BlobHash],
-    ) -> Result<BlobExistsBatch, LixError> {
-        crate::binary_cas::kv::exists_many(&self.store, hashes).await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn load_metadata_many(
-        &mut self,
-        hashes: &[BlobHash],
-    ) -> Result<BlobMetadataBatch, LixError> {
-        crate::binary_cas::kv::load_metadata_many(&self.store, hashes).await
-    }
-
     pub(crate) async fn load_bytes_many(
         &mut self,
         hashes: &[BlobHash],
     ) -> Result<BlobBytesBatch, LixError> {
         crate::binary_cas::kv::load_bytes_many(&self.store, hashes).await
-    }
-
-    #[cfg(feature = "storage-benches")]
-    pub(crate) async fn count_blob_manifests(&mut self) -> Result<usize, LixError> {
-        crate::binary_cas::kv::count_manifests(&self.store).await
     }
 }
 
@@ -117,23 +94,5 @@ impl<'a> BinaryCasWriter<'a> {
             &mut self.chunk_keys,
             &BlobWrite { bytes },
         )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn stage_many(
-        &mut self,
-        writes: &[BlobWrite<'_>],
-    ) -> Result<Vec<BlobWriteReceipt>, LixError> {
-        writes
-            .iter()
-            .map(|write| {
-                crate::binary_cas::kv::stage_blob_write(
-                    self.writes,
-                    &mut self.blob_hashes,
-                    &mut self.chunk_keys,
-                    write,
-                )
-            })
-            .collect()
     }
 }

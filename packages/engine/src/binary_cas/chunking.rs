@@ -3,11 +3,6 @@ const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
 const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
 const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
 
-#[allow(dead_code)]
-pub(crate) fn should_materialize_chunk_cas(data: &[u8]) -> bool {
-    data.len() > SINGLE_CHUNK_FAST_PATH_MAX_BYTES
-}
-
 pub(crate) fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return Vec::new();

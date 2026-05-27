@@ -38,23 +38,3 @@ pub trait WasmComponentInstance: Send + Sync {
         Ok(())
     }
 }
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopWasmRuntime;
-
-#[async_trait(?Send)]
-impl WasmRuntime for NoopWasmRuntime {
-    async fn init_component(
-        &self,
-        _bytes: Vec<u8>,
-        _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "wasm runtime is required to execute plugins; provide a non-noop runtime"
-                .to_string(),
-            hint: None,
-            details: None,
-        })
-    }
-}

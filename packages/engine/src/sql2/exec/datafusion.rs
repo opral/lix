@@ -16,7 +16,6 @@ use crate::sql2::bind::write::{BoundInsertValues, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
-use crate::sql2::parse::parse_statement;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 use crate::sql2::plan::LogicalWritePlan;
@@ -52,7 +51,7 @@ pub(crate) struct DataFusionLogicalPlan {
 /// execution context and source rows from `live_state()`.
 ///
 /// `catalog()` is intentionally omitted from the MVP boundary for now.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn execute_sql<C>(
     ctx: &C,
     sql: &str,
@@ -65,11 +64,12 @@ where
     execute_logical_plan(plan, params).await
 }
 
+#[cfg(test)]
 pub(crate) async fn create_logical_plan<C>(ctx: &C, sql: &str) -> Result<SqlLogicalPlan, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let statement = parse_statement(sql)?;
+    let statement = crate::sql2::parse::parse_statement(sql)?;
     create_logical_plan_from_parsed(ctx, sql, statement).await
 }
 
@@ -1354,7 +1354,6 @@ mod tests {
             .expect("read should open")
     }
 
-    #[allow(dead_code)]
     fn test_functions() -> FunctionProviderHandle {
         SharedFunctionProvider::new(
             Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>

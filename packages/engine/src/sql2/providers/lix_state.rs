@@ -395,7 +395,6 @@ impl InsertSink for LixStateInsertSink {
     }
 }
 
-#[allow(dead_code)]
 struct LixStateDeleteExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
@@ -535,7 +534,6 @@ impl ExecutionPlan for LixStateDeleteExec {
     }
 }
 
-#[allow(dead_code)]
 struct LixStateUpdateExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,

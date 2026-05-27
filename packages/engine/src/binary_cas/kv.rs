@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::binary_cas::chunking::fastcdc_chunk_ranges;
 use crate::binary_cas::codec::{
     decode_binary_cas_chunk, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
@@ -7,8 +5,8 @@ use crate::binary_cas::codec::{
     encode_binary_chunk_payload, BinaryCasManifest, BinaryChunkCodec,
 };
 use crate::binary_cas::{
-    BlobBytesBatch, BlobExistsBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
-    BlobWrite, BlobWriteReceipt,
+    BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWrite,
+    BlobWriteReceipt,
 };
 use crate::storage::{PointReadPlan, ScanPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
@@ -44,7 +42,8 @@ pub(crate) struct KvChunk {
     pub(crate) data: Vec<u8>,
 }
 
-pub(crate) async fn load_manifest(
+#[cfg(test)]
+async fn load_manifest(
     store: &impl StorageRead,
     blob_hash: BlobHash,
 ) -> Result<Option<BinaryCasManifest>, LixError> {
@@ -53,15 +52,6 @@ pub(crate) async fn load_manifest(
         return Ok(None);
     };
     decode_binary_cas_manifest(&bytes).map(Some)
-}
-
-#[cfg(feature = "storage-benches")]
-pub(crate) async fn count_manifests(store: &impl StorageRead) -> Result<usize, LixError> {
-    Ok(
-        scan_all_values(store, BINARY_CAS_MANIFEST_SPACE, Vec::new())
-            .await?
-            .len(),
-    )
 }
 
 pub(crate) fn stage_manifest(
@@ -113,7 +103,8 @@ pub(crate) fn stage_manifest_chunk(
     );
 }
 
-pub(crate) async fn load_chunk(
+#[cfg(test)]
+async fn load_chunk(
     store: &impl StorageRead,
     chunk_hash: BlobHash,
 ) -> Result<Option<KvChunk>, LixError> {
@@ -140,6 +131,7 @@ pub(crate) fn stage_chunk(writes: &mut StorageWriteSet, chunk_hash: BlobHash, ch
     );
 }
 
+#[cfg(test)]
 async fn get_one(
     store: &impl StorageRead,
     space: StorageSpace,
@@ -224,20 +216,6 @@ pub(crate) async fn load_metadata_many(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BlobMetadataBatch::new(entries))
-}
-
-pub(crate) async fn exists_many(
-    store: &impl StorageRead,
-    hashes: &[BlobHash],
-) -> Result<BlobExistsBatch, LixError> {
-    Ok(BlobExistsBatch::new(
-        load_metadata_many(store, hashes)
-            .await?
-            .into_vec()
-            .into_iter()
-            .map(|metadata| metadata.is_some())
-            .collect(),
-    ))
 }
 
 pub(crate) async fn load_bytes_many(
@@ -852,16 +830,6 @@ mod tests {
                 .await
                 .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
-        );
-        let store = storage
-            .begin_read(StorageReadOptions::default())
-            .expect("read should open");
-        assert_eq!(
-            exists_many(&store, &[blob_hash])
-                .await
-                .expect("blob exists should succeed")
-                .into_vec(),
-            vec![true]
         );
     }
 

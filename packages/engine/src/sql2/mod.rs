@@ -38,15 +38,14 @@ pub(crate) use context::{
 };
 #[allow(unused_imports)]
 pub(crate) use exec::{
-    create_logical_plan, create_logical_plan_from_parsed,
-    create_transaction_read_logical_plan_from_parsed, create_write_logical_plan,
-    create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql,
-    execute_write_logical_plan, SqlLogicalPlan,
+    create_logical_plan_from_parsed, create_transaction_read_logical_plan_from_parsed,
+    create_write_logical_plan_from_parsed, execute_logical_plan, execute_write_logical_plan,
+    SqlLogicalPlan,
 };
 #[cfg(test)]
 pub(crate) use exec::{
-    execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
-    WriteExecutorMode, WriteExecutorPath,
+    create_write_logical_plan, execute_write_logical_plan_with_mode,
+    execute_write_logical_plan_with_mode_and_trace, WriteExecutorMode, WriteExecutorPath,
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;

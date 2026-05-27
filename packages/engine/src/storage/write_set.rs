@@ -178,21 +178,6 @@ impl StorageWriteSet {
         group.deletes.reserve(expected_deletes);
     }
 
-    pub(crate) fn move_space_to_end(&mut self, space: StorageSpace) {
-        let Some(index) = self.group_index.get(&space.id).copied() else {
-            return;
-        };
-        if index + 1 == self.groups.len() {
-            return;
-        }
-        let group = self.groups.remove(index);
-        self.groups.push(group);
-        self.group_index.clear();
-        for (index, group) in self.groups.iter().enumerate() {
-            self.group_index.insert(group.space.id, index);
-        }
-    }
-
     pub fn extend(&mut self, other: StorageWriteSet) {
         for group in other.groups {
             let space = group.space;

@@ -25,29 +25,11 @@ impl<T> Default for NullableKeyFilter<T> {
 }
 
 impl<T> NullableKeyFilter<T> {
-    pub fn is_any(&self) -> bool {
-        matches!(self, Self::Any)
-    }
-
-    pub fn as_value(&self) -> Option<&T> {
-        match self {
-            Self::Value(value) => Some(value),
-            Self::Any | Self::Null => None,
-        }
-    }
-
     pub fn as_ref(&self) -> NullableKeyFilter<&T> {
         match self {
             Self::Any => NullableKeyFilter::Any,
             Self::Null => NullableKeyFilter::Null,
             Self::Value(value) => NullableKeyFilter::Value(value),
-        }
-    }
-
-    pub fn from_nullable(value: Option<T>) -> Self {
-        match value {
-            Some(value) => Self::Value(value),
-            None => Self::Null,
         }
     }
 }
@@ -90,16 +72,4 @@ pub struct LixNotice {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct WriteReceipt {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_commit_sequence: Option<u64>,
-}
-
-impl WriteReceipt {
-    pub fn is_empty(&self) -> bool {
-        self.state_commit_sequence.is_none()
-    }
 }

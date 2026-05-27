@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -10,8 +8,7 @@ use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::LixError;
 
 use super::filesystem_planner::{
-    FilesystemRowContext, BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-    FILE_DESCRIPTOR_SCHEMA_KEY,
+    BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 
 /// Execution-visible filesystem metadata decoded from live-state rows.
@@ -21,10 +18,9 @@ use super::filesystem_planner::{
 /// sees pending writes without reaching into write-execution internals.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct VisibleFilesystem {
-    pub(crate) directories_by_id: BTreeMap<String, VisibleDirectory>,
     pub(crate) directory_children_by_parent_id: BTreeMap<Option<String>, BTreeSet<String>>,
-    pub(crate) files_by_directory_id: BTreeMap<Option<String>, BTreeMap<String, VisibleFile>>,
-    pub(crate) blob_refs_by_file_id: BTreeMap<String, VisibleBlobRef>,
+    pub(crate) files_by_directory_id: BTreeMap<Option<String>, BTreeSet<String>>,
+    pub(crate) blob_refs_by_file_id: BTreeSet<String>,
 }
 
 impl VisibleFilesystem {
@@ -69,21 +65,11 @@ impl VisibleFilesystem {
                                 format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
                             )
                         })?;
-                    let directory = VisibleDirectory {
-                        id: snapshot.id,
-                        parent_id: snapshot.parent_id,
-                        name: snapshot.name,
-                        hidden: snapshot.hidden.unwrap_or(false),
-                        context: filesystem_row_context(&row)?,
-                    };
                     visible
                         .directory_children_by_parent_id
-                        .entry(directory.parent_id.clone())
+                        .entry(snapshot.parent_id)
                         .or_default()
-                        .insert(directory.id.clone());
-                    visible
-                        .directories_by_id
-                        .insert(directory.id.clone(), directory);
+                        .insert(snapshot.id);
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
@@ -93,18 +79,11 @@ impl VisibleFilesystem {
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
-                    let file = VisibleFile {
-                        id: snapshot.id,
-                        directory_id: snapshot.directory_id,
-                        name: snapshot.name,
-                        hidden: snapshot.hidden,
-                        context: filesystem_row_context(&row)?,
-                    };
                     visible
                         .files_by_directory_id
-                        .entry(file.directory_id.clone())
+                        .entry(snapshot.directory_id)
                         .or_default()
-                        .insert(file.id.clone(), file);
+                        .insert(snapshot.id);
                 }
                 BLOB_REF_SCHEMA_KEY => {
                     let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
@@ -114,15 +93,7 @@ impl VisibleFilesystem {
                                 format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
                             )
                         })?;
-                    visible.blob_refs_by_file_id.insert(
-                        snapshot.id.clone(),
-                        VisibleBlobRef {
-                            file_id: snapshot.id,
-                            blob_hash: snapshot.blob_hash,
-                            size_bytes: snapshot.size_bytes,
-                            context: filesystem_row_context(&row)?,
-                        },
-                    );
+                    visible.blob_refs_by_file_id.insert(snapshot.id);
                 }
                 _ => {}
             }
@@ -132,78 +103,21 @@ impl VisibleFilesystem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VisibleDirectory {
-    pub(crate) id: String,
-    pub(crate) parent_id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) hidden: bool,
-    pub(crate) context: FilesystemRowContext,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VisibleFile {
-    pub(crate) id: String,
-    pub(crate) directory_id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) hidden: bool,
-    pub(crate) context: FilesystemRowContext,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VisibleBlobRef {
-    pub(crate) file_id: String,
-    pub(crate) blob_hash: String,
-    pub(crate) size_bytes: Option<u64>,
-    pub(crate) context: FilesystemRowContext,
-}
-
 #[derive(Debug, Deserialize)]
 struct DirectoryDescriptorSnapshot {
     id: String,
     parent_id: Option<String>,
-    name: String,
-    hidden: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
-    name: String,
-    hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct BlobRefSnapshot {
     id: String,
-    blob_hash: String,
-    size_bytes: Option<u64>,
-}
-
-fn filesystem_row_context(
-    row: &MaterializedLiveStateRow,
-) -> Result<FilesystemRowContext, LixError> {
-    Ok(FilesystemRowContext {
-        branch_id: row.branch_id.clone(),
-        global: row.global,
-        untracked: row.untracked,
-        file_id: row.file_id.clone(),
-        metadata: row
-            .metadata
-            .as_deref()
-            .map(|metadata| {
-                crate::parse_row_metadata_value(metadata, "filesystem row metadata").and_then(
-                    |metadata| {
-                        crate::transaction::types::TransactionJson::from_value(
-                            metadata,
-                            "filesystem row metadata",
-                        )
-                    },
-                )
-            })
-            .transpose()?,
-    })
 }
 
 #[cfg(test)]
@@ -237,13 +151,6 @@ mod tests {
         .await
         .expect("visible filesystem should load");
 
-        assert_eq!(
-            filesystem
-                .directories_by_id
-                .get("dir-guides")
-                .and_then(|directory| directory.parent_id.as_deref()),
-            Some("dir-docs")
-        );
         assert!(filesystem
             .directory_children_by_parent_id
             .get(&None)
@@ -270,10 +177,7 @@ mod tests {
             .files_by_directory_id
             .get(&Some("dir-guides".to_string()))
             .expect("directory should have attached files");
-        let file = files
-            .get("file-readme")
-            .expect("file should be indexed by id inside directory");
-        assert_eq!(file.name, "readme.md");
+        assert!(files.contains("file-readme"));
     }
 
     #[tokio::test]
@@ -288,12 +192,7 @@ mod tests {
         .await
         .expect("visible filesystem should load");
 
-        let blob_ref = filesystem
-            .blob_refs_by_file_id
-            .get("file-readme")
-            .expect("blob ref should be indexed by file id");
-        assert_eq!(blob_ref.blob_hash, "abc123");
-        assert_eq!(blob_ref.size_bytes, Some(5));
+        assert!(filesystem.blob_refs_by_file_id.contains("file-readme"));
     }
 
     fn live_state(rows: Vec<MaterializedLiveStateRow>) -> std::sync::Arc<dyn LiveStateReader> {

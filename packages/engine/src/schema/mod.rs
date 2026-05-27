@@ -1,5 +1,4 @@
 mod builtin;
-#[allow(dead_code)]
 pub(crate) mod compatibility;
 mod definition;
 mod key;

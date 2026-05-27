@@ -151,28 +151,6 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
-    match schema_key {
-        LIX_REGISTERED_SCHEMA_KEY => Some(LIX_REGISTERED_SCHEMA_JSON),
-        LIX_KEY_VALUE_SCHEMA_KEY => Some(LIX_KEY_VALUE_SCHEMA_JSON),
-        LIX_ACCOUNT_SCHEMA_KEY => Some(LIX_ACCOUNT_SCHEMA_JSON),
-        LIX_ACTIVE_ACCOUNT_SCHEMA_KEY => Some(LIX_ACTIVE_ACCOUNT_SCHEMA_JSON),
-        LIX_LABEL_SCHEMA_KEY => Some(LIX_LABEL_SCHEMA_JSON),
-        LIX_LABEL_ASSIGNMENT_SCHEMA_KEY => Some(LIX_LABEL_ASSIGNMENT_SCHEMA_JSON),
-        LIX_CHANGE_SCHEMA_KEY => Some(LIX_CHANGE_SCHEMA_JSON),
-        LIX_CHANGE_AUTHOR_SCHEMA_KEY => Some(LIX_CHANGE_AUTHOR_SCHEMA_JSON),
-        LIX_COMMIT_SCHEMA_KEY => Some(LIX_COMMIT_SCHEMA_JSON),
-        LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY => Some(LIX_BRANCH_DESCRIPTOR_SCHEMA_JSON),
-        LIX_BRANCH_REF_SCHEMA_KEY => Some(LIX_BRANCH_REF_SCHEMA_JSON),
-        LIX_COMMIT_EDGE_SCHEMA_KEY => Some(LIX_COMMIT_EDGE_SCHEMA_JSON),
-        LIX_FILE_DESCRIPTOR_SCHEMA_KEY => Some(LIX_FILE_DESCRIPTOR_SCHEMA_JSON),
-        LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY => Some(LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON),
-        LIX_BINARY_BLOB_REF_SCHEMA_KEY => Some(LIX_BINARY_BLOB_REF_SCHEMA_JSON),
-        _ => None,
-    }
-}
-
 fn parse_builtin_schema(file_name: &str, raw_json: &str) -> JsonValue {
     serde_json::from_str(raw_json).unwrap_or_else(|error| {
         panic!("builtin schema file '{file_name}' must contain valid JSON: {error}")

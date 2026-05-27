@@ -1,4 +1,3 @@
-use crate::entity_pk::EntityPk;
 use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
 use crate::LixError;
 
@@ -104,44 +103,6 @@ pub(crate) fn decode_payload_with_identity(
         updated_at,
         global,
         branch_id: identity.branch_id,
-    })
-}
-
-#[allow(dead_code)]
-pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
-    if bytes.len() < flatbuffers::SIZE_UOFFSET + flatbuffers::FILE_IDENTIFIER_LENGTH
-        || !flatbuffers::buffer_has_identifier(bytes, UNTRACKED_STATE_FILE_IDENTIFIER, false)
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state row: invalid FlatBuffers file identifier",
-        ));
-    }
-
-    let row = flatbuffer::root_as_untracked_state_row(bytes).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state row: {error}"),
-        )
-    })?;
-
-    let entity_pk = required_str(row.entity_pk(), "entity_pk")?;
-    let entity_pk = EntityPk::from_json_array_text(entity_pk).map_err(|error| {
-        LixError::unknown(format!(
-            "failed to decode untracked-state entity primary key: {error}"
-        ))
-    })?;
-
-    Ok(UntrackedStateRow {
-        entity_pk,
-        schema_key: required_str(row.schema_key(), "schema_key")?.to_string(),
-        file_id: row.file_id().map(ToString::to_string),
-        snapshot_content: row.snapshot_content().map(ToString::to_string),
-        metadata: row.metadata().map(ToString::to_string),
-        created_at: required_str(row.created_at(), "created_at")?.to_string(),
-        updated_at: required_str(row.updated_at(), "updated_at")?.to_string(),
-        global: row.global(),
-        branch_id: required_str(row.branch_id(), "branch_id")?.to_string(),
     })
 }
 
@@ -280,6 +241,8 @@ fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, LixE
 
 #[cfg(test)]
 mod tests {
+    use crate::entity_pk::EntityPk;
+
     use super::*;
 
     fn row_ref<'a>(
