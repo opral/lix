@@ -5,10 +5,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rocksdb::{DBIteratorWithThreadMode, Snapshot};
@@ -118,11 +117,6 @@ impl Backend for RocksDbBackend {
         = RocksDbWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(RocksDbRead {
             snapshot: self.db.snapshot(),

@@ -327,7 +327,8 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
-        let runtime_write_access = if sql2::statement_has_durable_runtime_function(&statement) {
+        let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
+        let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
             Some(write_access)
         } else {
@@ -337,6 +338,11 @@ where
             None
         } else {
             Some(self.begin_session_operation()?)
+        };
+        let _deterministic_runtime_guard = if has_durable_runtime_function {
+            Some(self.lock_deterministic_runtime().await)
+        } else {
+            None
         };
         let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
         let read_result = async {

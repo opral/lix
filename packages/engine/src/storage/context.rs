@@ -336,10 +336,10 @@ mod shape_tests {
     use bytes::Bytes;
 
     use crate::backend::{
-        Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
-        ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-        StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+        Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+        CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue, ProjectedValueRef,
+        PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
+        WriteOptions, WriteStats,
     };
     use crate::storage::{PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
@@ -538,11 +538,6 @@ mod shape_tests {
             = CountingWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-        }
-
         fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             Ok(SpyRead::default())
         }

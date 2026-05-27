@@ -408,10 +408,10 @@ mod tests {
     use std::rc::Rc;
 
     use crate::backend::{
-        Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        BufferedRangeScan, CommitResult, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor,
-        PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-        WriteConcurrency, WriteOptions, WriteStats,
+        Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+        CommitResult, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor, PutBatch,
+        ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
+        WriteStats,
     };
     use crate::storage::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -833,11 +833,6 @@ mod tests {
             = CountingWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-        }
-
         fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             Ok(CountingRead)
         }

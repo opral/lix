@@ -6,12 +6,12 @@ mod wasm {
     use bytes::Bytes;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
-        BackendRead, BackendWrite, CommitResult, CoreProjection, CreateBranchOptions,
-        ExecuteResult, GetOptions, InMemoryBackend, Key, KeyRange, Lix as RsLix, LixError,
-        LixTransaction as RsLixTransaction, MergeBranchOptions, MergeBranchPreviewOptions,
-        PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
-        ScanVisitor, StoredValue, SwitchBranchOptions, Value, WriteOptions, WriteStats,
+        open_lix_with_backend, Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite,
+        CommitResult, CoreProjection, CreateBranchOptions, ExecuteResult, GetOptions,
+        InMemoryBackend, Key, KeyRange, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+        MergeBranchOptions, MergeBranchPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch,
+        ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchBranchOptions, Value,
+        WriteOptions, WriteStats,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -141,6 +141,13 @@ export type BackendWriteTransaction = BackendReadTransaction & {
 
 export type Backend = {
   beginReadTransaction(): BackendReadTransaction;
+  /**
+   * Opens one backend-owned write transaction.
+   *
+   * Implementations are responsible for their own durability and write
+   * serialization. A backend that cannot safely support concurrent write
+   * transactions must reject or serialize a second call itself.
+   */
   beginWriteTransaction(): BackendWriteTransaction;
   close?(): void;
 };
@@ -636,11 +643,6 @@ export type MergeConflictSide = {
             = JsBackendWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            InMemoryBackend::new().capabilities()
-        }
-
         fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             self.begin_transaction("beginReadTransaction")
                 .map(|inner| JsBackendRead { inner })

@@ -1,13 +1,12 @@
 use bytes::Bytes;
-use lix_engine::backend::WriteConcurrency;
 use lix_engine::storage::StorageContext;
 use lix_engine::transaction::bench::{
     BenchLayoutAccounting, BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
 };
 use lix_engine::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, Key, KeyRange, PointVisitor, ProjectedValue, PutBatch, ReadEntry,
-    ReadOptions, ScanOptions, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
+    CoreProjection, Key, KeyRange, PointVisitor, ProjectedValue, PutBatch, ReadEntry, ReadOptions,
+    ScanOptions, StoredValue, WriteOptions, WriteStats,
 };
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use std::sync::{Arc, Mutex};
@@ -73,11 +72,6 @@ where
         = B::Write<'a>
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(BenchRead::new(self.inner.begin_read(opts)?))
     }
@@ -304,11 +298,6 @@ impl Backend for OwnedRocksDbBackend {
         = OwnedRocksDbWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(OwnedRocksDbRead {
             db: Arc::clone(&self.db),

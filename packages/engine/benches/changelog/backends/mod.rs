@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use lix_engine::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    BufferedRangeScan, CommitResult, GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key,
-    KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanVisitor, WriteOptions,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+    CommitResult, GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, KeyRef,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanVisitor,
+    WriteOptions,
 };
 use tempfile::TempDir;
 
@@ -120,16 +120,6 @@ impl Backend for ChangelogScoreBackend {
         = ChangelogScoreWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        match self {
-            Self::Unit(backend) => backend.capabilities(),
-            Self::Sqlite { backend, .. } => backend.capabilities(),
-            Self::RocksDb { backend, .. } => backend.capabilities(),
-            Self::Redb { backend, .. } => backend.capabilities(),
-        }
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         match self {
             Self::Unit(backend) => backend.begin_read(opts).map(ChangelogScoreRead::Unit),

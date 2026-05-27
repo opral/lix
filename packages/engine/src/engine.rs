@@ -24,6 +24,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
+    deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<B> Engine<B>
@@ -52,6 +53,10 @@ where
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
     /// instance instead of being hidden behind a legacy boot path.
+    ///
+    /// Deterministic runtime sequencing is serialized within this Engine
+    /// context. Independently constructing multiple Engine values over the same
+    /// cloned backend is outside that MVP runtime-sharing boundary.
     pub async fn new(backend: B) -> Result<Self, LixError> {
         let storage = StorageContext::new(backend);
 
@@ -77,6 +82,7 @@ where
             live_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
+            deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -114,6 +120,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.deterministic_runtime_gate),
         )
         .await
     }
@@ -126,6 +133,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.deterministic_runtime_gate),
         )
         .await
     }

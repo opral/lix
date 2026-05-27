@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use crate::functions::FunctionContext;
+use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use tokio::sync::Notify;
 
+#[cfg(test)]
+use crate::transaction::CommitBoundaryGuard;
 use crate::transaction::{
-    open_transaction, CommitBoundaryGuard, CommitBoundaryState, Transaction,
-    TransactionCommitBoundary,
+    open_transaction, CommitBoundaryState, Transaction, TransactionCommitBoundary,
 };
 use crate::LixError;
 
@@ -17,6 +18,7 @@ pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) transaction: Option<Transaction<B>>,
     pub(super) runtime_functions: FunctionContext,
     transaction_manager: SessionTransactionManager,
+    _deterministic_runtime_guard: Option<DeterministicRuntimeGuard>,
     _write_access: SessionWriteAccess,
 }
 
@@ -29,6 +31,11 @@ where
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
         self.ensure_open()?;
         let write_access = self.begin_explicit_session_write_access().await?;
+        let deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
+            Some(self.lock_deterministic_runtime().await)
+        } else {
+            None
+        };
         let mut opened = match open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -55,6 +62,7 @@ where
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             transaction_manager: self.transaction_manager(),
+            _deterministic_runtime_guard: deterministic_runtime_guard,
             _write_access: write_access,
         })
     }
@@ -87,12 +95,10 @@ where
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        let queued_commit_guard = self.transaction_manager.begin_commit();
         let result = transaction
             .commit(&self.runtime_functions)
             .await
             .map(|_| ());
-        drop(queued_commit_guard);
         drop(operation_guard);
         result
     }
@@ -174,7 +180,12 @@ impl SessionTransactionManager {
     pub(super) async fn close(&self) -> Result<(), LixError> {
         let mut commit_rx = self.inner.commit_boundary.subscribe();
         loop {
-            if let Some(_commit_gate) = self.inner.commit_boundary.try_lock_commit() {
+            let commit_gate = if self.inner.commit_boundary.is_active() {
+                None
+            } else {
+                self.inner.commit_boundary.try_lock_commit()
+            };
+            if let Some(_commit_gate) = commit_gate {
                 {
                     let mut state = self.lock_state();
                     if state.has_explicit_transaction() {
@@ -307,6 +318,7 @@ impl SessionTransactionManager {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn begin_commit(&self) -> CommitBoundaryGuard {
         self.inner.commit_boundary.begin()
     }

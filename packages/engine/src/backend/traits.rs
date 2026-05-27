@@ -1,7 +1,6 @@
 use crate::backend::{
-    BackendCapabilities, BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange,
-    KeyRef, ProjectedValue, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions,
-    ScanResult, WriteOptions,
+    BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
+    ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanResult, WriteOptions,
 };
 
 pub trait Backend {
@@ -13,10 +12,18 @@ pub trait Backend {
     where
         Self: 'a;
 
-    fn capabilities(&self) -> BackendCapabilities;
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError>;
 
+    /// Opens one backend-owned write transaction.
+    ///
+    /// The backend is the concurrency boundary. Implementations are responsible
+    /// for their own durability and write concurrency semantics. A backend that
+    /// cannot safely support overlapping write transactions must serialize,
+    /// use native transactional locking, or reject the second writer with a
+    /// deterministic error.
+    ///
+    /// Lix sessions intentionally do not add a generic per-backend write lock
+    /// above this method.
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError>;
 }
 

@@ -5,10 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
@@ -133,11 +132,6 @@ impl Backend for SqliteBackend {
         = SqliteWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         let conn = self
             .read_pool

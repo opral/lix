@@ -8,13 +8,13 @@ mod lix;
 
 pub use lix::{open_lix, open_lix_with_backend, Lix, LixTransaction, OpenLixOptions};
 pub use lix_engine::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt as CreateBranchResult,
-    ExecuteResult, GetOptions, InMemoryBackend, InMemoryRangeScan, InMemoryRead, InMemoryWrite,
-    Key, KeyRange, LixError, LixNotice, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, CreateBranchOptions, CreateBranchReceipt as CreateBranchResult, ExecuteResult,
+    GetOptions, InMemoryBackend, InMemoryRangeScan, InMemoryRead, InMemoryWrite, Key, KeyRange,
+    LixError, LixNotice, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt as MergeBranchResult, MergeChangeStats,
     MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, Row, ScanOptions, ScanResult, ScanVisitor,
     SqlQueryResult, StoredValue, SwitchBranchOptions, SwitchBranchReceipt as SwitchBranchResult,
-    TryFromValue, Value, WriteConcurrency, WriteOptions, WriteStats,
+    TryFromValue, Value, WriteOptions, WriteStats,
 };
