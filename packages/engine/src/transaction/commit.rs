@@ -715,10 +715,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::backend::{
-        Backend, BackendCapabilities, BackendError, BackendWrite, CommitResult, DurableWriteLock,
-        KeyRange, PutBatch,
-    };
+    use crate::backend::{Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch};
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
@@ -1541,11 +1538,6 @@ mod tests {
             = CountingWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            self.inner.capabilities()
-        }
-
         fn begin_read(&self, opts: StorageReadOptions) -> Result<Self::Read<'_>, BackendError> {
             self.inner.begin_read(opts)
         }
@@ -1555,10 +1547,6 @@ mod tests {
                 inner: self.inner.begin_write(opts)?,
                 write_batches: Arc::clone(&self.write_batches),
             })
-        }
-
-        fn durable_write_lock(&self) -> DurableWriteLock {
-            self.inner.durable_write_lock()
         }
     }
 

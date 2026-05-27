@@ -17,6 +17,7 @@ pub mod bench {
 pub(crate) use context::begin_commit_boundary;
 pub(crate) use context::commit_at_boundary;
 pub(crate) use context::open_transaction;
+#[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;
 pub(crate) use context::Transaction;

@@ -127,7 +127,7 @@ impl TransactionCommitBoundary {
     }
 
     fn commit<T>(&self, commit: impl FnOnce() -> Result<T, LixError>) -> Result<T, LixError> {
-        let _gate = self.state.lock_durable_commit();
+        let _gate = self.state.lock_commit();
         self.check()?;
         commit()
     }
@@ -136,7 +136,7 @@ impl TransactionCommitBoundary {
 #[derive(Clone)]
 pub(crate) struct CommitBoundaryState {
     active_count: Arc<AtomicUsize>,
-    durable_commit_gate: Arc<std::sync::Mutex<()>>,
+    commit_gate: Arc<std::sync::Mutex<()>>,
     watch: tokio::sync::watch::Sender<usize>,
 }
 
@@ -145,7 +145,7 @@ impl CommitBoundaryState {
         let (watch, _) = tokio::sync::watch::channel(0);
         Self {
             active_count: Arc::new(AtomicUsize::new(0)),
-            durable_commit_gate: Arc::new(std::sync::Mutex::new(())),
+            commit_gate: Arc::new(std::sync::Mutex::new(())),
             watch,
         }
     }
@@ -170,18 +170,18 @@ impl CommitBoundaryState {
         self.watch.subscribe()
     }
 
-    pub(crate) fn lock_durable_commit(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.durable_commit_gate
+    pub(crate) fn lock_commit(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.commit_gate
             .lock()
-            .expect("commit boundary durable commit gate should not poison")
+            .expect("commit boundary gate should not poison")
     }
 
-    pub(crate) fn try_lock_durable_commit(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-        match self.durable_commit_gate.try_lock() {
+    pub(crate) fn try_lock_commit(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.commit_gate.try_lock() {
             Ok(guard) => Some(guard),
             Err(std::sync::TryLockError::WouldBlock) => None,
             Err(std::sync::TryLockError::Poisoned(_)) => {
-                panic!("commit boundary durable commit gate should not poison")
+                panic!("commit boundary gate should not poison")
             }
         }
     }
@@ -228,8 +228,7 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
-    /// Opens a backend write transaction and creates an execution-scoped
-    /// staging area for SQL/provider hooks.
+    /// Opens an execution-scoped staging area for SQL/provider hooks.
     async fn open(
         mode: &SessionMode,
         storage: StorageContext<B>,
@@ -334,10 +333,11 @@ where
             Err(error) => return Err(error),
         };
         writes.extend(transaction.staged_storage_writes);
+        let prepared_commit = transaction
+            .storage
+            .prepare_write_set(writes, StorageWriteOptions::default())?;
         let storage_stats = commit_at_boundary(commit_boundary.as_ref(), || {
-            let (_commit, stats) = transaction
-                .storage
-                .commit_write_set(writes, StorageWriteOptions::default())?;
+            let (_commit, stats) = prepared_commit.commit()?;
             Ok(stats)
         })?;
         Ok(TransactionCommitOutcome { storage_stats })

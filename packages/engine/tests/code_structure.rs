@@ -3007,7 +3007,7 @@ fn session_transaction_durable_commits_go_through_commit_boundary() {
 
     assert!(
         violations.is_empty(),
-        "session/transaction durable writes must use `commit_at_boundary` so close cannot race the final pre-commit check. Low-level storage, init, and engine maintenance writes are the MVP escape hatches.\n\nCurrent violations:\n{}",
+        "session/transaction commits must use `commit_at_boundary` so close cannot race the final pre-commit check. Low-level storage, init, and engine maintenance writes are the MVP escape hatches.\n\nCurrent violations:\n{}",
         render_grouped_raw_sql_execution_violations(&violations),
     );
 }

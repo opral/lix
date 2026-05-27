@@ -9,7 +9,7 @@ use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::session::SessionContext;
-use crate::storage::{DurableWriteLock, StorageBackend, StorageReadOptions, StorageWriteOptions};
+use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
@@ -24,7 +24,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     branch_ctx: Arc<BranchContext>,
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
-    write_lock: DurableWriteLock,
+    deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<B> Engine<B>
@@ -40,7 +40,6 @@ where
     /// backend.
     pub async fn initialize(backend: B) -> Result<InitReceipt, LixError> {
         let storage = StorageContext::new(backend);
-        let _write_guard = storage.durable_write_lock().lock_owned().await;
 
         crate::init::initialize(
             storage,
@@ -54,6 +53,10 @@ where
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
     /// instance instead of being hidden behind a legacy boot path.
+    ///
+    /// Deterministic runtime sequencing is serialized within this Engine
+    /// context. Independently constructing multiple Engine values over the same
+    /// cloned backend is outside that MVP runtime-sharing boundary.
     pub async fn new(backend: B) -> Result<Self, LixError> {
         let storage = StorageContext::new(backend);
 
@@ -74,12 +77,12 @@ where
 
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
-            write_lock: storage.durable_write_lock(),
             storage,
             tracked_state,
             live_state,
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
+            deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -117,7 +120,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
-            self.write_lock.clone(),
+            Arc::clone(&self.deterministic_runtime_gate),
         )
         .await
     }
@@ -130,7 +133,7 @@ where
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
-            self.write_lock.clone(),
+            Arc::clone(&self.deterministic_runtime_gate),
         )
         .await
     }
@@ -142,7 +145,6 @@ where
     /// state. The current branch head is read from the live-state facade so
     /// rebuild uses the same moving-ref visibility as normal execution.
     pub async fn rebuild_tracked_state_for_branch(&self, branch_id: &str) -> Result<(), LixError> {
-        let _write_guard = self.write_lock.lock_owned().await;
         let head_commit_id = self
             .load_branch_head_commit_id(branch_id)
             .await?

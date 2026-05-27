@@ -6,7 +6,7 @@ use crate::commands::version::{
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{CreateVersionOptions, CreateVersionResult, SwitchVersionOptions};
+use lix_rs_sdk::{CreateBranchOptions, CreateBranchResult, SwitchBranchOptions};
 
 pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
@@ -23,8 +23,8 @@ pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<Comman
     };
     let original_active = resolve_active_version_ref(&lix)?;
     if let Some(source) = &source {
-        crate::db::block_on(lix.switch_version(SwitchVersionOptions {
-            version_id: source.id.clone(),
+        crate::db::block_on(lix.switch_branch(SwitchBranchOptions {
+            branch_id: source.id.clone(),
         }))
         .map_err(|error| CliError::msg(error.to_string()))?;
     }
@@ -33,15 +33,15 @@ pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<Comman
         .clone()
         .or_else(|| command.id.clone())
         .ok_or_else(|| CliError::msg("version create requires --name when --id is omitted"))?;
-    let result = crate::db::block_on(lix.create_version(CreateVersionOptions {
+    let result = crate::db::block_on(lix.create_branch(CreateBranchOptions {
         id: command.id,
         name,
         from_commit_id: None,
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
     if source.is_some() {
-        crate::db::block_on(lix.switch_version(SwitchVersionOptions {
-            version_id: original_active.id.clone(),
+        crate::db::block_on(lix.switch_branch(SwitchBranchOptions {
+            branch_id: original_active.id.clone(),
         }))
         .map_err(|error| CliError::msg(error.to_string()))?;
     }
@@ -54,7 +54,7 @@ pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<Comman
 }
 
 fn create_confirmation_lines(
-    result: &CreateVersionResult,
+    result: &CreateBranchResult,
     parent: &ResolvedVersionRef,
     active: &ResolvedVersionRef,
 ) -> (String, String) {
@@ -74,11 +74,11 @@ fn create_confirmation_lines(
 mod tests {
     use super::create_confirmation_lines;
     use crate::commands::version::ResolvedVersionRef;
-    use lix_rs_sdk::CreateVersionResult;
+    use lix_rs_sdk::CreateBranchResult;
 
     #[test]
     fn create_confirmation_uses_active_version_not_parent_version() {
-        let result = CreateVersionResult {
+        let result = CreateBranchResult {
             id: "new-version".to_string(),
             name: "New Version".to_string(),
             hidden: false,

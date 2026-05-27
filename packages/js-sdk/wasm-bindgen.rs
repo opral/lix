@@ -1,17 +1,16 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::ops::Bound;
 
     use bytes::Bytes;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
-        BackendRead, BackendWrite, CommitResult, CoreProjection, CreateBranchOptions,
-        DurableWriteLock, ExecuteResult, GetOptions, InMemoryBackend, Key, KeyRange, Lix as RsLix,
-        LixError, LixTransaction as RsLixTransaction, MergeBranchOptions,
-        MergeBranchPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
-        ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchBranchOptions, Value,
+        open_lix_with_backend, Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite,
+        CommitResult, CoreProjection, CreateBranchOptions, ExecuteResult, GetOptions,
+        InMemoryBackend, Key, KeyRange, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
+        MergeBranchOptions, MergeBranchPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch,
+        ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchBranchOptions, Value,
         WriteOptions, WriteStats,
     };
     use serde::Serialize;
@@ -142,6 +141,13 @@ export type BackendWriteTransaction = BackendReadTransaction & {
 
 export type Backend = {
   beginReadTransaction(): BackendReadTransaction;
+  /**
+   * Opens one backend-owned write transaction.
+   *
+   * Implementations are responsible for their own durability and write
+   * serialization. A backend that cannot safely support concurrent write
+   * transactions must reject or serialize a second call itself.
+   */
   beginWriteTransaction(): BackendWriteTransaction;
   close?(): void;
 };
@@ -603,39 +609,14 @@ export type MergeConflictSide = {
         }
     }
 
-    thread_local! {
-        static JS_BACKEND_LOCKS: RefCell<Vec<(JsValue, DurableWriteLock)>> =
-            const { RefCell::new(Vec::new()) };
-    }
-
-    fn durable_write_lock_for_js_backend(backend: &JsValue) -> DurableWriteLock {
-        JS_BACKEND_LOCKS.with(|locks| {
-            let mut locks = locks.borrow_mut();
-            if let Some((_, lock)) = locks
-                .iter()
-                .find(|(known_backend, _)| Object::is(known_backend, backend))
-            {
-                return lock.clone();
-            }
-            let lock = DurableWriteLock::new();
-            locks.push((backend.clone(), lock.clone()));
-            lock
-        })
-    }
-
     #[derive(Clone)]
     struct JsBackend {
         inner: JsValue,
-        durable_write_lock: DurableWriteLock,
     }
 
     impl JsBackend {
         fn new(inner: JsValue) -> Self {
-            let durable_write_lock = durable_write_lock_for_js_backend(&inner);
-            Self {
-                inner,
-                durable_write_lock,
-            }
+            Self { inner }
         }
 
         fn begin_transaction(&self, method_name: &str) -> Result<JsValue, BackendError> {
@@ -662,15 +643,6 @@ export type MergeConflictSide = {
             = JsBackendWrite
         where
             Self: 'a;
-
-        fn capabilities(&self) -> BackendCapabilities {
-            InMemoryBackend::new().capabilities()
-        }
-
-        fn durable_write_lock(&self) -> DurableWriteLock {
-            self.durable_write_lock.clone()
-        }
-
         fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
             self.begin_transaction("beginReadTransaction")
                 .map(|inner| JsBackendRead { inner })

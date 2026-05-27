@@ -225,6 +225,13 @@ export type LixBackendWriteTransaction = LixBackendReadTransaction & {
 
 export type LixBackend = {
 	beginReadTransaction(): LixBackendReadTransaction;
+	/**
+	 * Opens one backend-owned write transaction.
+	 *
+	 * Implementations are responsible for their own durability and write
+	 * serialization. A backend that cannot safely support concurrent write
+	 * transactions must reject or serialize a second call itself.
+	 */
 	beginWriteTransaction(): LixBackendWriteTransaction;
 	close?(): void;
 };

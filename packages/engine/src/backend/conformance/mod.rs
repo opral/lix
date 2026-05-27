@@ -13,11 +13,7 @@ mod fixtures;
 mod model;
 mod model_based;
 mod persistence;
-mod projection;
-mod pushdown;
 mod runner;
-mod scan;
-mod write;
 
 pub(crate) use factory::open_backend;
 pub use factory::{BackendFactory, BackendFixture, BackendTestConfig};

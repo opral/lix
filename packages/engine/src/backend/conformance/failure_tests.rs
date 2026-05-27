@@ -8,10 +8,10 @@ use super::{
     run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
 };
 use crate::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, ProjectionCapabilities, PutBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions,
+    WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -25,12 +25,10 @@ enum BrokenMode {
     DeleteManyIgnoresExistingKeys,
     DeleteRangeIgnoresUpperBound,
     KeyOnlyScanReturnsFullValues,
-    AdvertisesPendingCapability,
     RollbackCommits,
     BadByteOrdering,
     KeyResumeRepeatsLastKey,
     LoseCommittedDataOnReopen,
-    ReopenReturnsFreshDurableWriteLock,
     CorruptOpaqueBytes,
 }
 
@@ -45,7 +43,6 @@ struct BrokenBackendFixture {
     entries: Arc<Mutex<BrokenMap>>,
     commit_count: Arc<Mutex<u64>>,
     open_count: Arc<Mutex<u64>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +50,6 @@ struct BrokenBackend {
     mode: BrokenMode,
     entries: Arc<Mutex<BrokenMap>>,
     commit_count: Arc<Mutex<u64>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -129,27 +125,6 @@ fn detects_key_only_scan_projection_violation() {
 }
 
 #[test]
-fn detects_advertised_pending_capability() {
-    let report = run_backend_conformance(&BrokenBackendFactory {
-        mode: BrokenMode::AdvertisesPendingCapability,
-    });
-    let pending = report.tests.iter().any(|test| {
-        test.name == "projection::header_returns_header_without_payload"
-            && matches!(test.status, ConformanceStatus::Pending)
-    });
-    assert!(
-        pending,
-        "expected advertised projection capability to create pending test, got {report:#?}"
-    );
-
-    let panic = std::panic::catch_unwind(|| report.assert_no_failures());
-    assert!(
-        panic.is_err(),
-        "assert_no_failures should fail when advertised capabilities are pending"
-    );
-}
-
-#[test]
 fn detects_rollback_commits_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
@@ -198,14 +173,6 @@ fn detects_persistent_commit_lost_on_reopen_violation() {
 }
 
 #[test]
-fn detects_fresh_durable_write_lock_on_reopen_violation() {
-    assert_failed(
-        BrokenMode::ReopenReturnsFreshDurableWriteLock,
-        "persistence::durable_write_lock_is_shared_across_reopen",
-    );
-}
-
-#[test]
 fn detects_persistent_rollback_on_reopen_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
@@ -236,7 +203,6 @@ impl BackendFactory for BrokenBackendFactory {
             entries: Arc::new(Mutex::new(BrokenMap::new())),
             commit_count: Arc::new(Mutex::new(0)),
             open_count: Arc::new(Mutex::new(0)),
-            durable_write_lock: DurableWriteLock::new(),
         }
     }
 
@@ -260,17 +226,10 @@ impl BackendFixture for BrokenBackendFixture {
                 .clear();
         }
         *open_count += 1;
-        let durable_write_lock =
-            if matches!(self.mode, BrokenMode::ReopenReturnsFreshDurableWriteLock) {
-                DurableWriteLock::new()
-            } else {
-                self.durable_write_lock.clone()
-            };
         BrokenBackend {
             mode: self.mode,
             entries: Arc::clone(&self.entries),
             commit_count: Arc::clone(&self.commit_count),
-            durable_write_lock,
         }
     }
 }
@@ -285,17 +244,6 @@ impl Backend for BrokenBackend {
         = BrokenWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        let mut capabilities = BackendCapabilities::v0(WriteConcurrency::SingleWriter);
-        if matches!(self.mode, BrokenMode::AdvertisesPendingCapability) {
-            capabilities.projection = ProjectionCapabilities {
-                header: true,
-                ..ProjectionCapabilities::default()
-            };
-        }
-        capabilities
-    }
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(BrokenRead {
@@ -317,10 +265,6 @@ impl Backend for BrokenBackend {
             commit_count: Arc::clone(&self.commit_count),
             staged: self.snapshot()?,
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 }
 

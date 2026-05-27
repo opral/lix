@@ -1,9 +1,8 @@
 use bytes::Bytes;
 use lix_rs_sdk::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, LixError,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, LixError, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
@@ -18,7 +17,6 @@ pub struct Engine2SqliteBackend {
     path: Arc<PathBuf>,
     conn: Arc<Mutex<Connection>>,
     read_pool: Arc<Mutex<Vec<Connection>>>,
-    durable_write_lock: DurableWriteLock,
 }
 
 #[derive(Clone)]
@@ -64,7 +62,6 @@ impl Engine2SqliteBackend {
             path: Arc::new(path.to_path_buf()),
             conn: Arc::new(Mutex::new(conn)),
             read_pool: Arc::new(Mutex::new(Vec::new())),
-            durable_write_lock: DurableWriteLock::new(),
         })
     }
 }
@@ -79,11 +76,6 @@ impl Backend for Engine2SqliteBackend {
         = Engine2SqliteWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         let conn = self
             .read_pool
@@ -112,10 +104,6 @@ impl Backend for Engine2SqliteBackend {
             overlay: BTreeMap::new(),
             stats: WriteStats::default(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
     }
 }
 
