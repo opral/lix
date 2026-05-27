@@ -23,7 +23,7 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
 }
 
 impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
@@ -41,7 +41,7 @@ impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
             change_id: None,
             commit_id: None,
             untracked: true,
-            version_id: row.version_id,
+            branch_id: row.branch_id,
         }
     }
 }
@@ -96,7 +96,7 @@ impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
         }
     }
 }
@@ -143,7 +143,7 @@ pub(crate) struct LiveStateFilter {
     #[serde(default)]
     pub(crate) entity_pks: Vec<EntityPk>,
     #[serde(default)]
-    pub(crate) version_ids: Vec<String>,
+    pub(crate) branch_ids: Vec<String>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
@@ -166,7 +166,7 @@ impl From<LiveStateFilter> for UntrackedStateFilter {
         Self {
             schema_keys: filter.schema_keys,
             entity_pks: filter.entity_pks,
-            version_ids: filter.version_ids,
+            branch_ids: filter.branch_ids,
             file_ids: filter.file_ids,
         }
     }
@@ -194,7 +194,7 @@ pub(crate) struct LiveStateScanRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LiveStateRowRequest {
     pub(crate) schema_key: String,
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: NullableKeyFilter<String>,
 }
@@ -203,7 +203,7 @@ impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
     fn from(request: &LiveStateRowRequest) -> Self {
         Self {
             schema_key: request.schema_key.clone(),
-            version_id: request.version_id.clone(),
+            branch_id: request.branch_id.clone(),
             entity_pk: request.entity_pk.clone(),
             file_id: request.file_id.clone(),
         }
@@ -213,7 +213,7 @@ impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
 /// Stable visible-row identity used for overlay composition.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LiveStateRowIdentity {
-    pub(crate) version_id: String,
+    pub(crate) branch_id: String,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
@@ -222,7 +222,7 @@ pub(crate) struct LiveStateRowIdentity {
 impl LiveStateRowIdentity {
     pub(crate) fn from_row(row: &MaterializedLiveStateRow) -> Self {
         Self {
-            version_id: row.version_id.clone(),
+            branch_id: row.branch_id.clone(),
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),

@@ -1,7 +1,7 @@
 use serde_json::{json, Value as JsonValue};
 
+use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage::StorageBackend;
-use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
 
 use super::analysis::{analyze, MergeCommits, MergeOutcome};
@@ -15,27 +15,27 @@ use crate::session::context::SessionContext;
 use crate::tracked_state::TrackedStateMergePick;
 use crate::transaction::types::StagedCommitChangeRef;
 
-/// Options for merging another version into this session's active version.
+/// Options for merging another branch into this session's active branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeVersionOptions {
-    /// Version whose changes should be merged into the active session version.
-    pub source_version_id: String,
+pub struct MergeBranchOptions {
+    /// Branch whose changes should be merged into the active session branch.
+    pub source_branch_id: String,
 }
 
-/// Options for previewing a merge from another version into this session's
-/// active version.
+/// Options for previewing a merge from another branch into this session's
+/// active branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeVersionPreviewOptions {
-    /// Version whose changes would be merged into the active session version.
-    pub source_version_id: String,
+pub struct MergeBranchPreviewOptions {
+    /// Branch whose changes would be merged into the active session branch.
+    pub source_branch_id: String,
 }
 
-/// Receipt returned after merging a version.
+/// Receipt returned after merging a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeVersionReceipt {
-    pub outcome: MergeVersionOutcome,
-    pub target_version_id: String,
-    pub source_version_id: String,
+pub struct MergeBranchReceipt {
+    pub outcome: MergeBranchOutcome,
+    pub target_branch_id: String,
+    pub source_branch_id: String,
     pub base_commit_id: String,
     pub target_head_before_commit_id: String,
     pub source_head_before_commit_id: String,
@@ -53,10 +53,10 @@ pub struct MergeChangeStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeVersionPreview {
-    pub outcome: MergeVersionOutcome,
-    pub target_version_id: String,
-    pub source_version_id: String,
+pub struct MergeBranchPreview {
+    pub outcome: MergeBranchOutcome,
+    pub target_branch_id: String,
+    pub source_branch_id: String,
     pub base_commit_id: String,
     pub target_head_commit_id: String,
     pub source_head_commit_id: String,
@@ -94,7 +94,7 @@ pub enum MergeConflictChangeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeVersionOutcome {
+pub enum MergeBranchOutcome {
     AlreadyUpToDate,
     FastForward,
     MergeCommitted,
@@ -106,36 +106,36 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
-    /// Previews merging `source_version_id` into this session's active version
+    /// Previews merging `source_branch_id` into this session's active branch
     /// without advancing refs, staging changes, or creating commits.
-    pub async fn merge_version_preview(
+    pub async fn merge_branch_preview(
         &self,
-        options: MergeVersionPreviewOptions,
-    ) -> Result<MergeVersionPreview, LixError> {
-        let source_version_id = options.source_version_id;
+        options: MergeBranchPreviewOptions,
+    ) -> Result<MergeBranchPreview, LixError> {
+        let source_branch_id = options.source_branch_id;
 
         self.with_write_transaction(|transaction| {
             Box::pin(async move {
-                let active_version_id = transaction.active_version_id().to_string();
-                if source_version_id == active_version_id {
-                    return Err(LixError::invalid_self_merge(active_version_id));
+                let active_branch_id = transaction.active_branch_id().to_string();
+                if source_branch_id == active_branch_id {
+                    return Err(LixError::invalid_self_merge(active_branch_id));
                 }
 
                 let (target_head, source_head) = {
-                    let reader = transaction.version_ref_reader();
-                    let lifecycle = VersionLifecycle::new(&reader);
+                    let reader = transaction.branch_ref_reader();
+                    let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
                         .require_existing_commit_id(
-                            &active_version_id,
-                            VersionOperation::MergeVersionPreview,
-                            VersionReferenceRole::Target,
+                            &active_branch_id,
+                            BranchOperation::MergeBranchPreview,
+                            BranchReferenceRole::Target,
                         )
                         .await?;
                     let source_head = lifecycle
                         .require_existing_commit_id(
-                            &source_version_id,
-                            VersionOperation::MergeVersionPreview,
-                            VersionReferenceRole::Source,
+                            &source_branch_id,
+                            BranchOperation::MergeBranchPreview,
+                            BranchReferenceRole::Source,
                         )
                         .await?;
                     (target_head, source_head)
@@ -160,8 +160,8 @@ where
                 };
 
                 Ok(preview_from_analysis(
-                    &active_version_id,
-                    &source_version_id,
+                    &active_branch_id,
+                    &source_branch_id,
                     &analysis,
                 ))
             })
@@ -169,40 +169,40 @@ where
         .await
     }
 
-    /// Merges `source_version_id` into this session's active version.
+    /// Merges `source_branch_id` into this session's active branch.
     ///
     /// The generated target commit keeps the previous target head as its first
     /// parent and records the source head as an additional parent, so the
     /// commit graph preserves branch ancestry while tracked-state storage
     /// selects the planned source changes into the new target root.
-    pub async fn merge_version(
+    pub async fn merge_branch(
         &self,
-        options: MergeVersionOptions,
-    ) -> Result<MergeVersionReceipt, LixError> {
-        let source_version_id = options.source_version_id;
+        options: MergeBranchOptions,
+    ) -> Result<MergeBranchReceipt, LixError> {
+        let source_branch_id = options.source_branch_id;
 
         self.with_write_transaction(|transaction| {
             Box::pin(async move {
-                let active_version_id = transaction.active_version_id().to_string();
-                if source_version_id == active_version_id {
-                    return Err(LixError::invalid_self_merge(active_version_id));
+                let active_branch_id = transaction.active_branch_id().to_string();
+                if source_branch_id == active_branch_id {
+                    return Err(LixError::invalid_self_merge(active_branch_id));
                 }
 
                 let (target_head, source_head) = {
-                    let reader = transaction.version_ref_reader();
-                    let lifecycle = VersionLifecycle::new(&reader);
+                    let reader = transaction.branch_ref_reader();
+                    let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
                         .require_existing_commit_id(
-                            &active_version_id,
-                            VersionOperation::MergeVersion,
-                            VersionReferenceRole::Target,
+                            &active_branch_id,
+                            BranchOperation::MergeBranch,
+                            BranchReferenceRole::Target,
                         )
                         .await?;
                     let source_head = lifecycle
                         .require_existing_commit_id(
-                            &source_version_id,
-                            VersionOperation::MergeVersion,
-                            VersionReferenceRole::Source,
+                            &source_branch_id,
+                            BranchOperation::MergeBranch,
+                            BranchReferenceRole::Source,
                         )
                         .await?;
                     (target_head, source_head)
@@ -228,10 +228,10 @@ where
                 };
 
                 if analysis.outcome == MergeOutcome::AlreadyUpToDate {
-                    return Ok(MergeVersionReceipt {
-                        outcome: MergeVersionOutcome::AlreadyUpToDate,
-                        target_version_id: active_version_id,
-                        source_version_id,
+                    return Ok(MergeBranchReceipt {
+                        outcome: MergeBranchOutcome::AlreadyUpToDate,
+                        target_branch_id: active_branch_id,
+                        source_branch_id,
                         base_commit_id: analysis.commits.base_commit_id,
                         target_head_after_commit_id: analysis.commits.target_commit_id.clone(),
                         target_head_before_commit_id: analysis.commits.target_commit_id,
@@ -243,13 +243,13 @@ where
 
                 if analysis.outcome == MergeOutcome::FastForward {
                     transaction
-                        .advance_version_ref(&active_version_id, &analysis.commits.source_commit_id)
+                        .advance_branch_ref(&active_branch_id, &analysis.commits.source_commit_id)
                         .await?;
 
-                    return Ok(MergeVersionReceipt {
-                        outcome: MergeVersionOutcome::FastForward,
-                        target_version_id: active_version_id,
-                        source_version_id,
+                    return Ok(MergeBranchReceipt {
+                        outcome: MergeBranchOutcome::FastForward,
+                        target_branch_id: active_branch_id,
+                        source_branch_id,
                         base_commit_id: analysis.commits.base_commit_id,
                         target_head_before_commit_id: analysis.commits.target_commit_id,
                         source_head_before_commit_id: analysis.commits.source_commit_id.clone(),
@@ -279,14 +279,14 @@ where
                     .map(selected_change_from_merge_pick)
                     .collect::<Vec<_>>();
                 let created_merge_commit_id = transaction.stage_merge_commit(
-                    active_version_id.clone(),
+                    active_branch_id.clone(),
                     analysis.commits.source_commit_id.clone(),
                     selected_changes,
                 )?;
-                return Ok(MergeVersionReceipt {
-                    outcome: MergeVersionOutcome::MergeCommitted,
-                    target_version_id: active_version_id,
-                    source_version_id,
+                return Ok(MergeBranchReceipt {
+                    outcome: MergeBranchOutcome::MergeCommitted,
+                    target_branch_id: active_branch_id,
+                    source_branch_id,
                     base_commit_id: analysis.commits.base_commit_id,
                     target_head_after_commit_id: created_merge_commit_id.clone(),
                     target_head_before_commit_id: analysis.commits.target_commit_id,
@@ -315,14 +315,14 @@ fn selected_change_from_merge_pick(pick: &TrackedStateMergePick) -> StagedCommit
 }
 
 fn preview_from_analysis(
-    target_version_id: &str,
-    source_version_id: &str,
+    target_branch_id: &str,
+    source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
-) -> MergeVersionPreview {
-    MergeVersionPreview {
-        outcome: merge_version_outcome_from_analysis(analysis.outcome),
-        target_version_id: target_version_id.to_string(),
-        source_version_id: source_version_id.to_string(),
+) -> MergeBranchPreview {
+    MergeBranchPreview {
+        outcome: merge_branch_outcome_from_analysis(analysis.outcome),
+        target_branch_id: target_branch_id.to_string(),
+        source_branch_id: source_branch_id.to_string(),
         base_commit_id: analysis.commits.base_commit_id.clone(),
         target_head_commit_id: analysis.commits.target_commit_id.clone(),
         source_head_commit_id: analysis.commits.source_commit_id.clone(),
@@ -335,11 +335,11 @@ fn preview_from_analysis(
     }
 }
 
-fn merge_version_outcome_from_analysis(outcome: MergeOutcome) -> MergeVersionOutcome {
+fn merge_branch_outcome_from_analysis(outcome: MergeOutcome) -> MergeBranchOutcome {
     match outcome {
-        MergeOutcome::AlreadyUpToDate => MergeVersionOutcome::AlreadyUpToDate,
-        MergeOutcome::FastForward => MergeVersionOutcome::FastForward,
-        MergeOutcome::MergeCommitted => MergeVersionOutcome::MergeCommitted,
+        MergeOutcome::AlreadyUpToDate => MergeBranchOutcome::AlreadyUpToDate,
+        MergeOutcome::FastForward => MergeBranchOutcome::FastForward,
+        MergeOutcome::MergeCommitted => MergeBranchOutcome::MergeCommitted,
     }
 }
 
@@ -381,9 +381,9 @@ fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixErro
     let conflict_count = conflicts.len();
     Ok(LixError::new(
         LixError::CODE_MERGE_CONFLICT,
-        format!("merge_version found {conflict_count} tracked-state conflict(s)"),
+        format!("merge_branch found {conflict_count} tracked-state conflict(s)"),
     )
-    .with_hint("Resolve the conflicting entities in the target version, then retry the merge.")
+    .with_hint("Resolve the conflicting entities in the target branch, then retry the merge.")
     .with_details(json!({
         "conflicts": conflicts.iter()
             .map(merge_conflict_details)

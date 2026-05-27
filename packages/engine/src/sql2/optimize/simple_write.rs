@@ -1,6 +1,6 @@
 use crate::sql2::bind::write::{BoundWriteOp, BoundWriteTarget};
+use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::FilterSet;
-use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::LixError;
 
@@ -33,12 +33,12 @@ pub(crate) fn try_make_fast_write_plan(
 fn is_supported_fast_target(plan: &LogicalWritePlan) -> bool {
     matches!(
         plan.bound.target,
-        BoundWriteTarget::LixState | BoundWriteTarget::LixStateByVersion
+        BoundWriteTarget::LixState | BoundWriteTarget::LixStateByBranch
     )
 }
 
 fn is_known_no_match(plan: &LogicalWritePlan) -> bool {
-    matches!(plan.bound.version_scope, VersionScope::Empty)
+    matches!(plan.bound.branch_scope, BranchScope::Empty)
         || matches!(plan.filters.rows, FilterSet::None)
 }
 
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn try_make_fast_write_plan_declines_unsupported_targets_even_when_no_match() {
-        let plan = plan_sql("DELETE FROM lix_version WHERE false");
+        let plan = plan_sql("DELETE FROM lix_branch WHERE false");
 
         assert_eq!(
             try_make_fast_write_plan(&plan).expect("optimization should not fail"),
@@ -110,7 +110,7 @@ mod tests {
 
     fn plan_sql(sql: &str) -> LogicalWritePlan {
         let statement = parse_statement(sql).expect("SQL parses");
-        let write = bind_statement(&statement, &[], "version1").expect("SQL binds");
+        let write = bind_statement(&statement, &[], "branch1").expect("SQL binds");
         plan_write(write).expect("write plans")
     }
 }

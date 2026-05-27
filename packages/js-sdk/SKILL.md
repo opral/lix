@@ -1,32 +1,32 @@
 ---
 name: lix-js-sdk
-description: Use this skill when building examples, demos, tests, or applications with @lix-js/sdk: opening a Lix, registering schemas, writing entities through generated SQL tables, creating named versions, merging, and querying change history.
+description: Use this skill when building examples, demos, tests, or applications with @lix-js/sdk: opening a Lix, registering schemas, writing entities through generated SQL tables, creating named branches, merging, and querying change history.
 ---
 
 # Lix JS SDK Skill
 
 ## What Is Lix
 
-Lix is an embeddable version control system for structured application state. It gives apps named versions, merge, and an immutable SQL-queryable change journal without asking the app to build those systems from scratch.
+Lix is an embeddable branch control system for structured application state. It gives apps named branches, merge, and an immutable SQL-queryable change journal without asking the app to build those systems from scratch.
 
 Current `@lix-js/sdk` capabilities:
 
 - Register JSON schemas as tracked entity tables.
 - Read and write entities through generated SQL tables.
 - Group related writes in explicit transactions so they commit once.
-- Create named versions of state and write/read across versions.
-- Merge one version into the active version.
+- Create named branches of state and write/read across branches.
+- Merge one branch into the active branch.
 - Query `lix_change` for history, audit, activity feeds, and undo-style features.
-- Store files as bytes with `lix_file` and version them like other entities.
+- Store files as bytes with `lix_file` and branch them like other entities.
 
 Product direction:
 
-- Lix is designed to version files of any kind by parsing them into typed entities on write.
-- Parser plugins that turn file contents into app entities are not shipped through the JS SDK yet. Do not promise this behavior in demos. Today, `lix_file` versions bytes, while app entities are modeled directly through registered schemas.
+- Lix is designed to track files of any kind by parsing them into typed entities on write.
+- Parser plugins that turn file contents into app entities are not shipped through the JS SDK yet. Do not promise this behavior in demos. Today, `lix_file` tracks bytes, while app entities are modeled directly through registered schemas.
 
-Every row in every registered schema is a tracked entity. Merge granularity is currently per-entity, not per-field: two versions editing different rows merge cleanly; two versions editing the same row conflict, even if the fields are disjoint. Model collaborative domains as many small entities, such as sections, blocks, paragraphs, message keys, or line items.
+Every row in every registered schema is a tracked entity. Merge granularity is currently per-entity, not per-field: two branches editing different rows merge cleanly; two branches editing the same row conflict, even if the fields are disjoint. Model collaborative domains as many small entities, such as sections, blocks, paragraphs, message keys, or line items.
 
-Use Lix vocabulary in user-facing copy. What Git calls a branch is called a **version** in Lix because that language makes sense to non-developers.
+Use Lix vocabulary in user-facing copy. Lix uses **branch** for named lines of work.
 
 ## When To Use This Skill
 
@@ -37,7 +37,7 @@ Use this skill when you need to write or debug consumer code using `@lix-js/sdk`
 - Writing and reading generated SQL entity tables.
 - Grouping imports, migrations, and batch writes into one transaction.
 - Reading `execute()` results.
-- Creating, switching, previewing, and merging versions.
+- Creating, switching, previewing, and merging branches.
 - Querying history through `lix_change`.
 - Building app demos, examples, smoke tests, or product flows around the SDK.
 
@@ -50,9 +50,9 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 3. Register a schema with `x-lix-key`, `x-lix-primary-key`, and `additionalProperties: false`.
 4. Write rows through the generated table named by `x-lix-key`.
 5. Use `beginTransaction()` for imports, migrations, and multi-row writes that should be one commit.
-6. Use `<schema>_by_version` plus `lixcol_version_id` for side-by-side version reads/writes.
+6. Use `<schema>_by_branch` plus `lixcol_branch_id` for side-by-side branch reads/writes.
 7. Query `lix_change` for audit/history instead of hand-rolling audit tables.
-8. Wrap `mergeVersion()` in `try/catch` whenever conflicts are possible.
+8. Wrap `mergeBranch()` in `try/catch` whenever conflicts are possible.
 
 ## Core Rules
 
@@ -65,9 +65,9 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 - Do not call `execute()` through the parent `lix` handle while a transaction is active; use the transaction handle for reads and writes until `commit()` or `rollback()`.
 - Use stable, namespaced, lowercase schema keys like `acme_section`, not generic names like `task`.
 - Always include `x-lix-primary-key` and `additionalProperties: false` on app schemas.
-- Use version names from the user's vocabulary, such as `"Marketing edit"` or `"Q3 pricing draft"`.
+- Use branch names from the user's vocabulary, such as `"Marketing edit"` or `"Q3 pricing draft"`.
 - Model concurrent-edit domains as collections of small rows because merge is per-row today.
-- Prefer `_by_version` tables for demos, sync, agent inspection, and side-by-side diffs.
+- Prefer `_by_branch` tables for demos, sync, agent inspection, and side-by-side diffs.
 - Close handles in scripts and tests with `await lix.close()`.
 
 ## Install And Open
@@ -110,7 +110,7 @@ Useful installed-package references:
 
 - `dist-engine-src/src/sql2/providers/entity.rs` - registered schema SQL surfaces.
 - `dist-engine-src/src/sql2/providers/change.rs` - `lix_change` projection.
-- `dist-engine-src/src/sql2/providers/version.rs` - writable `lix_version` surface.
+- `dist-engine-src/src/sql2/providers/branch.rs` - writable `lix_branch` surface.
 - `dist-engine-src/src/transaction/validation.rs` - primary-key, unique, foreign-key, and shape validation.
 - `dist-engine-src/src/schema/definition.json` - Lix schema-definition meta-schema.
 - `dist-engine-src/src/schema/builtin/` - built-in entity table shapes.
@@ -293,58 +293,58 @@ for (const row of schemas.rows) {
 }
 ```
 
-## Versions And `_by_version`
+## Branches And `_by_branch`
 
-Capture the initial active version id instead of hardcoding `"main"`:
-
-```ts
-const published = await lix.activeVersionId();
-```
-
-Create versions with names from the user's domain:
+Capture the initial active branch id instead of hardcoding `"main"`:
 
 ```ts
-const marketing = await lix.createVersion({ name: "Marketing edit" });
-const legal = await lix.createVersion({ name: "Legal review" });
+const published = await lix.activeBranchId();
 ```
 
-Every registered schema `X` gets a sibling table `X_by_version` with `lixcol_version_id`. Use it for side-by-side reads and for writes to non-active versions.
+Create branches with names from the user's domain:
+
+```ts
+const marketing = await lix.createBranch({ name: "Marketing edit" });
+const legal = await lix.createBranch({ name: "Legal review" });
+```
+
+Every registered schema `X` gets a sibling table `X_by_branch` with `lixcol_branch_id`. Use it for side-by-side reads and for writes to non-active branches.
 
 ```ts
 await lix.execute(
-  `UPDATE acme_note_by_version
+  `UPDATE acme_note_by_branch
       SET title = $1
-    WHERE id = $2 AND lixcol_version_id = $3`,
+    WHERE id = $2 AND lixcol_branch_id = $3`,
   ["Sharper launch copy", "n1", marketing.id],
 );
 
 const sideBySide = await lix.execute(
   `SELECT v.name, n.title
-     FROM acme_note_by_version n
-     JOIN lix_version v ON v.id = n.lixcol_version_id
+     FROM acme_note_by_branch n
+     JOIN lix_branch v ON v.id = n.lixcol_branch_id
     WHERE n.id = $1
-      AND n.lixcol_version_id IN ($2, $3)
+      AND n.lixcol_branch_id IN ($2, $3)
     ORDER BY v.name`,
   ["n1", published, marketing.id],
 );
 ```
 
-Rules for `_by_version`:
+Rules for `_by_branch`:
 
-- Reads filter by `lixcol_version_id`, or omit the filter to scan all versions.
-- INSERTs require `lixcol_version_id`.
-- UPDATEs and DELETEs must include `lixcol_version_id` in the WHERE clause.
-- The non-suffixed table is the active-version view.
+- Reads filter by `lixcol_branch_id`, or omit the filter to scan all branches.
+- INSERTs require `lixcol_branch_id`.
+- UPDATEs and DELETEs must include `lixcol_branch_id` in the WHERE clause.
+- The non-suffixed table is the active-branch view.
 
-`switchVersion()` is for app code with a current working version concept. `mergeVersion()` always merges into the active version, so switch first if you need a different target.
+`switchBranch()` is for app code with a current working branch concept. `mergeBranch()` always merges into the active branch, so switch first if you need a different target.
 
 ## Merging
 
-`mergeVersion()` merges the source version into the currently active version:
+`mergeBranch()` merges the source branch into the currently active branch:
 
 ```ts
 try {
-  const merge = await lix.mergeVersion({ sourceVersionId: marketing.id });
+  const merge = await lix.mergeBranch({ sourceBranchId: marketing.id });
   console.log(merge.outcome, merge.changeStats.total);
 } catch (error) {
   console.error("Merge conflict", error);
@@ -357,18 +357,18 @@ Common outcomes:
 - `"fastForward"` - target advanced to source without a merge commit.
 - `"mergeCommitted"` - a new merge commit was created.
 
-`mergeVersionPreview()` reports the same merge decision without advancing refs, staging changes, or creating commits. Merge conflicts are returned as preview data.
+`mergeBranchPreview()` reports the same merge decision without advancing refs, staging changes, or creating commits. Merge conflicts are returned as preview data.
 
-Conflicts throw from `mergeVersion()`. If both versions modified the same entity since their merge base, Lix raises a `LixError`. Conflict detection is row-level today, not field-level. To reproduce a conflict in a demo, fork all contending versions from the same base before merging any of them.
+Conflicts throw from `mergeBranch()`. If both branches modified the same entity since their merge base, Lix raises a `LixError`. Conflict detection is row-level today, not field-level. To reproduce a conflict in a demo, fork all contending branches from the same base before merging any of them.
 
 ## Demo Pattern To Imitate
 
 For richer demos, show these four things:
 
-1. Isolation: one SELECT against `<schema>_by_version` shows several versions side by side.
+1. Isolation: one SELECT against `<schema>_by_branch` shows several branches side by side.
 2. Clean parallel merges: two reviewers edit different entities and both land.
 3. Audit history: `lix_change` is queryable SQL.
-4. Conflict handling: two versions edit the same entity and `mergeVersion()` throws.
+4. Conflict handling: two branches edit the same entity and `mergeBranch()` throws.
 
 Shape the domain as a collection of small entities:
 
@@ -378,17 +378,17 @@ Shape the domain as a collection of small entities:
 Demo recipe:
 
 1. Register a schema such as `acme_section`.
-2. Seed several rows in the published version.
-3. Create all reviewer versions up front from the same base.
-4. Write each reviewer's changes through `acme_section_by_version`.
-5. Read side by side by joining `acme_section_by_version` to `lix_version`.
+2. Seed several rows in the published branch.
+3. Create all reviewer branches up front from the same base.
+4. Write each reviewer's changes through `acme_section_by_branch`.
+5. Read side by side by joining `acme_section_by_branch` to `lix_branch`.
 6. Merge non-overlapping row edits successfully.
 7. Query `lix_change`.
 8. Catch the deliberate same-row conflict.
 
 ## Files With `lix_file`
 
-`lix_file` stores files as versioned bytes. Parent directories are created automatically.
+`lix_file` stores files as branched bytes. Parent directories are created automatically.
 
 ```ts
 await lix.execute("INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)", [
@@ -417,13 +417,13 @@ Columns consumers usually need:
 | `path`     | Absolute path like `/docs/readme.md`.                                 |
 | `data`     | File contents as bytes.                                               |
 | `hidden`   | UI hint; does not affect storage.                                     |
-| `lixcol_*` | Version/change metadata, including `lixcol_version_id` where exposed. |
+| `lixcol_*` | Branch/change metadata, including `lixcol_branch_id` where exposed. |
 
-`lix_file_by_version` exists for cross-version file reads and writes. Files-as-parsed-entities are product direction, not current JS SDK behavior.
+`lix_file_by_branch` exists for cross-branch file reads and writes. Files-as-parsed-entities are product direction, not current JS SDK behavior.
 
 ## The Change Journal
 
-`lix_change` is an immutable SQL table of changes across registered schemas and versions. Use it for audit logs, blame, history, activity feeds, and undo-style UI.
+`lix_change` is an immutable SQL table of changes across registered schemas and branches. Use it for audit logs, blame, history, activity feeds, and undo-style UI.
 
 Important columns include `id`, `entity_pk`, `schema_key`, `snapshot_content`, `created_at`, and `lixcol_*` metadata.
 
@@ -457,20 +457,20 @@ Common tables:
 
 | Table                   | What it gives consumers                                                                                 |
 | ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| `lix_version`           | Writable version surface: `id`, `name`, `hidden`, `commit_id`.                                          |
+| `lix_branch`           | Writable branch surface: `id`, `name`, `hidden`, `commit_id`.                                          |
 | `lix_change`            | Immutable change journal.                                                                               |
-| `lix_file`              | Versioned byte storage for files.                                                                       |
+| `lix_file`              | Branched byte storage for files.                                                                       |
 | `lix_registered_schema` | Registry of app schemas plus built-ins; also exposes the Lix schema-definition meta-schema at runtime. |
 
-`lix_version` can be updated for admin flows:
+`lix_branch` can be updated for admin flows:
 
 ```ts
-await lix.execute("UPDATE lix_version SET hidden = true WHERE id = $1", [
+await lix.execute("UPDATE lix_branch SET hidden = true WHERE id = $1", [
   marketing.id,
 ]);
 ```
 
-There is no documented `deleteVersion()` helper in this preview. If the product wants reversible cleanup, hide the version. If it wants removal, `DELETE FROM lix_version WHERE id = $1` is the SQL surface; the engine rejects deleting the global version and active version.
+There is no documented `deleteBranch()` helper in this preview. If the product wants reversible cleanup, hide the branch. If it wants removal, `DELETE FROM lix_branch WHERE id = $1` is the SQL surface; the engine rejects deleting the global branch and active branch.
 
 Use `lix_json($1)` to parse JSON text parameters when writing JSON-typed columns:
 
@@ -493,12 +493,12 @@ Other UDFs, such as `lix_json_get`, `lix_uuid_v7`, `lix_text_encode`, and `lix_e
 | Use `lix_json($1)` for JSON parameters. | Inlining stringified JSON directly into SQL. |
 | Use `beginTransaction()` for imports and batch writes that should be one commit. | Loops of standalone `lix.execute()` writes for bulk imports. |
 | Use the transaction handle for reads and writes until it commits or rolls back. | Calling parent-handle `execute()` during an active transaction. |
-| Use `_by_version` for cross-version reads/writes. | Switching versions just to render a side-by-side view. |
-| Name versions in user vocabulary. | User-facing words like branch, branch-1, or generic Draft. |
+| Use `_by_branch` for cross-branch reads/writes. | Switching branches just to render a side-by-side view. |
+| Name branches in user vocabulary. | User-facing words like branch, branch-1, or generic Draft. |
 | Model collaborative data as small rows. | One giant row when multiple reviewers edit different parts. |
 | Add `x-lix-unique` for non-primary unique fields. | Assuming JSON Schema property metadata creates uniqueness. |
 | Read `snapshot_content` as JSON/native and handle null. | Blindly `JSON.parse(row.value(...).asText())`. |
-| Wrap `mergeVersion()` in `try/catch`. | Assuming merges cannot conflict. |
+| Wrap `mergeBranch()` in `try/catch`. | Assuming merges cannot conflict. |
 
 ## Reporting SDK Friction
 

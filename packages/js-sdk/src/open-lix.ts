@@ -233,44 +233,44 @@ export type OpenLixOptions = {
 	backend?: LixBackend;
 };
 
-export type CreateVersionOptions = {
+export type CreateBranchOptions = {
 	id?: string;
 	name: string;
 	fromCommitId?: string;
 };
 
-export type CreateVersionResult = {
+export type CreateBranchResult = {
 	id: string;
 	name: string;
 	hidden: boolean;
 	commitId: string;
 };
 
-export type SwitchVersionOptions = {
-	versionId: string;
+export type SwitchBranchOptions = {
+	branchId: string;
 };
 
-export type SwitchVersionResult = {
-	versionId: string;
+export type SwitchBranchResult = {
+	branchId: string;
 };
 
-export type MergeVersionOptions = {
-	sourceVersionId: string;
+export type MergeBranchOptions = {
+	sourceBranchId: string;
 };
 
-export type MergeVersionOutcome =
+export type MergeBranchOutcome =
 	| "alreadyUpToDate"
 	| "fastForward"
 	| "mergeCommitted";
 
-export type MergeVersionResult = {
+export type MergeBranchResult = {
 	/**
 	 * How the merge was applied. `fastForward` advances the target ref without
 	 * creating a merge commit, but can still make source changes visible.
 	 */
-	outcome: MergeVersionOutcome;
-	targetVersionId: string;
-	sourceVersionId: string;
+	outcome: MergeBranchOutcome;
+	targetBranchId: string;
+	sourceBranchId: string;
 	baseCommitId: string;
 	targetHeadBeforeCommitId: string;
 	sourceHeadBeforeCommitId: string;
@@ -279,10 +279,10 @@ export type MergeVersionResult = {
 	changeStats: MergeChangeStats;
 };
 
-export type MergeVersionPreviewResult = {
-	outcome: MergeVersionOutcome;
-	targetVersionId: string;
-	sourceVersionId: string;
+export type MergeBranchPreviewResult = {
+	outcome: MergeBranchOutcome;
+	targetBranchId: string;
+	sourceBranchId: string;
 	baseCommitId: string;
 	targetHeadCommitId: string;
 	sourceHeadCommitId: string;
@@ -327,13 +327,13 @@ export type Lix = {
 		params?: ReadonlyArray<LixRuntimeValue>,
 	): Promise<ExecuteResult>;
 	beginTransaction(): Promise<LixTransaction>;
-	activeVersionId(): Promise<string>;
-	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
-	switchVersion(options: SwitchVersionOptions): Promise<SwitchVersionResult>;
-	mergeVersionPreview(
-		options: MergeVersionOptions,
-	): Promise<MergeVersionPreviewResult>;
-	mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult>;
+	activeBranchId(): Promise<string>;
+	createBranch(options: CreateBranchOptions): Promise<CreateBranchResult>;
+	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchResult>;
+	mergeBranchPreview(
+		options: MergeBranchOptions,
+	): Promise<MergeBranchPreviewResult>;
+	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchResult>;
 	close(): Promise<void>;
 };
 
@@ -362,13 +362,13 @@ type WasmLix = {
 	 */
 	execute(sql: string, params: unknown[]): Promise<WasmExecuteResult>;
 	beginTransaction(): Promise<WasmLixTransaction>;
-	activeVersionId(): Promise<string>;
-	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
-	switchVersion(options: SwitchVersionOptions): Promise<SwitchVersionResult>;
-	mergeVersionPreview(
-		options: MergeVersionOptions,
-	): Promise<MergeVersionPreviewResult>;
-	mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult>;
+	activeBranchId(): Promise<string>;
+	createBranch(options: CreateBranchOptions): Promise<CreateBranchResult>;
+	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchResult>;
+	mergeBranchPreview(
+		options: MergeBranchOptions,
+	): Promise<MergeBranchPreviewResult>;
+	mergeBranch(options: MergeBranchOptions): Promise<MergeBranchResult>;
 	close(): Promise<void>;
 };
 
@@ -449,32 +449,32 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			return createLixTransactionHandle(wasmTransaction, runQueued);
 		},
 
-		async activeVersionId(): Promise<string> {
-			return await runQueued(() => wasmLix.activeVersionId());
+		async activeBranchId(): Promise<string> {
+			return await runQueued(() => wasmLix.activeBranchId());
 		},
 
-		async createVersion(
-			options: CreateVersionOptions,
-		): Promise<CreateVersionResult> {
-			return await runQueued(() => wasmLix.createVersion(options));
+		async createBranch(
+			options: CreateBranchOptions,
+		): Promise<CreateBranchResult> {
+			return await runQueued(() => wasmLix.createBranch(options));
 		},
 
-		async switchVersion(
-			options: SwitchVersionOptions,
-		): Promise<SwitchVersionResult> {
-			return await runQueued(() => wasmLix.switchVersion(options));
+		async switchBranch(
+			options: SwitchBranchOptions,
+		): Promise<SwitchBranchResult> {
+			return await runQueued(() => wasmLix.switchBranch(options));
 		},
 
-		async mergeVersionPreview(
-			options: MergeVersionOptions,
-		): Promise<MergeVersionPreviewResult> {
-			return await runQueued(() => wasmLix.mergeVersionPreview(options));
+		async mergeBranchPreview(
+			options: MergeBranchOptions,
+		): Promise<MergeBranchPreviewResult> {
+			return await runQueued(() => wasmLix.mergeBranchPreview(options));
 		},
 
-		async mergeVersion(
-			options: MergeVersionOptions,
-		): Promise<MergeVersionResult> {
-			return await runQueued(() => wasmLix.mergeVersion(options));
+		async mergeBranch(
+			options: MergeBranchOptions,
+		): Promise<MergeBranchResult> {
+			return await runQueued(() => wasmLix.mergeBranch(options));
 		},
 
 		async close(): Promise<void> {

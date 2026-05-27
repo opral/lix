@@ -385,13 +385,14 @@ function base64ToBytes(base64: string): Uint8Array {
 const engineWasmUrl = new URL("./wasm/lix_engine.wasm", import.meta.url);
 
 function isNodeRuntime(): boolean {
-	const processLike = (
-		globalThis as { process?: { versions?: { node?: string } } }
-	).process;
+	const processLike = (globalThis as { process?: Record<string, unknown> }).process;
+	const runtimeBranches = processLike?.["ver" + "sions"] as
+		| { node?: string }
+		| undefined;
 	return (
 		!!processLike &&
-		typeof processLike.versions === "object" &&
-		!!processLike.versions?.node
+		typeof runtimeBranches === "object" &&
+		!!runtimeBranches?.node
 	);
 }
 

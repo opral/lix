@@ -1,0 +1,34 @@
+{
+  "x-lix-key": "lix_branch_descriptor",
+  "description": "User-facing branch metadata (name and visibility). The stable identity of a branch; the matching `lix_branch_ref` carries the moving head pointer. The catalog's `lix_branch` surface joins this descriptor with its ref to present a single user-visible branch row.",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-unique": [
+    [
+      "/name"
+    ]
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Stable branch identifier (UUIDv7). Referenced by `lix_branch_ref.id`."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable branch name (e.g. `main`, `feature-x`) shown in branch listings and CLI output."
+    },
+    "hidden": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, the branch is filtered from default listings (CLI, catalog views); operations by explicit id still succeed."
+    }
+  },
+  "required": [
+    "id",
+    "name"
+  ],
+  "additionalProperties": false
+}

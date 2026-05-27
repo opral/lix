@@ -38,7 +38,7 @@ impl RebuildTrackedStateSimulation {
     pub(crate) async fn before_read(
         &self,
         engine: &Engine,
-        version_id: &str,
+        branch_id: &str,
     ) -> Result<(), LixError> {
         if self.mode != SimulationMode::TrackedStateRebuild {
             return Ok(());
@@ -46,7 +46,7 @@ impl RebuildTrackedStateSimulation {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
-        engine.rebuild_tracked_state_for_version(version_id).await
+        engine.rebuild_tracked_state_for_branch(branch_id).await
     }
 
     #[cfg(test)]

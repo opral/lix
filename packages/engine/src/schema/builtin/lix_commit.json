@@ -1,6 +1,6 @@
 {
   "x-lix-key": "lix_commit",
-  "description": "A commit is a stable point in project history. Versions point to commits. Use lix_commit_edge to inspect parent commits.",
+  "description": "A commit is a stable point in project history. Branches point to commits. Use lix_commit_edge to inspect parent commits.",
   "examples": [
     {
       "id": "commit_01jexample"

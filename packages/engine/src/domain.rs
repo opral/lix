@@ -1,57 +1,57 @@
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::{NullableKeyFilter, GLOBAL_VERSION_ID};
+use crate::{NullableKeyFilter, GLOBAL_BRANCH_ID};
 
 /// Validation/storage coordinate for repository facts.
 ///
 /// A domain is the complete scope in which a row identity is meaningful:
-/// version, durability, and file scope. Projection methods on this type are
+/// branch, durability, and file scope. Projection methods on this type are
 /// deliberately named so callers cannot silently erase part of the coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Domain {
-    version_id: String,
+    branch_id: String,
     untracked: bool,
     file_scope: DomainFileScope,
 }
 
 impl Domain {
     pub(crate) fn exact_file(
-        version_id: impl Into<String>,
+        branch_id: impl Into<String>,
         untracked: bool,
         file_id: Option<String>,
     ) -> Self {
         Self {
-            version_id: version_id.into(),
+            branch_id: branch_id.into(),
             untracked,
             file_scope: DomainFileScope::Exact(file_id),
         }
     }
 
-    pub(crate) fn any_file(version_id: impl Into<String>, untracked: bool) -> Self {
+    pub(crate) fn any_file(branch_id: impl Into<String>, untracked: bool) -> Self {
         Self {
-            version_id: version_id.into(),
+            branch_id: branch_id.into(),
             untracked,
             file_scope: DomainFileScope::Any,
         }
     }
 
-    pub(crate) fn schema_catalog(version_id: impl Into<String>, untracked: bool) -> Self {
-        Self::any_file(version_id, untracked)
+    pub(crate) fn schema_catalog(branch_id: impl Into<String>, untracked: bool) -> Self {
+        Self::any_file(branch_id, untracked)
     }
 
     pub(crate) fn for_live_row(row: &MaterializedLiveStateRow) -> Self {
-        Self::exact_file(row.version_id.clone(), row.untracked, row.file_id.clone())
+        Self::exact_file(row.branch_id.clone(), row.untracked, row.file_id.clone())
     }
 
     pub(crate) fn schema_catalog_domain(&self) -> Self {
-        // Schema definitions are version + durability scoped. They are not
+        // Schema definitions are branch + durability scoped. They are not
         // owned by a data file, so schema catalog lookup deliberately erases
         // row file scope into `Any`.
-        Self::schema_catalog(self.version_id.clone(), self.untracked)
+        Self::schema_catalog(self.branch_id.clone(), self.untracked)
     }
 
-    pub(crate) fn version_id(&self) -> &str {
-        &self.version_id
+    pub(crate) fn branch_id(&self) -> &str {
+        &self.branch_id
     }
 
     pub(crate) fn untracked(&self) -> bool {
@@ -64,7 +64,7 @@ impl Domain {
             DomainFileScope::Exact(Some(file_id)) => format!("={file_id}"),
             DomainFileScope::Exact(None) => "=".to_string(),
         };
-        format!("{}|{}|{}", self.version_id, self.untracked, file_scope)
+        format!("{}|{}|{}", self.branch_id, self.untracked, file_scope)
     }
 
     #[cfg(test)]
@@ -78,7 +78,7 @@ impl Domain {
 
     pub(crate) fn with_untracked(&self, untracked: bool) -> Self {
         Self {
-            version_id: self.version_id.clone(),
+            branch_id: self.branch_id.clone(),
             untracked,
             file_scope: self.file_scope.clone(),
         }
@@ -86,7 +86,7 @@ impl Domain {
 
     pub(crate) fn with_file_scope(&self, file_scope: DomainFileScope) -> Self {
         Self {
-            version_id: self.version_id.clone(),
+            branch_id: self.branch_id.clone(),
             untracked: self.untracked,
             file_scope,
         }
@@ -104,9 +104,9 @@ impl Domain {
     }
 
     pub(crate) fn contains(&self, row: &MaterializedLiveStateRow) -> bool {
-        row.version_id == self.version_id
+        row.branch_id == self.branch_id
             && row.untracked == self.untracked
-            && committed_row_is_exact_version_scoped(row, &self.version_id)
+            && committed_row_is_exact_branch_scoped(row, &self.branch_id)
             && match &self.file_scope {
                 DomainFileScope::Any => true,
                 DomainFileScope::Exact(file_id) => row.file_id == *file_id,
@@ -130,7 +130,7 @@ impl Domain {
     }
 
     fn can_reach(&self, target: &Self) -> bool {
-        self.version_id == target.version_id
+        self.branch_id == target.branch_id
             && self.file_scope == target.file_scope
             && (self.untracked || !target.untracked)
     }
@@ -155,7 +155,7 @@ impl Domain {
         self.reachable_target_domains()
     }
 
-    pub(crate) fn version_descriptor_domains_for_ref_delete(&self) -> Vec<Self> {
+    pub(crate) fn branch_descriptor_domains_for_ref_delete(&self) -> Vec<Self> {
         self.source_domains_that_can_reach()
     }
 
@@ -215,14 +215,14 @@ impl DomainRowIdentity {
 
     #[cfg(test)]
     pub(crate) fn exact(
-        version_id: impl Into<String>,
+        branch_id: impl Into<String>,
         untracked: bool,
         file_id: Option<String>,
         schema_key: impl Into<String>,
         entity_pk: EntityPk,
     ) -> Self {
         Self::new(
-            Domain::exact_file(version_id, untracked, file_id),
+            Domain::exact_file(branch_id, untracked, file_id),
             schema_key,
             entity_pk,
         )
@@ -305,11 +305,11 @@ impl DomainSchemaIdentity {
     }
 }
 
-pub(crate) fn committed_row_is_exact_version_scoped(
+pub(crate) fn committed_row_is_exact_branch_scoped(
     row: &MaterializedLiveStateRow,
-    version_id: &str,
+    branch_id: &str,
 ) -> bool {
-    row.version_id == version_id && row.global == (row.version_id == GLOBAL_VERSION_ID)
+    row.branch_id == branch_id && row.global == (row.branch_id == GLOBAL_BRANCH_ID)
 }
 
 fn nullable_filter_from_option(value: &Option<String>) -> NullableKeyFilter<String> {

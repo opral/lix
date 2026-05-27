@@ -569,7 +569,7 @@ where
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let plan = reader
-        .plan_gc(&[GcRoot::VersionHead(root_commit_id.to_string())])
+        .plan_gc(&[GcRoot::BranchHead(root_commit_id.to_string())])
         .await?;
     Ok(plan.into())
 }
@@ -587,7 +587,7 @@ where
     let plan = {
         let mut writer = store.context.writer(&mut *transaction, &mut writes);
         writer
-            .collect_garbage(&[GcRoot::VersionHead(root_commit_id.to_string())])
+            .collect_garbage(&[GcRoot::BranchHead(root_commit_id.to_string())])
             .await?
     };
     writes.apply(&mut *transaction).await?;

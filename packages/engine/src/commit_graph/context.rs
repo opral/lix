@@ -60,7 +60,7 @@ where
     /// Loads every direct commit fact from the changelog.
     ///
     /// This is used by global commit surfaces where the caller wants the durable
-    /// graph facts themselves, not reachability from a particular version head.
+    /// graph facts themselves, not reachability from a particular branch head.
     pub(crate) async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
         let mut commits = Vec::new();
         let mut start_after = None::<String>;

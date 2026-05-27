@@ -25,22 +25,22 @@ use datafusion::scalar::ScalarValue;
 use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
+use crate::branch::BranchRefReader;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
+use crate::sql2::branch_scope::{resolve_provider_branch_ids, BranchBinding};
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::read_only::reject_read_only_stage_rows;
-use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::version::VersionRefReader;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 use crate::{parse_row_metadata_value, serialize_row_metadata, LixError, NullableKeyFilter};
 
 use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
+    SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
@@ -52,39 +52,39 @@ use crate::sql2::result_metadata::json_field;
 pub(super) async fn register_lix_state_active_provider(
     session: &SessionContext,
     surface_name: &str,
-    active_version_id: &str,
+    active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     session
         .register_table(
             surface_name,
-            Arc::new(LixStateProvider::active_version(
-                active_version_id,
+            Arc::new(LixStateProvider::active_branch(
+                active_branch_id,
                 live_state,
-                version_ref,
+                branch_ref,
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
 
-pub(super) async fn register_lix_state_by_version_provider(
+pub(super) async fn register_lix_state_by_branch_provider(
     session: &SessionContext,
     surface_name: &str,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<(), LixError> {
     session
         .register_table(
             surface_name,
-            Arc::new(LixStateProvider::by_version(live_state, version_ref)),
+            Arc::new(LixStateProvider::by_branch(live_state, branch_ref)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
 
-pub(super) async fn register_lix_state_by_version_write_provider(
+pub(super) async fn register_lix_state_by_branch_write_provider(
     session: &SessionContext,
     surface_name: &str,
     write_ctx: SqlWriteContext,
@@ -92,7 +92,7 @@ pub(super) async fn register_lix_state_by_version_write_provider(
     session
         .register_table(
             surface_name,
-            Arc::new(LixStateProvider::by_version_with_write(write_ctx)),
+            Arc::new(LixStateProvider::by_branch_with_write(write_ctx)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
@@ -106,7 +106,7 @@ pub(super) async fn register_lix_state_active_write_provider(
     session
         .register_table(
             surface_name,
-            Arc::new(LixStateProvider::active_version_with_write(write_ctx)),
+            Arc::new(LixStateProvider::active_branch_with_write(write_ctx)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
@@ -115,9 +115,9 @@ pub(super) async fn register_lix_state_active_write_provider(
 pub(crate) struct LixStateProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
-    version_ref: Arc<dyn VersionRefReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     write_access: WriteAccess,
-    version_binding: VersionBinding,
+    branch_binding: BranchBinding,
 }
 
 impl std::fmt::Debug for LixStateProvider {
@@ -129,55 +129,55 @@ impl std::fmt::Debug for LixStateProvider {
 }
 
 impl LixStateProvider {
-    pub(crate) fn active_version(
-        active_version_id: impl Into<String>,
+    pub(crate) fn active_branch(
+        active_branch_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
-        version_ref: Arc<dyn VersionRefReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         Self {
             schema: lix_state_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::read_only(),
-            version_binding: VersionBinding::active(active_version_id),
+            branch_binding: BranchBinding::active(active_branch_id),
         }
     }
 
-    pub(crate) fn active_version_with_write(write_ctx: SqlWriteContext) -> Self {
-        let active_version_id = write_ctx.active_version_id();
+    pub(crate) fn active_branch_with_write(write_ctx: SqlWriteContext) -> Self {
+        let active_branch_id = write_ctx.active_branch_id();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         Self {
             schema: lix_state_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::write(write_ctx),
-            version_binding: VersionBinding::active(active_version_id),
+            branch_binding: BranchBinding::active(active_branch_id),
         }
     }
 
-    pub(crate) fn by_version(
+    pub(crate) fn by_branch(
         live_state: Arc<dyn LiveStateReader>,
-        version_ref: Arc<dyn VersionRefReader>,
+        branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         Self {
-            schema: lix_state_by_version_schema(),
+            schema: lix_state_by_branch_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::read_only(),
-            version_binding: VersionBinding::explicit(),
+            branch_binding: BranchBinding::explicit(),
         }
     }
 
-    pub(crate) fn by_version_with_write(write_ctx: SqlWriteContext) -> Self {
+    pub(crate) fn by_branch_with_write(write_ctx: SqlWriteContext) -> Self {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         Self {
-            schema: lix_state_by_version_schema(),
+            schema: lix_state_by_branch_schema(),
             live_state,
-            version_ref,
+            branch_ref,
             write_access: WriteAccess::write(write_ctx),
-            version_binding: VersionBinding::explicit(),
+            branch_binding: BranchBinding::explicit(),
         }
     }
 }
@@ -219,19 +219,19 @@ impl TableProvider for LixStateProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let route = LixStateByVersionRoute::from_filters(filters);
+        let route = LixStateByBranchRoute::from_filters(filters);
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = lix_state_scan_request(
             &self.schema,
-            self.version_binding.active_version_id(),
+            self.branch_binding.active_branch_id(),
             projection,
             &route,
             limit,
         );
-        request.filter.version_ids = resolve_provider_version_ids(
-            self.version_ref.as_ref(),
-            &self.version_binding,
-            request.filter.version_ids,
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
@@ -253,12 +253,12 @@ impl TableProvider for LixStateProvider {
         }
 
         let write_ctx = self.write_access.require_write("INSERT into lix_state")?;
-        let version_binding = self.version_binding.active_version_id().map(str::to_owned);
+        let branch_binding = self.branch_binding.active_branch_id().map(str::to_owned);
 
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
 
-        let sink = LixStateInsertSink::new(write_ctx.clone(), version_binding);
+        let sink = LixStateInsertSink::new(write_ctx.clone(), branch_binding);
         Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
@@ -277,15 +277,15 @@ impl TableProvider for LixStateProvider {
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
 
-        let route = LixStateByVersionRoute::from_filters(&filters);
-        let version_binding = self.version_binding.active_version_id().map(str::to_owned);
+        let route = LixStateByBranchRoute::from_filters(&filters);
+        let branch_binding = self.branch_binding.active_branch_id().map(str::to_owned);
         let request =
-            lix_state_scan_request(&self.schema, version_binding.as_deref(), None, &route, None);
+            lix_state_scan_request(&self.schema, branch_binding.as_deref(), None, &route, None);
 
         Ok(Arc::new(LixStateDeleteExec::new(
             write_ctx.clone(),
             Arc::clone(&self.schema),
-            version_binding,
+            branch_binding,
             request,
             physical_filters,
         )))
@@ -317,15 +317,15 @@ impl TableProvider for LixStateProvider {
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
 
-        let route = LixStateByVersionRoute::from_filters(&filters);
-        let version_binding = self.version_binding.active_version_id().map(str::to_owned);
+        let route = LixStateByBranchRoute::from_filters(&filters);
+        let branch_binding = self.branch_binding.active_branch_id().map(str::to_owned);
         let request =
-            lix_state_scan_request(&self.schema, version_binding.as_deref(), None, &route, None);
+            lix_state_scan_request(&self.schema, branch_binding.as_deref(), None, &route, None);
 
         Ok(Arc::new(LixStateUpdateExec::new(
             write_ctx.clone(),
             Arc::clone(&self.schema),
-            version_binding,
+            branch_binding,
             request,
             physical_assignments,
             physical_filters,
@@ -335,7 +335,7 @@ impl TableProvider for LixStateProvider {
 
 struct LixStateInsertSink {
     write_ctx: SqlWriteContext,
-    version_binding: Option<String>,
+    branch_binding: Option<String>,
 }
 
 impl std::fmt::Debug for LixStateInsertSink {
@@ -345,10 +345,10 @@ impl std::fmt::Debug for LixStateInsertSink {
 }
 
 impl LixStateInsertSink {
-    fn new(write_ctx: SqlWriteContext, version_binding: Option<String>) -> Self {
+    fn new(write_ctx: SqlWriteContext, branch_binding: Option<String>) -> Self {
         Self {
             write_ctx,
-            version_binding,
+            branch_binding,
         }
     }
 }
@@ -375,7 +375,7 @@ impl InsertSink for LixStateInsertSink {
         for batch in batches {
             rows.extend(lix_state_write_rows_from_batch(
                 &batch,
-                self.version_binding.as_deref(),
+                self.branch_binding.as_deref(),
                 "INSERT into lix_state",
             )?);
         }
@@ -399,7 +399,7 @@ impl InsertSink for LixStateInsertSink {
 struct LixStateDeleteExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    version_binding: Option<String>,
+    branch_binding: Option<String>,
     request: LiveStateScanRequest,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
@@ -416,7 +416,7 @@ impl LixStateDeleteExec {
     fn new(
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        version_binding: Option<String>,
+        branch_binding: Option<String>,
         request: LiveStateScanRequest,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -430,7 +430,7 @@ impl LixStateDeleteExec {
         Self {
             write_ctx,
             table_schema,
-            version_binding,
+            branch_binding,
             request,
             filters,
             result_schema,
@@ -491,7 +491,7 @@ impl ExecutionPlan for LixStateDeleteExec {
         }
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let version_binding = self.version_binding.clone();
+        let branch_binding = self.branch_binding.clone();
         let request = self.request.clone();
         let filters = self.filters.clone();
         let result_schema = Arc::clone(&self.result_schema);
@@ -507,7 +507,7 @@ impl ExecutionPlan for LixStateDeleteExec {
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
             let write_rows = lix_state_deletable_write_rows_from_batch(
                 &matched_batch,
-                version_binding.as_deref(),
+                branch_binding.as_deref(),
             )?;
             reject_read_only_stage_rows(&write_rows, "DELETE FROM lix_state")?;
             let count = u64::try_from(write_rows.len())
@@ -539,7 +539,7 @@ impl ExecutionPlan for LixStateDeleteExec {
 struct LixStateUpdateExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    version_binding: Option<String>,
+    branch_binding: Option<String>,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -557,7 +557,7 @@ impl LixStateUpdateExec {
     fn new(
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        version_binding: Option<String>,
+        branch_binding: Option<String>,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -572,7 +572,7 @@ impl LixStateUpdateExec {
         Self {
             write_ctx,
             table_schema,
-            version_binding,
+            branch_binding,
             request,
             assignments,
             filters,
@@ -639,7 +639,7 @@ impl ExecutionPlan for LixStateUpdateExec {
         }
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let version_binding = self.version_binding.clone();
+        let branch_binding = self.branch_binding.clone();
         let request = self.request.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
@@ -657,7 +657,7 @@ impl ExecutionPlan for LixStateUpdateExec {
             let write_rows = lix_state_update_write_rows_from_batch(
                 &matched_batch,
                 &assignments,
-                version_binding.as_deref(),
+                branch_binding.as_deref(),
             )?;
             reject_read_only_stage_rows(&write_rows, "UPDATE lix_state")?;
             let count = u64::try_from(write_rows.len())
@@ -727,10 +727,10 @@ fn evaluate_lix_state_filters(
 
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     action: &str,
 ) -> Result<Vec<TransactionWriteRow>> {
-    let mut rows = lix_state_write_rows_from_batch(batch, version_binding, action)?;
+    let mut rows = lix_state_write_rows_from_batch(batch, branch_binding, action)?;
     for row in &mut rows {
         row.created_at = None;
         row.updated_at = None;
@@ -743,23 +743,23 @@ fn lix_state_stageable_write_rows_from_batch(
 fn lix_state_update_write_rows_from_batch(
     batch: &RecordBatch,
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
     (0..batch.num_rows())
         .map(|row_index| {
             let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
-            let version_id =
-                optional_string_value(batch, row_index, "version_id")?.unwrap_or_else(|| {
+            let branch_id =
+                optional_string_value(batch, row_index, "branch_id")?.unwrap_or_else(|| {
                     if global {
-                        GLOBAL_VERSION_ID.to_string()
+                        GLOBAL_BRANCH_ID.to_string()
                     } else {
-                        version_binding.unwrap_or_default().to_string()
+                        branch_binding.unwrap_or_default().to_string()
                     }
                 });
-            if !global && version_id.is_empty() {
+            if !global && branch_id.is_empty() {
                 return Err(DataFusionError::Execution(
-                    "UPDATE lix_state_by_version requires version_id".to_string(),
+                    "UPDATE lix_state_by_branch requires branch_id".to_string(),
                 ));
             }
 
@@ -798,7 +798,7 @@ fn lix_state_update_write_rows_from_batch(
                 change_id: None,
                 commit_id: None,
                 untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
-                version_id,
+                branch_id,
             })
         })
         .collect()
@@ -806,10 +806,10 @@ fn lix_state_update_write_rows_from_batch(
 
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>> {
     let mut rows =
-        lix_state_stageable_write_rows_from_batch(batch, version_binding, "DELETE FROM lix_state")?;
+        lix_state_stageable_write_rows_from_batch(batch, branch_binding, "DELETE FROM lix_state")?;
     for row in &mut rows {
         row.snapshot = None;
     }
@@ -881,23 +881,23 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 
 fn lix_state_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     action: &str,
 ) -> Result<Vec<TransactionWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
-            let version_id =
-                optional_string_value(batch, row_index, "version_id")?.unwrap_or_else(|| {
+            let branch_id =
+                optional_string_value(batch, row_index, "branch_id")?.unwrap_or_else(|| {
                     if global {
-                        GLOBAL_VERSION_ID.to_string()
+                        GLOBAL_BRANCH_ID.to_string()
                     } else {
-                        version_binding.unwrap_or_default().to_string()
+                        branch_binding.unwrap_or_default().to_string()
                     }
                 });
-            if !global && version_id.is_empty() {
+            if !global && branch_id.is_empty() {
                 return Err(DataFusionError::Execution(format!(
-                    "{action} requires version_id"
+                    "{action} requires branch_id"
                 )));
             }
 
@@ -925,7 +925,7 @@ fn lix_state_write_rows_from_batch(
                 change_id: optional_string_value(batch, row_index, "change_id")?,
                 commit_id: optional_string_value(batch, row_index, "commit_id")?,
                 untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
-                version_id,
+                branch_id,
             })
         })
         .collect()
@@ -1183,7 +1183,7 @@ pub(super) fn lix_state_schema() -> SchemaRef {
     ]))
 }
 
-pub(super) fn lix_state_by_version_schema() -> SchemaRef {
+pub(super) fn lix_state_by_branch_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
@@ -1196,20 +1196,20 @@ pub(super) fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("change_id", DataType::Utf8, true),
         Field::new("commit_id", DataType::Utf8, true),
         Field::new("untracked", DataType::Boolean, true),
-        Field::new("version_id", DataType::Utf8, false),
+        Field::new("branch_id", DataType::Utf8, false),
     ]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct LixStateByVersionRoute {
+struct LixStateByBranchRoute {
     schema_keys: Option<BTreeSet<String>>,
-    version_ids: Option<BTreeSet<String>>,
+    branch_ids: Option<BTreeSet<String>>,
     entity_pks: Option<BTreeSet<String>>,
     file_id: Option<NullableKeyFilter<String>>,
     contradictory: bool,
 }
 
-impl LixStateByVersionRoute {
+impl LixStateByBranchRoute {
     fn from_filters(filters: &[Expr]) -> Self {
         let mut route = Self::default();
         for filter in filters {
@@ -1225,9 +1225,9 @@ impl LixStateByVersionRoute {
                             &mut route.contradictory,
                         );
                     }
-                    LixStateFilterPredicate::VersionIds(values) => {
+                    LixStateFilterPredicate::BranchIds(values) => {
                         merge_string_route_slot(
-                            &mut route.version_ids,
+                            &mut route.branch_ids,
                             values,
                             &mut route.contradictory,
                         );
@@ -1256,16 +1256,16 @@ impl LixStateByVersionRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LixStateFilterPredicate {
     SchemaKeys(BTreeSet<String>),
-    VersionIds(BTreeSet<String>),
+    BranchIds(BTreeSet<String>),
     EntityPks(BTreeSet<String>),
     FileId(NullableKeyFilter<String>),
 }
 
 fn lix_state_scan_request(
     schema: &SchemaRef,
-    version_binding: Option<&str>,
+    branch_binding: Option<&str>,
     projection: Option<&Vec<usize>>,
-    route: &LixStateByVersionRoute,
+    route: &LixStateByBranchRoute,
     limit: Option<usize>,
 ) -> LiveStateScanRequest {
     let projection = LiveStateProjection {
@@ -1287,11 +1287,11 @@ fn lix_state_scan_request(
                     .collect()
             })
             .unwrap_or_default(),
-        version_ids: version_binding
+        branch_ids: branch_binding
             .map(|value| vec![value.to_string()])
             .or_else(|| {
                 route
-                    .version_ids
+                    .branch_ids
                     .as_ref()
                     .map(|values| values.iter().cloned().collect())
             })
@@ -1408,7 +1408,7 @@ fn parse_lix_state_in_list_filter(in_list: &InList) -> Option<LixStateFilterPred
     let values = values.into_iter().collect::<BTreeSet<_>>();
     match column.name.as_str() {
         "schema_key" => Some(LixStateFilterPredicate::SchemaKeys(values)),
-        "version_id" => Some(LixStateFilterPredicate::VersionIds(values)),
+        "branch_id" => Some(LixStateFilterPredicate::BranchIds(values)),
         "entity_pk" => canonical_entity_pk_values(values).map(LixStateFilterPredicate::EntityPks),
         _ => None,
     }
@@ -1436,8 +1436,8 @@ fn parse_lix_state_column_literal_filter(
     match column.name.as_str() {
         "schema_key" => string_expr_literal(literal_expr)
             .map(|value| LixStateFilterPredicate::SchemaKeys(BTreeSet::from([value]))),
-        "version_id" => string_expr_literal(literal_expr)
-            .map(|value| LixStateFilterPredicate::VersionIds(BTreeSet::from([value]))),
+        "branch_id" => string_expr_literal(literal_expr)
+            .map(|value| LixStateFilterPredicate::BranchIds(BTreeSet::from([value]))),
         "entity_pk" => string_expr_literal(literal_expr)
             .and_then(|value| canonical_entity_pk_value(&value))
             .map(|value| LixStateFilterPredicate::EntityPks(BTreeSet::from([value]))),
@@ -1527,7 +1527,7 @@ fn lix_state_record_batch(
                 "untracked" => Arc::new(BooleanArray::from(
                     rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
                 )) as ArrayRef,
-                "version_id" => string_array(rows.iter().map(|row| Some(row.version_id.as_str()))),
+                "branch_id" => string_array(rows.iter().map(|row| Some(row.branch_id.as_str()))),
                 other => {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -1541,7 +1541,7 @@ fn lix_state_record_batch(
     RecordBatch::try_new(schema, columns).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("sql2 failed to build lix_state_by_version batch: {error}"),
+            format!("sql2 failed to build lix_state_by_branch batch: {error}"),
         )
     })
 }
@@ -1577,10 +1577,11 @@ mod tests {
     use super::{
         lix_state_scan_request, lix_state_schema, lix_state_write_rows_from_batch,
         parse_lix_state_filter, register_lix_state_active_write_provider,
-        register_lix_state_by_version_write_provider, LixStateByVersionRoute, LixStateDeleteExec,
+        register_lix_state_by_branch_write_provider, LixStateByBranchRoute, LixStateDeleteExec,
         LixStateFilterPredicate, LixStateInsertSink, LixStateProvider, LixStateUpdateExec,
     };
     use crate::binary_cas::BlobDataReader;
+    use crate::branch::{BranchHead, BranchRefReader};
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -1590,7 +1591,6 @@ mod tests {
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
         TransactionWriteRow,
     };
-    use crate::version::{VersionHead, VersionRefReader};
     use crate::{
         entity_pk::EntityPk,
         live_state::{
@@ -1623,7 +1623,7 @@ mod tests {
     use std::sync::Arc;
 
     struct EmptyLiveStateReader;
-    struct EmptyVersionRefReader;
+    struct EmptyBranchRefReader;
     struct DummyBlobReader;
 
     #[derive(Default)]
@@ -1738,18 +1738,18 @@ mod tests {
     }
 
     #[async_trait]
-    impl VersionRefReader for EmptyVersionRefReader {
-        async fn load_head(&self, _version_id: &str) -> Result<Option<VersionHead>, LixError> {
+    impl BranchRefReader for EmptyBranchRefReader {
+        async fn load_head(&self, _branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             Ok(None)
         }
 
-        async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+        async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             Ok(Vec::new())
         }
     }
 
-    fn empty_version_ref() -> Arc<dyn VersionRefReader> {
-        Arc::new(EmptyVersionRefReader)
+    fn empty_branch_ref() -> Arc<dyn BranchRefReader> {
+        Arc::new(EmptyBranchRefReader)
     }
 
     fn test_functions() -> FunctionProviderHandle {
@@ -1773,8 +1773,8 @@ mod tests {
 
     #[async_trait]
     impl SqlWriteExecutionContext for DummyWriteContext {
-        fn active_version_id(&self) -> &str {
-            "version-a"
+        fn active_branch_id(&self) -> &str {
+            "branch-a"
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -1799,14 +1799,11 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_version_head(
-            &mut self,
-            version_id: &str,
-        ) -> Result<Option<String>, LixError> {
-            if version_id == "ghost-version" {
+        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+            if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{version_id}")))
+            Ok(Some(format!("commit-{branch_id}")))
         }
 
         async fn stage_write(
@@ -1819,8 +1816,8 @@ mod tests {
 
     #[async_trait]
     impl SqlWriteExecutionContext for CapturingWriteContext {
-        fn active_version_id(&self) -> &str {
-            "version-a"
+        fn active_branch_id(&self) -> &str {
+            "branch-a"
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -1845,14 +1842,11 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_version_head(
-            &mut self,
-            version_id: &str,
-        ) -> Result<Option<String>, LixError> {
-            if version_id == "ghost-version" {
+        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+            if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{version_id}")))
+            Ok(Some(format!("commit-{branch_id}")))
         }
 
         async fn stage_write(
@@ -1936,7 +1930,7 @@ mod tests {
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
             deleted: false,
-            version_id: "version-a".to_string(),
+            branch_id: "branch-a".to_string(),
             change_id: Some(format!("change-{entity_pk}")),
             commit_id: Some(format!("commit-{entity_pk}")),
             global: false,
@@ -1963,16 +1957,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_in_list_filter_for_version_id() {
+    fn parses_in_list_filter_for_branch_id() {
         let expr = Expr::InList(InList::new(
-            Box::new(col("version_id")),
+            Box::new(col("branch_id")),
             vec![str_lit("a"), str_lit("b")],
             false,
         ));
 
         assert_eq!(
             parse_lix_state_filter(&expr),
-            Some(LixStateFilterPredicate::VersionIds(BTreeSet::from([
+            Some(LixStateFilterPredicate::BranchIds(BTreeSet::from([
                 "a".to_string(),
                 "b".to_string(),
             ])))
@@ -1981,15 +1975,15 @@ mod tests {
 
     #[test]
     fn builds_scan_request_from_route_and_projection() {
-        let schema = super::lix_state_by_version_schema();
-        let route = LixStateByVersionRoute::from_filters(&[
+        let schema = super::lix_state_by_branch_schema();
+        let route = LixStateByBranchRoute::from_filters(&[
             Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("schema_key")),
                 Operator::Eq,
                 Box::new(str_lit("profile")),
             )),
             Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(col("version_id")),
+                Box::new(col("branch_id")),
                 Operator::Eq,
                 Box::new(str_lit("v1")),
             )),
@@ -2000,14 +1994,14 @@ mod tests {
             lix_state_scan_request(&schema, None, Some(&vec![0, 1, 11]), &route, Some(10));
 
         assert_eq!(request.filter.schema_keys, vec!["profile".to_string()]);
-        assert_eq!(request.filter.version_ids, vec!["v1".to_string()]);
+        assert_eq!(request.filter.branch_ids, vec!["v1".to_string()]);
         assert_eq!(request.filter.file_ids, vec![NullableKeyFilter::Null]);
         assert_eq!(
             request.projection.columns,
             vec![
                 "entity_pk".to_string(),
                 "schema_key".to_string(),
-                "version_id".to_string()
+                "branch_id".to_string()
             ]
         );
         assert_eq!(request.limit, Some(10));
@@ -2015,7 +2009,7 @@ mod tests {
 
     #[test]
     fn builds_route_from_and_filter_tree() {
-        let route = LixStateByVersionRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
+        let route = LixStateByBranchRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("entity_pk")),
                 Operator::Eq,
@@ -2023,8 +2017,8 @@ mod tests {
             ))),
             Operator::And,
             Box::new(Expr::InList(InList::new(
-                Box::new(col("version_id")),
-                vec![str_lit("version-a"), str_lit("global")],
+                Box::new(col("branch_id")),
+                vec![str_lit("branch-a"), str_lit("global")],
                 false,
             ))),
         ))]);
@@ -2034,18 +2028,18 @@ mod tests {
             Some(BTreeSet::from(["[\"entity-a\"]".to_string()]))
         );
         assert_eq!(
-            route.version_ids,
+            route.branch_ids,
             Some(BTreeSet::from([
                 "global".to_string(),
-                "version-a".to_string()
+                "branch-a".to_string()
             ]))
         );
     }
 
     #[test]
     fn contradictory_filters_turn_into_zero_limit_request() {
-        let schema = super::lix_state_by_version_schema();
-        let route = LixStateByVersionRoute::from_filters(&[
+        let schema = super::lix_state_by_branch_schema();
+        let route = LixStateByBranchRoute::from_filters(&[
             Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("schema_key")),
                 Operator::Eq,
@@ -2070,10 +2064,10 @@ mod tests {
 
     #[tokio::test]
     async fn active_provider_contradictory_filters_still_validate_active_head() {
-        let provider = LixStateProvider::active_version(
-            "missing-version",
+        let provider = LixStateProvider::active_branch(
+            "missing-branch",
             Arc::new(EmptyLiveStateReader),
-            empty_version_ref(),
+            empty_branch_ref(),
         );
         let session = SessionContext::new();
         let filters = vec![
@@ -2092,28 +2086,28 @@ mod tests {
         let error = provider
             .scan(&session.state(), None, &filters, None)
             .await
-            .expect_err("missing active version should be checked before zero-row scan");
+            .expect_err("missing active branch should be checked before zero-row scan");
         let error = super::datafusion_error_to_lix_error(error);
 
-        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
         assert!(error
             .message
-            .contains("version 'missing-version' was not found"));
+            .contains("branch 'missing-branch' was not found"));
     }
 
     #[test]
-    fn active_version_view_pins_version_filter() {
+    fn active_branch_view_pins_branch_filter() {
         let schema = super::lix_state_schema();
-        let route = LixStateByVersionRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
+        let route = LixStateByBranchRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("schema_key")),
             Operator::Eq,
             Box::new(str_lit("profile")),
         ))]);
 
-        let request = lix_state_scan_request(&schema, Some("version-a"), None, &route, None);
+        let request = lix_state_scan_request(&schema, Some("branch-a"), None, &route, None);
 
         assert_eq!(request.filter.schema_keys, vec!["profile".to_string()]);
-        assert_eq!(request.filter.version_ids, vec!["version-a".to_string()]);
+        assert_eq!(request.filter.branch_ids, vec!["branch-a".to_string()]);
     }
 
     #[tokio::test]
@@ -2125,9 +2119,9 @@ mod tests {
         register_lix_state_active_write_provider(&session, "lix_state", write_ctx.clone())
             .await
             .expect("lix_state provider should register");
-        register_lix_state_by_version_write_provider(&session, "lix_state_by_version", write_ctx)
+        register_lix_state_by_branch_write_provider(&session, "lix_state_by_branch", write_ctx)
             .await
-            .expect("lix_state_by_version provider should register");
+            .expect("lix_state_by_branch provider should register");
 
         let lix_state = session
             .table_provider("lix_state")
@@ -2139,23 +2133,22 @@ mod tests {
             .expect("lix_state should be a LixStateProvider");
         assert!(lix_state.write_access.is_write());
 
-        let by_version = session
-            .table_provider("lix_state_by_version")
+        let by_branch = session
+            .table_provider("lix_state_by_branch")
             .await
-            .expect("lix_state_by_version provider should exist");
-        let by_version = by_version
+            .expect("lix_state_by_branch provider should exist");
+        let by_branch = by_branch
             .as_any()
             .downcast_ref::<LixStateProvider>()
-            .expect("lix_state_by_version should be a LixStateProvider");
-        assert!(by_version.write_access.is_write());
+            .expect("lix_state_by_branch should be a LixStateProvider");
+        assert!(by_branch.write_access.is_write());
     }
 
     #[tokio::test]
     async fn insert_into_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, empty_version_ref());
+        let provider = LixStateProvider::active_branch("branch-a", live_state, empty_branch_ref());
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
         let error = provider
@@ -2173,8 +2166,7 @@ mod tests {
     async fn update_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, empty_version_ref());
+        let provider = LixStateProvider::active_branch("branch-a", live_state, empty_branch_ref());
 
         let error = provider
             .update(
@@ -2195,8 +2187,7 @@ mod tests {
     async fn delete_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, empty_version_ref());
+        let provider = LixStateProvider::active_branch("branch-a", live_state, empty_branch_ref());
 
         let error = provider
             .delete_from(&session.state(), vec![])
@@ -2214,7 +2205,7 @@ mod tests {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
 
         let plan = provider
             .delete_from(&session.state(), vec![])
@@ -2229,7 +2220,7 @@ mod tests {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
 
         let error = provider
             .update(
@@ -2251,7 +2242,7 @@ mod tests {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
 
         let plan = provider
             .update(
@@ -2270,7 +2261,7 @@ mod tests {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
         let plan = provider
@@ -2285,7 +2276,7 @@ mod tests {
     fn decodes_lix_state_batch_into_write_rows() {
         let rows = lix_state_write_rows_from_batch(
             &one_row_lix_state_batch(false),
-            Some("version-a"),
+            Some("branch-a"),
             "INSERT into lix_state",
         )
         .expect("batch should decode");
@@ -2309,21 +2300,21 @@ mod tests {
                 change_id: Some("change-a".to_string()),
                 commit_id: None,
                 untracked: false,
-                version_id: "version-a".to_string(),
+                branch_id: "branch-a".to_string(),
             }]
         );
     }
 
     #[test]
-    fn decodes_global_lix_state_batch_into_global_version() {
+    fn decodes_global_lix_state_batch_into_global_branch() {
         let rows = lix_state_write_rows_from_batch(
             &one_row_lix_state_batch(true),
-            Some("version-a"),
+            Some("branch-a"),
             "INSERT into lix_state",
         )
         .expect("batch should decode");
 
-        assert_eq!(rows[0].version_id, "global");
+        assert_eq!(rows[0].branch_id, "global");
         assert!(rows[0].global);
     }
 
@@ -2331,7 +2322,7 @@ mod tests {
     async fn insert_sink_stages_decoded_lix_state_rows() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let sink = LixStateInsertSink::new(write_ctx, Some("version-a".to_string()));
+        let sink = LixStateInsertSink::new(write_ctx, Some("branch-a".to_string()));
         let batch = one_row_lix_state_batch(false);
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
@@ -2360,7 +2351,7 @@ mod tests {
                     change_id: Some("change-a".to_string()),
                     commit_id: None,
                     untracked: false,
-                    version_id: "version-a".to_string(),
+                    branch_id: "branch-a".to_string(),
                 }]
             }]
         );
@@ -2371,7 +2362,7 @@ mod tests {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
         let input = Arc::new(SingleBatchExec::new(one_row_stageable_lix_state_batch()))
             as Arc<dyn ExecutionPlan>;
 
@@ -2410,7 +2401,7 @@ mod tests {
             writes: Vec::new(),
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
 
         let plan = provider
             .update(
@@ -2468,7 +2459,7 @@ mod tests {
                     change_id: None,
                     commit_id: None,
                     untracked: false,
-                    version_id: "version-a".to_string(),
+                    branch_id: "branch-a".to_string(),
                 }]
             }]
         );
@@ -2485,7 +2476,7 @@ mod tests {
             writes: Vec::new(),
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let provider = LixStateProvider::active_version_with_write(write_ctx);
+        let provider = LixStateProvider::active_branch_with_write(write_ctx);
 
         let plan = provider
             .delete_from(&session.state(), vec![])
@@ -2525,7 +2516,7 @@ mod tests {
                         change_id: None,
                         commit_id: None,
                         untracked: false,
-                        version_id: "version-a".to_string(),
+                        branch_id: "branch-a".to_string(),
                     },
                     TransactionWriteRow {
                         entity_pk: Some(crate::entity_pk::EntityPk::single("entity-2")),
@@ -2542,7 +2533,7 @@ mod tests {
                         change_id: None,
                         commit_id: None,
                         untracked: false,
-                        version_id: "version-a".to_string(),
+                        branch_id: "branch-a".to_string(),
                     },
                 ]
             }]

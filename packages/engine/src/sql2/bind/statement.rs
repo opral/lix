@@ -11,10 +11,10 @@ use datafusion::sql::sqlparser::ast::{
 use serde_json::Value as JsonValue;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
+use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::sql2::plan::version_scope::VersionScope;
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
+use crate::GLOBAL_BRANCH_ID;
 
 use super::expr::{BoundExpr, BoundLiteral, BoundParamRef};
 use super::read::BoundRead;
@@ -29,12 +29,12 @@ use super::write::{
 pub(crate) fn bind_statement(
     statement: &DataFusionStatement,
     visible_schemas: &[JsonValue],
-    active_version_id: &str,
+    active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
     let catalog = PublicCatalog::from_visible_schemas(visible_schemas)?;
     match statement {
         DataFusionStatement::Statement(statement) => {
-            bind_sql_statement(statement, &catalog, active_version_id)
+            bind_sql_statement(statement, &catalog, active_branch_id)
         }
         DataFusionStatement::Explain(_) => Err(super::error::unsupported(
             "EXPLAIN statements are not supported by SQL write binding",
@@ -48,12 +48,12 @@ pub(crate) fn bind_statement(
 fn bind_sql_statement(
     statement: &SqlStatement,
     catalog: &PublicCatalog,
-    active_version_id: &str,
+    active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
     match statement {
-        SqlStatement::Insert(insert) => bind_insert_bound(insert, catalog, active_version_id),
-        SqlStatement::Update(update) => bind_update_bound(update, catalog, active_version_id),
-        SqlStatement::Delete(delete) => bind_delete_bound(delete, catalog, active_version_id),
+        SqlStatement::Insert(insert) => bind_insert_bound(insert, catalog, active_branch_id),
+        SqlStatement::Update(update) => bind_update_bound(update, catalog, active_branch_id),
+        SqlStatement::Delete(delete) => bind_delete_bound(delete, catalog, active_branch_id),
         SqlStatement::Explain { .. } => Err(super::error::unsupported(
             "EXPLAIN statements are not supported by SQL write binding",
         )),
@@ -66,7 +66,7 @@ fn bind_sql_statement(
 pub(super) fn bind_insert_bound(
     insert: &Insert,
     catalog: &PublicCatalog,
-    active_version_id: &str,
+    active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
     let mut params = ParamBinder::default();
     reject_unsupported_insert_clauses(insert)?;
@@ -97,11 +97,11 @@ pub(super) fn bind_insert_bound(
         insert.source.as_deref(),
         &mut params,
     )?;
-    let version_scope = bind_write_version_scope(
+    let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &input,
         &BoundPredicate::True,
-        active_version_id,
+        active_branch_id,
     )?;
     Ok(BoundWrite {
         target: bound_write_target(&table.surface.kind),
@@ -110,14 +110,14 @@ pub(super) fn bind_insert_bound(
         predicate: BoundPredicate::True,
         assignments: Vec::new(),
         params: params.into_map(),
-        version_scope,
+        branch_scope,
     })
 }
 
 pub(super) fn bind_update_bound(
     update: &Update,
     catalog: &PublicCatalog,
-    active_version_id: &str,
+    active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
     let mut params = ParamBinder::default();
     reject_unsupported_update_clauses(update)?;
@@ -134,11 +134,11 @@ pub(super) fn bind_update_bound(
         });
     }
     let predicate = bind_optional_predicate(&table, update.selection.as_ref(), &mut params)?;
-    let version_scope = bind_write_version_scope(
+    let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
         &predicate,
-        active_version_id,
+        active_branch_id,
     )?;
     Ok(BoundWrite {
         target: bound_write_target(&table.surface.kind),
@@ -147,25 +147,25 @@ pub(super) fn bind_update_bound(
         predicate,
         assignments,
         params: params.into_map(),
-        version_scope,
+        branch_scope,
     })
 }
 
 pub(super) fn bind_delete_bound(
     delete: &Delete,
     catalog: &PublicCatalog,
-    active_version_id: &str,
+    active_branch_id: &str,
 ) -> Result<BoundWrite, LixError> {
     let mut params = ParamBinder::default();
     reject_unsupported_delete_clauses(delete)?;
     let table = bind_delete_target(catalog, &delete.from)?;
     require_write_capability(&table.surface, BoundWriteOp::Delete)?;
     let predicate = bind_optional_predicate(&table, delete.selection.as_ref(), &mut params)?;
-    let version_scope = bind_write_version_scope(
+    let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &BoundWriteInput::None,
         &predicate,
-        active_version_id,
+        active_branch_id,
     )?;
     Ok(BoundWrite {
         target: bound_write_target(&table.surface.kind),
@@ -174,7 +174,7 @@ pub(super) fn bind_delete_bound(
         predicate,
         assignments: Vec::new(),
         params: params.into_map(),
-        version_scope,
+        branch_scope,
     })
 }
 
@@ -310,12 +310,12 @@ fn bind_table_with_joins(
         alias,
         args,
         with_hints,
-        version,
         with_ordinality,
         partitions,
         json_path,
         sample,
         index_hints,
+        ..
     } = &table.relation
     else {
         return Err(super::error::unsupported("unsupported DML target"));
@@ -327,7 +327,6 @@ fn bind_table_with_joins(
     }
     if args.is_some()
         || !with_hints.is_empty()
-        || version.is_some()
         || *with_ordinality
         || !partitions.is_empty()
         || json_path.is_some()
@@ -381,7 +380,7 @@ fn bind_insert_input(
     let SetExpr::Values(values) = source.body.as_ref() else {
         if matches!(
             surface_kind,
-            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByVersion { .. }
+            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
         ) {
             return Err(super::error::unsupported(
                 "INSERT ... SELECT is not supported for entity SQL surfaces yet",
@@ -774,7 +773,7 @@ fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixErr
         "lix_empty_blob" => expect_exact_function_arity(name, actual, 0),
         "lix_timestamp" => expect_exact_function_arity(name, actual, 0),
         "lix_uuid_v7" => expect_exact_function_arity(name, actual, 0),
-        "lix_active_version_commit_id" => expect_exact_function_arity(name, actual, 0),
+        "lix_active_branch_commit_id" => expect_exact_function_arity(name, actual, 0),
         "lix_json_get" | "lix_json_get_text" => expect_min_function_arity(name, actual, 2),
         "lix_text_encode" | "lix_text_decode" => {
             if (1..=2).contains(&actual) {
@@ -870,7 +869,7 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
         | "lix_empty_blob"
         | "lix_timestamp"
         | "lix_uuid_v7"
-        | "lix_active_version_commit_id"
+        | "lix_active_branch_commit_id"
         | "lix_text_encode"
         | "lix_text_decode" => Ok(name),
         _ => Err(super::error::unsupported(format!(
@@ -975,24 +974,24 @@ fn require_write_capability(
 fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
     match kind {
         PublicSurfaceKind::LixState => BoundWriteTarget::LixState,
-        PublicSurfaceKind::LixStateByVersion => BoundWriteTarget::LixStateByVersion,
+        PublicSurfaceKind::LixStateByBranch => BoundWriteTarget::LixStateByBranch,
         PublicSurfaceKind::EntityBase { schema_key } => {
             BoundWriteTarget::Entity(EntityWriteSurface::Base {
                 schema_key: schema_key.clone(),
             })
         }
-        PublicSurfaceKind::EntityByVersion { schema_key } => {
-            BoundWriteTarget::Entity(EntityWriteSurface::ByVersion {
+        PublicSurfaceKind::EntityByBranch { schema_key } => {
+            BoundWriteTarget::Entity(EntityWriteSurface::ByBranch {
                 schema_key: schema_key.clone(),
             })
         }
         PublicSurfaceKind::File => BoundWriteTarget::File(FileWriteSurface::Base),
-        PublicSurfaceKind::FileByVersion => BoundWriteTarget::File(FileWriteSurface::ByVersion),
+        PublicSurfaceKind::FileByBranch => BoundWriteTarget::File(FileWriteSurface::ByBranch),
         PublicSurfaceKind::Directory => BoundWriteTarget::Directory(DirectoryWriteSurface::Base),
-        PublicSurfaceKind::DirectoryByVersion => {
-            BoundWriteTarget::Directory(DirectoryWriteSurface::ByVersion)
+        PublicSurfaceKind::DirectoryByBranch => {
+            BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch)
         }
-        PublicSurfaceKind::Version => BoundWriteTarget::Version,
+        PublicSurfaceKind::Branch => BoundWriteTarget::Branch,
         PublicSurfaceKind::EntityHistory { .. }
         | PublicSurfaceKind::FileHistory
         | PublicSurfaceKind::DirectoryHistory
@@ -1003,32 +1002,32 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
     }
 }
 
-fn bind_write_version_scope(
+fn bind_write_branch_scope(
     kind: &PublicSurfaceKind,
     input: &BoundWriteInput,
     predicate: &BoundPredicate,
-    active_version_id: &str,
-) -> Result<VersionScope, LixError> {
-    let Some(version_column) = by_version_column_name(kind) else {
-        return bind_base_write_version_scope(kind, input, predicate, active_version_id);
+    active_branch_id: &str,
+) -> Result<BranchScope, LixError> {
+    let Some(branch_column) = by_branch_column_name(kind) else {
+        return bind_base_write_branch_scope(kind, input, predicate, active_branch_id);
     };
-    let version_selector = match input {
+    let branch_selector = match input {
         BoundWriteInput::Values(values) => {
-            let mut selector = VersionSelector::Missing;
-            if let Some(column_index) = values.column_index(version_column) {
+            let mut selector = BranchSelector::Missing;
+            if let Some(column_index) = values.column_index(branch_column) {
                 for row in &values.rows {
                     let value = &row[column_index];
-                    selector = selector.union(value_version_selector(value)?);
+                    selector = selector.union(value_branch_selector(value)?);
                 }
             }
             selector
         }
-        BoundWriteInput::None => predicate_version_selector(predicate, version_column)?,
+        BoundWriteInput::None => predicate_branch_selector(predicate, branch_column)?,
         BoundWriteInput::Query { .. } => Err(super::error::unsupported(
-            "INSERT ... SELECT by-version writes are not supported",
+            "INSERT ... SELECT by-branch writes are not supported",
         ))?,
     };
-    if matches!(kind, PublicSurfaceKind::LixStateByVersion) {
+    if matches!(kind, PublicSurfaceKind::LixStateByBranch) {
         let global_selector = match input {
             BoundWriteInput::Values(values) => {
                 let mut selector = GlobalSelector::Missing;
@@ -1042,127 +1041,122 @@ fn bind_write_version_scope(
             BoundWriteInput::None => predicate_global_selector(predicate)?,
             BoundWriteInput::Query { .. } => GlobalSelector::Missing,
         };
-        return lix_state_by_version_scope(
-            input,
-            version_column,
-            version_selector,
-            global_selector,
-        );
+        return lix_state_by_branch_scope(input, branch_column, branch_selector, global_selector);
     }
-    by_version_scope(input, version_column, version_selector)
+    by_branch_scope(input, branch_column, branch_selector)
 }
 
-fn by_version_scope(
+fn by_branch_scope(
     input: &BoundWriteInput,
-    version_column: &str,
-    selector: VersionSelector,
-) -> Result<VersionScope, LixError> {
+    branch_column: &str,
+    selector: BranchSelector,
+) -> Result<BranchScope, LixError> {
     match (input, selector) {
-        (_, selector) if selector.is_empty() => Ok(VersionScope::Empty),
-        (BoundWriteInput::Values(_), VersionSelector::Missing) => Err(super::error::unsupported(
-            format!("INSERT into by-version SQL table requires explicit '{version_column}'"),
+        (_, selector) if selector.is_empty() => Ok(BranchScope::Empty),
+        (BoundWriteInput::Values(_), BranchSelector::Missing) => Err(super::error::unsupported(
+            format!("INSERT into by-branch SQL table requires explicit '{branch_column}'"),
         )),
-        (BoundWriteInput::Values(_), VersionSelector::Static(version_ids)) => {
-            Ok(VersionScope::Explicit { version_ids })
+        (BoundWriteInput::Values(_), BranchSelector::Static(branch_ids)) => {
+            Ok(BranchScope::Explicit { branch_ids })
         }
         (
             BoundWriteInput::Values(_),
-            VersionSelector::Dynamic {
-                version_ids,
+            BranchSelector::Dynamic {
+                branch_ids,
                 param_indexes,
             },
-        ) => Ok(VersionScope::ExplicitDynamic {
-            version_ids,
+        ) => Ok(BranchScope::ExplicitDynamic {
+            branch_ids,
             param_indexes,
         }),
-        (BoundWriteInput::None, VersionSelector::Missing) => Err(super::error::unsupported(
-            format!("by-version SQL writes require an explicit '{version_column}' predicate"),
+        (BoundWriteInput::None, BranchSelector::Missing) => Err(super::error::unsupported(
+            format!("by-branch SQL writes require an explicit '{branch_column}' predicate"),
         )),
-        (BoundWriteInput::None, VersionSelector::Static(version_ids)) => {
-            Ok(VersionScope::ExplicitRequired { version_ids })
+        (BoundWriteInput::None, BranchSelector::Static(branch_ids)) => {
+            Ok(BranchScope::ExplicitRequired { branch_ids })
         }
         (
             BoundWriteInput::None,
-            VersionSelector::Dynamic {
-                version_ids,
+            BranchSelector::Dynamic {
+                branch_ids,
                 param_indexes,
             },
-        ) => Ok(VersionScope::ExplicitRequiredDynamic {
-            version_ids,
+        ) => Ok(BranchScope::ExplicitRequiredDynamic {
+            branch_ids,
             param_indexes,
         }),
         (BoundWriteInput::Query { .. }, _) => Err(super::error::unsupported(
-            "INSERT ... SELECT by-version writes are not supported",
+            "INSERT ... SELECT by-branch writes are not supported",
         )),
     }
 }
 
-fn lix_state_by_version_scope(
+fn lix_state_by_branch_scope(
     input: &BoundWriteInput,
-    version_column: &str,
-    version_selector: VersionSelector,
+    branch_column: &str,
+    branch_selector: BranchSelector,
     global_selector: GlobalSelector,
-) -> Result<VersionScope, LixError> {
-    if matches!(global_selector, GlobalSelector::Empty) || version_selector.is_empty() {
-        return Ok(VersionScope::Empty);
+) -> Result<BranchScope, LixError> {
+    if matches!(global_selector, GlobalSelector::Empty) || branch_selector.is_empty() {
+        return Ok(BranchScope::Empty);
     }
 
     match global_selector {
-        GlobalSelector::Static(true) => match version_selector {
-            VersionSelector::Missing => Ok(VersionScope::Global),
-            VersionSelector::Static(version_ids)
-                if version_ids == BTreeSet::from([GLOBAL_VERSION_ID.to_string()]) =>
+        GlobalSelector::Static(true) => match branch_selector {
+            BranchSelector::Missing => Ok(BranchScope::Global),
+            BranchSelector::Static(branch_ids)
+                if branch_ids == BTreeSet::from([GLOBAL_BRANCH_ID.to_string()]) =>
             {
-                Ok(VersionScope::Global)
+                Ok(BranchScope::Global)
             }
-            VersionSelector::Static(_) => Err(super::error::unsupported(
-                "lix_state_by_version writes cannot combine global = true with non-global version_id",
+            BranchSelector::Static(_) => Err(super::error::unsupported(
+                "lix_state_by_branch writes cannot combine global = true with non-global branch_id",
             )),
-            VersionSelector::Dynamic { .. } => by_version_scope(input, version_column, version_selector),
+            BranchSelector::Dynamic { .. } => by_branch_scope(input, branch_column, branch_selector),
         },
-        GlobalSelector::Static(false) => match &version_selector {
-            VersionSelector::Static(version_ids) if version_ids.contains(GLOBAL_VERSION_ID) => {
+        GlobalSelector::Static(false) => match &branch_selector {
+            BranchSelector::Static(branch_ids) if branch_ids.contains(GLOBAL_BRANCH_ID) => {
                 Err(super::error::unsupported(
-                    "lix_state_by_version writes cannot combine global = false with global version_id",
+                    "lix_state_by_branch writes cannot combine global = false with global branch_id",
                 ))
             }
-            _ => by_version_scope(input, version_column, version_selector),
+            _ => by_branch_scope(input, branch_column, branch_selector),
         },
-        GlobalSelector::Dynamic => by_version_scope(input, version_column, version_selector),
-        GlobalSelector::Missing => match &version_selector {
-            VersionSelector::Static(version_ids)
-                if version_ids == &BTreeSet::from([GLOBAL_VERSION_ID.to_string()]) =>
+        GlobalSelector::Dynamic => by_branch_scope(input, branch_column, branch_selector),
+        GlobalSelector::Missing => match &branch_selector {
+            BranchSelector::Static(branch_ids)
+                if branch_ids == &BTreeSet::from([GLOBAL_BRANCH_ID.to_string()]) =>
             {
-                Ok(VersionScope::Global)
+                Ok(BranchScope::Global)
             }
-            VersionSelector::Static(version_ids) if version_ids.contains(GLOBAL_VERSION_ID) => {
+            BranchSelector::Static(branch_ids) if branch_ids.contains(GLOBAL_BRANCH_ID) => {
                 Err(super::error::unsupported(
-                    "lix_state_by_version writes cannot mix global and non-global version scopes",
+                    "lix_state_by_branch writes cannot mix global and non-global branch scopes",
                 ))
             }
-            _ => by_version_scope(input, version_column, version_selector),
+            _ => by_branch_scope(input, branch_column, branch_selector),
         },
         GlobalSelector::Mixed => Err(super::error::unsupported(
-            "lix_state_by_version writes cannot mix global and version-specific rows",
+            "lix_state_by_branch writes cannot mix global and branch-specific rows",
         )),
-        GlobalSelector::Empty => Ok(VersionScope::Empty),
+        GlobalSelector::Empty => Ok(BranchScope::Empty),
     }
 }
 
-fn bind_base_write_version_scope(
+fn bind_base_write_branch_scope(
     kind: &PublicSurfaceKind,
     input: &BoundWriteInput,
     predicate: &BoundPredicate,
-    active_version_id: &str,
-) -> Result<VersionScope, LixError> {
+    active_branch_id: &str,
+) -> Result<BranchScope, LixError> {
     if predicate == &BoundPredicate::False {
-        return Ok(VersionScope::Empty);
+        return Ok(BranchScope::Empty);
     }
-    if matches!(kind, PublicSurfaceKind::Version) {
-        return Ok(VersionScope::Global);
+    if matches!(kind, PublicSurfaceKind::Branch) {
+        return Ok(BranchScope::Global);
     }
     if !matches!(kind, PublicSurfaceKind::LixState) {
-        return Ok(active_version_scope(active_version_id));
+        return Ok(active_branch_scope(active_branch_id));
     }
     match input {
         BoundWriteInput::Values(values) => {
@@ -1173,32 +1167,32 @@ fn bind_base_write_version_scope(
             }
             match selector {
                 GlobalSelector::Missing | GlobalSelector::Static(false) => {
-                    Ok(active_version_scope(active_version_id))
+                    Ok(active_branch_scope(active_branch_id))
                 }
-                GlobalSelector::Static(true) => Ok(VersionScope::Global),
-                GlobalSelector::Empty => Ok(VersionScope::Empty),
+                GlobalSelector::Static(true) => Ok(BranchScope::Global),
+                GlobalSelector::Empty => Ok(BranchScope::Empty),
                 GlobalSelector::Dynamic => Err(super::error::unsupported(
                     "parameterized lix_state global scope selectors are not supported yet",
                 )),
                 GlobalSelector::Mixed => Err(super::error::unsupported(
-                    "lix_state INSERT cannot mix global and active-version rows",
+                    "lix_state INSERT cannot mix global and active-branch rows",
                 )),
             }
         }
         BoundWriteInput::None => match predicate_global_selector(predicate)? {
-            GlobalSelector::Static(true) => Ok(VersionScope::Global),
+            GlobalSelector::Static(true) => Ok(BranchScope::Global),
             GlobalSelector::Static(false) | GlobalSelector::Missing => {
-                Ok(active_version_scope(active_version_id))
+                Ok(active_branch_scope(active_branch_id))
             }
-            GlobalSelector::Empty => Ok(VersionScope::Empty),
+            GlobalSelector::Empty => Ok(BranchScope::Empty),
             GlobalSelector::Dynamic => Err(super::error::unsupported(
                 "parameterized lix_state global scope selectors are not supported yet",
             )),
             GlobalSelector::Mixed => Err(super::error::unsupported(
-                "lix_state global predicates select mixed version scopes",
+                "lix_state global predicates select mixed branch scopes",
             )),
         },
-        BoundWriteInput::Query { .. } => Ok(active_version_scope(active_version_id)),
+        BoundWriteInput::Query { .. } => Ok(active_branch_scope(active_branch_id)),
     }
 }
 
@@ -1323,37 +1317,37 @@ fn global_selector_value(expr: &BoundExpr) -> Result<GlobalSelector, LixError> {
     }
 }
 
-fn by_version_column_name(kind: &PublicSurfaceKind) -> Option<&'static str> {
+fn by_branch_column_name(kind: &PublicSurfaceKind) -> Option<&'static str> {
     match kind {
-        PublicSurfaceKind::LixStateByVersion => Some("version_id"),
-        PublicSurfaceKind::EntityByVersion { .. }
-        | PublicSurfaceKind::FileByVersion
-        | PublicSurfaceKind::DirectoryByVersion => Some("lixcol_version_id"),
+        PublicSurfaceKind::LixStateByBranch => Some("branch_id"),
+        PublicSurfaceKind::EntityByBranch { .. }
+        | PublicSurfaceKind::FileByBranch
+        | PublicSurfaceKind::DirectoryByBranch => Some("lixcol_branch_id"),
         _ => None,
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum VersionSelector {
+enum BranchSelector {
     Missing,
     Static(BTreeSet<String>),
     Dynamic {
-        version_ids: BTreeSet<String>,
+        branch_ids: BTreeSet<String>,
         param_indexes: BTreeSet<usize>,
     },
 }
 
-impl VersionSelector {
+impl BranchSelector {
     fn is_empty(&self) -> bool {
-        matches!(self, Self::Static(version_ids) if version_ids.is_empty())
+        matches!(self, Self::Static(branch_ids) if branch_ids.is_empty())
     }
 
     fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Missing, selector) | (selector, Self::Missing) => selector,
-            (Self::Static(version_ids), Self::Dynamic { param_indexes, .. })
-            | (Self::Dynamic { param_indexes, .. }, Self::Static(version_ids))
-                if version_ids.is_empty() || param_indexes.is_empty() =>
+            (Self::Static(branch_ids), Self::Dynamic { param_indexes, .. })
+            | (Self::Dynamic { param_indexes, .. }, Self::Static(branch_ids))
+                if branch_ids.is_empty() || param_indexes.is_empty() =>
             {
                 Self::Static(BTreeSet::new())
             }
@@ -1362,38 +1356,38 @@ impl VersionSelector {
             }
             (
                 Self::Dynamic {
-                    mut version_ids,
+                    mut branch_ids,
                     mut param_indexes,
                 },
                 Self::Dynamic {
-                    version_ids: right_versions,
+                    branch_ids: right_branches,
                     param_indexes: right_params,
                 },
             ) => {
-                version_ids.extend(right_versions);
+                branch_ids.extend(right_branches);
                 param_indexes.extend(right_params);
                 Self::Dynamic {
-                    version_ids,
+                    branch_ids,
                     param_indexes,
                 }
             }
             (
-                Self::Static(mut version_ids),
+                Self::Static(mut branch_ids),
                 Self::Dynamic {
-                    version_ids: right_versions,
+                    branch_ids: right_branches,
                     param_indexes,
                 },
             )
             | (
                 Self::Dynamic {
-                    version_ids: right_versions,
+                    branch_ids: right_branches,
                     param_indexes,
                 },
-                Self::Static(mut version_ids),
+                Self::Static(mut branch_ids),
             ) => {
-                version_ids.extend(right_versions);
+                branch_ids.extend(right_branches);
                 Self::Dynamic {
-                    version_ids,
+                    branch_ids,
                     param_indexes,
                 }
             }
@@ -1409,38 +1403,38 @@ impl VersionSelector {
             }
             (
                 Self::Dynamic {
-                    mut version_ids,
+                    mut branch_ids,
                     mut param_indexes,
                 },
                 Self::Dynamic {
-                    version_ids: right_versions,
+                    branch_ids: right_branches,
                     param_indexes: right_params,
                 },
             ) => {
-                version_ids.extend(right_versions);
+                branch_ids.extend(right_branches);
                 param_indexes.extend(right_params);
                 Self::Dynamic {
-                    version_ids,
+                    branch_ids,
                     param_indexes,
                 }
             }
             (
-                Self::Static(mut version_ids),
+                Self::Static(mut branch_ids),
                 Self::Dynamic {
-                    version_ids: right_versions,
+                    branch_ids: right_branches,
                     param_indexes,
                 },
             )
             | (
                 Self::Dynamic {
-                    version_ids: right_versions,
+                    branch_ids: right_branches,
                     param_indexes,
                 },
-                Self::Static(mut version_ids),
+                Self::Static(mut branch_ids),
             ) => {
-                version_ids.extend(right_versions);
+                branch_ids.extend(right_branches);
                 Self::Dynamic {
-                    version_ids,
+                    branch_ids,
                     param_indexes,
                 }
             }
@@ -1448,86 +1442,86 @@ impl VersionSelector {
     }
 }
 
-fn predicate_version_selector(
+fn predicate_branch_selector(
     predicate: &BoundPredicate,
-    version_column: &str,
-) -> Result<VersionSelector, LixError> {
+    branch_column: &str,
+) -> Result<BranchSelector, LixError> {
     match predicate {
-        BoundPredicate::True => Ok(VersionSelector::Missing),
-        BoundPredicate::False => Ok(VersionSelector::Static(BTreeSet::new())),
+        BoundPredicate::True => Ok(BranchSelector::Missing),
+        BoundPredicate::False => Ok(BranchSelector::Static(BTreeSet::new())),
         BoundPredicate::And(predicates) => {
-            let mut result = VersionSelector::Missing;
+            let mut result = BranchSelector::Missing;
             for predicate in predicates {
-                result = result.intersect(predicate_version_selector(predicate, version_column)?);
+                result = result.intersect(predicate_branch_selector(predicate, branch_column)?);
             }
             Ok(result)
         }
         BoundPredicate::Or(predicates) => {
-            let mut result = VersionSelector::Static(BTreeSet::new());
+            let mut result = BranchSelector::Static(BTreeSet::new());
             for predicate in predicates {
-                let selector = predicate_version_selector(predicate, version_column)?;
-                if selector == VersionSelector::Missing {
-                    return Ok(VersionSelector::Missing);
+                let selector = predicate_branch_selector(predicate, branch_column)?;
+                if selector == BranchSelector::Missing {
+                    return Ok(BranchSelector::Missing);
                 }
                 result = result.union(selector);
             }
             Ok(result)
         }
         BoundPredicate::Eq(left, right) => {
-            version_selector_from_binary_exprs(left, right, version_column)
-                .or_else(|| version_selector_from_binary_exprs(right, left, version_column))
+            branch_selector_from_binary_exprs(left, right, branch_column)
+                .or_else(|| branch_selector_from_binary_exprs(right, left, branch_column))
                 .transpose()
-                .map(|selector| selector.unwrap_or(VersionSelector::Missing))
+                .map(|selector| selector.unwrap_or(BranchSelector::Missing))
         }
-        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(VersionSelector::Missing),
+        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(BranchSelector::Missing),
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
-                return Ok(VersionSelector::Missing);
+                return Ok(BranchSelector::Missing);
             };
-            if column.name != version_column {
-                return Ok(VersionSelector::Missing);
+            if column.name != branch_column {
+                return Ok(BranchSelector::Missing);
             }
-            let mut selector = VersionSelector::Missing;
+            let mut selector = BranchSelector::Missing;
             for value in values {
-                selector = selector.union(value_version_selector(value)?);
+                selector = selector.union(value_branch_selector(value)?);
             }
             Ok(selector)
         }
     }
 }
 
-fn version_selector_from_binary_exprs(
+fn branch_selector_from_binary_exprs(
     column_expr: &BoundExpr,
     value_expr: &BoundExpr,
-    version_column: &str,
-) -> Option<Result<VersionSelector, LixError>> {
+    branch_column: &str,
+) -> Option<Result<BranchSelector, LixError>> {
     let BoundExpr::Column(column) = column_expr else {
         return None;
     };
-    if column.name != version_column {
+    if column.name != branch_column {
         return None;
     }
-    Some(value_version_selector(value_expr))
+    Some(value_branch_selector(value_expr))
 }
 
-fn value_version_selector(expr: &BoundExpr) -> Result<VersionSelector, LixError> {
+fn value_branch_selector(expr: &BoundExpr) -> Result<BranchSelector, LixError> {
     match expr {
-        BoundExpr::Literal(BoundLiteral::Text(version_id)) => Ok(VersionSelector::Static(
-            BTreeSet::from([version_id.clone()]),
-        )),
-        BoundExpr::Param(param) => Ok(VersionSelector::Dynamic {
-            version_ids: BTreeSet::new(),
+        BoundExpr::Literal(BoundLiteral::Text(branch_id)) => {
+            Ok(BranchSelector::Static(BTreeSet::from([branch_id.clone()])))
+        }
+        BoundExpr::Param(param) => Ok(BranchSelector::Dynamic {
+            branch_ids: BTreeSet::new(),
             param_indexes: BTreeSet::from([param.index]),
         }),
         _ => Err(super::error::unsupported(
-            "by-version SQL write predicates require string version ids",
+            "by-branch SQL write predicates require string branch ids",
         )),
     }
 }
 
-fn active_version_scope(active_version_id: &str) -> VersionScope {
-    VersionScope::Active {
-        version_id: active_version_id.to_string(),
+fn active_branch_scope(active_branch_id: &str) -> BranchScope {
+    BranchScope::Active {
+        branch_id: active_branch_id.to_string(),
     }
 }
 
@@ -1609,7 +1603,7 @@ mod tests {
     #[test]
     fn bind_statement_uses_exact_table_binding_for_write_targets() {
         let statement = parse_statement("INSERT INTO foo.lix_file (id) VALUES ('file1')");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("qualified write target should be rejected by the binder");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -1621,7 +1615,7 @@ mod tests {
         let statement = parse_statement(
             "INSERT INTO lix_file (id, path, directory_id, name, data, lixcol_schema_key) VALUES ('file1', '/a', null, 'a', null, 'schema')",
         );
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("hidden columns should not bind through statement binder");
 
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
@@ -1631,7 +1625,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_implicit_insert_columns() {
         let statement = parse_statement("INSERT INTO lix_file VALUES ('file1')");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("implicit insert column list should fail closed");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -1653,7 +1647,7 @@ mod tests {
                     "value": { "type": "string" }
                 }
             })],
-            "version1",
+            "branch1",
         )
         .expect_err("entity INSERT SELECT should fail closed at binding");
 
@@ -1666,7 +1660,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_duplicate_insert_columns() {
         let statement = parse_statement("INSERT INTO lix_file (id, id) VALUES ('file1', 'file2')");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("duplicate insert columns should be rejected");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
@@ -1674,27 +1668,27 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_duplicate_lix_state_by_version_insert_columns() {
+    fn bind_statement_rejects_duplicate_lix_state_by_branch_insert_columns() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (\
-             entity_pk, schema_key, snapshot_content, version_id, version_id\
+            "INSERT INTO lix_state_by_branch (\
+             entity_pk, schema_key, snapshot_content, branch_id, branch_id\
              ) VALUES (\
-             '[\"entity1\"]', 'lix_key_value', '{\"key\":\"k\",\"value\":\"v\"}', 'version1', 'version2'\
+             '[\"entity1\"]', 'lix_key_value', '{\"key\":\"k\",\"value\":\"v\"}', 'branch1', 'branch2'\
              )",
         );
-        let error = bind_statement(&statement, &[], "version1")
-            .expect_err("duplicate lix_state_by_version insert columns should be rejected");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("duplicate lix_state_by_branch insert columns should be rejected");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error
             .message
-            .contains("duplicate write target column 'version_id'"));
+            .contains("duplicate write target column 'branch_id'"));
     }
 
     #[test]
     fn bind_statement_rejects_duplicate_update_columns() {
         let statement = parse_statement("UPDATE lix_file SET name = 'a', name = 'b'");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("duplicate update columns should be rejected");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
@@ -1706,7 +1700,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_read_only_history_writes() {
         let statement = parse_statement("DELETE FROM lix_file_history");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("history surfaces should be read-only");
 
         assert_eq!(error.code, LixError::CODE_READ_ONLY);
@@ -1715,7 +1709,7 @@ mod tests {
     #[test]
     fn bind_statement_preserves_update_assignment_and_predicate() {
         let statement = parse_statement(
-            "UPDATE test_state_schema_by_version SET name = 'next' WHERE lixcol_version_id = 'version2'",
+            "UPDATE test_state_schema_by_branch SET name = 'next' WHERE lixcol_branch_id = 'branch2'",
         );
         let bound = bind_statement(
             &statement,
@@ -1726,14 +1720,14 @@ mod tests {
                     "name": { "type": "string" }
                 }
             })],
-            "version1",
+            "branch1",
         )
         .expect("write body should bind");
 
         let write = bound;
         assert!(matches!(
             write.target,
-            BoundWriteTarget::Entity(EntityWriteSurface::ByVersion { .. })
+            BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
         ));
         assert_eq!(write.op, BoundWriteOp::Update);
         assert_eq!(write.assignments.len(), 1);
@@ -1747,19 +1741,19 @@ mod tests {
             BoundPredicate::Eq(
                 BoundExpr::Column(ref column),
                 BoundExpr::Literal(BoundLiteral::Text(ref value)),
-            ) if column.name == "lixcol_version_id" && value == "version2"
+            ) if column.name == "lixcol_branch_id" && value == "branch2"
         ));
         assert!(matches!(
-            write.version_scope,
-            VersionScope::ExplicitRequired { ref version_ids }
-                if version_ids == &BTreeSet::from(["version2".to_string()])
+            write.branch_scope,
+            BranchScope::ExplicitRequired { ref branch_ids }
+                if branch_ids == &BTreeSet::from(["branch2".to_string()])
         ));
     }
 
     #[test]
     fn bind_statement_rejects_hidden_predicate_columns() {
         let statement = parse_statement("DELETE FROM lix_file WHERE lixcol_schema_key = 'schema'");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("hidden predicate columns should not bind");
 
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
@@ -1769,7 +1763,7 @@ mod tests {
     #[test]
     fn bind_statement_binds_insert_values_and_params_once() {
         let statement = parse_statement("INSERT INTO lix_file (id, name) VALUES ($1, $2)");
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
         assert_eq!(write.op, BoundWriteOp::Insert);
@@ -1801,7 +1795,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_insert_values_column_refs() {
         let statement = parse_statement("INSERT INTO lix_file (id) VALUES (name)");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("VALUES rows should not bind target table column refs");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -1814,7 +1808,7 @@ mod tests {
     fn bind_statement_binds_hex_literals_as_blobs() {
         let statement =
             parse_statement("INSERT INTO lix_file (id, data) VALUES ('file1', X'4142')");
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
         let BoundWriteInput::Values(values) = write.input else {
@@ -1830,7 +1824,7 @@ mod tests {
         let statement = parse_statement(
             "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content) VALUES (lix_json('[\"e1\"]'), 'app.test', lix_json('{\"id\":\"e1\"}'))",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
         let BoundWriteInput::Values(values) = write.input else {
@@ -1851,7 +1845,7 @@ mod tests {
         let statement = parse_statement(
             "INSERT INTO lix_file (id, path, data) VALUES (lix_uuid_v7(), lix_timestamp(), lix_text_encode('hello'))",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
         let BoundWriteInput::Values(values) = write.input else {
@@ -1876,80 +1870,80 @@ mod tests {
             "INSERT INTO lix_file (id, data) VALUES ('f1', lix_text_encode('Ada', 'base64'))",
             "INSERT INTO lix_file (id, data) VALUES ('f1', lix_empty_blob() FILTER (WHERE false))",
         ] {
-            let error = bind_statement(&parse_statement(sql), &[], "version1")
+            let error = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect_err("unsupported function details should fail closed");
             assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
         }
     }
 
     #[test]
-    fn bind_statement_binds_by_version_insert_scope_from_version_column() {
+    fn bind_statement_binds_by_branch_insert_scope_from_branch_column() {
         let statement = parse_statement(
-            "INSERT INTO lix_file_by_version (id, name, lixcol_version_id) VALUES ('file1', 'a', 'version2')",
+            "INSERT INTO lix_file_by_branch (id, name, lixcol_branch_id) VALUES ('file1', 'a', 'branch2')",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
         assert!(matches!(
-            write.version_scope,
-            VersionScope::Explicit { ref version_ids }
-                if version_ids == &BTreeSet::from(["version2".to_string()])
+            write.branch_scope,
+            BranchScope::Explicit { ref branch_ids }
+                if branch_ids == &BTreeSet::from(["branch2".to_string()])
         ));
     }
 
     #[test]
-    fn bind_statement_preserves_parameterized_by_version_scope_selectors() {
+    fn bind_statement_preserves_parameterized_by_branch_scope_selectors() {
         let update = bind_statement(
             &parse_statement(
-                "UPDATE lix_file_by_version SET hidden = true WHERE id = 'file1' AND lixcol_version_id = $1",
+                "UPDATE lix_file_by_branch SET hidden = true WHERE id = 'file1' AND lixcol_branch_id = $1",
             ),
             &[],
-            "version1",
+            "branch1",
         )
-        .expect("parameterized update version scope should bind");
+        .expect("parameterized update branch scope should bind");
         assert_eq!(
-            update.version_scope,
-            VersionScope::ExplicitRequiredDynamic {
-                version_ids: BTreeSet::new(),
+            update.branch_scope,
+            BranchScope::ExplicitRequiredDynamic {
+                branch_ids: BTreeSet::new(),
                 param_indexes: BTreeSet::from([1])
             }
         );
 
         let insert = bind_statement(
             &parse_statement(
-                "INSERT INTO lix_file_by_version (id, name, lixcol_version_id) VALUES ('file1', 'a', $1)",
+                "INSERT INTO lix_file_by_branch (id, name, lixcol_branch_id) VALUES ('file1', 'a', $1)",
             ),
             &[],
-            "version1",
+            "branch1",
         )
-        .expect("parameterized insert version scope should bind");
+        .expect("parameterized insert branch scope should bind");
         assert_eq!(
-            insert.version_scope,
-            VersionScope::ExplicitDynamic {
-                version_ids: BTreeSet::new(),
+            insert.branch_scope,
+            BranchScope::ExplicitDynamic {
+                branch_ids: BTreeSet::new(),
                 param_indexes: BTreeSet::from([1])
             }
         );
     }
 
     #[test]
-    fn bind_statement_binds_contradictory_by_version_selectors_as_empty() {
+    fn bind_statement_binds_contradictory_by_branch_selectors_as_empty() {
         let statement = parse_statement(
-            "DELETE FROM lix_file_by_version WHERE lixcol_version_id IN ('v1') AND lixcol_version_id IN ('v2')",
+            "DELETE FROM lix_file_by_branch WHERE lixcol_branch_id IN ('v1') AND lixcol_branch_id IN ('v2')",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("delete should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("delete should bind");
 
         let write = bound;
-        assert_eq!(write.version_scope, VersionScope::Empty);
+        assert_eq!(write.branch_scope, BranchScope::Empty);
     }
 
     #[test]
-    fn bind_statement_binds_false_by_version_predicate_as_empty() {
-        let statement = parse_statement("DELETE FROM lix_file_by_version WHERE false");
-        let bound = bind_statement(&statement, &[], "version1").expect("no-match delete binds");
+    fn bind_statement_binds_false_by_branch_predicate_as_empty() {
+        let statement = parse_statement("DELETE FROM lix_file_by_branch WHERE false");
+        let bound = bind_statement(&statement, &[], "branch1").expect("no-match delete binds");
 
         let write = bound;
-        assert_eq!(write.version_scope, VersionScope::Empty);
+        assert_eq!(write.branch_scope, BranchScope::Empty);
     }
 
     #[test]
@@ -1957,12 +1951,12 @@ mod tests {
         for sql in [
             "DELETE FROM lix_file WHERE false",
             "UPDATE lix_state SET metadata = '{}' WHERE false",
-            "DELETE FROM lix_version WHERE false",
+            "DELETE FROM lix_branch WHERE false",
         ] {
-            let bound = bind_statement(&parse_statement(sql), &[], "version1")
+            let bound = bind_statement(&parse_statement(sql), &[], "branch1")
                 .expect("no-match write should bind");
             let write = bound;
-            assert_eq!(write.version_scope, VersionScope::Empty, "{sql}");
+            assert_eq!(write.branch_scope, BranchScope::Empty, "{sql}");
         }
     }
 
@@ -1972,7 +1966,7 @@ mod tests {
             "DELETE FROM lix_file WHERE data IS NULL",
             "DELETE FROM lix_file WHERE data IS NOT NULL",
         ] {
-            bind_statement(&parse_statement(sql), &[], "version1")
+            bind_statement(&parse_statement(sql), &[], "branch1")
                 .unwrap_or_else(|error| panic!("{sql} should bind, got {error:?}"));
         }
     }
@@ -1982,10 +1976,10 @@ mod tests {
         let statement = parse_statement(
             "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', true)",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
-        assert_eq!(write.version_scope, VersionScope::Global);
+        assert_eq!(write.branch_scope, BranchScope::Global);
     }
 
     #[test]
@@ -1993,7 +1987,7 @@ mod tests {
         let statement = parse_statement(
             "INSERT INTO lix_state (entity_pk, schema_key, snapshot_content, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
         );
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("parameterized global scope should fail closed until scope resolution");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -2003,73 +1997,73 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_lix_state_by_version_global_true_with_version_id() {
+    fn bind_statement_rejects_lix_state_by_branch_global_true_with_branch_id() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'v1', true)",
+            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'v1', true)",
         );
-        let error = bind_statement(&statement, &[], "version1")
-            .expect_err("global true and version_id select contradictory scopes");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("global true and branch_id select contradictory scopes");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = true with non-global version_id"));
+            .contains("cannot combine global = true with non-global branch_id"));
     }
 
     #[test]
-    fn bind_statement_binds_lix_state_by_version_global_true_with_global_version() {
+    fn bind_statement_binds_lix_state_by_branch_global_true_with_global_branch() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', true)",
+            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', true)",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("global row should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("global row should bind");
 
         let write = bound;
-        assert_eq!(write.version_scope, VersionScope::Global);
+        assert_eq!(write.branch_scope, BranchScope::Global);
     }
 
     #[test]
-    fn bind_statement_rejects_lix_state_by_version_global_false_with_global_version() {
+    fn bind_statement_rejects_lix_state_by_branch_global_false_with_global_branch() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', false)",
+            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', 'global', false)",
         );
-        let error = bind_statement(&statement, &[], "version1")
-            .expect_err("global false cannot target the global version");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("global false cannot target the global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error
             .message
-            .contains("cannot combine global = false with global version_id"));
+            .contains("cannot combine global = false with global branch_id"));
     }
 
     #[test]
-    fn bind_statement_binds_parameterized_lix_state_by_version_version_id() {
+    fn bind_statement_binds_parameterized_lix_state_by_branch_branch_id() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
+            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id) VALUES ('[\"e1\"]', 'app.test', '{}', $1)",
         );
-        let bound = bind_statement(&statement, &[], "version1")
-            .expect("parameterized lix_state_by_version version_id should bind");
+        let bound = bind_statement(&statement, &[], "branch1")
+            .expect("parameterized lix_state_by_branch branch_id should bind");
 
         assert_eq!(
-            bound.version_scope,
-            VersionScope::ExplicitDynamic {
-                version_ids: BTreeSet::new(),
+            bound.branch_scope,
+            BranchScope::ExplicitDynamic {
+                branch_ids: BTreeSet::new(),
                 param_indexes: BTreeSet::from([1])
             }
         );
     }
 
     #[test]
-    fn bind_statement_binds_parameterized_lix_state_by_version_global_false_version_id() {
+    fn bind_statement_binds_parameterized_lix_state_by_branch_global_false_branch_id() {
         let statement = parse_statement(
-            "INSERT INTO lix_state_by_version (entity_pk, schema_key, snapshot_content, version_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1, false)",
+            "INSERT INTO lix_state_by_branch (entity_pk, schema_key, snapshot_content, branch_id, global) VALUES ('[\"e1\"]', 'app.test', '{}', $1, false)",
         );
-        let bound = bind_statement(&statement, &[], "version1")
-            .expect("parameterized lix_state_by_version non-global row should bind");
+        let bound = bind_statement(&statement, &[], "branch1")
+            .expect("parameterized lix_state_by_branch non-global row should bind");
 
         assert_eq!(
-            bound.version_scope,
-            VersionScope::ExplicitDynamic {
-                version_ids: BTreeSet::new(),
+            bound.branch_scope,
+            BranchScope::ExplicitDynamic {
+                branch_ids: BTreeSet::new(),
                 param_indexes: BTreeSet::from([1])
             }
         );
@@ -2080,11 +2074,10 @@ mod tests {
         let statement = parse_statement(
             "UPDATE lix_state SET metadata = '{}' WHERE global = true AND global = false",
         );
-        let bound =
-            bind_statement(&statement, &[], "version1").expect("no-match scope should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("no-match scope should bind");
 
         let write = bound;
-        assert_eq!(write.version_scope, VersionScope::Empty);
+        assert_eq!(write.branch_scope, BranchScope::Empty);
     }
 
     #[test]
@@ -2092,14 +2085,14 @@ mod tests {
         let statement = parse_statement(
             "UPDATE lix_state SET metadata = '{}' WHERE global = true OR schema_key = 'app.test'",
         );
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("mixed global OR scope should fail closed");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(
             error
                 .message
-                .contains("lix_state global predicates select mixed version scopes"),
+                .contains("lix_state global predicates select mixed branch scopes"),
             "{}",
             error.message
         );
@@ -2133,7 +2126,7 @@ mod tests {
                 "required": ["id", "body"],
                 "additionalProperties": false
             })],
-            "version1",
+            "branch1",
         )
         .expect_err("entity primary key columns should be insert-only");
 
@@ -2142,13 +2135,13 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_binds_version_writes_as_global() {
+    fn bind_statement_binds_branch_writes_as_global() {
         let statement =
-            parse_statement("INSERT INTO lix_version (id, name) VALUES ('draft', 'Draft')");
-        let bound = bind_statement(&statement, &[], "version1").expect("insert should bind");
+            parse_statement("INSERT INTO lix_branch (id, name) VALUES ('draft', 'Draft')");
+        let bound = bind_statement(&statement, &[], "branch1").expect("insert should bind");
 
         let write = bound;
-        assert_eq!(write.version_scope, VersionScope::Global);
+        assert_eq!(write.branch_scope, BranchScope::Global);
     }
 
     #[test]
@@ -2156,7 +2149,7 @@ mod tests {
         let statement = parse_statement(
             "UPDATE lix_state SET snapshot_content = -1 WHERE entity_pk = '[\"e1\"]'",
         );
-        let bound = bind_statement(&statement, &[], "version1").expect("update should bind");
+        let bound = bind_statement(&statement, &[], "branch1").expect("update should bind");
 
         let write = bound;
         assert!(matches!(
@@ -2166,11 +2159,11 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_by_version_writes_without_version_selector() {
+    fn bind_statement_rejects_by_branch_writes_without_branch_selector() {
         let statement =
-            parse_statement("UPDATE lix_file_by_version SET hidden = true WHERE id = 'file1'");
-        let error = bind_statement(&statement, &[], "version1")
-            .expect_err("by-version writes should require explicit version predicate");
+            parse_statement("UPDATE lix_file_by_branch SET hidden = true WHERE id = 'file1'");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("by-branch writes should require explicit branch predicate");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error.message.contains("require an explicit"));
@@ -2191,11 +2184,11 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_read_only_by_version_columns_as_write_targets() {
+    fn bind_statement_rejects_read_only_by_branch_columns_as_write_targets() {
         let statement =
-            parse_statement("UPDATE lix_file_by_version SET lixcol_version_id = 'version2'");
-        let error = bind_statement(&statement, &[], "version1")
-            .expect_err("by-version version columns are filter-only");
+            parse_statement("UPDATE lix_file_by_branch SET lixcol_branch_id = 'branch2'");
+        let error = bind_statement(&statement, &[], "branch1")
+            .expect_err("by-branch branch columns are filter-only");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
         assert!(error.message.contains("is not writable"));
@@ -2204,7 +2197,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_provider_read_only_update_columns() {
         let statement = parse_statement("UPDATE lix_state SET entity_pk = '[\"next\"]'");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("lix_state identity columns are insert-only");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -2215,7 +2208,7 @@ mod tests {
     fn bind_statement_rejects_explain_wrappers() {
         let statement =
             parse_statement("EXPLAIN UPDATE lix_file SET name = 'x' WHERE id = 'file1'");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("EXPLAIN should not bind as a write");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
@@ -2228,7 +2221,7 @@ mod tests {
     fn bind_statement_rejects_unsupported_write_clauses() {
         let statement =
             parse_statement("UPDATE lix_file AS f SET name = 'next' WHERE f.id = 'file1'");
-        let error = bind_statement(&statement, &[], "version1")
+        let error = bind_statement(&statement, &[], "branch1")
             .expect_err("target aliases should not be ignored");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);

@@ -535,7 +535,7 @@ simulation_test!(
             .await
             .expect("valid object metadata should write");
         let commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("head commit should load")
             .expect("head commit should exist");

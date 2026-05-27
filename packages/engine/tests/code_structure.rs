@@ -2049,7 +2049,7 @@ fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
     let in_scope_owner_root = relative_path.starts_with("live_state/")
         || relative_path.starts_with("canonical/")
         || relative_path.starts_with("binary_cas/")
-        || relative_path.starts_with("session/version_ops/");
+        || relative_path.starts_with("session/branch_ops/");
     let is_allowed_adapter_surface = relative_path.ends_with("/store.rs")
         || relative_path.ends_with("/store_sql.rs")
         || relative_path.ends_with("/storage.rs");
@@ -2853,7 +2853,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "mod file_history;",
             "mod history;",
             "mod lix_state;",
-            "mod version;",
+            "mod branch;",
         ],
     );
     assert_source_contains_none(
@@ -2874,27 +2874,27 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "PublicCatalog::from_visible_schemas",
             "catalog.surfaces()",
             "PublicSurfaceKind::LixState",
-            "PublicSurfaceKind::LixStateByVersion",
-            "PublicSurfaceKind::Version",
+            "PublicSurfaceKind::LixStateByBranch",
+            "PublicSurfaceKind::Branch",
             "PublicSurfaceKind::Change",
             "PublicSurfaceKind::History",
             "PublicSurfaceKind::File",
-            "PublicSurfaceKind::FileByVersion",
+            "PublicSurfaceKind::FileByBranch",
             "PublicSurfaceKind::FileHistory",
             "PublicSurfaceKind::Directory",
-            "PublicSurfaceKind::DirectoryByVersion",
+            "PublicSurfaceKind::DirectoryByBranch",
             "PublicSurfaceKind::DirectoryHistory",
             "lix_state::register_lix_state_active_provider",
-            "lix_state::register_lix_state_by_version_provider",
-            "version::register_lix_version_read_provider",
+            "lix_state::register_lix_state_by_branch_provider",
+            "branch::register_lix_branch_read_provider",
             "change::register_lix_change_read_provider",
             "history::register_history_provider",
             "file_history::register_lix_file_history_surface",
             "directory_history::register_lix_directory_history_surface",
             "directory::register_lix_directory_active_provider",
-            "directory::register_lix_directory_by_version_provider",
+            "directory::register_lix_directory_by_branch_provider",
             "file::register_lix_file_active_provider",
-            "file::register_lix_file_by_version_provider",
+            "file::register_lix_file_by_branch_provider",
             "entity::register_entity_providers",
         ],
     );
@@ -2903,12 +2903,12 @@ fn sql2_read_session_does_not_register_write_surfaces() {
         read_registration,
         &[
             "register_lix_state_write_providers",
-            "register_lix_version_write_provider",
+            "register_lix_branch_write_provider",
             "register_lix_directory_write_providers",
             "register_lix_file_write_providers",
             "register_entity_write_providers",
             "register_lix_state_providers",
-            "register_lix_version_provider",
+            "register_lix_branch_provider",
             "register_lix_change_provider",
             "register_history_providers",
             "register_lix_file_history_provider",
@@ -2957,19 +2957,19 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "PublicCatalog::from_visible_schemas",
             "catalog.surfaces()",
             "PublicSurfaceKind::LixState",
-            "PublicSurfaceKind::LixStateByVersion",
-            "PublicSurfaceKind::Version",
+            "PublicSurfaceKind::LixStateByBranch",
+            "PublicSurfaceKind::Branch",
             "PublicSurfaceKind::File",
-            "PublicSurfaceKind::FileByVersion",
+            "PublicSurfaceKind::FileByBranch",
             "PublicSurfaceKind::Directory",
-            "PublicSurfaceKind::DirectoryByVersion",
+            "PublicSurfaceKind::DirectoryByBranch",
             "lix_state::register_lix_state_active_write_provider",
-            "lix_state::register_lix_state_by_version_write_provider",
-            "version::register_write_provider",
+            "lix_state::register_lix_state_by_branch_write_provider",
+            "branch::register_write_provider",
             "file::register_active_write_provider",
-            "file::register_by_version_write_provider",
+            "file::register_by_branch_write_provider",
             "directory::register_active_write_provider",
-            "directory::register_by_version_write_provider",
+            "directory::register_by_branch_write_provider",
             "entity::register_entity_write_providers",
         ],
     );
@@ -2978,9 +2978,9 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
         write_registration,
         &[
             "ctx.live_state()",
-            "ctx.version_ref()",
+            "ctx.branch_ref()",
             "register_lix_state_providers",
-            "register_lix_version_provider",
+            "register_lix_branch_provider",
             "register_lix_change_provider",
             "register_history_providers",
             "register_lix_file_history_provider",
@@ -2989,13 +2989,13 @@ fn sql2_write_session_registers_writable_transaction_surfaces() {
             "register_lix_file_providers",
             "register_entity_providers",
             "register_lix_state_write_providers",
-            "register_lix_version_write_provider",
-            "register_lix_version_write_surface",
+            "register_lix_branch_write_provider",
+            "register_lix_branch_write_surface",
             "register_lix_directory_active_write_provider",
-            "register_lix_directory_by_version_write_provider",
+            "register_lix_directory_by_branch_write_provider",
             "register_lix_directory_write_providers",
             "register_lix_file_active_write_provider",
-            "register_lix_file_by_version_write_provider",
+            "register_lix_file_by_branch_write_provider",
             "register_lix_file_write_providers",
         ],
     );
@@ -3036,7 +3036,7 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         &[
             "catalog.surfaces()",
             "PublicSurfaceKind::EntityBase",
-            "PublicSurfaceKind::EntityByVersion",
+            "PublicSurfaceKind::EntityByBranch",
             "PublicSurfaceKind::EntityHistory",
         ],
     );
@@ -3046,7 +3046,7 @@ fn sql2_entity_provider_registration_is_catalog_driven() {
         &[
             "catalog.surfaces()",
             "PublicSurfaceKind::EntityBase",
-            "PublicSurfaceKind::EntityByVersion",
+            "PublicSurfaceKind::EntityByBranch",
         ],
     );
     assert_source_contains_none(

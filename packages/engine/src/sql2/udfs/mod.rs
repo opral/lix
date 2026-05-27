@@ -1,5 +1,5 @@
 mod common;
-mod lix_active_version_commit_id;
+mod lix_active_branch_commit_id;
 mod lix_empty_blob;
 mod lix_json;
 mod lix_json_get;
@@ -24,10 +24,10 @@ pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
 pub(crate) fn register_sql2_functions(
     ctx: &SessionContext,
     functions: FunctionProviderHandle,
-    active_version_commit_id: Option<String>,
+    active_branch_commit_id: Option<String>,
 ) {
     ctx.register_udf(ScalarUDF::from(
-        lix_active_version_commit_id::LixActiveVersionCommitId::new(active_version_commit_id),
+        lix_active_branch_commit_id::LixActiveBranchCommitId::new(active_branch_commit_id),
     ));
     ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
     ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));

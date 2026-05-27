@@ -79,7 +79,7 @@ mod tests {
     use crate::live_state::LiveStateContext;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::GLOBAL_VERSION_ID;
+    use crate::GLOBAL_BRANCH_ID;
 
     use super::*;
 
@@ -117,7 +117,7 @@ mod tests {
     async fn prepare_starts_deterministic_functions_at_sequence_zero() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(storage.clone()).await;
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
             DETERMINISTIC_MODE_KEY,
@@ -154,7 +154,7 @@ mod tests {
     async fn prepare_continues_from_persisted_sequence() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(storage.clone()).await;
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
             DETERMINISTIC_MODE_KEY,
@@ -196,7 +196,7 @@ mod tests {
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(storage.clone()).await;
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
             DETERMINISTIC_MODE_KEY,
@@ -283,7 +283,7 @@ mod tests {
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
             global: true,
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
         };
         crate::untracked_state::UntrackedStateContext::new()
             .writer(&mut writes)

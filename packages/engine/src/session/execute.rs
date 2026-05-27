@@ -344,17 +344,17 @@ where
                 Arc::new(self.live_state.reader(read_store.clone()));
             let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
             let functions = runtime_functions.provider();
-            let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
+            let active_branch_id = self.active_branch_id_from_reader(&mut read_store).await?;
             let visible_schemas = self
                 .catalog_context
-                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_version_id)
+                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
                 .await?;
             let ctx = SessionSqlExecutionContext {
-                active_version_id: &active_version_id,
+                active_branch_id: &active_branch_id,
                 read_store,
                 live_state: Arc::clone(&self.live_state),
                 binary_cas: Arc::clone(&self.binary_cas),
-                version_ctx: Arc::clone(&self.version_ctx),
+                branch_ctx: Arc::clone(&self.branch_ctx),
                 visible_schemas,
                 functions: functions.clone(),
             };
@@ -634,15 +634,6 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
             code: LixError::CODE_INVALID_PARAM.to_string(),
             ..error
         };
-    }
-    if error.code == LixError::CODE_FOREIGN_KEY {
-        let lower = error.message.to_ascii_lowercase();
-        if lower.contains("schema 'lix_version_ref'") && lower.contains("target 'lix_commit.") {
-            return LixError {
-                code: LixError::CODE_VERSION_NOT_FOUND.to_string(),
-                ..error
-            };
-        }
     }
     error
 }

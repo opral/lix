@@ -1,22 +1,22 @@
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum VersionScope {
+pub(crate) enum BranchScope {
     Active {
-        version_id: String,
+        branch_id: String,
     },
     Explicit {
-        version_ids: BTreeSet<String>,
+        branch_ids: BTreeSet<String>,
     },
     ExplicitDynamic {
-        version_ids: BTreeSet<String>,
+        branch_ids: BTreeSet<String>,
         param_indexes: BTreeSet<usize>,
     },
     ExplicitRequired {
-        version_ids: BTreeSet<String>,
+        branch_ids: BTreeSet<String>,
     },
     ExplicitRequiredDynamic {
-        version_ids: BTreeSet<String>,
+        branch_ids: BTreeSet<String>,
         param_indexes: BTreeSet<usize>,
     },
     Global,

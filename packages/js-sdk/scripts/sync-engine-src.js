@@ -32,7 +32,7 @@ async function main() {
 			"",
 			"- `src/sql2/providers/entity.rs` - registered schema SQL surfaces",
 			"- `src/sql2/providers/change.rs` - `lix_change` projection",
-			"- `src/sql2/providers/version.rs` - writable `lix_version` surface",
+			"- `src/sql2/providers/branch.rs` - writable `lix_branch` surface",
 			"- `src/transaction/validation.rs` - primary-key, unique, foreign-key, and shape validation",
 			"- `src/schema/definition.json` - Lix schema-definition meta-schema",
 			"- `src/schema/builtin/` - built-in schema definitions",

@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     use crate::sql2::bind::bind_statement;
     use crate::sql2::parse_statement;
-    use crate::sql2::plan::version_scope::VersionScope;
+    use crate::sql2::plan::branch_scope::BranchScope;
     use std::collections::BTreeSet;
 
     #[test]
@@ -79,25 +79,25 @@ mod tests {
     }
 
     #[test]
-    fn plan_write_applies_active_version_scope_to_base_writes() {
+    fn plan_write_applies_active_branch_scope_to_base_writes() {
         let plan = plan_sql("DELETE FROM lix_state WHERE schema_key = 'profile'");
 
         assert_eq!(
-            plan.bound.version_scope,
-            VersionScope::Active {
-                version_id: "version1".to_string()
+            plan.bound.branch_scope,
+            BranchScope::Active {
+                branch_id: "branch1".to_string()
             }
         );
     }
 
     #[test]
-    fn plan_write_keeps_explicit_required_scope_for_by_version_writes() {
-        let plan = plan_sql("DELETE FROM lix_state_by_version WHERE version_id IN ('v1', 'v2')");
+    fn plan_write_keeps_explicit_required_scope_for_by_branch_writes() {
+        let plan = plan_sql("DELETE FROM lix_state_by_branch WHERE branch_id IN ('v1', 'v2')");
 
         assert_eq!(
-            plan.bound.version_scope,
-            VersionScope::ExplicitRequired {
-                version_ids: BTreeSet::from(["v1".to_string(), "v2".to_string()])
+            plan.bound.branch_scope,
+            BranchScope::ExplicitRequired {
+                branch_ids: BTreeSet::from(["v1".to_string(), "v2".to_string()])
             }
         );
     }
@@ -128,9 +128,9 @@ mod tests {
         );
 
         assert_eq!(
-            plan.bound.version_scope,
-            VersionScope::Active {
-                version_id: "version1".to_string()
+            plan.bound.branch_scope,
+            BranchScope::Active {
+                branch_id: "branch1".to_string()
             }
         );
     }
@@ -141,7 +141,7 @@ mod tests {
 
     fn plan_sql_with_schemas(sql: &str, schemas: &[serde_json::Value]) -> LogicalWritePlan {
         let statement = parse_statement(sql).expect("parse SQL");
-        let write = bind_statement(&statement, schemas, "version1").expect("bind SQL");
+        let write = bind_statement(&statement, schemas, "branch1").expect("bind SQL");
         plan_write(write).expect("plan write")
     }
 }

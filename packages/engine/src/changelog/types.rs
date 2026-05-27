@@ -183,7 +183,7 @@ impl RebuildIndexStats {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GcRoot {
-    VersionHead(CommitId),
+    BranchHead(CommitId),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -63,7 +63,7 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
         "lix_empty_blob" => expect_exact_arity(name, arity, 0),
         "lix_timestamp" => expect_exact_arity(name, arity, 0),
         "lix_uuid_v7" => expect_exact_arity(name, arity, 0),
-        "lix_active_version_commit_id" => expect_exact_arity(name, arity, 0),
+        "lix_active_branch_commit_id" => expect_exact_arity(name, arity, 0),
         "lix_text_encode" | "lix_text_decode" => {
             expect_arity_range(name, arity, 1, 2)?;
             validate_literal_utf8_encoding(name, &function.args)
@@ -154,7 +154,7 @@ fn public_lix_function_name(function: &Function) -> Option<&'static str> {
         "lix_empty_blob" => Some("lix_empty_blob"),
         "lix_timestamp" => Some("lix_timestamp"),
         "lix_uuid_v7" => Some("lix_uuid_v7"),
-        "lix_active_version_commit_id" => Some("lix_active_version_commit_id"),
+        "lix_active_branch_commit_id" => Some("lix_active_branch_commit_id"),
         "lix_text_encode" => Some("lix_text_encode"),
         "lix_text_decode" => Some("lix_text_decode"),
         _ => None,

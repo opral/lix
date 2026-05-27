@@ -1,0 +1,48 @@
+{
+  "x-lix-key": "lix_branch_ref",
+  "description": "Branch head pointer. Records which commit a branch should currently resolve to in the local runtime. Intentionally not part of canonical commit membership: refs may be reset client-side after sync without introducing content conflicts. Each `lix_branch_descriptor.id` has exactly one `lix_branch_ref` row.",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/id"
+      ],
+      "references": {
+        "schemaKey": "lix_branch_descriptor",
+        "properties": [
+          "/id"
+        ]
+      }
+    },
+    {
+      "properties": [
+        "/commit_id"
+      ],
+      "references": {
+        "schemaKey": "lix_commit",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Branch identifier whose head pointer is being stored; matches `lix_branch_descriptor.id`."
+    },
+    "commit_id": {
+      "type": "string",
+      "description": "Commit the branch should currently resolve to in the local runtime (references `lix_commit.id`)."
+    }
+  },
+  "required": [
+    "id",
+    "commit_id"
+  ],
+  "additionalProperties": false
+}

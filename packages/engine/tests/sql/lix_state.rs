@@ -412,7 +412,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_global_rows_are_visible_through_version_overlay,
+    lix_state_global_rows_are_visible_through_branch_overlay,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -453,26 +453,26 @@ simulation_test!(
             ]],
         );
 
-        let by_version_result = session
+        let by_branch_result = session
             .execute(
                 &format!(
-                    "SELECT entity_pk, version_id, global, untracked \
-                 FROM lix_state_by_version \
+                    "SELECT entity_pk, branch_id, global, untracked \
+                 FROM lix_state_by_branch \
                  WHERE entity_pk = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value' \
-                 AND version_id IN ('{}', 'global') \
-                 ORDER BY version_id",
-                    sim.main_version_id()
+                 AND branch_id IN ('{}', 'global') \
+                 ORDER BY branch_id",
+                    sim.main_branch_id()
                 ),
                 &[],
             )
             .await
-            .expect("by-version lix_state read should succeed");
+            .expect("by-branch lix_state read should succeed");
         assert_rows_eq(
-            by_version_result,
+            by_branch_result,
             vec![
                 vec![
                     Value::Json(json!(["state-global-overlay"])),
-                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Text(sim.main_branch_id().to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],
@@ -488,7 +488,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_version_tombstone_hides_global_row_in_active_and_by_version,
+    lix_state_branch_tombstone_hides_global_row_in_active_and_by_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -520,7 +520,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("version-local tombstone insert should succeed");
+            .expect("branch-local tombstone insert should succeed");
 
         let active_result = session
             .execute(
@@ -533,22 +533,22 @@ simulation_test!(
             .expect("active lix_state read should succeed");
         assert_rows_eq(active_result, Vec::new());
 
-        let by_version_result = session
+        let by_branch_result = session
             .execute(
                 &format!(
-                    "SELECT entity_pk, version_id, global, untracked \
-                     FROM lix_state_by_version \
+                    "SELECT entity_pk, branch_id, global, untracked \
+                     FROM lix_state_by_branch \
                      WHERE entity_pk = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value' \
-                     AND version_id IN ('{}', 'global') \
-                     ORDER BY version_id",
-                    sim.main_version_id()
+                     AND branch_id IN ('{}', 'global') \
+                     ORDER BY branch_id",
+                    sim.main_branch_id()
                 ),
                 &[],
             )
             .await
-            .expect("by-version lix_state read should succeed");
+            .expect("by-branch lix_state read should succeed");
         assert_rows_eq(
-            by_version_result,
+            by_branch_result,
             vec![vec![
                 Value::Json(json!(["state-global-tombstone-overlay"])),
                 Value::Text("global".to_string()),

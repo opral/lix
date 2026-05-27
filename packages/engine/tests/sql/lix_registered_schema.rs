@@ -1,4 +1,4 @@
-use lix_engine::CreateVersionOptions;
+use lix_engine::CreateBranchOptions;
 use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
@@ -286,7 +286,7 @@ simulation_test!(
             .await
             .expect("tracked schema insert should succeed");
         let first_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("first head should load")
             .expect("first head should exist");
@@ -301,7 +301,7 @@ simulation_test!(
             .await
             .expect("compatible tracked schema amendment should succeed");
         let second_commit_id = engine
-            .load_version_head_commit_id(sim.main_version_id())
+            .load_branch_head_commit_id(sim.main_branch_id())
             .await
             .expect("second head should load")
             .expect("second head should exist");
@@ -429,24 +429,24 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_by_version_insert_rejects_target_version_without_schema,
+    entity_by_branch_insert_rejects_target_branch_without_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("schemaless-target".to_string()),
             name: "Schemaless Target".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("target version should be created before schema registration");
+        .expect("target branch should be created before schema registration");
 
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
@@ -462,13 +462,13 @@ simulation_test!(
 
         let error = main
             .execute(
-                "INSERT INTO engine_poison_schema_by_version \
-                 (id, name, lixcol_version_id, lixcol_untracked) \
+                "INSERT INTO engine_poison_schema_by_branch \
+                 (id, name, lixcol_branch_id, lixcol_untracked) \
                  VALUES ('poison-1', 'Poisoned', 'schemaless-target', true)",
                 &[],
             )
             .await
-            .expect_err("_by_version write must use the target version schema catalog");
+            .expect_err("_by_branch write must use the target branch schema catalog");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
@@ -479,24 +479,24 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_schema_identity_is_scoped_per_version,
+    registered_schema_identity_is_scoped_per_branch,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("divergent-target".to_string()),
             name: "Divergent Target".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("target version should be created before schema divergence");
+        .expect("target branch should be created before schema divergence");
 
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
@@ -552,7 +552,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("same schema key may have independent version-local definitions");
+            .expect("same schema key may have independent branch-local definitions");
 
         let main_result = main
             .execute(
@@ -579,12 +579,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    independent_schema_amendments_on_two_versions_are_allowed,
+    independent_schema_amendments_on_two_branches_are_allowed,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -634,13 +634,13 @@ simulation_test!(
         .await
         .expect("base schema should be registered");
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("schema-amendment-draft".to_string()),
             name: "Schema Amendment Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created from base schema");
+        .expect("draft branch should be created from base schema");
 
         let draft = sim.wrap_session(
             engine
@@ -697,24 +697,24 @@ simulation_test!(
 );
 
 simulation_test!(
-    entity_by_version_insert_rejects_fk_graph_when_target_version_lacks_schemas,
+    entity_by_branch_insert_rejects_fk_graph_when_target_branch_lacks_schemas,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
         );
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("fk-schemaless-target".to_string()),
             name: "FK Schemaless Target".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("target version should be created before FK schemas");
+        .expect("target branch should be created before FK schemas");
 
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
@@ -742,8 +742,8 @@ simulation_test!(
 
         let parent_result = main
             .execute(
-                "INSERT INTO engine_fk_parent_schema_by_version \
-                 (id, lixcol_version_id, lixcol_untracked) \
+                "INSERT INTO engine_fk_parent_schema_by_branch \
+                 (id, lixcol_branch_id, lixcol_untracked) \
                  VALUES ('parent-1', 'fk-schemaless-target', true)",
                 &[],
             )
@@ -760,8 +760,8 @@ simulation_test!(
 
         let error = main
             .execute(
-                "INSERT INTO engine_fk_child_schema_by_version \
-                 (id, parent_id, lixcol_version_id, lixcol_untracked) \
+                "INSERT INTO engine_fk_child_schema_by_branch \
+                 (id, parent_id, lixcol_branch_id, lixcol_untracked) \
                  VALUES ('child-1', 'parent-1', 'fk-schemaless-target', true)",
                 &[],
             )
@@ -898,7 +898,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
+simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let global_session = sim.wrap_session(
         engine
@@ -953,21 +953,21 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, name, lixcol_version_id, lixcol_global, lixcol_untracked \
-                 FROM engine_overlay_schema_by_version \
+            "SELECT id, name, lixcol_branch_id, lixcol_global, lixcol_untracked \
+                 FROM engine_overlay_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"entity-global-overlay\"]') \
-                 ORDER BY lixcol_version_id",
+                 ORDER BY lixcol_branch_id",
             &[],
         )
         .await
-        .expect("entity by-version read should succeed");
+        .expect("entity by-branch read should succeed");
     assert_rows_eq(
         result,
         vec![
             vec![
                 Value::Text("entity-global-overlay".to_string()),
                 Value::Text("Global Entity".to_string()),
-                Value::Text(sim.main_version_id().to_string()),
+                Value::Text(sim.main_branch_id().to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ],
@@ -1255,12 +1255,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_base_update_cannot_override_active_version_filter,
+    typed_entity_base_update_cannot_override_active_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1269,7 +1269,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_version_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_base_branch_filter_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",
@@ -1278,13 +1278,13 @@ simulation_test!(
         .await
         .expect("registered schema insert should succeed");
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("base-filter-draft".to_string()),
             name: "Base Filter Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created after schema registration");
+        .expect("draft branch should be created after schema registration");
 
         let draft = sim.wrap_session(
             engine
@@ -1296,7 +1296,7 @@ simulation_test!(
 
         draft
             .execute(
-                "INSERT INTO engine_base_version_filter_schema \
+                "INSERT INTO engine_base_branch_filter_schema \
                  (id, name, lixcol_global, lixcol_untracked) \
                  VALUES ('row-1', 'draft', false, false)",
                 &[],
@@ -1306,37 +1306,37 @@ simulation_test!(
 
         let error = main
             .execute(
-                "UPDATE engine_base_version_filter_schema \
+                "UPDATE engine_base_branch_filter_schema \
                  SET name = 'main-updated-draft' \
                  WHERE lixcol_entity_pk = '[\"row-1\"]' \
-                   AND lixcol_version_id = 'base-filter-draft'",
+                   AND lixcol_branch_id = 'base-filter-draft'",
                 &[],
             )
             .await
-            .expect_err("base entity table should not expose lixcol_version_id");
+            .expect_err("base entity table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT name \
-                 FROM engine_base_version_filter_schema_by_version \
+                 FROM engine_base_branch_filter_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_version_id = 'base-filter-draft'",
+                   AND lixcol_branch_id = 'base-filter-draft'",
                 &[],
             )
             .await
-            .expect("by-version query should succeed");
+            .expect("by-branch query should succeed");
         assert_rows_eq(result, vec![vec![Value::Text("draft".to_string())]]);
     }
 );
 
 simulation_test!(
-    typed_entity_base_insert_cannot_override_active_version_scope,
+    typed_entity_base_insert_cannot_override_active_branch_scope,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1345,7 +1345,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_insert_version_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_base_insert_branch_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",
@@ -1354,35 +1354,35 @@ simulation_test!(
         .await
         .expect("registered schema insert should succeed");
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("base-insert-draft".to_string()),
             name: "Base Insert Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created after schema registration");
+        .expect("draft branch should be created after schema registration");
 
         let error = main
             .execute(
-                "INSERT INTO engine_base_insert_version_schema \
-                 (id, name, lixcol_version_id, lixcol_untracked) \
+                "INSERT INTO engine_base_insert_branch_schema \
+                 (id, name, lixcol_branch_id, lixcol_untracked) \
                  VALUES ('row-1', 'draft', 'base-insert-draft', false)",
                 &[],
             )
             .await
-            .expect_err("base entity table should not expose lixcol_version_id");
+            .expect_err("base entity table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT name \
-                 FROM engine_base_insert_version_schema_by_version \
+                 FROM engine_base_insert_branch_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_version_id = 'base-insert-draft'",
+                   AND lixcol_branch_id = 'base-insert-draft'",
                 &[],
             )
             .await
-            .expect("by-version query should succeed");
+            .expect("by-branch query should succeed");
         assert_rows_eq(result, vec![]);
     }
 );
@@ -1519,12 +1519,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_base_insert_cannot_override_active_version_filter,
+    typed_entity_base_insert_cannot_override_active_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1533,7 +1533,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_base_version_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_base_branch_insert_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",
@@ -1542,45 +1542,45 @@ simulation_test!(
         .await
         .expect("registered schema insert should succeed");
 
-        main.create_version(CreateVersionOptions {
+        main.create_branch(CreateBranchOptions {
             id: Some("base-insert-draft".to_string()),
             name: "Base Insert Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created after schema registration");
+        .expect("draft branch should be created after schema registration");
 
         let error = main
             .execute(
-                "INSERT INTO engine_base_version_insert_schema \
-                 (id, name, lixcol_version_id, lixcol_global, lixcol_untracked) \
+                "INSERT INTO engine_base_branch_insert_schema \
+                 (id, name, lixcol_branch_id, lixcol_global, lixcol_untracked) \
                  VALUES ('row-1', 'draft-via-main', 'base-insert-draft', false, false)",
                 &[],
             )
             .await
-            .expect_err("base entity table should not expose lixcol_version_id");
+            .expect_err("base entity table should not expose lixcol_branch_id");
         assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 "SELECT id \
-                 FROM engine_base_version_insert_schema_by_version \
-                 WHERE lixcol_version_id = 'base-insert-draft'",
+                 FROM engine_base_branch_insert_schema_by_branch \
+                 WHERE lixcol_branch_id = 'base-insert-draft'",
                 &[],
             )
             .await
-            .expect("by-version query should succeed");
+            .expect("by-branch query should succeed");
         assert_rows_eq(result, Vec::<Vec<Value>>::new());
     }
 );
 
 simulation_test!(
-    typed_entity_by_version_delete_requires_explicit_version_filter,
+    typed_entity_by_branch_delete_requires_explicit_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1589,7 +1589,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_version_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_delete_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",
@@ -1598,16 +1598,16 @@ simulation_test!(
         .await
         .expect("registered schema insert should succeed");
 
-        main.create_version(CreateVersionOptions {
-            id: Some("by-version-delete-draft".to_string()),
-            name: "By-version Delete Draft".to_string(),
+        main.create_branch(CreateBranchOptions {
+            id: Some("by-branch-delete-draft".to_string()),
+            name: "By-branch Delete Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created after schema registration");
+        .expect("draft branch should be created after schema registration");
 
         main.execute(
-            "INSERT INTO engine_by_version_delete_scope_schema \
+            "INSERT INTO engine_by_branch_delete_scope_schema \
              (id, name, lixcol_global, lixcol_untracked) \
              VALUES ('row-1', 'main', false, false)",
             &[],
@@ -1617,14 +1617,14 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("by-version-delete-draft")
+                .open_session("by-branch-delete-draft")
                 .await
                 .expect("draft session should open"),
             &engine,
         );
         draft
             .execute(
-                "INSERT INTO engine_by_version_delete_scope_schema \
+                "INSERT INTO engine_by_branch_delete_scope_schema \
                  (id, name, lixcol_global, lixcol_untracked) \
                  VALUES ('row-1', 'draft', false, false)",
                 &[],
@@ -1633,37 +1633,37 @@ simulation_test!(
             .expect("draft entity insert should succeed");
 
         main.execute(
-            "DELETE FROM engine_by_version_delete_scope_schema_by_version \
+            "DELETE FROM engine_by_branch_delete_scope_schema_by_branch \
              WHERE lixcol_entity_pk = '[\"row-1\"]'",
             &[],
         )
         .await
-        .expect_err("_by_version delete should not delete all versions without a version filter");
+        .expect_err("_by_branch delete should not delete all branches without a branch filter");
 
         let result = main
             .execute(
                 &format!(
-                    "SELECT name, lixcol_version_id \
-                 FROM engine_by_version_delete_scope_schema_by_version \
+                    "SELECT name, lixcol_branch_id \
+                 FROM engine_by_branch_delete_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_version_id IN ('{}', 'by-version-delete-draft') \
+                   AND lixcol_branch_id IN ('{}', 'by-branch-delete-draft') \
                  ORDER BY name",
-                    sim.main_version_id()
+                    sim.main_branch_id()
                 ),
                 &[],
             )
             .await
-            .expect("by-version query should succeed");
+            .expect("by-branch query should succeed");
         assert_rows_eq(
             result,
             vec![
                 vec![
                     Value::Text("draft".to_string()),
-                    Value::Text("by-version-delete-draft".to_string()),
+                    Value::Text("by-branch-delete-draft".to_string()),
                 ],
                 vec![
                     Value::Text("main".to_string()),
-                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Text(sim.main_branch_id().to_string()),
                 ],
             ],
         );
@@ -1671,12 +1671,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_by_version_update_requires_explicit_version_filter,
+    typed_entity_by_branch_update_requires_explicit_branch_filter,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1685,7 +1685,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_version_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_update_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",
@@ -1694,16 +1694,16 @@ simulation_test!(
         .await
         .expect("registered schema insert should succeed");
 
-        main.create_version(CreateVersionOptions {
-            id: Some("by-version-update-draft".to_string()),
-            name: "By-version Update Draft".to_string(),
+        main.create_branch(CreateBranchOptions {
+            id: Some("by-branch-update-draft".to_string()),
+            name: "By-branch Update Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created after schema registration");
+        .expect("draft branch should be created after schema registration");
 
         main.execute(
-            "INSERT INTO engine_by_version_update_scope_schema \
+            "INSERT INTO engine_by_branch_update_scope_schema \
              (id, name, lixcol_global, lixcol_untracked) \
              VALUES ('row-1', 'main', false, false)",
             &[],
@@ -1713,14 +1713,14 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("by-version-update-draft")
+                .open_session("by-branch-update-draft")
                 .await
                 .expect("draft session should open"),
             &engine,
         );
         draft
             .execute(
-                "INSERT INTO engine_by_version_update_scope_schema \
+                "INSERT INTO engine_by_branch_update_scope_schema \
                  (id, name, lixcol_global, lixcol_untracked) \
                  VALUES ('row-1', 'draft', false, false)",
                 &[],
@@ -1729,38 +1729,38 @@ simulation_test!(
             .expect("draft entity insert should succeed");
 
         main.execute(
-            "UPDATE engine_by_version_update_scope_schema_by_version \
+            "UPDATE engine_by_branch_update_scope_schema_by_branch \
              SET name = 'updated-all' \
              WHERE lixcol_entity_pk = '[\"row-1\"]'",
             &[],
         )
         .await
-        .expect_err("_by_version update should not update all versions without a version filter");
+        .expect_err("_by_branch update should not update all branches without a branch filter");
 
         let result = main
             .execute(
                 &format!(
-                    "SELECT name, lixcol_version_id \
-                 FROM engine_by_version_update_scope_schema_by_version \
+                    "SELECT name, lixcol_branch_id \
+                 FROM engine_by_branch_update_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_version_id IN ('{}', 'by-version-update-draft') \
+                   AND lixcol_branch_id IN ('{}', 'by-branch-update-draft') \
                  ORDER BY name",
-                    sim.main_version_id()
+                    sim.main_branch_id()
                 ),
                 &[],
             )
             .await
-            .expect("by-version query should succeed");
+            .expect("by-branch query should succeed");
         assert_rows_eq(
             result,
             vec![
                 vec![
                     Value::Text("draft".to_string()),
-                    Value::Text("by-version-update-draft".to_string()),
+                    Value::Text("by-branch-update-draft".to_string()),
                 ],
                 vec![
                     Value::Text("main".to_string()),
-                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Text(sim.main_branch_id().to_string()),
                 ],
             ],
         );
@@ -1768,12 +1768,12 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_entity_by_version_dml_rejects_version_id_alias,
+    typed_entity_by_branch_dml_rejects_branch_id_alias,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
             engine
-                .open_session(sim.main_version_id())
+                .open_session(sim.main_branch_id())
                 .await
                 .expect("main session should open"),
             &engine,
@@ -1782,7 +1782,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_by_version_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_by_branch_alias_scope_schema\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",
@@ -1791,16 +1791,16 @@ simulation_test!(
         .await
         .expect("registered schema insert should succeed");
 
-        main.create_version(CreateVersionOptions {
-            id: Some("by-version-alias-draft".to_string()),
-            name: "By-version Alias Draft".to_string(),
+        main.create_branch(CreateBranchOptions {
+            id: Some("by-branch-alias-draft".to_string()),
+            name: "By-branch Alias Draft".to_string(),
             from_commit_id: None,
         })
         .await
-        .expect("draft version should be created after schema registration");
+        .expect("draft branch should be created after schema registration");
 
         main.execute(
-            "INSERT INTO engine_by_version_alias_scope_schema \
+            "INSERT INTO engine_by_branch_alias_scope_schema \
              (id, name, lixcol_global, lixcol_untracked) \
              VALUES ('row-1', 'main', false, false)",
             &[],
@@ -1810,14 +1810,14 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("by-version-alias-draft")
+                .open_session("by-branch-alias-draft")
                 .await
                 .expect("draft session should open"),
             &engine,
         );
         draft
             .execute(
-                "INSERT INTO engine_by_version_alias_scope_schema \
+                "INSERT INTO engine_by_branch_alias_scope_schema \
                  (id, name, lixcol_global, lixcol_untracked) \
                  VALUES ('row-1', 'draft', false, false)",
                 &[],
@@ -1827,51 +1827,51 @@ simulation_test!(
 
         let update_error = main
             .execute(
-                "UPDATE engine_by_version_alias_scope_schema_by_version \
+                "UPDATE engine_by_branch_alias_scope_schema_by_branch \
                  SET name = 'updated-via-alias' \
                  WHERE lixcol_entity_pk = '[\"row-1\"]' \
-                   AND version_id = 'by-version-alias-draft'",
+                   AND branch_id = 'by-branch-alias-draft'",
                 &[],
             )
             .await
-            .expect_err("_by_version update should not accept version_id alias");
+            .expect_err("_by_branch update should not accept branch_id alias");
         assert_eq!(update_error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let delete_error = main
             .execute(
-                "DELETE FROM engine_by_version_alias_scope_schema_by_version \
+                "DELETE FROM engine_by_branch_alias_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = '[\"row-1\"]' \
-                   AND version_id = 'by-version-alias-draft'",
+                   AND branch_id = 'by-branch-alias-draft'",
                 &[],
             )
             .await
-            .expect_err("_by_version delete should not accept version_id alias");
+            .expect_err("_by_branch delete should not accept branch_id alias");
         assert_eq!(delete_error.code, LixError::CODE_COLUMN_NOT_FOUND);
 
         let result = main
             .execute(
                 &format!(
-                    "SELECT name, lixcol_version_id \
-                 FROM engine_by_version_alias_scope_schema_by_version \
+                    "SELECT name, lixcol_branch_id \
+                 FROM engine_by_branch_alias_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_version_id IN ('{}', 'by-version-alias-draft') \
+                   AND lixcol_branch_id IN ('{}', 'by-branch-alias-draft') \
                  ORDER BY name",
-                    sim.main_version_id()
+                    sim.main_branch_id()
                 ),
                 &[],
             )
             .await
-            .expect("by-version query should succeed");
+            .expect("by-branch query should succeed");
         assert_rows_eq(
             result,
             vec![
                 vec![
                     Value::Text("draft".to_string()),
-                    Value::Text("by-version-alias-draft".to_string()),
+                    Value::Text("by-branch-alias-draft".to_string()),
                 ],
                 vec![
                     Value::Text("main".to_string()),
-                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Text(sim.main_branch_id().to_string()),
                 ],
             ],
         );

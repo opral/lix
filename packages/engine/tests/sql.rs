@@ -99,6 +99,8 @@ mod entity_history;
 mod errors;
 #[path = "sql/history_conformance.rs"]
 mod history_conformance;
+#[path = "sql/lix_branch.rs"]
+mod lix_branch;
 #[path = "sql/lix_change.rs"]
 mod lix_change;
 #[path = "sql/lix_commit.rs"]
@@ -123,8 +125,6 @@ mod lix_registered_schema;
 mod lix_state;
 #[path = "sql/lix_state_history.rs"]
 mod lix_state_history;
-#[path = "sql/lix_version.rs"]
-mod lix_version;
 #[path = "sql/metadata.rs"]
 mod metadata;
 #[path = "sql/read_only.rs"]

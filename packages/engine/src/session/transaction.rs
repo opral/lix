@@ -35,7 +35,7 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.version_ctx),
+            Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
         )
         .await
@@ -73,11 +73,11 @@ where
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 
-    pub fn active_version_id(&self) -> Result<&str, LixError> {
+    pub fn active_branch_id(&self) -> Result<&str, LixError> {
         self.ensure_session_open()?;
         self.transaction
             .as_ref()
-            .map(|transaction| transaction.active_version_id())
+            .map(|transaction| transaction.active_branch_id())
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 

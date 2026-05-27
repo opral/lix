@@ -1,4 +1,5 @@
 use crate::binary_cas::BinaryCasContext;
+use crate::branch::{BranchContext, BranchRefReader};
 use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
     CommitChangeRefSet, CommitRecord,
@@ -8,13 +9,12 @@ use crate::functions::FunctionContext;
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
-use crate::transaction::prepare_version_ref_row;
+use crate::transaction::prepare_branch_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateIdentity, UntrackedStateIdentityRef, UntrackedStateRowRef,
 };
-use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,7 +29,7 @@ type RowIndex = usize;
 /// the new commit id.
 pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
-    version_ctx: &VersionContext,
+    branch_ctx: &BranchContext,
     runtime_functions: Option<&FunctionContext>,
     read: &mut (impl StorageRead + Send + Sync),
     prepared_writes: PreparedWriteSet,
@@ -46,14 +46,14 @@ pub(crate) async fn commit_prepared_writes(
 
     let state_rows = prepared_writes.state_rows;
     let finalized = finalize_commit_rows(
-        prepared_writes.commit_change_refs_by_version,
-        prepared_writes.extra_commit_parents_by_version,
-        version_ctx,
+        prepared_writes.commit_change_refs_by_branch,
+        prepared_writes.extra_commit_parents_by_branch,
+        branch_ctx,
         &*read,
     )
     .await?;
     let commit_rows = finalized.commit_rows;
-    let version_heads = finalized.version_heads;
+    let branch_heads = finalized.branch_heads;
     let tracked_roots = finalized.tracked_roots;
     let row_index = index_prepared_rows(&state_rows)?;
 
@@ -65,7 +65,7 @@ pub(crate) async fn commit_prepared_writes(
 
     if state_rows.is_empty()
         && commit_rows.is_empty()
-        && version_heads.is_empty()
+        && branch_heads.is_empty()
         && writes.is_empty()
     {
         return Ok(writes);
@@ -125,13 +125,13 @@ pub(crate) async fn commit_prepared_writes(
         .await?;
     }
 
-    for version_head in version_heads {
-        let canonical_row = prepare_version_ref_row(
-            &version_head.version_id,
-            &version_head.commit_id,
-            &version_head.timestamp,
+    for branch_head in branch_heads {
+        let canonical_row = prepare_branch_ref_row(
+            &branch_head.branch_id,
+            &branch_head.commit_id,
+            &branch_head.timestamp,
         )?;
-        version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
+        branch_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
     Ok(writes)
@@ -585,13 +585,13 @@ fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRow
         created_at: &row.created_at,
         updated_at: &row.updated_at,
         global: row.global,
-        version_id: &row.version_id,
+        branch_id: &row.branch_id,
     }
 }
 
 fn untracked_identity_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateIdentityRef<'_> {
     UntrackedStateIdentityRef {
-        version_id: &row.version_id,
+        branch_id: &row.branch_id,
         schema_key: &row.schema_key,
         entity_pk: &row.entity_pk,
         file_id: row.file_id.as_deref(),
@@ -600,7 +600,7 @@ fn untracked_identity_ref_from_state_row(row: &PreparedStateRow) -> UntrackedSta
 
 /// Materializes tracked staged change refs into changelog commits.
 ///
-/// Staging only accumulates `version_id -> change_ids` because commit ids,
+/// Staging only accumulates `branch_id -> change_ids` because commit ids,
 /// parent heads, and commit-row timestamps belong to transaction finalization.
 /// The `change_ids` list is the ordered set of canonical changes whose effects
 /// the commit introduces relative to its first parent.
@@ -611,11 +611,11 @@ fn untracked_identity_ref_from_state_row(row: &PreparedStateRow) -> UntrackedSta
 /// `commit_rows` are canonical changelog commit facts. tracked_state roots store
 /// serving commit roots keyed by the corresponding commit id.
 ///
-/// `version_heads` are moving refs. They are written through `VersionContext`,
+/// `branch_heads` are moving refs. They are written through `BranchContext`,
 /// not the canonical changelog.
 struct FinalizedCommitRows {
     commit_rows: Vec<FinalizedCommitRow>,
-    version_heads: Vec<PendingVersionHead>,
+    branch_heads: Vec<PendingBranchHead>,
     tracked_roots: Vec<PendingTrackedRoot>,
 }
 
@@ -627,8 +627,8 @@ struct FinalizedCommitRow {
     selected_change_refs: Vec<StagedCommitChangeRef>,
 }
 
-struct PendingVersionHead {
-    version_id: String,
+struct PendingBranchHead {
+    branch_id: String,
     commit_id: String,
     timestamp: String,
 }
@@ -639,16 +639,16 @@ struct PendingTrackedRoot {
 }
 
 async fn finalize_commit_rows(
-    commit_change_refs_by_version: BTreeMap<String, StagedCommitChangeRefs>,
-    extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
-    version_ctx: &VersionContext,
+    commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
+    extra_commit_parents_by_branch: BTreeMap<String, Vec<String>>,
+    branch_ctx: &BranchContext,
     read: &(impl StorageRead + Send + Sync + ?Sized),
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
-    let mut version_heads = Vec::new();
+    let mut branch_heads = Vec::new();
     let mut tracked_roots = Vec::new();
 
-    for (version_id, change_refs) in commit_change_refs_by_version {
+    for (branch_id, change_refs) in commit_change_refs_by_branch {
         if change_refs.is_empty() && !change_refs.allow_empty {
             continue;
         }
@@ -657,16 +657,16 @@ async fn finalize_commit_rows(
         let commit_change_id = change_refs.commit_change_id;
         let timestamp = change_refs.created_at;
         let selected_change_refs = change_refs.selected_change_refs;
-        let parent_commit_ids = version_ctx
+        let parent_commit_ids = branch_ctx
             .ref_reader(read)
-            .load_head_commit_id(&version_id)
+            .load_head_commit_id(&branch_id)
             .await?
             .into_iter()
             .collect::<Vec<_>>();
         let parent_commit_ids = merge_parent_commit_ids(
             parent_commit_ids,
-            extra_commit_parents_by_version
-                .get(&version_id)
+            extra_commit_parents_by_branch
+                .get(&branch_id)
                 .cloned()
                 .unwrap_or_default(),
         );
@@ -679,8 +679,8 @@ async fn finalize_commit_rows(
             change_id: commit_change_id,
             selected_change_refs,
         });
-        version_heads.push(PendingVersionHead {
-            version_id: version_id.clone(),
+        branch_heads.push(PendingBranchHead {
+            branch_id: branch_id.clone(),
             commit_id: commit_id.clone(),
             timestamp,
         });
@@ -692,7 +692,7 @@ async fn finalize_commit_rows(
 
     Ok(FinalizedCommitRows {
         commit_rows,
-        version_heads,
+        branch_heads,
         tracked_roots,
     })
 }
@@ -719,6 +719,7 @@ mod tests {
         Backend, BackendCapabilities, BackendError, BackendWrite, CommitResult, DurableWriteLock,
         KeyRange, PutBatch,
     };
+    use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
@@ -730,9 +731,8 @@ mod tests {
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
     };
-    use crate::version::VersionContext;
     use crate::NullableKeyFilter;
-    use crate::GLOBAL_VERSION_ID;
+    use crate::GLOBAL_BRANCH_ID;
 
     const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
     const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -749,7 +749,7 @@ mod tests {
     async fn commit_staged_writes_appends_changelog_and_updates_commit_root() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
@@ -757,17 +757,17 @@ mod tests {
         let state_rows = vec![tracked_global_row("change-1")];
         let writes = commit_prepared_writes(
             &binary_cas,
-            &version_ctx,
+            &branch_ctx,
             None,
             &mut read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                commit_change_refs_by_version: BTreeMap::from([(
-                    GLOBAL_VERSION_ID.to_string(),
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
                     change_refs(["change-1"]),
                 )]),
-                extra_commit_parents_by_version: BTreeMap::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -843,15 +843,15 @@ mod tests {
             "commit root should surface the derived lix_commit row"
         );
 
-        let loaded_head = version_ctx
+        let loaded_head = branch_ctx
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .load_head_commit_id(GLOBAL_BRANCH_ID)
             .await
-            .expect("version ref load should succeed");
+            .expect("branch ref load should succeed");
         assert_eq!(loaded_head.as_deref(), Some("test-uuid-1"));
     }
 
@@ -918,7 +918,7 @@ mod tests {
     async fn commit_with_only_untracked_writes_does_not_create_lix_commit() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
         let untracked_state = UntrackedStateContext::new();
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -927,14 +927,14 @@ mod tests {
         let state_rows = vec![untracked_global_row("change-untracked")];
         let writes = commit_prepared_writes(
             &binary_cas,
-            &version_ctx,
+            &branch_ctx,
             None,
             &mut read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                commit_change_refs_by_version: BTreeMap::new(),
-                extra_commit_parents_by_version: BTreeMap::new(),
+                commit_change_refs_by_branch: BTreeMap::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -953,7 +953,7 @@ mod tests {
             untracked_reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
                     file_id: NullableKeyFilter::Null,
                 })
@@ -973,7 +973,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let untracked_state = UntrackedStateContext::new();
         let live_state = Arc::new(live_state_context());
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
 
         let mut writes = StorageWriteSet::new();
         let staged_row = untracked_global_row("change-untracked");
@@ -996,17 +996,17 @@ mod tests {
         let state_rows = vec![tracked_global_row("change-tracked")];
         let writes = commit_prepared_writes(
             &binary_cas,
-            &version_ctx,
+            &branch_ctx,
             None,
             &mut read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                commit_change_refs_by_version: BTreeMap::from([(
-                    GLOBAL_VERSION_ID.to_string(),
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
                     change_refs(["change-tracked"]),
                 )]),
-                extra_commit_parents_by_version: BTreeMap::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -1050,7 +1050,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let live_state = Arc::new(live_state_context());
         let untracked_state = UntrackedStateContext::new();
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
         {
             let mut read = storage
                 .begin_read(StorageReadOptions::default())
@@ -1066,19 +1066,19 @@ mod tests {
             )
             .await
             .expect("empty tracked root should stage");
-            let version_ref_row = crate::transaction::prepare_version_ref_row(
-                GLOBAL_VERSION_ID,
+            let branch_ref_row = crate::transaction::prepare_branch_ref_row(
+                GLOBAL_BRANCH_ID,
                 crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
                 "1970-01-01T00:00:00.000Z",
             )
-            .expect("global version ref should stage");
+            .expect("global branch ref should stage");
             UntrackedStateContext::new()
                 .writer(&mut writes)
-                .stage_rows([version_ref_row.row.as_ref()])
-                .expect("global version ref should stage");
+                .stage_rows([branch_ref_row.row.as_ref()])
+                .expect("global branch ref should stage");
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
-                .expect("global version ref should commit");
+                .expect("global branch ref should commit");
         }
         {
             let mut writes = StorageWriteSet::new();
@@ -1104,7 +1104,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 global: true,
-                version_id: GLOBAL_VERSION_ID.to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
             };
             UntrackedStateContext::new()
                 .writer(&mut writes)
@@ -1136,17 +1136,17 @@ mod tests {
 
         let writes = commit_prepared_writes(
             &binary_cas,
-            &version_ctx,
+            &branch_ctx,
             Some(&runtime_functions),
             &mut read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![tracked_row, untracked_row],
-                commit_change_refs_by_version: BTreeMap::from([(
-                    GLOBAL_VERSION_ID.to_string(),
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
                     change_refs(["change-tracked"]),
                 )]),
-                extra_commit_parents_by_version: BTreeMap::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -1192,15 +1192,15 @@ mod tests {
             [Some(change)] if change.change_id == "change-tracked"
         ));
 
-        let loaded_head = version_ctx
+        let loaded_head = branch_ctx
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .load_head_commit_id(GLOBAL_BRANCH_ID)
             .await
-            .expect("version ref load should succeed");
+            .expect("branch ref load should succeed");
         assert_eq!(loaded_head.as_deref(), Some("test-uuid-1"));
 
         let untracked = {
@@ -1212,7 +1212,7 @@ mod tests {
             untracked_reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single("entity-2"),
                     file_id: NullableKeyFilter::Null,
                 })
@@ -1233,7 +1233,7 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
@@ -1247,37 +1247,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_version() {
+    async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_branch() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let binary_cas = BinaryCasContext::new();
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(storage.clone(), GLOBAL_VERSION_ID, "global-before")
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
+        crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
             .await;
-        crate::test_support::seed_version_head(storage.clone(), "version-a", "version-a-before")
-            .await;
+        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "branch-a-before").await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
-        let state_rows = vec![tracked_version_row("version-a", "change-version-a")];
+        let state_rows = vec![tracked_branch_row("branch-a", "change-branch-a")];
         let writes = commit_prepared_writes(
             &binary_cas,
-            &version_ctx,
+            &branch_ctx,
             None,
             &mut read,
             PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
                 state_rows,
-                commit_change_refs_by_version: BTreeMap::from([(
-                    "version-a".to_string(),
-                    change_refs(["change-version-a"]),
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs(["change-branch-a"]),
                 )]),
-                extra_commit_parents_by_version: BTreeMap::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
         .await
-        .expect("version commit should flush");
+        .expect("branch commit should flush");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should commit");
@@ -1300,133 +1299,128 @@ mod tests {
             panic!("changelog commit should exist");
         };
         assert_eq!(commit.change_id, "test-uuid-2");
-        assert_eq!(commit.parent_commit_ids, vec!["version-a-before"]);
+        assert_eq!(commit.parent_commit_ids, vec!["branch-a-before"]);
 
-        let global_head = version_ctx
+        let global_head = branch_ctx
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .load_head_commit_id(GLOBAL_BRANCH_ID)
             .await
             .expect("global head should load");
-        let version_head = version_ctx
+        let branch_head = branch_ctx
             .ref_reader(
                 storage
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .load_head_commit_id("version-a")
+            .load_head_commit_id("branch-a")
             .await
-            .expect("version head should load");
+            .expect("branch head should load");
         assert_eq!(global_head.as_deref(), Some("global-before"));
-        assert_eq!(version_head.as_deref(), Some("test-uuid-1"));
+        assert_eq!(branch_head.as_deref(), Some("test-uuid-1"));
     }
 
     #[tokio::test]
-    async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
+    async fn finalize_commit_rows_parents_global_commit_to_existing_branch_ref() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(
-            storage.clone(),
-            GLOBAL_VERSION_ID,
-            "initial-commit",
-        )
-        .await;
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
+        crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "initial-commit")
+            .await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
-                GLOBAL_VERSION_ID.to_string(),
+                GLOBAL_BRANCH_ID.to_string(),
                 change_refs(["change-a", "change-b"]),
             )]),
             BTreeMap::new(),
-            &version_ctx,
+            &branch_ctx,
             &mut read,
         )
         .await
         .expect("global commit row should finalize");
 
         assert_eq!(rows.commit_rows.len(), 1);
-        assert_eq!(rows.version_heads.len(), 1);
+        assert_eq!(rows.branch_heads.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, "test-uuid-1");
         assert_eq!(row.change_id, "test-uuid-2");
         assert_eq!(row.created_at, "test-timestamp-1");
         assert_eq!(row.parent_commit_ids, vec!["initial-commit"]);
 
-        let version_head = &rows.version_heads[0];
-        assert_eq!(version_head.version_id, GLOBAL_VERSION_ID);
-        assert_eq!(version_head.commit_id, "test-uuid-1");
+        let branch_head = &rows.branch_heads[0];
+        assert_eq!(branch_head.branch_id, GLOBAL_BRANCH_ID);
+        assert_eq!(branch_head.commit_id, "test-uuid-1");
     }
 
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
-                GLOBAL_VERSION_ID.to_string(),
+                GLOBAL_BRANCH_ID.to_string(),
                 StagedCommitChangeRefs::default(),
             )]),
             BTreeMap::new(),
-            &version_ctx,
+            &branch_ctx,
             &mut read,
         )
         .await
         .expect("empty change_refs should be ignored");
 
         assert!(rows.commit_rows.is_empty());
-        assert!(rows.version_heads.is_empty());
+        assert!(rows.branch_heads.is_empty());
     }
 
     #[tokio::test]
-    async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
+    async fn finalize_commit_rows_uses_existing_branch_ref_as_parent() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(storage.clone(), GLOBAL_VERSION_ID, "global-before")
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
+        crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
             .await;
-        crate::test_support::seed_version_head(storage.clone(), "version-a", "previous-commit")
-            .await;
+        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "previous-commit").await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let rows = finalize_commit_rows(
-            BTreeMap::from([("version-a".to_string(), change_refs(["change-a"]))]),
+            BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
             BTreeMap::new(),
-            &version_ctx,
+            &branch_ctx,
             &mut read,
         )
         .await
-        .expect("active-version commit finalization should resolve parent");
+        .expect("active-branch commit finalization should resolve parent");
 
         assert_eq!(
             rows.commit_rows[0].parent_commit_ids,
             vec!["previous-commit"]
         );
-        assert_eq!(rows.version_heads[0].version_id, "version-a");
+        assert_eq!(rows.branch_heads[0].branch_id, "branch-a");
     }
 
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
-        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(storage.clone(), "version-a", "target-head").await;
+        let branch_ctx = BranchContext::new(Arc::new(UntrackedStateContext::new()));
+        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "target-head").await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let rows = finalize_commit_rows(
-            BTreeMap::from([("version-a".to_string(), change_refs(["change-a"]))]),
-            BTreeMap::from([("version-a".to_string(), vec!["source-head".to_string()])]),
-            &version_ctx,
+            BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
+            BTreeMap::from([("branch-a".to_string(), vec!["source-head".to_string()])]),
+            &branch_ctx,
             &mut read,
         )
         .await
@@ -1451,10 +1445,10 @@ mod tests {
     }
 
     fn tracked_global_row(change_id: &str) -> PreparedStateRow {
-        tracked_version_row(GLOBAL_VERSION_ID, change_id)
+        tracked_branch_row(GLOBAL_BRANCH_ID, change_id)
     }
 
-    fn tracked_version_row(version_id: &str, change_id: &str) -> PreparedStateRow {
+    fn tracked_branch_row(branch_id: &str, change_id: &str) -> PreparedStateRow {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
@@ -1474,11 +1468,11 @@ mod tests {
             origin: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: version_id == GLOBAL_VERSION_ID,
+            global: branch_id == GLOBAL_BRANCH_ID,
             change_id: Some(change_id.to_string()),
             commit_id: Some("test-uuid-1".to_string()),
             untracked: false,
-            version_id: version_id.to_string(),
+            branch_id: branch_id.to_string(),
         }
     }
 
@@ -1504,7 +1498,7 @@ mod tests {
     fn untracked_request() -> UntrackedStateRowRequest {
         UntrackedStateRowRequest {
             schema_key: "test_schema".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
@@ -1513,7 +1507,7 @@ mod tests {
     fn live_state_request() -> LiveStateRowRequest {
         LiveStateRowRequest {
             schema_key: "test_schema".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }

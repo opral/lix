@@ -59,8 +59,8 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
 
     session
         .execute(
-            "UPDATE lix_key_value SET value = 'missing-version' \
-             WHERE key = 'lix_workspace_version_id'",
+            "UPDATE lix_key_value SET value = 'missing-branch' \
+             WHERE key = 'lix_workspace_branch_id'",
             &[],
         )
         .await
@@ -70,9 +70,9 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
     let error = session
         .execute("SELECT 1", &[])
         .await
-        .expect_err("missing active version should fail read pre-plan");
+        .expect_err("missing active branch should fail read pre-plan");
     assert!(
-        error.message.contains("missing-version"),
+        error.message.contains("missing-branch"),
         "unexpected error: {error:?}"
     );
 
@@ -100,8 +100,8 @@ async fn write_setup_failure_does_not_open_backend_write() {
 
     session
         .execute(
-            "UPDATE lix_key_value SET value = 'missing-version' \
-             WHERE key = 'lix_workspace_version_id'",
+            "UPDATE lix_key_value SET value = 'missing-branch' \
+             WHERE key = 'lix_workspace_branch_id'",
             &[],
         )
         .await
@@ -114,8 +114,8 @@ async fn write_setup_failure_does_not_open_backend_write() {
             &[],
         )
         .await
-        .expect_err("missing active version should fail write open");
-    assert_eq!(error.code, "LIX_VERSION_NOT_FOUND");
+        .expect_err("missing active branch should fail write open");
+    assert_eq!(error.code, "LIX_BRANCH_NOT_FOUND");
 
     let delta = backend.stats().delta_since(&before);
     assert_eq!(
@@ -141,7 +141,7 @@ async fn rebuild_tracked_state_does_not_commit_on_read_failure() {
     backend.fail_read_namespace("changelog.commit");
     let before = backend.stats();
     let error = engine
-        .rebuild_tracked_state_for_version(&receipt.main_version_id)
+        .rebuild_tracked_state_for_branch(&receipt.main_branch_id)
         .await
         .expect_err("forced changelog read failure should fail rebuild");
     assert!(
@@ -508,7 +508,7 @@ async fn transaction_read_can_query_history_surfaces() {
     let result = tx
         .execute(
             "SELECT entity_pk FROM lix_state_history \
-             WHERE start_commit_id = lix_active_version_commit_id() \
+             WHERE start_commit_id = lix_active_branch_commit_id() \
              AND schema_key = 'lix_key_value'",
             &[],
         )
@@ -625,7 +625,7 @@ async fn closed_session_still_allows_active_transaction_rollback() {
 }
 
 #[tokio::test]
-async fn closed_session_active_version_id_does_not_open_backend_read() {
+async fn closed_session_active_branch_id_does_not_open_backend_read() {
     let backend = RecordingBackend::new();
     let _receipt = Engine::initialize(backend.clone())
         .await
@@ -641,15 +641,15 @@ async fn closed_session_active_version_id_does_not_open_backend_read() {
     session.close().await.expect("session close should succeed");
     let before = backend.stats();
     let error = session
-        .active_version_id()
+        .active_branch_id()
         .await
-        .expect_err("active_version_id should reject a closed session");
+        .expect_err("active_branch_id should reject a closed session");
     assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
 
     let delta = backend.stats().delta_since(&before);
     assert_eq!(
         delta.read_opened, 0,
-        "closed active_version_id must reject before backend IO"
+        "closed active_branch_id must reject before backend IO"
     );
 }
 

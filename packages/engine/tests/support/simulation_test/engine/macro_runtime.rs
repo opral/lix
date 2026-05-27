@@ -60,7 +60,7 @@ pub(crate) async fn enable_deterministic_mode(
     mode: SimulationMode,
 ) -> Result<(), LixError> {
     let timestamp_shuffle = deterministic_timestamp_shuffle_for(mode);
-    let session = engine.open_session(receipt.main_version_id.clone()).await?;
+    let session = engine.open_session(receipt.main_branch_id.clone()).await?;
     match session
         .execute(&deterministic_mode_insert_sql(timestamp_shuffle), &[])
         .await
