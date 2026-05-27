@@ -1,15 +1,13 @@
-use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use redb::{
@@ -35,7 +33,6 @@ pub struct RedbBackendFixture {
 pub struct RedbBackend {
     path: PathBuf,
     db: Arc<Database>,
-    durable_write_lock: DurableWriteLock,
 }
 
 pub struct RedbRead {
@@ -101,14 +98,9 @@ impl BackendFixture for RedbBackendFixture {
 impl RedbBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
-        let durable_write_lock = durable_write_lock_for_path(&path);
         let db = Arc::new(Database::create(&path).map_err(redb_error)?);
         initialize_database(&db)?;
-        Ok(Self {
-            path,
-            db,
-            durable_write_lock,
-        })
+        Ok(Self { path, db })
     }
 
     #[allow(dead_code)]
@@ -127,11 +119,6 @@ impl Backend for RedbBackend {
         = RedbWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(RedbRead {
             read: self.db.begin_read().map_err(redb_error)?,
@@ -143,48 +130,6 @@ impl Backend for RedbBackend {
             write: self.db.begin_write().map_err(redb_error)?,
             stats: WriteStats::default(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
-    }
-}
-
-fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
-    let key = canonical_lock_key(path);
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .expect("redb durable write lock registry should not poison");
-    if let Some(lock) = locks.get(&key) {
-        return lock.clone();
-    }
-    let lock = DurableWriteLock::new();
-    locks.insert(key, lock.clone());
-    lock
-}
-
-fn canonical_lock_key(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return path;
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .expect("current directory should be available")
-            .join(path)
-    };
-    let Some(parent) = absolute.parent() else {
-        return absolute;
-    };
-    let Ok(parent) = parent.canonicalize() else {
-        return absolute;
-    };
-    match absolute.file_name() {
-        Some(file_name) => parent.join(file_name),
-        None => parent,
     }
 }
 

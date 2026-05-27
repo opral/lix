@@ -3,17 +3,17 @@ use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_rs_sdk::{
-    open_lix_with_backend, Backend, BackendCapabilities, BackendError, BackendRangeScan,
-    BackendRead, BackendWrite, CommitResult, CoreProjection, DurableWriteLock, GetOptions, Key,
-    KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
-    ScanResult, ScanVisitor, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    open_lix_with_backend, Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite,
+    CommitResult, CoreProjection, GetOptions, Key, KeyRange, Lix, LixError, PointVisitor,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
+    WriteOptions, WriteStats,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 pub type FileLix = Lix<FileBackend>;
 
@@ -172,21 +172,27 @@ fn remove_sidecar(path: &Path, suffix: &str) -> Result<(), CliError> {
 
 type KvMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
+// TODO: Replace this custom whole-file KV backend with SQLite for the CLI.
+// This backend exists only as a transitional local `.lix` file adapter. It
+// snapshots the entire file into memory and rewrites it on commit, so it is not
+// a real concurrent storage backend. The instance-local write gate below only
+// rejects overlapping writes through the same opened handle; separate handles
+// or processes can still overwrite each other. SQLite should own CLI durability
+// and write concurrency instead.
 #[derive(Clone)]
 pub struct FileBackend {
     path: Arc<PathBuf>,
     kv: Arc<Mutex<KvMap>>,
-    durable_write_lock: DurableWriteLock,
+    write_active: Arc<Mutex<bool>>,
 }
 
 impl FileBackend {
     fn from_path(path: &Path) -> Result<Self, CliError> {
         let kv = read_kv_file(path)?;
-        let durable_write_lock = durable_write_lock_for_path(path);
         Ok(Self {
             path: Arc::new(path.to_path_buf()),
             kv: Arc::new(Mutex::new(kv)),
-            durable_write_lock,
+            write_active: Arc::new(Mutex::new(false)),
         })
     }
 }
@@ -205,8 +211,10 @@ pub struct FileBackendRangeScan {
 pub struct FileBackendWrite {
     path: Arc<PathBuf>,
     parent: Arc<Mutex<KvMap>>,
+    write_active: Arc<Mutex<bool>>,
     kv: KvMap,
     stats: WriteStats,
+    closed: bool,
 }
 
 impl Backend for FileBackend {
@@ -219,11 +227,6 @@ impl Backend for FileBackend {
         = FileBackendWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
-    }
-
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(FileBackendRead {
             kv: self
@@ -235,20 +238,46 @@ impl Backend for FileBackend {
     }
 
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        {
+            let mut active = self
+                .write_active
+                .lock()
+                .map_err(|_| backend_lock_error("cli file backend write gate"))?;
+            if *active {
+                return Err(BackendError::Io(
+                    "cli file backend write transaction already active".to_string(),
+                ));
+            }
+            *active = true;
+        }
+        let kv = match self
+            .kv
+            .lock()
+            .map_err(|_| backend_lock_error("cli file backend kv"))
+            .map(|parent| parent.clone())
+        {
+            Ok(kv) => kv,
+            Err(error) => {
+                self.clear_write_active();
+                return Err(error);
+            }
+        };
         Ok(FileBackendWrite {
             path: Arc::clone(&self.path),
             parent: Arc::clone(&self.kv),
-            kv: self
-                .kv
-                .lock()
-                .map_err(|_| backend_lock_error("cli file backend kv"))?
-                .clone(),
+            write_active: Arc::clone(&self.write_active),
+            kv,
             stats: WriteStats::default(),
+            closed: false,
         })
     }
+}
 
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.durable_write_lock.clone()
+impl FileBackend {
+    fn clear_write_active(&self) {
+        if let Ok(mut active) = self.write_active.lock() {
+            *active = false;
+        }
     }
 }
 
@@ -364,20 +393,40 @@ impl BackendWrite for FileBackendWrite {
         Ok(())
     }
 
-    fn commit(self) -> Result<CommitResult, BackendError> {
+    fn commit(mut self) -> Result<CommitResult, BackendError> {
         write_kv_file(&self.path, &self.kv).map_err(lix_to_backend_error)?;
         *self
             .parent
             .lock()
-            .map_err(|_| backend_lock_error("cli file backend kv"))? = self.kv;
+            .map_err(|_| backend_lock_error("cli file backend kv"))? = self.kv.clone();
+        self.closed = true;
+        self.clear_write_active();
         Ok(CommitResult {
             commit_id: None,
-            stats: self.stats,
+            stats: self.stats.clone(),
         })
     }
 
-    fn rollback(self) -> Result<(), BackendError> {
+    fn rollback(mut self) -> Result<(), BackendError> {
+        self.closed = true;
+        self.clear_write_active();
         Ok(())
+    }
+}
+
+impl FileBackendWrite {
+    fn clear_write_active(&self) {
+        if let Ok(mut active) = self.write_active.lock() {
+            *active = false;
+        }
+    }
+}
+
+impl Drop for FileBackendWrite {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.clear_write_active();
+        }
     }
 }
 
@@ -471,44 +520,6 @@ fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValue
 
 fn stored_value_bytes(value: StoredValue) -> Vec<u8> {
     value.bytes.to_vec()
-}
-
-fn durable_write_lock_for_path(path: &Path) -> DurableWriteLock {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, DurableWriteLock>>> = OnceLock::new();
-    let key = canonical_lock_key(path);
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .expect("cli file backend write lock registry should not poison");
-    if let Some(lock) = locks.get(&key) {
-        return lock.clone();
-    }
-    let lock = DurableWriteLock::new();
-    locks.insert(key, lock.clone());
-    lock
-}
-
-fn canonical_lock_key(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return path;
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .expect("current directory should be available")
-            .join(path)
-    };
-    let Some(parent) = absolute.parent() else {
-        return absolute;
-    };
-    let Ok(parent) = parent.canonicalize() else {
-        return absolute;
-    };
-    match absolute.file_name() {
-        Some(file_name) => parent.join(file_name),
-        None => parent,
-    }
 }
 
 fn encode_bytes(bytes: &[u8]) -> String {

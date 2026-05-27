@@ -1,11 +1,10 @@
 //! Lix engine runtime.
 //!
 //! MVP transaction boundary:
-//! - Engine/session APIs provide one process-local durable write lane per
-//!   backend durable target.
+//! - Engine/session APIs coordinate session lifecycle and commit boundaries.
 //! - Explicit transactions serialize with implicit session writes on the same
-//!   handle and durable target. The MVP does not promise multi-branch snapshot
-//!   isolation across concurrent sessions beyond each backend read snapshot.
+//!   handle. The MVP does not promise multi-branch snapshot isolation across
+//!   concurrent sessions beyond each backend read snapshot.
 //! - `SessionContext::close()` is a lifecycle boundary. It waits for in-flight
 //!   reads, rejects live explicit transactions, cancels queued or pre-boundary
 //!   writes, and waits once a commit has entered the durable point-of-no-return.
@@ -13,7 +12,7 @@
 //!   engine WAL, fsync policy, or recovery protocol above backend commits.
 //! - `backend` and `storage` are low-level surfaces. Code that bypasses
 //!   `Engine`/`SessionContext` also bypasses session lifecycle accounting and
-//!   must provide its own serialization.
+//!   relies on backend-provided serialization.
 
 pub mod backend;
 mod binary_cas;
@@ -64,15 +63,14 @@ pub use backend::conformance::{
     ConformanceStatus as BackendConformanceStatus, ConformanceTest as BackendConformanceTest,
 };
 pub use backend::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendCapabilities,
-    BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
-    CoreProjection, Durability, DurableWriteGuard, DurableWriteLock, GetManyResult, GetOptions,
-    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRangeScan,
-    InMemoryRead, InMemoryScanVisitResult, InMemoryWrite, Key, Key as BackendKey, KeyRange,
-    KeyRef as BackendKeyRef, PointVisitor, Prefix as BackendPrefix, ProjectedValue,
-    ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, ScanResult, ScanVisitor, SnapshotRef, SpaceId, StoredValue, Value as BackendValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
+    BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult, CoreProjection,
+    Durability, GetManyResult, GetOptions, InMemoryBackend, InMemoryBackendFactory,
+    InMemoryBackendFixture, InMemoryRangeScan, InMemoryRead, InMemoryScanVisitResult,
+    InMemoryWrite, Key, Key as BackendKey, KeyRange, KeyRef as BackendKeyRef, PointVisitor,
+    Prefix as BackendPrefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry,
+    ReadConsistency, ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
+    SnapshotRef, SpaceId, StoredValue, Value as BackendValue, WriteOptions, WriteStats,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

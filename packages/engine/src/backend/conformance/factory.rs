@@ -1,16 +1,10 @@
-use crate::backend::{
-    Backend, BackendCapabilities, BackendError, DurableWriteLock, ReadOptions, WriteOptions,
-};
+use crate::backend::{Backend, BackendError, ReadOptions, WriteOptions};
 
 pub trait BackendFactory {
     type Backend: Backend;
     type Fixture: BackendFixture<Backend = Self::Backend>;
 
     fn create_fixture(&self) -> Self::Fixture;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.create_fixture().open().capabilities()
-    }
 
     fn config(&self) -> BackendTestConfig {
         BackendTestConfig::default()
@@ -56,20 +50,12 @@ where
     where
         Self: 'a;
 
-    fn capabilities(&self) -> BackendCapabilities {
-        self.backend.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.backend.begin_read(opts)
     }
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.backend.begin_write(opts)
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.backend.durable_write_lock()
     }
 }
 

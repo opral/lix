@@ -6,7 +6,7 @@
 //!
 //! Storage is intentionally below the session transaction lifecycle. Direct
 //! users of `StorageContext` or `StorageWriteSet` bypass session close/commit
-//! accounting and must serialize durable writes themselves.
+//! accounting and rely on backend-provided serialization.
 
 mod context;
 mod point;
@@ -29,10 +29,9 @@ pub type StorageBackendReadOf<'a, B> = <B as crate::backend::Backend>::Read<'a>;
 
 pub use crate::backend::{
     BackendError as StorageBackendError, CoreProjection as StorageCoreProjection,
-    DurableWriteGuard, DurableWriteLock, GetOptions as StorageGetOptions,
-    InMemoryBackend as InMemoryStorageBackend, InMemoryRead as InMemoryStorageRead,
-    InMemoryWrite as InMemoryStorageWrite, Key as StorageKey, KeyRange as StorageKeyRange,
-    Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
+    GetOptions as StorageGetOptions, InMemoryBackend as InMemoryStorageBackend,
+    InMemoryRead as InMemoryStorageRead, InMemoryWrite as InMemoryStorageWrite, Key as StorageKey,
+    KeyRange as StorageKeyRange, Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
     ReadOptions as StorageReadOptions, ScanOptions as StorageScanOptions,
     SpaceId as StorageSpaceId, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
 };

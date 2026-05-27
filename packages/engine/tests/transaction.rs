@@ -5,11 +5,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::backend::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    DurableWriteLock, GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange,
-    PointVisitor, PutBatch, ReadOptions, ScanOptions, WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
+    InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
+    WriteOptions,
 };
-use lix_engine::{Engine, ExecuteResult, Value};
+use lix_engine::Engine;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -30,17 +30,6 @@ fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
         Ok(result) => result,
         Err(_) => panic!("{description} panicked"),
     }
-}
-
-fn single_text(result: ExecuteResult) -> String {
-    let row = result
-        .rows()
-        .first()
-        .expect("result should contain one row");
-    let Value::Text(value) = &row.values()[0] else {
-        panic!("result value should be text");
-    };
-    value.clone()
 }
 
 #[tokio::test]
@@ -249,234 +238,6 @@ async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
         .await
         .expect("timed out closing after active transaction rejection")
         .expect("session close should succeed after rollback");
-}
-
-#[tokio::test]
-async fn concurrent_deterministic_runtime_reads_serialize_sequence_prepare() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
-        .await
-        .expect("initialized backend should create an engine");
-    let first_session = Arc::new(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("first workspace session should open"),
-    );
-    let second_session = Arc::new(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("second workspace session should open"),
-    );
-
-    first_session
-        .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-             VALUES ('lix_deterministic_mode', \
-             lix_json('{\"enabled\":true}'), true, true)",
-            &[],
-        )
-        .await
-        .expect("deterministic mode insert should succeed");
-
-    let barrier = Arc::new(std::sync::Barrier::new(3));
-    let handles = [first_session, second_session]
-        .into_iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime should build");
-                runtime.block_on(async move {
-                    let result = session
-                        .execute("SELECT lix_uuid_v7()", &[])
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("concurrent deterministic read {index} failed: {error:?}")
-                        });
-                    single_text(result)
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    barrier.wait();
-    let mut values = handles
-        .into_iter()
-        .enumerate()
-        .map(|(index, handle)| join_thread(handle, &format!("deterministic read {index}")))
-        .collect::<Vec<_>>();
-    values.sort();
-
-    assert_eq!(
-        values,
-        vec![
-            "01920000-0000-7000-8000-000000000000".to_string(),
-            "01920000-0000-7000-8000-000000000001".to_string(),
-        ],
-        "concurrent deterministic reads should reserve distinct sequence values"
-    );
-}
-
-#[tokio::test]
-async fn concurrent_deterministic_runtime_reads_serialize_across_engine_handles() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let first_engine = Engine::new(backend.clone())
-        .await
-        .expect("first initialized backend handle should create an engine");
-    let second_engine = Engine::new(backend)
-        .await
-        .expect("second initialized backend handle should create an engine");
-    let first_session = Arc::new(
-        first_engine
-            .open_workspace_session()
-            .await
-            .expect("first workspace session should open"),
-    );
-    let second_session = Arc::new(
-        second_engine
-            .open_workspace_session()
-            .await
-            .expect("second workspace session should open"),
-    );
-
-    first_session
-        .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-             VALUES ('lix_deterministic_mode', \
-             lix_json('{\"enabled\":true}'), true, true)",
-            &[],
-        )
-        .await
-        .expect("deterministic mode insert should succeed");
-
-    let barrier = Arc::new(std::sync::Barrier::new(3));
-    let handles = [first_session, second_session]
-        .into_iter()
-        .enumerate()
-        .map(|(index, session)| {
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime should build");
-                runtime.block_on(async move {
-                    let result = session
-                        .execute("SELECT lix_uuid_v7()", &[])
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("cross-engine deterministic read {index} failed: {error:?}")
-                        });
-                    single_text(result)
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-
-    barrier.wait();
-    let mut values = handles
-        .into_iter()
-        .enumerate()
-        .map(|(index, handle)| join_thread(handle, &format!("cross-engine read {index}")))
-        .collect::<Vec<_>>();
-    values.sort();
-
-    assert_eq!(
-        values,
-        vec![
-            "01920000-0000-7000-8000-000000000000".to_string(),
-            "01920000-0000-7000-8000-000000000001".to_string(),
-        ],
-        "engine handles over one backend should share deterministic reservations"
-    );
-}
-
-#[tokio::test]
-async fn explicit_transaction_runtime_read_reserves_sequence_before_concurrent_session_read() {
-    let backend = RecordingBackend::new();
-    let _receipt = Engine::initialize(backend.clone())
-        .await
-        .expect("backend should initialize");
-    let engine = Engine::new(backend)
-        .await
-        .expect("initialized backend should create an engine");
-    let first_session = engine
-        .open_workspace_session()
-        .await
-        .expect("first workspace session should open");
-    let second_session = Arc::new(
-        engine
-            .open_workspace_session()
-            .await
-            .expect("second workspace session should open"),
-    );
-
-    first_session
-        .execute(
-            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
-             VALUES ('lix_deterministic_mode', \
-             lix_json('{\"enabled\":true}'), true, true)",
-            &[],
-        )
-        .await
-        .expect("deterministic mode insert should succeed");
-
-    let mut transaction = first_session
-        .begin_transaction()
-        .await
-        .expect("transaction should begin");
-    assert_eq!(
-        single_text(
-            transaction
-                .execute("SELECT lix_uuid_v7()", &[])
-                .await
-                .expect("transaction deterministic read should succeed")
-        ),
-        "01920000-0000-7000-8000-000000000000",
-    );
-
-    let reader_session = Arc::clone(&second_session);
-    let reader = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime should build");
-        runtime.block_on(async move {
-            let result = reader_session
-                .execute("SELECT lix_uuid_v7()", &[])
-                .await
-                .expect("concurrent deterministic read should succeed");
-            single_text(result)
-        })
-    });
-
-    thread::sleep(Duration::from_millis(20));
-    assert!(
-        !reader.is_finished(),
-        "concurrent deterministic read should wait for explicit transaction write access"
-    );
-
-    transaction
-        .commit()
-        .await
-        .expect("transaction commit should persist deterministic sequence");
-    assert_eq!(
-        join_thread(reader, "concurrent deterministic session read"),
-        "01920000-0000-7000-8000-000000000001",
-    );
 }
 
 #[tokio::test]
@@ -704,7 +465,7 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
 }
 
 #[tokio::test]
-async fn close_during_transaction_commit_aborts_before_backend_write() {
+async fn close_during_transaction_commit_waits_after_commit_boundary() {
     let backend = BlockingBeginReadBackend::new();
     let gate = backend.gate();
     let _receipt = Engine::initialize(backend.clone())
@@ -748,27 +509,28 @@ async fn close_during_transaction_commit_aborts_before_backend_write() {
             .expect("test runtime should build");
         runtime.block_on(async move { close_session.close().await })
     });
-    wait_until("session to be marked closed", || session.is_closed());
     assert!(
         !closer.is_finished(),
-        "close should wait for the blocked commit to exit"
+        "close should wait for the blocked commit boundary to exit"
     );
     gate.release();
-    join_thread(closer, "close while commit waits before backend write")
-        .expect("session close should succeed");
-
-    let error = join_thread(committer, "committer waiting before backend write")
-        .expect_err("commit should observe the close before durable writes");
-    assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
+    join_thread(committer, "committer waiting after commit boundary")
+        .expect("commit past the boundary should finish before close");
+    join_thread(closer, "close while commit waits after commit boundary")
+        .expect("session close should succeed after commit exits");
 
     let delta = backend.stats().delta_since(&before);
     assert_eq!(
-        delta.write_opened, 0,
-        "closed transaction commit must abort before opening a backend write"
+        delta.write_opened, 1,
+        "commit preparation should open a backend write"
     );
     assert_eq!(
-        delta.write_committed, 0,
-        "closed transaction commit must not commit backend writes"
+        delta.write_committed, 1,
+        "commit past the boundary should commit backend writes"
+    );
+    assert_eq!(
+        delta.write_rolled_back, 0,
+        "commit past the boundary should not roll back backend writes"
     );
 }
 
@@ -990,11 +752,6 @@ impl Backend for BlockingBeginWriteBackend {
         = <RecordingBackend as Backend>::Write<'a>
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.inner.begin_read(opts)
     }
@@ -1002,10 +759,6 @@ impl Backend for BlockingBeginWriteBackend {
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.gate.maybe_block();
         self.inner.begin_write(opts)
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.inner.durable_write_lock()
     }
 }
 
@@ -1019,11 +772,6 @@ impl Backend for BlockingBeginReadBackend {
         = <RecordingBackend as Backend>::Write<'a>
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.gate.maybe_block();
         self.inner.begin_read(opts)
@@ -1031,10 +779,6 @@ impl Backend for BlockingBeginReadBackend {
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         self.inner.begin_write(opts)
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.inner.durable_write_lock()
     }
 }
 
@@ -1048,11 +792,6 @@ impl Backend for BlockingCommitBackend {
         = BlockingCommitWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.inner.begin_read(opts)
     }
@@ -1062,10 +801,6 @@ impl Backend for BlockingCommitBackend {
             inner: self.inner.begin_write(opts)?,
             gate: self.gate.clone(),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.inner.durable_write_lock()
     }
 }
 
@@ -1214,11 +949,6 @@ impl Backend for RecordingBackend {
         = RecordingWrite
     where
         Self: 'a;
-
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
     fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         self.stats.read_opened.fetch_add(1, Ordering::SeqCst);
         Ok(RecordingRead {
@@ -1235,10 +965,6 @@ impl Backend for RecordingBackend {
             stats: Arc::clone(&self.stats),
             fail_write_namespace: Arc::clone(&self.fail_write_namespace),
         })
-    }
-
-    fn durable_write_lock(&self) -> DurableWriteLock {
-        self.inner.durable_write_lock()
     }
 }
 
