@@ -5,6 +5,7 @@ use super::types::{
 use crate::common::LixError;
 use crate::storage::{StorageSpace, StorageSpaceId};
 use async_trait::async_trait;
+use std::fmt;
 
 pub(crate) const COMMIT_NAMESPACE: &str = "changelog.commit";
 pub(crate) const CHANGE_NAMESPACE: &str = "changelog.change";
@@ -19,21 +20,21 @@ pub(crate) const COMMIT_CHANGE_REF_CHUNK_SPACE: StorageSpace = StorageSpace::new
     COMMIT_CHANGE_REF_CHUNK_NAMESPACE,
 );
 
-pub(crate) fn commit_key(commit_id: &str) -> Vec<u8> {
+pub(crate) fn commit_key(commit_id: impl fmt::Display) -> Vec<u8> {
     identity_key(commit_id)
 }
 
-pub(crate) fn change_key(change_id: &str) -> Vec<u8> {
+pub(crate) fn change_key(change_id: impl fmt::Display) -> Vec<u8> {
     identity_key(change_id)
 }
 
-pub(crate) fn commit_change_ref_chunk_prefix(commit_id: &str) -> Vec<u8> {
+pub(crate) fn commit_change_ref_chunk_prefix(commit_id: impl fmt::Display) -> Vec<u8> {
     let mut key = Vec::new();
     push_ordered_str(&mut key, commit_id);
     key
 }
 
-pub(crate) fn commit_change_ref_chunk_key(commit_id: &str, chunk_no: u32) -> Vec<u8> {
+pub(crate) fn commit_change_ref_chunk_key(commit_id: impl fmt::Display, chunk_no: u32) -> Vec<u8> {
     let mut key = commit_change_ref_chunk_prefix(commit_id);
     key.extend_from_slice(&chunk_no.to_be_bytes());
     key
@@ -52,11 +53,12 @@ pub(crate) fn commit_change_ref_chunk_ids_from_key(key: &[u8]) -> Result<(String
     Ok((commit_id, chunk_no))
 }
 
-fn identity_key(id: &str) -> Vec<u8> {
-    id.as_bytes().to_vec()
+fn identity_key(id: impl fmt::Display) -> Vec<u8> {
+    id.to_string().into_bytes()
 }
 
-fn push_ordered_str(out: &mut Vec<u8>, value: &str) {
+fn push_ordered_str(out: &mut Vec<u8>, value: impl fmt::Display) {
+    let value = value.to_string();
     for byte in value.as_bytes() {
         out.push(*byte);
         if *byte == 0 {

@@ -1,8 +1,10 @@
+use crate::changelog::CommitId;
+
 /// Current changelog head for a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchHead {
     pub(crate) branch_id: String,
-    pub(crate) commit_id: String,
+    pub(crate) commit_id: CommitId,
 }
 
 /// Typed reader for moving branch heads.
@@ -13,7 +15,7 @@ pub(crate) trait BranchRefReader: Send + Sync {
     async fn load_head_commit_id(
         &self,
         branch_id: &str,
-    ) -> Result<Option<String>, crate::LixError> {
+    ) -> Result<Option<CommitId>, crate::LixError> {
         Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 

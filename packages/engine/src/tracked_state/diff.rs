@@ -1,3 +1,4 @@
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
@@ -51,8 +52,8 @@ pub(crate) struct TrackedStateDiffRow {
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
-    pub(crate) change_id: String,
-    pub(crate) commit_id: String,
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
 }
 
 /// Root-local tracked-state identity.
@@ -274,6 +275,15 @@ mod tests {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
     }
 
+    fn change_id(label: &str) -> String {
+        ChangeId::for_test_label(label).to_string()
+    }
+
+    fn commit_row_change_id(commit_id: &str) -> String {
+        let commit_id = CommitId::for_test_label(commit_id);
+        ChangeId::for_test_label(&format!("{commit_id}:commit")).to_string()
+    }
+
     #[tokio::test]
     async fn diff_commits_reports_added_rows() {
         let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
@@ -289,8 +299,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("after")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("after"))
         );
         assert!(!diff.entries[0].before_is_live());
         assert!(diff.entries[0].after_is_live());
@@ -310,8 +320,8 @@ mod tests {
             diff.entries[0]
                 .before
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("before")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("before"))
         );
         assert!(diff.entries[0].after.is_none());
         assert!(diff.entries[0].before_is_live());
@@ -334,8 +344,8 @@ mod tests {
         );
         let entry = &diff.entries[0];
         assert_eq!(
-            entry.after.as_ref().map(|row| row.change_id.as_str()),
-            Some("delete")
+            entry.after.as_ref().map(|row| row.change_id.to_string()),
+            Some(change_id("delete"))
         );
         assert!(
             entry.after.as_ref().is_some_and(|row| row.deleted),
@@ -361,8 +371,8 @@ mod tests {
         );
         let entry = &diff.entries[0];
         assert_eq!(
-            entry.before.as_ref().map(|row| row.change_id.as_str()),
-            Some("delete")
+            entry.before.as_ref().map(|row| row.change_id.to_string()),
+            Some(change_id("delete"))
         );
         assert!(
             entry.before.as_ref().is_some_and(|row| row.deleted),
@@ -493,7 +503,8 @@ mod tests {
     async fn diff_validation_rejects_missing_changelog_change() {
         let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
         let mut diff = diff(&storage, &tracked_state).await;
-        diff.entries[0].after.as_mut().expect("after row").change_id = "missing-change".to_string();
+        diff.entries[0].after.as_mut().expect("after row").change_id =
+            ChangeId::for_test_label("missing-change");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -627,15 +638,22 @@ mod tests {
         value.created_at =
             crate::common::LixTimestamp::expect_parse("created_at", "2026-01-03T00:00:00Z");
         value.updated_at = crate::common::LixTimestamp::expect_parse("updated_at", &updated_at);
-        let parent_commit_row =
-            commit_root_row_entry("parent", "parent:commit", "2026-01-01T00:00:00Z");
-        let commit_row = commit_root_row_entry("child", "child:commit", "2026-01-02T00:00:00Z");
+        let parent_commit_row = commit_root_row_entry(
+            "parent",
+            &commit_row_change_id("parent"),
+            "2026-01-01T00:00:00Z",
+        );
+        let commit_row = commit_root_row_entry(
+            "child",
+            &commit_row_change_id("child"),
+            "2026-01-02T00:00:00Z",
+        );
         stage_corrupt_commit_root(
             &storage,
             "child",
             vec![(key, value), parent_commit_row, commit_row],
             vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
@@ -719,7 +737,7 @@ mod tests {
             crate::tracked_state::storage::stage_commit_root(
                 &mut writes,
                 &TrackedStateCommitRoot {
-                    commit_id: "right-corrupt".to_string(),
+                    commit_id: CommitId::for_test_label("right-corrupt"),
                     root_id: result.root_id.clone(),
                     parent_roots: Vec::new(),
                     changed_key_count: 1,
@@ -800,7 +818,7 @@ mod tests {
             "child",
             vec![(stale_key, stale_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
@@ -887,7 +905,7 @@ mod tests {
             crate::tracked_state::storage::stage_commit_root(
                 &mut writes,
                 &TrackedStateCommitRoot {
-                    commit_id: "right-corrupt".to_string(),
+                    commit_id: CommitId::for_test_label("right-corrupt"),
                     root_id: result.root_id.clone(),
                     parent_roots: Vec::new(),
                     changed_key_count: 1,
@@ -977,7 +995,7 @@ mod tests {
             "merge",
             vec![(source_key, source_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "target".to_string(),
+                commit_id: CommitId::for_test_label("target"),
                 root_id: tracked_state_root_id(&storage, "target").await,
             }],
         )
@@ -1055,7 +1073,7 @@ mod tests {
             "merge",
             vec![(source_key, source_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "source".to_string(),
+                commit_id: CommitId::for_test_label("source"),
                 root_id: tracked_state_root_id(&storage, "source").await,
             }],
         )
@@ -1130,7 +1148,7 @@ mod tests {
             "right-corrupt",
             vec![(source_key, source_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "source".to_string(),
+                commit_id: CommitId::for_test_label("source"),
                 root_id: tracked_state_root_id(&storage, "source").await,
             }],
         )
@@ -1200,7 +1218,7 @@ mod tests {
             "child",
             vec![(child_key, child_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "source".to_string(),
+                commit_id: CommitId::for_test_label("source"),
                 root_id: tracked_state_root_id(&storage, "source").await,
             }],
         )
@@ -1270,7 +1288,7 @@ mod tests {
             "child",
             vec![(stale_key, stale_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "grandparent".to_string(),
+                commit_id: CommitId::for_test_label("grandparent"),
                 root_id: tracked_state_root_id(&storage, "grandparent").await,
             }],
         )
@@ -1454,7 +1472,7 @@ mod tests {
             "child",
             vec![(unrelated_key, unrelated_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
@@ -1526,7 +1544,7 @@ mod tests {
             "child",
             vec![(unrelated_key, unrelated_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
@@ -1624,7 +1642,7 @@ mod tests {
             "left",
             vec![(left_key, left_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
@@ -1634,7 +1652,7 @@ mod tests {
             "right",
             vec![(right_key, right_value)],
             vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: tracked_state_root_id(&storage, "parent").await,
             }],
         )
@@ -1861,8 +1879,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("child-delete")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("child-delete"))
         );
     }
 
@@ -1999,7 +2017,7 @@ mod tests {
         crate::tracked_state::storage::stage_commit_root(
             &mut writes,
             &TrackedStateCommitRoot {
-                commit_id: commit_id.to_string(),
+                commit_id: CommitId::for_test_label(commit_id),
                 root_id: result.root_id,
                 parent_roots,
                 changed_key_count,
@@ -2058,18 +2076,20 @@ mod tests {
         change_id: &str,
         created_at: &str,
     ) -> (TrackedStateKey, TrackedStateIndexValue) {
+        let commit_id = CommitId::for_test_label(commit_id);
+        let commit_id_text = commit_id.to_string();
         (
             TrackedStateKey {
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single(commit_id),
+                entity_pk: EntityPk::single(&commit_id_text),
             },
             TrackedStateIndexValue {
-                change_id: change_id.to_string(),
-                commit_id: commit_id.to_string(),
+                change_id: ChangeId::for_test_label(change_id),
+                commit_id,
                 deleted: false,
                 snapshot_ref: Some(JsonRef::for_content(
-                    format!("{{\"id\":\"{commit_id}\"}}").as_bytes(),
+                    format!("{{\"id\":\"{commit_id_text}\"}}").as_bytes(),
                 )),
                 metadata_ref: None,
                 created_at: crate::common::LixTimestamp::expect_parse("created_at", created_at),
@@ -2141,8 +2161,8 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: change_id.to_string(),
-            commit_id: change_id.replace("change", "commit"),
+            change_id: ChangeId::for_test_label(change_id),
+            commit_id: CommitId::for_test_label(&change_id.replace("change", "commit")),
         }
     }
 }

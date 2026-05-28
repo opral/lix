@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
+use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::LixTimestamp;
 use crate::domain::Domain;
@@ -587,10 +588,10 @@ where
     pub(crate) async fn advance_branch_ref(
         &mut self,
         branch_id: &str,
-        commit_id: &str,
+        commit_id: crate::changelog::CommitId,
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp();
-        let canonical_row = prepare_branch_ref_row(branch_id, commit_id, &timestamp)?;
+        let canonical_row = prepare_branch_ref_row(branch_id, &commit_id, &timestamp)?;
         self.branch_ctx
             .stage_canonical_ref_rows(&mut self.staged_storage_writes, &[canonical_row.row])
     }
@@ -598,7 +599,7 @@ where
     pub(crate) fn stage_merge_commit(
         &self,
         branch_id: String,
-        source_parent_commit_id: String,
+        source_parent_commit_id: crate::changelog::CommitId,
         selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
     ) -> Result<String, LixError> {
         let commit_id = self
@@ -791,10 +792,20 @@ fn prepare_state_row(
         global: row.global,
         change_id: if row.untracked {
             row.change_id
+                .as_deref()
+                .map(|id| ChangeId::parse_lix(id, "prepared untracked row change_id"))
+                .transpose()?
         } else {
-            Some(row.change_id.unwrap_or_else(|| functions.call_uuid_v7()))
+            Some(ChangeId::parse_lix(
+                &row.change_id.unwrap_or_else(|| functions.call_uuid_v7()),
+                "prepared tracked row change_id",
+            )?)
         },
-        commit_id: row.commit_id,
+        commit_id: row
+            .commit_id
+            .as_deref()
+            .map(|id| CommitId::parse_lix(id, "prepared row commit_id"))
+            .transpose()?,
         untracked: row.untracked,
         branch_id: row.branch_id,
     })
@@ -873,7 +884,10 @@ where
         overlay_scan_rows(&base, &staged, request).await
     }
 
-    async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+    async fn load_branch_head(
+        &mut self,
+        branch_id: &str,
+    ) -> Result<Option<crate::changelog::CommitId>, LixError> {
         let read = self.storage.begin_read(StorageReadOptions::default())?;
         let result = self
             .branch_ctx
@@ -1059,7 +1073,7 @@ mod tests {
         )
     }
 
-    const SCHEMA_FIXTURE_COMMIT_ID: &str = "schema-fixture-commit";
+    const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
 
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
@@ -1158,7 +1172,7 @@ mod tests {
                     .expect("read should open"),
             )
             .load_rows_at_commit(
-                &head_commit_id,
+                &head_commit_id.to_string(),
                 &[TrackedStateKey {
                     schema_key: "lix_key_value".to_string(),
                     entity_pk: crate::entity_pk::EntityPk::single("tracked-programmatic"),
@@ -1221,7 +1235,10 @@ mod tests {
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(&head_commit_id, &TrackedStateScanRequest::default())
+            .scan_rows_at_commit(
+                &head_commit_id.to_string(),
+                &TrackedStateScanRequest::default(),
+            )
             .await
             .expect("tracked state should scan");
         assert!(
@@ -1231,6 +1248,43 @@ mod tests {
                     != Ok("untracked-programmatic")),
             "untracked staged rows should not be written into tracked state"
         );
+    }
+
+    #[tokio::test]
+    async fn stage_rows_accepts_lossy_iso_timestamps_without_sql() {
+        let backend = InMemoryStorageBackend::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("lossy-timestamp", "value", true);
+        row.created_at = Some("1969-12-31T23:59:59.999999Z".to_string());
+        row.updated_at = Some("2026-04-23T00:00:00.123456Z".to_string());
+
+        let outcome = transaction
+            .stage_rows(vec![row])
+            .await
+            .expect("valid ISO timestamps should stage after lossy normalization");
+        assert_eq!(outcome.count, 1);
+
+        let rows = transaction
+            .scan_live_state(&LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec!["lix_key_value".to_string()],
+                    entity_pks: vec![crate::entity_pk::EntityPk::single("lossy-timestamp")],
+                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(true),
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("staged row should scan through transaction live state");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].created_at, "1970-01-01T00:00:00.000Z");
+        assert_eq!(rows[0].updated_at, "2026-04-23T00:00:00.123Z");
     }
 
     #[tokio::test]
@@ -1286,8 +1340,8 @@ mod tests {
             .await
             .expect("branch ref should load after failed commit");
         assert_eq!(
-            head.as_deref(),
-            Some(SCHEMA_FIXTURE_COMMIT_ID),
+            head,
+            Some(CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID)),
             "validation failure must not advance the branch ref"
         );
     }
@@ -1565,14 +1619,17 @@ mod tests {
                     deleted: false,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    change_id: format!("schema-fixture-{}", key.schema_key),
-                    commit_id: SCHEMA_FIXTURE_COMMIT_ID.to_string(),
+                    change_id: ChangeId::for_test_label(&format!(
+                        "schema-fixture-{}",
+                        key.schema_key
+                    )),
+                    commit_id: CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
                 }
             })
             .collect::<Vec<_>>();
         let branch_ref_row = prepare_branch_ref_row(
             GLOBAL_BRANCH_ID,
-            SCHEMA_FIXTURE_COMMIT_ID,
+            &CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
             "1970-01-01T00:00:00.000Z",
         )
         .expect("schema fixture branch ref should stage");
@@ -1614,8 +1671,8 @@ mod tests {
             .await
             .expect("branch ref should load after failed commit");
         assert_eq!(
-            head.as_deref(),
-            Some(SCHEMA_FIXTURE_COMMIT_ID),
+            head,
+            Some(CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID)),
             "validation failure must not advance the branch ref"
         );
         let row = live_state

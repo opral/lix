@@ -295,8 +295,8 @@ fn commit_row(
         created_at: commit.change.created_at.to_string(),
         updated_at: commit.change.created_at.to_string(),
         global: true,
-        change_id: Some(commit.change.id.clone()),
-        commit_id: Some(commit.commit_id.clone()),
+        change_id: Some(commit.change.id),
+        commit_id: Some(commit.commit_id),
         untracked: false,
         branch_id: branch_id.to_string(),
     })
@@ -319,7 +319,10 @@ fn commit_edge_row(
     })?;
     Ok(MaterializedLiveStateRow {
         entity_pk: EntityPk {
-            parts: vec![edge.parent_commit_id.clone(), edge.child_commit_id.clone()],
+            parts: vec![
+                edge.parent_commit_id.to_string(),
+                edge.child_commit_id.to_string(),
+            ],
         },
         schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
         file_id: None,
@@ -330,7 +333,7 @@ fn commit_edge_row(
         updated_at: "1970-01-01T00:00:00.000Z".to_string(),
         global: true,
         change_id: None,
-        commit_id: Some(edge.child_commit_id.clone()),
+        commit_id: Some(edge.child_commit_id),
         untracked: false,
         branch_id: branch_id.to_string(),
     })
@@ -502,6 +505,7 @@ fn project_tracked_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
     use crate::live_state::LiveStateFilter;
@@ -516,6 +520,10 @@ mod tests {
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    fn change_id(label: &str) -> ChangeId {
+        ChangeId::for_test_label(label)
     }
 
     fn live_state_context() -> LiveStateContext {
@@ -555,19 +563,20 @@ mod tests {
         let mut json_writer = JsonStoreContext::new().writer();
         let mut append = crate::changelog::ChangelogAppend::default();
         for commit_id in commit_ids {
-            let commit_change_id = format!("{commit_id}:commit");
+            let commit_id_text = CommitId::for_test_label(commit_id).to_string();
+            let commit_change_id = format!("{commit_id_text}:commit");
             append.commits.push(crate::changelog::CommitRecord {
                 format_version: 1,
-                commit_id: (*commit_id).to_string(),
+                commit_id: CommitId::for_test_label(&commit_id_text),
                 parent_commit_ids: Vec::new(),
-                change_id: commit_change_id.clone(),
+                change_id: ChangeId::for_test_label(&commit_change_id),
                 author_account_ids: Vec::new(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
             append
                 .commit_change_refs
                 .push(crate::changelog::CommitChangeRefSet {
-                    commit_id: (*commit_id).to_string(),
+                    commit_id: CommitId::for_test_label(&commit_id_text),
                     entries: Vec::new(),
                 });
         }
@@ -579,8 +588,9 @@ mod tests {
             .expect("empty changelog commits should stage");
         drop(writer);
         for commit_id in commit_ids {
-            let snapshot_content =
-                commit_row_snapshot_content(commit_id).expect("commit snapshot should encode");
+            let commit_id_text = CommitId::for_test_label(commit_id).to_string();
+            let snapshot_content = commit_row_snapshot_content(&commit_id_text)
+                .expect("commit snapshot should encode");
             let snapshot_ref = JsonRef::for_content(snapshot_content.as_bytes());
             json_writer
                 .stage_batch(
@@ -592,14 +602,14 @@ mod tests {
                     )],
                 )
                 .expect("commit snapshot should stage");
-            let change_id = format!("{commit_id}:commit");
-            let entity_pk = EntityPk::single(*commit_id);
+            let change_id = format!("{commit_id_text}:commit");
+            let entity_pk = EntityPk::single(&commit_id_text);
             let deltas = [TrackedStateDeltaRef {
                 schema_key: COMMIT_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &entity_pk,
-                change_id: &change_id,
-                commit_id,
+                change_id: ChangeId::for_test_label(&change_id),
+                commit_id: CommitId::for_test_label(&commit_id_text),
                 snapshot_ref: Some(&snapshot_ref),
                 metadata_ref: None,
                 deleted: false,
@@ -608,7 +618,7 @@ mod tests {
             }];
             TrackedStateContext::new()
                 .writer(read, &mut writes)
-                .stage_commit_root(commit_id, None, deltas)
+                .stage_commit_root(&commit_id_text, None, deltas)
                 .await
                 .expect("empty tracked roots should stage");
         }
@@ -648,20 +658,24 @@ mod tests {
             let commit_id = row.commit_id.clone().ok_or_else(|| {
                 LixError::new("LIX_ERROR_UNKNOWN", "test tracked row missing commit_id")
             })?;
+            let commit_id_text = commit_id.to_string();
             if row.schema_key == COMMIT_SCHEMA_KEY {
                 parent_by_commit.insert(
-                    commit_id.clone(),
+                    commit_id_text.clone(),
                     parent_commit_id_from_test_commit_row(row)?,
                 );
             }
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
                 stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
-                tracked_rows_by_commit.entry(commit_id).or_default().push((
-                    change,
-                    ts(&materialized.created_at),
-                    ts(&materialized.updated_at),
-                ));
+                tracked_rows_by_commit
+                    .entry(commit_id_text)
+                    .or_default()
+                    .push((
+                        change,
+                        ts(&materialized.created_at),
+                        ts(&materialized.updated_at),
+                    ));
             }
         }
 
@@ -694,16 +708,19 @@ mod tests {
                 .extend(rows.iter().map(|(change, _, _)| change.clone()));
             append.commits.push(crate::changelog::CommitRecord {
                 format_version: 1,
-                commit_id: commit_id.clone(),
-                parent_commit_ids: parent_ids,
-                change_id: commit_change_id.clone(),
+                commit_id: CommitId::for_test_label(&commit_id),
+                parent_commit_ids: parent_ids
+                    .iter()
+                    .map(|id| CommitId::for_test_label(id))
+                    .collect(),
+                change_id: ChangeId::for_test_label(&commit_change_id),
                 author_account_ids: Vec::new(),
                 created_at: commit_created_at,
             });
             append
                 .commit_change_refs
                 .push(crate::changelog::CommitChangeRefSet {
-                    commit_id: commit_id.clone(),
+                    commit_id: CommitId::for_test_label(&commit_id),
                     entries: change_refs,
                 });
             let mut changelog_read = store;
@@ -722,14 +739,15 @@ mod tests {
                 )],
             )?;
             let commit_entity_pk = EntityPk::single(&commit_id);
+            let typed_commit_id = CommitId::for_test_label(&commit_id);
             let mut deltas = rows
                 .iter()
                 .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
                     file_id: change.file_id.as_deref(),
                     entity_pk: &change.entity_pk,
-                    change_id: &change.change_id,
-                    commit_id: &commit_id,
+                    change_id: change.change_id,
+                    commit_id: typed_commit_id,
                     snapshot_ref: change.snapshot_ref.as_ref(),
                     metadata_ref: change.metadata_ref.as_ref(),
                     deleted: change.snapshot_ref.is_none(),
@@ -741,8 +759,8 @@ mod tests {
                 schema_key: COMMIT_SCHEMA_KEY,
                 file_id: None,
                 entity_pk: &commit_entity_pk,
-                change_id: &commit_change_id,
-                commit_id: &commit_id,
+                change_id: ChangeId::for_test_label(&commit_change_id),
+                commit_id: typed_commit_id,
                 snapshot_ref: Some(&snapshot_ref),
                 metadata_ref: None,
                 deleted: false,
@@ -928,7 +946,7 @@ mod tests {
             .expect("load should succeed")
             .expect("tracked row should be visible");
         assert!(!loaded.untracked);
-        assert_eq!(loaded.change_id.as_deref(), Some("change-tracked"));
+        assert_eq!(loaded.change_id, Some(change_id("change-tracked")));
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"tracked-value\"}")
@@ -995,7 +1013,7 @@ mod tests {
             .expect("load should succeed")
             .expect("tracked row should be visible again");
         assert!(!loaded.untracked);
-        assert_eq!(loaded.change_id.as_deref(), Some("change-tracked"));
+        assert_eq!(loaded.change_id, Some(change_id("change-tracked")));
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"tracked-value\"}")
@@ -1771,6 +1789,7 @@ mod tests {
         change_id: Option<&str>,
         commit_id: &str,
     ) -> MaterializedLiveStateRow {
+        let commit_id = CommitId::for_test_label(commit_id);
         MaterializedLiveStateRow {
             entity_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
@@ -1781,8 +1800,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: branch_id == "global",
-            change_id: change_id.map(str::to_string),
-            commit_id: Some(commit_id.to_string()),
+            change_id: change_id.map(ChangeId::for_test_label),
+            commit_id: Some(commit_id),
             untracked: false,
             branch_id: branch_id.to_string(),
         }
@@ -1820,6 +1839,7 @@ mod tests {
     }
 
     fn branch_ref_row(branch_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
+        let commit_id = CommitId::for_test_label(commit_id).to_string();
         MaterializedUntrackedStateRow {
             entity_pk: identity(branch_id),
             schema_key: "lix_branch_ref".to_string(),
@@ -1848,14 +1868,19 @@ mod tests {
         commit_id: &str,
         parent_ids: &[&str],
     ) -> MaterializedLiveStateRow {
+        let commit_id_text = CommitId::for_test_label(commit_id).to_string();
+        let parent_id_texts = parent_ids
+            .iter()
+            .map(|parent| CommitId::for_test_label(parent).to_string())
+            .collect::<Vec<_>>();
         let mut row = commit_live_state_row_with_snapshot(
-            commit_id,
+            &commit_id_text,
             json!({
-                "id": commit_id,
+                "id": commit_id_text,
             }),
         );
         row.metadata = Some(
-            serde_json::to_string(&json!({ "test_parents": parent_ids }))
+            serde_json::to_string(&json!({ "test_parents": parent_id_texts }))
                 .expect("test metadata should serialize"),
         );
         row
@@ -1865,8 +1890,10 @@ mod tests {
         commit_id: &str,
         snapshot: serde_json::Value,
     ) -> MaterializedLiveStateRow {
+        let commit_id = CommitId::for_test_label(commit_id);
+        let commit_id_text = commit_id.to_string();
         MaterializedLiveStateRow {
-            entity_pk: identity(commit_id),
+            entity_pk: identity(&commit_id_text),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1877,8 +1904,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
-            change_id: Some(format!("change-{commit_id}")),
-            commit_id: Some(commit_id.to_string()),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{commit_id}"))),
+            commit_id: Some(commit_id),
             untracked: false,
             branch_id: "global".to_string(),
         }

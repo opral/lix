@@ -9,7 +9,6 @@ const OFFSET_MASK: u64 = (1u64 << OFFSET_BITS) - 1;
 const MAX_PACKED_MILLIS: u64 = (1u64 << MILLIS_BITS) - 1;
 const MIN_OFFSET_MINUTES: i16 = -(23 * 60 + 59);
 const MAX_OFFSET_MINUTES: i16 = 23 * 60 + 59;
-const NANOS_PER_MILLI: i32 = 1_000_000;
 
 static TIMESTAMP_PARSER: DateTimeParser = DateTimeParser::new();
 
@@ -49,23 +48,16 @@ impl LixTimestamp {
     }
 
     fn from_jiff(timestamp: Timestamp, offset: Offset) -> Result<Self, String> {
-        if timestamp.as_millisecond() < 0 {
-            return Err("timestamps before the Unix epoch cannot be packed".to_string());
-        }
-
-        if timestamp.subsec_nanosecond() % NANOS_PER_MILLI != 0 {
-            return Err("timestamps must have millisecond precision".to_string());
-        }
-
         let offset_seconds = offset.seconds();
         if offset_seconds % 60 != 0 {
             return Err("timezone offsets must have minute precision".to_string());
         }
 
-        Self::from_parts(
-            timestamp.as_millisecond() as u64,
-            (offset_seconds / 60) as i16,
-        )
+        // Public write schemas accept ISO-8601 timestamps. The packed form only
+        // stores non-negative whole milliseconds, so parse valid timestamps
+        // lossily instead of rejecting common RFC3339 values.
+        let millis = timestamp.as_millisecond().max(0) as u64;
+        Self::from_parts(millis, (offset_seconds / 60) as i16)
     }
 
     fn from_parts(millis: u64, offset_minutes: i16) -> Result<Self, String> {
@@ -211,9 +203,19 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_rejects_unsupported_values() {
-        assert!(LixTimestamp::parse("1969-12-31T23:59:59.999Z").is_err());
-        assert!(LixTimestamp::parse("2026-05-19T00:00:00.000000001Z").is_err());
+    fn timestamp_lossily_accepts_public_iso_values() {
+        let sub_millisecond = LixTimestamp::parse("2026-05-19T00:00:00.123456789Z").unwrap();
+        let pre_unix = LixTimestamp::parse("1969-12-31T23:59:59.999999Z").unwrap();
+        let pre_unix_offset = LixTimestamp::parse("1969-12-31T15:59:59.999999-08:00").unwrap();
+
+        assert_eq!(sub_millisecond.to_string(), "2026-05-19T00:00:00.123Z");
+        assert_eq!(pre_unix.to_string(), "1970-01-01T00:00:00.000Z");
+        assert_eq!(pre_unix_offset.milliseconds_since_unix_epoch(), 0);
+        assert_eq!(pre_unix_offset.offset_minutes(), -(8 * 60));
+    }
+
+    #[test]
+    fn timestamp_rejects_offsets_outside_packed_model() {
         assert!(LixTimestamp::parse("2026-05-19T00:00:00.000+00:00:01").is_err());
         assert!(LixTimestamp::parse("2026-05-19T00:00:00.000+24:00").is_err());
     }

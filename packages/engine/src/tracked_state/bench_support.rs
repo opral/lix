@@ -1,3 +1,4 @@
+use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{
@@ -319,8 +320,8 @@ where
 }
 
 struct OwnedDelta {
-    change_id: String,
-    commit_id: String,
+    change_id: ChangeId,
+    commit_id: CommitId,
     entity_pk: EntityPk,
     schema_key: String,
     file_id: Option<String>,
@@ -356,8 +357,8 @@ impl OwnedDelta {
         };
         let change_id = format!("tracked-crud-change-{commit_id}-{index}");
         Self {
-            change_id,
-            commit_id: commit_id.to_string(),
+            change_id: ChangeId::for_test_label(&change_id),
+            commit_id: CommitId::for_test_label(commit_id),
             entity_pk: EntityPk::single(row.entity_pk),
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -380,8 +381,8 @@ impl OwnedDelta {
             schema_key: &self.schema_key,
             file_id: self.file_id.as_deref(),
             entity_pk: &self.entity_pk,
-            change_id: &self.change_id,
-            commit_id: &self.commit_id,
+            change_id: self.change_id,
+            commit_id: self.commit_id,
             snapshot_ref: self.snapshot_ref.as_ref(),
             metadata_ref: self.metadata_ref.as_ref(),
             deleted: self.deleted,

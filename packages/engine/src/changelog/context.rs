@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -12,10 +13,10 @@ use super::store::{
     CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE,
 };
 use crate::changelog::{
-    ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
+    ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, ChangelogReader, ChangelogWriter, CommitChangeRef, CommitChangeRefChunk,
-    CommitChangeRefSet, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection,
-    CommitRecord, CommitScanBatch, CommitScanRequest, GcPlan, GcRoot,
+    CommitChangeRefSet, CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest,
+    CommitProjection, CommitRecord, CommitScanBatch, CommitScanRequest, GcPlan, GcRoot,
 };
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
@@ -70,9 +71,9 @@ pub(crate) struct ChangelogStoreReader<S> {
 pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
     store: &'a mut S,
     writes: &'a mut StorageWriteSet,
-    staged_commits: HashMap<String, CommitRecord>,
-    staged_changes: HashMap<String, ChangeRecord>,
-    staged_commit_change_ref_chunks: HashMap<String, Vec<CommitChangeRefChunk>>,
+    staged_commits: HashMap<CommitId, CommitRecord>,
+    staged_changes: HashMap<ChangeId, ChangeRecord>,
+    staged_commit_change_ref_chunks: HashMap<CommitId, Vec<CommitChangeRefChunk>>,
 }
 
 #[derive(Debug)]
@@ -236,7 +237,7 @@ where
             .filter(|commit| {
                 request
                     .start_after
-                    .map(|start_after| commit.commit_id.as_str() > start_after)
+                    .map(|start_after| commit.commit_id.to_string().as_str() > start_after)
                     .unwrap_or(true)
             })
             .cloned()
@@ -252,19 +253,13 @@ where
                     .unwrap_or_default(),
             ));
         }
-        batch.entries.sort_by(|left, right| {
-            commit_entry_id(left)
-                .unwrap_or_default()
-                .cmp(commit_entry_id(right).unwrap_or_default())
-        });
+        batch
+            .entries
+            .sort_by(|left, right| commit_entry_id(left).cmp(&commit_entry_id(right)));
         let limit = request.limit.unwrap_or(usize::MAX);
         if batch.entries.len() > limit {
             batch.entries.truncate(limit);
-            batch.next_start_after = batch
-                .entries
-                .last()
-                .and_then(commit_entry_id)
-                .map(str::to_string);
+            batch.next_start_after = batch.entries.last().and_then(commit_entry_id);
         }
         Ok(batch)
     }
@@ -294,7 +289,7 @@ where
             .filter(|change| {
                 request
                     .start_after
-                    .map(|start_after| change.change_id.as_str() > start_after)
+                    .map(|start_after| change.change_id.to_string().as_str() > start_after)
                     .unwrap_or(true)
             })
             .cloned()
@@ -369,43 +364,31 @@ where
 {
     async fn validate_append(&mut self, append: &ChangelogAppend) -> Result<(), LixError> {
         validate_unique(
-            append
-                .commits
-                .iter()
-                .map(|commit| commit.commit_id.as_str()),
+            append.commits.iter().map(|commit| commit.commit_id),
             "commit_id",
         )?;
         validate_unique(
-            append
-                .changes
-                .iter()
-                .map(|change| change.change_id.as_str()),
+            append.changes.iter().map(|change| change.change_id),
             "change_id",
         )?;
         validate_unique(
-            append
-                .commits
-                .iter()
-                .map(|commit| commit.change_id.as_str()),
+            append.commits.iter().map(|commit| commit.change_id),
             "commit change_id",
         )?;
         validate_unique(
-            append
-                .commit_change_refs
-                .iter()
-                .map(|refs| refs.commit_id.as_str()),
+            append.commit_change_refs.iter().map(|refs| refs.commit_id),
             "commit change ref commit_id",
         )?;
 
         let append_commit_ids = append
             .commits
             .iter()
-            .map(|commit| commit.commit_id.as_str())
+            .map(|commit| commit.commit_id)
             .collect::<HashSet<_>>();
         let append_changes = append
             .changes
             .iter()
-            .map(|change| (change.change_id.as_str(), change))
+            .map(|change| (change.change_id, change))
             .collect::<HashMap<_, _>>();
 
         self.reject_existing_commits(&append_commit_ids).await?;
@@ -430,7 +413,7 @@ where
         }
 
         for refs in &append.commit_change_refs {
-            if !append_commit_ids.contains(refs.commit_id.as_str()) {
+            if !append_commit_ids.contains(&refs.commit_id) {
                 return Err(LixError::unknown(format!(
                     "changelog commit change refs target missing staged commit '{}'",
                     refs.commit_id
@@ -446,10 +429,10 @@ where
     async fn reject_commit_change_id_collisions(
         &mut self,
         append: &ChangelogAppend,
-        append_changes: &HashMap<&str, &ChangeRecord>,
+        append_changes: &HashMap<ChangeId, &ChangeRecord>,
     ) -> Result<(), LixError> {
         for commit in &append.commits {
-            if append_changes.contains_key(commit.change_id.as_str())
+            if append_changes.contains_key(&commit.change_id)
                 || self.change_exists(&commit.change_id).await?
                 || self
                     .staged_commits
@@ -491,24 +474,21 @@ where
             let Some(next) = batch.next_start_after else {
                 break;
             };
-            start_after = Some(next);
+            start_after = Some(next.to_string());
         }
         Ok(())
     }
 
-    async fn reject_existing_commits<'a>(
+    async fn reject_existing_commits(
         &mut self,
-        commit_ids: &HashSet<&'a str>,
+        commit_ids: &HashSet<CommitId>,
     ) -> Result<(), LixError> {
-        let keys = commit_ids
-            .iter()
-            .map(|commit_id| commit_key(commit_id))
-            .collect::<Vec<_>>();
+        let keys = commit_ids.iter().map(commit_key).collect::<Vec<_>>();
         for (commit_id, found) in commit_ids
             .iter()
             .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
         {
-            if found.is_some() || self.staged_commits.contains_key(*commit_id) {
+            if found.is_some() || self.staged_commits.contains_key(commit_id) {
                 return Err(LixError::unknown(format!(
                     "changelog commit '{}' already exists",
                     commit_id
@@ -518,20 +498,17 @@ where
         Ok(())
     }
 
-    async fn reject_existing_changes<'a>(
+    async fn reject_existing_changes(
         &mut self,
-        change_ids: impl IntoIterator<Item = &'a str>,
+        change_ids: impl IntoIterator<Item = ChangeId>,
     ) -> Result<(), LixError> {
         let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-        let keys = change_ids
-            .iter()
-            .map(|change_id| change_key(change_id))
-            .collect::<Vec<_>>();
+        let keys = change_ids.iter().map(change_key).collect::<Vec<_>>();
         for (change_id, found) in change_ids
             .iter()
             .zip(get_many(self.store, CHANGE_SPACE, keys).await?)
         {
-            if found.is_some() || self.staged_changes.contains_key(*change_id) {
+            if found.is_some() || self.staged_changes.contains_key(change_id) {
                 return Err(LixError::unknown(format!(
                     "changelog change '{}' already exists",
                     change_id
@@ -544,23 +521,20 @@ where
     async fn validate_parent_commits(
         &mut self,
         append: &ChangelogAppend,
-        append_commit_ids: &HashSet<&str>,
+        append_commit_ids: &HashSet<CommitId>,
     ) -> Result<(), LixError> {
         let parent_ids = append
             .commits
             .iter()
-            .flat_map(|commit| commit.parent_commit_ids.iter().map(String::as_str))
+            .flat_map(|commit| commit.parent_commit_ids.iter().copied())
             .filter(|parent_id| !append_commit_ids.contains(parent_id))
             .collect::<HashSet<_>>();
-        let keys = parent_ids
-            .iter()
-            .map(|parent_id| commit_key(parent_id))
-            .collect::<Vec<_>>();
+        let keys = parent_ids.iter().map(commit_key).collect::<Vec<_>>();
         for (parent_id, found) in parent_ids
             .iter()
             .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
         {
-            if found.is_none() && !self.staged_commits.contains_key(*parent_id) {
+            if found.is_none() && !self.staged_commits.contains_key(parent_id) {
                 return Err(LixError::unknown(format!(
                     "changelog parent commit '{}' does not exist",
                     parent_id
@@ -573,13 +547,13 @@ where
     async fn validate_change_refs(
         &mut self,
         refs: &CommitChangeRefSet,
-        append_changes: &HashMap<&str, &ChangeRecord>,
+        append_changes: &HashMap<ChangeId, &ChangeRecord>,
     ) -> Result<(), LixError> {
         let missing_from_append = refs
             .entries
             .iter()
-            .filter(|entry| !append_changes.contains_key(entry.change_id.as_str()))
-            .map(|entry| entry.change_id.as_str())
+            .filter(|entry| !append_changes.contains_key(&entry.change_id))
+            .map(|entry| entry.change_id)
             .collect::<HashSet<_>>();
         let stored = self
             .load_stored_changes(missing_from_append.iter().copied())
@@ -587,10 +561,10 @@ where
 
         for entry in &refs.entries {
             let change = append_changes
-                .get(entry.change_id.as_str())
+                .get(&entry.change_id)
                 .copied()
                 .or_else(|| self.staged_changes.get(&entry.change_id))
-                .or_else(|| stored.get(entry.change_id.as_str()))
+                .or_else(|| stored.get(&entry.change_id))
                 .ok_or_else(|| {
                     LixError::unknown(format!(
                         "changelog commit '{}' references missing change '{}'",
@@ -602,26 +576,23 @@ where
         Ok(())
     }
 
-    async fn load_stored_changes<'a>(
+    async fn load_stored_changes(
         &mut self,
-        change_ids: impl IntoIterator<Item = &'a str>,
-    ) -> Result<HashMap<String, ChangeRecord>, LixError> {
+        change_ids: impl IntoIterator<Item = ChangeId>,
+    ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
         let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-        let keys = change_ids
-            .iter()
-            .map(|change_id| change_key(change_id))
-            .collect::<Vec<_>>();
+        let keys = change_ids.iter().map(change_key).collect::<Vec<_>>();
         let values = get_many(self.store, CHANGE_SPACE, keys).await?;
         let mut out = HashMap::new();
         for (change_id, value) in change_ids.into_iter().zip(values) {
             if let Some(value) = value {
-                out.insert(change_id.to_string(), decode_change_record(&value)?);
+                out.insert(change_id, decode_change_record(&value)?);
             }
         }
         Ok(out)
     }
 
-    async fn change_exists(&mut self, change_id: &str) -> Result<bool, LixError> {
+    async fn change_exists(&mut self, change_id: &ChangeId) -> Result<bool, LixError> {
         if self.staged_changes.contains_key(change_id) {
             return Ok(true);
         }
@@ -677,7 +648,10 @@ async fn scan_commits_from_store(
     if limit == 0 {
         return Ok(CommitScanBatch {
             entries: Vec::new(),
-            next_start_after: request.start_after.map(str::to_string),
+            next_start_after: request
+                .start_after
+                .map(|id| CommitId::parse_lix(id, "commit scan start_after"))
+                .transpose()?,
         });
     }
     let page = store
@@ -713,6 +687,7 @@ async fn scan_commits_from_store(
                 )
             })
         })
+        .map(|result| result.and_then(|id| CommitId::parse_lix(&id, "commit scan resume key")))
         .transpose()?;
     Ok(CommitScanBatch {
         entries,
@@ -745,7 +720,10 @@ async fn scan_changes_from_store(
     if limit == 0 {
         return Ok(ChangeScanBatch {
             entries: Vec::new(),
-            next_start_after: request.start_after.map(str::to_string),
+            next_start_after: request
+                .start_after
+                .map(|id| ChangeId::parse_lix(id, "change scan start_after"))
+                .transpose()?,
         });
     }
     let page = store
@@ -781,6 +759,7 @@ async fn scan_changes_from_store(
                 )
             })
         })
+        .map(|result| result.and_then(|id| ChangeId::parse_lix(&id, "change scan resume key")))
         .transpose()?;
     Ok(ChangeScanBatch {
         entries,
@@ -790,9 +769,10 @@ async fn scan_changes_from_store(
 
 async fn load_commit_change_ref_chunks(
     store: &mut (impl ChangelogStorageRead + ?Sized),
-    commit_id: &str,
+    commit_id: &CommitId,
 ) -> Result<Vec<CommitChangeRefChunk>, LixError> {
-    let prefix = commit_change_ref_chunk_prefix(commit_id);
+    let commit_id_text = commit_id.to_string();
+    let prefix = commit_change_ref_chunk_prefix(&commit_id_text);
     let mut after = None;
     let mut chunks = Vec::new();
     loop {
@@ -806,7 +786,7 @@ async fn load_commit_change_ref_chunks(
             )
             .await?;
         for value in page.values {
-            chunks.push(decode_commit_change_ref_chunk(&value, commit_id)?);
+            chunks.push(decode_commit_change_ref_chunk(&value, *commit_id)?);
         }
         let Some(resume_after) = page.resume_after else {
             break;
@@ -831,17 +811,17 @@ fn project_commit_entry(
     }
 }
 
-fn commit_entry_id(entry: &CommitLoadEntry) -> Option<&str> {
+fn commit_entry_id(entry: &CommitLoadEntry) -> Option<CommitId> {
     match entry {
-        CommitLoadEntry::Record(record) => Some(&record.commit_id),
-        CommitLoadEntry::Full { record, .. } => Some(&record.commit_id),
-        CommitLoadEntry::ChangeRefs(chunks) => chunks.first().map(|chunk| chunk.commit_id.as_str()),
+        CommitLoadEntry::Record(record) => Some(record.commit_id),
+        CommitLoadEntry::Full { record, .. } => Some(record.commit_id),
+        CommitLoadEntry::ChangeRefs(chunks) => chunks.first().map(|chunk| chunk.commit_id),
     }
 }
 
 fn chunk_commit_change_refs(
     refs: Vec<CommitChangeRefSet>,
-) -> Result<HashMap<String, Vec<CommitChangeRefChunk>>, LixError> {
+) -> Result<HashMap<CommitId, Vec<CommitChangeRefChunk>>, LixError> {
     refs.into_iter()
         .map(|refs| {
             let commit_id = refs.commit_id.clone();
@@ -869,13 +849,13 @@ fn chunk_one_commit_change_refs(
             left.schema_key.as_str(),
             left.file_id.as_deref(),
             &left.entity_pk,
-            left.change_id.as_str(),
+            left.change_id,
         )
             .cmp(&(
                 right.schema_key.as_str(),
                 right.file_id.as_deref(),
                 &right.entity_pk,
-                right.change_id.as_str(),
+                right.change_id,
             ))
     });
 
@@ -902,10 +882,13 @@ fn chunk_one_commit_change_refs(
     Ok(chunks)
 }
 
-fn commit_change_ref_chunk(commit_id: &str, entries: Vec<CommitChangeRef>) -> CommitChangeRefChunk {
+fn commit_change_ref_chunk(
+    commit_id: CommitId,
+    entries: Vec<CommitChangeRef>,
+) -> CommitChangeRefChunk {
     CommitChangeRefChunk {
         format_version: COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION,
-        commit_id: commit_id.to_string(),
+        commit_id,
         entries,
     }
 }
@@ -928,7 +911,7 @@ fn validate_commit_change_ref_chunk_size(
 }
 
 struct CommitChangeRefChunkBuilder {
-    commit_id: String,
+    commit_id: CommitId,
     entries: Vec<CommitChangeRef>,
     schema_keys: HashSet<String>,
     file_ids: HashSet<Option<String>>,
@@ -936,7 +919,7 @@ struct CommitChangeRefChunkBuilder {
 }
 
 impl CommitChangeRefChunkBuilder {
-    fn new(commit_id: String) -> Self {
+    fn new(commit_id: CommitId) -> Self {
         Self {
             commit_id,
             entries: Vec::new(),
@@ -986,7 +969,7 @@ impl CommitChangeRefChunkBuilder {
     }
 
     fn finish(self) -> Result<CommitChangeRefChunk, LixError> {
-        Ok(commit_change_ref_chunk(&self.commit_id, self.entries))
+        Ok(commit_change_ref_chunk(self.commit_id, self.entries))
     }
 }
 
@@ -1002,7 +985,11 @@ fn encoded_commit_change_ref_entry_size(entry: &CommitChangeRef) -> usize {
     2 // schema index
         + 2 // file index
         + encoded_entity_pk_compact_size(&entry.entity_pk)
-        + encoded_str_size(&entry.change_id)
+        + encoded_change_id_size(&entry.change_id)
+}
+
+fn encoded_change_id_size(_change_id: &ChangeId) -> usize {
+    std::mem::size_of::<uuid::Bytes>()
 }
 
 fn encoded_entity_pk_compact_size(identity: &crate::entity_pk::EntityPk) -> usize {
@@ -1026,13 +1013,13 @@ fn encoded_str_size(value: &str) -> usize {
     4 + value.len()
 }
 
-fn validate_unique<'a>(
-    values: impl IntoIterator<Item = &'a str>,
-    label: &str,
-) -> Result<(), LixError> {
+fn validate_unique<T>(values: impl IntoIterator<Item = T>, label: &str) -> Result<(), LixError>
+where
+    T: fmt::Display,
+{
     let mut seen = HashSet::new();
     for value in values {
-        if !seen.insert(value) {
+        if !seen.insert(value.to_string()) {
             return Err(LixError::unknown(format!(
                 "changelog append contains duplicate {label} '{value}'"
             )));
@@ -1041,7 +1028,10 @@ fn validate_unique<'a>(
     Ok(())
 }
 
-fn validate_unique_ref_keys(entries: &[CommitChangeRef], commit_id: &str) -> Result<(), LixError> {
+fn validate_unique_ref_keys(
+    entries: &[CommitChangeRef],
+    commit_id: &CommitId,
+) -> Result<(), LixError> {
     let mut seen = HashSet::new();
     for entry in entries {
         let key = (
@@ -1059,7 +1049,7 @@ fn validate_unique_ref_keys(entries: &[CommitChangeRef], commit_id: &str) -> Res
 }
 
 fn validate_ref_matches_change(
-    commit_id: &str,
+    commit_id: &CommitId,
     entry: &CommitChangeRef,
     change: &ChangeRecord,
 ) -> Result<(), LixError> {
@@ -1176,8 +1166,9 @@ where
 mod tests {
     use crate::changelog::test_support::{changelog_test_context, test_append};
     use crate::changelog::{
-        ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogAppend, ChangelogReader,
-        ChangelogWriter, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitScanRequest,
+        ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogAppend,
+        ChangelogReader, ChangelogWriter, CommitId, CommitLoadEntry, CommitLoadRequest,
+        CommitProjection, CommitScanRequest,
     };
     use crate::entity_pk::EntityPk;
 
@@ -1187,19 +1178,53 @@ mod tests {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
     }
 
+    fn commit_id(label: &str) -> String {
+        CommitId::for_test_label(label).to_string()
+    }
+
+    fn change_id(label: &str) -> String {
+        ChangeId::for_test_label(label).to_string()
+    }
+
+    fn change_ids<const N: usize>(labels: [&str; N]) -> Vec<String> {
+        labels.into_iter().map(change_id).collect()
+    }
+
+    fn sorted_commit_ids<const N: usize>(labels: [&str; N]) -> Vec<String> {
+        let mut ids = labels.into_iter().map(commit_id).collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn sorted_change_ids<const N: usize>(labels: [&str; N]) -> Vec<String> {
+        let mut ids = labels.into_iter().map(change_id).collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     fn test_change_ref(entity: &str, change_id: &str) -> CommitChangeRef {
         CommitChangeRef {
             schema_key: "message".to_string(),
             file_id: None,
             entity_pk: EntityPk::single(entity.to_string()),
-            change_id: change_id.to_string(),
+            change_id: ChangeId::for_test_label(change_id),
         }
+    }
+
+    #[test]
+    fn encoded_commit_change_ref_entry_size_counts_binary_change_id() {
+        let entry = test_change_ref("entity-1", "change-with-a-long-source-label");
+
+        assert_eq!(
+            encoded_commit_change_ref_entry_size(&entry),
+            2 + 2 + encoded_entity_pk_compact_size(&entry.entity_pk) + 16
+        );
     }
 
     #[test]
     fn chunk_one_commit_change_refs_splits_by_encoded_size() {
         let refs = CommitChangeRefSet {
-            commit_id: "commit-1".to_string(),
+            commit_id: CommitId::for_test_label("commit-1"),
             entries: (0..8)
                 .map(|index| {
                     test_change_ref(
@@ -1221,9 +1246,9 @@ mod tests {
             chunks
                 .iter()
                 .flat_map(|chunk| chunk.entries.iter())
-                .map(|entry| entry.change_id.as_str())
+                .map(|entry| entry.change_id.to_string())
                 .collect::<Vec<_>>(),
-            vec![
+            change_ids([
                 "change-0000-yyyyyyyyyyyyyyyyyyyyyyyy",
                 "change-0001-yyyyyyyyyyyyyyyyyyyyyyyy",
                 "change-0002-yyyyyyyyyyyyyyyyyyyyyyyy",
@@ -1232,14 +1257,14 @@ mod tests {
                 "change-0005-yyyyyyyyyyyyyyyyyyyyyyyy",
                 "change-0006-yyyyyyyyyyyyyyyyyyyyyyyy",
                 "change-0007-yyyyyyyyyyyyyyyyyyyyyyyy",
-            ]
+            ])
         );
     }
 
     #[test]
     fn chunk_one_commit_change_refs_splits_by_entry_count() {
         let refs = CommitChangeRefSet {
-            commit_id: "commit-1".to_string(),
+            commit_id: CommitId::for_test_label("commit-1"),
             entries: (0..5)
                 .map(|index| {
                     test_change_ref(&format!("entity-{index}"), &format!("change-{index}"))
@@ -1278,7 +1303,7 @@ mod tests {
         let mut reader = context.reader(&mut *read);
         let commits = reader
             .load_commits(CommitLoadRequest {
-                commit_ids: &["commit-1".to_string()],
+                commit_ids: &[CommitId::for_test_label("commit-1")],
                 projection: CommitProjection::Full,
             })
             .await
@@ -1297,14 +1322,17 @@ mod tests {
             change_ref_chunks[0]
                 .entries
                 .iter()
-                .map(|entry| entry.change_id.as_str())
+                .map(|entry| entry.change_id.to_string())
                 .collect::<Vec<_>>(),
-            vec!["change-1"]
+            change_ids(["change-1"])
         );
 
         let changes = reader
             .load_changes(ChangeLoadRequest {
-                change_ids: &["change-1".to_string(), "missing".to_string()],
+                change_ids: &[
+                    ChangeId::for_test_label("change-1"),
+                    ChangeId::for_test_label("missing"),
+                ],
             })
             .await
             .unwrap();
@@ -1377,7 +1405,7 @@ mod tests {
         let mut append = test_append();
         append.changes.push(ChangeRecord {
             format_version: 1,
-            change_id: "change-0".to_string(),
+            change_id: ChangeId::for_test_label("change-0"),
             schema_key: "alpha".to_string(),
             entity_pk: EntityPk::single("entity-0"),
             file_id: None,
@@ -1391,7 +1419,7 @@ mod tests {
                 schema_key: "alpha".to_string(),
                 file_id: None,
                 entity_pk: EntityPk::single("entity-0"),
-                change_id: "change-0".to_string(),
+                change_id: ChangeId::for_test_label("change-0"),
             },
         );
         append.commit_change_refs[0].entries.swap(0, 1);
@@ -1409,7 +1437,7 @@ mod tests {
         let mut reader = context.reader(&mut *read);
         let commits = reader
             .load_commits(CommitLoadRequest {
-                commit_ids: &["commit-1".to_string()],
+                commit_ids: &[CommitId::for_test_label("commit-1")],
                 projection: CommitProjection::Full,
             })
             .await
@@ -1424,9 +1452,9 @@ mod tests {
             change_ref_chunks[0]
                 .entries
                 .iter()
-                .map(|entry| entry.change_id.as_str())
+                .map(|entry| entry.change_id.to_string())
                 .collect::<Vec<_>>(),
-            vec!["change-0", "change-1"]
+            change_ids(["change-0", "change-1"])
         );
     }
 
@@ -1434,16 +1462,16 @@ mod tests {
     async fn scan_commits_reads_direct_commit_records_in_key_order() {
         let (context, storage) = changelog_test_context();
         let mut first = test_append();
-        first.commits[0].commit_id = "commit-b".to_string();
-        first.commits[0].change_id = "commit-b-row-change".to_string();
-        first.commit_change_refs[0].commit_id = "commit-b".to_string();
+        first.commits[0].commit_id = CommitId::for_test_label("commit-b");
+        first.commits[0].change_id = ChangeId::for_test_label("commit-b-row-change");
+        first.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-b");
 
         let mut second = test_append();
-        second.commits[0].commit_id = "commit-a".to_string();
-        second.commits[0].change_id = "commit-a-row-change".to_string();
-        second.changes[0].change_id = "change-a".to_string();
-        second.commit_change_refs[0].commit_id = "commit-a".to_string();
-        second.commit_change_refs[0].entries[0].change_id = "change-a".to_string();
+        second.commits[0].commit_id = CommitId::for_test_label("commit-a");
+        second.commits[0].change_id = ChangeId::for_test_label("commit-a-row-change");
+        second.changes[0].change_id = ChangeId::for_test_label("change-a");
+        second.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-a");
+        second.commit_change_refs[0].entries[0].change_id = ChangeId::for_test_label("change-a");
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -1457,6 +1485,7 @@ mod tests {
 
         let mut read = storage.begin_read_transaction().await.unwrap();
         let mut reader = context.reader(&mut *read);
+        let expected_ids = sorted_commit_ids(["commit-b", "commit-a"]);
         let scan = reader
             .scan_commits(CommitScanRequest {
                 start_after: None,
@@ -1465,16 +1494,17 @@ mod tests {
             })
             .await
             .unwrap();
+        let next_start_after = scan.next_start_after.map(|commit_id| commit_id.to_string());
         assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.next_start_after.as_deref(), Some("commit-a"));
+        assert_eq!(next_start_after.as_deref(), Some(expected_ids[0].as_str()));
         let CommitLoadEntry::Record(record) = &scan.entries[0] else {
             panic!("expected record projection");
         };
-        assert_eq!(record.commit_id, "commit-a");
+        assert_eq!(record.commit_id.to_string(), expected_ids[0]);
 
         let next = reader
             .scan_commits(CommitScanRequest {
-                start_after: scan.next_start_after.as_deref(),
+                start_after: next_start_after.as_deref(),
                 limit: Some(10),
                 projection: CommitProjection::Record,
             })
@@ -1487,10 +1517,10 @@ mod tests {
                 let CommitLoadEntry::Record(record) = entry else {
                     panic!("expected record projection");
                 };
-                record.commit_id.as_str()
+                record.commit_id.to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["commit-b"]);
+        assert_eq!(ids, expected_ids[1..].to_vec());
         assert_eq!(next.next_start_after, None);
     }
 
@@ -1498,18 +1528,18 @@ mod tests {
     async fn scan_changes_reads_direct_change_records_in_key_order() {
         let (context, storage) = changelog_test_context();
         let mut first = test_append();
-        first.commits[0].commit_id = "commit-b".to_string();
-        first.commits[0].change_id = "commit-b-row-change".to_string();
-        first.changes[0].change_id = "change-b".to_string();
-        first.commit_change_refs[0].commit_id = "commit-b".to_string();
-        first.commit_change_refs[0].entries[0].change_id = "change-b".to_string();
+        first.commits[0].commit_id = CommitId::for_test_label("commit-b");
+        first.commits[0].change_id = ChangeId::for_test_label("commit-b-row-change");
+        first.changes[0].change_id = ChangeId::for_test_label("change-b");
+        first.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-b");
+        first.commit_change_refs[0].entries[0].change_id = ChangeId::for_test_label("change-b");
 
         let mut second = test_append();
-        second.commits[0].commit_id = "commit-a".to_string();
-        second.commits[0].change_id = "commit-a-row-change".to_string();
-        second.changes[0].change_id = "change-a".to_string();
-        second.commit_change_refs[0].commit_id = "commit-a".to_string();
-        second.commit_change_refs[0].entries[0].change_id = "change-a".to_string();
+        second.commits[0].commit_id = CommitId::for_test_label("commit-a");
+        second.commits[0].change_id = ChangeId::for_test_label("commit-a-row-change");
+        second.changes[0].change_id = ChangeId::for_test_label("change-a");
+        second.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-a");
+        second.commit_change_refs[0].entries[0].change_id = ChangeId::for_test_label("change-a");
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -1523,6 +1553,7 @@ mod tests {
 
         let mut read = storage.begin_read_transaction().await.unwrap();
         let mut reader = context.reader(&mut *read);
+        let expected_ids = sorted_change_ids(["change-b", "change-a"]);
         let scan = reader
             .scan_changes(ChangeScanRequest {
                 start_after: None,
@@ -1530,13 +1561,14 @@ mod tests {
             })
             .await
             .unwrap();
+        let next_start_after = scan.next_start_after.map(|change_id| change_id.to_string());
         assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].change_id, "change-a");
-        assert_eq!(scan.next_start_after.as_deref(), Some("change-a"));
+        assert_eq!(scan.entries[0].change_id.to_string(), expected_ids[0]);
+        assert_eq!(next_start_after.as_deref(), Some(expected_ids[0].as_str()));
 
         let next = reader
             .scan_changes(ChangeScanRequest {
-                start_after: scan.next_start_after.as_deref(),
+                start_after: next_start_after.as_deref(),
                 limit: Some(10),
             })
             .await
@@ -1544,9 +1576,9 @@ mod tests {
         let ids = next
             .entries
             .iter()
-            .map(|change| change.change_id.as_str())
+            .map(|change| change.change_id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["change-b"]);
+        assert_eq!(ids, expected_ids[1..].to_vec());
         assert_eq!(next.next_start_after, None);
     }
 
@@ -1556,7 +1588,7 @@ mod tests {
         let changes = (0..2_500)
             .map(|index| ChangeRecord {
                 format_version: 1,
-                change_id: format!("change-{index:04}"),
+                change_id: ChangeId::for_test_label(&format!("change-{index:04}")),
                 schema_key: "message".to_string(),
                 entity_pk: EntityPk::single(format!("entity-{index:04}")),
                 file_id: None,
@@ -1565,10 +1597,11 @@ mod tests {
                 created_at: ts("2026-05-20T00:00:00Z"),
             })
             .collect::<Vec<_>>();
-        let expected_ids = changes
+        let mut expected_ids = changes
             .iter()
             .map(|change| change.change_id.clone())
             .collect::<Vec<_>>();
+        expected_ids.sort();
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -1604,7 +1637,7 @@ mod tests {
             let Some(next_start_after) = page.next_start_after else {
                 break;
             };
-            start_after = Some(next_start_after);
+            start_after = Some(next_start_after.to_string());
         }
 
         assert_eq!(page_sizes, vec![1_024, 1_024, 452]);

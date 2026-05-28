@@ -68,7 +68,10 @@ mod tests {
             panic!("fast no-match execution should not inspect context")
         }
 
-        async fn load_branch_head(&mut self, _branch_id: &str) -> Result<Option<String>, LixError> {
+        async fn load_branch_head(
+            &mut self,
+            _branch_id: &str,
+        ) -> Result<Option<crate::changelog::CommitId>, LixError> {
             panic!("fast no-match execution should not inspect context")
         }
 

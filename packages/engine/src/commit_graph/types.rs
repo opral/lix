@@ -1,3 +1,4 @@
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
@@ -5,7 +6,7 @@ use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {
-    pub(crate) id: String,
+    pub(crate) id: ChangeId,
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -24,10 +25,10 @@ pub(crate) struct CommitGraphChange {
 pub(crate) struct CommitGraphCommit {
     pub(crate) canonical_change: CommitGraphChange,
     pub(crate) change: CommitGraphChange,
-    pub(crate) commit_id: String,
-    pub(crate) change_ids: Vec<String>,
+    pub(crate) commit_id: CommitId,
+    pub(crate) change_ids: Vec<ChangeId>,
     pub(crate) author_account_ids: Vec<String>,
-    pub(crate) parent_commit_ids: Vec<String>,
+    pub(crate) parent_commit_ids: Vec<CommitId>,
 }
 
 /// Commit reachable from a requested graph head.
@@ -40,8 +41,8 @@ pub(crate) struct ReachableCommitGraphCommit {
 /// Derived parent/child edge between two commit entities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphEdge {
-    pub(crate) parent_commit_id: String,
-    pub(crate) child_commit_id: String,
+    pub(crate) parent_commit_id: CommitId,
+    pub(crate) child_commit_id: CommitId,
     pub(crate) parent_order: u32,
 }
 
@@ -63,8 +64,8 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
     pub(crate) change: CommitGraphChange,
-    pub(crate) observed_commit_id: String,
-    pub(crate) start_commit_id: String,
+    pub(crate) observed_commit_id: CommitId,
+    pub(crate) start_commit_id: CommitId,
     pub(crate) depth: u32,
 }
 
@@ -74,17 +75,19 @@ pub(crate) struct CommitGraphChangeHistoryEntry {
 /// changelog storage or traversal details.
 #[async_trait::async_trait]
 pub(crate) trait CommitGraphReader: Send + Sync {
-    async fn load_commit(&mut self, commit_id: &str)
-        -> Result<Option<CommitGraphCommit>, LixError>;
+    async fn load_commit(
+        &mut self,
+        commit_id: &CommitId,
+    ) -> Result<Option<CommitGraphCommit>, LixError>;
 
     async fn reachable_commits(
         &mut self,
-        head_commit_id: &str,
+        head_commit_id: &CommitId,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>;
 
     async fn change_history_from_commit(
         &mut self,
-        start_commit_id: &str,
+        start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError>;
 }

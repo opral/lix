@@ -1,3 +1,4 @@
+use crate::changelog::CommitId;
 use crate::storage::StorageRead;
 use crate::tracked_state::{
     plan_merge, TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan,
@@ -17,9 +18,9 @@ pub(crate) enum MergeOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeCommits {
-    pub(crate) base_commit_id: String,
-    pub(crate) target_commit_id: String,
-    pub(crate) source_commit_id: String,
+    pub(crate) base_commit_id: CommitId,
+    pub(crate) target_commit_id: CommitId,
+    pub(crate) source_commit_id: CommitId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +48,11 @@ where
     S: StorageRead + Send + Sync,
 {
     let request = TrackedStateDiffRequest::default();
+    let base_commit_id = commits.base_commit_id.to_string();
+    let source_commit_id = commits.source_commit_id.to_string();
+    let target_commit_id = commits.target_commit_id.to_string();
     let source_diff = reader
-        .diff_commits(&commits.base_commit_id, &commits.source_commit_id, &request)
+        .diff_commits(&base_commit_id, &source_commit_id, &request)
         .await?;
     let target_diff = if commits.base_commit_id == commits.source_commit_id
         || commits.base_commit_id == commits.target_commit_id
@@ -56,13 +60,7 @@ where
         TrackedStateDiff::default()
     } else {
         reader
-            .diff_commits_with_validation(
-                &commits.base_commit_id,
-                &commits.target_commit_id,
-                &request,
-                false,
-                true,
-            )
+            .diff_commits_with_validation(&base_commit_id, &target_commit_id, &request, false, true)
             .await?
     };
 

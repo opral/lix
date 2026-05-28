@@ -1,3 +1,4 @@
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
@@ -59,8 +60,8 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
     pub(crate) entity_pk: &'a EntityPk,
-    pub(crate) change_id: &'a str,
-    pub(crate) commit_id: &'a str,
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     pub(crate) metadata_ref: Option<&'a JsonRef>,
     pub(crate) deleted: bool,
@@ -72,8 +73,8 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedStateIndexValue {
-    pub(crate) change_id: String,
-    pub(crate) commit_id: String,
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_ref: Option<JsonRef>,
@@ -96,9 +97,9 @@ impl TrackedStateIndexValue {
 /// Zero-copy view of a tracked-state commit-root value.
 #[derive(Debug, Clone, Copy, musli::Encode, musli::Decode)]
 #[musli(packed)]
-pub(crate) struct TrackedStateIndexValueRef<'a> {
-    pub(crate) change_id: &'a str,
-    pub(crate) commit_id: &'a str,
+pub(crate) struct TrackedStateIndexValueRef {
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_ref: Option<JsonRef>,
@@ -112,7 +113,7 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedStateCommitRoot {
-    pub(crate) commit_id: String,
+    pub(crate) commit_id: CommitId,
     pub(crate) root_id: TrackedStateRootId,
     pub(crate) parent_roots: Vec<TrackedStateCommitRootParent>,
     pub(crate) changed_key_count: u64,
@@ -125,7 +126,7 @@ pub(crate) struct TrackedStateCommitRoot {
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedStateCommitRootParent {
-    pub(crate) commit_id: String,
+    pub(crate) commit_id: CommitId,
     pub(crate) root_id: TrackedStateRootId,
 }
 
@@ -145,8 +146,8 @@ pub(crate) struct MaterializedTrackedStateRow {
     pub(crate) deleted: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    pub(crate) change_id: String,
-    pub(crate) commit_id: String,
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
 }
 
 /// Identity-centered filter for tracked-state scans.

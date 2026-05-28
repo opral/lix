@@ -1,3 +1,4 @@
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
@@ -93,8 +94,8 @@ struct TrackedRowMaterializationPlan {
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    change_id: String,
-    commit_id: String,
+    change_id: ChangeId,
+    commit_id: CommitId,
     snapshot_ref_index: Option<usize>,
     metadata_ref_index: Option<usize>,
 }

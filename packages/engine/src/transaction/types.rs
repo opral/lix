@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::catalog::SchemaPlanId;
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
@@ -275,8 +276,8 @@ pub(crate) struct PreparedStateRow {
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
-    pub(crate) change_id: Option<String>,
-    pub(crate) commit_id: Option<String>,
+    pub(crate) change_id: Option<ChangeId>,
+    pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: String,
 }
@@ -347,10 +348,10 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
 /// future commit introduces for a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedCommitChangeRefs {
-    pub(crate) commit_id: String,
-    pub(crate) commit_change_id: String,
+    pub(crate) commit_id: CommitId,
+    pub(crate) commit_change_id: ChangeId,
     pub(crate) created_at: LixTimestamp,
-    pub(crate) change_ids: BTreeSet<String>,
+    pub(crate) change_ids: BTreeSet<ChangeId>,
     pub(crate) selected_change_refs: Vec<StagedCommitChangeRef>,
     pub(crate) allow_empty: bool,
 }
@@ -358,8 +359,8 @@ pub(crate) struct StagedCommitChangeRefs {
 impl Default for StagedCommitChangeRefs {
     fn default() -> Self {
         Self {
-            commit_id: String::new(),
-            commit_change_id: String::new(),
+            commit_id: CommitId::default(),
+            commit_change_id: ChangeId::default(),
             created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
             change_ids: BTreeSet::new(),
             selected_change_refs: Vec::new(),
@@ -373,7 +374,7 @@ pub(crate) struct StagedCommitChangeRef {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
-    pub(crate) change_id: String,
+    pub(crate) change_id: ChangeId,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) deleted: bool,
@@ -383,8 +384,8 @@ pub(crate) struct StagedCommitChangeRef {
 
 impl StagedCommitChangeRefs {
     pub(crate) fn new(
-        commit_id: String,
-        commit_change_id: String,
+        commit_id: CommitId,
+        commit_change_id: ChangeId,
         created_at: LixTimestamp,
     ) -> Self {
         Self {
@@ -397,7 +398,7 @@ impl StagedCommitChangeRefs {
         }
     }
 
-    pub(crate) fn add_change_id(&mut self, change_id: String) {
+    pub(crate) fn add_change_id(&mut self, change_id: ChangeId) {
         self.change_ids.insert(change_id);
     }
 
@@ -407,7 +408,7 @@ impl StagedCommitChangeRefs {
         }
     }
 
-    pub(crate) fn remove_change_id(&mut self, change_id: &str) {
+    pub(crate) fn remove_change_id(&mut self, change_id: &ChangeId) {
         self.change_ids.remove(change_id);
     }
 

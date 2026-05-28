@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::SchemaPlanId;
+use crate::changelog::{ChangeId, CommitId};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
@@ -31,7 +32,7 @@ pub(crate) struct TransactionWriteBuffer {
     by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
     insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>>,
     commit_change_refs_by_branch: Mutex<BTreeMap<String, StagedCommitChangeRefs>>,
-    extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<String>>>,
+    extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
 }
 
@@ -46,7 +47,7 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) insert_identities:
         BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>,
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
-    pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<String>>,
+    pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
 }
 
@@ -340,7 +341,7 @@ impl TransactionWriteBuffer {
     pub(crate) fn add_commit_parent(
         &self,
         branch_id: String,
-        parent_commit_id: String,
+        parent_commit_id: CommitId,
     ) -> Result<(), LixError> {
         let mut guard = self.extra_commit_parents_by_branch.lock().map_err(|_| {
             LixError::new(
@@ -370,8 +371,10 @@ impl TransactionWriteBuffer {
         let change_refs = guard.entry(branch_id).or_insert_with(|| {
             let timestamp = functions.timestamp();
             StagedCommitChangeRefs::new(
-                functions.uuid_v7(),
-                functions.uuid_v7(),
+                CommitId::parse_lix(&functions.uuid_v7(), "staged merge commit_id")
+                    .expect("uuid_v7 provider must return a valid UUID"),
+                ChangeId::parse_lix(&functions.uuid_v7(), "staged merge commit change_id")
+                    .expect("uuid_v7 provider must return a valid UUID"),
                 crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
@@ -379,7 +382,7 @@ impl TransactionWriteBuffer {
         for change_ref in selected_change_refs {
             change_refs.add_selected_change_ref(change_ref);
         }
-        Ok(change_refs.commit_id.clone())
+        Ok(change_refs.commit_id.to_string())
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.
@@ -809,8 +812,10 @@ fn add_row_to_commit_change_refs(
         .or_insert_with(|| {
             let timestamp = functions.timestamp();
             StagedCommitChangeRefs::new(
-                functions.uuid_v7(),
-                functions.uuid_v7(),
+                CommitId::parse_lix(&functions.uuid_v7(), "staged commit_id")
+                    .expect("uuid_v7 provider must return a valid UUID"),
+                ChangeId::parse_lix(&functions.uuid_v7(), "staged commit change_id")
+                    .expect("uuid_v7 provider must return a valid UUID"),
                 crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
@@ -828,7 +833,7 @@ fn remove_row_from_commit_change_refs(
     let Some(change_refs) = change_refs_by_branch.get_mut(&row.branch_id) else {
         return;
     };
-    let Some(change_id) = row.change_id.as_deref() else {
+    let Some(change_id) = row.change_id.as_ref() else {
         return;
     };
     change_refs.remove_change_id(change_id);
@@ -1126,7 +1131,7 @@ mod tests {
             .expect("global commit change_refs should exist");
         assert_eq!(
             change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec!["test-change-id".to_string()]
+            vec![labeled_change_id("test-change-id")]
         );
     }
 
@@ -1173,7 +1178,7 @@ mod tests {
             .expect("global commit change_refs should exist");
         assert_eq!(
             change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec!["change-second".to_string()]
+            vec![labeled_change_id("change-second")]
         );
     }
 
@@ -1196,21 +1201,19 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 2);
-        assert!(drained
-            .state_rows
-            .iter()
-            .any(|row| { row.change_id.as_deref() == Some("change-tracked") && !row.untracked }));
-        assert!(drained
-            .state_rows
-            .iter()
-            .any(|row| { row.change_id.as_deref() == Some("change-untracked") && row.untracked }));
+        assert!(drained.state_rows.iter().any(|row| {
+            row.change_id == Some(labeled_change_id("change-tracked")) && !row.untracked
+        }));
+        assert!(drained.state_rows.iter().any(|row| {
+            row.change_id == Some(labeled_change_id("change-untracked")) && row.untracked
+        }));
         let change_refs = drained
             .commit_change_refs_by_branch
             .get("global")
             .expect("tracked commit member should remain in tracked domain");
         assert_eq!(
             change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec!["change-tracked".to_string()]
+            vec![labeled_change_id("change-tracked")]
         );
     }
 
@@ -1281,7 +1284,7 @@ mod tests {
             .expect("active-branch commit change_refs should exist");
         assert_eq!(
             change_refs.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec!["test-change-id".to_string()]
+            vec![labeled_change_id("test-change-id")]
         );
     }
 
@@ -1376,8 +1379,8 @@ mod tests {
             .commit_change_refs_by_branch
             .get("global")
             .expect("global commit change_refs should exist");
-        assert_eq!(change_refs.commit_id, "test-uuid-1");
-        assert_eq!(change_refs.commit_change_id, "test-uuid-2");
+        assert_eq!(change_refs.commit_id, test_commit_id(1));
+        assert_eq!(change_refs.commit_change_id, test_change_id(2));
         assert_eq!(
             change_refs.created_at.to_string(),
             "2026-01-01T00:00:00.001Z"
@@ -1397,17 +1400,14 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 1);
-        assert_eq!(
-            drained.state_rows[0].commit_id.as_deref(),
-            Some("test-uuid-1")
-        );
+        assert_eq!(drained.state_rows[0].commit_id, Some(test_commit_id(1)));
         assert_eq!(
             drained
                 .commit_change_refs_by_branch
                 .get("global")
                 .expect("global commit change_refs should exist")
                 .commit_id,
-            "test-uuid-1"
+            test_commit_id(1)
         );
     }
 
@@ -1426,13 +1426,29 @@ mod tests {
     impl FunctionProvider for TestFunctionProvider {
         fn uuid_v7(&mut self) -> String {
             self.uuid_count += 1;
-            format!("test-uuid-{}", self.uuid_count)
+            test_uuid(self.uuid_count)
         }
 
         fn timestamp(&mut self) -> String {
             self.timestamp_count += 1;
             format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count)
         }
+    }
+
+    fn test_uuid(index: usize) -> String {
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128).to_string()
+    }
+
+    fn test_commit_id(index: usize) -> CommitId {
+        CommitId::parse(&test_uuid(index)).expect("test uuid should parse as commit id")
+    }
+
+    fn test_change_id(index: usize) -> ChangeId {
+        ChangeId::parse(&test_uuid(index)).expect("test uuid should parse as change id")
+    }
+
+    fn labeled_change_id(label: &str) -> ChangeId {
+        ChangeId::for_test_label(label)
     }
 
     fn state_row(key: &str, value: &str) -> PreparedStateRow {
@@ -1517,7 +1533,7 @@ mod tests {
         fn with_tracked(mut self) -> Self {
             self.untracked = false;
             if self.change_id.is_none() {
-                self.change_id = Some("test-change-id".to_string());
+                self.change_id = Some(ChangeId::for_test_label("test-change-id"));
             }
             self
         }
@@ -1529,7 +1545,7 @@ mod tests {
         }
 
         fn with_change_id(mut self, change_id: &str) -> Self {
-            self.change_id = Some(change_id.to_string());
+            self.change_id = Some(ChangeId::for_test_label(change_id));
             self
         }
     }
