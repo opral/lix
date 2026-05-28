@@ -34,6 +34,10 @@ pub struct SqliteBackend {
     write_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
+pub struct SqliteBackendOptions {
+    pub path: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct SqliteRead {
     state: Arc<Mutex<SqliteReadState>>,
@@ -101,6 +105,10 @@ impl BackendFixture for SqliteBackendFixture {
 }
 
 impl SqliteBackend {
+    pub fn new(options: SqliteBackendOptions) -> Result<Self, BackendError> {
+        Self::open(options.path)
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
         initialize_database(&path)?;

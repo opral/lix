@@ -1,42 +1,27 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "vitest";
 import {
 	openLix,
+	SqliteBackend,
 	Value,
-	type BackendKvEntryPage,
-	type BackendKvGetRequest,
-	type BackendKvScanRange,
-	type BackendKvScanRequest,
-	type BackendKvValueBatch,
-	type BackendKvWriteBatch,
-	type BackendKvWriteStats,
 	type ExecuteResult,
-	type LixBackend,
-	type LixBackendReadTransaction,
-	type LixBackendWriteTransaction,
-	type LixError,
 	type Lix,
-	isLixError,
 } from "./index.js";
-
-const execFileAsync = promisify(execFile);
-const jsSdkRoot = fileURLToPath(new URL("..", import.meta.url));
 
 test("openLix exposes the rs-sdk e2e flow", async () => {
 	const lix = await openLix();
 	const mainBranchId = await lix.activeBranchId();
 
 	await registerCrmTaskSchema(lix);
-
 	await lix.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
 		[
 			"task-1",
-			"Draft JS SDK flow",
+			"Draft native SDK flow",
 			false,
-			JSON.stringify({ priority: "high", tags: ["sdk", "json"] }),
+			JSON.stringify({ priority: "high", tags: ["sdk", "native"] }),
 		],
 	);
 
@@ -44,203 +29,151 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 		"SELECT title, meta FROM crm_task WHERE id = $1",
 		["task-1"],
 	);
-	const projectedRow = projected.rows[0]!;
-	expect(projectedRow.get("title")).toBe("Draft JS SDK flow");
-	expect(projectedRow.value("title")).toBeInstanceOf(Value);
-	expect(projectedRow.get("meta")).toEqual({
+	expect(get(projected, "title")).toBe("Draft native SDK flow");
+	expect(get(projected, "meta")).toEqual({
 		priority: "high",
-		tags: ["sdk", "json"],
+		tags: ["sdk", "native"],
 	});
-	expect(projectedRow.value("meta").kind).toBe("json");
-	expect(projectedRow.value("meta").asJson()).toEqual({
-		priority: "high",
-		tags: ["sdk", "json"],
-	});
-	expect(projectedRow.toObject()).toEqual({
-		title: "Draft JS SDK flow",
-		meta: { priority: "high", tags: ["sdk", "json"] },
-	});
-	expect(projectedRow.toValueMap().title).toBeInstanceOf(Value);
-	expect(() => projectedRow.get("missing")).toThrow(
-		/Available columns: title, meta/,
-	);
-
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
 	const mainHead = await lix.execute("SELECT lix_active_branch_commit_id()");
-	const mainHeadCommitId = mainHead.rows[0]!.get(
-		"lix_active_branch_commit_id()",
-	);
+	const mainHeadCommitId = get(mainHead, "lix_active_branch_commit_id()");
 	expect(typeof mainHeadCommitId).toBe("string");
 
 	const draft = await lix.createBranch({
-		id: "draft-branch",
-		name: "Draft",
+		id: "native-draft-branch",
+		name: "Native draft",
 	});
 	expect(draft).toMatchObject({
-		id: "draft-branch",
-		name: "Draft",
+		id: "native-draft-branch",
+		name: "Native draft",
 		hidden: false,
 		commitId: mainHeadCommitId,
 	});
 
 	await lix.switchBranch({ branchId: draft.id });
-
 	await lix.execute("UPDATE crm_task SET done = $1 WHERE id = $2", [
 		true,
 		"task-1",
 	]);
-
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.switchBranch({ branchId: mainBranchId });
-
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
-	const preview = await lix.mergeBranchPreview({
+	const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
+	expect(preview).toMatchObject({
+		outcome: "fastForward",
+		targetBranchId: mainBranchId,
 		sourceBranchId: draft.id,
+		changeStats: {
+			total: 1,
+			added: 0,
+			modified: 1,
+			removed: 0,
+		},
+		conflicts: [],
 	});
-	expect(preview.outcome).toBe("fastForward");
-	expect(preview.targetBranchId).toBe(mainBranchId);
-	expect(preview.sourceBranchId).toBe(draft.id);
-	expect(preview.changeStats).toEqual({
-		total: 1,
-		added: 0,
-		modified: 1,
-		removed: 0,
-	});
-	expect(preview.conflicts).toEqual([]);
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
-	const merge = await lix.mergeBranch({
-		sourceBranchId: draft.id,
-	});
-
-	expect(merge.outcome).toBe("fastForward");
-	expect(merge.targetBranchId).toBe(mainBranchId);
-	expect(merge.changeStats).toEqual({
-		total: 1,
-		added: 0,
-		modified: 1,
-		removed: 0,
+	const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
+	expect(merge).toMatchObject({
+		outcome: "fastForward",
+		targetBranchId: mainBranchId,
+		changeStats: {
+			total: 1,
+			added: 0,
+			modified: 1,
+			removed: 0,
+		},
 	});
 	expect(merge.createdMergeCommitId).toBeNull();
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.close();
 	await lix.close();
-	await expect(lix.activeBranchId()).rejects.toMatchObject({
-		code: "LIX_ERROR_CLOSED",
-	});
-	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
-		code: "LIX_ERROR_CLOSED",
-	});
+	await expect(lix.activeBranchId()).rejects.toThrow(/closed/);
+	await expect(lix.execute("SELECT 1")).rejects.toThrow(/closed/);
+	await expect(lix.beginTransaction()).rejects.toThrow(/closed/);
+	await expect(lix.createBranch({ name: "After close" })).rejects.toThrow(/closed/);
+	await expect(lix.switchBranch({ branchId: mainBranchId })).rejects.toThrow(/closed/);
+	await expect(lix.mergeBranchPreview({ sourceBranchId: mainBranchId })).rejects.toThrow(/closed/);
+	await expect(lix.mergeBranch({ sourceBranchId: mainBranchId })).rejects.toThrow(/closed/);
 });
 
-test("openLix accepts an explicit backend", async () => {
-	const backend = createMemoryBackend();
+test("committed writes survive close and reopen", async () => {
+	const path = tempLixPath();
+	const first = await openLix({ backend: new SqliteBackend({ path }) });
 
-	const first = await openLix({ backend });
 	await registerCrmTaskSchema(first);
 	await first.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-		[
-			"backend-task",
-			"Stored through explicit backend",
-			false,
-			JSON.stringify({ priority: "normal" }),
-		],
+		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
+		["persistent-task", "Persist before close", false],
 	);
 	await first.close();
 
-	const second = await openLix({ backend });
-	expect(await taskDone(second, "backend-task")).toBe(false);
+	const second = await openLix({ backend: new SqliteBackend({ path }) });
+	expect(await taskTitle(second, "persistent-task")).toBe("Persist before close");
 	await second.close();
 });
 
-test("openLix paginates explicit backend scans", async () => {
-	const backend = createMemoryBackend({ scanPageSize: 1 });
-	const lix = await openLix({ backend });
+test.each([
+	["memory", () => openLix()],
+	[
+		"sqlite",
+		() => openLix({ backend: new SqliteBackend({ path: tempLixPath() }) }),
+	],
+] as const)("core native flow works with %s backend", async (_name, open) => {
+	const lix = await open();
 
 	await registerCrmTaskSchema(lix);
 	await lix.execute(
-		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4)), ($5, $6, $7, lix_json($8)), ($9, $10, $11, lix_json($12))",
-		[
-			"paged-task-1",
-			"First paged task",
-			false,
-			JSON.stringify({ page: 1 }),
-			"paged-task-2",
-			"Second paged task",
-			true,
-			JSON.stringify({ page: 2 }),
-			"paged-task-3",
-			"Third paged task",
-			false,
-			JSON.stringify({ page: 3 }),
-		],
+		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
+		["matrix-task", "Matrix", false],
 	);
+	expect(await taskTitle(lix, "matrix-task")).toBe("Matrix");
 
-	const result = await lix.execute(
-		"SELECT id FROM crm_task WHERE id LIKE $1 ORDER BY id",
-		["paged-task-%"],
-	);
-
-	expect(result.rows.map((row) => row.get("id"))).toEqual([
-		"paged-task-1",
-		"paged-task-2",
-		"paged-task-3",
+	const tx = await lix.beginTransaction();
+	await tx.execute("UPDATE crm_task SET done = $1 WHERE id = $2", [
+		true,
+		"matrix-task",
 	]);
+	await tx.commit();
+	expect(await taskDone(lix, "matrix-task")).toBe(true);
+
+	const bytes = new Uint8Array([0x10, 0x20, 0x30]);
+	const blob = await lix.execute("SELECT $1 AS bytes", [bytes]);
+	expect(get(blob, "bytes")).toEqual(bytes);
+
 	await lix.close();
 });
 
-test("custom backend applies ordered deleteRange write ops", () => {
-	const backend = createMemoryBackend();
-	const tx = backend.beginWriteTransaction();
-
-	tx.writeKvBatch({
-		ops: [
-			{
-				kind: "put",
-				key: new Uint8Array([1]),
-				value: new Uint8Array([10]),
-			},
-			{
-				kind: "put",
-				key: new Uint8Array([2]),
-				value: new Uint8Array([20]),
-			},
-			{
-				kind: "deleteRange",
-				range: {
-					lower: { kind: "included", key: new Uint8Array([1]) },
-					upper: { kind: "excluded", key: new Uint8Array([2]) },
-				},
-			},
-			{
-				kind: "put",
-				key: new Uint8Array([1]),
-				value: new Uint8Array([11]),
-			},
-		],
-	});
-	expect(tx.commit()).toBeUndefined();
-
-	const read = backend.beginReadTransaction();
-	const values = read.getValues({
-		keys: [new Uint8Array([1]), new Uint8Array([2])],
-	});
-
-	expect(values.values).toEqual([new Uint8Array([11]), new Uint8Array([20])]);
-	expect(read.rollback()).toBeUndefined();
-});
-
-test("execute supports UNION ALL without trapping wasm", async () => {
+test("execute supports UNION ALL without trapping", async () => {
 	const lix = await openLix();
-
 	const result = await lix.execute("SELECT 1 UNION ALL SELECT 2");
 
 	expect(result.rows.map((row) => row.get("Int64(1)"))).toEqual([1, 2]);
+	await lix.close();
+});
+
+test("UNION DISTINCT executes without trapping native", async () => {
+	const lix = await openLix();
+
+	const result = await lix.execute("SELECT 1 UNION SELECT 1");
+
+	expect(result.rows.map((row) => row.get("Int64(1)"))).toEqual([1]);
+
+	await lix.close();
+});
+
+test("INSERT SELECT UNION ALL executes without trapping", async () => {
+	const lix = await openLix();
+
+	const result = await lix.execute(
+		"INSERT INTO lix_directory (path) SELECT '/u1/' UNION ALL SELECT '/u2/'",
+	);
+
+	expect(result.rowsAffected).toBe(2);
 	await lix.close();
 });
 
@@ -251,11 +184,21 @@ test("beginTransaction commits multiple statements together", async () => {
 	const tx = await lix.beginTransaction();
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-		["tx-task-1", "First", false, JSON.stringify({ batch: 1 })],
+		[
+			"tx-task-1",
+			"First",
+			false,
+			JSON.stringify({ batch: 1 }),
+		],
 	);
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-		["tx-task-2", "Second", true, JSON.stringify({ batch: 1 })],
+		[
+			"tx-task-2",
+			"Second",
+			true,
+			JSON.stringify({ batch: 1 }),
+		],
 	);
 
 	const staged = await tx.execute(
@@ -277,9 +220,9 @@ test("beginTransaction commits multiple statements together", async () => {
 		"tx-task-1",
 		"tx-task-2",
 	]);
-	await expect(tx.execute("SELECT 1")).rejects.toMatchObject({
-		code: "LIX_INVALID_TRANSACTION_STATE",
-	});
+	await expect(tx.execute("SELECT 1")).rejects.toThrow(/closed/);
+	await expect(tx.commit()).rejects.toThrow(/closed/);
+	await expect(tx.rollback()).rejects.toThrow(/closed/);
 
 	await lix.close();
 });
@@ -291,7 +234,12 @@ test("beginTransaction rollback discards writes and closes handle", async () => 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-		["rolled-back-task", "Rollback", false, JSON.stringify({ batch: 1 })],
+		[
+			"rolled-back-task",
+			"Rollback",
+			false,
+			JSON.stringify({ batch: 1 }),
+		],
 	);
 	await tx.rollback();
 
@@ -299,31 +247,122 @@ test("beginTransaction rollback discards writes and closes handle", async () => 
 		"rolled-back-task",
 	]);
 	expect(result.rows).toHaveLength(0);
-	await expect(tx.rollback()).rejects.toMatchObject({
-		code: "LIX_INVALID_TRANSACTION_STATE",
-	});
+	await expect(tx.rollback()).rejects.toThrow(/closed/);
+	await expect(tx.commit()).rejects.toThrow(/closed/);
+	await expect(tx.execute("SELECT 1")).rejects.toThrow(/closed/);
 
 	await lix.close();
 });
 
-test("beginTransaction blocks session writes on the same handle", async () => {
+test("beginTransaction preserves handle after failed statement", async () => {
 	const lix = await openLix();
 	await registerCrmTaskSchema(lix);
 
 	const tx = await lix.beginTransaction();
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-		["tx-only-task", "Inside tx", false, JSON.stringify({ batch: 1 })],
+		[
+			"failed-tx-task",
+			"Before failure",
+			false,
+			JSON.stringify({ batch: 1 }),
+		],
+	);
+	await expect(tx.execute("SELECT entity_pk FROM lix_state_history")).rejects.toMatchObject({
+		code: "LIX_HISTORY_FILTER_REQUIRED",
+	});
+	await tx.rollback();
+
+	const result = await lix.execute("SELECT id FROM crm_task WHERE id = $1", [
+		"failed-tx-task",
+	]);
+	expect(result.rows).toHaveLength(0);
+
+	await lix.close();
+});
+
+test("beginTransaction can continue after failed statement", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const tx = await lix.beginTransaction();
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"continued-tx-task-1",
+			"Before failure",
+			false,
+			JSON.stringify({ batch: 1 }),
+		],
+	);
+	await expect(tx.execute("SELECT entity_pk FROM lix_state_history")).rejects.toMatchObject({
+		code: "LIX_HISTORY_FILTER_REQUIRED",
+	});
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"continued-tx-task-2",
+			"After failure",
+			true,
+			JSON.stringify({ batch: 1 }),
+		],
+	);
+	await tx.commit();
+
+	const committed = await lix.execute(
+		"SELECT id FROM crm_task WHERE id IN ($1, $2) ORDER BY id",
+		["continued-tx-task-1", "continued-tx-task-2"],
+	);
+	expect(committed.rows.map((row) => row.get("id"))).toEqual([
+		"continued-tx-task-1",
+		"continued-tx-task-2",
+	]);
+	await expect(tx.rollback()).rejects.toThrow(/closed/);
+
+	await lix.close();
+});
+
+test("beginTransaction preserves handle after invalid JS parameter", async () => {
+	const lix = await openLix();
+	const tx = await lix.beginTransaction();
+
+	await expect(tx.execute("SELECT $1", [undefined as never])).rejects.toMatchObject({
+		code: "LIX_INVALID_PARAM",
+	});
+	await tx.rollback();
+
+	await lix.close();
+});
+
+test("beginTransaction blocks session reads and writes on the same handle", async () => {
+	const lix = await openLix();
+	await registerCrmTaskSchema(lix);
+
+	const tx = await lix.beginTransaction();
+	await tx.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"tx-only-task",
+			"Inside tx",
+			false,
+			JSON.stringify({ batch: 1 }),
+		],
 	);
 
+	await expect(lix.execute("SELECT 1 AS ok")).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
 	await expect(
 		lix.execute(
 			"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
-			["outside-task", "Outside tx", false, JSON.stringify({ batch: 1 })],
+			[
+				"outside-task",
+				"Outside tx",
+				false,
+				JSON.stringify({ batch: 1 }),
+			],
 		),
-	).rejects.toMatchObject({
-		code: "LIX_INVALID_TRANSACTION_STATE",
-	});
+	).rejects.toMatchObject({ code: "LIX_INVALID_TRANSACTION_STATE" });
 
 	await tx.commit();
 
@@ -336,76 +375,29 @@ test("beginTransaction blocks session writes on the same handle", async () => {
 	await lix.close();
 });
 
-test("beginTransaction blocks session reads on the same handle", async () => {
+test("close preserves lix handle when an active transaction blocks close", async () => {
 	const lix = await openLix();
 	const tx = await lix.beginTransaction();
 
-	await expect(lix.execute("SELECT 1 AS ok")).rejects.toMatchObject({
+	await expect(lix.close()).rejects.toMatchObject({
 		code: "LIX_INVALID_TRANSACTION_STATE",
 	});
-
-	const result = await tx.execute("SELECT 1 AS ok");
-	expect(result.rows[0]?.get("ok")).toBe(1);
-
+	const txResult = await tx.execute("SELECT 1 AS tx_ok");
+	expect(get(txResult, "tx_ok")).toBe(1);
 	await tx.rollback();
+
+	const result = await lix.execute("SELECT 1 AS ok");
+	expect(get(result, "ok")).toBe(1);
+
 	await lix.close();
-});
-
-test("unsupported UNION DISTINCT returns a JS error without trapping wasm", async () => {
-	const { stdout } = await execFileAsync(
-		process.execPath,
-		[
-			"--input-type=module",
-			"-e",
-			`
-				import { openLix } from './dist/index.js';
-				const lix = await openLix();
-				try {
-					await lix.execute('SELECT 1 UNION SELECT 1');
-					console.log('unexpected-success');
-				} catch (error) {
-					console.log(error.code, error.message);
-				} finally {
-					await lix.close().catch(() => {});
-				}
-			`,
-		],
-		{ cwd: jsSdkRoot },
-	);
-
-	expect(stdout).toContain("LIX_UNSUPPORTED_SQL_RUNTIME_PLAN");
-	expect(stdout).toContain("CoalescePartitionsExec");
-});
-
-test("INSERT SELECT UNION ALL executes without trapping wasm", async () => {
-	const { stdout } = await execFileAsync(
-		process.execPath,
-		[
-			"--input-type=module",
-			"-e",
-			`
-				import { openLix } from './dist/index.js';
-				const lix = await openLix();
-				try {
-					const result = await lix.execute("INSERT INTO lix_directory (path) SELECT '/u1/' UNION ALL SELECT '/u2/'");
-					console.log(String(result.rowsAffected));
-				} finally {
-					await lix.close().catch(() => {});
-				}
-			`,
-		],
-		{ cwd: jsSdkRoot },
-	);
-
-	expect(stdout.trim()).toBe("2");
 });
 
 test("createBranch can start from an explicit commit id", async () => {
 	const lix = await openLix();
-
 	await registerCrmTaskSchema(lix);
+
 	const baseHead = await lix.execute("SELECT lix_active_branch_commit_id()");
-	const fromCommitId = baseHead.rows[0]!.get("lix_active_branch_commit_id()");
+	const fromCommitId = get(baseHead, "lix_active_branch_commit_id()");
 	expect(typeof fromCommitId).toBe("string");
 
 	await lix.execute(
@@ -419,18 +411,18 @@ test("createBranch can start from an explicit commit id", async () => {
 	);
 
 	const branch = await lix.createBranch({
-		id: "from-explicit-commit",
-		name: "From explicit commit",
+		id: "native-from-explicit-commit",
+		name: "Native from explicit commit",
 		fromCommitId: fromCommitId as string,
 	});
 	expect(branch).toMatchObject({
-		id: "from-explicit-commit",
-		name: "From explicit commit",
+		id: "native-from-explicit-commit",
+		name: "Native from explicit commit",
 		hidden: false,
 		commitId: fromCommitId,
 	});
-	await lix.switchBranch({ branchId: branch.id });
 
+	await lix.switchBranch({ branchId: branch.id });
 	const projected = await lix.execute("SELECT id FROM crm_task WHERE id = $1", [
 		"after-base",
 	]);
@@ -439,7 +431,26 @@ test("createBranch can start from an explicit commit id", async () => {
 	await lix.close();
 });
 
-test("merge conflicts expose structured details", async () => {
+test("engine errors cross the native boundary", async () => {
+	const lix = await openLix();
+
+	try {
+		await lix.execute("SELECT entity_pk FROM lix_state_history");
+		throw new Error("expected history query to fail");
+	} catch (error) {
+		expect(error).toMatchObject({
+			name: "LixError",
+			code: "LIX_HISTORY_FILTER_REQUIRED",
+		});
+		expect((error as { hint?: string }).hint).toContain(
+			"lix_active_branch_commit_id()",
+		);
+	}
+
+	await lix.close();
+});
+
+test("merge conflicts expose structured preview details and merge error", async () => {
 	const lix = await openLix();
 	const mainBranchId = await lix.activeBranchId();
 	await registerCrmTaskSchema(lix);
@@ -448,8 +459,8 @@ test("merge conflicts expose structured details", async () => {
 		["conflict-task", "Base", false, JSON.stringify({ priority: "normal" })],
 	);
 	const draft = await lix.createBranch({
-		id: "conflict-draft",
-		name: "Conflict draft",
+		id: "native-conflict-draft",
+		name: "Native conflict draft",
 	});
 
 	await lix.switchBranch({ branchId: draft.id });
@@ -464,99 +475,61 @@ test("merge conflicts expose structured details", async () => {
 		"conflict-task",
 	]);
 
+	const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
+	expect(preview.conflicts).toHaveLength(1);
+	expect(preview.conflicts[0]).toMatchObject({
+		kind: "sameEntityChanged",
+		schemaKey: "crm_task",
+		entityPk: ["conflict-task"],
+	});
+	expect(preview.conflicts[0]?.target).toBeDefined();
+	expect(preview.conflicts[0]?.source).toBeDefined();
+
 	try {
 		await lix.mergeBranch({ sourceBranchId: draft.id });
 		throw new Error("expected merge conflict");
 	} catch (error) {
-		expect(isLixError(error)).toBe(true);
-		if (!isLixError(error)) throw error;
-		expect(error.code).toBe("LIX_MERGE_CONFLICT");
-		expect(error.message).toContain("tracked-state conflict");
-		expect(error.details).toBeDefined();
-		expect((error as LixError & { data?: unknown }).data).toBeUndefined();
-		expect(
-			"description" in (error as LixError & { description?: unknown }),
-		).toBe(false);
-		const details = error.details as {
-			conflicts?: Array<{
-				schemaKey?: string;
-				entityPk?: string[];
-				target?: unknown;
-				source?: unknown;
-			}>;
-		};
-		expect(details.conflicts).toHaveLength(1);
-		expect(details.conflicts?.[0]).toMatchObject({
-			schemaKey: "crm_task",
-			entityPk: ["conflict-task"],
+		expect(error).toMatchObject({
+			name: "LixError",
+			code: "LIX_MERGE_CONFLICT",
 		});
-		expect(details.conflicts?.[0]?.target).toBeDefined();
-		expect(details.conflicts?.[0]?.source).toBeDefined();
+		if (!(error instanceof Error)) throw error;
+		expect(error.message).toContain("tracked-state conflict");
 	}
 
 	await lix.close();
 });
 
-test("lix.close delegates backend close through the engine bridge", async () => {
-	let closeCount = 0;
-	const backend = {
-		...createMemoryBackend(),
-		close() {
-			closeCount += 1;
-		},
-	};
-
-	const lix = await openLix({ backend });
-	await lix.close();
-	await lix.close();
-
-	expect(closeCount).toBe(1);
-});
-
-test("engine errors expose structured hints", async () => {
-	const lix = await openLix();
-
-	try {
-		await lix.execute("SELECT entity_pk FROM lix_state_history");
-		throw new Error("expected history query to fail");
-	} catch (error) {
-		expect(isLixError(error)).toBe(true);
-		if (!isLixError(error)) throw error;
-		expect(error.code).toBe("LIX_HISTORY_FILTER_REQUIRED");
-		expect(error.hint).toContain("lix_active_branch_commit_id()");
-	}
-
-	await lix.close();
-});
-
-test("execute rejects invalid runtime arguments before wasm", async () => {
+test("execute rejects invalid runtime arguments before native call", async () => {
 	const lix = await openLix();
 	const unsafeLix = lix as unknown as {
 		execute(sql: unknown, params?: unknown): Promise<ExecuteResult>;
 	};
 
+	await expect(openLix({ backend: { path: tempLixPath() } } as never)).rejects.toThrow(
+		/openLix\(\) requires/,
+	);
+	await expect(openLix(null as never)).rejects.toThrow(/options must be an object/);
 	await expect(unsafeLix.execute(123, [])).rejects.toMatchObject({
-		name: "LixError",
-		code: "LIX_INVALID_ARGUMENT",
-		message: "lix.execute() expected sql to be a string",
-		details: {
-			operation: "execute",
-			argument: "sql",
-			expected: "string",
-			actual: "number",
-		},
+			name: "LixError",
+			code: "LIX_INVALID_ARGUMENT",
+			details: {
+				operation: "execute",
+				argument: "sql",
+				expected: "string",
+				actual: "number",
+			},
 	});
 
 	await expect(unsafeLix.execute("SELECT 1", 123)).rejects.toMatchObject({
-		name: "LixError",
-		code: "LIX_INVALID_ARGUMENT",
-		message: "lix.execute() expected params to be an array",
-		details: {
-			operation: "execute",
-			argument: "params",
-			expected: "array",
-			actual: "number",
-		},
+			name: "LixError",
+			code: "LIX_INVALID_ARGUMENT",
+			details: {
+				operation: "execute",
+				argument: "params",
+				expected: "array",
+				actual: "number",
+			},
 	});
 
 	await lix.close();
@@ -600,7 +573,7 @@ test("execute rejects lossy JavaScript parameter coercions", async () => {
 		{
 			name: "BigInt",
 			value: 10n,
-			message: /requires a LixValue, JSON value, or binary value/,
+			message: /bigint is not a valid SQL parameter/,
 			actual: "bigint",
 		},
 		{
@@ -624,14 +597,82 @@ test("execute rejects lossy JavaScript parameter coercions", async () => {
 		{
 			name: "Symbol",
 			value: Symbol("x"),
-			message: /requires a LixValue, JSON value, or binary value/,
+			message: /symbol is not a valid SQL parameter/,
 			actual: "symbol",
 		},
 		{
 			name: "function",
 			value: () => undefined,
-			message: /requires a LixValue, JSON value, or binary value/,
+			message: /function is not a valid SQL parameter/,
 			actual: "function",
+		},
+		{
+			name: "nested undefined",
+			value: { nested: undefined },
+			message: /undefined is not a valid SQL parameter/,
+			actual: "undefined",
+		},
+		{
+			name: "nested BigInt",
+			value: { nested: [10n] },
+			message: /bigint is not a valid SQL parameter/,
+			actual: "bigint",
+		},
+		{
+			name: "nested Symbol",
+			value: { nested: Symbol("x") },
+			message: /symbol is not a valid SQL parameter/,
+			actual: "symbol",
+		},
+		{
+			name: "nested function",
+			value: { nested: () => undefined },
+			message: /function is not a valid SQL parameter/,
+			actual: "function",
+		},
+		{
+			name: "nested Date",
+			value: { nested: new Date("2026-01-02T03:04:05.000Z") },
+			message: /Date is not a valid SQL parameter/,
+			actual: "Date",
+		},
+		{
+			name: "nested Uint8Array",
+			value: { nested: new Uint8Array([1, 2, 3]) },
+			message: /typed array SQL parameters must be top-level Uint8Array values/,
+			actual: "Uint8Array",
+		},
+		{
+			name: "Map",
+			value: new Map([["key", "value"]]),
+			message: /plain objects or arrays/,
+			actual: "Map",
+		},
+		{
+			name: "Set",
+			value: new Set(["value"]),
+			message: /plain objects or arrays/,
+			actual: "Set",
+		},
+		{
+			name: "RegExp",
+			value: /value/,
+			message: /plain objects or arrays/,
+			actual: "RegExp",
+		},
+		{
+			name: "class instance",
+			value: new (class Task {
+				id = "task-1";
+			})(),
+			message: /plain objects or arrays/,
+			actual: "Task",
+		},
+		{
+			name: "nested Map",
+			value: { nested: new Map([["key", "value"]]) },
+			message: /plain objects or arrays/,
+			actual: "Map",
 		},
 	];
 
@@ -658,6 +699,133 @@ test("execute rejects lossy JavaScript parameter coercions", async () => {
 	await lix.close();
 });
 
+test("execute treats LixValue-shaped objects as JSON parameters", async () => {
+	const lix = await openLix();
+
+	const realObject = await lix.execute("SELECT $1 AS v", [
+		{ kind: "real", value: 1.5 },
+	]);
+	expect(get(realObject, "v")).toEqual({ kind: "real", value: 1.5 });
+	const blobObject = await lix.execute("SELECT $1 AS v", [
+		{ kind: "blob", value: "AQID" },
+	]);
+	expect(get(blobObject, "v")).toEqual({
+		kind: "blob",
+		value: "AQID",
+	});
+
+	await lix.close();
+});
+
+test("execute round-trips Uint8Array blob parameters", async () => {
+	const lix = await openLix();
+
+	const bytes = new Uint8Array([0x01, 0x02, 0x03, 0xff]);
+	const result = await lix.execute("SELECT $1 AS v", [bytes]);
+	const value = result.rows[0]?.value("v");
+
+	expect(get(result, "v")).toEqual(bytes);
+	expect(value?.kind).toBe("blob");
+	expect(value?.toJS()).toEqual(bytes);
+	expect(value?.asBytes()).toEqual(bytes);
+	const returnedBytes = value?.asBytes();
+	if (!returnedBytes) throw new Error("expected blob bytes");
+	returnedBytes[0] = 0x99;
+	expect(value?.asBytes()).toEqual(bytes);
+
+	await lix.close();
+});
+
+test("Value and Row return copies for structured values", async () => {
+	const source = { nested: { ok: true } };
+	const value = Value.json(source);
+	source.nested.ok = false;
+
+	const first = value.toJS() as { nested: { ok: boolean } };
+	first.nested.ok = false;
+	expect(value.toJS()).toEqual({ nested: { ok: true } });
+
+	const lix = await openLix();
+	const result = await lix.execute("SELECT $1 AS value", [
+		{ nested: { ok: true } },
+	]);
+	const rowValue = result.rows[0]?.get("value") as { nested: { ok: boolean } };
+	rowValue.nested.ok = false;
+	expect(result.rows[0]?.get("value")).toEqual({ nested: { ok: true } });
+	expect(result.rows[0]?.toObject()).toEqual({ value: { nested: { ok: true } } });
+
+	await lix.close();
+});
+
+test("execute accepts explicit Value parameters", async () => {
+	const lix = await openLix();
+
+	const real = await lix.execute("SELECT $1 AS v", [
+		Value.real(1.5),
+	]);
+	expect(get(real, "v")).toBe(1.5);
+	const blob = await lix.execute("SELECT $1 AS v", [
+		Value.blob(new Uint8Array([0x01, 0x02, 0x03])),
+	]);
+	expect(get(blob, "v")).toEqual(new Uint8Array([0x01, 0x02, 0x03]));
+	const source = new Uint8Array([0x04, 0x05, 0x06]);
+	const explicitBlob = Value.blob(source);
+	source[0] = 0xff;
+	const copiedBlob = await lix.execute("SELECT $1 AS v", [explicitBlob]);
+	expect(get(copiedBlob, "v")).toEqual(new Uint8Array([0x04, 0x05, 0x06]));
+
+	await lix.close();
+});
+
+test("execute rejects invalid explicit Value parameters", async () => {
+	const lix = await openLix();
+
+	expect(
+		() => Value.json({ nested: undefined } as never),
+	).toThrow(/undefined is not a valid SQL parameter/);
+	expect(() => Value.json(new Map() as never)).toThrow(/plain objects or arrays/);
+	expect(() => Value.integer(1.5)).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
+	expect(() => Value.integer(Number.MAX_SAFE_INTEGER + 1)).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
+	expect(
+		() => Value.from(Number.MAX_SAFE_INTEGER + 1),
+	).toThrow(/safe integer/);
+	expect(
+		() => Value.real(Number.POSITIVE_INFINITY),
+	).toThrow(/explicit Value contains an invalid native value/);
+	expect(() => Value.text("X\uD83DY")).toThrow(/well-formed UTF-16/);
+	expect(() => Value.blob("AQID" as never)).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
+
+	await lix.close();
+});
+
+test("execute treats objects with non-LixValue kind as JSON parameters", async () => {
+	const lix = await openLix();
+
+	const result = await lix.execute("SELECT $1 AS value", [
+		{ kind: "task", id: 1 },
+	]);
+	expect(get(result, "value")).toEqual({ kind: "task", id: 1 });
+
+	await lix.close();
+});
+
+test("execute treats arrays as JSON parameters", async () => {
+	const lix = await openLix();
+
+	const result = await lix.execute("SELECT $1 AS value", [
+		[1, "x", { ok: true }],
+	]);
+	expect(get(result, "value")).toEqual([1, "x", { ok: true }]);
+
+	await lix.close();
+});
+
 test("execute rejects extra SQL parameters", async () => {
 	const lix = await openLix();
 
@@ -666,13 +834,8 @@ test("execute rejects extra SQL parameters", async () => {
 		throw new Error("expected extra params to fail");
 	} catch (error) {
 		expect(error).toMatchObject({
+			name: "LixError",
 			code: "LIX_INVALID_PARAM",
-			details: {
-				operation: "execute",
-				expected_param_count: 1,
-				provided_param_count: 2,
-				placeholders: ["$1"],
-			},
 		});
 		if (!(error instanceof Error)) throw error;
 		expect(error.message).toBe(
@@ -689,8 +852,8 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	await lix.execute(
 		"INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
 		[
-			"history-binary-js-repro",
-			"/history/repro.bin",
+			"history-binary-native-repro",
+			"/history/native-repro.bin",
 			new Uint8Array([0x80, 0xff, 0x00]),
 		],
 	);
@@ -703,7 +866,6 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	const directoryRow = result.rows.find(
 		(row) => row.get("schema_key") === "lix_directory_descriptor",
 	);
-
 	expect(directoryRow?.get("snapshot_content")).toMatchObject({
 		parent_id: null,
 	});
@@ -711,13 +873,13 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	await lix.close();
 });
 
-async function registerCrmTaskSchema(lix: Lix) {
+async function registerCrmTaskSchema(lix: Lix): Promise<void> {
 	const schema = {
 		$schema: "https://json-schema.org/draft/2020-12/schema",
 		"x-lix-key": "crm_task",
 		"x-lix-primary-key": ["/id"],
 		type: "object",
-		required: ["id", "title", "done", "meta"],
+		required: ["id", "title", "done"],
 		properties: {
 			id: { type: "string" },
 			title: { type: "string" },
@@ -734,189 +896,32 @@ async function registerCrmTaskSchema(lix: Lix) {
 }
 
 async function taskDone(lix: Lix, taskId: string): Promise<boolean> {
-	const result = await lix.execute("SELECT done FROM crm_task WHERE id = $1", [
-		taskId,
-	]);
-	const rows = expectRows(result);
-	expect(rows.rows).toHaveLength(1);
-	const done = rows.rows[0]?.get("done");
+	const result = await lix.execute("SELECT done FROM crm_task WHERE id = $1", [taskId]);
+	expect(result.rows).toHaveLength(1);
+	const done = get(result, "done");
 	expect(typeof done).toBe("boolean");
 	return done as boolean;
 }
 
-function expectRows(result: ExecuteResult) {
-	return result;
+async function taskTitle(lix: Lix, taskId: string): Promise<string> {
+	const result = await lix.execute("SELECT title FROM crm_task WHERE id = $1", [
+		taskId,
+	]);
+	expect(result.rows).toHaveLength(1);
+	const title = get(result, "title");
+	expect(typeof title).toBe("string");
+	return title as string;
 }
 
-type StoredKvPair = {
-	key: Uint8Array;
-	value: Uint8Array;
-};
-
-type MemoryBackendOptions = {
-	scanPageSize?: number;
-};
-
-function createMemoryBackend(options: MemoryBackendOptions = {}): LixBackend {
-	let rows: StoredKvPair[] = [];
-
-	function createTransaction(): LixBackendWriteTransaction {
-		let transactionRows = rows.map(cloneStoredPair);
-		let closed = false;
-
-		const ensureOpen = () => {
-			if (closed) {
-				throw new Error("transaction is closed");
-			}
-		};
-
-		return {
-			getValues(request): BackendKvValueBatch {
-				ensureOpen();
-				return {
-					values: request.keys.map((key) => {
-						const row = transactionRows.find(
-							(row) => compareBytes(row.key, key) === 0,
-						);
-						return row ? new Uint8Array(row.value) : null;
-					}),
-				};
-			},
-			scanEntries(request): BackendKvEntryPage {
-				ensureOpen();
-				const { pairs, resumeAfter } = scanPage(
-					transactionRows,
-					limitScanRequest(request, options.scanPageSize),
-				);
-				return {
-					keys: pairs.map((row) => new Uint8Array(row.key)),
-					values: pairs.map((row) => new Uint8Array(row.value)),
-					resumeAfter,
-				};
-			},
-			writeKvBatch(batch): BackendKvWriteStats {
-				ensureOpen();
-				const stats: BackendKvWriteStats = {
-					puts: 0,
-					deletes: 0,
-					deleteRanges: 0,
-					bytesWritten: 0,
-				};
-				for (const op of batch.ops) {
-					if (op.kind === "put") {
-						stats.puts += 1;
-						stats.bytesWritten += op.key.length + op.value.length;
-						transactionRows = transactionRows.filter(
-							(row) => compareBytes(row.key, op.key) !== 0,
-						);
-						transactionRows.push({
-							key: new Uint8Array(op.key),
-							value: new Uint8Array(op.value),
-						});
-					} else if (op.kind === "delete") {
-						stats.deletes += 1;
-						stats.bytesWritten += op.key.length;
-						transactionRows = transactionRows.filter(
-							(row) => compareBytes(row.key, op.key) !== 0,
-						);
-					} else {
-						stats.deleteRanges += 1;
-						stats.bytesWritten += deleteRangeBytes(op.range);
-						transactionRows = transactionRows.filter(
-							(row) => !keyMatchesRange(row.key, op.range),
-						);
-					}
-				}
-				return stats;
-			},
-			commit() {
-				ensureOpen();
-				rows = transactionRows.map(cloneStoredPair);
-				closed = true;
-			},
-			rollback() {
-				ensureOpen();
-				closed = true;
-			},
-		};
-	}
-
-	return {
-		beginReadTransaction(): LixBackendReadTransaction {
-			return createTransaction();
-		},
-		beginWriteTransaction(): LixBackendWriteTransaction {
-			return createTransaction();
-		},
-	};
+function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {
+	return result.rows[rowIndex]?.get(column);
 }
 
-function limitScanRequest(
-	request: BackendKvScanRequest,
-	scanPageSize: number | undefined,
-): BackendKvScanRequest {
-	if (scanPageSize === undefined) return request;
-	return {
-		...request,
-		limit: Math.min(request.limit, scanPageSize),
-	};
-}
-
-function cloneStoredPair(row: StoredKvPair): StoredKvPair {
-	return {
-		key: new Uint8Array(row.key),
-		value: new Uint8Array(row.value),
-	};
-}
-
-function scanPage(
-	rows: StoredKvPair[],
-	request: BackendKvScanRequest,
-): { pairs: StoredKvPair[]; resumeAfter: Uint8Array | null } {
-	const matches = rows
-		.filter(
-			(row) =>
-				keyMatchesRange(row.key, request.range) &&
-				(!request.after || compareBytes(row.key, request.after) > 0),
-		)
-		.sort((left, right) => compareBytes(left.key, right.key));
-	const hasMore = matches.length > request.limit;
-	const pairs = matches.slice(0, request.limit);
-	return {
-		pairs,
-		resumeAfter: hasMore ? (pairs.at(-1)?.key ?? null) : null,
-	};
-}
-
-function keyMatchesRange(key: Uint8Array, range: BackendKvScanRange): boolean {
-	return lowerBoundMatches(key, range.lower) && upperBoundMatches(key, range.upper);
-}
-
-function lowerBoundMatches(key: Uint8Array, bound: BackendKvScanRange["lower"]) {
-	if (bound.kind === "unbounded") return true;
-	const comparison = compareBytes(key, bound.key);
-	return bound.kind === "included" ? comparison >= 0 : comparison > 0;
-}
-
-function upperBoundMatches(key: Uint8Array, bound: BackendKvScanRange["upper"]) {
-	if (bound.kind === "unbounded") return true;
-	const comparison = compareBytes(key, bound.key);
-	return bound.kind === "included" ? comparison <= 0 : comparison < 0;
-}
-
-function deleteRangeBytes(range: BackendKvScanRange): number {
-	return boundBytes(range.lower) + boundBytes(range.upper);
-}
-
-function boundBytes(bound: BackendKvScanRange["lower"]): number {
-	return bound.kind === "unbounded" ? 0 : bound.key.length;
-}
-
-function compareBytes(left: Uint8Array, right: Uint8Array): number {
-	const length = Math.min(left.length, right.length);
-	for (let index = 0; index < length; index++) {
-		const delta = left[index]! - right[index]!;
-		if (delta !== 0) return delta;
-	}
-	return left.length - right.length;
+function tempLixPath(): string {
+	const dir = join(tmpdir(), "lix-js-sdk-tests");
+	mkdirSync(dir, { recursive: true });
+	return join(
+		dir,
+		`lix-test-${Date.now()}-${Math.random().toString(16).slice(2)}.lix`,
+	);
 }

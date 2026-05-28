@@ -1,5 +1,22 @@
-export * from "./open-lix.js";
-export * from "./builtin-schemas.js";
-export { Value, isLixError } from "./engine-wasm/index.js";
-export type { LixError, LixValue } from "./engine-wasm/index.js";
-export type { JsonValue, LixRuntimeValue } from "./types.js";
+export { Lix, LixTransaction, openLix, SqliteBackend } from "./open-lix.js";
+export { Row } from "./result.js";
+export { Value } from "./value.js";
+export type {
+	CreateBranchOptions,
+	CreateBranchReceipt,
+	ExecuteResult,
+	JsonValue,
+	LixValue,
+	MergeBranchOptions,
+	MergeBranchOutcome,
+	MergeBranchPreview,
+	MergeBranchReceipt,
+	MergeChangeStats,
+	MergeConflict,
+	MergeConflictSide,
+	OpenLixOptions,
+	SqlParam,
+	SqliteBackendOptions,
+	SwitchBranchOptions,
+	SwitchBranchReceipt,
+} from "./types.js";
