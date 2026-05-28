@@ -375,7 +375,7 @@ impl TransactionWriteBuffer {
             StagedCommitChangeRefs::new(
                 CommitId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
-                crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
+                timestamp,
             )
         });
         change_refs.allow_empty();
@@ -814,7 +814,7 @@ fn add_row_to_commit_change_refs(
             StagedCommitChangeRefs::new(
                 CommitId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
-                crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
+                timestamp,
             )
         });
     row.commit_id = Some(change_refs.commit_id.clone());
@@ -1426,9 +1426,12 @@ mod tests {
             test_uuid_value(self.uuid_count)
         }
 
-        fn timestamp(&mut self) -> String {
+        fn timestamp(&mut self) -> crate::common::LixTimestamp {
             self.timestamp_count += 1;
-            format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count)
+            crate::common::LixTimestamp::expect_parse(
+                "timestamp",
+                &format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count),
+            )
         }
     }
 

@@ -82,12 +82,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     let main_branch_id = functions.call_uuid_v7().to_string();
     let lix_id = functions.call_uuid_v7().to_string();
     let initial_commit_id = CommitId::from(functions.call_uuid_v7());
-    let timestamp_text = functions.call_timestamp();
-    let timestamp = LixTimestamp::parse(&timestamp_text).map_err(|error| {
-        LixError::unknown(format!(
-            "invalid init timestamp from function provider: {error}"
-        ))
-    })?;
+    let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
     for schema in seed_schema_definitions() {
@@ -697,9 +692,12 @@ mod tests {
             test_uuid_value(self.uuid_count)
         }
 
-        fn timestamp(&mut self) -> String {
+        fn timestamp(&mut self) -> LixTimestamp {
             self.timestamp_count += 1;
-            format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count)
+            LixTimestamp::expect_parse(
+                "timestamp",
+                &format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count),
+            )
         }
     }
 

@@ -1,3 +1,4 @@
+use crate::common::LixTimestamp;
 use crate::functions::{
     state, DeterministicFunctionProvider, DeterministicSequence, FunctionProvider,
     FunctionProviderHandle, SystemFunctionProvider,
@@ -14,7 +15,7 @@ use crate::LixError;
 /// successful execution.
 pub(crate) struct FunctionContext {
     functions: FunctionProviderHandle,
-    bookkeeping_timestamp: String,
+    bookkeeping_timestamp: LixTimestamp,
 }
 
 impl FunctionContext {
@@ -64,7 +65,7 @@ impl FunctionContext {
         state::stage_sequence(
             writes,
             DeterministicSequence { highest_seen },
-            &self.bookkeeping_timestamp,
+            self.bookkeeping_timestamp,
         )
         .await
     }
@@ -139,7 +140,10 @@ mod tests {
             functions.call_uuid_v7().to_string(),
             "01920000-0000-7000-8000-000000000000"
         );
-        assert_eq!(functions.call_timestamp(), "1970-01-01T00:00:00.001Z");
+        assert_eq!(
+            functions.call_timestamp().to_string(),
+            "1970-01-01T00:00:00.001Z"
+        );
         assert_eq!(
             context
                 .provider()
