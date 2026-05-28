@@ -1,8 +1,7 @@
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt as CreateBranchResult, Engine, ExecuteResult,
-    InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt as MergeBranchResult, SessionContext, SwitchBranchOptions,
-    SwitchBranchReceipt as SwitchBranchResult, Value,
+    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InMemoryBackend,
+    LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 
 /// Options for opening a Lix workspace session.
@@ -77,14 +76,14 @@ where
     pub async fn create_branch(
         &self,
         options: CreateBranchOptions,
-    ) -> Result<CreateBranchResult, LixError> {
+    ) -> Result<CreateBranchReceipt, LixError> {
         self.session.create_branch(options).await
     }
 
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<SwitchBranchResult, LixError> {
+    ) -> Result<SwitchBranchReceipt, LixError> {
         let (_session, receipt) = self.session.switch_branch(options).await?;
         Ok(receipt)
     }
@@ -92,7 +91,7 @@ where
     pub async fn merge_branch(
         &self,
         options: MergeBranchOptions,
-    ) -> Result<MergeBranchResult, LixError> {
+    ) -> Result<MergeBranchReceipt, LixError> {
         self.session.merge_branch(options).await
     }
 
