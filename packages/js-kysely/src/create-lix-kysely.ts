@@ -416,7 +416,7 @@ function decodeLixValue(value: unknown): unknown {
 		kind?: unknown;
 		value?: unknown;
 		base64?: unknown;
-		asBlob?: unknown;
+		asBytes?: unknown;
 	};
 	switch (candidate.kind) {
 		case "null":
@@ -428,8 +428,8 @@ function decodeLixValue(value: unknown): unknown {
 		case "json":
 			return candidate.value;
 		case "blob":
-			if (typeof candidate.asBlob === "function") {
-				return candidate.asBlob();
+			if (typeof candidate.asBytes === "function") {
+				return candidate.asBytes();
 			}
 			return typeof candidate.base64 === "string"
 				? Uint8Array.from(atob(candidate.base64), (char) => char.charCodeAt(0))

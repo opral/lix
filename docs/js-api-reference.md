@@ -70,7 +70,7 @@ const result = await lix.execute(
 );
 
 const path = result.rows[0]?.value("path").asText();
-const data = result.rows[0]?.value("data").asBlob();
+const data = result.rows[0]?.value("data").asBytes();
 ```
 
 ### beginTransaction()
@@ -270,7 +270,7 @@ Accessors:
 | `asReal()`    | `number \| undefined`     | Returns a number for real values.     |
 | `asText()`    | `string \| undefined`     | Returns a string for text values.     |
 | `asJson()`    | `JsonValue \| undefined`  | Returns a JSON value for JSON values. |
-| `asBlob()`    | `Uint8Array \| undefined` | Returns bytes for blob values.        |
+| `asBytes()`   | `Uint8Array \| undefined` | Returns bytes for blob values.        |
 | `toJSON()`    | `LixValue`                | Serializes the typed value.           |
 
 Constructors:
@@ -285,5 +285,3 @@ Constructors:
 | `Value.json(value)`    | Create a JSON value.                                                           |
 | `Value.blob(value)`    | Create a blob value from `Uint8Array`.                                         |
 | `Value.from(raw)`      | Convert a JS value, `LixValue`, `Uint8Array`, or `ArrayBuffer` into a `Value`. |
-
-There is no `asBytes()` accessor. Use `asBlob()` for byte content from `lix_file.data`.

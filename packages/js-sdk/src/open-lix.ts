@@ -120,7 +120,7 @@ function valueToNative(value: Value): LixNativeValue {
 		case "json":
 			return value.value as JsonValue;
 		case "blob":
-			return value.asBlob() ?? new Uint8Array();
+			return value.asBytes() ?? new Uint8Array();
 	}
 }
 

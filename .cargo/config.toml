@@ -37,8 +37,7 @@ debug = true
 trim-paths = true
 
 [profile.bench]
-debug = true
-strip = false
+debug = "line-tables-only"
 
 [unstable]
 bindeps = true

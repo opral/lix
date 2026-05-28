@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::mode::SimulationMode;
@@ -31,7 +30,7 @@ pub(crate) struct SharedExpectSameRun {
     case: Arc<SharedExpectSameCase>,
 }
 
-struct SharedExpectSameCase {
+pub(super) struct SharedExpectSameCase {
     state: Mutex<SharedExpectSameState>,
     condvar: Condvar,
 }
@@ -49,23 +48,11 @@ pub(crate) struct SharedExpectSameRunGuard {
 }
 
 impl SharedExpectSameRun {
-    pub(crate) fn new(case_id: &str, mode: SimulationMode) -> Self {
-        static CASES: OnceLock<Mutex<HashMap<String, Arc<SharedExpectSameCase>>>> = OnceLock::new();
-        let cases = CASES.get_or_init(|| Mutex::new(HashMap::new()));
-        let case = {
-            let mut guard = cases
-                .lock()
-                .expect("engine shared expectation registry lock poisoned");
-            guard
-                .entry(case_id.to_string())
-                .or_insert_with(|| {
-                    Arc::new(SharedExpectSameCase {
-                        state: Mutex::new(SharedExpectSameState::default()),
-                        condvar: Condvar::new(),
-                    })
-                })
-                .clone()
-        };
+    pub(crate) fn with_case(
+        case_id: &str,
+        mode: SimulationMode,
+        case: Arc<SharedExpectSameCase>,
+    ) -> Self {
         Self {
             case_id: case_id.to_string(),
             mode,
@@ -237,6 +224,15 @@ impl SharedExpectSameRun {
     }
 }
 
+impl SharedExpectSameCase {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SharedExpectSameState::default()),
+            condvar: Condvar::new(),
+        })
+    }
+}
+
 impl SharedExpectSameRunGuard {
     pub(crate) fn new(run: SharedExpectSameRun) -> Self {
         Self {
@@ -263,11 +259,17 @@ mod tests {
     #[test]
     fn shared_expect_same_compares_against_base_run() {
         let case_id = "expect_same_unit_shared";
-        let base = SharedExpectSameRun::new(case_id, SimulationMode::Base);
+        let shared_case = SharedExpectSameCase::new();
+        let base =
+            SharedExpectSameRun::with_case(case_id, SimulationMode::Base, shared_case.clone());
         base.assert_same("value", "1".to_string());
         base.finish_mode();
 
-        let rebuild = SharedExpectSameRun::new(case_id, SimulationMode::TrackedStateRebuild);
+        let rebuild = SharedExpectSameRun::with_case(
+            case_id,
+            SimulationMode::TrackedStateRebuild,
+            shared_case,
+        );
         rebuild.assert_same("value", "1".to_string());
         rebuild.finish_mode();
     }

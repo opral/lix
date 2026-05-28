@@ -202,7 +202,7 @@ for (const row of r.rows) {
 | `asInteger()` | `number \| undefined`     | integer fields                            |
 | `asReal()`    | `number \| undefined`     | decimal/real fields                       |
 | `asJson()`    | `JsonValue \| undefined`  | objects and arrays                        |
-| `asBlob()`    | `Uint8Array \| undefined` | binary data                               |
+| `asBytes()`   | `Uint8Array \| undefined` | binary data                               |
 
 Accessors return `undefined` when the cell kind does not match. Branch on `value.kind` if a column can hold multiple types. Public kind strings are `"null"`, `"boolean"`, `"integer"`, `"real"`, `"text"`, `"json"`, and `"blob"`.
 
@@ -405,7 +405,7 @@ const result = await lix.execute(
 const file = result.rows[0]!;
 console.log(
   file.value("path").asText(),
-  new TextDecoder().decode(file.value("data").asBlob()!),
+  new TextDecoder().decode(file.value("data").asBytes()!),
 );
 ```
 
