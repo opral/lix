@@ -5,7 +5,9 @@ edition = "2021"
 autobenches = false
 
 [features]
-storage-benches = []
+rocksdb = ["dep:rocksdb"]
+redb = ["dep:redb"]
+storage-benches = ["rocksdb", "redb"]
 
 [[bench]]
 name = "storage_v2"
@@ -78,12 +80,13 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 bytes = "1"
 
+rocksdb = { version = "0.22", default-features = false, optional = true }
+redb = { version = "4.1.0", optional = true }
+
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "*" }
 iref = "4.0.0"
 paste = "1"
-rocksdb = { version = "0.22", default-features = false }
-redb = "4.1.0"
 rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
