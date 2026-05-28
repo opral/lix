@@ -80,7 +80,7 @@ fn project_state_context_from_before(
                     snapshot_content: row.snapshot_content,
                     file_id: None,
                     plugin_key: None,
-                    version_id: None,
+                    branch_id: None,
                     change_id: None,
                     metadata: None,
                     created_at: None,

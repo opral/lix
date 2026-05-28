@@ -1,3 +1,4 @@
+use crate::binary_cas::codec::BinaryChunkCodec;
 use crate::binary_cas::codec::{binary_blob_hash_bytes, hash_bytes_to_hex, hash_hex_to_bytes};
 use crate::LixError;
 
@@ -84,4 +85,13 @@ pub(crate) struct BlobWriteReceipt {
     pub(crate) hash: BlobHash,
     pub(crate) size_bytes: u64,
     pub(crate) layout: BlobLayout,
+}
+
+#[derive(musli::Decode)]
+#[musli(packed)]
+pub(crate) struct BinaryCasChunkView<'a> {
+    pub(crate) codec: BinaryChunkCodec,
+    pub(crate) uncompressed_len: u64,
+    #[musli(bytes)]
+    pub(crate) payload: &'a [u8],
 }
