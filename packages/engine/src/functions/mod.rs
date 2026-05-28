@@ -12,9 +12,7 @@ mod types;
 
 pub(crate) use context::FunctionContext;
 pub(crate) use deterministic::DeterministicFunctionProvider;
-pub(crate) use provider::{
-    FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-};
+pub(crate) use provider::{FunctionProvider, FunctionProviderHandle, SystemFunctionProvider};
 pub(crate) use types::{DeterministicMode, DeterministicSequence};
 
 pub(crate) type DeterministicRuntimeGuard = tokio::sync::OwnedMutexGuard<()>;

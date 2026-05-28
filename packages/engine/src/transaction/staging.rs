@@ -5,7 +5,9 @@ use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_pk::EntityPk;
-use crate::functions::{FunctionProvider, FunctionProviderHandle};
+#[cfg(test)]
+use crate::functions::FunctionProvider;
+use crate::functions::FunctionProviderHandle;
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
@@ -361,7 +363,7 @@ impl TransactionWriteBuffer {
         branch_id: String,
         selected_change_refs: impl IntoIterator<Item = StagedCommitChangeRef>,
     ) -> Result<String, LixError> {
-        let mut functions = self.functions.clone();
+        let functions = self.functions.clone();
         let mut guard = self.commit_change_refs_by_branch.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -369,10 +371,10 @@ impl TransactionWriteBuffer {
             )
         })?;
         let change_refs = guard.entry(branch_id).or_insert_with(|| {
-            let timestamp = functions.timestamp();
+            let timestamp = functions.call_timestamp();
             StagedCommitChangeRefs::new(
-                CommitId::from(functions.uuid_v7()),
-                ChangeId::from(functions.uuid_v7()),
+                CommitId::from(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
                 crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
@@ -403,7 +405,7 @@ impl TransactionWriteBuffer {
             PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
             PreparedTransactionWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
         };
-        let mut functions = self.functions.clone();
+        let functions = self.functions.clone();
         let (rows, file_data_writes) = self.state_rows_from_stage_write(write);
         reject_duplicate_present_rows_in_batch(&rows)?;
         let mut guard = self.rows.lock().map_err(|_| {
@@ -450,7 +452,7 @@ impl TransactionWriteBuffer {
                     remove_row_from_commit_change_refs(&mut commit_change_refs_guard, &previous);
                 }
             }
-            add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &mut functions);
+            add_row_to_commit_change_refs(&mut commit_change_refs_guard, &mut row, &functions);
             let identity = PreparedStateRowIdentity::from(&row);
             if mode == Some(TransactionWriteMode::Insert) {
                 insert_identities_guard.insert(identity.clone(), row.origin.clone());
@@ -796,7 +798,7 @@ fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
 fn add_row_to_commit_change_refs(
     change_refs_by_branch: &mut BTreeMap<String, StagedCommitChangeRefs>,
     row: &mut PreparedStateRow,
-    functions: &mut dyn FunctionProvider,
+    functions: &FunctionProviderHandle,
 ) {
     if row.untracked {
         return;
@@ -808,10 +810,10 @@ fn add_row_to_commit_change_refs(
     let change_refs = change_refs_by_branch
         .entry(row.branch_id.clone())
         .or_insert_with(|| {
-            let timestamp = functions.timestamp();
+            let timestamp = functions.call_timestamp();
             StagedCommitChangeRefs::new(
-                CommitId::from(functions.uuid_v7()),
-                ChangeId::from(functions.uuid_v7()),
+                CommitId::from(functions.call_uuid_v7()),
+                ChangeId::from(functions.call_uuid_v7()),
                 crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
@@ -900,7 +902,6 @@ fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::functions::SharedFunctionProvider;
     use crate::live_state::{LiveStateFilter, LiveStateRowRequest};
 
     #[tokio::test]
@@ -1408,7 +1409,7 @@ mod tests {
     }
 
     fn test_staged_writes() -> Arc<TransactionWriteBuffer> {
-        Arc::new(TransactionWriteBuffer::new(SharedFunctionProvider::new(
+        Arc::new(TransactionWriteBuffer::new(FunctionProviderHandle::shared(
             Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>,
         )))
     }

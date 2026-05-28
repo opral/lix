@@ -316,7 +316,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::functions::{FunctionProvider, SharedFunctionProvider};
+    use crate::functions::FunctionProvider;
     use crate::schema::seed_schema_definition;
 
     #[test]
@@ -862,7 +862,7 @@ mod tests {
     }
 
     fn functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(Box::new(FixedFunctions) as Box<dyn FunctionProvider + Send>)
+        FunctionProviderHandle::shared(Box::new(FixedFunctions) as Box<dyn FunctionProvider + Send>)
     }
 
     struct FixedFunctions;
