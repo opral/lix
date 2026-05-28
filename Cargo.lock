@@ -3010,7 +3010,6 @@ dependencies = [
 name = "lix_js_sdk"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "lix_rs_sdk",
  "napi",
  "napi-derive",

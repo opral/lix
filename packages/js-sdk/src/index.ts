@@ -5,6 +5,7 @@ export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	ExecuteResult,
+	JsonValue,
 	LixValue,
 	MergeBranchOptions,
 	MergeBranchOutcome,

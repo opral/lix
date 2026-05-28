@@ -1,7 +1,7 @@
-import { invalidArgument, withLixError } from "./errors.js";
+import { invalidArgument } from "./errors.js";
 import { addon } from "./native.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
-import { normalizeParam } from "./value.js";
+import { normalizeParam, toNativeValue } from "./value.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -17,7 +17,7 @@ import type {
 } from "./types.js";
 
 type NativeExecuteResult = Parameters<typeof wrapExecuteResult>[0];
-type NativeParam = ReturnType<typeof normalizeParam>;
+type NativeParam = ReturnType<typeof toNativeValue>;
 
 type NativeLix = {
 	execute(sql: string, params: NativeParam[]): NativeExecuteResult;
@@ -47,7 +47,13 @@ export class SqliteBackend {
 	}
 }
 
-export async function openLix(options: Partial<OpenLixOptions> = {}): Promise<Lix> {
+export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
+	if (!options || typeof options !== "object") {
+		throw new TypeError("openLix() options must be an object");
+	}
+	if (options.backend === undefined) {
+		return new Lix(addon.Lix.openMemory());
+	}
 	if (!(options.backend instanceof SqliteBackend)) {
 		throw new TypeError("openLix() requires { backend: new SqliteBackend({ path }) }");
 	}
@@ -59,48 +65,42 @@ export class Lix {
 
 	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
 		assertExecuteArgs("lix", sql, params);
-		return withLixError(() =>
-			wrapExecuteResult(
-				this.native.execute(
-					sql,
-					params.map((param, index) => normalizeParam(param, index)),
-				),
+		return wrapExecuteResult(
+			this.native.execute(
+				sql,
+				params.map((param, index) => toNativeValue(normalizeParam(param, index))),
 			),
 		);
 	}
 
 	async beginTransaction(): Promise<LixTransaction> {
-		return withLixError(() => new LixTransaction(this.native.beginTransaction()));
+		return new LixTransaction(this.native.beginTransaction());
 	}
 
 	async activeBranchId(): Promise<string> {
-		return withLixError(() => this.native.activeBranchId());
+		return this.native.activeBranchId();
 	}
 
 	async createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt> {
-		return withLixError(() => this.native.createBranch(options));
+		return this.native.createBranch(options);
 	}
 
 	async switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt> {
-		return withLixError(() => this.native.switchBranch(options));
+		return this.native.switchBranch(options);
 	}
 
 	async mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview> {
-		return withLixError(() =>
-			normalizeOptionals(this.native.mergeBranchPreview(options)),
-		);
+		return normalizeOptionals(this.native.mergeBranchPreview(options));
 	}
 
 	async mergeBranch(options: MergeBranchOptions): Promise<MergeBranchReceipt> {
-		return withLixError(() => {
-			const receipt = normalizeOptionals(this.native.mergeBranch(options));
-			receipt.createdMergeCommitId ??= null;
-			return receipt;
-		});
+		const receipt = normalizeOptionals(this.native.mergeBranch(options));
+		receipt.createdMergeCommitId ??= null;
+		return receipt;
 	}
 
 	async close(): Promise<void> {
-		return withLixError(() => this.native.close());
+		return this.native.close();
 	}
 }
 
@@ -109,22 +109,20 @@ export class LixTransaction {
 
 	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
 		assertExecuteArgs("lixTransaction", sql, params);
-		return withLixError(() =>
-			wrapExecuteResult(
-				this.native.execute(
-					sql,
-					params.map((param, index) => normalizeParam(param, index)),
-				),
+		return wrapExecuteResult(
+			this.native.execute(
+				sql,
+				params.map((param, index) => toNativeValue(normalizeParam(param, index))),
 			),
 		);
 	}
 
 	async commit(): Promise<void> {
-		return withLixError(() => this.native.commit());
+		return this.native.commit();
 	}
 
 	async rollback(): Promise<void> {
-		return withLixError(() => this.native.rollback());
+		return this.native.rollback();
 	}
 }
 

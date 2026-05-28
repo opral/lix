@@ -3,9 +3,7 @@ export type SqliteBackendOptions = {
 };
 
 export type OpenLixOptions = {
-	backend: {
-		readonly path: string;
-	};
+	backend?: import("./open-lix.js").SqliteBackend;
 };
 
 export type LixValue =
@@ -14,20 +12,18 @@ export type LixValue =
 	| { kind: "integer"; value: number }
 	| { kind: "real"; value: number }
 	| { kind: "text"; value: string }
-	| { kind: "json"; value: unknown }
-	| { kind: "blob"; base64: string };
+	| { kind: "json"; value: JsonValue }
+	| { kind: "blob"; value: Uint8Array };
 
-export type SqlParam =
+export type JsonValue =
 	| null
 	| boolean
 	| number
 	| string
-	| Uint8Array
-	| Date
-	| ArrayBufferView
-	| Record<string, unknown>
-	| LixValue
-	| { readonly raw: LixValue };
+	| readonly JsonValue[]
+	| { readonly [key: string]: JsonValue };
+
+export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
 export type ExecuteResult = {
 	columns: string[];
@@ -49,7 +45,7 @@ export type RowLike = {
 
 export type ValueLike = {
 	readonly kind: LixValue["kind"];
-	asJson(): unknown;
+	toJS(): unknown;
 	asBytes(): Uint8Array | undefined;
 };
 

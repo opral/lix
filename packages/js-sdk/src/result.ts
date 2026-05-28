@@ -1,4 +1,4 @@
-import { Value } from "./value.js";
+import { fromNativeValue, type NativeLixValue, Value } from "./value.js";
 import type { ExecuteResult, LixValue } from "./types.js";
 
 export class Row {
@@ -10,12 +10,12 @@ export class Row {
 	static fromRaw(columns: string[], values: LixValue[]) {
 		return new Row(
 			columns,
-			values.map((value) => new Value(value)),
+			values.map((value) => Value._fromNative(value)),
 		);
 	}
 
 	get(column: string): unknown {
-		return this.value(column).asJson();
+		return this.value(column).toJS();
 	}
 
 	value(column: string): Value {
@@ -34,7 +34,7 @@ export class Row {
 
 	toObject(): Record<string, unknown> {
 		return Object.fromEntries(
-			this.columns.map((column, index) => [column, this.values[index]?.asJson()]),
+			this.columns.map((column, index) => [column, this.values[index]?.toJS()]),
 		);
 	}
 
@@ -46,13 +46,15 @@ export class Row {
 }
 
 type NativeExecuteResult = Omit<ExecuteResult, "rows"> & {
-	rows: LixValue[][];
+	rows: NativeLixValue[][];
 };
 
 export function wrapExecuteResult(result: NativeExecuteResult): ExecuteResult {
 	return {
 		...result,
-		rows: result.rows.map((row) => Row.fromRaw(result.columns, row)),
+		rows: result.rows.map((row) =>
+			Row.fromRaw(result.columns, row.map(fromNativeValue)),
+		),
 	};
 }
 
