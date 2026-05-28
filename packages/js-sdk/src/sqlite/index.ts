@@ -1,13 +1,12 @@
-import DatabaseConstructor, { type Database } from "better-sqlite3";
+import { createRequire } from "node:module";
+import type { Database } from "better-sqlite3";
 import type {
 	BackendKvEntryPage,
-	BackendKvExistsBatch,
+	BackendKvBound,
 	BackendKvGetRequest,
-	BackendKvKeyPage,
 	BackendKvScanRange,
 	BackendKvScanRequest,
 	BackendKvValueBatch,
-	BackendKvValuePage,
 	BackendKvWriteBatch,
 	BackendKvWriteStats,
 	LixBackend,
@@ -15,7 +14,10 @@ import type {
 	LixBackendWriteTransaction,
 } from "../open-lix.js";
 
-export type BetterSqlite3BackendOptions = {
+const SQLITE_FORMAT_VERSION = 1;
+const require = createRequire(import.meta.url);
+
+export type SqliteBackendOptions = {
 	path: string;
 	databaseOptions?: BetterSqlite3DatabaseOptions;
 };
@@ -27,67 +29,111 @@ export type BetterSqlite3DatabaseOptions = {
 	verbose?: (message?: unknown, ...additional: unknown[]) => void;
 };
 
+type BetterSqlite3Constructor = {
+	new (filename: string, options?: BetterSqlite3DatabaseOptions): Database;
+	(filename: string, options?: BetterSqlite3DatabaseOptions): Database;
+};
+
 const openFileHandles = new Set<string>();
 
-export function createBetterSqlite3Backend(
-	options: BetterSqlite3BackendOptions,
-): LixBackend {
-	if (!options.path) {
-		throw new Error("createBetterSqlite3Backend() requires a non-empty path");
-	}
-	const registryKey = registryKeyForPath(options.path);
-	if (registryKey && openFileHandles.has(registryKey)) {
-		throw doubleOpenError(options.path);
-	}
-	let activeRegistryKey: string | null = registryKey;
-	let db: Database | undefined;
-	if (activeRegistryKey) {
-		openFileHandles.add(activeRegistryKey);
-	}
-	try {
-		db = new DatabaseConstructor(options.path, options.databaseOptions);
-		initializeDatabase(db);
-		return new BetterSqlite3Backend(db, activeRegistryKey);
-	} catch (error) {
-		if (activeRegistryKey) {
-			openFileHandles.delete(activeRegistryKey);
-		}
-		if (db) {
-			try {
-				db.close();
-			} catch {
-				// Ignore close errors while preserving the original open failure.
-			}
-		}
-		throw error;
-	}
+function openDatabase(
+	path: string,
+	options: BetterSqlite3DatabaseOptions | undefined,
+): Database {
+	const DatabaseConstructor = require(
+		"better-sqlite3",
+	) as BetterSqlite3Constructor;
+	return new DatabaseConstructor(path, options);
+}
+
+function configureConnection(db: Database): void {
+	db.pragma("busy_timeout = 5000");
 }
 
 function initializeDatabase(db: Database): void {
+	db.pragma("journal_mode = WAL");
+	configureConnection(db);
+	const userVersion = db.pragma("user_version", { simple: true }) as number;
+	if (userVersion > SQLITE_FORMAT_VERSION) {
+		throw new Error(
+			`SQLite file format version ${userVersion} is newer than supported version ${SQLITE_FORMAT_VERSION}`,
+		);
+	}
 	db.exec(`
-		CREATE TABLE IF NOT EXISTS lix_kv (
-			namespace TEXT NOT NULL,
+		CREATE TABLE IF NOT EXISTS lix_entries (
 			key BLOB NOT NULL,
 			value BLOB NOT NULL,
-			PRIMARY KEY (namespace, key)
+			PRIMARY KEY (key)
 		) WITHOUT ROWID
 	`);
+	db.pragma(`user_version = ${SQLITE_FORMAT_VERSION}`);
 }
 
-class BetterSqlite3Backend implements LixBackend {
+export class SqliteBackend implements LixBackend {
 	readonly #db: Database;
+	readonly #path: string;
+	readonly #databaseOptions: BetterSqlite3DatabaseOptions | undefined;
 	readonly #registryKey: string | null;
-	#transactionMode: "read" | "write" | null = null;
 	#closed = false;
 
-	constructor(db: Database, registryKey: string | null) {
-		this.#db = db;
-		this.#registryKey = registryKey;
+	constructor(options: SqliteBackendOptions) {
+		const path = options.path;
+		if (!path) {
+			throw new Error("SqliteBackend requires a non-empty path");
+		}
+		const registryKey = registryKeyForPath(path);
+		if (registryKey && openFileHandles.has(registryKey)) {
+			throw doubleOpenError(path);
+		}
+		let db: Database | undefined;
+		if (registryKey) {
+			openFileHandles.add(registryKey);
+		}
+		try {
+			db = openDatabase(path, options.databaseOptions);
+			initializeDatabase(db);
+			this.#db = db;
+			this.#path = path;
+			this.#databaseOptions = options.databaseOptions;
+			this.#registryKey = registryKey;
+		} catch (error) {
+			if (registryKey) {
+				openFileHandles.delete(registryKey);
+			}
+			if (db) {
+				try {
+					db.close();
+				} catch {
+					// Ignore close errors while preserving the original open failure.
+				}
+			}
+			throw error;
+		}
 	}
 
 	beginReadTransaction(): LixBackendReadTransaction {
 		this.#ensureOpen();
-		return new BetterSqlite3Transaction(this.#db, {
+		if (this.#registryKey) {
+			const db = openDatabase(this.#path, {
+				...this.#databaseOptions,
+				readonly: true,
+				fileMustExist: true,
+			});
+			try {
+				configureConnection(db);
+				db.exec("BEGIN");
+				db.prepare("SELECT 1 FROM lix_entries LIMIT 1").all();
+				return new SqliteTransaction(db, {
+					ownsTransaction: true,
+					writable: false,
+					onClose: () => db.close(),
+				});
+			} catch (error) {
+				db.close();
+				throw error;
+			}
+		}
+		return new SqliteTransaction(this.#db, {
 			ownsTransaction: false,
 			writable: false,
 		});
@@ -96,16 +142,12 @@ class BetterSqlite3Backend implements LixBackend {
 	beginWriteTransaction(): LixBackendWriteTransaction {
 		this.#ensureOpen();
 		if (this.#db.inTransaction) {
-			throw new Error("better-sqlite3 Lix backend write transaction already active");
+			throw new Error("SQLite Lix backend write transaction already active");
 		}
 		this.#db.exec("BEGIN IMMEDIATE");
-		this.#transactionMode = "write";
-		return new BetterSqlite3Transaction(this.#db, {
+		return new SqliteTransaction(this.#db, {
 			ownsTransaction: true,
 			writable: true,
-			onClose: () => {
-				this.#transactionMode = null;
-			},
 		});
 	}
 
@@ -123,12 +165,12 @@ class BetterSqlite3Backend implements LixBackend {
 
 	#ensureOpen(): void {
 		if (this.#closed) {
-			throw new Error("better-sqlite3 Lix backend is closed");
+			throw new Error("SQLite Lix backend is closed");
 		}
 	}
 }
 
-class BetterSqlite3Transaction implements LixBackendWriteTransaction {
+class SqliteTransaction implements LixBackendWriteTransaction {
 	readonly #db: Database;
 	readonly #ownsTransaction: boolean;
 	readonly #writable: boolean;
@@ -154,29 +196,6 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 		return getValues(this.#db, request);
 	}
 
-	existsMany(request: BackendKvGetRequest): BackendKvExistsBatch {
-		this.#ensureOpen();
-		return existsMany(this.#db, request);
-	}
-
-	scanKeys(request: BackendKvScanRequest): BackendKvKeyPage {
-		this.#ensureOpen();
-		const { pairs, resumeAfter } = scanPage(this.#db, request);
-		return {
-			keys: pairs.map(({ key }) => key),
-			resumeAfter,
-		};
-	}
-
-	scanValues(request: BackendKvScanRequest): BackendKvValuePage {
-		this.#ensureOpen();
-		const { pairs, resumeAfter } = scanPage(this.#db, request);
-		return {
-			values: pairs.map(({ value }) => value),
-			resumeAfter,
-		};
-	}
-
 	scanEntries(request: BackendKvScanRequest): BackendKvEntryPage {
 		this.#ensureOpen();
 		const { pairs, resumeAfter } = scanPage(this.#db, request);
@@ -198,21 +217,19 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 			deleteRanges: 0,
 			bytesWritten: 0,
 		};
-		for (const group of batch.groups) {
-			for (const op of group.ops) {
-				if (op.kind === "put") {
-					stats.puts += 1;
-					stats.bytesWritten += op.key.length + op.value.length;
-					kvPut(this.#db, group.namespace, op.key, op.value);
-				} else if (op.kind === "delete") {
-					stats.deletes += 1;
-					stats.bytesWritten += op.key.length;
-					kvDelete(this.#db, group.namespace, op.key);
-				} else {
-					stats.deleteRanges += 1;
-					stats.bytesWritten += deleteRangeBytes(op.range);
-					kvDeleteRange(this.#db, group.namespace, op.range);
-				}
+		for (const op of batch.ops) {
+			if (op.kind === "put") {
+				stats.puts += 1;
+				stats.bytesWritten += op.key.length + op.value.length;
+				kvPut(this.#db, op.key, op.value);
+			} else if (op.kind === "delete") {
+				stats.deletes += 1;
+				stats.bytesWritten += op.key.length;
+				kvDelete(this.#db, op.key);
+			} else {
+				stats.deleteRanges += 1;
+				stats.bytesWritten += deleteRangeBytes(op.range);
+				kvDeleteRange(this.#db, op.range);
 			}
 		}
 		return stats;
@@ -259,22 +276,7 @@ function getValues(
 	request: BackendKvGetRequest,
 ): BackendKvValueBatch {
 	return {
-		groups: request.groups.map((group) => ({
-			namespace: group.namespace,
-			values: group.keys.map((key) => kvGet(db, group.namespace, key)),
-		})),
-	};
-}
-
-function existsMany(
-	db: Database,
-	request: BackendKvGetRequest,
-): BackendKvExistsBatch {
-	return {
-		groups: request.groups.map((group) => ({
-			namespace: group.namespace,
-			exists: group.keys.map((key) => kvGet(db, group.namespace, key) !== null),
-		})),
+		values: request.keys.map((key) => kvGet(db, key)),
 	};
 }
 
@@ -282,10 +284,10 @@ function scanPage(
 	db: Database,
 	request: BackendKvScanRequest,
 ): { pairs: KvPair[]; resumeAfter: Uint8Array | null } {
-	const scanLimit = request.limit + 1 + (request.after ? 1 : 0);
-	const pairs = kvScan(db, request.namespace, request.range, scanLimit).filter(
-		(pair) => !request.after || compareBytes(pair.key, request.after) > 0,
-	);
+	const range = request.after
+		? rangeAfter(request.range, request.after)
+		: request.range;
+	const pairs = kvScan(db, range, request.limit + 1);
 	const hasMore = pairs.length > request.limit;
 	const pagePairs = pairs.slice(0, request.limit);
 	return {
@@ -294,79 +296,90 @@ function scanPage(
 	};
 }
 
-function kvGet(
-	db: Database,
-	namespace: string,
-	key: Uint8Array,
-): Uint8Array | null {
+function rangeAfter(
+	range: BackendKvScanRange,
+	after: Uint8Array,
+): BackendKvScanRange {
+	return {
+		...range,
+		lower: laterLowerBound(range.lower, after),
+	};
+}
+
+function laterLowerBound(
+	lower: BackendKvBound,
+	after: Uint8Array,
+): BackendKvBound {
+	if (lower.kind === "unbounded") {
+		return { kind: "excluded", key: after };
+	}
+	const comparison = compareBytes(lower.key, after);
+	if (comparison > 0) {
+		return lower;
+	}
+	return { kind: "excluded", key: after };
+}
+
+function kvGet(db: Database, key: Uint8Array): Uint8Array | null {
 	const row = db
-		.prepare("SELECT value FROM lix_kv WHERE namespace = ? AND key = ?")
-		.get(namespace, sqliteBytes(key));
+		.prepare("SELECT value FROM lix_entries WHERE key = ?")
+		.get(sqliteBytes(key));
 	if (!isObject(row) || !("value" in row)) {
 		return null;
 	}
-	return bytesFromUnknown(row.value, "lix_kv.value");
+	return bytesFromUnknown(row.value, "lix_entries.value");
 }
 
 function kvPut(
 	db: Database,
-	namespace: string,
 	key: Uint8Array,
 	value: Uint8Array,
 ): void {
 	db.prepare(
-		`INSERT INTO lix_kv (namespace, key, value)
-		 VALUES (?, ?, ?)
-		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
-	).run(namespace, sqliteBytes(key), sqliteBytes(value));
+		`INSERT INTO lix_entries (key, value)
+		 VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+	).run(sqliteBytes(key), sqliteBytes(value));
 }
 
-function kvDelete(db: Database, namespace: string, key: Uint8Array): void {
-	db.prepare("DELETE FROM lix_kv WHERE namespace = ? AND key = ?").run(
-		namespace,
-		sqliteBytes(key),
-	);
+function kvDelete(db: Database, key: Uint8Array): void {
+	db.prepare("DELETE FROM lix_entries WHERE key = ?").run(sqliteBytes(key));
 }
 
-function kvDeleteRange(
-	db: Database,
-	namespace: string,
-	range: BackendKvScanRange,
-): void {
-	const { clauses, params } = rangeClauses(namespace, range);
-	db.prepare(`DELETE FROM lix_kv WHERE ${clauses.join(" AND ")}`).run(
+function kvDeleteRange(db: Database, range: BackendKvScanRange): void {
+	const { clauses, params } = rangeClauses(range);
+	db.prepare(`DELETE FROM lix_entries WHERE ${clauses.join(" AND ")}`).run(
 		...params,
 	);
 }
 
 function kvScan(
 	db: Database,
-	namespace: string,
 	range: BackendKvScanRange,
 	limit?: number | null,
 ): KvPair[] {
-	const { sql, params } = scanQuery(namespace, range, limit);
+	const { sql, params } = scanQuery(range, limit);
 	return db
 		.prepare(sql)
 		.all(...params)
 		.map((row) => {
 			if (!isObject(row) || !("key" in row) || !("value" in row)) {
-				throw new Error("invalid lix_kv scan row");
+				throw new Error("invalid lix_entries scan row");
 			}
+			const key = bytesFromUnknown(row.key, "lix_entries.key");
 			return {
-				key: bytesFromUnknown(row.key, "lix_kv.key"),
-				value: bytesFromUnknown(row.value, "lix_kv.value"),
+				key,
+				value: bytesFromUnknown(row.value, "lix_entries.value"),
 			};
 		});
 }
 
 function scanQuery(
-	namespace: string,
 	range: BackendKvScanRange,
 	limit?: number | null,
 ): { sql: string; params: unknown[] } {
-	const { clauses, params } = rangeClauses(namespace, range);
-	let sql = `SELECT key, value FROM lix_kv WHERE ${clauses.join(
+	const { clauses, params } = rangeClauses(range);
+	let sql = `SELECT key, value FROM lix_entries WHERE ${clauses.join(
 		" AND ",
 	)} ORDER BY key`;
 	if (limit != null) {
@@ -377,33 +390,39 @@ function scanQuery(
 }
 
 function rangeClauses(
-	namespace: string,
 	range: BackendKvScanRange,
 ): { clauses: string[]; params: unknown[] } {
-	const params: unknown[] = [namespace];
-	const clauses = ["namespace = ?"];
-
-	if (range.kind === "prefix") {
-		clauses.push("key >= ?");
-		params.push(sqliteBytes(range.prefix));
-		const end = prefixUpperBound(range.prefix);
-		if (end) {
-			clauses.push("key < ?");
-			params.push(sqliteBytes(end));
-		}
-	} else {
-		clauses.push("key >= ?", "key < ?");
-		params.push(sqliteBytes(range.start), sqliteBytes(range.end));
+	const params: unknown[] = [];
+	const clauses: string[] = [];
+	appendBoundClause(clauses, params, range.lower, "key", ">=", ">");
+	appendBoundClause(clauses, params, range.upper, "key", "<=", "<");
+	if (clauses.length === 0) {
+		clauses.push("1 = 1");
 	}
-
 	return { clauses, params };
 }
 
-function deleteRangeBytes(range: BackendKvScanRange): number {
-	if (range.kind === "prefix") {
-		return range.prefix.length;
+function appendBoundClause(
+	clauses: string[],
+	params: unknown[],
+	bound: BackendKvBound,
+	column: string,
+	includedOp: string,
+	excludedOp: string,
+): void {
+	if (bound.kind === "unbounded") {
+		return;
 	}
-	return range.start.length + range.end.length;
+	clauses.push(`${column} ${bound.kind === "included" ? includedOp : excludedOp} ?`);
+	params.push(sqliteBytes(bound.key));
+}
+
+function deleteRangeBytes(range: BackendKvScanRange): number {
+	return boundBytes(range.lower) + boundBytes(range.upper);
+}
+
+function boundBytes(bound: BackendKvBound): number {
+	return bound.kind === "unbounded" ? 0 : bound.key.length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
@@ -413,17 +432,6 @@ function compareBytes(left: Uint8Array, right: Uint8Array): number {
 		if (delta !== 0) return delta;
 	}
 	return left.length - right.length;
-}
-
-function prefixUpperBound(prefix: Uint8Array): Uint8Array | null {
-	const end = new Uint8Array(prefix);
-	for (let index = end.length - 1; index >= 0; index--) {
-		if (end[index] !== 0xff) {
-			end[index]! += 1;
-			return end.slice(0, index + 1);
-		}
-	}
-	return null;
 }
 
 function bytesFromUnknown(value: unknown, context: string): Uint8Array {
@@ -475,7 +483,7 @@ function normalizeAbsolutePath(filename: string): string {
 
 function doubleOpenError(filename: string): Error {
 	return new Error(
-		`createBetterSqlite3Backend() already has an open handle for ${filename}; close the existing Lix handle before opening this file again`,
+		`SqliteBackend already has an open handle for ${filename}; close the existing Lix handle before opening this file again`,
 	);
 }
 
