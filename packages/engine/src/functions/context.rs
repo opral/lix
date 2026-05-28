@@ -138,7 +138,7 @@ mod tests {
         let functions = context.provider();
 
         assert_eq!(
-            functions.call_uuid_v7(),
+            functions.call_uuid_v7().to_string(),
             "01920000-0000-7000-8000-000000000000"
         );
         assert_eq!(functions.call_timestamp(), "1970-01-01T00:00:00.001Z");
@@ -181,7 +181,7 @@ mod tests {
         let functions = context.provider();
 
         assert_eq!(
-            functions.call_uuid_v7(),
+            functions.call_uuid_v7().to_string(),
             "01920000-0000-7000-8000-00000000002a"
         );
         assert_eq!(

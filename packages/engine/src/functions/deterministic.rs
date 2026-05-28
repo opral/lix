@@ -36,10 +36,10 @@ impl DeterministicFunctionProvider {
 }
 
 impl FunctionProvider for DeterministicFunctionProvider {
-    fn uuid_v7(&mut self) -> String {
+    fn uuid_v7(&mut self) -> uuid::Uuid {
         let counter = self.take_sequence();
         let counter_bits = (counter as u64) & DETERMINISTIC_UUID_COUNTER_MASK;
-        format!("01920000-0000-7000-8000-{counter_bits:012x}")
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + counter_bits as u128)
     }
 
     fn timestamp(&mut self) -> String {
@@ -79,8 +79,14 @@ mod tests {
     fn deterministic_uuid_uses_sequence_counter() {
         let mut provider = DeterministicFunctionProvider::new(0, false);
 
-        assert_eq!(provider.uuid_v7(), "01920000-0000-7000-8000-000000000000");
-        assert_eq!(provider.uuid_v7(), "01920000-0000-7000-8000-000000000001");
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000000"
+        );
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000001"
+        );
         assert_eq!(provider.highest_seen(), Some(1));
     }
 
@@ -107,7 +113,10 @@ mod tests {
         let sequence = DeterministicSequence { highest_seen: 41 };
         let mut provider = DeterministicFunctionProvider::new(sequence.next_sequence(), false);
 
-        assert_eq!(provider.uuid_v7(), "01920000-0000-7000-8000-00000000002a");
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-00000000002a"
+        );
         assert_eq!(provider.highest_seen(), Some(42));
     }
 }

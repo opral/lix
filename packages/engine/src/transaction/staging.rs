@@ -371,10 +371,8 @@ impl TransactionWriteBuffer {
         let change_refs = guard.entry(branch_id).or_insert_with(|| {
             let timestamp = functions.timestamp();
             StagedCommitChangeRefs::new(
-                CommitId::parse_lix(&functions.uuid_v7(), "staged merge commit_id")
-                    .expect("uuid_v7 provider must return a valid UUID"),
-                ChangeId::parse_lix(&functions.uuid_v7(), "staged merge commit change_id")
-                    .expect("uuid_v7 provider must return a valid UUID"),
+                CommitId::from(functions.uuid_v7()),
+                ChangeId::from(functions.uuid_v7()),
                 crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
@@ -812,10 +810,8 @@ fn add_row_to_commit_change_refs(
         .or_insert_with(|| {
             let timestamp = functions.timestamp();
             StagedCommitChangeRefs::new(
-                CommitId::parse_lix(&functions.uuid_v7(), "staged commit_id")
-                    .expect("uuid_v7 provider must return a valid UUID"),
-                ChangeId::parse_lix(&functions.uuid_v7(), "staged commit change_id")
-                    .expect("uuid_v7 provider must return a valid UUID"),
+                CommitId::from(functions.uuid_v7()),
+                ChangeId::from(functions.uuid_v7()),
                 crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
@@ -1424,9 +1420,9 @@ mod tests {
     }
 
     impl FunctionProvider for TestFunctionProvider {
-        fn uuid_v7(&mut self) -> String {
+        fn uuid_v7(&mut self) -> uuid::Uuid {
             self.uuid_count += 1;
-            test_uuid(self.uuid_count)
+            test_uuid_value(self.uuid_count)
         }
 
         fn timestamp(&mut self) -> String {
@@ -1436,7 +1432,11 @@ mod tests {
     }
 
     fn test_uuid(index: usize) -> String {
-        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128).to_string()
+        test_uuid_value(index).to_string()
+    }
+
+    fn test_uuid_value(index: usize) -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
     }
 
     fn test_commit_id(index: usize) -> CommitId {

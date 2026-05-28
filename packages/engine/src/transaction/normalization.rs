@@ -356,9 +356,11 @@ mod tests {
 
         assert_eq!(
             row.row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("uuid-default"))
+            Some(&crate::entity_pk::EntityPk::single(
+                "00000000-0000-0000-0000-000000000000"
+            ))
         );
-        assert_eq!(snapshot["id"], "uuid-default");
+        assert_eq!(snapshot["id"], "00000000-0000-0000-0000-000000000000");
         assert_eq!(snapshot["value"], "literal-default");
     }
 
@@ -866,8 +868,8 @@ mod tests {
     struct FixedFunctions;
 
     impl FunctionProvider for FixedFunctions {
-        fn uuid_v7(&mut self) -> String {
-            "uuid-default".to_string()
+        fn uuid_v7(&mut self) -> uuid::Uuid {
+            uuid::Uuid::nil()
         }
 
         fn timestamp(&mut self) -> String {

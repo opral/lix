@@ -796,10 +796,12 @@ fn prepare_state_row(
                 .map(|id| ChangeId::parse_lix(id, "prepared untracked row change_id"))
                 .transpose()?
         } else {
-            Some(ChangeId::parse_lix(
-                &row.change_id.unwrap_or_else(|| functions.call_uuid_v7()),
-                "prepared tracked row change_id",
-            )?)
+            Some(match row.change_id {
+                Some(change_id) => {
+                    ChangeId::parse_lix(&change_id, "prepared tracked row change_id")?
+                }
+                None => ChangeId::from(functions.call_uuid_v7()),
+            })
         },
         commit_id: row
             .commit_id

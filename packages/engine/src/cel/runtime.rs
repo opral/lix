@@ -77,8 +77,8 @@ mod tests {
     struct FixedFunctions;
 
     impl CelFunctionProvider for FixedFunctions {
-        fn call_uuid_v7(&self) -> String {
-            "uuid-fixed".to_string()
+        fn call_uuid_v7(&self) -> uuid::Uuid {
+            uuid::Uuid::nil()
         }
 
         fn call_timestamp(&self) -> String {
