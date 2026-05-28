@@ -201,6 +201,8 @@ impl TrackedStateDiffIdentity {
 
 impl TrackedStateDiffRow {
     pub(crate) fn from_tree_entry(key: TrackedStateKey, value: TrackedStateIndexValue) -> Self {
+        let created_at = value.created_at().to_string();
+        let updated_at = value.updated_at().to_string();
         Self {
             entity_pk: key.entity_pk,
             schema_key: key.schema_key,
@@ -208,8 +210,8 @@ impl TrackedStateDiffRow {
             deleted: value.deleted,
             snapshot_ref: value.snapshot_ref,
             metadata_ref: value.metadata_ref,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
+            created_at,
+            updated_at,
             change_id: value.change_id,
             commit_id: value.commit_id,
         }
@@ -228,8 +230,10 @@ impl TrackedStateDiffRow {
                 deleted: self.deleted,
                 snapshot_ref: self.snapshot_ref,
                 metadata_ref: self.metadata_ref,
-                created_at: self.created_at,
-                updated_at: self.updated_at,
+                created_updated_at: TrackedStateIndexValue::created_updated_at(
+                    self.created_at,
+                    self.updated_at,
+                ),
             },
         )
     }
@@ -618,7 +622,11 @@ mod tests {
             .find_map(|entry| entry.after.clone())
             .expect("child row should appear");
         let (key, mut value) = row.into_index_entry();
-        value.created_at = "2026-01-03T00:00:00Z".to_string();
+        let updated_at = value.updated_at().to_string();
+        value.created_updated_at = TrackedStateIndexValue::created_updated_at(
+            "2026-01-03T00:00:00Z".to_string(),
+            updated_at,
+        );
         let parent_commit_row =
             commit_root_row_entry("parent", "parent:commit", "2026-01-01T00:00:00Z");
         let commit_row = commit_root_row_entry("child", "child:commit", "2026-01-02T00:00:00Z");
@@ -2064,8 +2072,10 @@ mod tests {
                     format!("{{\"id\":\"{commit_id}\"}}").as_bytes(),
                 )),
                 metadata_ref: None,
-                created_at: created_at.to_string(),
-                updated_at: created_at.to_string(),
+                created_updated_at: TrackedStateIndexValue::created_updated_at(
+                    created_at.to_string(),
+                    created_at.to_string(),
+                ),
             },
         )
     }

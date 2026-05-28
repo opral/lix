@@ -28,8 +28,10 @@ pub(crate) fn prepare_branch_ref_row(
             file_id: None,
             snapshot_content: Some(snapshot.as_str().to_string()),
             metadata: None,
-            created_at: timestamp.to_string(),
-            updated_at: timestamp.to_string(),
+            created_updated_at: UntrackedStateRow::created_updated_at(
+                timestamp.to_string(),
+                timestamp.to_string(),
+            ),
             global: true,
             branch_id: GLOBAL_BRANCH_ID.to_string(),
         },

@@ -6,6 +6,8 @@ pub(crate) fn materialize_row(
     projection: &UntrackedMaterializationProjection,
 ) -> Result<MaterializedUntrackedStateRow, LixError> {
     let deleted = row.snapshot_content.is_none();
+    let created_at = row.created_at().to_string();
+    let updated_at = row.updated_at().to_string();
     let snapshot_content = if projection.snapshot_content {
         row.snapshot_content
     } else {
@@ -23,8 +25,8 @@ pub(crate) fn materialize_row(
         snapshot_content,
         metadata,
         deleted,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
+        created_at,
+        updated_at,
         global: row.global,
         branch_id: row.branch_id,
     })

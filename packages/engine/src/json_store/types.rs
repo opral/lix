@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::LixError;
+use musli::{Allocator, Decode, Decoder, Encode, Encoder};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NormalizedJson(Arc<str>);
@@ -61,6 +62,37 @@ impl JsonRef {
 
     pub(crate) fn to_hex(&self) -> String {
         self.hash.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+impl<M> Encode<M> for JsonRef {
+    type Encode = [u8; 32];
+
+    fn encode<E>(&self, encoder: E) -> Result<(), E::Error>
+    where
+        E: Encoder<Mode = M>,
+    {
+        encoder.encode(&self.hash)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.hash.len())
+    }
+
+    fn as_encode(&self) -> &Self::Encode {
+        &self.hash
+    }
+}
+
+impl<'de, M, A> Decode<'de, M, A> for JsonRef
+where
+    A: Allocator,
+{
+    fn decode<D>(decoder: D) -> Result<Self, D::Error>
+    where
+        D: Decoder<'de, Mode = M, Allocator = A>,
+    {
+        Ok(Self::from_hash_bytes(<[u8; 32]>::decode(decoder)?))
     }
 }
 
@@ -208,5 +240,34 @@ impl JsonProjectionBatch {
 
     pub(crate) fn into_values(self) -> Vec<Option<JsonProjection>> {
         self.values
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_codec_roundtrips_json_ref() {
+        let json_ref = JsonRef::from_hash_bytes([7; 32]);
+        let bytes =
+            crate::storage_codec::encode("json ref", &json_ref).expect("json ref should encode");
+
+        let decoded: JsonRef =
+            crate::storage_codec::decode("json ref", &bytes).expect("json ref should decode");
+
+        assert_eq!(decoded, json_ref);
+    }
+
+    #[test]
+    fn storage_codec_rejects_wrong_hash_length() {
+        let short_hash: &[u8] = &[0; 31];
+        let bytes = crate::storage_codec::encode("json ref hash", short_hash)
+            .expect("short hash should encode");
+
+        let error = crate::storage_codec::decode::<JsonRef>("json ref", &bytes)
+            .expect_err("short hash should reject");
+
+        assert!(error.message.contains("failed to decode json ref"));
     }
 }

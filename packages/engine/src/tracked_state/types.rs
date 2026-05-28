@@ -1,31 +1,17 @@
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
-use crate::{LixError, NullableKeyFilter};
+use crate::storage_codec::{compact_pair, compact_pair_left, compact_pair_right, Either};
+use crate::NullableKeyFilter;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 
 /// Content-addressed root id for one tracked-state commit-root tree.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct TrackedStateRootId([u8; TRACKED_STATE_HASH_BYTES]);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, musli::Encode, musli::Decode)]
+pub(crate) struct TrackedStateRootId(#[musli(bytes)] [u8; TRACKED_STATE_HASH_BYTES]);
 
 impl TrackedStateRootId {
     pub(crate) fn new(bytes: [u8; TRACKED_STATE_HASH_BYTES]) -> Self {
         Self(bytes)
-    }
-
-    pub(crate) fn from_slice(bytes: &[u8]) -> Result<Self, LixError> {
-        if bytes.len() != TRACKED_STATE_HASH_BYTES {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "tracked-state tree root id must be {TRACKED_STATE_HASH_BYTES} bytes, got {}",
-                    bytes.len()
-                ),
-            ));
-        }
-        let mut out = [0_u8; TRACKED_STATE_HASH_BYTES];
-        out.copy_from_slice(bytes);
-        Ok(Self(out))
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8; TRACKED_STATE_HASH_BYTES] {
@@ -34,19 +20,37 @@ impl TrackedStateRootId {
 }
 
 /// Root-independent tracked entity primary key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct TrackedStateKey {
     pub(crate) schema_key: String,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
 }
 
 /// Zero-copy view of primary tracked-state key.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, musli::Encode)]
+#[musli(packed)]
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
     pub(crate) entity_pk: &'a EntityPk,
+}
+
+#[derive(Debug, Clone, Copy, musli::Encode)]
+#[musli(packed)]
+pub(crate) struct TrackedSchemaKeyPrefixRef<'a> {
+    pub(crate) schema_key: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, musli::Encode)]
+#[musli(packed)]
+pub(crate) struct TrackedSchemaFilePrefixRef<'a> {
+    pub(crate) schema_key: &'a str,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) file_id: Option<&'a str>,
 }
 
 /// Zero-copy tracked-state commit-root delta prepared from changelog facts.
@@ -65,31 +69,62 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
 }
 
 /// Value stored in tracked-state commit-root trees.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct TrackedStateIndexValue {
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
     pub(crate) deleted: bool,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_ref: Option<JsonRef>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_updated_at: Either<String, (String, String)>,
+}
+
+impl TrackedStateIndexValue {
+    pub(crate) fn created_updated_at(
+        created_at: String,
+        updated_at: String,
+    ) -> Either<String, (String, String)> {
+        compact_pair(created_at, updated_at)
+    }
+
+    pub(crate) fn created_at(&self) -> &str {
+        compact_pair_left(&self.created_updated_at).as_str()
+    }
+
+    pub(crate) fn updated_at(&self) -> &str {
+        compact_pair_right(&self.created_updated_at).as_str()
+    }
 }
 
 /// Zero-copy view of a tracked-state commit-root value.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) change_id: &'a str,
     pub(crate) commit_id: &'a str,
     pub(crate) deleted: bool,
-    pub(crate) snapshot_ref: Option<&'a JsonRef>,
-    pub(crate) metadata_ref: Option<&'a JsonRef>,
-    pub(crate) created_at: &'a str,
-    pub(crate) updated_at: &'a str,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) created_updated_at: Either<&'a str, (&'a str, &'a str)>,
+}
+
+impl<'a> TrackedStateIndexValueRef<'a> {
+    pub(crate) fn created_updated_at(
+        created_at: &'a str,
+        updated_at: &'a str,
+    ) -> Either<&'a str, (&'a str, &'a str)> {
+        compact_pair(created_at, updated_at)
+    }
 }
 
 /// Durable tracked-state root metadata for one commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct TrackedStateCommitRoot {
     pub(crate) commit_id: String,
     pub(crate) root_id: TrackedStateRootId,
@@ -101,7 +136,8 @@ pub(crate) struct TrackedStateCommitRoot {
     pub(crate) primary_chunk_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct TrackedStateCommitRootParent {
     pub(crate) commit_id: String,
     pub(crate) root_id: TrackedStateRootId,

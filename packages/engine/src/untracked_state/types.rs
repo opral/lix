@@ -1,24 +1,51 @@
 use crate::entity_pk::EntityPk;
+use crate::storage_codec::{compact_pair, compact_pair_left, compact_pair_right, Either};
 use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
 ///
 /// This is the canonical physical shape: identity/header fields are stored
 /// directly, and mutable JSON payloads are stored inline in the sidecar row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 pub(crate) struct UntrackedStateRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_content: Option<String>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata: Option<String>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_updated_at: Either<String, (String, String)>,
     pub(crate) global: bool,
     pub(crate) branch_id: String,
 }
 
 impl UntrackedStateRow {
+    pub(crate) fn created_updated_at(
+        created_at: String,
+        updated_at: String,
+    ) -> Either<String, (String, String)> {
+        compact_pair(created_at, updated_at)
+    }
+
+    pub(crate) fn created_at(&self) -> &str {
+        compact_pair_left(&self.created_updated_at).as_str()
+    }
+
+    pub(crate) fn updated_at(&self) -> &str {
+        compact_pair_right(&self.created_updated_at).as_str()
+    }
+
+    pub(crate) fn created_updated_at_ref(&self) -> Either<&str, (&str, &str)> {
+        match &self.created_updated_at {
+            Either::Left(timestamp) => Either::Left(timestamp.as_str()),
+            Either::Right((created_at, updated_at)) => {
+                Either::Right((created_at.as_str(), updated_at.as_str()))
+            }
+        }
+    }
+
     pub(crate) fn as_ref(&self) -> UntrackedStateRowRef<'_> {
         UntrackedStateRowRef {
             entity_pk: &self.entity_pk,
@@ -26,8 +53,7 @@ impl UntrackedStateRow {
             file_id: self.file_id.as_deref(),
             snapshot_content: self.snapshot_content.as_deref(),
             metadata: self.metadata.as_deref(),
-            created_at: &self.created_at,
-            updated_at: &self.updated_at,
+            created_updated_at: self.created_updated_at_ref(),
             global: self.global,
             branch_id: &self.branch_id,
         }
@@ -38,17 +64,39 @@ impl UntrackedStateRow {
 ///
 /// Untracked state owns this storage-facing write shape. Callers adapt into it
 /// without making untracked_state depend on transaction or live-state types.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, musli::Encode)]
 pub(crate) struct UntrackedStateRowRef<'a> {
     pub(crate) entity_pk: &'a EntityPk,
     pub(crate) schema_key: &'a str,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_content: Option<&'a str>,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata: Option<&'a str>,
-    pub(crate) created_at: &'a str,
-    pub(crate) updated_at: &'a str,
+    pub(crate) created_updated_at: Either<&'a str, (&'a str, &'a str)>,
     pub(crate) global: bool,
     pub(crate) branch_id: &'a str,
+}
+
+impl<'a> UntrackedStateRowRef<'a> {
+    pub(crate) fn created_updated_at(
+        created_at: &'a str,
+        updated_at: &'a str,
+    ) -> Either<&'a str, (&'a str, &'a str)> {
+        compact_pair(created_at, updated_at)
+    }
+}
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct UntrackedPayloadRef<'a> {
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) snapshot_content: Option<&'a str>,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) metadata: Option<&'a str>,
+    pub(crate) created_updated_at: Either<&'a str, (&'a str, &'a str)>,
+    pub(crate) global: bool,
 }
 
 /// Hydrated boundary shape for callers that still work with JSON payloads.
@@ -67,19 +115,23 @@ pub(crate) struct MaterializedUntrackedStateRow {
 }
 
 /// Stable identity for one local untracked overlay row.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
+#[musli(packed)]
 pub(crate) struct UntrackedStateIdentity {
     pub(crate) branch_id: String,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode)]
+#[musli(packed)]
 pub(crate) struct UntrackedStateIdentityRef<'a> {
     pub(crate) branch_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a EntityPk,
+    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
 }
 
@@ -143,4 +195,35 @@ pub(crate) struct UntrackedStateRowRequest {
     pub(crate) branch_id: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: NullableKeyFilter<String>,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct UntrackedBranchPrefixRef<'a> {
+    pub(crate) branch_id: &'a str,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct UntrackedBranchSchemaPrefixRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) schema_key: &'a str,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct UntrackedBranchSchemaEntityPrefixRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) schema_key: &'a str,
+    pub(crate) entity_pk: &'a EntityPk,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+pub(crate) struct UntrackedBranchSchemaEntityFilePrefixRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) schema_key: &'a str,
+    pub(crate) entity_pk: &'a EntityPk,
+    #[musli(with = crate::storage_codec::option)]
+    pub(crate) file_id: Option<&'a str>,
 }

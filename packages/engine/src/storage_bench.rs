@@ -148,8 +148,10 @@ fn untracked_state_row_key_value_with_payload(
         file_id: Some(""),
         snapshot_content: Some(snapshot_content),
         metadata: None,
-        created_at: "2026-01-01T00:00:00.000Z",
-        updated_at: "2026-01-01T00:00:00.000Z",
+        created_updated_at: UntrackedStateRowRef::created_updated_at(
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000Z",
+        ),
         global: false,
         branch_id: "bench-branch",
     };

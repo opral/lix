@@ -6,10 +6,9 @@ use crate::storage::{
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
-    TRACKED_STATE_HASH_BYTES,
+    TrackedStateCommitRoot, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
 };
-use crate::LixError;
+use crate::{storage_codec, LixError};
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree_chunk";
@@ -22,8 +21,6 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
     StorageSpaceId(0x0004_0004),
     TRACKED_STATE_COMMIT_ROOT_NAMESPACE,
 );
-
-const COMMIT_ROOT_MAGIC: &[u8; 5] = b"LXTR1";
 
 async fn get_one(
     store: &(impl StorageRead + ?Sized),
@@ -169,141 +166,11 @@ fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
 }
 
 fn encode_commit_root(metadata: &TrackedStateCommitRoot) -> Result<Vec<u8>, LixError> {
-    let mut out = Vec::new();
-    out.extend_from_slice(COMMIT_ROOT_MAGIC);
-    write_string(&mut out, &metadata.commit_id)?;
-    out.extend_from_slice(metadata.root_id.as_bytes());
-    write_u32(&mut out, metadata.parent_roots.len(), "parent root count")?;
-    for parent in &metadata.parent_roots {
-        write_string(&mut out, &parent.commit_id)?;
-        out.extend_from_slice(parent.root_id.as_bytes());
-    }
-    out.extend_from_slice(&metadata.changed_key_count.to_le_bytes());
-    out.extend_from_slice(&metadata.row_count_estimate.to_le_bytes());
-    out.extend_from_slice(&metadata.tree_height.to_le_bytes());
-    out.extend_from_slice(&metadata.primary_chunk_count.to_le_bytes());
-    out.extend_from_slice(&metadata.primary_chunk_bytes.to_le_bytes());
-    Ok(out)
+    storage_codec::encode("tracked_state commit_root", metadata)
 }
 
 fn decode_commit_root(bytes: &[u8]) -> Result<TrackedStateCommitRoot, LixError> {
-    let mut cursor = CommitRootCursor { bytes, offset: 0 };
-    cursor.expect_magic()?;
-    let commit_id = cursor.read_string("commit_id")?;
-    let root_id = cursor.read_root_id("root_id")?;
-    let parent_count = cursor.read_u32("parent root count")? as usize;
-    let mut parent_roots = Vec::with_capacity(parent_count);
-    for _ in 0..parent_count {
-        parent_roots.push(TrackedStateCommitRootParent {
-            commit_id: cursor.read_string("parent commit_id")?,
-            root_id: cursor.read_root_id("parent root_id")?,
-        });
-    }
-    let changed_key_count = cursor.read_u64("changed_key_count")?;
-    let row_count_estimate = cursor.read_u64("row_count_estimate")?;
-    let tree_height = cursor.read_u32("tree_height")?;
-    let primary_chunk_count = cursor.read_u64("primary_chunk_count")?;
-    let primary_chunk_bytes = cursor.read_u64("primary_chunk_bytes")?;
-    cursor.expect_end()?;
-    Ok(TrackedStateCommitRoot {
-        commit_id,
-        root_id,
-        parent_roots,
-        changed_key_count,
-        row_count_estimate,
-        tree_height,
-        primary_chunk_count,
-        primary_chunk_bytes,
-    })
-}
-
-fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
-    write_u32(out, value.len(), "string length")?;
-    out.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn write_u32(out: &mut Vec<u8>, value: usize, field: &str) -> Result<(), LixError> {
-    let value = u32::try_from(value).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("tracked_state commit root metadata {field} exceeds u32"),
-        )
-    })?;
-    out.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-struct CommitRootCursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl CommitRootCursor<'_> {
-    fn expect_magic(&mut self) -> Result<(), LixError> {
-        let magic = self.read_exact(COMMIT_ROOT_MAGIC.len(), "magic")?;
-        if magic != COMMIT_ROOT_MAGIC {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "failed to decode tracked_state commit_root: bad magic",
-            ));
-        }
-        Ok(())
-    }
-
-    fn expect_end(&self) -> Result<(), LixError> {
-        if self.offset != self.bytes.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "failed to decode tracked_state commit_root: trailing bytes",
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_string(&mut self, field: &str) -> Result<String, LixError> {
-        let len = self.read_u32(field)? as usize;
-        let bytes = self.read_exact(len, field)?;
-        String::from_utf8(bytes.to_vec()).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode tracked_state commit_root {field}: {error}"),
-            )
-        })
-    }
-
-    fn read_root_id(&mut self, field: &str) -> Result<TrackedStateRootId, LixError> {
-        let bytes = self.read_exact(TRACKED_STATE_HASH_BYTES, field)?;
-        TrackedStateRootId::from_slice(bytes)
-    }
-
-    fn read_u32(&mut self, field: &str) -> Result<u32, LixError> {
-        let bytes = self.read_exact(std::mem::size_of::<u32>(), field)?;
-        Ok(u32::from_le_bytes(bytes.try_into().expect("fixed u32")))
-    }
-
-    fn read_u64(&mut self, field: &str) -> Result<u64, LixError> {
-        let bytes = self.read_exact(std::mem::size_of::<u64>(), field)?;
-        Ok(u64::from_le_bytes(bytes.try_into().expect("fixed u64")))
-    }
-
-    fn read_exact(&mut self, len: usize, field: &str) -> Result<&[u8], LixError> {
-        let end = self.offset.checked_add(len).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode tracked_state commit_root {field}: overflow"),
-            )
-        })?;
-        if end > self.bytes.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode tracked_state commit_root {field}: truncated"),
-            ));
-        }
-        let out = &self.bytes[self.offset..end];
-        self.offset = end;
-        Ok(out)
-    }
+    storage_codec::decode("tracked_state commit_root", bytes)
 }
 
 #[cfg(test)]
@@ -317,9 +184,15 @@ mod tests {
     };
     use crate::changelog::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
     use crate::json_store::store::JSON_SPACE;
+    use crate::tracked_state::types::{
+        TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
+    };
     use crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE;
 
-    use super::{TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE};
+    use super::{
+        decode_commit_root, encode_commit_root, TRACKED_STATE_COMMIT_ROOT_SPACE,
+        TRACKED_STATE_TREE_CHUNK_SPACE,
+    };
 
     #[test]
     fn native_storage_space_ids_are_unique_across_owner_layouts() {
@@ -346,6 +219,61 @@ mod tests {
                 space.name
             );
         }
+    }
+
+    #[test]
+    fn commit_root_codec_roundtrips_with_parent_metadata() {
+        let metadata = TrackedStateCommitRoot {
+            commit_id: "child".to_string(),
+            root_id: TrackedStateRootId::new([2; 32]),
+            parent_roots: vec![TrackedStateCommitRootParent {
+                commit_id: "parent".to_string(),
+                root_id: TrackedStateRootId::new([1; 32]),
+            }],
+            changed_key_count: 7,
+            row_count_estimate: 42,
+            tree_height: 3,
+            primary_chunk_count: 5,
+            primary_chunk_bytes: 4096,
+        };
+
+        let encoded = encode_commit_root(&metadata).expect("commit root should encode");
+        let decoded = decode_commit_root(&encoded).expect("commit root should decode");
+
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn commit_root_codec_rejects_malformed_storage_bytes() {
+        let error = decode_commit_root(b"LXTR1not-musli")
+            .expect_err("old hand-rolled bytes should not decode as musli");
+
+        assert!(error
+            .to_string()
+            .contains("failed to decode tracked_state commit_root"));
+    }
+
+    #[test]
+    fn commit_root_codec_rejects_trailing_bytes() {
+        let metadata = TrackedStateCommitRoot {
+            commit_id: "commit".to_string(),
+            root_id: TrackedStateRootId::new([9; 32]),
+            parent_roots: Vec::new(),
+            changed_key_count: 1,
+            row_count_estimate: 2,
+            tree_height: 1,
+            primary_chunk_count: 1,
+            primary_chunk_bytes: 128,
+        };
+        let mut encoded = encode_commit_root(&metadata).expect("commit root should encode");
+        encoded.push(0);
+
+        let error = decode_commit_root(&encoded)
+            .expect_err("trailing bytes should fail commit root decode");
+
+        assert!(error
+            .to_string()
+            .contains("failed to decode tracked_state commit_root"));
     }
 
     #[test]

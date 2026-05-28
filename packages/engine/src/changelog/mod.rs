@@ -13,8 +13,8 @@ mod types;
 
 pub(crate) use codec::{
     decode_change_record, decode_commit_change_ref_chunk, decode_commit_record,
-    encode_change_record, encode_commit_change_ref_chunk, encode_commit_record, view_change_record,
-    view_commit_change_ref_chunk, view_commit_record,
+    encode_change_record, encode_commit_change_ref_chunk, encode_commit_record,
+    view_commit_change_ref_chunk,
 };
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
@@ -24,6 +24,6 @@ pub(crate) use types::{
     ChangeScanBatch, ChangeScanRequest, ChangelogAppend, CommitChangeRef, CommitChangeRefChunk,
     CommitChangeRefChunkView, CommitChangeRefSet, CommitChangeRefView, CommitId, CommitIdRef,
     CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitRecordView, CommitScanBatch, CommitScanRequest, EntityPkRef, GcLiveSet, GcPlan,
-    GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
+    CommitScanBatch, CommitScanRequest, EntityPkRef, ExpandedCommitChangeRefChunkView, GcLiveSet,
+    GcPlan, GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
 };
