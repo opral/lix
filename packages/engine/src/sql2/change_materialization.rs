@@ -83,7 +83,7 @@ where
         file_id: change.file_id,
         snapshot_content,
         metadata,
-        created_at: change.created_at,
+        created_at: change.created_at.to_string(),
     })
 }
 

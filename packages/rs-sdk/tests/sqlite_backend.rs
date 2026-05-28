@@ -2,7 +2,7 @@
 
 use lix_engine::run_backend_conformance;
 use lix_rs_sdk::{
-	open_lix_with_backend, SqliteBackend, SqliteBackendFactory, Value, SQLITE_FORMAT_VERSION,
+    open_lix_with_backend, SqliteBackend, SqliteBackendFactory, Value, SQLITE_FORMAT_VERSION,
 };
 use rusqlite::Connection;
 

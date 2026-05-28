@@ -9,6 +9,7 @@ use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
+use crate::common::LixTimestamp;
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -761,6 +762,9 @@ fn prepare_state_row(
         facts,
     } = normalized;
     let updated_at = row.updated_at.unwrap_or_else(|| functions.call_timestamp());
+    let created_at = row.created_at.unwrap_or_else(|| updated_at.clone());
+    let created_at = parse_prepared_timestamp("created_at", &created_at)?;
+    let updated_at = parse_prepared_timestamp("updated_at", &updated_at)?;
     let snapshot = snapshot
         .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
         .transpose()?;
@@ -782,7 +786,7 @@ fn prepare_state_row(
         snapshot,
         metadata,
         origin: row.origin,
-        created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
+        created_at,
         updated_at,
         global: row.global,
         change_id: if row.untracked {
@@ -793,6 +797,14 @@ fn prepare_state_row(
         commit_id: row.commit_id,
         untracked: row.untracked,
         branch_id: row.branch_id,
+    })
+}
+
+fn parse_prepared_timestamp(column: &str, timestamp: &str) -> Result<LixTimestamp, LixError> {
+    LixTimestamp::parse(timestamp).map_err(|error| {
+        LixError::unknown(format!(
+            "invalid {column} timestamp for prepared state row: {error}"
+        ))
     })
 }
 

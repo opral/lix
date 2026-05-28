@@ -250,7 +250,7 @@ where
             .map(|reachable| {
                 (
                     reachable.commit.commit_id.clone(),
-                    reachable.commit.change.created_at.clone(),
+                    reachable.commit.change.created_at.to_string(),
                 )
             })
             .collect::<BTreeMap<_, _>>();

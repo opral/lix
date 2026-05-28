@@ -229,6 +229,10 @@ mod tests {
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::LixError;
 
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
+
     #[tokio::test]
     async fn reachable_commits_returns_commits_nearest_first() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
@@ -746,7 +750,7 @@ mod tests {
                 parent_commit_ids: change.parent_commit_ids.clone(),
                 change_id: change.change.id.clone(),
                 author_account_ids: Vec::new(),
-                created_at: change.change.created_at.clone(),
+                created_at: change.change.created_at,
             });
             append.commit_change_refs.push(CommitChangeRefSet {
                 commit_id: commit_id.clone(),
@@ -778,7 +782,7 @@ mod tests {
                 file_id: None,
                 snapshot_ref: None,
                 metadata_ref: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_at: ts("2026-01-01T00:00:00Z"),
             },
             parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
         }

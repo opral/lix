@@ -4,6 +4,7 @@ use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
     CommitChangeRefSet, CommitRecord,
 };
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionContext;
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
@@ -126,11 +127,9 @@ pub(crate) async fn commit_prepared_writes(
     }
 
     for branch_head in branch_heads {
-        let canonical_row = prepare_branch_ref_row(
-            &branch_head.branch_id,
-            &branch_head.commit_id,
-            &branch_head.timestamp,
-        )?;
+        let timestamp = branch_head.timestamp.to_string();
+        let canonical_row =
+            prepare_branch_ref_row(&branch_head.branch_id, &branch_head.commit_id, &timestamp)?;
         branch_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
@@ -213,7 +212,7 @@ struct StagedChangelogCommit {
     change_ids: Vec<String>,
     selected_change_refs: Vec<StagedCommitChangeRef>,
     commit_change_id: String,
-    commit_created_at: String,
+    commit_created_at: LixTimestamp,
 }
 
 async fn stage_changelog_commits(
@@ -261,7 +260,7 @@ async fn stage_changelog_commits(
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
             change_id: commit_row.change_id.clone(),
             author_account_ids: Vec::new(),
-            created_at: commit_row.created_at.clone(),
+            created_at: commit_row.created_at,
         });
         commit_change_refs.push(CommitChangeRefSet {
             commit_id: commit_row.commit_id.clone(),
@@ -273,7 +272,7 @@ async fn stage_changelog_commits(
                 change_ids,
                 selected_change_refs: commit_row.selected_change_refs.clone(),
                 commit_change_id: commit_row.change_id.clone(),
-                commit_created_at: commit_row.created_at.clone(),
+                commit_created_at: commit_row.created_at,
             },
         );
     }
@@ -305,7 +304,7 @@ fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, 
         file_id: row.file_id.clone(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| metadata.json_ref),
-        created_at: row.updated_at.clone(),
+        created_at: row.updated_at,
     })
 }
 
@@ -383,8 +382,8 @@ fn tracked_delta_from_state_row(
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
         deleted: row.snapshot.is_none(),
-        created_at: &row.created_at,
-        updated_at: &row.updated_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
     })
 }
 
@@ -401,8 +400,8 @@ fn tracked_delta_from_selected_change_ref<'a>(
         snapshot_ref: change_ref.snapshot_ref.as_ref(),
         metadata_ref: change_ref.metadata_ref.as_ref(),
         deleted: change_ref.deleted,
-        created_at: &change_ref.created_at,
-        updated_at: &change_ref.updated_at,
+        created_at: change_ref.created_at,
+        updated_at: change_ref.updated_at,
     })
 }
 
@@ -460,8 +459,8 @@ async fn stage_tracked_roots(
             snapshot_ref: Some(&commit_snapshot_ref),
             metadata_ref: None,
             deleted: false,
-            created_at: &staged.commit_created_at,
-            updated_at: &staged.commit_created_at,
+            created_at: staged.commit_created_at,
+            updated_at: staged.commit_created_at,
         });
         tracked_writer
             .stage_commit_root(&root.commit_id, root.parent_commit_id.as_deref(), deltas)
@@ -582,10 +581,8 @@ fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRow
             .metadata
             .as_ref()
             .map(|metadata| metadata.normalized.as_ref()),
-        created_updated_at: UntrackedStateRowRef::created_updated_at(
-            &row.created_at,
-            &row.updated_at,
-        ),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         global: row.global,
         branch_id: &row.branch_id,
     }
@@ -624,7 +621,7 @@ struct FinalizedCommitRows {
 struct FinalizedCommitRow {
     commit_id: String,
     parent_commit_ids: Vec<String>,
-    created_at: String,
+    created_at: LixTimestamp,
     change_id: String,
     selected_change_refs: Vec<StagedCommitChangeRef>,
 }
@@ -632,7 +629,7 @@ struct FinalizedCommitRow {
 struct PendingBranchHead {
     branch_id: String,
     commit_id: String,
-    timestamp: String,
+    timestamp: LixTimestamp,
 }
 
 struct PendingTrackedRoot {
@@ -732,6 +729,10 @@ mod tests {
     };
     use crate::NullableKeyFilter;
     use crate::GLOBAL_BRANCH_ID;
+
+    fn ts(value: &str) -> LixTimestamp {
+        LixTimestamp::expect_parse("timestamp", value)
+    }
 
     const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
     const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -870,14 +871,14 @@ mod tests {
             FinalizedCommitRow {
                 commit_id: "child-commit".to_string(),
                 parent_commit_ids: vec!["parent-commit".to_string()],
-                created_at: "2026-01-01T00:00:01Z".to_string(),
+                created_at: ts("2026-01-01T00:00:01Z"),
                 change_id: "child-commit-change".to_string(),
                 selected_change_refs: Vec::new(),
             },
             FinalizedCommitRow {
                 commit_id: "parent-commit".to_string(),
                 parent_commit_ids: Vec::new(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
+                created_at: ts("2026-01-01T00:00:00Z"),
                 change_id: "parent-commit-change".to_string(),
                 selected_change_refs: Vec::new(),
             },
@@ -1100,9 +1101,13 @@ mod tests {
                 file_id: None,
                 snapshot_content: Some(mode_snapshot.to_string()),
                 metadata: None,
-                created_updated_at: crate::untracked_state::UntrackedStateRow::created_updated_at(
-                    "2026-01-01T00:00:00Z".to_string(),
-                    "2026-01-01T00:00:00Z".to_string(),
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    "2026-01-01T00:00:00Z",
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
+                    "2026-01-01T00:00:00Z",
                 ),
                 global: true,
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -1351,7 +1356,7 @@ mod tests {
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, "test-uuid-1");
         assert_eq!(row.change_id, "test-uuid-2");
-        assert_eq!(row.created_at, "test-timestamp-1");
+        assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.001Z");
         assert_eq!(row.parent_commit_ids, vec!["initial-commit"]);
 
         let branch_head = &rows.branch_heads[0];
@@ -1437,7 +1442,7 @@ mod tests {
         let mut change_refs = StagedCommitChangeRefs::new(
             "test-uuid-1".to_string(),
             "test-uuid-2".to_string(),
-            "test-timestamp-1".to_string(),
+            ts("2026-01-01T00:00:00.001Z"),
         );
         for change_id in change_ids {
             change_refs.add_change_id(change_id.to_string());
@@ -1467,8 +1472,8 @@ mod tests {
             ),
             metadata: None,
             origin: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
             global: branch_id == GLOBAL_BRANCH_ID,
             change_id: Some(change_id.to_string()),
             commit_id: Some("test-uuid-1".to_string()),

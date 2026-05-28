@@ -27,6 +27,10 @@ use crate::GLOBAL_BRANCH_ID;
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "test-empty-root";
 const TEST_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 
+fn test_timestamp() -> crate::common::LixTimestamp {
+    crate::common::LixTimestamp::expect_parse("timestamp", TEST_TIMESTAMP)
+}
+
 /// Seeds a branch head and matching tracked root for unit tests.
 ///
 /// A branch ref that points at a commit without a tracked root is invalid for
@@ -117,8 +121,14 @@ pub(crate) async fn stage_tracked_root_from_materialized(
                 snapshot_ref: change.snapshot_ref.as_ref(),
                 metadata_ref: change.metadata_ref.as_ref(),
                 deleted: change.snapshot_ref.is_none(),
-                created_at: &row.created_at,
-                updated_at: &row.updated_at,
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    &row.created_at,
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
+                    &row.updated_at,
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -131,8 +141,8 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         snapshot_ref: Some(&commit_snapshot_ref),
         metadata_ref: None,
         deleted: false,
-        created_at: &staged.commit_created_at,
-        updated_at: &staged.commit_created_at,
+        created_at: staged.commit_created_at,
+        updated_at: staged.commit_created_at,
     });
     tracked_state
         .writer(read, writes)
@@ -183,8 +193,14 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 snapshot_ref: change.snapshot_ref.as_ref(),
                 metadata_ref: change.metadata_ref.as_ref(),
                 deleted: change.snapshot_ref.is_none(),
-                created_at: &row.created_at,
-                updated_at: &row.updated_at,
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    &row.created_at,
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
+                    &row.updated_at,
+                ),
             }
         })
         .collect::<Vec<_>>();
@@ -197,8 +213,8 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         snapshot_ref: Some(&commit_snapshot_ref),
         metadata_ref: None,
         deleted: false,
-        created_at: &staged.commit_created_at,
-        updated_at: &staged.commit_created_at,
+        created_at: staged.commit_created_at,
+        updated_at: staged.commit_created_at,
     });
     tracked_state
         .writer(read, writes)
@@ -290,15 +306,15 @@ async fn stage_test_changelog_commit(
     stage_json_payloads(writes, &json_payloads)?;
     let created_at = rows
         .first()
-        .map(|row| row.created_at.clone())
-        .unwrap_or_else(|| TEST_TIMESTAMP.to_string());
+        .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
+        .unwrap_or_else(test_timestamp);
     append.commits.push(CommitRecord {
         format_version: 1,
         commit_id: commit_id.to_string(),
         parent_commit_ids: parent_ids.to_vec(),
         change_id: commit_change_id.to_string(),
         author_account_ids: Vec::new(),
-        created_at: created_at.clone(),
+        created_at,
     });
     append.commit_change_refs.push(CommitChangeRefSet {
         commit_id: commit_id.to_string(),
@@ -329,7 +345,7 @@ fn commit_row_snapshot_content(commit_id: &str) -> Result<String, crate::LixErro
 struct TestStagedChangelogCommit {
     change_commit_ids: Vec<(usize, String)>,
     commit_change_id: String,
-    commit_created_at: String,
+    commit_created_at: crate::common::LixTimestamp,
 }
 
 async fn load_existing_changelog_change_ids(
@@ -428,7 +444,7 @@ pub(crate) fn tracked_change_from_materialized(
             let serialized = crate::serialize_row_metadata(value);
             prepare_json_ref(&serialized)
         }),
-        created_at: row.updated_at.clone(),
+        created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.updated_at),
     })
 }
 
@@ -442,10 +458,8 @@ pub(crate) fn untracked_state_row_from_materialized(
         file_id: row.file_id.clone(),
         snapshot_content: row.snapshot_content.clone(),
         metadata: row.metadata.as_ref().map(crate::serialize_row_metadata),
-        created_updated_at: UntrackedStateRow::created_updated_at(
-            row.created_at.clone(),
-            row.updated_at.clone(),
-        ),
+        created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
+        updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
         global: row.global,
         branch_id: row.branch_id.clone(),
     })

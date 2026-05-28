@@ -14,7 +14,8 @@ pub(crate) fn encode_payload_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8
         &UntrackedPayloadRef {
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
-            created_updated_at: row.created_updated_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
             global: row.global,
         },
     )
@@ -27,7 +28,8 @@ pub(crate) fn decode_payload_with_identity(
     let UntrackedPayloadRef {
         snapshot_content,
         metadata,
-        created_updated_at,
+        created_at,
+        updated_at,
         global,
     } = storage_codec::decode("untracked-state payload", bytes)?;
 
@@ -37,17 +39,8 @@ pub(crate) fn decode_payload_with_identity(
         file_id: identity.file_id,
         snapshot_content: snapshot_content.map(str::to_string),
         metadata: metadata.map(str::to_string),
-        created_updated_at: match created_updated_at {
-            crate::storage_codec::Either::Left(timestamp) => {
-                UntrackedStateRow::created_updated_at(timestamp.to_string(), timestamp.to_string())
-            }
-            crate::storage_codec::Either::Right((created_at, updated_at)) => {
-                UntrackedStateRow::created_updated_at(
-                    created_at.to_string(),
-                    updated_at.to_string(),
-                )
-            }
-        },
+        created_at,
+        updated_at,
         global,
         branch_id: identity.branch_id,
     })
@@ -74,8 +67,12 @@ mod tests {
             file_id: Some("file-1"),
             snapshot_content,
             metadata,
-            created_updated_at: UntrackedStateRowRef::created_updated_at(
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
                 "2026-05-19T00:00:00.000Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
                 "2026-05-19T00:00:01.000Z",
             ),
             global: false,
@@ -113,8 +110,8 @@ mod tests {
             Some("{\"hello\":\"world\"}")
         );
         assert_eq!(decoded.metadata.as_deref(), Some("{\"meta\":true}"));
-        assert_eq!(decoded.created_at(), "2026-05-19T00:00:00.000Z");
-        assert_eq!(decoded.updated_at(), "2026-05-19T00:00:01.000Z");
+        assert_eq!(decoded.created_at().to_string(), "2026-05-19T00:00:00.000Z");
+        assert_eq!(decoded.updated_at().to_string(), "2026-05-19T00:00:01.000Z");
         assert!(!decoded.global);
         assert_eq!(decoded.branch_id, "branch-1");
     }
@@ -177,8 +174,12 @@ mod tests {
                 file_id: None,
                 snapshot_content: None,
                 metadata: None,
-                created_updated_at: UntrackedStateRowRef::created_updated_at(
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
                     "2026-05-19T00:00:00.000Z",
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
                     "2026-05-19T00:00:00.000Z",
                 ),
                 global: false,

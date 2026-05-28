@@ -469,8 +469,14 @@ mod tests {
             deleted: false,
             snapshot_ref: Some(JsonRef::for_content(snapshot.as_bytes())),
             metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-01-01T00:00:00Z",
+            ),
             change_id: change_id.to_string(),
             commit_id: change_id.replace("change", "commit"),
         }

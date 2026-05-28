@@ -1183,6 +1183,10 @@ mod tests {
 
     use super::*;
 
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
+
     fn test_change_ref(entity: &str, change_id: &str) -> CommitChangeRef {
         CommitChangeRef {
             schema_key: "message".to_string(),
@@ -1379,7 +1383,7 @@ mod tests {
             file_id: None,
             snapshot_ref: None,
             metadata_ref: None,
-            created_at: "2026-05-12T00:00:00Z".to_string(),
+            created_at: ts("2026-05-12T00:00:00Z"),
         });
         append.commit_change_refs[0].entries.insert(
             0,
@@ -1558,7 +1562,7 @@ mod tests {
                 file_id: None,
                 snapshot_ref: None,
                 metadata_ref: None,
-                created_at: "2026-05-20T00:00:00Z".to_string(),
+                created_at: ts("2026-05-20T00:00:00Z"),
             })
             .collect::<Vec<_>>();
         let expected_ids = changes

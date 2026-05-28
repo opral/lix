@@ -368,7 +368,7 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
             snapshot_content.as_bytes(),
         )),
         metadata_ref: None,
-        created_at: record.created_at.clone(),
+        created_at: record.created_at,
     }
 }
 
@@ -385,6 +385,10 @@ mod tests {
     };
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
@@ -684,7 +688,7 @@ mod tests {
                     file_id: None,
                     snapshot_ref: None,
                     metadata_ref: None,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    created_at: ts("2026-01-01T00:00:00Z"),
                 },
                 commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
                 parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
@@ -710,7 +714,7 @@ mod tests {
                         crate::json_store::JsonRef::from_hash(blake3::hash(content.as_bytes()))
                     }),
                     metadata_ref: None,
-                    created_at: created_at.to_string(),
+                    created_at: ts(created_at),
                 },
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
@@ -791,7 +795,7 @@ mod tests {
                 parent_commit_ids: commit.parent_commit_ids.clone(),
                 change_id: commit.canonical_change.id.clone(),
                 author_account_ids: commit.author_account_ids.clone(),
-                created_at: commit.canonical_change.created_at.clone(),
+                created_at: commit.canonical_change.created_at,
             });
             append.commit_change_refs.push(CommitChangeRefSet {
                 commit_id: commit.commit_id.clone(),
@@ -816,7 +820,7 @@ mod tests {
             parent_commit_ids: Vec::new(),
             change_id: change_id.clone(),
             author_account_ids: Vec::new(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
         });
         append.commit_change_refs.push(CommitChangeRefSet {
             commit_id: commit_id.to_string(),
@@ -833,7 +837,7 @@ mod tests {
             file_id: change.change.file_id.clone(),
             snapshot_ref: change.change.snapshot_ref,
             metadata_ref: change.change.metadata_ref,
-            created_at: change.change.created_at.clone(),
+            created_at: change.change.created_at,
         }
     }
 

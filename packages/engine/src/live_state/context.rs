@@ -292,8 +292,8 @@ fn commit_row(
         snapshot_content: Some(snapshot_content),
         metadata: None,
         deleted: false,
-        created_at: commit.change.created_at.clone(),
-        updated_at: commit.change.created_at.clone(),
+        created_at: commit.change.created_at.to_string(),
+        updated_at: commit.change.created_at.to_string(),
         global: true,
         change_id: Some(commit.change.id.clone()),
         commit_id: Some(commit.commit_id.clone()),
@@ -514,6 +514,10 @@ mod tests {
 
     const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
+
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
@@ -558,7 +562,7 @@ mod tests {
                 parent_commit_ids: Vec::new(),
                 change_id: commit_change_id.clone(),
                 author_account_ids: Vec::new(),
-                created_at: "1970-01-01T00:00:00.000Z".to_string(),
+                created_at: ts("1970-01-01T00:00:00.000Z"),
             });
             append
                 .commit_change_refs
@@ -599,8 +603,8 @@ mod tests {
                 snapshot_ref: Some(&snapshot_ref),
                 metadata_ref: None,
                 deleted: false,
-                created_at: "1970-01-01T00:00:00.000Z",
-                updated_at: "1970-01-01T00:00:00.000Z",
+                created_at: ts("1970-01-01T00:00:00.000Z"),
+                updated_at: ts("1970-01-01T00:00:00.000Z"),
             }];
             TrackedStateContext::new()
                 .writer(read, &mut writes)
@@ -622,7 +626,11 @@ mod tests {
         let mut untracked_rows = Vec::new();
         let mut tracked_rows_by_commit = std::collections::BTreeMap::<
             String,
-            Vec<(crate::changelog::ChangeRecord, String, String)>,
+            Vec<(
+                crate::changelog::ChangeRecord,
+                crate::common::LixTimestamp,
+                crate::common::LixTimestamp,
+            )>,
         >::new();
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
 
@@ -651,8 +659,8 @@ mod tests {
                 stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
                 tracked_rows_by_commit.entry(commit_id).or_default().push((
                     change,
-                    materialized.created_at,
-                    materialized.updated_at,
+                    ts(&materialized.created_at),
+                    ts(&materialized.updated_at),
                 ));
             }
         }
@@ -668,9 +676,8 @@ mod tests {
                 .unwrap_or_default();
             let commit_created_at = rows
                 .first()
-                .map(|(change, _, _)| change.created_at.as_str())
-                .unwrap_or("1970-01-01T00:00:00.000Z")
-                .to_string();
+                .map(|(change, _, _)| change.created_at)
+                .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
             let change_refs = rows
                 .iter()
                 .map(|(change, _, _)| crate::changelog::CommitChangeRef {
@@ -691,7 +698,7 @@ mod tests {
                 parent_commit_ids: parent_ids,
                 change_id: commit_change_id.clone(),
                 author_account_ids: Vec::new(),
-                created_at: commit_created_at.clone(),
+                created_at: commit_created_at,
             });
             append
                 .commit_change_refs
@@ -726,8 +733,8 @@ mod tests {
                     snapshot_ref: change.snapshot_ref.as_ref(),
                     metadata_ref: change.metadata_ref.as_ref(),
                     deleted: change.snapshot_ref.is_none(),
-                    created_at,
-                    updated_at,
+                    created_at: *created_at,
+                    updated_at: *updated_at,
                 })
                 .collect::<Vec<_>>();
             deltas.push(TrackedStateDeltaRef {
@@ -739,8 +746,8 @@ mod tests {
                 snapshot_ref: Some(&snapshot_ref),
                 metadata_ref: None,
                 deleted: false,
-                created_at: &commit_created_at,
-                updated_at: &commit_created_at,
+                created_at: commit_created_at,
+                updated_at: commit_created_at,
             });
             TrackedStateContext::new()
                 .writer(&*store, writes)

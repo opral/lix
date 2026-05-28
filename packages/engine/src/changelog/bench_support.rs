@@ -629,7 +629,10 @@ fn direct_append_with_shape(
                     format!("{{\"value\":{next_change}}}").as_bytes(),
                 )),
                 metadata_ref: None,
-                created_at: "2026-05-20T00:00:00Z".to_string(),
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    "2026-05-20T00:00:00Z",
+                ),
             });
             refs.push(CommitChangeRef {
                 schema_key: "message".to_string(),
@@ -645,7 +648,10 @@ fn direct_append_with_shape(
             parent_commit_ids: Vec::new(),
             change_id: commit_change_id,
             author_account_ids: Vec::new(),
-            created_at: "2026-05-20T00:00:00Z".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-05-20T00:00:00Z",
+            ),
         });
         append.commit_change_refs.push(CommitChangeRefSet {
             commit_id,

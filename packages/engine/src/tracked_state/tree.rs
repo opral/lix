@@ -3056,9 +3056,13 @@ mod tests {
             snapshot_ref: snapshot_content
                 .map(|content| crate::json_store::JsonRef::for_content(content.as_bytes())),
             metadata_ref: None,
-            created_updated_at: TrackedStateIndexValue::created_updated_at(
-                "2026-01-01T00:00:00Z".to_string(),
-                "2026-01-01T00:00:00Z".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-01-01T00:00:00Z",
             ),
         }
     }
