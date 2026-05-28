@@ -20,10 +20,10 @@ pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreW
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
 pub(crate) use types::{
-    ChangeId, ChangeIdRef, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView,
-    ChangeScanBatch, ChangeScanRequest, ChangelogAppend, CommitChangeRef, CommitChangeRefChunk,
-    CommitChangeRefChunkView, CommitChangeRefSet, CommitChangeRefView, CommitId, CommitIdRef,
-    CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitScanBatch, CommitScanRequest, EntityPkRef, ExpandedCommitChangeRefChunkView, GcLiveSet,
-    GcPlan, GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
+    ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
+    ChangeScanRequest, ChangelogAppend, CommitChangeRef, CommitChangeRefChunk,
+    CommitChangeRefChunkView, CommitChangeRefSet, CommitChangeRefView, CommitId, CommitLoadBatch,
+    CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord, CommitScanBatch,
+    CommitScanRequest, EntityPkRef, ExpandedCommitChangeRefChunkView, GcLiveSet, GcPlan,
+    GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
 };

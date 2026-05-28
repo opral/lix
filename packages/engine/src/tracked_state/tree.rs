@@ -2366,6 +2366,7 @@ fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
@@ -3050,8 +3051,8 @@ mod tests {
 
     fn value(change_id: &str, snapshot_content: Option<&str>) -> TrackedStateIndexValue {
         TrackedStateIndexValue {
-            change_id: change_id.to_string(),
-            commit_id: "commit".to_string(),
+            change_id: ChangeId::for_test_label(change_id),
+            commit_id: CommitId::for_test_label("commit"),
             deleted: snapshot_content.is_none(),
             snapshot_ref: snapshot_content
                 .map(|content| crate::json_store::JsonRef::for_content(content.as_bytes())),

@@ -877,6 +877,8 @@ mod tests {
 
     use serde_json::Value as JsonValue;
 
+    use crate::changelog::{ChangeId, CommitId};
+
     use super::{
         blob_ref_row, directory_descriptor_row, file_descriptor_row, plan_file_path_update,
         plan_file_path_write, BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
@@ -1391,8 +1393,8 @@ mod tests {
             metadata: None,
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

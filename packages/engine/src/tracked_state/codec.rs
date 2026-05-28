@@ -204,7 +204,7 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
         .expect("tracked-state value storage encoding should not fail")
 }
 
-pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
+pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef) -> Vec<u8> {
     storage_codec::encode("tracked-state value", &value)
         .expect("tracked-state value storage encoding should not fail")
 }
@@ -229,11 +229,11 @@ pub(crate) fn decode_visible_value(
     Ok(Some(tracked_value_from_storage(view)))
 }
 
-fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixError> {
+fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef, LixError> {
     storage_codec::decode("tracked-state value", bytes)
 }
 
-fn tracked_value_from_storage(value: TrackedStateIndexValueRef<'_>) -> TrackedStateIndexValue {
+fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateIndexValue {
     let TrackedStateIndexValueRef {
         change_id,
         commit_id,
@@ -244,8 +244,8 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef<'_>) -> TrackedSt
         updated_at,
     } = value;
     TrackedStateIndexValue {
-        change_id: change_id.to_string(),
-        commit_id: commit_id.to_string(),
+        change_id,
+        commit_id,
         deleted,
         snapshot_ref,
         metadata_ref,
@@ -391,6 +391,7 @@ fn level_salt(level: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
 
@@ -400,8 +401,8 @@ mod tests {
 
     fn test_value(commit_id: &str, change_id: &str) -> TrackedStateIndexValue {
         TrackedStateIndexValue {
-            change_id: change_id.to_string(),
-            commit_id: commit_id.to_string(),
+            change_id: ChangeId::for_test_label(change_id),
+            commit_id: CommitId::for_test_label(commit_id),
             deleted: false,
             snapshot_ref: None,
             metadata_ref: None,
@@ -540,8 +541,8 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_change_ref_value() {
         let value = TrackedStateIndexValue {
-            change_id: "change".to_string(),
-            commit_id: "commit".to_string(),
+            change_id: ChangeId::for_test_label("change"),
+            commit_id: CommitId::for_test_label("commit"),
             deleted: false,
             snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
             metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
@@ -556,8 +557,8 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_second_change_ref_value() {
         let value = TrackedStateIndexValue {
-            change_id: "other-change".to_string(),
-            commit_id: "other-commit".to_string(),
+            change_id: ChangeId::for_test_label("other-change"),
+            commit_id: CommitId::for_test_label("other-commit"),
             deleted: true,
             snapshot_ref: None,
             metadata_ref: None,
@@ -626,8 +627,8 @@ mod tests {
     fn encoded_value_len_matches_encoded_value_bytes() {
         let values = [
             TrackedStateIndexValue {
-                change_id: "change".to_string(),
-                commit_id: "commit".to_string(),
+                change_id: ChangeId::for_test_label("change"),
+                commit_id: CommitId::for_test_label("commit"),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: None,
@@ -635,8 +636,8 @@ mod tests {
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
             TrackedStateIndexValue {
-                change_id: "change-2".to_string(),
-                commit_id: "commit".to_string(),
+                change_id: ChangeId::for_test_label("change-2"),
+                commit_id: CommitId::for_test_label("commit"),
                 deleted: true,
                 snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
                 metadata_ref: None,
@@ -644,8 +645,8 @@ mod tests {
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
             TrackedStateIndexValue {
-                change_id: "change-3".to_string(),
-                commit_id: "other".to_string(),
+                change_id: ChangeId::for_test_label("change-3"),
+                commit_id: CommitId::for_test_label("other"),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),

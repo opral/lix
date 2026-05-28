@@ -7,6 +7,8 @@ use crate::catalog::{
     CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
     StateForeignKeyPlan,
 };
+#[cfg(test)]
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
@@ -772,7 +774,9 @@ fn directory_parent_missing_error(
         LixError::CODE_FOREIGN_KEY,
         format!(
             "lix_directory_descriptor parent_id chain in branch '{}' for directory '{}' references missing directory '{}'",
-            scope.domain.branch_id(), start_id, missing_id
+            scope.domain.branch_id(),
+            start_id,
+            missing_id
         ),
     )
 }
@@ -782,7 +786,9 @@ fn directory_parent_depth_error(scope: &DirectoryDescriptorScope, start_id: &str
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!(
             "lix_directory_descriptor parent_id chain in branch '{}' for directory '{}' exceeds maximum depth {}",
-            scope.domain.branch_id(), start_id, MAX_DIRECTORY_PARENT_DEPTH
+            scope.domain.branch_id(),
+            start_id,
+            MAX_DIRECTORY_PARENT_DEPTH
         ),
     )
 }
@@ -5394,8 +5400,8 @@ mod tests {
             created_at: ts("2026-04-29T00:00:00.000Z"),
             updated_at: ts("2026-04-29T00:00:00.000Z"),
             global: true,
-            change_id: Some("change-registered-schema".to_string()),
-            commit_id: Some("commit-registered-schema".to_string()),
+            change_id: Some(ChangeId::for_test_label("change-registered-schema")),
+            commit_id: Some(CommitId::for_test_label("commit-registered-schema")),
             untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }
@@ -5761,8 +5767,8 @@ mod tests {
             created_at: ts("2026-04-29T00:00:00.000Z"),
             updated_at: ts("2026-04-29T00:00:00.000Z"),
             global: true,
-            change_id: Some("change-1".to_string()),
-            commit_id: Some("commit-1".to_string()),
+            change_id: Some(ChangeId::for_test_label("change-1")),
+            commit_id: Some(CommitId::for_test_label("commit-1")),
             untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }

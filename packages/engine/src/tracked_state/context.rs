@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
+use crate::changelog::ChangeId;
 use crate::changelog::{
-    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitLoadEntry,
+    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
     CommitLoadRequest, CommitProjection, CommitRecord,
 };
 use crate::entity_pk::EntityPk;
@@ -101,11 +103,11 @@ pub(crate) struct TrackedStateStoreReader<S> {
 }
 
 struct DiffCommitRootValidationCache {
-    commit_ref_winners: HashMap<String, HashMap<TrackedStateIdentity, String>>,
+    commit_ref_winners: HashMap<String, HashMap<TrackedStateIdentity, crate::changelog::ChangeId>>,
     commit_root_metadata: HashMap<String, TrackedStateCommitRoot>,
     commit_roots: HashMap<String, TrackedStateRootId>,
     tree_values: HashMap<(TrackedStateRootId, TrackedStateKey), Option<TrackedStateIndexValue>>,
-    changelog_first_parents: HashMap<String, Option<String>>,
+    changelog_first_parents: HashMap<String, Option<CommitId>>,
 }
 
 impl DiffCommitRootValidationCache {
@@ -359,7 +361,7 @@ where
                     root_commit_id, parent.commit_id, identity
                 )));
             }
-            current_commit_id = parent.commit_id.clone();
+            current_commit_id = parent.commit_id.to_string();
         }
     }
 
@@ -372,9 +374,9 @@ where
         let changelog_first_parent = self
             .load_cached_changelog_first_parent(commit_id, cache)
             .await?;
-        let expected_parent = match changelog_first_parent.as_deref() {
+        let expected_parent = match changelog_first_parent {
             Some(first_parent_id) => {
-                self.nearest_available_commit_root_parent(first_parent_id, cache)
+                self.nearest_available_commit_root_parent(&first_parent_id.to_string(), cache)
                     .await?
             }
             None => None,
@@ -382,12 +384,13 @@ where
         match (expected_parent, metadata.parent_roots.first()) {
             (None, None) => Ok(()),
             (Some((expected_parent_id, expected_root)), Some(parent))
-                if parent.commit_id == expected_parent_id && parent.root_id == expected_root =>
+                if parent.commit_id.to_string() == expected_parent_id
+                    && parent.root_id == expected_root =>
             {
                 Ok(())
             }
             (Some((expected_parent_id, expected_root)), Some(parent))
-                if parent.commit_id == expected_parent_id =>
+                if parent.commit_id.to_string() == expected_parent_id =>
             {
                 let _ = expected_root;
                 Err(LixError::unknown(format!(
@@ -431,7 +434,8 @@ where
             }
             current = self
                 .load_cached_changelog_first_parent(&commit_id, cache)
-                .await?;
+                .await?
+                .map(|id| id.to_string());
         }
         Ok(None)
     }
@@ -440,11 +444,14 @@ where
         &mut self,
         commit_id: &str,
         cache: &mut DiffCommitRootValidationCache,
-    ) -> Result<HashMap<TrackedStateIdentity, String>, LixError> {
+    ) -> Result<HashMap<TrackedStateIdentity, crate::changelog::ChangeId>, LixError> {
         if let Some(winners) = cache.commit_ref_winners.get(commit_id) {
             return Ok(winners.clone());
         }
-        let commit_ids = [commit_id.to_string()];
+        let commit_ids = [CommitId::parse_lix(
+            commit_id,
+            "commit-ref winner commit_id",
+        )?];
         let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
@@ -550,11 +557,14 @@ where
         &mut self,
         commit_id: &str,
         cache: &mut DiffCommitRootValidationCache,
-    ) -> Result<Option<String>, LixError> {
+    ) -> Result<Option<CommitId>, LixError> {
         if let Some(parent_id) = cache.changelog_first_parents.get(commit_id) {
             return Ok(parent_id.clone());
         }
-        let commit_ids = [commit_id.to_string()];
+        let commit_ids = [CommitId::parse_lix(
+            commit_id,
+            "changelog first parent commit_id",
+        )?];
         let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
@@ -632,7 +642,7 @@ where
         row: &TrackedStateDiffRow,
         key: &TrackedStateKey,
     ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
-        let commit_ids = [commit_id.to_string()];
+        let commit_ids = [CommitId::parse_lix(commit_id, "merge parent commit_id")?];
         let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
@@ -645,7 +655,8 @@ where
             return Ok(None);
         };
         for parent_id in commit.parent_commit_ids.iter().skip(1) {
-            let Some(parent_root) = storage::load_root(&self.store, parent_id).await? else {
+            let Some(parent_root) = storage::load_root(&self.store, &parent_id.to_string()).await?
+            else {
                 continue;
             };
             let parent_value = self
@@ -669,7 +680,8 @@ where
         row: &TrackedStateDiffRow,
         key: &TrackedStateKey,
     ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
-        let Some(metadata) = storage::load_commit_root(&mut self.store, &row.commit_id).await?
+        let row_commit_id = row.commit_id.to_string();
+        let Some(metadata) = storage::load_commit_root(&mut self.store, &row_commit_id).await?
         else {
             return Ok(None);
         };
@@ -869,6 +881,11 @@ where
         I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
     {
         let deltas = deltas.into_iter().collect::<Vec<_>>();
+        let typed_commit_id =
+            CommitId::parse_lix(commit_id, "tracked-state commit root commit_id")?;
+        let typed_parent_commit_id = parent_commit_id
+            .map(|id| CommitId::parse_lix(id, "tracked-state parent commit_id"))
+            .transpose()?;
         let base_root = match parent_commit_id {
             Some(parent_commit_id) => {
                 let root = match self.staged_roots.get(parent_commit_id) {
@@ -939,13 +956,13 @@ where
         storage::stage_commit_root(
             self.writes,
             &TrackedStateCommitRoot {
-                commit_id: commit_id.to_string(),
+                commit_id: typed_commit_id,
                 root_id: result.root_id.clone(),
-                parent_roots: parent_commit_id
+                parent_roots: typed_parent_commit_id
                     .zip(base_root.as_ref())
                     .map(|(parent_commit_id, root_id)| {
                         vec![TrackedStateCommitRootParent {
-                            commit_id: parent_commit_id.to_string(),
+                            commit_id: parent_commit_id,
                             root_id: root_id.clone(),
                         }]
                     })
@@ -984,7 +1001,7 @@ where
         )?;
 
         Ok(TrackedStateWriteReport {
-            commit_id: commit_id.to_string(),
+            commit_id: typed_commit_id,
             root_id: result.root_id,
             changed_rows: deltas.len(),
             primary_chunk_puts: result.chunk_count,
@@ -994,7 +1011,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateWriteReport {
-    pub(crate) commit_id: String,
+    pub(crate) commit_id: CommitId,
     pub(crate) root_id: TrackedStateRootId,
     pub(crate) changed_rows: usize,
     pub(crate) primary_chunk_puts: usize,
@@ -1002,8 +1019,8 @@ pub(crate) struct TrackedStateWriteReport {
 
 fn missing_commit_root_error(commit_id: &str) -> LixError {
     LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
+        LixError::CODE_INTERNAL_ERROR,
+        format!(
             "tracked_state commit_root is missing for commit '{commit_id}'; run explicit commit_root rebuild before structural diff"
         ),
     )
@@ -1026,7 +1043,7 @@ fn tree_scan_request_from_tracked(
 
 fn validate_diff_row_against_changelog(
     row: &TrackedStateDiffRow,
-    changes: &HashMap<String, ChangeRecord>,
+    changes: &HashMap<crate::changelog::ChangeId, ChangeRecord>,
 ) -> Result<(), LixError> {
     let Some(change) = changes.get(&row.change_id) else {
         return Err(LixError::unknown(format!(
@@ -1065,10 +1082,10 @@ fn validate_diff_row_against_changelog(
 }
 
 fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecord, LixError> {
-    let snapshot_content = commit_row_snapshot_content(&commit.commit_id)?;
+    let snapshot_content = commit_row_snapshot_content(&commit.commit_id.to_string())?;
     Ok(ChangeRecord {
         format_version: 1,
-        change_id: commit.change_id.clone(),
+        change_id: commit.change_id,
         schema_key: "lix_commit".to_string(),
         entity_pk: EntityPk::single(&commit.commit_id),
         file_id: None,
@@ -1139,6 +1156,18 @@ mod tests {
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::NullableKeyFilter;
+
+    fn commit_id(label: &str) -> String {
+        CommitId::for_test_label(label).to_string()
+    }
+
+    fn commit_root_key(label: &str) -> crate::storage::StorageKey {
+        crate::storage::StorageKey(bytes::Bytes::from(commit_id(label).into_bytes()))
+    }
+
+    fn change_id(label: &str) -> String {
+        ChangeId::for_test_label(label).to_string()
+    }
 
     #[tokio::test]
     async fn stage_commit_root_requires_parent_commit_root() {
@@ -1352,7 +1381,10 @@ mod tests {
 
         assert_eq!(merge_pick_ids(&plan), vec!["entity-a"]);
         assert!(plan.picks[0].source_row().deleted);
-        assert_eq!(plan.picks[0].source_change_id(), "change-source-delete");
+        assert_eq!(
+            plan.picks[0].source_change_id(),
+            change_id("change-source-delete")
+        );
     }
 
     #[tokio::test]
@@ -1381,7 +1413,7 @@ mod tests {
             let mut writes = storage.new_write_set();
             writes.delete(
                 storage::TRACKED_STATE_COMMIT_ROOT_SPACE,
-                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"child")),
+                commit_root_key("child"),
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -1430,8 +1462,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("change-child")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("change-child"))
         );
     }
 
@@ -1476,7 +1508,7 @@ mod tests {
             for commit_id in ["middle", "child"] {
                 writes.delete(
                     storage::TRACKED_STATE_COMMIT_ROOT_SPACE,
-                    crate::storage::StorageKey(bytes::Bytes::copy_from_slice(commit_id.as_bytes())),
+                    commit_root_key(commit_id),
                 );
             }
             storage
@@ -1512,8 +1544,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("change-child")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("change-child"))
         );
     }
 
@@ -1558,7 +1590,7 @@ mod tests {
             for commit_id in ["middle", "child"] {
                 writes.delete(
                     storage::TRACKED_STATE_COMMIT_ROOT_SPACE,
-                    crate::storage::StorageKey(bytes::Bytes::copy_from_slice(commit_id.as_bytes())),
+                    commit_root_key(commit_id),
                 );
             }
             storage
@@ -1594,8 +1626,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("change-child")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("change-child"))
         );
     }
 
@@ -1639,14 +1671,17 @@ mod tests {
         }
         {
             let mut writes = storage.new_write_set();
+            let commit_a = CommitId::for_test_label("commit-a");
+            let commit_b = CommitId::for_test_label("commit-b");
+            let commit_a_text = commit_a.to_string();
             writes.put(
                 crate::changelog::COMMIT_SPACE,
-                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"commit-a")),
+                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(commit_a_text.as_bytes())),
                 crate::changelog::encode_commit_record(&crate::changelog::CommitRecord {
                     format_version: 1,
-                    commit_id: "commit-a".to_string(),
-                    parent_commit_ids: vec!["commit-b".to_string()],
-                    change_id: "commit-a:commit".to_string(),
+                    commit_id: commit_a,
+                    parent_commit_ids: vec![commit_b],
+                    change_id: ChangeId::for_test_label("commit-a:commit"),
                     author_account_ids: Vec::new(),
                     created_at: crate::common::LixTimestamp::expect_parse(
                         "created_at",
@@ -1740,8 +1775,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("change-child")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("change-child"))
         );
     }
 
@@ -1797,8 +1832,8 @@ mod tests {
             diff.entries[0]
                 .after
                 .as_ref()
-                .map(|row| row.change_id.as_str()),
-            Some("change-child")
+                .map(|row| row.change_id.to_string()),
+            Some(change_id("change-child"))
         );
     }
 
@@ -1909,9 +1944,9 @@ mod tests {
             .expect("repaired child root should scan");
         assert_eq!(
             rows.iter()
-                .map(|row| row.change_id.as_str())
+                .map(|row| row.change_id.to_string())
                 .collect::<Vec<_>>(),
-            vec!["change-base", "change-child"]
+            vec![change_id("change-base"), change_id("change-child")]
         );
     }
 
@@ -2495,7 +2530,7 @@ mod tests {
             let mut writes = storage.new_write_set();
             writes.delete(
                 storage::TRACKED_STATE_COMMIT_ROOT_SPACE,
-                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(b"child")),
+                commit_root_key("child"),
             );
             storage
                 .commit_write_set(writes, StorageWriteOptions::default())
@@ -2741,7 +2776,7 @@ mod tests {
         storage::stage_commit_root(
             &mut writes,
             &TrackedStateCommitRoot {
-                commit_id: commit_id.to_string(),
+                commit_id: CommitId::for_test_label(commit_id),
                 root_id: result.root_id,
                 parent_roots: Vec::new(),
                 changed_key_count: rows.len() as u64,
@@ -2801,8 +2836,8 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: change_id.to_string(),
-            commit_id: commit_id.to_string(),
+            change_id: ChangeId::for_test_label(change_id),
+            commit_id: CommitId::for_test_label(commit_id),
         }
     }
 }

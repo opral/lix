@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphStoreReader, ReachableCommitGraphCommit};
 use crate::storage::StorageRead;
 use crate::LixError;
@@ -12,7 +13,7 @@ use crate::LixError;
 /// detection, and nearest-depth selection.
 pub(crate) async fn walk_reachable_commits<S>(
     reader: &mut CommitGraphStoreReader<S>,
-    head_commit_id: &str,
+    head_commit_id: &CommitId,
 ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>
 where
     S: StorageRead + Send + Sync,
@@ -63,8 +64,8 @@ where
 /// a single lowest common ancestor.
 pub(crate) async fn best_common_ancestors<S>(
     reader: &mut CommitGraphStoreReader<S>,
-    left_commit_id: &str,
-    right_commit_id: &str,
+    left_commit_id: &CommitId,
+    right_commit_id: &CommitId,
 ) -> Result<Vec<CommitGraphCommit>, LixError>
 where
     S: StorageRead + Send + Sync,
@@ -73,12 +74,12 @@ where
     let right_reachable = walk_reachable_commits(reader, right_commit_id).await?;
     let right_ids = right_reachable
         .iter()
-        .map(|reachable| reachable.commit.commit_id.clone())
+        .map(|reachable| reachable.commit.commit_id)
         .collect::<BTreeSet<_>>();
     let common_ids = left_reachable
         .iter()
         .filter(|reachable| right_ids.contains(&reachable.commit.commit_id))
-        .map(|reachable| reachable.commit.commit_id.clone())
+        .map(|reachable| reachable.commit.commit_id)
         .collect::<BTreeSet<_>>();
 
     let mut best = Vec::new();
@@ -100,8 +101,8 @@ where
 
 async fn has_descendant_in_set<S>(
     reader: &mut CommitGraphStoreReader<S>,
-    commit_id: &str,
-    candidate_descendant_ids: &BTreeSet<String>,
+    commit_id: &CommitId,
+    candidate_descendant_ids: &BTreeSet<CommitId>,
 ) -> Result<bool, LixError>
 where
     S: StorageRead + Send + Sync,
@@ -113,7 +114,7 @@ where
         let reachable = walk_reachable_commits(reader, candidate_descendant_id).await?;
         if reachable
             .iter()
-            .any(|reachable| reachable.commit.commit_id == commit_id)
+            .any(|reachable| reachable.commit.commit_id == *commit_id)
         {
             return Ok(true);
         }
@@ -126,7 +127,7 @@ where
     S: StorageRead + Send + Sync,
 {
     reader: &'a mut CommitGraphStoreReader<S>,
-    loaded: BTreeMap<String, CommitGraphCommit>,
+    loaded: BTreeMap<CommitId, CommitGraphCommit>,
 }
 
 impl<'a, S> CommitTraversalLoader<'a, S>
@@ -142,13 +143,13 @@ where
 
     async fn walk_commit(
         &mut self,
-        commit_id: &str,
+        commit_id: &CommitId,
         depth: u32,
-        visiting: &mut BTreeSet<String>,
-        nearest_depths: &mut BTreeMap<String, u32>,
+        visiting: &mut BTreeSet<CommitId>,
+        nearest_depths: &mut BTreeMap<CommitId, u32>,
     ) -> Result<(), LixError> {
         let mut stack = vec![TraversalFrame {
-            commit_id: commit_id.to_string(),
+            commit_id: *commit_id,
             depth,
             expanded: false,
         }];
@@ -176,9 +177,9 @@ where
             }
 
             let commit = self.load_commit(&frame.commit_id).await?;
-            nearest_depths.insert(frame.commit_id.clone(), frame.depth);
+            nearest_depths.insert(frame.commit_id, frame.depth);
 
-            visiting.insert(frame.commit_id.clone());
+            visiting.insert(frame.commit_id);
             stack.push(TraversalFrame {
                 commit_id: frame.commit_id,
                 depth: frame.depth,
@@ -186,7 +187,7 @@ where
             });
             for parent_commit_id in commit.parent_commit_ids.iter().rev() {
                 stack.push(TraversalFrame {
-                    commit_id: parent_commit_id.clone(),
+                    commit_id: *parent_commit_id,
                     depth: frame.depth + 1,
                     expanded: false,
                 });
@@ -195,7 +196,7 @@ where
         Ok(())
     }
 
-    async fn load_commit(&mut self, commit_id: &str) -> Result<CommitGraphCommit, LixError> {
+    async fn load_commit(&mut self, commit_id: &CommitId) -> Result<CommitGraphCommit, LixError> {
         if let Some(commit) = self.loaded.get(commit_id) {
             return Ok(commit.clone());
         }
@@ -205,13 +206,13 @@ where
                 format!("commit_graph missing commit '{commit_id}'"),
             ));
         };
-        self.loaded.insert(commit_id.to_string(), commit.clone());
+        self.loaded.insert(*commit_id, commit.clone());
         Ok(commit)
     }
 }
 
 struct TraversalFrame {
-    commit_id: String,
+    commit_id: CommitId,
     depth: u32,
     expanded: bool,
 }
@@ -221,7 +222,8 @@ mod tests {
     use serde_json::json;
 
     use crate::changelog::{
-        ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitRecord,
+        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitId,
+        CommitRecord,
     };
     use crate::commit_graph::CommitGraphChange;
     use crate::commit_graph::CommitGraphContext;
@@ -231,6 +233,30 @@ mod tests {
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    fn commit_id(label: &str) -> CommitId {
+        CommitId::for_test_label(label)
+    }
+
+    fn commit_ids<const N: usize>(labels: [&str; N]) -> Vec<CommitId> {
+        labels.into_iter().map(commit_id).collect()
+    }
+
+    fn sorted_commit_ids<const N: usize>(labels: [&str; N]) -> Vec<CommitId> {
+        let mut ids = commit_ids(labels);
+        ids.sort();
+        ids
+    }
+
+    fn sorted_commit_ids_at_depth<const N: usize>(
+        labels: [&str; N],
+        depth: u32,
+    ) -> Vec<(CommitId, u32)> {
+        sorted_commit_ids(labels)
+            .into_iter()
+            .map(|id| (id, depth))
+            .collect()
     }
 
     #[tokio::test]
@@ -256,17 +282,22 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits("commit-head")
+            .reachable_commits(&commit_head)
             .await
             .expect("reachable commits should load");
 
         assert_eq!(
             commits
                 .iter()
-                .map(|reachable| (reachable.commit.commit_id.as_str(), reachable.depth))
+                .map(|reachable| (reachable.commit.commit_id.clone(), reachable.depth))
                 .collect::<Vec<_>>(),
-            vec![("commit-head", 0), ("commit-parent", 1), ("commit-root", 2)]
+            vec![
+                (commit_id("commit-head"), 0),
+                (commit_id("commit-parent"), 1),
+                (commit_id("commit-root"), 2)
+            ]
         );
     }
 
@@ -285,7 +316,9 @@ mod tests {
         .await
         .expect_err("changelog should reject missing parent");
 
-        assert!(error.message.contains("missing-parent"));
+        assert!(error
+            .message
+            .contains(&commit_id("missing-parent").to_string()));
     }
 
     #[tokio::test]
@@ -305,8 +338,9 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_a = commit_id("commit-a");
         let error = reader
-            .reachable_commits("commit-a")
+            .reachable_commits(&commit_a)
             .await
             .expect_err("walker should reject parent cycles");
 
@@ -337,22 +371,24 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits("commit-head")
+            .reachable_commits(&commit_head)
             .await
             .expect("reachable commits should load");
+        let mut expected = vec![(commit_id("commit-head"), 0)];
+        expected.extend(sorted_commit_ids_at_depth(
+            ["commit-left", "commit-right"],
+            1,
+        ));
+        expected.push((commit_id("commit-root"), 2));
 
         assert_eq!(
             commits
                 .iter()
-                .map(|reachable| (reachable.commit.commit_id.as_str(), reachable.depth))
+                .map(|reachable| (reachable.commit.commit_id.clone(), reachable.depth))
                 .collect::<Vec<_>>(),
-            vec![
-                ("commit-head", 0),
-                ("commit-left", 1),
-                ("commit-right", 1),
-                ("commit-root", 2),
-            ]
+            expected
         );
     }
 
@@ -384,17 +420,22 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits("commit-head")
+            .reachable_commits(&commit_head)
             .await
             .expect("reachable commits should load");
 
         assert_eq!(
             commits
                 .iter()
-                .map(|reachable| (reachable.commit.commit_id.as_str(), reachable.depth))
+                .map(|reachable| (reachable.commit.commit_id.clone(), reachable.depth))
                 .collect::<Vec<_>>(),
-            vec![("commit-head", 0), ("commit-parent", 1), ("commit-root", 1)]
+            vec![
+                (commit_id("commit-head"), 0),
+                (commit_id("commit-parent"), 1),
+                (commit_id("commit-root"), 1)
+            ]
         );
     }
 
@@ -421,17 +462,20 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let commits = reader
-            .reachable_commits("commit-head")
+            .reachable_commits(&commit_head)
             .await
             .expect("reachable commits should load");
+        let mut expected = vec![(commit_id("commit-head"), 0)];
+        expected.extend(sorted_commit_ids_at_depth(["commit-z", "commit-a"], 1));
 
         assert_eq!(
             commits
                 .iter()
-                .map(|reachable| (reachable.commit.commit_id.as_str(), reachable.depth))
+                .map(|reachable| (reachable.commit.commit_id.clone(), reachable.depth))
                 .collect::<Vec<_>>(),
-            vec![("commit-head", 0), ("commit-a", 1), ("commit-z", 1)]
+            expected
         );
     }
 
@@ -443,13 +487,14 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let missing_head = commit_id("missing-head");
 
         let error = reader
-            .reachable_commits("missing-head")
+            .reachable_commits(&missing_head)
             .await
             .expect_err("missing head should fail");
 
-        assert!(error.message.contains("missing-head"));
+        assert!(error.message.contains(&missing_head.to_string()));
     }
 
     #[tokio::test]
@@ -471,17 +516,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_c = commit_id("commit-c");
+        let commit_d = commit_id("commit-d");
         let ancestors = reader
-            .best_common_ancestors("commit-c", "commit-d")
+            .best_common_ancestors(&commit_c, &commit_d)
             .await
             .expect("best common ancestors should load");
 
         assert_eq!(
             ancestors
                 .iter()
-                .map(|commit| commit.commit_id.as_str())
+                .map(|commit| commit.commit_id.clone())
                 .collect::<Vec<_>>(),
-            vec!["commit-b"]
+            commit_ids(["commit-b"])
         );
     }
 
@@ -515,17 +562,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_left_head = commit_id("commit-left-head");
+        let commit_right_head = commit_id("commit-right-head");
         let ancestors = reader
-            .best_common_ancestors("commit-left-head", "commit-right-head")
+            .best_common_ancestors(&commit_left_head, &commit_right_head)
             .await
             .expect("best common ancestors should load");
 
         assert_eq!(
             ancestors
                 .iter()
-                .map(|commit| commit.commit_id.as_str())
+                .map(|commit| commit.commit_id.clone())
                 .collect::<Vec<_>>(),
-            vec!["commit-root"]
+            commit_ids(["commit-root"])
         );
     }
 
@@ -547,17 +596,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_b = commit_id("commit-b");
+        let commit_c = commit_id("commit-c");
         let ancestors = reader
-            .best_common_ancestors("commit-b", "commit-c")
+            .best_common_ancestors(&commit_b, &commit_c)
             .await
             .expect("best common ancestors should load");
 
         assert_eq!(
             ancestors
                 .iter()
-                .map(|commit| commit.commit_id.as_str())
+                .map(|commit| commit.commit_id.clone())
                 .collect::<Vec<_>>(),
-            vec!["commit-b"]
+            commit_ids(["commit-b"])
         );
     }
 
@@ -591,17 +642,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head_left = commit_id("commit-head-left");
+        let commit_head_right = commit_id("commit-head-right");
         let ancestors = reader
-            .best_common_ancestors("commit-head-left", "commit-head-right")
+            .best_common_ancestors(&commit_head_left, &commit_head_right)
             .await
             .expect("best common ancestors should load");
 
         assert_eq!(
             ancestors
                 .iter()
-                .map(|commit| commit.commit_id.as_str())
+                .map(|commit| commit.commit_id.clone())
                 .collect::<Vec<_>>(),
-            vec!["commit-left", "commit-right"]
+            sorted_commit_ids(["commit-left", "commit-right"])
         );
     }
 
@@ -624,12 +677,14 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_c = commit_id("commit-c");
+        let commit_d = commit_id("commit-d");
         let base = reader
-            .merge_base("commit-c", "commit-d")
+            .merge_base(&commit_c, &commit_d)
             .await
             .expect("single merge base should resolve");
 
-        assert_eq!(base.commit_id, "commit-b");
+        assert_eq!(base.commit_id, commit_id("commit-b"));
     }
 
     #[tokio::test]
@@ -649,8 +704,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_left = commit_id("commit-left");
+        let commit_right = commit_id("commit-right");
         let error = reader
-            .merge_base("commit-left", "commit-right")
+            .merge_base(&commit_left, &commit_right)
             .await
             .expect_err("unrelated histories should not have a merge base");
 
@@ -687,8 +744,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head_left = commit_id("commit-head-left");
+        let commit_head_right = commit_id("commit-head-right");
         let error = reader
-            .merge_base("commit-head-left", "commit-head-right")
+            .merge_base(&commit_head_left, &commit_head_right)
             .await
             .expect_err("ambiguous best common ancestors should fail");
 
@@ -698,28 +757,31 @@ mod tests {
                 .details
                 .as_ref()
                 .and_then(|details| details.get("left_commit_id")),
-            Some(&json!("commit-head-left"))
+            Some(&json!(commit_id("commit-head-left").to_string()))
         );
         assert_eq!(
             error
                 .details
                 .as_ref()
                 .and_then(|details| details.get("right_commit_id")),
-            Some(&json!("commit-head-right"))
+            Some(&json!(commit_id("commit-head-right").to_string()))
         );
         assert_eq!(
             error
                 .details
                 .as_ref()
                 .and_then(|details| details.get("candidates")),
-            Some(&json!(["commit-left", "commit-right"]))
+            Some(&json!(sorted_commit_ids(["commit-left", "commit-right"])
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()))
         );
     }
 
     #[derive(Clone)]
     struct TestCommitChange {
         change: CommitGraphChange,
-        parent_commit_ids: Vec<String>,
+        parent_commit_ids: Vec<CommitId>,
     }
 
     async fn append_changes(storage: &StorageContext, changes: &[TestCommitChange]) {
@@ -746,14 +808,14 @@ mod tests {
                 .to_string();
             append.commits.push(CommitRecord {
                 format_version: 1,
-                commit_id: commit_id.clone(),
-                parent_commit_ids: change.parent_commit_ids.clone(),
-                change_id: change.change.id.clone(),
+                commit_id: CommitId::for_test_label(&commit_id),
+                parent_commit_ids: change.parent_commit_ids.iter().copied().collect(),
+                change_id: change.change.id,
                 author_account_ids: Vec::new(),
                 created_at: change.change.created_at,
             });
             append.commit_change_refs.push(CommitChangeRefSet {
-                commit_id: commit_id.clone(),
+                commit_id: CommitId::for_test_label(&commit_id),
                 entries: Vec::new(),
             });
         }
@@ -776,7 +838,7 @@ mod tests {
         let _ = change_ids;
         TestCommitChange {
             change: CommitGraphChange {
-                id: change_id.to_string(),
+                id: ChangeId::for_test_label(change_id),
                 entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
@@ -784,7 +846,10 @@ mod tests {
                 metadata_ref: None,
                 created_at: ts("2026-01-01T00:00:00Z"),
             },
-            parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
+            parent_commit_ids: parent_commit_ids
+                .iter()
+                .map(|id| CommitId::for_test_label(id))
+                .collect(),
         }
     }
 }

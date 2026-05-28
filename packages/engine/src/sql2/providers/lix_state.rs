@@ -1520,8 +1520,16 @@ fn lix_state_record_batch(
                 "global" => Arc::new(BooleanArray::from(
                     rows.iter().map(|row| row.global).collect::<Vec<_>>(),
                 )) as ArrayRef,
-                "change_id" => string_array(rows.iter().map(|row| row.change_id.as_deref())),
-                "commit_id" => string_array(rows.iter().map(|row| row.commit_id.as_deref())),
+                "change_id" => Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| row.change_id.map(|id| id.to_string()))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                "commit_id" => Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| row.commit_id.map(|id| id.to_string()))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
                 "untracked" => Arc::new(BooleanArray::from(
                     rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
                 )) as ArrayRef,
@@ -1530,7 +1538,7 @@ fn lix_state_record_batch(
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("sql2 does not support lix_state column '{other}'"),
-                    ))
+                    ));
                 }
             })
         })
@@ -1580,6 +1588,7 @@ mod tests {
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::{BranchHead, BranchRefReader};
+    use crate::changelog::{ChangeId, CommitId};
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -1797,11 +1806,16 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<CommitId>, LixError> {
             if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{branch_id}")))
+            Ok(Some(CommitId::for_test_label(&format!(
+                "commit-{branch_id}"
+            ))))
         }
 
         async fn stage_write(
@@ -1840,11 +1854,16 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<CommitId>, LixError> {
             if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{branch_id}")))
+            Ok(Some(CommitId::for_test_label(&format!(
+                "commit-{branch_id}"
+            ))))
         }
 
         async fn stage_write(
@@ -1929,8 +1948,8 @@ mod tests {
             metadata: metadata.map(str::to_string),
             deleted: false,
             branch_id: "branch-a".to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

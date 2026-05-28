@@ -77,7 +77,7 @@ where
         None => None,
     };
     Ok(MaterializedChange {
-        id: change.id,
+        id: change.id.to_string(),
         entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,

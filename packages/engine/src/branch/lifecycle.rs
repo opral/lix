@@ -1,3 +1,4 @@
+use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::common::validate_non_empty_identity_value;
 use crate::LixError;
@@ -67,15 +68,23 @@ impl<'a> BranchLifecycle<'a> {
 
     pub(crate) async fn require_existing_commit(
         commit_graph: &mut dyn CommitGraphReader,
-        commit_id: &str,
+        commit_id: CommitId,
         operation: BranchOperation,
         role: BranchReferenceRole,
     ) -> Result<CommitGraphCommit, LixError> {
-        require_non_empty_public_id("commit_id", commit_id, operation, role)?;
         commit_graph
-            .load_commit(commit_id)
+            .load_commit(&commit_id)
             .await?
             .ok_or_else(|| LixError::commit_not_found(commit_id, operation.label(), role.label()))
+    }
+
+    pub(crate) fn parse_commit_id(
+        commit_id: &str,
+        operation: BranchOperation,
+        role: BranchReferenceRole,
+    ) -> Result<CommitId, LixError> {
+        require_non_empty_public_id("commit_id", commit_id, operation, role)?;
+        CommitId::parse_lix(commit_id, "branch lifecycle commit_id")
     }
 
     pub(crate) async fn require_existing_ref(
@@ -94,7 +103,7 @@ impl<'a> BranchLifecycle<'a> {
         branch_id: &str,
         operation: BranchOperation,
         role: BranchReferenceRole,
-    ) -> Result<String, LixError> {
+    ) -> Result<CommitId, LixError> {
         Ok(self
             .require_existing_ref(branch_id, operation, role)
             .await?
@@ -139,12 +148,13 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::changelog::CommitId;
 
     #[tokio::test]
     async fn require_existing_ref_returns_head() {
         let reader = RowsBranchRefReader::new(vec![BranchHead {
             branch_id: "branch-a".to_string(),
-            commit_id: "commit-a".to_string(),
+            commit_id: CommitId::for_test_label("commit-a"),
         }]);
         let lifecycle = BranchLifecycle::new(&reader);
 

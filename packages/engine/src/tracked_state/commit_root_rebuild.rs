@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::changelog::{
-    ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitChangeRef, CommitLoadEntry,
-    CommitLoadRequest, CommitProjection, CommitRecord,
+    ChangeId, ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitChangeRef, CommitId,
+    CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -27,8 +27,8 @@ pub(crate) struct CommitRootRebuildDelta {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
-    pub(crate) change_id: String,
-    pub(crate) commit_id: String,
+    pub(crate) change_id: ChangeId,
+    pub(crate) commit_id: CommitId,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: LixTimestamp,
@@ -94,7 +94,7 @@ where
         let Some(parent_commit_id) = parent_commit_id else {
             break;
         };
-        current_commit_id = parent_commit_id;
+        current_commit_id = parent_commit_id.to_string();
         force_current = false;
     }
     Ok(plans)
@@ -159,13 +159,15 @@ where
     S: StorageRead + Send + Sync + ?Sized,
 {
     let plan = load_commit_root_rebuild_plan(store, commit_id).await?;
-    if let Some(parent_commit_id) = plan.parent_commit_id.as_deref() {
-        let Some(parent_root_id) = load_available_root(store, parent_commit_id, seen).await? else {
+    if let Some(parent_commit_id) = plan.parent_commit_id.as_ref() {
+        let parent_commit_id_text = parent_commit_id.to_string();
+        let Some(parent_root_id) = load_available_root(store, &parent_commit_id_text, seen).await?
+        else {
             return Ok(false);
         };
         match metadata.parent_roots.first() {
             Some(parent)
-                if parent.commit_id == parent_commit_id && parent.root_id == parent_root_id => {}
+                if parent.commit_id == *parent_commit_id && parent.root_id == parent_root_id => {}
             _ => return Ok(false),
         }
     } else if !metadata.parent_roots.is_empty() {
@@ -180,8 +182,8 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitRootRebuildPlan {
-    commit_id: String,
-    parent_commit_id: Option<String>,
+    commit_id: CommitId,
+    parent_commit_id: Option<CommitId>,
     deltas: Vec<CommitRootRebuildDelta>,
 }
 
@@ -193,7 +195,10 @@ where
     S: StorageRead + Send + Sync + ?Sized,
 {
     let mut reader = ChangelogContext::new().reader(store);
-    let commit_ids = [commit_id.to_string()];
+    let commit_ids = [CommitId::parse_lix(
+        commit_id,
+        "commit-root rebuild commit_id",
+    )?];
     let batch = reader
         .load_commits(CommitLoadRequest {
             commit_ids: &commit_ids,
@@ -221,12 +226,12 @@ where
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "changelog returned a partial commit load for commit-root rebuild",
-            ))
+            ));
         }
     };
     let change_ids = change_refs
         .iter()
-        .map(|entry| entry.change_id.clone())
+        .map(|entry| entry.change_id)
         .collect::<Vec<_>>();
     let changes = reader
         .load_changes(ChangeLoadRequest {
@@ -252,7 +257,7 @@ where
     deltas.push(rebuild_delta_from_commit_record(&commit)?);
 
     Ok(CommitRootRebuildPlan {
-        commit_id: commit.commit_id.clone(),
+        commit_id: commit.commit_id,
         parent_commit_id: first_parent_commit_id(&commit),
         deltas,
     })
@@ -272,8 +277,8 @@ where
             schema_key: &delta.schema_key,
             file_id: delta.file_id.as_deref(),
             entity_pk: &delta.entity_pk,
-            change_id: &delta.change_id,
-            commit_id: &delta.commit_id,
+            change_id: delta.change_id,
+            commit_id: delta.commit_id,
             snapshot_ref: delta.snapshot_ref.as_ref(),
             metadata_ref: delta.metadata_ref.as_ref(),
             deleted: delta.snapshot_ref.is_none(),
@@ -281,25 +286,27 @@ where
             updated_at: delta.updated_at,
         })
         .collect::<Vec<_>>();
+    let commit_id = plan.commit_id.to_string();
+    let parent_commit_id = plan.parent_commit_id.map(|commit_id| commit_id.to_string());
     writer
-        .stage_commit_root(&plan.commit_id, plan.parent_commit_id.as_deref(), deltas)
+        .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
         .await
 }
 
-fn first_parent_commit_id(commit: &CommitRecord) -> Option<String> {
-    commit.parent_commit_ids.first().cloned()
+fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
+    commit.parent_commit_ids.first().copied()
 }
 
 fn rebuild_delta_from_commit_record(
     commit: &CommitRecord,
 ) -> Result<CommitRootRebuildDelta, LixError> {
-    let snapshot_content = commit_row_snapshot_content(&commit.commit_id)?;
+    let snapshot_content = commit_row_snapshot_content(&commit.commit_id.to_string())?;
     Ok(CommitRootRebuildDelta {
         schema_key: "lix_commit".to_string(),
         file_id: None,
         entity_pk: EntityPk::single(&commit.commit_id),
-        change_id: commit.change_id.clone(),
-        commit_id: commit.commit_id.clone(),
+        change_id: commit.change_id,
+        commit_id: commit.commit_id,
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
         metadata_ref: None,
         created_at: commit.created_at,
@@ -350,7 +357,7 @@ fn rebuild_delta_from_change_ref(
         file_id: change.file_id,
         entity_pk: change.entity_pk,
         change_id: change.change_id,
-        commit_id: commit_id.to_string(),
+        commit_id: CommitId::parse_lix(commit_id, "commit-root rebuild delta commit_id")?,
         snapshot_ref: change.snapshot_ref,
         metadata_ref: change.metadata_ref,
         created_at: change.created_at,
