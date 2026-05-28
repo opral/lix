@@ -248,11 +248,15 @@ impl TableProvider for EntityProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
+        let primary_key_analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
+        let row_filter_analyzer = EntityRowFilterAnalyzer::new(&self.spec);
         Ok(filters
             .iter()
             .map(|filter| {
-                if ExactBranchIdFilterAnalyzer.supports(filter) || analyzer.supports(filter) {
+                if ExactBranchIdFilterAnalyzer.supports(filter)
+                    || primary_key_analyzer.supports(filter)
+                    || row_filter_analyzer.supports(filter)
+                {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -269,11 +273,13 @@ impl TableProvider for EntityProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
+        let row_filters = EntityRowFilterAnalyzer::new(&self.spec).analyze_filters(filters)?;
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             self.branch_binding.active_branch_id(),
             Some(projected_schema.as_ref()),
-            limit,
+            if row_filters.is_empty() { limit } else { None },
+            !row_filters.is_empty(),
         );
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
@@ -290,6 +296,7 @@ impl TableProvider for EntityProvider {
             Arc::clone(&self.live_state),
             projected_schema,
             request,
+            row_filters,
         )))
     }
 
@@ -382,6 +389,10 @@ fn apply_exact_branch_id_filter(
 
 struct EntityPrimaryKeyFilterAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
+}
+
+struct EntityRowFilterAnalyzer<'a> {
+    spec: &'a EntitySurfaceSpec,
 }
 
 struct ExactBranchIdFilterAnalyzer;
@@ -571,6 +582,222 @@ impl EntityPkConstraint {
     }
 }
 
+impl<'a> EntityRowFilterAnalyzer<'a> {
+    fn new(spec: &'a EntitySurfaceSpec) -> Self {
+        Self { spec }
+    }
+
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr).is_some()
+    }
+
+    fn analyze_filters(&self, filters: &[Expr]) -> Result<Vec<EntityRowFilter>> {
+        Ok(filters
+            .iter()
+            .filter_map(|filter| self.analyze(filter))
+            .collect())
+    }
+
+    fn analyze(&self, expr: &Expr) -> Option<EntityRowFilter> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                let left = self.analyze(&binary_expr.left)?;
+                let right = self.analyze(&binary_expr.right)?;
+                Some(EntityRowFilter::And(Box::new(left), Box::new(right)))
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                let left = self.analyze(&binary_expr.left)?;
+                let right = self.analyze(&binary_expr.right)?;
+                Some(EntityRowFilter::Or(Box::new(left), Box::new(right)))
+            }
+            Expr::BinaryExpr(binary_expr) => self.analyze_binary(binary_expr),
+            Expr::InList(in_list) => self.analyze_in_list(in_list),
+            _ => None,
+        }
+    }
+
+    fn analyze_binary(&self, binary_expr: &BinaryExpr) -> Option<EntityRowFilter> {
+        if binary_expr.op != Operator::Eq {
+            return None;
+        }
+        self.analyze_column_literal(&binary_expr.left, &binary_expr.right)
+            .or_else(|| self.analyze_column_literal(&binary_expr.right, &binary_expr.left))
+    }
+
+    fn analyze_in_list(&self, in_list: &InList) -> Option<EntityRowFilter> {
+        if in_list.negated {
+            return None;
+        }
+        let Expr::Column(column) = in_list.expr.as_ref() else {
+            return None;
+        };
+        let column_name = self.filterable_column_name(&column.name)?;
+        let values = in_list
+            .list
+            .iter()
+            .map(entity_filter_value_literal)
+            .collect::<Option<Vec<_>>>()?;
+        if values.is_empty() {
+            return None;
+        }
+        Some(EntityRowFilter::ColumnIn {
+            column: column_name.to_string(),
+            column_type: self
+                .spec
+                .visible_column(column_name)
+                .expect("filterable column should exist")
+                .column_type,
+            values,
+        })
+    }
+
+    fn analyze_column_literal(
+        &self,
+        column_expr: &Expr,
+        literal_expr: &Expr,
+    ) -> Option<EntityRowFilter> {
+        let Expr::Column(column) = column_expr else {
+            return None;
+        };
+        let column_name = self.filterable_column_name(&column.name)?;
+        Some(EntityRowFilter::ColumnEq {
+            column: column_name.to_string(),
+            column_type: self
+                .spec
+                .visible_column(column_name)
+                .expect("filterable column should exist")
+                .column_type,
+            value: entity_filter_value_literal(literal_expr)?,
+        })
+    }
+
+    fn filterable_column_name(&self, column_name: &str) -> Option<&str> {
+        let column = self.spec.visible_column(column_name)?;
+        match column.column_type {
+            EntityColumnType::String
+            | EntityColumnType::Boolean
+            | EntityColumnType::Integer
+            | EntityColumnType::Number => Some(column.name.as_str()),
+            EntityColumnType::Json => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum EntityFilterValue {
+    Boolean(bool),
+    Integer(i64),
+    Number(f64),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum EntityRowFilter {
+    ColumnEq {
+        column: String,
+        column_type: EntityColumnType,
+        value: EntityFilterValue,
+    },
+    ColumnIn {
+        column: String,
+        column_type: EntityColumnType,
+        values: Vec<EntityFilterValue>,
+    },
+    And(Box<EntityRowFilter>, Box<EntityRowFilter>),
+    Or(Box<EntityRowFilter>, Box<EntityRowFilter>),
+}
+
+impl EntityRowFilter {
+    fn matches_snapshot(&self, snapshot: Option<&JsonValue>) -> bool {
+        match self {
+            Self::ColumnEq {
+                column,
+                column_type,
+                value,
+            } => entity_snapshot_value(snapshot, column, *column_type)
+                .is_some_and(|actual| entity_filter_values_equal(&actual, value, *column_type)),
+            Self::ColumnIn {
+                column,
+                column_type,
+                values,
+            } => entity_snapshot_value(snapshot, column, *column_type).is_some_and(|actual| {
+                values
+                    .iter()
+                    .any(|expected| entity_filter_values_equal(&actual, expected, *column_type))
+            }),
+            Self::And(left, right) => {
+                left.matches_snapshot(snapshot) && right.matches_snapshot(snapshot)
+            }
+            Self::Or(left, right) => {
+                left.matches_snapshot(snapshot) || right.matches_snapshot(snapshot)
+            }
+        }
+    }
+}
+
+fn entity_filter_value_literal(expr: &Expr) -> Option<EntityFilterValue> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Boolean(Some(value)) => Some(EntityFilterValue::Boolean(*value)),
+        ScalarValue::Int8(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Int16(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Int32(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::Int64(Some(value)) => Some(EntityFilterValue::Integer(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::UInt16(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::UInt32(Some(value)) => Some(EntityFilterValue::Integer(i64::from(*value))),
+        ScalarValue::UInt64(Some(value)) => {
+            i64::try_from(*value).ok().map(EntityFilterValue::Integer)
+        }
+        ScalarValue::Float32(Some(value)) => Some(EntityFilterValue::Number(f64::from(*value))),
+        ScalarValue::Float64(Some(value)) => Some(EntityFilterValue::Number(*value)),
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(EntityFilterValue::String(value.clone())),
+        _ => None,
+    }
+}
+
+fn entity_snapshot_value(
+    snapshot: Option<&JsonValue>,
+    column: &str,
+    column_type: EntityColumnType,
+) -> Option<EntityFilterValue> {
+    let value = snapshot?.get(column)?;
+    match column_type {
+        EntityColumnType::String => match value {
+            JsonValue::String(value) => Some(EntityFilterValue::String(value.clone())),
+            _ => None,
+        },
+        EntityColumnType::Integer => entity_i64_value(Some(value)).map(EntityFilterValue::Integer),
+        EntityColumnType::Number => entity_f64_value(Some(value)).map(EntityFilterValue::Number),
+        EntityColumnType::Boolean => value.as_bool().map(EntityFilterValue::Boolean),
+        EntityColumnType::Json => None,
+    }
+}
+
+fn entity_filter_values_equal(
+    actual: &EntityFilterValue,
+    expected: &EntityFilterValue,
+    column_type: EntityColumnType,
+) -> bool {
+    match (column_type, actual, expected) {
+        (
+            EntityColumnType::Number,
+            EntityFilterValue::Number(actual),
+            EntityFilterValue::Integer(expected),
+        ) => *actual == *expected as f64,
+        (
+            EntityColumnType::Number,
+            EntityFilterValue::Integer(actual),
+            EntityFilterValue::Number(expected),
+        ) => *actual as f64 == *expected,
+        _ => actual == expected,
+    }
+}
+
 fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
     spec.primary_key_paths
         .iter()
@@ -729,6 +956,7 @@ struct EntityScanExec {
     live_state: Arc<dyn LiveStateReader>,
     schema: SchemaRef,
     request: LiveStateScanRequest,
+    row_filters: Vec<EntityRowFilter>,
     properties: Arc<PlanProperties>,
 }
 
@@ -746,6 +974,7 @@ impl EntityScanExec {
         live_state: Arc<dyn LiveStateReader>,
         schema: SchemaRef,
         request: LiveStateScanRequest,
+        row_filters: Vec<EntityRowFilter>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -758,6 +987,7 @@ impl EntityScanExec {
             live_state,
             schema,
             request,
+            row_filters,
             properties: Arc::new(properties),
         }
     }
@@ -822,12 +1052,14 @@ impl ExecutionPlan for EntityScanExec {
         let live_state = Arc::clone(&self.live_state);
         let schema = Arc::clone(&self.schema);
         let request = self.request.clone();
+        let row_filters = self.row_filters.clone();
         let stream_schema = Arc::clone(&schema);
         let stream = stream::once(async move {
-            let rows = live_state
+            let mut rows = live_state
                 .scan_rows(&request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
+            apply_entity_row_filters(&mut rows, &row_filters)?;
             let batch = entity_record_batch(&spec, Arc::clone(&stream_schema), &rows)?;
             Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
                 batch,
@@ -839,11 +1071,44 @@ impl ExecutionPlan for EntityScanExec {
     }
 }
 
+fn apply_entity_row_filters(
+    rows: &mut Vec<MaterializedLiveStateRow>,
+    filters: &[EntityRowFilter],
+) -> Result<()> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    let mut filtered_rows = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+            DataFusionError::External(Box::new(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
+                    row.schema_key, row.entity_pk
+                ),
+            )))
+        })?;
+        if filters
+            .iter()
+            .all(|filter| filter.matches_snapshot(Some(&snapshot)))
+        {
+            filtered_rows.push(row);
+        }
+    }
+    *rows = filtered_rows;
+    Ok(())
+}
+
 fn entity_live_state_scan_request(
     schema_key: &str,
     active_branch_id: Option<&str>,
     projected_schema: Option<&Schema>,
     limit: Option<usize>,
+    force_snapshot_content: bool,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
         filter: LiveStateFilter {
@@ -853,20 +1118,24 @@ fn entity_live_state_scan_request(
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
-        projection: entity_live_state_projection(projected_schema),
+        projection: entity_live_state_projection(projected_schema, force_snapshot_content),
         limit,
     }
 }
 
-fn entity_live_state_projection(projected_schema: Option<&Schema>) -> LiveStateProjection {
+fn entity_live_state_projection(
+    projected_schema: Option<&Schema>,
+    force_snapshot_content: bool,
+) -> LiveStateProjection {
     let Some(schema) = projected_schema else {
         return LiveStateProjection::default();
     };
     let mut columns = projection_column_names(schema);
-    if schema
-        .fields()
-        .iter()
-        .any(|field| !field.name().starts_with("lixcol_"))
+    if (force_snapshot_content
+        || schema
+            .fields()
+            .iter()
+            .any(|field| !field.name().starts_with("lixcol_")))
         && !columns.iter().any(|column| column == "snapshot_content")
     {
         columns.push("snapshot_content".to_string());
@@ -1083,8 +1352,10 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::arrow::array::{Float64Array, Int64Array};
     use datafusion::common::{Column, ScalarValue};
+    use datafusion::datasource::TableProvider;
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use datafusion::prelude::SessionContext;
     use serde_json::json;
 
     use super::entity_record_batch;
@@ -1165,6 +1436,24 @@ mod tests {
                     "body": { "type": "string" }
                 },
                 "required": ["id", "body"]
+            }))
+            .expect("schema should derive entity surface spec"),
+        )
+    }
+
+    fn filter_pushdown_spec() -> Arc<super::EntitySurfaceSpec> {
+        Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "pushdown_note",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "score": { "type": "number" },
+                    "meta": { "type": "object" }
+                },
+                "required": ["id", "kind", "score"]
             }))
             .expect("schema should derive entity surface spec"),
         )
@@ -1480,5 +1769,120 @@ mod tests {
             .expect("ignored filters should analyze")
             .unwrap_or_default()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn payload_filter_scan_forces_snapshot_and_removes_pushed_limit() {
+        let spec = filter_pushdown_spec();
+        let provider = super::EntityProvider::by_branch(
+            Arc::clone(&spec),
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+        );
+        let ctx = SessionContext::new();
+        let entity_pk_index = provider
+            .schema
+            .index_of("lixcol_entity_pk")
+            .expect("system entity-pk column should exist");
+        let projection = vec![entity_pk_index];
+
+        let plan = provider
+            .scan(
+                &ctx.state(),
+                Some(&projection),
+                &[eq_filter("kind", "todo")],
+                Some(5),
+            )
+            .await
+            .expect("scan should plan");
+        let exec = plan
+            .as_any()
+            .downcast_ref::<super::EntityScanExec>()
+            .expect("entity provider should produce EntityScanExec");
+
+        assert_eq!(exec.request.limit, None);
+        assert!(
+            exec.request
+                .projection
+                .columns
+                .iter()
+                .any(|column| column == "snapshot_content"),
+            "filter-only payload column should force snapshot_content projection: {:?}",
+            exec.request.projection.columns
+        );
+        assert_eq!(
+            exec.row_filters,
+            vec![super::EntityRowFilter::ColumnEq {
+                column: "kind".to_string(),
+                column_type: EntityColumnType::String,
+                value: super::EntityFilterValue::String("todo".to_string()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_payload_filter_keeps_limit_and_no_snapshot_projection() {
+        let spec = filter_pushdown_spec();
+        let provider = super::EntityProvider::by_branch(
+            Arc::clone(&spec),
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_branch_ref(),
+        );
+        let ctx = SessionContext::new();
+        let entity_pk_index = provider
+            .schema
+            .index_of("lixcol_entity_pk")
+            .expect("system entity-pk column should exist");
+        let projection = vec![entity_pk_index];
+        let range_filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column("score")),
+            Operator::Gt,
+            Box::new(Expr::Literal(ScalarValue::Float64(Some(5.0)), None)),
+        ));
+
+        let plan = provider
+            .scan(&ctx.state(), Some(&projection), &[range_filter], Some(5))
+            .await
+            .expect("scan should plan");
+        let exec = plan
+            .as_any()
+            .downcast_ref::<super::EntityScanExec>()
+            .expect("entity provider should produce EntityScanExec");
+
+        assert_eq!(exec.request.limit, Some(5));
+        assert!(
+            !exec
+                .request
+                .projection
+                .columns
+                .iter()
+                .any(|column| column == "snapshot_content"),
+            "unsupported payload filter should remain residual and not change projection: {:?}",
+            exec.request.projection.columns
+        );
+        assert!(exec.row_filters.is_empty());
+    }
+
+    #[test]
+    fn payload_row_filter_invalid_snapshot_errors() {
+        let mut rows = vec![MaterializedLiveStateRow {
+            snapshot_content: Some("{not-json".to_string()),
+            ..live_row()
+        }];
+        let filters = vec![super::EntityRowFilter::ColumnEq {
+            column: "body".to_string(),
+            column_type: EntityColumnType::String,
+            value: super::EntityFilterValue::String("hello".to_string()),
+        }];
+
+        let error = super::apply_entity_row_filters(&mut rows, &filters)
+            .expect_err("invalid snapshot_content should surface as an error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not parse snapshot_content"),
+            "error should explain invalid snapshot_content: {error}"
+        );
     }
 }
