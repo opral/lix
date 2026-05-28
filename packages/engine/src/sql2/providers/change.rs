@@ -320,7 +320,7 @@ fn commit_record_canonical_change(
             snapshot_content.as_bytes(),
         )),
         metadata_ref: None,
-        created_at: commit.created_at.clone(),
+        created_at: commit.created_at,
     }
 }
 

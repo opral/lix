@@ -1,6 +1,6 @@
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
-use crate::storage_codec::{compact_pair, compact_pair_left, compact_pair_right, Either};
 use crate::NullableKeyFilter;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
@@ -64,8 +64,8 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     pub(crate) metadata_ref: Option<&'a JsonRef>,
     pub(crate) deleted: bool,
-    pub(crate) created_at: &'a str,
-    pub(crate) updated_at: &'a str,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 /// Value stored in tracked-state commit-root trees.
@@ -79,23 +79,17 @@ pub(crate) struct TrackedStateIndexValue {
     pub(crate) snapshot_ref: Option<JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_updated_at: Either<String, (String, String)>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 impl TrackedStateIndexValue {
-    pub(crate) fn created_updated_at(
-        created_at: String,
-        updated_at: String,
-    ) -> Either<String, (String, String)> {
-        compact_pair(created_at, updated_at)
+    pub(crate) fn created_at(&self) -> LixTimestamp {
+        self.created_at
     }
 
-    pub(crate) fn created_at(&self) -> &str {
-        compact_pair_left(&self.created_updated_at).as_str()
-    }
-
-    pub(crate) fn updated_at(&self) -> &str {
-        compact_pair_right(&self.created_updated_at).as_str()
+    pub(crate) fn updated_at(&self) -> LixTimestamp {
+        self.updated_at
     }
 }
 
@@ -110,16 +104,8 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) snapshot_ref: Option<JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_updated_at: Either<&'a str, (&'a str, &'a str)>,
-}
-
-impl<'a> TrackedStateIndexValueRef<'a> {
-    pub(crate) fn created_updated_at(
-        created_at: &'a str,
-        updated_at: &'a str,
-    ) -> Either<&'a str, (&'a str, &'a str)> {
-        compact_pair(created_at, updated_at)
-    }
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 /// Durable tracked-state root metadata for one commit.

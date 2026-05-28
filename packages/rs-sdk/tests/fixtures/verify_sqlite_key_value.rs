@@ -19,9 +19,10 @@ async fn main() {
         .and_then(|value| value.into_string().ok())
         .expect("usage: verify_sqlite_key_value <path> <key> <value>");
 
-    let lix = open_lix_with_backend(SqliteBackend::open(&path).expect("sqlite backend should open"))
-        .await
-        .expect("lix should open on sqlite backend");
+    let lix =
+        open_lix_with_backend(SqliteBackend::open(&path).expect("sqlite backend should open"))
+            .await
+            .expect("lix should open on sqlite backend");
     let result = lix
         .execute(
             "SELECT value FROM lix_key_value WHERE key = $1",

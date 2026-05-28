@@ -368,10 +368,11 @@ impl TransactionWriteBuffer {
             )
         })?;
         let change_refs = guard.entry(branch_id).or_insert_with(|| {
+            let timestamp = functions.timestamp();
             StagedCommitChangeRefs::new(
                 functions.uuid_v7(),
                 functions.uuid_v7(),
-                functions.timestamp(),
+                crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
         change_refs.allow_empty();
@@ -806,10 +807,11 @@ fn add_row_to_commit_change_refs(
     let change_refs = change_refs_by_branch
         .entry(row.branch_id.clone())
         .or_insert_with(|| {
+            let timestamp = functions.timestamp();
             StagedCommitChangeRefs::new(
                 functions.uuid_v7(),
                 functions.uuid_v7(),
-                functions.timestamp(),
+                crate::common::LixTimestamp::expect_parse("created_at", &timestamp),
             )
         });
     row.commit_id = Some(change_refs.commit_id.clone());
@@ -1376,7 +1378,10 @@ mod tests {
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.commit_id, "test-uuid-1");
         assert_eq!(change_refs.commit_change_id, "test-uuid-2");
-        assert_eq!(change_refs.created_at, "test-timestamp-1");
+        assert_eq!(
+            change_refs.created_at.to_string(),
+            "2026-01-01T00:00:00.001Z"
+        );
     }
 
     #[tokio::test]
@@ -1426,7 +1431,7 @@ mod tests {
 
         fn timestamp(&mut self) -> String {
             self.timestamp_count += 1;
-            format!("test-timestamp-{}", self.timestamp_count)
+            format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count)
         }
     }
 
@@ -1445,8 +1450,14 @@ mod tests {
             snapshot: Some(snapshot),
             metadata: None,
             origin: None,
-            created_at: "test-created-at".to_string(),
-            updated_at: "test-updated-at".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-01-01T00:00:00.000Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-01-01T00:00:00.000Z",
+            ),
             global: true,
             change_id: None,
             commit_id: None,

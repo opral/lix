@@ -250,8 +250,8 @@ mod tests {
             .expect("branch-ref row should load")
             .expect("branch-ref row should exist");
         assert!(row.global);
-        assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(row.updated_at, "2026-01-01T00:00:00Z");
+        assert_eq!(row.created_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(row.updated_at, "2026-01-01T00:00:00.000Z");
     }
 
     #[tokio::test]

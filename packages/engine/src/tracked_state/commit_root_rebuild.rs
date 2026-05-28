@@ -6,6 +6,7 @@ use crate::changelog::{
     ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitChangeRef, CommitLoadEntry,
     CommitLoadRequest, CommitProjection, CommitRecord,
 };
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::storage::{StorageRead, StorageWriteSet};
@@ -30,8 +31,8 @@ pub(crate) struct CommitRootRebuildDelta {
     pub(crate) commit_id: String,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 pub(crate) async fn rebuild_commit_root_at<S>(
@@ -276,8 +277,8 @@ where
             snapshot_ref: delta.snapshot_ref.as_ref(),
             metadata_ref: delta.metadata_ref.as_ref(),
             deleted: delta.snapshot_ref.is_none(),
-            created_at: &delta.created_at,
-            updated_at: &delta.updated_at,
+            created_at: delta.created_at,
+            updated_at: delta.updated_at,
         })
         .collect::<Vec<_>>();
     writer
@@ -301,8 +302,8 @@ fn rebuild_delta_from_commit_record(
         commit_id: commit.commit_id.clone(),
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
         metadata_ref: None,
-        created_at: commit.created_at.clone(),
-        updated_at: commit.created_at.clone(),
+        created_at: commit.created_at,
+        updated_at: commit.created_at,
     })
 }
 
@@ -352,7 +353,7 @@ fn rebuild_delta_from_change_ref(
         commit_id: commit_id.to_string(),
         snapshot_ref: change.snapshot_ref,
         metadata_ref: change.metadata_ref,
-        created_at: change.created_at.clone(),
+        created_at: change.created_at,
         updated_at: change.created_at,
     })
 }

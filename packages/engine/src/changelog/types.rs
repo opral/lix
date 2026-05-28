@@ -1,3 +1,4 @@
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 
@@ -35,7 +36,7 @@ pub(crate) struct CommitRecord {
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) change_id: ChangeId,
     pub(crate) author_account_ids: Vec<String>,
-    pub(crate) created_at: String,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,7 +172,7 @@ pub(crate) struct ChangeRecord {
     pub(crate) snapshot_ref: Option<JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: String,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(musli::Encode)]
@@ -187,7 +188,7 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<&'a JsonRef>,
-    pub(crate) created_at: &'a str,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
@@ -204,7 +205,7 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) snapshot_ref: Option<JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: &'a str,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(Clone, Copy, Debug)]

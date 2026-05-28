@@ -3,6 +3,7 @@ use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
     CommitChangeRefSet, CommitRecord,
 };
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
@@ -43,7 +44,7 @@ struct InitSeedCommit {
     change_id: String,
     parent_ids: Vec<String>,
     author_account_ids: Vec<String>,
-    created_at: String,
+    created_at: LixTimestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +53,7 @@ struct InitSeedChange {
     entity_pk: EntityPk,
     schema_key: String,
     snapshot_content: String,
-    created_at: String,
+    created_at: LixTimestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,8 +61,8 @@ struct InitSeedLiveRow {
     entity_pk: EntityPk,
     schema_key: String,
     snapshot_content: String,
-    created_at: String,
-    updated_at: String,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
     global: bool,
     branch_id: String,
 }
@@ -83,7 +84,12 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     let main_branch_id = functions.call_uuid_v7();
     let lix_id = functions.call_uuid_v7();
     let initial_commit_id = functions.call_uuid_v7();
-    let timestamp = functions.call_timestamp();
+    let timestamp_text = functions.call_timestamp();
+    let timestamp = LixTimestamp::parse(&timestamp_text).map_err(|error| {
+        LixError::unknown(format!(
+            "invalid init timestamp from function provider: {error}"
+        ))
+    })?;
 
     let mut registered_schema_changes = Vec::new();
     for schema in seed_schema_definitions() {
@@ -93,7 +99,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             registered_schema_entity_pk(&key.schema_key)?,
             REGISTERED_SCHEMA_KEY,
             registered_schema_snapshot(schema)?,
-            &timestamp,
+            timestamp,
         ));
     }
 
@@ -102,21 +108,21 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         EntityPk::single(GLOBAL_BRANCH_ID),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(GLOBAL_BRANCH_ID, "global", true)?,
-        &timestamp,
+        timestamp,
     );
     let main_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
         EntityPk::single(&main_branch_id),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(&main_branch_id, "main", false)?,
-        &timestamp,
+        timestamp,
     );
     let kv_lix_id_change = canonical_change(
         functions.call_uuid_v7(),
         EntityPk::single(LIX_ID_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
-        &timestamp,
+        timestamp,
     );
 
     let initial_commit = InitSeedCommit {
@@ -124,25 +130,25 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         change_id: functions.call_uuid_v7(),
         parent_ids: Vec::new(),
         author_account_ids: Vec::new(),
-        created_at: timestamp.clone(),
+        created_at: timestamp,
     };
     let global_branch_ref_row = untracked_row(
         EntityPk::single(GLOBAL_BRANCH_ID),
         BRANCH_REF_SCHEMA_KEY,
         branch_ref_snapshot(GLOBAL_BRANCH_ID, &initial_commit_id)?,
-        &timestamp,
+        timestamp,
     );
     let main_branch_ref_row = untracked_row(
         EntityPk::single(&main_branch_id),
         BRANCH_REF_SCHEMA_KEY,
         branch_ref_snapshot(&main_branch_id, &initial_commit_id)?,
-        &timestamp,
+        timestamp,
     );
     let workspace_branch_row = untracked_row(
         EntityPk::single(WORKSPACE_BRANCH_KEY),
         KEY_VALUE_SCHEMA_KEY,
         key_value_snapshot(WORKSPACE_BRANCH_KEY, &main_branch_id)?,
-        &timestamp,
+        timestamp,
     );
 
     Ok(InitSeedPlan {
@@ -225,8 +231,8 @@ where
                 snapshot_ref: change.snapshot_ref.as_ref(),
                 metadata_ref: change.metadata_ref.as_ref(),
                 deleted: change.snapshot_ref.is_none(),
-                created_at: &change.created_at,
-                updated_at: &change.created_at,
+                created_at: change.created_at,
+                updated_at: change.created_at,
             })
             .collect::<Vec<_>>();
         deltas.push(TrackedStateDeltaRef {
@@ -238,8 +244,8 @@ where
             snapshot_ref: commit_row_change.snapshot_ref.as_ref(),
             metadata_ref: commit_row_change.metadata_ref.as_ref(),
             deleted: commit_row_change.snapshot_ref.is_none(),
-            created_at: &commit_row_change.created_at,
-            updated_at: &commit_row_change.created_at,
+            created_at: commit_row_change.created_at,
+            updated_at: commit_row_change.created_at,
         });
         let mut writer = tracked_state.writer(&read, &mut writes);
         writer
@@ -260,7 +266,7 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         file_id: None,
         snapshot_ref: Some(JsonRef::for_content(change.snapshot_content.as_bytes())),
         metadata_ref: None,
-        created_at: change.created_at.clone(),
+        created_at: change.created_at,
     }
 }
 
@@ -274,7 +280,7 @@ fn seed_commit_row_change_record(commit: &InitSeedCommit) -> Result<ChangeRecord
         file_id: None,
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
         metadata_ref: None,
-        created_at: commit.created_at.clone(),
+        created_at: commit.created_at,
     })
 }
 
@@ -308,7 +314,7 @@ async fn stage_init_changelog_commit(
         parent_commit_ids: plan.commit.parent_ids.clone(),
         change_id: plan.commit.change_id.clone(),
         author_account_ids: plan.commit.author_account_ids.clone(),
-        created_at: plan.commit.created_at.clone(),
+        created_at: plan.commit.created_at,
     };
     let commit_change_refs = CommitChangeRefSet {
         commit_id: plan.commit.id.clone(),
@@ -350,10 +356,8 @@ fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedState
         file_id: None,
         snapshot_content: Some(row.snapshot_content.clone()),
         metadata: None,
-        created_updated_at: UntrackedStateRow::created_updated_at(
-            row.created_at.clone(),
-            row.updated_at.clone(),
-        ),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         global: row.global,
         branch_id: row.branch_id.clone(),
     })
@@ -363,14 +367,14 @@ fn untracked_row(
     entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
-    timestamp: &str,
+    timestamp: LixTimestamp,
 ) -> InitSeedLiveRow {
     InitSeedLiveRow {
         entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
-        created_at: timestamp.to_string(),
-        updated_at: timestamp.to_string(),
+        created_at: timestamp,
+        updated_at: timestamp,
         global: true,
         branch_id: GLOBAL_BRANCH_ID.to_string(),
     }
@@ -381,14 +385,14 @@ fn canonical_change(
     entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
-    created_at: &str,
+    created_at: LixTimestamp,
 ) -> InitSeedChange {
     InitSeedChange {
         id,
         entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
-        created_at: created_at.to_string(),
+        created_at,
     }
 }
 
@@ -461,7 +465,10 @@ mod tests {
         assert_eq!(plan.commit.change_id, "test-uuid-21");
         assert!(plan.commit.parent_ids.is_empty());
         assert!(plan.commit.author_account_ids.is_empty());
-        assert_eq!(plan.commit.created_at, "test-timestamp-1");
+        assert_eq!(
+            plan.commit.created_at.to_string(),
+            "2026-01-01T00:00:00.001Z"
+        );
 
         let change_ids = plan
             .changes
@@ -688,7 +695,7 @@ mod tests {
 
         fn timestamp(&mut self) -> String {
             self.timestamp_count += 1;
-            format!("test-timestamp-{}", self.timestamp_count)
+            format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count)
         }
     }
 }

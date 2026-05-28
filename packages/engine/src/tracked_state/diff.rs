@@ -1,3 +1,4 @@
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
@@ -48,8 +49,8 @@ pub(crate) struct TrackedStateDiffRow {
     pub(crate) deleted: bool,
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
 }
@@ -201,8 +202,6 @@ impl TrackedStateDiffIdentity {
 
 impl TrackedStateDiffRow {
     pub(crate) fn from_tree_entry(key: TrackedStateKey, value: TrackedStateIndexValue) -> Self {
-        let created_at = value.created_at().to_string();
-        let updated_at = value.updated_at().to_string();
         Self {
             entity_pk: key.entity_pk,
             schema_key: key.schema_key,
@@ -210,8 +209,8 @@ impl TrackedStateDiffRow {
             deleted: value.deleted,
             snapshot_ref: value.snapshot_ref,
             metadata_ref: value.metadata_ref,
-            created_at,
-            updated_at,
+            created_at: value.created_at(),
+            updated_at: value.updated_at(),
             change_id: value.change_id,
             commit_id: value.commit_id,
         }
@@ -230,10 +229,8 @@ impl TrackedStateDiffRow {
                 deleted: self.deleted,
                 snapshot_ref: self.snapshot_ref,
                 metadata_ref: self.metadata_ref,
-                created_updated_at: TrackedStateIndexValue::created_updated_at(
-                    self.created_at,
-                    self.updated_at,
-                ),
+                created_at: self.created_at,
+                updated_at: self.updated_at,
             },
         )
     }
@@ -272,6 +269,10 @@ mod tests {
     };
     use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateContext};
     use crate::NullableKeyFilter;
+
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
 
     #[tokio::test]
     async fn diff_commits_reports_added_rows() {
@@ -520,7 +521,7 @@ mod tests {
             .after
             .as_mut()
             .expect("after row")
-            .updated_at = "2026-01-02T00:00:00Z".to_string();
+            .updated_at = ts("2026-01-02T00:00:00Z");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -548,7 +549,7 @@ mod tests {
             .after
             .as_mut()
             .expect("after row")
-            .created_at = "2025-12-31T00:00:00Z".to_string();
+            .created_at = ts("2025-12-31T00:00:00Z");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -623,10 +624,9 @@ mod tests {
             .expect("child row should appear");
         let (key, mut value) = row.into_index_entry();
         let updated_at = value.updated_at().to_string();
-        value.created_updated_at = TrackedStateIndexValue::created_updated_at(
-            "2026-01-03T00:00:00Z".to_string(),
-            updated_at,
-        );
+        value.created_at =
+            crate::common::LixTimestamp::expect_parse("created_at", "2026-01-03T00:00:00Z");
+        value.updated_at = crate::common::LixTimestamp::expect_parse("updated_at", &updated_at);
         let parent_commit_row =
             commit_root_row_entry("parent", "parent:commit", "2026-01-01T00:00:00Z");
         let commit_row = commit_root_row_entry("child", "child:commit", "2026-01-02T00:00:00Z");
@@ -1401,8 +1401,8 @@ mod tests {
             vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
         );
         let row = diff.entries[0].after.as_ref().expect("after row");
-        assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(row.updated_at, "2026-01-02T00:00:00Z");
+        assert_eq!(row.created_at.to_string(), "2026-01-01T00:00:00.000Z");
+        assert_eq!(row.updated_at.to_string(), "2026-01-02T00:00:00.000Z");
         assert_eq!(row.change_id, "source-update-a");
     }
 
@@ -2072,10 +2072,8 @@ mod tests {
                     format!("{{\"id\":\"{commit_id}\"}}").as_bytes(),
                 )),
                 metadata_ref: None,
-                created_updated_at: TrackedStateIndexValue::created_updated_at(
-                    created_at.to_string(),
-                    created_at.to_string(),
-                ),
+                created_at: crate::common::LixTimestamp::expect_parse("created_at", created_at),
+                updated_at: crate::common::LixTimestamp::expect_parse("updated_at", created_at),
             },
         )
     }

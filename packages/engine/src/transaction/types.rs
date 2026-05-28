@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::catalog::SchemaPlanId;
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
@@ -271,8 +272,8 @@ pub(crate) struct PreparedStateRow {
     pub(crate) snapshot: Option<StageJson>,
     pub(crate) metadata: Option<StageJson>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
     pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
@@ -290,8 +291,8 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
             deleted,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            created_at: row.created_at.to_string(),
+            updated_at: row.updated_at.to_string(),
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
@@ -310,8 +311,8 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
             deleted: row.snapshot.is_none(),
-            created_at: row.created_at.clone(),
-            updated_at: row.updated_at.clone(),
+            created_at: row.created_at.to_string(),
+            updated_at: row.updated_at.to_string(),
             global: row.global,
             change_id: row.change_id.clone(),
             commit_id: row.commit_id.clone(),
@@ -331,8 +332,8 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
             deleted,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            created_at: row.created_at.to_string(),
+            updated_at: row.updated_at.to_string(),
             global: row.global,
             branch_id: row.branch_id,
         }
@@ -344,14 +345,27 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
 /// Final commit row materialization owns commit ids, parent heads, and commit
 /// row timestamps. Staging only tracks which hydrated tracked changes the
 /// future commit introduces for a branch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_id: String,
     pub(crate) commit_change_id: String,
-    pub(crate) created_at: String,
+    pub(crate) created_at: LixTimestamp,
     pub(crate) change_ids: BTreeSet<String>,
     pub(crate) selected_change_refs: Vec<StagedCommitChangeRef>,
     pub(crate) allow_empty: bool,
+}
+
+impl Default for StagedCommitChangeRefs {
+    fn default() -> Self {
+        Self {
+            commit_id: String::new(),
+            commit_change_id: String::new(),
+            created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
+            change_ids: BTreeSet::new(),
+            selected_change_refs: Vec::new(),
+            allow_empty: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,12 +377,16 @@ pub(crate) struct StagedCommitChangeRef {
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) deleted: bool,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
 }
 
 impl StagedCommitChangeRefs {
-    pub(crate) fn new(commit_id: String, commit_change_id: String, created_at: String) -> Self {
+    pub(crate) fn new(
+        commit_id: String,
+        commit_change_id: String,
+        created_at: LixTimestamp,
+    ) -> Self {
         Self {
             commit_id,
             commit_change_id,

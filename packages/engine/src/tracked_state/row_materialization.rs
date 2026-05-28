@@ -1,3 +1,4 @@
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
@@ -46,15 +47,13 @@ where
             &mut json_refs,
             &mut json_ref_localities,
         );
-        let created_at = value.created_at().to_string();
-        let updated_at = value.updated_at().to_string();
         row_plans.push(TrackedRowMaterializationPlan {
             entity_pk: key.entity_pk,
             schema_key: key.schema_key,
             file_id: key.file_id,
             deleted: value.deleted,
-            created_at,
-            updated_at,
+            created_at: value.created_at(),
+            updated_at: value.updated_at(),
             change_id: value.change_id,
             commit_id: value.commit_id,
             snapshot_ref_index,
@@ -73,8 +72,6 @@ where
 fn materialize_entry_without_json(
     (key, value): (TrackedStateKey, TrackedStateIndexValue),
 ) -> MaterializedTrackedStateRow {
-    let created_at = value.created_at().to_string();
-    let updated_at = value.updated_at().to_string();
     MaterializedTrackedStateRow {
         entity_pk: key.entity_pk,
         schema_key: key.schema_key,
@@ -82,8 +79,8 @@ fn materialize_entry_without_json(
         snapshot_content: None,
         metadata: None,
         deleted: value.deleted,
-        created_at,
-        updated_at,
+        created_at: value.created_at().to_string(),
+        updated_at: value.updated_at().to_string(),
         change_id: value.change_id,
         commit_id: value.commit_id,
     }
@@ -94,8 +91,8 @@ struct TrackedRowMaterializationPlan {
     schema_key: String,
     file_id: Option<String>,
     deleted: bool,
-    created_at: String,
-    updated_at: String,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
     change_id: String,
     commit_id: String,
     snapshot_ref_index: Option<usize>,
@@ -185,8 +182,8 @@ fn materialize_row_plan(
         )?,
         metadata: materialized_json_string(plan.metadata_ref_index, json_refs, json_values)?,
         deleted: plan.deleted,
-        created_at: plan.created_at,
-        updated_at: plan.updated_at,
+        created_at: plan.created_at.to_string(),
+        updated_at: plan.updated_at.to_string(),
         change_id: plan.change_id,
         commit_id: plan.commit_id,
     })

@@ -45,12 +45,6 @@ path = "benches/tracked_state_crud/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
-[[bench]]
-name = "acrm_eav_repro"
-path = "benches/acrm_eav_repro.rs"
-harness = false
-required-features = ["storage-benches"]
-
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"
@@ -69,6 +63,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonschema = { version = "0.17", default-features = false, features = ["draft202012"] }
 globset = "0.4"
+jiff = { version = "0.2.27", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v7", "std", "js"] }
 unicode-normalization = "0.1"
 precis-profiles = "0.1.13"

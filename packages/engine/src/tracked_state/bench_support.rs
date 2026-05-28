@@ -327,8 +327,8 @@ struct OwnedDelta {
     snapshot_ref: Option<crate::json_store::JsonRef>,
     metadata_ref: Option<crate::json_store::JsonRef>,
     deleted: bool,
-    created_at: String,
-    updated_at: String,
+    created_at: crate::common::LixTimestamp,
+    updated_at: crate::common::LixTimestamp,
 }
 
 impl OwnedDelta {
@@ -364,8 +364,14 @@ impl OwnedDelta {
             snapshot_ref,
             metadata_ref: None,
             deleted,
-            created_at: "2026-05-19T00:00:00.000Z".to_string(),
-            updated_at: "2026-05-19T00:00:00.000Z".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-05-19T00:00:00.000Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-05-19T00:00:00.000Z",
+            ),
         }
     }
 
@@ -379,8 +385,8 @@ impl OwnedDelta {
             snapshot_ref: self.snapshot_ref.as_ref(),
             metadata_ref: self.metadata_ref.as_ref(),
             deleted: self.deleted,
-            created_at: &self.created_at,
-            updated_at: &self.updated_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
         }
     }
 }

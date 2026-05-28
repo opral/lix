@@ -17,9 +17,8 @@ use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue,
-    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
-    TrackedStateRootId, TrackedStateTreeScanRequest,
+    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue, TrackedStateKey,
+    TrackedStateKeyRef, TrackedStateMutation, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
@@ -275,7 +274,7 @@ where
             validate_diff_row_against_changelog(row, &changes)?;
             let change_created_at = changes
                 .get(&row.change_id)
-                .map(|change| change.created_at.as_str())
+                .map(|change| change.created_at)
                 .ok_or_else(|| {
                     LixError::unknown(format!(
                         "tracked-state diff row references missing changelog change '{}'",
@@ -297,7 +296,7 @@ where
         &mut self,
         row: &TrackedStateDiffRow,
         root_commit_id: &str,
-        change_created_at: &str,
+        change_created_at: crate::common::LixTimestamp,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<(), LixError> {
         let identity = tracked_state_identity_from_diff_row(row)?;
@@ -585,9 +584,9 @@ where
         row: &TrackedStateDiffRow,
         key: &TrackedStateKey,
         commit_id: &str,
-        change_created_at: &str,
+        change_created_at: crate::common::LixTimestamp,
     ) -> Result<(), LixError> {
-        let mut expected_created_at = change_created_at.to_string();
+        let mut expected_created_at = change_created_at;
         let Some(metadata) = storage::load_commit_root(&mut self.store, commit_id).await? else {
             return Err(missing_commit_root_error(commit_id));
         };
@@ -600,7 +599,7 @@ where
                 .next()
                 .flatten();
             if let Some(parent_value) = parent_value {
-                expected_created_at = parent_value.created_at().to_string();
+                expected_created_at = parent_value.created_at();
             }
         }
         if expected_created_at == change_created_at {
@@ -632,7 +631,7 @@ where
         commit_id: &str,
         row: &TrackedStateDiffRow,
         key: &TrackedStateKey,
-    ) -> Result<Option<String>, LixError> {
+    ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
         let commit_ids = [commit_id.to_string()];
         let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
         let batch = changelog_reader
@@ -658,7 +657,7 @@ where
                 .flatten();
             if let Some(parent_value) = parent_value {
                 if parent_value.change_id == row.change_id {
-                    return Ok(Some(parent_value.created_at().to_string()));
+                    return Ok(Some(parent_value.created_at()));
                 }
             }
         }
@@ -669,7 +668,7 @@ where
         &mut self,
         row: &TrackedStateDiffRow,
         key: &TrackedStateKey,
-    ) -> Result<Option<String>, LixError> {
+    ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
         let Some(metadata) = storage::load_commit_root(&mut self.store, &row.commit_id).await?
         else {
             return Ok(None);
@@ -684,7 +683,7 @@ where
             .into_iter()
             .next()
             .flatten();
-        Ok(parent_value.map(|value| value.created_at().to_string()))
+        Ok(parent_value.map(|value| value.created_at()))
     }
 
     pub(crate) async fn validate_tree_rows_at_commit_against_changelog(
@@ -903,10 +902,8 @@ where
         };
         let mut mutations = Vec::with_capacity(deltas.len());
         for (delta, parent_value) in deltas.iter().zip(parent_values.iter()) {
-            let created_at = parent_value
-                .as_ref()
-                .map(|value| value.created_at())
-                .unwrap_or(delta.created_at);
+            let parent_created_at = parent_value.as_ref().map(|value| value.created_at());
+            let created_at = parent_created_at.unwrap_or(delta.created_at);
             let key = TrackedStateKeyRef {
                 schema_key: delta.schema_key,
                 file_id: delta.file_id,
@@ -918,10 +915,8 @@ where
                 deleted: delta.deleted,
                 snapshot_ref: delta.snapshot_ref.copied(),
                 metadata_ref: delta.metadata_ref.copied(),
-                created_updated_at: TrackedStateIndexValueRef::created_updated_at(
-                    created_at,
-                    delta.updated_at,
-                ),
+                created_at,
+                updated_at: delta.updated_at,
             };
             mutations.push(TrackedStateMutation::put_encoded(
                 encode_key_ref(key),
@@ -1081,7 +1076,7 @@ fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecor
             snapshot_content.as_bytes(),
         )),
         metadata_ref: None,
-        created_at: commit.created_at.clone(),
+        created_at: commit.created_at,
     })
 }
 
@@ -1653,7 +1648,10 @@ mod tests {
                     parent_commit_ids: vec!["commit-b".to_string()],
                     change_id: "commit-a:commit".to_string(),
                     author_account_ids: Vec::new(),
-                    created_at: "1970-01-01T00:00:00.000Z".to_string(),
+                    created_at: crate::common::LixTimestamp::expect_parse(
+                        "created_at",
+                        "1970-01-01T00:00:00.000Z",
+                    ),
                 })
                 .expect("corrupt cycle commit should encode"),
             );
@@ -2439,8 +2437,8 @@ mod tests {
             .flatten()
             .expect("row should exist");
 
-        assert_eq!(loaded.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(loaded.updated_at, "2026-01-02T00:00:00Z");
+        assert_eq!(loaded.created_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(loaded.updated_at, "2026-01-02T00:00:00.000Z");
     }
 
     #[tokio::test]
@@ -2490,8 +2488,8 @@ mod tests {
             .pop()
             .flatten()
             .expect("child row should exist");
-        assert_eq!(loaded.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(loaded.updated_at, "2026-01-03T00:00:00Z");
+        assert_eq!(loaded.created_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(loaded.updated_at, "2026-01-03T00:00:00.000Z");
 
         {
             let mut writes = storage.new_write_set();
@@ -2530,8 +2528,8 @@ mod tests {
             .pop()
             .flatten()
             .expect("rebuilt child row should exist");
-        assert_eq!(rebuilt.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(rebuilt.updated_at, "2026-01-03T00:00:00Z");
+        assert_eq!(rebuilt.created_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(rebuilt.updated_at, "2026-01-03T00:00:00.000Z");
     }
 
     #[tokio::test]
@@ -2721,9 +2719,13 @@ mod tests {
                         metadata_ref: row.metadata.as_ref().map(|metadata| {
                             crate::json_store::JsonRef::for_content(metadata.as_bytes())
                         }),
-                        created_updated_at: TrackedStateIndexValue::created_updated_at(
-                            row.created_at.clone(),
-                            row.updated_at.clone(),
+                        created_at: crate::common::LixTimestamp::expect_parse(
+                            "created_at",
+                            &row.created_at,
+                        ),
+                        updated_at: crate::common::LixTimestamp::expect_parse(
+                            "updated_at",
+                            &row.updated_at,
                         ),
                     };
                     TrackedStateMutation::put_encoded(

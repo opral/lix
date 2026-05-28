@@ -36,7 +36,7 @@ pub(crate) fn test_commit_record() -> CommitRecord {
         parent_commit_ids: Vec::new(),
         change_id: "commit-row-change-1".to_string(),
         author_account_ids: vec!["account-1".to_string()],
-        created_at: "2026-05-12T00:00:00Z".to_string(),
+        created_at: crate::common::LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
     }
 }
 
@@ -49,6 +49,6 @@ pub(crate) fn test_change_record() -> ChangeRecord {
         file_id: Some("file-1".to_string()),
         snapshot_ref: None,
         metadata_ref: None,
-        created_at: "2026-05-12T00:00:00Z".to_string(),
+        created_at: crate::common::LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
     }
 }
