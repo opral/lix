@@ -149,7 +149,7 @@ export class Value {
 		return this.kind === "json" ? normalizeJsonValue(this.value) : undefined;
 	}
 
-	asBlob(): Uint8Array | undefined {
+	asBytes(): Uint8Array | undefined {
 		return this.kind === "blob" && this.base64 !== undefined
 			? base64ToBytes(this.base64)
 			: undefined;

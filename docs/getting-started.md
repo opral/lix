@@ -80,15 +80,15 @@ Each row is a `Row`. Use `row.value(name)` for a typed `Value`, or `row.get(name
 | `asInteger()` | integer columns |
 | `asReal()` | decimal columns |
 | `asJson()` | JSON columns such as `snapshot_content` and `entity_pk` |
-| `asBlob()` | binary columns such as `lix_file.data` |
+| `asBytes()` | binary columns such as `lix_file.data` |
 
-There is no `asBytes()` accessor. Use `asBlob()` for bytes:
+Use `asBytes()` for byte content:
 
 ```ts
 const file = await lix.execute("SELECT data FROM lix_file WHERE path = $1", [
   "/orders.xlsx",
 ]);
-const bytes = file.rows[0]!.value("data").asBlob();
+const bytes = file.rows[0]!.value("data").asBytes();
 ```
 
 ## Isolate a change in a version
