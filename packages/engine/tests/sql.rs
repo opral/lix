@@ -95,6 +95,8 @@ macro_rules! simulation_test {
 
 #[path = "sql/entity_history.rs"]
 mod entity_history;
+#[path = "sql/entity_view.rs"]
+mod entity_view;
 #[path = "sql/errors.rs"]
 mod errors;
 #[path = "sql/history_conformance.rs"]

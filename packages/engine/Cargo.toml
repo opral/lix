@@ -43,6 +43,12 @@ path = "benches/tracked_state_crud/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "acrm_eav_repro"
+path = "benches/acrm_eav_repro.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"
