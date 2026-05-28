@@ -1,6 +1,0 @@
-packages:
-  - packages/**/*
-  - '!packages/**/dist'
-onlyBuiltDependencies:
-  - '@tailwindcss/oxide'
-  - 'better-sqlite3'
