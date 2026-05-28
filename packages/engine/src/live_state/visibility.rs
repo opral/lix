@@ -234,6 +234,7 @@ fn insert_row_preferring_untracked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::live_state::LiveStateRowRequest;
     use async_trait::async_trait;
@@ -603,8 +604,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global,
-            change_id: change_id.map(str::to_string),
-            commit_id: Some("commit".to_string()),
+            change_id: change_id.map(ChangeId::for_test_label),
+            commit_id: Some(CommitId::for_test_label("commit")),
             untracked: false,
             branch_id: branch_id.to_string(),
         }

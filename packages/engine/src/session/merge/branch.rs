@@ -232,10 +232,10 @@ where
                         outcome: MergeBranchOutcome::AlreadyUpToDate,
                         target_branch_id: active_branch_id,
                         source_branch_id,
-                        base_commit_id: analysis.commits.base_commit_id,
-                        target_head_after_commit_id: analysis.commits.target_commit_id.clone(),
-                        target_head_before_commit_id: analysis.commits.target_commit_id,
-                        source_head_before_commit_id: analysis.commits.source_commit_id,
+                        base_commit_id: analysis.commits.base_commit_id.to_string(),
+                        target_head_after_commit_id: analysis.commits.target_commit_id.to_string(),
+                        target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+                        source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
                         created_merge_commit_id: None,
                         change_stats: merge_change_stats_from_analysis(&analysis.stats),
                     });
@@ -243,17 +243,17 @@ where
 
                 if analysis.outcome == MergeOutcome::FastForward {
                     transaction
-                        .advance_branch_ref(&active_branch_id, &analysis.commits.source_commit_id)
+                        .advance_branch_ref(&active_branch_id, analysis.commits.source_commit_id)
                         .await?;
 
                     return Ok(MergeBranchReceipt {
                         outcome: MergeBranchOutcome::FastForward,
                         target_branch_id: active_branch_id,
                         source_branch_id,
-                        base_commit_id: analysis.commits.base_commit_id,
-                        target_head_before_commit_id: analysis.commits.target_commit_id,
-                        source_head_before_commit_id: analysis.commits.source_commit_id.clone(),
-                        target_head_after_commit_id: analysis.commits.source_commit_id,
+                        base_commit_id: analysis.commits.base_commit_id.to_string(),
+                        target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+                        source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
+                        target_head_after_commit_id: analysis.commits.source_commit_id.to_string(),
                         created_merge_commit_id: None,
                         change_stats: merge_change_stats_from_analysis(&analysis.stats),
                     });
@@ -280,17 +280,17 @@ where
                     .collect::<Vec<_>>();
                 let created_merge_commit_id = transaction.stage_merge_commit(
                     active_branch_id.clone(),
-                    analysis.commits.source_commit_id.clone(),
+                    analysis.commits.source_commit_id,
                     selected_changes,
                 )?;
                 return Ok(MergeBranchReceipt {
                     outcome: MergeBranchOutcome::MergeCommitted,
                     target_branch_id: active_branch_id,
                     source_branch_id,
-                    base_commit_id: analysis.commits.base_commit_id,
+                    base_commit_id: analysis.commits.base_commit_id.to_string(),
                     target_head_after_commit_id: created_merge_commit_id.clone(),
-                    target_head_before_commit_id: analysis.commits.target_commit_id,
-                    source_head_before_commit_id: analysis.commits.source_commit_id,
+                    target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+                    source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
                     created_merge_commit_id: Some(created_merge_commit_id),
                     change_stats: merge_change_stats_from_analysis(&analysis.stats),
                 });
@@ -323,9 +323,9 @@ fn preview_from_analysis(
         outcome: merge_branch_outcome_from_analysis(analysis.outcome),
         target_branch_id: target_branch_id.to_string(),
         source_branch_id: source_branch_id.to_string(),
-        base_commit_id: analysis.commits.base_commit_id.clone(),
-        target_head_commit_id: analysis.commits.target_commit_id.clone(),
-        source_head_commit_id: analysis.commits.source_commit_id.clone(),
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_head_commit_id: analysis.commits.target_commit_id.to_string(),
+        source_head_commit_id: analysis.commits.source_commit_id.to_string(),
         change_stats: merge_change_stats_from_analysis(&analysis.stats),
         conflicts: analysis
             .conflicts

@@ -257,11 +257,12 @@ simulation_test!(
             &engine,
         );
 
+        let missing_commit_id = "ffffffff-ffff-4fff-bfff-ffffffffffff";
         let error = main
             .create_branch(CreateBranchOptions {
                 id: Some("from-missing".to_string()),
                 name: "From missing".to_string(),
-                from_commit_id: Some("missing-commit".to_string()),
+                from_commit_id: Some(missing_commit_id.to_string()),
             })
             .await
             .expect_err("creating a branch from a missing commit should fail");
@@ -272,7 +273,7 @@ simulation_test!(
                 .details
                 .as_ref()
                 .and_then(|details| details.get("commit_id").and_then(JsonValue::as_str)),
-            Some("missing-commit")
+            Some(missing_commit_id)
         );
 
         drop(main);

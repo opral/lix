@@ -4,6 +4,7 @@ use tokio::sync::Mutex;
 
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHead, BranchRefReader};
+use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{
@@ -83,7 +84,7 @@ where
     pub(crate) async fn load_head_commit_id(
         &self,
         branch_id: &str,
-    ) -> Result<Option<String>, LixError> {
+    ) -> Result<Option<CommitId>, LixError> {
         Ok(self.load_head(branch_id).await?.map(|head| head.commit_id))
     }
 
@@ -125,7 +126,7 @@ where
         BranchRefStoreReader::load_head(self, branch_id).await
     }
 
-    async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<String>, LixError> {
+    async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         BranchRefStoreReader::load_head_commit_id(self, branch_id).await
     }
 
@@ -173,7 +174,7 @@ fn decode_branch_head(
         })?;
     Ok(Some(BranchHead {
         branch_id: requested_branch_id.to_string(),
-        commit_id: commit_id.to_string(),
+        commit_id: CommitId::parse_lix(commit_id, "branch ref commit_id")?,
     }))
 }
 
@@ -250,8 +251,8 @@ mod tests {
             .expect("branch-ref row should load")
             .expect("branch-ref row should exist");
         assert!(row.global);
-        assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(row.updated_at, "2026-01-01T00:00:00Z");
+        assert_eq!(row.created_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(row.updated_at, "2026-01-01T00:00:00.000Z");
     }
 
     #[tokio::test]
@@ -294,11 +295,11 @@ mod tests {
             vec![
                 BranchHead {
                     branch_id: "branch-a".to_string(),
-                    commit_id: "commit-a".to_string(),
+                    commit_id: CommitId::for_test_label("commit-a"),
                 },
                 BranchHead {
                     branch_id: "branch-b".to_string(),
-                    commit_id: "commit-b".to_string(),
+                    commit_id: CommitId::for_test_label("commit-b"),
                 },
             ]
         );
@@ -315,7 +316,8 @@ mod tests {
         commit_id: &str,
         timestamp: &str,
     ) -> Result<(), LixError> {
-        let canonical_row = prepare_branch_ref_row(branch_id, commit_id, timestamp)?;
+        let commit_id = CommitId::parse_lix(commit_id, "test branch head commit_id")?;
+        let canonical_row = prepare_branch_ref_row(branch_id, &commit_id, timestamp)?;
         branch_ref.writer(writes).stage_rows(&[canonical_row.row])
     }
 }

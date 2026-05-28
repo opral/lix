@@ -7,6 +7,8 @@ use crate::catalog::{
     CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
     StateForeignKeyPlan,
 };
+#[cfg(test)]
+use crate::changelog::{ChangeId, CommitId};
 use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
@@ -772,7 +774,9 @@ fn directory_parent_missing_error(
         LixError::CODE_FOREIGN_KEY,
         format!(
             "lix_directory_descriptor parent_id chain in branch '{}' for directory '{}' references missing directory '{}'",
-            scope.domain.branch_id(), start_id, missing_id
+            scope.domain.branch_id(),
+            start_id,
+            missing_id
         ),
     )
 }
@@ -782,7 +786,9 @@ fn directory_parent_depth_error(scope: &DirectoryDescriptorScope, start_id: &str
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!(
             "lix_directory_descriptor parent_id chain in branch '{}' for directory '{}' exceeds maximum depth {}",
-            scope.domain.branch_id(), start_id, MAX_DIRECTORY_PARENT_DEPTH
+            scope.domain.branch_id(),
+            start_id,
+            MAX_DIRECTORY_PARENT_DEPTH
         ),
     )
 }
@@ -2596,6 +2602,10 @@ mod tests {
     use crate::transaction::types::{StageJson, TransactionJson};
 
     struct EmptyLiveStateReader;
+
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
 
     fn test_stage_json(value: &str) -> StageJson {
         let parsed = test_json_text(value).expect("test staged JSON should parse");
@@ -5387,11 +5397,11 @@ mod tests {
             snapshot: Some(test_stage_json(&json!({ "value": schema }).to_string())),
             metadata: None,
             origin: None,
-            created_at: "2026-04-29T00:00:00.000Z".to_string(),
-            updated_at: "2026-04-29T00:00:00.000Z".to_string(),
+            created_at: ts("2026-04-29T00:00:00.000Z"),
+            updated_at: ts("2026-04-29T00:00:00.000Z"),
             global: true,
-            change_id: Some("change-registered-schema".to_string()),
-            commit_id: Some("commit-registered-schema".to_string()),
+            change_id: Some(ChangeId::for_test_label("change-registered-schema")),
+            commit_id: Some(CommitId::for_test_label("commit-registered-schema")),
             untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }
@@ -5726,8 +5736,8 @@ mod tests {
             snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.as_ref().map(|metadata| metadata.materialize()),
             deleted: row.snapshot.is_none(),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            created_at: row.created_at.to_string(),
+            updated_at: row.updated_at.to_string(),
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
@@ -5754,11 +5764,11 @@ mod tests {
             snapshot: snapshot_content.as_deref().map(test_stage_json),
             metadata: None,
             origin: None,
-            created_at: "2026-04-29T00:00:00.000Z".to_string(),
-            updated_at: "2026-04-29T00:00:00.000Z".to_string(),
+            created_at: ts("2026-04-29T00:00:00.000Z"),
+            updated_at: ts("2026-04-29T00:00:00.000Z"),
             global: true,
-            change_id: Some("change-1".to_string()),
-            commit_id: Some("commit-1".to_string()),
+            change_id: Some(ChangeId::for_test_label("change-1")),
+            commit_id: Some(CommitId::for_test_label("commit-1")),
             untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }

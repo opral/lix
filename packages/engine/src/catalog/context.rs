@@ -145,6 +145,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::changelog::ChangeId;
     use crate::live_state::LiveStateRowRequest;
     use crate::GLOBAL_BRANCH_ID;
 
@@ -375,7 +376,7 @@ mod tests {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             metadata: None,
             deleted: false,
-            change_id: Some("change-registered-schema".to_string()),
+            change_id: Some(ChangeId::for_test_label("change-registered-schema")),
             commit_id: None,
             global: true,
             untracked: true,

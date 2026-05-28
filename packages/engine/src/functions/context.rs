@@ -280,9 +280,13 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content),
             metadata: None,
-            created_updated_at: crate::untracked_state::UntrackedStateRow::created_updated_at(
-                "1970-01-01T00:00:00.000Z".to_string(),
-                "1970-01-01T00:00:00.000Z".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "1970-01-01T00:00:00.000Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "1970-01-01T00:00:00.000Z",
             ),
             global: true,
             branch_id: GLOBAL_BRANCH_ID.to_string(),

@@ -25,6 +25,7 @@ use crate::branch::{
     branch_descriptor_stage_row, branch_descriptor_tombstone_row, branch_ref_stage_row,
     branch_ref_tombstone_row, BranchRefReader,
 };
+use crate::changelog::CommitId;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
@@ -671,7 +672,7 @@ struct BranchRow {
     id: String,
     name: String,
     hidden: bool,
-    commit_id: String,
+    commit_id: CommitId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -816,7 +817,7 @@ fn evaluate_branch_filters(
 
 fn branch_insert_rows_from_batch(
     batch: &RecordBatch,
-    default_commit_id: &str,
+    default_commit_id: &CommitId,
 ) -> Result<Vec<BranchRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
@@ -825,7 +826,11 @@ fn branch_insert_rows_from_batch(
             let hidden =
                 optional_bool_value(batch, row_index, "hidden", "INSERT")?.unwrap_or(false);
             let commit_id = optional_string_value(batch, row_index, "commit_id", "INSERT")?
-                .unwrap_or_else(|| default_commit_id.to_string());
+                .map(|commit_id| {
+                    parse_branch_row_commit_id(commit_id, TransactionWriteOperation::Insert)
+                })
+                .transpose()?
+                .unwrap_or(*default_commit_id);
             Ok(BranchRow {
                 id,
                 name,
@@ -843,7 +848,10 @@ fn branch_rows_from_batch(batch: &RecordBatch) -> Result<Vec<BranchRow>> {
                 id: required_string_value(batch, row_index, "id", "DELETE")?,
                 name: required_string_value(batch, row_index, "name", "DELETE")?,
                 hidden: required_bool_value(batch, row_index, "hidden", "DELETE")?,
-                commit_id: required_string_value(batch, row_index, "commit_id", "DELETE")?,
+                commit_id: parse_branch_row_commit_id(
+                    required_string_value(batch, row_index, "commit_id", "DELETE")?,
+                    TransactionWriteOperation::Delete,
+                )?,
             })
         })
         .collect()
@@ -901,16 +909,36 @@ fn branch_update_rows_from_batch(
                     row_index,
                     "hidden",
                 )?,
-                commit_id: update_string_value(
-                    batch,
-                    &assignment_values,
-                    table_schema,
-                    row_index,
-                    "commit_id",
+                commit_id: parse_branch_row_commit_id(
+                    update_string_value(
+                        batch,
+                        &assignment_values,
+                        table_schema,
+                        row_index,
+                        "commit_id",
+                    )?,
+                    TransactionWriteOperation::Update,
                 )?,
             })
         })
         .collect()
+}
+
+fn parse_branch_row_commit_id(
+    commit_id: String,
+    operation: TransactionWriteOperation,
+) -> Result<CommitId> {
+    let operation_name = match operation {
+        TransactionWriteOperation::Insert => "INSERT",
+        TransactionWriteOperation::Update => "UPDATE",
+        TransactionWriteOperation::Delete => "DELETE",
+    };
+    CommitId::parse_lix(&commit_id, "lix_branch commit_id").map_err(|error| {
+        DataFusionError::Execution(format!(
+            "{operation_name} lix_branch received invalid commit_id '{commit_id}': {}",
+            error.message
+        ))
+    })
 }
 
 fn branch_stage_rows(
@@ -1169,9 +1197,11 @@ fn branch_record_batch(projection: &[BranchColumn], rows: &[BranchRow]) -> Resul
             BranchColumn::Hidden => Arc::new(BooleanArray::from(
                 rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
             )) as ArrayRef,
-            BranchColumn::CommitId => {
-                string_array(rows.iter().map(|row| Some(row.commit_id.as_str())))
-            }
+            BranchColumn::CommitId => Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.commit_id.to_string())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
         })
         .collect::<Vec<_>>();
     record_batch_with_row_count(branch_schema(projection), arrays, rows.len()).map_err(|error| {
