@@ -44,7 +44,7 @@ macro_rules! simulation_test {
                                     .build()
                                     .expect("failed to build tokio runtime");
                                 runtime.block_on(async {
-                                    crate::support::simulation_test::engine::run_single_simulation_test(
+                                    crate::support::simulation_test::engine::run_simulation_test(
                                         simulation_mode,
                                         $options,
                                         case_id,

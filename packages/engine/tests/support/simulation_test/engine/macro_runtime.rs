@@ -1,19 +1,23 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use lix_engine::backend::InMemoryBackend;
 use lix_engine::LixError;
 use lix_engine::{Engine, InitReceipt};
 
-use super::expect_same::{SharedExpectSameRun, SharedExpectSameRunGuard, SimulationAssertions};
+use super::expect_same::{
+    SharedExpectSameCase, SharedExpectSameRun, SharedExpectSameRunGuard, SimulationAssertions,
+};
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::deterministic_timestamp_shuffle_for;
 use super::simulation::Simulation;
 
-/// Runs one matrix entry for `simulation_test!`.
+/// Runs one generated test entry for `simulation_test!`.
 ///
-/// The macro generates one Rust test per mode. `assert_same` coordinates across
-/// those test functions through shared state keyed by `case_id`.
-pub async fn run_single_simulation_test<F, Fut>(
+/// Non-base modes first execute the base mode in the same process. This keeps
+/// simulation comparisons compatible with runners like nextest that isolate
+/// every test case in a separate process.
+pub async fn run_simulation_test<F, Fut>(
     mode: SimulationMode,
     options: SimulationOptions,
     case_id: &str,
@@ -22,10 +26,57 @@ pub async fn run_single_simulation_test<F, Fut>(
     F: Fn(Simulation) -> Fut,
     Fut: Future<Output = ()>,
 {
+    if mode == SimulationMode::Base {
+        run_single_simulation_test(mode, options, case_id, test_fn).await;
+        return;
+    }
+
+    let shared_case = SharedExpectSameCase::new();
+    run_single_simulation_test_with_case(
+        SimulationMode::Base,
+        options,
+        case_id,
+        shared_case.clone(),
+        &test_fn,
+    )
+    .await;
+    run_single_simulation_test_with_case(mode, options, case_id, shared_case, &test_fn).await;
+}
+
+/// Runs one simulation mode without bootstrapping a base comparison first.
+async fn run_single_simulation_test<F, Fut>(
+    mode: SimulationMode,
+    options: SimulationOptions,
+    case_id: &str,
+    test_fn: F,
+) where
+    F: Fn(Simulation) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    run_single_simulation_test_with_case(
+        mode,
+        options,
+        case_id,
+        SharedExpectSameCase::new(),
+        &test_fn,
+    )
+    .await;
+}
+
+async fn run_single_simulation_test_with_case<F, Fut>(
+    mode: SimulationMode,
+    options: SimulationOptions,
+    case_id: &str,
+    shared_case: Arc<SharedExpectSameCase>,
+    test_fn: &F,
+) where
+    F: Fn(Simulation) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let bootstrap = Bootstrap::create()
         .await
         .expect("simulation bootstrap should initialize");
-    let expect_same = SharedExpectSameRun::new(case_id, mode);
+    let expect_same = SharedExpectSameRun::with_case(case_id, mode, shared_case);
     let _guard = SharedExpectSameRunGuard::new(expect_same.clone());
     let sim = Simulation::from_bootstrap(
         mode,

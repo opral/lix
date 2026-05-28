@@ -66,7 +66,7 @@ mod tests {
             "execute",
             "--params",
             "[\"first\", \"second\"]",
-            "SELECT ?1, ?2",
+            "SELECT $1, $2",
         ])
         .expect("parse succeeds");
 
@@ -74,7 +74,7 @@ mod tests {
             Some(Command::Sql(sql)) => match sql.command {
                 SqlSubcommand::Execute(args) => {
                     assert_eq!(args.params, Some("[\"first\", \"second\"]".to_string()));
-                    assert_eq!(args.sql, "SELECT ?1, ?2");
+                    assert_eq!(args.sql, "SELECT $1, $2");
                 }
             },
             _ => panic!("expected sql command"),
