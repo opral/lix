@@ -13,12 +13,12 @@ const targetDir = join(repoRoot, "target", profile);
 const source = join(
 	targetDir,
 	process.platform === "darwin"
-		? "liblix_js_sdk_native.dylib"
+		? "liblix_js_sdk.dylib"
 		: process.platform === "win32"
-			? "lix_js_sdk_native.dll"
-			: "liblix_js_sdk_native.so",
+			? "lix_js_sdk.dll"
+			: "liblix_js_sdk.so",
 );
-const destination = join(packageDir, "lix_js_sdk_native.node");
+const destination = join(packageDir, "lix_js_sdk.node");
 
 function run(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {

@@ -29,37 +29,24 @@ Lix is an **embeddable version control system** you import as a library. Give ag
 </p>
 
 ```bash
-npm install @lix-js/sdk better-sqlite3
+npm install @lix-js/sdk
 ```
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "app.lix" }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });
 
-const main = await lix.activeVersionId();
-
 await lix.execute(
-  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-  ["orders-file", "/orders.xlsx", bytes],
+  "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+  ["status", "draft"],
 );
 
-const draft = await lix.createVersion({ name: "Explore" });
-await lix.switchVersion({ versionId: draft.id });
-
-await lix.execute(
-  "UPDATE lix_file SET data = $1 WHERE path = '/orders.xlsx'",
-  [draftBytes],
-);
-
-await lix.switchVersion({ versionId: main });
-
-const merge = await lix.mergeVersion({
-  sourceVersionId: draft.id,
-});
+const main = await lix.activeBranchId();
+const draft = await lix.createBranch({ name: "Explore" });
+await lix.switchBranch({ branchId: draft.id });
 
 const changes = await lix.execute(
   "SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key",
@@ -85,11 +72,10 @@ Lix is built the other way around: version control runs in-process inside your a
 Import Lix and open it inside your app. No daemon, no protocol.
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "app.lix" }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });
 ```
 
@@ -116,36 +102,36 @@ try {
 }
 ```
 
-#### Parallel versions. No worktrees.
+#### Parallel branches. No worktrees.
 
-Give every agent its own isolated version without creating Git-style multi-checkout worktrees.
+Give every agent its own isolated branch without creating Git-style multi-checkout worktrees.
 
 ```ts
-const main = await lix.activeVersionId();
+const main = await lix.activeBranchId();
 
-const copy = await lix.createVersion({ name: "Copy draft" });
-const pricing = await lix.createVersion({ name: "Pricing draft" });
-const qa = await lix.createVersion({ name: "QA draft" });
+const copy = await lix.createBranch({ name: "Copy draft" });
+const pricing = await lix.createBranch({ name: "Pricing draft" });
+const qa = await lix.createBranch({ name: "QA draft" });
 
-await lix.switchVersion({ versionId: copy.id });
+await lix.switchBranch({ branchId: copy.id });
 await lix.execute(
   "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
   ["landing", "/landing.md", copyDraft],
 );
 
-await lix.switchVersion({ versionId: pricing.id });
+await lix.switchBranch({ branchId: pricing.id });
 await lix.execute(
   "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
   ["plans", "/plans.json", priceModel],
 );
 
-await lix.switchVersion({ versionId: qa.id });
+await lix.switchBranch({ branchId: qa.id });
 await lix.execute(
   "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
   ["qa-report", "/checks/report.json", testRun],
 );
 
-await lix.switchVersion({ versionId: main });
+await lix.switchBranch({ branchId: main });
 ```
 
 #### Semantic changes
@@ -219,7 +205,7 @@ Start in memory, then plug Lix into the infrastructure your app already runs.
 
 ```ts
 const lix = await openLix({
-  backend: createBackend({ url: env.LIX_BACKEND }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });
 ```
 

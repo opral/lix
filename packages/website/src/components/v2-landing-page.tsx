@@ -8,32 +8,31 @@ const pythonIssueUrl = "https://github.com/opral/lix/issues/373";
 const goIssueUrl = "https://github.com/opral/lix/issues/370";
 const npmUrl = "https://www.npmjs.com/package/@lix-js/sdk";
 
-const jsHeroSample = `import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+const jsHeroSample = `import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "app.lix" }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });
 
-const main = await lix.activeVersionId();
+const main = await lix.activeBranchId();
 
 await lix.execute(
   "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
   ["orders-file", "/orders.xlsx", bytes],
 );
 
-const draft = await lix.createVersion({ name: "Explore" });
-await lix.switchVersion({ versionId: draft.id });
+const draft = await lix.createBranch({ name: "Explore" });
+await lix.switchBranch({ branchId: draft.id });
 
 await lix.execute(
   "UPDATE lix_file SET data = $1 WHERE path = '/orders.xlsx'",
   [draftBytes],
 );
 
-await lix.switchVersion({ versionId: main });
+await lix.switchBranch({ branchId: main });
 
-const merge = await lix.mergeVersion({
-  sourceVersionId: draft.id,
+const merge = await lix.mergeBranch({
+  sourceBranchId: draft.id,
 });
 
 const changes = await lix.execute(
@@ -83,11 +82,10 @@ const features = [
     tag: "01",
     title: "Importable library.",
     body: "Import, open, run. Programmatic and in-process - no daemon, no protocol, no remote. In-memory by default; bring your own SQLite, Postgres, S3, or Cloudflare backend if needed.",
-    code: `import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+    code: `import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "app.lix" }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });`,
   },
   {
@@ -127,7 +125,7 @@ await agent3.commit();`,
     body: "Start in memory, then plug Lix into the infrastructure your app already runs: SQLite, Postgres, S3 object storage, Cloudflare storage, or your own backend adapter.",
     visual: "backend",
     code: `const lix = await openLix({
-  backend: createBackend({ url: env.LIX_BACKEND }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });`,
   },
 ];
@@ -181,7 +179,7 @@ function cn(...classes: Array<string | false | undefined>) {
 
 function highlightCode(code: string) {
   const pattern =
-    /(`[^`]*`|"[^"]*"|'[^']*'|\bORDER BY\b|\bGROUP BY\b|\b(?:import|from|const|let|await|async|return|use|SELECT|FROM|JOIN|WHERE|AND|AS|DESC|INSERT|INTO|VALUES|UPDATE|SET)\b|\b(?:openLix|createBackend|createBetterSqlite3Backend|sqlite|execute|transaction|create_session|createVersion|switchVersion|mergeVersionPreview|mergeVersion|activeVersionId|branch|diff|history|entity|write|commit|file|lix_json_get_text)\b|\b(?:lix_change|lix_file|xlsx_row)\b)/g;
+    /(`[^`]*`|"[^"]*"|'[^']*'|\bORDER BY\b|\bGROUP BY\b|\b(?:import|from|const|let|await|async|return|use|SELECT|FROM|JOIN|WHERE|AND|AS|DESC|INSERT|INTO|VALUES|UPDATE|SET)\b|\b(?:openLix|createBackend|SqliteBackend|sqlite|execute|transaction|create_session|createBranch|switchBranch|mergeBranchPreview|mergeBranch|activeBranchId|branch|diff|history|entity|write|commit|file|lix_json_get_text)\b|\b(?:lix_change|lix_file|xlsx_row)\b)/g;
 
   return code.split(pattern).map((part, index) => {
     if (!part) return null;
@@ -196,7 +194,7 @@ function highlightCode(code: string) {
     ) {
       className = "text-[#6d28d9]";
     } else if (
-      /^(openLix|createBackend|createBetterSqlite3Backend|sqlite|execute|transaction|create_session|createVersion|switchVersion|mergeVersionPreview|mergeVersion|activeVersionId|branch|diff|history|entity|write|commit|file|lix_json_get_text)$/.test(
+      /^(openLix|createBackend|SqliteBackend|sqlite|execute|transaction|create_session|createBranch|switchBranch|mergeBranchPreview|mergeBranch|activeBranchId|branch|diff|history|entity|write|commit|file|lix_json_get_text)$/.test(
         part,
       )
     ) {
