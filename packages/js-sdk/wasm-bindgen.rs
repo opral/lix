@@ -277,7 +277,7 @@ export type MergeConflictSide = {
         async fn create_branch(
             &self,
             options: CreateBranchOptions,
-        ) -> Result<lix_rs_sdk::CreateBranchResult, LixError> {
+        ) -> Result<lix_rs_sdk::CreateBranchReceipt, LixError> {
             match self {
                 LixInner::InMemory(inner) => inner.create_branch(options).await,
                 LixInner::Js(inner) => inner.create_branch(options).await,
@@ -287,7 +287,7 @@ export type MergeConflictSide = {
         async fn switch_branch(
             &self,
             options: SwitchBranchOptions,
-        ) -> Result<lix_rs_sdk::SwitchBranchResult, LixError> {
+        ) -> Result<lix_rs_sdk::SwitchBranchReceipt, LixError> {
             match self {
                 LixInner::InMemory(inner) => inner.switch_branch(options).await,
                 LixInner::Js(inner) => inner.switch_branch(options).await,
@@ -307,7 +307,7 @@ export type MergeConflictSide = {
         async fn merge_branch(
             &self,
             options: MergeBranchOptions,
-        ) -> Result<lix_rs_sdk::MergeBranchResult, LixError> {
+        ) -> Result<lix_rs_sdk::MergeBranchReceipt, LixError> {
             match self {
                 LixInner::InMemory(inner) => inner.merge_branch(options).await,
                 LixInner::Js(inner) => inner.merge_branch(options).await,
