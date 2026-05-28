@@ -1,73 +1,29 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.6.0-preview.5",
+	"version": "0.6.0",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
-	"files": [
-		"dist",
-		"dist-engine-src",
-		"SKILL.md"
-	],
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
-		},
-		"./sqlite": {
-			"types": "./dist/sqlite/index.d.ts",
-			"default": "./dist/sqlite/index.js"
 		}
 	},
-	"description": "WASM-backed JS SDK wrapper for Lix",
-	"engines": {
-		"node": ">=22"
-	},
+	"files": [
+		"dist",
+		"*.node"
+	],
 	"scripts": {
-		"build": "node ./scripts/build.js",
-		"sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",
-		"sync:engine-src": "node ./scripts/sync-engine-src.js",
-		"prepack": "node ./scripts/sync-engine-src.js",
-		"typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
-		"test": "node ./scripts/build.js && vitest run",
-		"test:watch": "node ./scripts/build.js && vitest",
-		"format": "prettier --write --ignore-unknown ."
-	},
-	"peerDependencies": {
-		"better-sqlite3": "^12.9.0"
-	},
-	"peerDependenciesMeta": {
-		"better-sqlite3": {
-			"optional": true
-		}
+		"build": "pnpm run build:native && pnpm run build:ts",
+		"build:native": "node ./scripts/build-native.js",
+		"build:ts": "tsc -p tsconfig.json",
+		"test": "pnpm run build && vitest run",
+		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"devDependencies": {
-		"better-sqlite3": "^12.10.0",
+		"@types/node": "^24.10.2",
 		"typescript": "^5.5.4",
 		"vitest": "^4.0.18"
-	},
-	"nx": {
-		"targets": {
-			"build": {
-				"inputs": [
-					"default",
-					"^default",
-					"publicEnv",
-					"nodeVersion",
-					"platform",
-					"{workspaceRoot}/Cargo.toml",
-					"{workspaceRoot}/Cargo.lock",
-					"{workspaceRoot}/packages/engine/**/*",
-					"{workspaceRoot}/packages/rs-sdk/**/*",
-					"{workspaceRoot}/packages/js-sdk/Cargo.toml",
-					"{workspaceRoot}/packages/js-sdk/wasm-bindgen.rs"
-				],
-				"outputs": [
-					"{projectRoot}/dist",
-					"{projectRoot}/dist-engine-src",
-					"{projectRoot}/src/engine-wasm/wasm"
-				]
-			}
-		}
 	}
 }
