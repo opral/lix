@@ -6,12 +6,13 @@ mod wasm {
     use bytes::Bytes;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix_with_backend, Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-        CommitResult, CoreProjection, CreateBranchOptions, ExecuteResult, GetOptions,
-        InMemoryBackend, Key, KeyRange, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-        MergeBranchOptions, MergeBranchPreviewOptions, PointVisitor, ProjectedValueRef, PutBatch,
-        ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, SwitchBranchOptions, Value,
-        WriteOptions, WriteStats,
+        open_lix_with_backend, run_backend_conformance, Backend, BackendConformanceStatus,
+        BackendError, BackendFactory, BackendFixture, BackendRangeScan, BackendRead,
+        BackendTestConfig, BackendWrite, CommitResult, CoreProjection, CreateBranchOptions,
+        ExecuteResult, GetOptions, InMemoryBackend, Key, KeyRange, Lix as RsLix, LixError,
+        LixTransaction as RsLixTransaction, MergeBranchOptions, MergeBranchPreviewOptions,
+        PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
+        ScanVisitor, StoredValue, SwitchBranchOptions, Value, WriteOptions, WriteStats,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -50,52 +51,28 @@ export type LixNotice = {
   hint?: string;
 };
 
-export type BackendKvScanRange =
-  | { kind: "prefix"; prefix: Uint8Array }
-  | { kind: "range"; start: Uint8Array; end: Uint8Array };
+export type BackendKvBound =
+  | { kind: "included"; key: Uint8Array }
+  | { kind: "excluded"; key: Uint8Array }
+  | { kind: "unbounded" };
 
-export type BackendKvGetRequest = {
-  groups: BackendKvGetGroup[];
+export type BackendKvScanRange = {
+  lower: BackendKvBound;
+  upper: BackendKvBound;
 };
 
-export type BackendKvGetGroup = {
-  namespace: string;
+export type BackendKvGetRequest = {
   keys: Uint8Array[];
 };
 
 export type BackendKvValueBatch = {
-  groups: BackendKvValueGroup[];
-};
-
-export type BackendKvValueGroup = {
-  namespace: string;
   values: Array<Uint8Array | null>;
 };
 
-export type BackendKvExistsBatch = {
-  groups: BackendKvExistsGroup[];
-};
-
-export type BackendKvExistsGroup = {
-  namespace: string;
-  exists: boolean[];
-};
-
 export type BackendKvScanRequest = {
-  namespace: string;
   range: BackendKvScanRange;
   after?: Uint8Array | null;
   limit: number;
-};
-
-export type BackendKvKeyPage = {
-  keys: Uint8Array[];
-  resumeAfter?: Uint8Array | null;
-};
-
-export type BackendKvValuePage = {
-  values: Uint8Array[];
-  resumeAfter?: Uint8Array | null;
 };
 
 export type BackendKvEntryPage = {
@@ -110,11 +87,6 @@ export type BackendKvWriteOp =
   | { kind: "deleteRange"; range: BackendKvScanRange };
 
 export type BackendKvWriteBatch = {
-  groups: BackendKvWriteGroup[];
-};
-
-export type BackendKvWriteGroup = {
-  namespace: string;
   ops: BackendKvWriteOp[];
 };
 
@@ -127,9 +99,6 @@ export type BackendKvWriteStats = {
 
 export type BackendReadTransaction = {
   getValues(request: BackendKvGetRequest): BackendKvValueBatch;
-  existsMany(request: BackendKvGetRequest): BackendKvExistsBatch;
-  scanKeys(request: BackendKvScanRequest): BackendKvKeyPage;
-  scanValues(request: BackendKvScanRequest): BackendKvValuePage;
   scanEntries(request: BackendKvScanRequest): BackendKvEntryPage;
   rollback(): void;
 };
@@ -150,6 +119,32 @@ export type Backend = {
    */
   beginWriteTransaction(): BackendWriteTransaction;
   close?(): void;
+};
+
+export type BackendConformanceFactory = {
+  createFixture(): BackendConformanceFixture;
+  config?: Partial<BackendConformanceConfig>;
+};
+
+export type BackendConformanceFixture = {
+  open(): Backend;
+};
+
+export type BackendConformanceConfig = {
+  maxKeyLen: number;
+  maxValueLen: number;
+  ephemeral: boolean;
+  supportsConcurrentWriters: boolean;
+};
+
+export type BackendConformanceReport = {
+  tests: BackendConformanceTest[];
+};
+
+export type BackendConformanceTest = {
+  name: string;
+  status: "passed" | "failed" | "pending";
+  error?: string;
 };
 
 export type OpenLixOptions = {
@@ -554,6 +549,13 @@ export type MergeConflictSide = {
         })
     }
 
+    #[wasm_bindgen(js_name = runBackendConformance)]
+    pub fn run_backend_conformance_js(factory: JsValue) -> Result<JsValue, JsValue> {
+        let factory = JsBackendConformanceFactory::new(factory).map_err(js_error)?;
+        let report = run_backend_conformance(&factory);
+        backend_conformance_report_to_js(report).map_err(js_error)
+    }
+
     struct WasmOpenLixOptions {
         backend: Option<JsBackend>,
         backend_handle: Option<JsValue>,
@@ -614,6 +616,20 @@ export type MergeConflictSide = {
         inner: JsValue,
     }
 
+    struct JsBackendConformanceFactory {
+        inner: JsValue,
+        config: BackendTestConfig,
+    }
+
+    struct JsBackendConformanceFixture {
+        inner: JsValue,
+    }
+
+    struct JsConformanceBackend {
+        inner: JsBackend,
+        handle: JsValue,
+    }
+
     impl JsBackend {
         fn new(inner: JsValue) -> Self {
             Self { inner }
@@ -627,6 +643,81 @@ export type MergeConflictSide = {
                 )));
             }
             Ok(transaction)
+        }
+    }
+
+    impl JsBackendConformanceFactory {
+        fn new(inner: JsValue) -> Result<Self, LixError> {
+            if inner.is_null() || inner.is_undefined() || !inner.is_object() {
+                return Err(js_sdk_error(
+                    "runBackendConformance() factory must be an object",
+                ));
+            }
+            let object = Object::from(inner.clone());
+            Ok(Self {
+                inner,
+                config: backend_conformance_config_from_js(&object)?,
+            })
+        }
+    }
+
+    impl BackendFactory for JsBackendConformanceFactory {
+        type Backend = JsConformanceBackend;
+        type Fixture = JsBackendConformanceFixture;
+
+        fn create_fixture(&self) -> Self::Fixture {
+            let fixture = call_method0(&self.inner, "createFixture")
+                .expect("runBackendConformance() factory.createFixture() failed");
+            if fixture.is_null() || fixture.is_undefined() || !fixture.is_object() {
+                panic!("runBackendConformance() factory.createFixture() must return an object");
+            }
+            JsBackendConformanceFixture { inner: fixture }
+        }
+
+        fn config(&self) -> BackendTestConfig {
+            self.config.clone()
+        }
+    }
+
+    impl BackendFixture for JsBackendConformanceFixture {
+        type Backend = JsConformanceBackend;
+
+        fn open(&self) -> Self::Backend {
+            let backend = call_method0(&self.inner, "open")
+                .expect("runBackendConformance() fixture.open() failed");
+            if backend.is_null() || backend.is_undefined() || !backend.is_object() {
+                panic!("runBackendConformance() fixture.open() must return a backend object");
+            }
+            JsConformanceBackend {
+                inner: JsBackend::new(backend.clone()),
+                handle: backend,
+            }
+        }
+    }
+
+    impl Backend for JsConformanceBackend {
+        type Read<'a>
+            = JsBackendRead
+        where
+            Self: 'a;
+
+        type Write<'a>
+            = JsBackendWrite
+        where
+            Self: 'a;
+
+        fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+            self.inner.begin_read(opts)
+        }
+
+        fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+            self.inner.begin_write(opts)
+        }
+    }
+
+    impl Drop for JsConformanceBackend {
+        fn drop(&mut self) {
+            let _ = close_js_backend(&self.handle);
         }
     }
 
@@ -869,8 +960,6 @@ export type MergeConflictSide = {
         JsValue::from_f64(value as f64)
     }
 
-    const JS_BACKEND_NAMESPACE: &str = "default";
-
     enum JsWriteOp {
         Put { key: Key, value: StoredValue },
         Delete(Key),
@@ -917,6 +1006,75 @@ export type MergeConflictSide = {
         Ok(())
     }
 
+    fn backend_conformance_config_from_js(
+        factory: &Object,
+    ) -> Result<BackendTestConfig, LixError> {
+        let mut config = BackendTestConfig::default();
+        let value = Reflect::get(factory, &JsValue::from_str("config"))
+            .map_err(|_| js_sdk_error("runBackendConformance() could not read config"))?;
+        if value.is_undefined() || value.is_null() {
+            return Ok(config);
+        }
+        if !value.is_object() {
+            return Err(js_sdk_error(
+                "runBackendConformance() config must be an object when provided",
+            ));
+        }
+        let object = Object::from(value);
+        if let Some(max_key_len) = optional_usize(&object, "maxKeyLen", "config")? {
+            config.max_key_len = max_key_len;
+        }
+        if let Some(max_value_len) = optional_usize(&object, "maxValueLen", "config")? {
+            config.max_value_len = max_value_len;
+        }
+        if let Some(ephemeral) = optional_bool(&object, "ephemeral", "config")? {
+            config.ephemeral = ephemeral;
+        }
+        if let Some(supports_concurrent_writers) =
+            optional_bool(&object, "supportsConcurrentWriters", "config")?
+        {
+            config.supports_concurrent_writers = supports_concurrent_writers;
+        }
+        Ok(config)
+    }
+
+    fn backend_conformance_report_to_js(
+        report: lix_rs_sdk::BackendConformanceReport,
+    ) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        let tests = Array::new();
+        for test in report.tests {
+            let test_object = Object::new();
+            Reflect::set(
+                &test_object,
+                &JsValue::from_str("name"),
+                &JsValue::from_str(test.name),
+            )
+            .map_err(|_| js_sdk_error("could not set conformance test name"))?;
+            match test.status {
+                BackendConformanceStatus::Passed => {
+                    set_string(&test_object, "status", "passed")?;
+                }
+                BackendConformanceStatus::Pending => {
+                    set_string(&test_object, "status", "pending")?;
+                }
+                BackendConformanceStatus::Failed(error) => {
+                    set_string(&test_object, "status", "failed")?;
+                    Reflect::set(
+                        &test_object,
+                        &JsValue::from_str("error"),
+                        &JsValue::from_str(&error),
+                    )
+                    .map_err(|_| js_sdk_error("could not set conformance test error"))?;
+                }
+            }
+            tests.push(&test_object);
+        }
+        Reflect::set(&object, &JsValue::from_str("tests"), &tests)
+            .map_err(|_| js_sdk_error("could not set conformance tests"))?;
+        Ok(object.into())
+    }
+
     fn to_backend_error(error: LixError) -> BackendError {
         BackendError::Io(error.to_string())
     }
@@ -926,34 +1084,15 @@ export type MergeConflictSide = {
         keys: &[Key],
     ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
         let object = Object::new();
-        let groups = Array::new();
-        let group_object = Object::new();
-        set_string(&group_object, "namespace", JS_BACKEND_NAMESPACE).map_err(to_backend_error)?;
         let js_keys = Array::new();
         for key in keys {
             js_keys.push(&bytes_to_js(key.0.as_ref()));
         }
-        Reflect::set(&group_object, &JsValue::from_str("keys"), &js_keys)
+        Reflect::set(&object, &JsValue::from_str("keys"), &js_keys)
             .map_err(|_| to_backend_error(js_sdk_error("could not set get request keys")))?;
-        groups.push(&group_object);
-        Reflect::set(&object, &JsValue::from_str("groups"), &groups)
-            .map_err(|_| to_backend_error(js_sdk_error("could not set get request groups")))?;
         let response =
             call_method1(transaction, "getValues", &object.into()).map_err(to_backend_error)?;
         js_value_to_values(response, "transaction.getValues").map_err(to_backend_error)
-    }
-
-    fn next_lexicographic_key(key: &Key) -> Option<Key> {
-        let mut bytes = key.0.to_vec();
-        while let Some(last) = bytes.last_mut() {
-            if *last == u8::MAX {
-                bytes.pop();
-            } else {
-                *last += 1;
-                return Some(Key(Bytes::from(bytes)));
-            }
-        }
-        None
     }
 
     fn choose_scan_after(explicit_after: Option<&Key>, lower_after: Option<&Key>) -> Option<Key> {
@@ -967,76 +1106,63 @@ export type MergeConflictSide = {
         }
     }
 
-    fn kv_range_to_js(start: &Key, end: &Key) -> Result<JsValue, BackendError> {
+    fn kv_bound_to_js(bound: &Bound<Key>) -> Result<JsValue, BackendError> {
         let object = Object::new();
-        set_string(&object, "kind", "range").map_err(to_backend_error)?;
-        Reflect::set(
-            &object,
-            &JsValue::from_str("start"),
-            &bytes_to_js(start.0.as_ref()),
-        )
-        .map_err(|_| to_backend_error(js_sdk_error("could not set range.start")))?;
-        Reflect::set(
-            &object,
-            &JsValue::from_str("end"),
-            &bytes_to_js(end.0.as_ref()),
-        )
-        .map_err(|_| to_backend_error(js_sdk_error("could not set range.end")))?;
-        Ok(object.into())
-    }
-
-    fn kv_prefix_to_js(prefix: &Key) -> Result<JsValue, BackendError> {
-        let object = Object::new();
-        set_string(&object, "kind", "prefix").map_err(to_backend_error)?;
-        Reflect::set(
-            &object,
-            &JsValue::from_str("prefix"),
-            &bytes_to_js(prefix.0.as_ref()),
-        )
-        .map_err(|_| to_backend_error(js_sdk_error("could not set range.prefix")))?;
+        match bound {
+            Bound::Included(key) => {
+                set_string(&object, "kind", "included").map_err(to_backend_error)?;
+                Reflect::set(
+                    &object,
+                    &JsValue::from_str("key"),
+                    &bytes_to_js(key.0.as_ref()),
+                )
+                .map_err(|_| to_backend_error(js_sdk_error("could not set bound.key")))?;
+            }
+            Bound::Excluded(key) => {
+                set_string(&object, "kind", "excluded").map_err(to_backend_error)?;
+                Reflect::set(
+                    &object,
+                    &JsValue::from_str("key"),
+                    &bytes_to_js(key.0.as_ref()),
+                )
+                .map_err(|_| to_backend_error(js_sdk_error("could not set bound.key")))?;
+            }
+            Bound::Unbounded => {
+                set_string(&object, "kind", "unbounded").map_err(to_backend_error)?;
+            }
+        }
         Ok(object.into())
     }
 
     fn kv_scan_range_to_js(range: &KeyRange) -> Result<JsValue, BackendError> {
-        match (&range.lower, &range.upper) {
-            (Bound::Included(start), Bound::Excluded(end)) => kv_range_to_js(start, end),
-            (Bound::Included(start), Bound::Included(end)) => {
-                let end = next_lexicographic_key(end).ok_or(BackendError::InvalidKey)?;
-                kv_range_to_js(start, &end)
-            }
-            (Bound::Included(prefix), Bound::Unbounded) => kv_prefix_to_js(prefix),
-            _ => Err(BackendError::InvalidKey),
-        }
+        let object = Object::new();
+        Reflect::set(
+            &object,
+            &JsValue::from_str("lower"),
+            &kv_bound_to_js(&range.lower)?,
+        )
+        .map_err(|_| to_backend_error(js_sdk_error("could not set range.lower")))?;
+        Reflect::set(
+            &object,
+            &JsValue::from_str("upper"),
+            &kv_bound_to_js(&range.upper)?,
+        )
+        .map_err(|_| to_backend_error(js_sdk_error("could not set range.upper")))?;
+        Ok(object.into())
     }
 
     fn kv_scan_range_and_after_to_js(
         range: &KeyRange,
         after: Option<&Key>,
     ) -> Result<(JsValue, Option<Key>), BackendError> {
-        match (&range.lower, &range.upper) {
-            (Bound::Included(start), Bound::Excluded(end)) => {
-                Ok((kv_range_to_js(start, end)?, choose_scan_after(after, None)))
-            }
-            (Bound::Excluded(start), Bound::Excluded(end)) => Ok((
-                kv_range_to_js(start, end)?,
-                choose_scan_after(after, Some(start)),
-            )),
-            (Bound::Included(start), Bound::Included(end)) => {
-                let end = next_lexicographic_key(end).ok_or(BackendError::InvalidKey)?;
-                Ok((kv_range_to_js(start, &end)?, choose_scan_after(after, None)))
-            }
-            (Bound::Excluded(start), Bound::Included(end)) => {
-                let end = next_lexicographic_key(end).ok_or(BackendError::InvalidKey)?;
-                Ok((
-                    kv_range_to_js(start, &end)?,
-                    choose_scan_after(after, Some(start)),
-                ))
-            }
-            (Bound::Included(prefix), Bound::Unbounded) => {
-                Ok((kv_prefix_to_js(prefix)?, choose_scan_after(after, None)))
-            }
-            _ => Err(BackendError::InvalidKey),
-        }
+        let lower_after = match &range.lower {
+            Bound::Excluded(start) => Some(start),
+            _ => None,
+        };
+        Ok((
+            kv_scan_range_to_js(range)?,
+            choose_scan_after(after, lower_after),
+        ))
     }
 
     fn kv_scan_request_to_js(
@@ -1046,7 +1172,6 @@ export type MergeConflictSide = {
     ) -> Result<JsValue, BackendError> {
         let object = Object::new();
         let (range, after) = kv_scan_range_and_after_to_js(range, after)?;
-        set_string(&object, "namespace", JS_BACKEND_NAMESPACE).map_err(to_backend_error)?;
         Reflect::set(&object, &JsValue::from_str("range"), &range)
             .map_err(|_| to_backend_error(js_sdk_error("could not set scan request range")))?;
         let after = after
@@ -1062,9 +1187,6 @@ export type MergeConflictSide = {
 
     fn kv_write_batch_to_js(ops: Vec<JsWriteOp>) -> Result<JsValue, BackendError> {
         let object = Object::new();
-        let groups = Array::new();
-        let group_object = Object::new();
-        set_string(&group_object, "namespace", JS_BACKEND_NAMESPACE).map_err(to_backend_error)?;
         let js_ops = Array::new();
         for op in ops {
             let op_object = Object::new();
@@ -1109,34 +1231,20 @@ export type MergeConflictSide = {
             }
             js_ops.push(&op_object);
         }
-        Reflect::set(&group_object, &JsValue::from_str("ops"), &js_ops)
+        Reflect::set(&object, &JsValue::from_str("ops"), &js_ops)
             .map_err(|_| to_backend_error(js_sdk_error("could not set write ops")))?;
-        groups.push(&group_object);
-        Reflect::set(&object, &JsValue::from_str("groups"), &groups)
-            .map_err(|_| to_backend_error(js_sdk_error("could not set write groups")))?;
         Ok(object.into())
     }
 
     fn js_value_to_values(value: JsValue, context: &str) -> Result<Vec<Option<Vec<u8>>>, LixError> {
         let object = expect_backend_object(value, context)?;
-        let groups = required_array(&object, "groups", context)?;
-        if groups.length() != 1 {
-            return Err(js_sdk_error(format!(
-                "{context}.groups must contain one group"
-            )));
-        }
-        let group_context = format!("{context}.groups[0]");
-        let group = expect_backend_object(groups.get(0), &group_context)?;
-        let values = required_array(&group, "values", &group_context)?;
+        let values = required_array(&object, "values", context)?;
         let mut out = Vec::with_capacity(values.length() as usize);
         for value in values.iter() {
             if value.is_null() || value.is_undefined() {
                 out.push(None);
             } else {
-                out.push(Some(js_value_to_bytes(
-                    value,
-                    &format!("{group_context}.values"),
-                )?));
+                out.push(Some(js_value_to_bytes(value, &format!("{context}.values"))?));
             }
         }
         Ok(out)
@@ -1209,228 +1317,6 @@ export type MergeConflictSide = {
             .map_err(to_backend_error)
     }
 
-    #[cfg(any())]
-    fn kv_get_request_to_js(request: &BackendKvGetRequest) -> Result<JsValue, LixError> {
-        let object = Object::new();
-        let groups = Array::new();
-        for group in &request.groups {
-            let group_object = Object::new();
-            set_string(&group_object, "namespace", &group.namespace)?;
-            let keys = Array::new();
-            for key in &group.keys {
-                keys.push(&bytes_to_js(key));
-            }
-            Reflect::set(&group_object, &JsValue::from_str("keys"), &keys)
-                .map_err(|_| js_sdk_error("could not set get request keys"))?;
-            groups.push(&group_object);
-        }
-        Reflect::set(&object, &JsValue::from_str("groups"), &groups)
-            .map_err(|_| js_sdk_error("could not set get request groups"))?;
-        Ok(object.into())
-    }
-
-    #[cfg(any())]
-    fn kv_scan_range_to_js(range: &BackendKvScanRange) -> Result<JsValue, LixError> {
-        let object = Object::new();
-        match range {
-            BackendKvScanRange::Prefix(prefix) => {
-                set_string(&object, "kind", "prefix")?;
-                Reflect::set(&object, &JsValue::from_str("prefix"), &bytes_to_js(prefix))
-                    .map_err(|_| js_sdk_error("could not set range.prefix"))?;
-            }
-            BackendKvScanRange::Range { start, end } => {
-                set_string(&object, "kind", "range")?;
-                Reflect::set(&object, &JsValue::from_str("start"), &bytes_to_js(start))
-                    .map_err(|_| js_sdk_error("could not set range.start"))?;
-                Reflect::set(&object, &JsValue::from_str("end"), &bytes_to_js(end))
-                    .map_err(|_| js_sdk_error("could not set range.end"))?;
-            }
-        }
-        Ok(object.into())
-    }
-
-    #[cfg(any())]
-    fn kv_scan_request_to_js(request: &BackendKvScanRequest) -> Result<JsValue, LixError> {
-        let object = Object::new();
-        set_string(&object, "namespace", &request.namespace)?;
-        Reflect::set(
-            &object,
-            &JsValue::from_str("range"),
-            &kv_scan_range_to_js(&request.range)?,
-        )
-        .map_err(|_| js_sdk_error("could not set scan request range"))?;
-        let after = request
-            .after
-            .as_deref()
-            .map(bytes_to_js)
-            .unwrap_or(JsValue::NULL);
-        Reflect::set(&object, &JsValue::from_str("after"), &after)
-            .map_err(|_| js_sdk_error("could not set scan request after"))?;
-        Reflect::set(
-            &object,
-            &JsValue::from_str("limit"),
-            &usize_to_js(request.limit),
-        )
-        .map_err(|_| js_sdk_error("could not set scan request limit"))?;
-        Ok(object.into())
-    }
-
-    #[cfg(any())]
-    fn kv_write_batch_to_js(batch: &BackendKvWriteBatch) -> Result<JsValue, LixError> {
-        let object = Object::new();
-        let groups = Array::new();
-        for group in &batch.groups {
-            let group_object = Object::new();
-            set_string(&group_object, "namespace", group.namespace())?;
-
-            let ops = Array::new();
-            for op in group.ops() {
-                let op_object = Object::new();
-                match op {
-                    BackendKvWriteOp::Put { key, value } => {
-                        set_string(&op_object, "kind", "put")?;
-                        Reflect::set(&op_object, &JsValue::from_str("key"), &bytes_to_js(key))
-                            .map_err(|_| js_sdk_error("could not set write put key"))?;
-                        Reflect::set(&op_object, &JsValue::from_str("value"), &bytes_to_js(value))
-                            .map_err(|_| js_sdk_error("could not set write put value"))?;
-                    }
-                    BackendKvWriteOp::Delete { key } => {
-                        set_string(&op_object, "kind", "delete")?;
-                        Reflect::set(&op_object, &JsValue::from_str("key"), &bytes_to_js(key))
-                            .map_err(|_| js_sdk_error("could not set write delete key"))?;
-                    }
-                    BackendKvWriteOp::DeleteRange { range } => {
-                        set_string(&op_object, "kind", "deleteRange")?;
-                        Reflect::set(
-                            &op_object,
-                            &JsValue::from_str("range"),
-                            &kv_scan_range_to_js(range)?,
-                        )
-                        .map_err(|_| js_sdk_error("could not set write delete range"))?;
-                    }
-                }
-                ops.push(&op_object);
-            }
-            Reflect::set(&group_object, &JsValue::from_str("ops"), &ops)
-                .map_err(|_| js_sdk_error("could not set write ops"))?;
-            groups.push(&group_object);
-        }
-        Reflect::set(&object, &JsValue::from_str("groups"), &groups)
-            .map_err(|_| js_sdk_error("could not set write groups"))?;
-        Ok(object.into())
-    }
-
-    #[cfg(any())]
-    fn js_value_to_value_batch(
-        value: JsValue,
-        context: &str,
-    ) -> Result<BackendKvValueBatch, LixError> {
-        let object = expect_backend_object(value, context)?;
-        let groups = required_array(&object, "groups", context)?;
-        let groups = groups
-            .iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let group_context = format!("{context}.groups[{index}]");
-                let group = expect_backend_object(group, &group_context)?;
-                let namespace = required_string(&group, "namespace", &group_context)?;
-                let values = required_array(&group, "values", &group_context)?;
-                let mut bytes = BytePageBuilder::with_capacity(values.length() as usize, 0);
-                let mut present = Vec::with_capacity(values.length() as usize);
-                for value in values.iter() {
-                    if value.is_null() || value.is_undefined() {
-                        bytes.push([]);
-                        present.push(false);
-                    } else {
-                        bytes.push(js_value_to_bytes(
-                            value,
-                            &format!("{group_context}.values"),
-                        )?);
-                        present.push(true);
-                    }
-                }
-                Ok(BackendKvValueGroup::new(namespace, bytes.finish(), present))
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        Ok(BackendKvValueBatch { groups })
-    }
-
-    #[cfg(any())]
-    fn js_value_to_exists_batch(
-        value: JsValue,
-        context: &str,
-    ) -> Result<BackendKvExistsBatch, LixError> {
-        let object = expect_backend_object(value, context)?;
-        let groups = required_array(&object, "groups", context)?;
-        let groups = groups
-            .iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let group_context = format!("{context}.groups[{index}]");
-                let group = expect_backend_object(group, &group_context)?;
-                let namespace = required_string(&group, "namespace", &group_context)?;
-                let exists = required_array(&group, "exists", &group_context)?
-                    .iter()
-                    .map(|value| {
-                        value.as_bool().ok_or_else(|| {
-                            js_sdk_error(format!("{group_context}.exists must contain booleans"))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, LixError>>()?;
-                Ok(BackendKvExistsGroup { namespace, exists })
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
-        Ok(BackendKvExistsBatch { groups })
-    }
-
-    #[cfg(any())]
-    fn js_value_to_key_page(value: JsValue, context: &str) -> Result<BackendKvKeyPage, LixError> {
-        let object = expect_backend_object(value, context)?;
-        Ok(BackendKvKeyPage {
-            keys: byte_array_property(&object, "keys", context)?.finish(),
-            resume_after: optional_bytes_property(&object, "resumeAfter", context)?,
-        })
-    }
-
-    #[cfg(any())]
-    fn js_value_to_value_page(
-        value: JsValue,
-        context: &str,
-    ) -> Result<BackendKvValuePage, LixError> {
-        let object = expect_backend_object(value, context)?;
-        Ok(BackendKvValuePage {
-            values: byte_array_property(&object, "values", context)?.finish(),
-            resume_after: optional_bytes_property(&object, "resumeAfter", context)?,
-        })
-    }
-
-    #[cfg(any())]
-    fn js_value_to_entry_page(
-        value: JsValue,
-        context: &str,
-    ) -> Result<BackendKvEntryPage, LixError> {
-        let object = expect_backend_object(value, context)?;
-        Ok(BackendKvEntryPage {
-            keys: byte_array_property(&object, "keys", context)?.finish(),
-            values: byte_array_property(&object, "values", context)?.finish(),
-            resume_after: optional_bytes_property(&object, "resumeAfter", context)?,
-        })
-    }
-
-    #[cfg(any())]
-    fn js_value_to_write_stats(
-        value: JsValue,
-        context: &str,
-    ) -> Result<BackendKvWriteStats, LixError> {
-        let object = expect_backend_object(value, context)?;
-        Ok(BackendKvWriteStats {
-            puts: required_usize(&object, "puts", context)?,
-            deletes: required_usize(&object, "deletes", context)?,
-            delete_ranges: required_usize(&object, "deleteRanges", context)?,
-            bytes_written: required_usize(&object, "bytesWritten", context)?,
-        })
-    }
-
     fn expect_backend_object(value: JsValue, context: &str) -> Result<Object, LixError> {
         if value.is_null() || value.is_undefined() || !value.is_object() {
             return Err(js_sdk_error(format!("{context} must return an object")));
@@ -1445,34 +1331,6 @@ export type MergeConflictSide = {
             return Err(js_sdk_error(format!("{context}.{key} must be an array")));
         }
         Ok(Array::from(&value))
-    }
-
-    #[cfg(any())]
-    fn byte_array_property(
-        object: &Object,
-        key: &str,
-        context: &str,
-    ) -> Result<BytePageBuilder, LixError> {
-        let array = required_array(object, key, context)?;
-        let mut page = BytePageBuilder::with_capacity(array.length() as usize, 0);
-        for value in array.iter() {
-            page.push(js_value_to_bytes(value, &format!("{context}.{key}"))?);
-        }
-        Ok(page)
-    }
-
-    #[cfg(any())]
-    fn optional_bytes_property(
-        object: &Object,
-        key: &str,
-        context: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        let value = Reflect::get(object, &JsValue::from_str(key))
-            .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
-        if value.is_undefined() || value.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(js_value_to_bytes(value, &format!("{context}.{key}"))?))
     }
 
     fn required_usize(object: &Object, key: &str, context: &str) -> Result<usize, LixError> {
@@ -1658,6 +1516,43 @@ export type MergeConflictSide = {
             "LIX_ERROR_JS_SDK",
             format!("{method}() requires {key} to be a non-empty string when provided"),
         ))
+    }
+
+    fn optional_bool(
+        object: &Object,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<bool>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key))
+            .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
+        if value.is_undefined() || value.is_null() {
+            return Ok(None);
+        }
+        value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| js_sdk_error(format!("{context}.{key} must be a boolean")))
+    }
+
+    fn optional_usize(
+        object: &Object,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<usize>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key))
+            .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
+        if value.is_undefined() || value.is_null() {
+            return Ok(None);
+        }
+        let number = value
+            .as_f64()
+            .ok_or_else(|| js_sdk_error(format!("{context}.{key} must be a number")))?;
+        if !number.is_finite() || number < 0.0 || number.fract() != 0.0 {
+            return Err(js_sdk_error(format!(
+                "{context}.{key} must be a non-negative integer"
+            )));
+        }
+        Ok(Some(number as usize))
     }
 
     fn value_from_js(value: JsValue) -> Result<Value, LixError> {
