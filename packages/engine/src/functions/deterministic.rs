@@ -1,3 +1,4 @@
+use crate::common::LixTimestamp;
 use crate::functions::FunctionProvider;
 
 const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -42,16 +43,14 @@ impl FunctionProvider for DeterministicFunctionProvider {
         uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + counter_bits as u128)
     }
 
-    fn timestamp(&mut self) -> String {
+    fn timestamp(&mut self) -> LixTimestamp {
         let counter = self.take_sequence();
         let millis = if self.timestamp_shuffle {
             shuffled_timestamp_millis(counter)
         } else {
             counter
         };
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        LixTimestamp::from_unix_millis_utc_lossy(millis)
     }
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
@@ -94,7 +93,7 @@ mod tests {
     fn deterministic_timestamp_uses_sequence_counter() {
         let mut provider = DeterministicFunctionProvider::new(1, false);
 
-        assert_eq!(provider.timestamp(), "1970-01-01T00:00:00.001Z");
+        assert_eq!(provider.timestamp().to_string(), "1970-01-01T00:00:00.001Z");
         assert_eq!(provider.highest_seen(), Some(1));
     }
 

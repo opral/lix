@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use crate::cel::CelFunctionProvider;
+use crate::common::LixTimestamp;
 
 /// Engine-owned runtime function provider trait.
 pub(crate) trait FunctionProvider: Send {
     fn uuid_v7(&mut self) -> uuid::Uuid;
-    fn timestamp(&mut self) -> String;
+    fn timestamp(&mut self) -> LixTimestamp;
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         None
@@ -34,7 +35,7 @@ impl FunctionProviderHandle {
         }
     }
 
-    pub(crate) fn call_timestamp(&self) -> String {
+    pub(crate) fn call_timestamp(&self) -> LixTimestamp {
         match self {
             Self::System => SystemFunctionProvider::timestamp_now(),
             Self::Shared(provider) => provider.call_timestamp(),
@@ -55,7 +56,7 @@ impl CelFunctionProvider for FunctionProviderHandle {
     }
 
     fn call_timestamp(&self) -> String {
-        FunctionProviderHandle::call_timestamp(self)
+        FunctionProviderHandle::call_timestamp(self).to_string()
     }
 }
 
@@ -104,7 +105,7 @@ where
         self.with_lock_mut(|provider| provider.uuid_v7())
     }
 
-    pub(crate) fn call_timestamp(&self) -> String {
+    pub(crate) fn call_timestamp(&self) -> LixTimestamp {
         self.with_lock_mut(|provider| provider.timestamp())
     }
 
@@ -122,7 +123,7 @@ where
     }
 
     fn call_timestamp(&self) -> String {
-        SharedFunctionProvider::call_timestamp(self)
+        SharedFunctionProvider::call_timestamp(self).to_string()
     }
 }
 
@@ -134,7 +135,7 @@ where
         self.call_uuid_v7()
     }
 
-    fn timestamp(&mut self) -> String {
+    fn timestamp(&mut self) -> LixTimestamp {
         self.call_timestamp()
     }
 
@@ -151,7 +152,7 @@ where
         (**self).uuid_v7()
     }
 
-    fn timestamp(&mut self) -> String {
+    fn timestamp(&mut self) -> LixTimestamp {
         (**self).timestamp()
     }
 
@@ -169,7 +170,7 @@ impl FunctionProvider for SystemFunctionProvider {
         Self::uuid_v7_now()
     }
 
-    fn timestamp(&mut self) -> String {
+    fn timestamp(&mut self) -> LixTimestamp {
         Self::timestamp_now()
     }
 }
@@ -179,7 +180,7 @@ impl SystemFunctionProvider {
         uuid::Uuid::now_v7()
     }
 
-    fn timestamp_now() -> String {
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    fn timestamp_now() -> LixTimestamp {
+        LixTimestamp::from_unix_millis_utc_lossy(chrono::Utc::now().timestamp_millis())
     }
 }

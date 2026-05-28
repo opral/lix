@@ -872,8 +872,8 @@ mod tests {
             uuid::Uuid::nil()
         }
 
-        fn timestamp(&mut self) -> String {
-            "1970-01-01T00:00:00.000Z".to_string()
+        fn timestamp(&mut self) -> crate::common::LixTimestamp {
+            crate::common::LixTimestamp::expect_parse("timestamp", "1970-01-01T00:00:00.000Z")
         }
     }
 }
