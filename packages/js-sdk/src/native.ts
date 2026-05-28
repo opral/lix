@@ -12,7 +12,7 @@ try {
 	const error = new Error(
 		`Failed to load @lix-js/sdk native addon for ${process.platform}-${process.arch}. ` +
 			"This package currently requires a matching Node native binary. " +
-			"Run `pnpm build` from packages/js-sdk for local development, or install a release that includes your platform binary.",
+			"Run `npm run build` from packages/js-sdk for local development, or install a release that includes your platform binary.",
 	) as Error & { cause?: unknown };
 	error.cause = cause;
 	throw error;
