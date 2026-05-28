@@ -77,13 +77,13 @@ where
         None => None,
     };
     Ok(MaterializedChange {
-        id: change.id,
+        id: change.id.to_string(),
         entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
         snapshot_content,
         metadata,
-        created_at: change.created_at,
+        created_at: change.created_at.to_string(),
     })
 }
 

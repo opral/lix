@@ -57,7 +57,7 @@ fn conflict_side_from_diff_entry(entry: &TrackedStateDiffEntry) -> MergeConflict
             TrackedStateDiffKind::Modified => MergeConflictChangeKind::Modified,
             TrackedStateDiffKind::Removed => MergeConflictChangeKind::Removed,
         },
-        before_change_id: entry.before.as_ref().map(|row| row.change_id.clone()),
-        after_change_id: entry.after.as_ref().map(|row| row.change_id.clone()),
+        before_change_id: entry.before.as_ref().map(|row| row.change_id.to_string()),
+        after_change_id: entry.after.as_ref().map(|row| row.change_id.to_string()),
     }
 }

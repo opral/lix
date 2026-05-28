@@ -1006,9 +1006,7 @@ export type MergeConflictSide = {
         Ok(())
     }
 
-    fn backend_conformance_config_from_js(
-        factory: &Object,
-    ) -> Result<BackendTestConfig, LixError> {
+    fn backend_conformance_config_from_js(factory: &Object) -> Result<BackendTestConfig, LixError> {
         let mut config = BackendTestConfig::default();
         let value = Reflect::get(factory, &JsValue::from_str("config"))
             .map_err(|_| js_sdk_error("runBackendConformance() could not read config"))?;
@@ -1244,7 +1242,10 @@ export type MergeConflictSide = {
             if value.is_null() || value.is_undefined() {
                 out.push(None);
             } else {
-                out.push(Some(js_value_to_bytes(value, &format!("{context}.values"))?));
+                out.push(Some(js_value_to_bytes(
+                    value,
+                    &format!("{context}.values"),
+                )?));
             }
         }
         Ok(out)
@@ -1518,11 +1519,7 @@ export type MergeConflictSide = {
         ))
     }
 
-    fn optional_bool(
-        object: &Object,
-        key: &str,
-        context: &str,
-    ) -> Result<Option<bool>, LixError> {
+    fn optional_bool(object: &Object, key: &str, context: &str) -> Result<Option<bool>, LixError> {
         let value = Reflect::get(object, &JsValue::from_str(key))
             .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
         if value.is_undefined() || value.is_null() {

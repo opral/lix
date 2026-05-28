@@ -104,8 +104,9 @@ where
             .branch_ctx
             .ref_reader(&read)
             .load_head_commit_id(branch_id)
-            .await;
-        result
+            .await?
+            .map(|commit_id| commit_id.to_string());
+        Ok(result)
     }
 
     pub async fn open_session(

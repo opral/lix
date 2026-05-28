@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::changelog::{
-    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitLoadEntry,
-    CommitLoadRequest, CommitProjection, CommitRecord, CommitScanRequest,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId,
+    CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord, CommitScanRequest,
 };
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
@@ -52,7 +52,7 @@ where
     /// Loads and parses a `lix_commit` canonical change by commit id.
     pub(crate) async fn load_commit(
         &mut self,
-        commit_id: &str,
+        commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
         self.load_changelog_commit(commit_id).await
     }
@@ -85,7 +85,7 @@ where
             let Some(next) = scan.next_start_after else {
                 break;
             };
-            start_after = Some(next);
+            start_after = Some(next.to_string());
         }
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
         Ok(commits)
@@ -94,7 +94,7 @@ where
     /// Walks from `head_commit_id` through parent commits and records nearest depth.
     pub(crate) async fn reachable_commits(
         &mut self,
-        head_commit_id: &str,
+        head_commit_id: &CommitId,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
         walk_reachable_commits(self, head_commit_id).await
     }
@@ -106,8 +106,8 @@ where
     /// policy on top when it needs exactly one base for a three-way merge.
     pub(crate) async fn best_common_ancestors(
         &mut self,
-        left_commit_id: &str,
-        right_commit_id: &str,
+        left_commit_id: &CommitId,
+        right_commit_id: &CommitId,
     ) -> Result<Vec<CommitGraphCommit>, LixError> {
         best_common_ancestors(self, left_commit_id, right_commit_id).await
     }
@@ -119,8 +119,8 @@ where
     /// so merge code cannot accidentally hide unsupported graph semantics.
     pub(crate) async fn merge_base(
         &mut self,
-        left_commit_id: &str,
-        right_commit_id: &str,
+        left_commit_id: &CommitId,
+        right_commit_id: &CommitId,
     ) -> Result<CommitGraphCommit, LixError> {
         let ancestors = self
             .best_common_ancestors(left_commit_id, right_commit_id)
@@ -138,7 +138,7 @@ where
                 right_commit_id,
                 ancestors
                     .iter()
-                    .map(|ancestor| ancestor.commit_id.clone())
+                    .map(|ancestor| ancestor.commit_id.to_string())
                     .collect(),
             )),
         }
@@ -168,7 +168,7 @@ where
     /// SQL providers.
     pub(crate) async fn change_history_from_commit(
         &mut self,
-        start_commit_id: &str,
+        start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
         let commits = self.reachable_commits(start_commit_id).await?;
@@ -187,22 +187,22 @@ where
             {
                 entries.push(CommitGraphChangeHistoryEntry {
                     change: canonical_change,
-                    observed_commit_id: commit_id.clone(),
-                    start_commit_id: start_commit_id.to_string(),
+                    observed_commit_id: commit_id,
+                    start_commit_id: *start_commit_id,
                     depth: reachable.depth,
                 });
             }
 
             for change_id in reachable.commit.change_ids {
-                if !seen_change_ids.insert(change_id.clone()) {
+                if !seen_change_ids.insert(change_id) {
                     continue;
                 }
                 let change = self.load_member_canonical_change(&change_id).await?;
                 if change_matches_history_request(&change, request) {
                     entries.push(CommitGraphChangeHistoryEntry {
                         change,
-                        observed_commit_id: commit_id.clone(),
-                        start_commit_id: start_commit_id.to_string(),
+                        observed_commit_id: commit_id,
+                        start_commit_id: *start_commit_id,
                         depth: reachable.depth,
                     });
                 }
@@ -214,10 +214,9 @@ where
 
     async fn load_member_canonical_change(
         &mut self,
-        change_id: &str,
+        change_id: &ChangeId,
     ) -> Result<CommitGraphChange, LixError> {
-        let change_ids = vec![change_id.to_string()];
-        self.load_canonical_changes(&change_ids)
+        self.load_canonical_changes(std::slice::from_ref(change_id))
             .await?
             .into_iter()
             .next()
@@ -232,12 +231,12 @@ where
 
     async fn load_changelog_commit(
         &mut self,
-        commit_id: &str,
+        commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
         let mut reader = ChangelogContext::new().reader(&self.store);
         let batch = reader
             .load_commits(CommitLoadRequest {
-                commit_ids: &[commit_id.to_string()],
+                commit_ids: std::slice::from_ref(commit_id),
                 projection: CommitProjection::Full,
             })
             .await?;
@@ -266,7 +265,7 @@ where
 
     async fn load_canonical_changes(
         &self,
-        change_ids: &[String],
+        change_ids: &[ChangeId],
     ) -> Result<Vec<Option<CommitGraphChange>>, LixError> {
         let mut reader = ChangelogContext::new().reader(&self.store);
         let batch = reader
@@ -299,21 +298,21 @@ where
 {
     async fn load_commit(
         &mut self,
-        commit_id: &str,
+        commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
         CommitGraphStoreReader::load_commit(self, commit_id).await
     }
 
     async fn reachable_commits(
         &mut self,
-        head_commit_id: &str,
+        head_commit_id: &CommitId,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
         CommitGraphStoreReader::reachable_commits(self, head_commit_id).await
     }
 
     async fn change_history_from_commit(
         &mut self,
-        start_commit_id: &str,
+        start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
         CommitGraphStoreReader::change_history_from_commit(self, start_commit_id, request).await
@@ -341,7 +340,7 @@ fn change_matches_history_request(
 
 fn commit_graph_commit_from_commit_record(
     record: CommitRecord,
-    change_ids: Vec<String>,
+    change_ids: Vec<ChangeId>,
 ) -> CommitGraphCommit {
     let change = commit_record_canonical_change(&record);
     CommitGraphCommit {
@@ -356,11 +355,11 @@ fn commit_graph_commit_from_commit_record(
 
 fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": record.commit_id,
+        "id": record.commit_id.to_string(),
     }))
     .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
-        id: record.change_id.clone(),
+        id: record.change_id,
         entity_pk: EntityPk::single(&record.commit_id),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
@@ -368,7 +367,7 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
             snapshot_content.as_bytes(),
         )),
         metadata_ref: None,
-        created_at: record.created_at.clone(),
+        created_at: record.created_at,
     }
 }
 
@@ -377,14 +376,40 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::changelog::{
-        ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
-        CommitChangeRefSet, CommitRecord,
+        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
+        CommitChangeRef, CommitChangeRefSet, CommitId, CommitRecord,
     };
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
+
+    fn ts(value: &str) -> crate::common::LixTimestamp {
+        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    fn commit_id(label: &str) -> CommitId {
+        CommitId::for_test_label(label)
+    }
+
+    fn change_id(label: &str) -> ChangeId {
+        ChangeId::for_test_label(label)
+    }
+
+    fn commit_ids<const N: usize>(labels: [&str; N]) -> Vec<CommitId> {
+        labels.into_iter().map(commit_id).collect()
+    }
+
+    fn sorted_commit_ids<const N: usize>(labels: [&str; N]) -> Vec<CommitId> {
+        let mut ids = commit_ids(labels);
+        ids.sort();
+        ids
+    }
+
+    fn change_ids<const N: usize>(labels: [&str; N]) -> Vec<ChangeId> {
+        labels.into_iter().map(change_id).collect()
+    }
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
@@ -409,16 +434,17 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_1 = commit_id("commit-1");
         let commit = reader
-            .load_commit("commit-1")
+            .load_commit(&commit_1)
             .await
             .expect("commit load should succeed")
             .expect("commit should exist");
 
-        assert_eq!(commit.commit_id, "commit-1");
-        assert_eq!(commit.change_ids, vec!["change-1", "change-2"]);
-        assert_eq!(commit.parent_commit_ids, vec!["parent-1"]);
-        assert_eq!(commit.change.id, "commit-1-change");
+        assert_eq!(commit.commit_id, commit_id("commit-1"));
+        assert_eq!(commit.change_ids, change_ids(["change-1", "change-2"]));
+        assert_eq!(commit.parent_commit_ids, commit_ids(["parent-1"]));
+        assert_eq!(commit.change.id, change_id("commit-1-change"));
     }
 
     #[tokio::test]
@@ -429,9 +455,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let missing = commit_id("missing");
 
         let commit = reader
-            .load_commit("missing")
+            .load_commit(&missing)
             .await
             .expect("commit load should succeed");
 
@@ -464,9 +491,9 @@ mod tests {
         assert_eq!(
             commits
                 .iter()
-                .map(|commit| commit.commit_id.as_str())
+                .map(|commit| commit.commit_id.clone())
                 .collect::<Vec<_>>(),
-            vec!["commit-a", "commit-b"]
+            sorted_commit_ids(["commit-a", "commit-b"])
         );
     }
 
@@ -490,14 +517,14 @@ mod tests {
             edges
                 .iter()
                 .map(|edge| (
-                    edge.parent_commit_id.as_str(),
-                    edge.child_commit_id.as_str(),
+                    edge.parent_commit_id.clone(),
+                    edge.child_commit_id.clone(),
                     edge.parent_order,
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("commit-left", "commit-head", 0),
-                ("commit-right", "commit-head", 1)
+                (commit_id("commit-left"), commit_id("commit-head"), 0),
+                (commit_id("commit-right"), commit_id("commit-head"), 1)
             ]
         );
     }
@@ -526,9 +553,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let history = reader
             .change_history_from_commit(
-                "commit-head",
+                &commit_head,
                 &CommitGraphChangeHistoryRequest {
                     schema_keys: vec!["test_schema".to_string()],
                     include_tombstones: true,
@@ -542,15 +570,25 @@ mod tests {
             history
                 .iter()
                 .map(|entry| (
-                    entry.change.id.as_str(),
-                    entry.observed_commit_id.as_str(),
-                    entry.start_commit_id.as_str(),
+                    entry.change.id.clone(),
+                    entry.observed_commit_id.clone(),
+                    entry.start_commit_id.clone(),
                     entry.depth
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("change-head", "commit-head", "commit-head", 0),
-                ("change-root", "commit-root", "commit-head", 1),
+                (
+                    change_id("change-head"),
+                    commit_id("commit-head"),
+                    commit_id("commit-head"),
+                    0
+                ),
+                (
+                    change_id("change-root"),
+                    commit_id("commit-root"),
+                    commit_id("commit-head"),
+                    1
+                ),
             ]
         );
     }
@@ -592,9 +630,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let history = reader
             .change_history_from_commit(
-                "commit-head",
+                &commit_head,
                 &CommitGraphChangeHistoryRequest {
                     entity_pks: vec![crate::entity_pk::EntityPk::single("entity-1")],
                     file_ids: vec!["file-a".to_string()],
@@ -608,7 +647,7 @@ mod tests {
             .expect("history should resolve");
 
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].change.id, "change-file-a");
+        assert_eq!(history[0].change.id, change_id("change-file-a"));
         assert_eq!(history[0].depth, 1);
     }
 
@@ -634,9 +673,10 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut reader = graph.reader(read);
+        let commit_head = commit_id("commit-head");
         let hidden = reader
             .change_history_from_commit(
-                "commit-head",
+                &commit_head,
                 &CommitGraphChangeHistoryRequest {
                     schema_keys: vec!["test_schema".to_string()],
                     ..CommitGraphChangeHistoryRequest::default()
@@ -646,7 +686,7 @@ mod tests {
             .expect("history should resolve");
         let visible = reader
             .change_history_from_commit(
-                "commit-head",
+                &commit_head,
                 &CommitGraphChangeHistoryRequest {
                     schema_keys: vec!["test_schema".to_string()],
                     include_tombstones: true,
@@ -658,14 +698,14 @@ mod tests {
 
         assert!(hidden.is_empty());
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].change.id, "change-deleted");
+        assert_eq!(visible[0].change.id, change_id("change-deleted"));
     }
 
     #[derive(Clone)]
     struct TestChange {
         change: CommitGraphChange,
-        commit_change_ids: Vec<String>,
-        parent_commit_ids: Vec<String>,
+        commit_change_ids: Vec<ChangeId>,
+        parent_commit_ids: Vec<CommitId>,
         author_account_ids: Vec<String>,
     }
 
@@ -678,16 +718,22 @@ mod tests {
         ) -> Self {
             Self {
                 change: CommitGraphChange {
-                    id: change_id.to_string(),
+                    id: ChangeId::for_test_label(change_id),
                     entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot_ref: None,
                     metadata_ref: None,
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    created_at: ts("2026-01-01T00:00:00Z"),
                 },
-                commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
-                parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
+                commit_change_ids: change_ids
+                    .iter()
+                    .map(|id| ChangeId::for_test_label(id))
+                    .collect(),
+                parent_commit_ids: parent_commit_ids
+                    .iter()
+                    .map(|id| CommitId::for_test_label(id))
+                    .collect(),
                 author_account_ids: Vec::new(),
             }
         }
@@ -702,7 +748,7 @@ mod tests {
         ) -> Self {
             Self {
                 change: CommitGraphChange {
-                    id: change_id.to_string(),
+                    id: ChangeId::for_test_label(change_id),
                     entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
@@ -710,7 +756,7 @@ mod tests {
                         crate::json_store::JsonRef::from_hash(blake3::hash(content.as_bytes()))
                     }),
                     metadata_ref: None,
-                    created_at: created_at.to_string(),
+                    created_at: ts(created_at),
                 },
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
@@ -733,21 +779,22 @@ mod tests {
             .filter(|change| !change.is_commit())
             .cloned()
             .collect::<Vec<_>>();
-        let changes_by_id: BTreeMap<&str, &TestChange> = canonical_changes
+        let changes_by_id: BTreeMap<ChangeId, &TestChange> = canonical_changes
             .iter()
-            .map(|change| (change.change.id.as_str(), change))
+            .map(|change| (change.change.id, change))
             .collect::<BTreeMap<_, _>>();
         let mut authored_change_ids = BTreeSet::new();
         let provided_commit_ids = changes
             .iter()
             .filter(|change| change.is_commit())
             .map(|change| {
-                change
-                    .change
-                    .entity_pk
-                    .as_single_string()
-                    .expect("commit fixture should use single entity pk")
-                    .to_string()
+                CommitId::for_test_label(
+                    change
+                        .change
+                        .entity_pk
+                        .as_single_string()
+                        .expect("commit fixture should use single entity pk"),
+                )
             })
             .collect::<BTreeSet<_>>();
         let mut staged_commit_ids = BTreeSet::new();
@@ -755,30 +802,31 @@ mod tests {
         let mut writer = changelog.writer(&mut read, &mut writes);
         let mut append = ChangelogAppend::default();
         for change in changes.iter().filter(|change| change.is_commit()) {
+            let commit_label = change
+                .change
+                .entity_pk
+                .as_single_string()
+                .expect("commit fixture should use single entity pk")
+                .to_string();
             let commit = crate::commit_graph::CommitGraphCommit {
                 canonical_change: change.change.clone(),
                 change: change.change.clone(),
-                commit_id: change
-                    .change
-                    .entity_pk
-                    .as_single_string()
-                    .expect("commit fixture should use single entity pk")
-                    .to_string(),
+                commit_id: CommitId::for_test_label(&commit_label),
                 change_ids: change.commit_change_ids.clone(),
                 author_account_ids: change.author_account_ids.clone(),
                 parent_commit_ids: change.parent_commit_ids.clone(),
             };
-            for parent_commit_id in &commit.parent_commit_ids {
+            for parent_commit_id in &change.parent_commit_ids {
                 if !provided_commit_ids.contains(parent_commit_id)
-                    && staged_commit_ids.insert(parent_commit_id.clone())
+                    && staged_commit_ids.insert(*parent_commit_id)
                 {
-                    append_empty_commit(&mut append, parent_commit_id);
+                    append_empty_commit(&mut append, *parent_commit_id);
                 }
             }
             let mut refs = Vec::new();
             for change_id in &commit.change_ids {
-                if let Some(change) = changes_by_id.get(change_id.as_str()) {
-                    if authored_change_ids.insert(change_id.clone()) {
+                if let Some(change) = changes_by_id.get(change_id) {
+                    if authored_change_ids.insert(*change_id) {
                         append.changes.push(change_record_from_test_change(change));
                     }
                     refs.push(commit_change_ref_from_test_change(change));
@@ -787,17 +835,17 @@ mod tests {
 
             append.commits.push(CommitRecord {
                 format_version: 1,
-                commit_id: commit.commit_id.clone(),
+                commit_id: commit.commit_id,
                 parent_commit_ids: commit.parent_commit_ids.clone(),
-                change_id: commit.canonical_change.id.clone(),
+                change_id: commit.canonical_change.id,
                 author_account_ids: commit.author_account_ids.clone(),
-                created_at: commit.canonical_change.created_at.clone(),
+                created_at: commit.canonical_change.created_at,
             });
             append.commit_change_refs.push(CommitChangeRefSet {
-                commit_id: commit.commit_id.clone(),
+                commit_id: commit.commit_id,
                 entries: refs,
             });
-            staged_commit_ids.insert(commit.commit_id.clone());
+            staged_commit_ids.insert(commit.commit_id);
         }
         writer
             .stage_append(append)
@@ -808,18 +856,18 @@ mod tests {
             .expect("commit should succeed");
     }
 
-    fn append_empty_commit(append: &mut ChangelogAppend, commit_id: &str) {
+    fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
         let change_id = format!("{commit_id}-change");
         append.commits.push(CommitRecord {
             format_version: 1,
-            commit_id: commit_id.to_string(),
+            commit_id,
             parent_commit_ids: Vec::new(),
-            change_id: change_id.clone(),
+            change_id: ChangeId::for_test_label(&change_id),
             author_account_ids: Vec::new(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
         });
         append.commit_change_refs.push(CommitChangeRefSet {
-            commit_id: commit_id.to_string(),
+            commit_id,
             entries: Vec::new(),
         });
     }
@@ -827,13 +875,13 @@ mod tests {
     fn change_record_from_test_change(change: &TestChange) -> ChangeRecord {
         ChangeRecord {
             format_version: 1,
-            change_id: change.change.id.clone(),
+            change_id: change.change.id,
             entity_pk: change.change.entity_pk.clone(),
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
             snapshot_ref: change.change.snapshot_ref,
             metadata_ref: change.change.metadata_ref,
-            created_at: change.change.created_at.clone(),
+            created_at: change.change.created_at,
         }
     }
 
@@ -842,7 +890,7 @@ mod tests {
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
             entity_pk: change.change.entity_pk.clone(),
-            change_id: change.change.id.clone(),
+            change_id: change.change.id,
         }
     }
 
@@ -856,28 +904,31 @@ mod tests {
     }
 
     fn parsed_commit(
-        commit_id: &str,
+        commit_label: &str,
         change_ids: &[&str],
         parent_commit_ids: &[&str],
     ) -> crate::commit_graph::CommitGraphCommit {
+        let commit_id = CommitId::for_test_label(commit_label);
         let fixture = commit_change(
-            &format!("{commit_id}-change"),
-            commit_id,
+            &format!("{commit_label}-change"),
+            commit_label,
             change_ids,
             parent_commit_ids,
         );
+        let mut change = fixture.change;
+        change.entity_pk = crate::entity_pk::EntityPk::single(&commit_id);
         crate::commit_graph::CommitGraphCommit {
-            canonical_change: fixture.change.clone(),
-            change: fixture.change,
-            commit_id: commit_id.to_string(),
+            canonical_change: change.clone(),
+            change,
+            commit_id,
             change_ids: change_ids
                 .iter()
-                .map(|change_id| change_id.to_string())
+                .map(|change_id| ChangeId::for_test_label(change_id))
                 .collect(),
             author_account_ids: Vec::new(),
             parent_commit_ids: parent_commit_ids
                 .iter()
-                .map(|parent_id| parent_id.to_string())
+                .map(|parent_id| CommitId::for_test_label(parent_id))
                 .collect(),
         }
     }

@@ -1,7 +1,7 @@
 use super::types::{
     ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRef, CommitChangeRefChunk,
     CommitChangeRefChunkRef, CommitChangeRefChunkView, CommitChangeRefEntryRef,
-    CommitChangeRefEntryView, CommitChangeRefView, CommitRecord, EntityPkRef,
+    CommitChangeRefEntryView, CommitChangeRefView, CommitId, CommitRecord, EntityPkRef,
     ExpandedCommitChangeRefChunkView,
 };
 use crate::common::LixError;
@@ -45,7 +45,7 @@ pub(crate) fn encode_commit_change_ref_chunk(
             schema_index: u16_index(schema_index, "commit change ref schema index")?,
             file_index: u16_index(file_index, "commit change ref file index")?,
             entity_pk: &entry.entity_pk.parts,
-            change_id: &entry.change_id,
+            change_id: entry.change_id,
         });
     }
     storage_codec::encode(
@@ -61,7 +61,7 @@ pub(crate) fn encode_commit_change_ref_chunk(
 
 pub(crate) fn view_commit_change_ref_chunk<'a>(
     bytes: &'a [u8],
-    commit_id: &'a str,
+    commit_id: CommitId,
 ) -> Result<ExpandedCommitChangeRefChunkView<'a>, LixError> {
     let CommitChangeRefChunkView {
         format_version,
@@ -106,12 +106,12 @@ pub(crate) fn view_commit_change_ref_chunk<'a>(
 
 pub(crate) fn decode_commit_change_ref_chunk(
     bytes: &[u8],
-    commit_id: &str,
+    commit_id: CommitId,
 ) -> Result<CommitChangeRefChunk, LixError> {
     let view = view_commit_change_ref_chunk(bytes, commit_id)?;
     Ok(CommitChangeRefChunk {
         format_version: view.format_version,
-        commit_id: view.commit_id.to_string(),
+        commit_id: view.commit_id,
         entries: view
             .entries
             .iter()
@@ -120,7 +120,7 @@ pub(crate) fn decode_commit_change_ref_chunk(
                     schema_key: entry.schema_key.to_string(),
                     file_id: entry.file_id.map(str::to_string),
                     entity_pk: entity_pk_from_ref(entry.entity_pk.clone())?,
-                    change_id: entry.change_id.to_string(),
+                    change_id: entry.change_id,
                 })
             })
             .collect::<Result<Vec<_>, LixError>>()?,

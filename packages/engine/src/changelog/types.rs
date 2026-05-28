@@ -1,5 +1,10 @@
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
+use crate::LixError;
+use std::fmt;
+use std::str::FromStr;
+use uuid::Uuid;
 
 mod entity_pk_ref_storage {
     use super::EntityPkRef;
@@ -14,11 +19,285 @@ mod entity_pk_ref_storage {
     }
 }
 
-pub(crate) type CommitId = String;
-pub(crate) type ChangeId = String;
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CommitId {
+    uuid: Uuid,
+}
 
-pub(crate) type CommitIdRef<'a> = &'a str;
-pub(crate) type ChangeIdRef<'a> = &'a str;
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ChangeId {
+    uuid: Uuid,
+}
+
+const UUID_HYPHENATED_LEN: usize = uuid::fmt::Hyphenated::LENGTH;
+
+impl CommitId {
+    pub(crate) fn new(value: Uuid) -> Self {
+        Self { uuid: value }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, uuid::Error> {
+        value.parse()
+    }
+
+    pub(crate) fn parse_lix(value: &str, context: &str) -> Result<Self, LixError> {
+        Self::parse(value).or_else(|error| {
+            #[cfg(test)]
+            {
+                if !value.is_empty() {
+                    return Ok(Self::for_test_label(value));
+                }
+            }
+            Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("{context} must be a UUID commit id: {error}"),
+            ))
+        })
+    }
+
+    pub(crate) fn as_uuid(&self) -> &Uuid {
+        &self.uuid
+    }
+
+    #[cfg(any(test, feature = "storage-benches"))]
+    pub(crate) fn for_test_label(value: &str) -> Self {
+        Uuid::parse_str(value)
+            .map(Self::new)
+            .unwrap_or_else(|_| Self::new(test_uuid_from_label(0x43, value)))
+    }
+}
+
+impl ChangeId {
+    pub(crate) fn new(value: Uuid) -> Self {
+        Self { uuid: value }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, uuid::Error> {
+        value.parse()
+    }
+
+    pub(crate) fn parse_lix(value: &str, context: &str) -> Result<Self, LixError> {
+        Self::parse(value).or_else(|error| {
+            #[cfg(test)]
+            {
+                if !value.is_empty() {
+                    return Ok(Self::for_test_label(value));
+                }
+            }
+            Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("{context} must be a UUID change id: {error}"),
+            ))
+        })
+    }
+
+    pub(crate) fn as_uuid(&self) -> &Uuid {
+        &self.uuid
+    }
+
+    #[cfg(any(test, feature = "storage-benches"))]
+    pub(crate) fn for_test_label(value: &str) -> Self {
+        Uuid::parse_str(value)
+            .map(Self::new)
+            .unwrap_or_else(|_| Self::new(test_uuid_from_label(0x68, value)))
+    }
+}
+
+fn uuid_text(value: Uuid) -> [u8; UUID_HYPHENATED_LEN] {
+    let mut text = [0; UUID_HYPHENATED_LEN];
+    value.hyphenated().encode_lower(&mut text);
+    text
+}
+
+fn uuid_text_str(text: &[u8; UUID_HYPHENATED_LEN]) -> &str {
+    std::str::from_utf8(text).expect("UUID text cache should contain valid UTF-8")
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+fn test_uuid_from_label(kind: u8, value: &str) -> Uuid {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn hash(seed: u64, bytes: impl Iterator<Item = u8>) -> u64 {
+        bytes.fold(seed, |hash, byte| {
+            let hash = hash ^ u64::from(byte);
+            hash.wrapping_mul(FNV_PRIME)
+        })
+    }
+
+    let high = hash(FNV_OFFSET ^ u64::from(kind), value.bytes());
+    let low = hash(FNV_OFFSET ^ !u64::from(kind), value.bytes().rev());
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&high.to_be_bytes());
+    bytes[8..].copy_from_slice(&low.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+macro_rules! impl_uuid_id {
+    ($id:ident, $name:literal) => {
+        impl fmt::Display for $id {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let text = uuid_text(self.uuid);
+                f.write_str(uuid_text_str(&text))
+            }
+        }
+
+        impl Default for $id {
+            fn default() -> Self {
+                Self::new(Uuid::nil())
+            }
+        }
+
+        impl From<Uuid> for $id {
+            fn from(value: Uuid) -> Self {
+                Self::new(value)
+            }
+        }
+
+        impl From<$id> for Uuid {
+            fn from(value: $id) -> Self {
+                value.uuid
+            }
+        }
+
+        impl FromStr for $id {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(value).map(Self::new)
+            }
+        }
+
+        impl TryFrom<&str> for $id {
+            type Error = uuid::Error;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                value.parse()
+            }
+        }
+
+        impl TryFrom<String> for $id {
+            type Error = uuid::Error;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                value.parse()
+            }
+        }
+
+        impl From<$id> for String {
+            fn from(value: $id) -> Self {
+                value.to_string()
+            }
+        }
+
+        impl From<&$id> for String {
+            fn from(value: &$id) -> Self {
+                value.to_string()
+            }
+        }
+
+        impl PartialEq<str> for $id {
+            fn eq(&self, other: &str) -> bool {
+                let text = uuid_text(self.uuid);
+                if uuid_text_str(&text) == other {
+                    return true;
+                }
+                #[cfg(test)]
+                {
+                    if !other.is_empty() && Self::for_test_label(other) == *self {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+
+        impl PartialEq<&str> for $id {
+            fn eq(&self, other: &&str) -> bool {
+                self == *other
+            }
+        }
+
+        impl PartialEq<String> for $id {
+            fn eq(&self, other: &String) -> bool {
+                self == other.as_str()
+            }
+        }
+
+        impl PartialEq<$id> for str {
+            fn eq(&self, other: &$id) -> bool {
+                other == self
+            }
+        }
+
+        impl PartialEq<$id> for &str {
+            fn eq(&self, other: &$id) -> bool {
+                other == *self
+            }
+        }
+
+        impl PartialEq<$id> for String {
+            fn eq(&self, other: &$id) -> bool {
+                other == self
+            }
+        }
+
+        impl<M> musli::Encode<M> for $id {
+            type Encode = uuid::Bytes;
+
+            fn encode<E>(&self, encoder: E) -> Result<(), E::Error>
+            where
+                E: musli::Encoder<Mode = M>,
+            {
+                encoder.encode_array(self.uuid.as_bytes())
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(std::mem::size_of::<uuid::Bytes>())
+            }
+
+            fn as_encode(&self) -> &Self::Encode {
+                self.uuid.as_bytes()
+            }
+        }
+
+        impl<'de, M, A> musli::Decode<'de, M, A> for $id
+        where
+            A: musli::Allocator,
+        {
+            fn decode<D>(decoder: D) -> Result<Self, D::Error>
+            where
+                D: musli::Decoder<'de, Mode = M, Allocator = A>,
+            {
+                Ok(Self::new(Uuid::from_bytes(decoder.decode_array()?)))
+            }
+        }
+
+        impl serde::Serialize for $id {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.to_string())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $id {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+impl_uuid_id!(CommitId, "commit id");
+impl_uuid_id!(ChangeId, "change id");
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChangelogAppend {
@@ -35,7 +314,7 @@ pub(crate) struct CommitRecord {
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) change_id: ChangeId,
     pub(crate) author_account_ids: Vec<String>,
-    pub(crate) created_at: String,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,7 +353,7 @@ pub(crate) struct CommitChangeRefChunkView<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExpandedCommitChangeRefChunkView<'a> {
     pub(crate) format_version: u32,
-    pub(crate) commit_id: CommitIdRef<'a>,
+    pub(crate) commit_id: CommitId,
     pub(crate) entries: Vec<CommitChangeRefView<'a>>,
 }
 
@@ -92,7 +371,7 @@ pub(crate) struct CommitChangeRefEntryRef<'a> {
     pub(crate) schema_index: u16,
     pub(crate) file_index: u16,
     pub(crate) entity_pk: &'a [String],
-    pub(crate) change_id: &'a str,
+    pub(crate) change_id: ChangeId,
 }
 
 #[derive(musli::Decode)]
@@ -101,7 +380,7 @@ pub(crate) struct CommitChangeRefEntryView<'a> {
     pub(crate) schema_index: u16,
     pub(crate) file_index: u16,
     pub(crate) entity_pk: Vec<&'a str>,
-    pub(crate) change_id: &'a str,
+    pub(crate) change_id: ChangeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,7 +388,7 @@ pub(crate) struct CommitChangeRefView<'a> {
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
     pub(crate) entity_pk: EntityPkRef<'a>,
-    pub(crate) change_id: ChangeIdRef<'a>,
+    pub(crate) change_id: ChangeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,14 +450,14 @@ pub(crate) struct ChangeRecord {
     pub(crate) snapshot_ref: Option<JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: String,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(musli::Encode)]
 #[musli(packed)]
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
-    pub(crate) change_id: &'a str,
+    pub(crate) change_id: ChangeId,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a [String],
     #[musli(with = crate::storage_codec::option)]
@@ -187,14 +466,14 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<&'a JsonRef>,
-    pub(crate) created_at: &'a str,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
-    pub(crate) change_id: ChangeIdRef<'a>,
+    pub(crate) change_id: ChangeId,
     pub(crate) schema_key: &'a str,
     #[musli(with = entity_pk_ref_storage)]
     pub(crate) entity_pk: EntityPkRef<'a>,
@@ -204,7 +483,7 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) snapshot_ref: Option<JsonRef>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) created_at: &'a str,
+    pub(crate) created_at: LixTimestamp,
 }
 
 #[derive(Clone, Copy, Debug)]

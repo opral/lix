@@ -50,15 +50,20 @@ where
                     .id
                     .unwrap_or_else(|| transaction.functions().call_uuid_v7());
                 let source_head = if let Some(from_commit_id) = options.from_commit_id {
-                    let mut commit_graph = transaction.commit_graph_reader();
-                    BranchLifecycle::require_existing_commit(
-                        &mut commit_graph,
+                    let from_commit_id = BranchLifecycle::parse_commit_id(
                         &from_commit_id,
+                        BranchOperation::CreateBranch,
+                        BranchReferenceRole::CommitSource,
+                    )?;
+                    let mut commit_graph = transaction.commit_graph_reader();
+                    let commit = BranchLifecycle::require_existing_commit(
+                        &mut commit_graph,
+                        from_commit_id,
                         BranchOperation::CreateBranch,
                         BranchReferenceRole::CommitSource,
                     )
                     .await?;
-                    from_commit_id
+                    commit.commit_id
                 } else {
                     let active_branch_id = transaction.active_branch_id().to_string();
                     let reader = transaction.branch_ref_reader();
@@ -85,7 +90,7 @@ where
                     id: branch_id,
                     name: options.name,
                     hidden: false,
-                    commit_id: source_head,
+                    commit_id: source_head.to_string(),
                 })
             })
         })

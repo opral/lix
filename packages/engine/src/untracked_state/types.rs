@@ -1,5 +1,5 @@
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::storage_codec::{compact_pair, compact_pair_left, compact_pair_right, Either};
 use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
@@ -16,34 +16,19 @@ pub(crate) struct UntrackedStateRow {
     pub(crate) snapshot_content: Option<String>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata: Option<String>,
-    pub(crate) created_updated_at: Either<String, (String, String)>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
     pub(crate) branch_id: String,
 }
 
 impl UntrackedStateRow {
-    pub(crate) fn created_updated_at(
-        created_at: String,
-        updated_at: String,
-    ) -> Either<String, (String, String)> {
-        compact_pair(created_at, updated_at)
+    pub(crate) fn created_at(&self) -> LixTimestamp {
+        self.created_at
     }
 
-    pub(crate) fn created_at(&self) -> &str {
-        compact_pair_left(&self.created_updated_at).as_str()
-    }
-
-    pub(crate) fn updated_at(&self) -> &str {
-        compact_pair_right(&self.created_updated_at).as_str()
-    }
-
-    pub(crate) fn created_updated_at_ref(&self) -> Either<&str, (&str, &str)> {
-        match &self.created_updated_at {
-            Either::Left(timestamp) => Either::Left(timestamp.as_str()),
-            Either::Right((created_at, updated_at)) => {
-                Either::Right((created_at.as_str(), updated_at.as_str()))
-            }
-        }
+    pub(crate) fn updated_at(&self) -> LixTimestamp {
+        self.updated_at
     }
 
     pub(crate) fn as_ref(&self) -> UntrackedStateRowRef<'_> {
@@ -53,7 +38,8 @@ impl UntrackedStateRow {
             file_id: self.file_id.as_deref(),
             snapshot_content: self.snapshot_content.as_deref(),
             metadata: self.metadata.as_deref(),
-            created_updated_at: self.created_updated_at_ref(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
             global: self.global,
             branch_id: &self.branch_id,
         }
@@ -74,18 +60,10 @@ pub(crate) struct UntrackedStateRowRef<'a> {
     pub(crate) snapshot_content: Option<&'a str>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata: Option<&'a str>,
-    pub(crate) created_updated_at: Either<&'a str, (&'a str, &'a str)>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
     pub(crate) branch_id: &'a str,
-}
-
-impl<'a> UntrackedStateRowRef<'a> {
-    pub(crate) fn created_updated_at(
-        created_at: &'a str,
-        updated_at: &'a str,
-    ) -> Either<&'a str, (&'a str, &'a str)> {
-        compact_pair(created_at, updated_at)
-    }
 }
 
 #[derive(musli::Encode, musli::Decode)]
@@ -95,7 +73,8 @@ pub(crate) struct UntrackedPayloadRef<'a> {
     pub(crate) snapshot_content: Option<&'a str>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata: Option<&'a str>,
-    pub(crate) created_updated_at: Either<&'a str, (&'a str, &'a str)>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
 }
 

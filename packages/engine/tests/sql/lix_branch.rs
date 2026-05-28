@@ -457,7 +457,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_branch (id, name, commit_id) \
-                 VALUES ('sql-branch-invalid-commit', 'Invalid Commit', 'missing-commit')",
+                 VALUES ('sql-branch-invalid-commit', 'Invalid Commit', 'ffffffff-ffff-4fff-bfff-ffffffffffff')",
                 &[],
             )
             .await

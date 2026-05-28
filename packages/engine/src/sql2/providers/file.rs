@@ -1818,10 +1818,10 @@ async fn lix_file_record_batch(
         schema_keys.push(Some(file.live.schema_key));
         file_ids.push(file.live.file_id);
         globals.push(Some(file.live.global));
-        change_ids.push(file.live.change_id);
+        change_ids.push(file.live.change_id.map(|id| id.to_string()));
         created_ats.push(file.live.created_at);
         updated_ats.push(file.live.updated_at);
-        commit_ids.push(file.live.commit_id);
+        commit_ids.push(file.live.commit_id.map(|id| id.to_string()));
         untracked_values.push(Some(file.live.untracked));
         metadata_values.push(file.live.metadata.as_ref().map(serialize_row_metadata));
         branch_ids.push(Some(branch_id));
@@ -1856,7 +1856,7 @@ async fn lix_file_record_batch(
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("sql2 lix_file provider does not support projected column '{other}'"),
-                ))
+                ));
             }
         };
         columns.push(array);
@@ -2640,6 +2640,7 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::BlobDataReader;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -2859,11 +2860,16 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<crate::changelog::CommitId>, LixError> {
             if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{branch_id}")))
+            Ok(Some(crate::changelog::CommitId::for_test_label(&format!(
+                "commit-{branch_id}"
+            ))))
         }
 
         async fn stage_write(
@@ -2910,8 +2916,8 @@ mod tests {
             metadata: None,
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -2932,8 +2938,8 @@ mod tests {
             metadata: None,
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

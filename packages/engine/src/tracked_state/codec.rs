@@ -204,7 +204,7 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
         .expect("tracked-state value storage encoding should not fail")
 }
 
-pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
+pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef) -> Vec<u8> {
     storage_codec::encode("tracked-state value", &value)
         .expect("tracked-state value storage encoding should not fail")
 }
@@ -229,39 +229,28 @@ pub(crate) fn decode_visible_value(
     Ok(Some(tracked_value_from_storage(view)))
 }
 
-fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef<'_>, LixError> {
+fn decode_value_view(bytes: &[u8]) -> Result<TrackedStateIndexValueRef, LixError> {
     storage_codec::decode("tracked-state value", bytes)
 }
 
-fn tracked_value_from_storage(value: TrackedStateIndexValueRef<'_>) -> TrackedStateIndexValue {
+fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateIndexValue {
     let TrackedStateIndexValueRef {
         change_id,
         commit_id,
         deleted,
         snapshot_ref,
         metadata_ref,
-        created_updated_at,
+        created_at,
+        updated_at,
     } = value;
     TrackedStateIndexValue {
-        change_id: change_id.to_string(),
-        commit_id: commit_id.to_string(),
+        change_id,
+        commit_id,
         deleted,
         snapshot_ref,
         metadata_ref,
-        created_updated_at: match created_updated_at {
-            crate::storage_codec::Either::Left(timestamp) => {
-                TrackedStateIndexValue::created_updated_at(
-                    timestamp.to_string(),
-                    timestamp.to_string(),
-                )
-            }
-            crate::storage_codec::Either::Right((created_at, updated_at)) => {
-                TrackedStateIndexValue::created_updated_at(
-                    created_at.to_string(),
-                    updated_at.to_string(),
-                )
-            }
-        },
+        created_at,
+        updated_at,
     }
 }
 
@@ -402,27 +391,29 @@ fn level_salt(level: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
+
+    fn timestamp(field: &str, value: &str) -> LixTimestamp {
+        LixTimestamp::expect_parse(field, value)
+    }
 
     fn test_value(commit_id: &str, change_id: &str) -> TrackedStateIndexValue {
         TrackedStateIndexValue {
-            change_id: change_id.to_string(),
-            commit_id: commit_id.to_string(),
+            change_id: ChangeId::for_test_label(change_id),
+            commit_id: CommitId::for_test_label(commit_id),
             deleted: false,
             snapshot_ref: None,
             metadata_ref: None,
-            created_updated_at: TrackedStateIndexValue::created_updated_at(
-                "2026-01-01T00:00:00Z".to_string(),
-                "2026-01-02T00:00:00Z".to_string(),
-            ),
+            created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
         }
     }
 
     fn set_timestamps(value: &mut TrackedStateIndexValue, created_at: &str, updated_at: &str) {
-        value.created_updated_at = TrackedStateIndexValue::created_updated_at(
-            created_at.to_string(),
-            updated_at.to_string(),
-        );
+        value.created_at = timestamp("created_at", created_at);
+        value.updated_at = timestamp("updated_at", updated_at);
     }
 
     #[test]
@@ -550,15 +541,13 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_change_ref_value() {
         let value = TrackedStateIndexValue {
-            change_id: "change".to_string(),
-            commit_id: "commit".to_string(),
+            change_id: ChangeId::for_test_label("change"),
+            commit_id: CommitId::for_test_label("commit"),
             deleted: false,
             snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
             metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
-            created_updated_at: TrackedStateIndexValue::created_updated_at(
-                "2026-01-01T00:00:00Z".to_string(),
-                "2026-01-02T00:00:00Z".to_string(),
-            ),
+            created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
         };
 
         let encoded = encode_value(&value);
@@ -568,15 +557,13 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_second_change_ref_value() {
         let value = TrackedStateIndexValue {
-            change_id: "other-change".to_string(),
-            commit_id: "other-commit".to_string(),
+            change_id: ChangeId::for_test_label("other-change"),
+            commit_id: CommitId::for_test_label("other-commit"),
             deleted: true,
             snapshot_ref: None,
             metadata_ref: None,
-            created_updated_at: TrackedStateIndexValue::created_updated_at(
-                "2026-01-01T00:00:00Z".to_string(),
-                "2026-01-02T00:00:00Z".to_string(),
-            ),
+            created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
         };
 
         let encoded = encode_value(&value);
@@ -584,19 +571,27 @@ mod tests {
     }
 
     #[test]
-    fn value_codec_compacts_matching_timestamps() {
-        let mut compact = test_value("commit", "change");
-        set_timestamps(&mut compact, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
-        let compact_len = encode_value(&compact).len();
+    fn value_codec_stores_fixed_width_timestamps() {
+        let mut matching = test_value("commit", "change");
+        set_timestamps(
+            &mut matching,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let matching_len = encode_value(&matching).len();
         assert_eq!(
-            decode_value(&encode_value(&compact)).expect("value"),
-            compact
+            decode_value(&encode_value(&matching)).expect("value"),
+            matching
         );
 
-        set_timestamps(&mut compact, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
-        let distinct_len = encode_value(&compact).len();
+        set_timestamps(
+            &mut matching,
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        );
+        let distinct_len = encode_value(&matching).len();
 
-        assert!(compact_len < distinct_len);
+        assert_eq!(matching_len, distinct_len);
     }
 
     #[test]
@@ -632,37 +627,31 @@ mod tests {
     fn encoded_value_len_matches_encoded_value_bytes() {
         let values = [
             TrackedStateIndexValue {
-                change_id: "change".to_string(),
-                commit_id: "commit".to_string(),
+                change_id: ChangeId::for_test_label("change"),
+                commit_id: CommitId::for_test_label("commit"),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: None,
-                created_updated_at: TrackedStateIndexValue::created_updated_at(
-                    "2026-01-01T00:00:00Z".to_string(),
-                    "2026-01-02T00:00:00Z".to_string(),
-                ),
+                created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+                updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
             TrackedStateIndexValue {
-                change_id: "change-2".to_string(),
-                commit_id: "commit".to_string(),
+                change_id: ChangeId::for_test_label("change-2"),
+                commit_id: CommitId::for_test_label("commit"),
                 deleted: true,
                 snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
                 metadata_ref: None,
-                created_updated_at: TrackedStateIndexValue::created_updated_at(
-                    "2026-01-01T00:00:00Z".to_string(),
-                    "2026-01-02T00:00:00Z".to_string(),
-                ),
+                created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+                updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
             TrackedStateIndexValue {
-                change_id: "change-3".to_string(),
-                commit_id: "other".to_string(),
+                change_id: ChangeId::for_test_label("change-3"),
+                commit_id: CommitId::for_test_label("other"),
                 deleted: false,
                 snapshot_ref: None,
                 metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
-                created_updated_at: TrackedStateIndexValue::created_updated_at(
-                    "2026-01-01T00:00:00Z".to_string(),
-                    "2026-01-02T00:00:00Z".to_string(),
-                ),
+                created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+                updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
         ];
 

@@ -1,3 +1,4 @@
+use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::untracked_state::{
@@ -20,8 +21,8 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
-    pub(crate) change_id: Option<String>,
-    pub(crate) commit_id: Option<String>,
+    pub(crate) change_id: Option<ChangeId>,
+    pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: String,
 }

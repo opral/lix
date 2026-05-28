@@ -357,7 +357,7 @@ fn state_history_record_batch(
                 other => {
                     return Err(DataFusionError::Execution(format!(
                         "lix_state_history provider does not support projected column '{other}'"
-                    )))
+                    )));
                 }
             })
         })

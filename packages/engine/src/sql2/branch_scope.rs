@@ -240,12 +240,13 @@ mod tests {
 
     use super::*;
     use crate::branch::BranchHead;
+    use crate::changelog::CommitId;
 
     #[tokio::test]
     async fn active_scope_uses_session_branch() {
         let branch_ref = RowsBranchRefReader::new(vec![BranchHead {
             branch_id: "main".to_string(),
-            commit_id: "commit-main".to_string(),
+            commit_id: CommitId::for_test_label("commit-main"),
         }]);
         let ids =
             resolve_provider_branch_ids(&branch_ref, &BranchBinding::active("main"), Vec::new())
@@ -271,7 +272,7 @@ mod tests {
     async fn explicit_scope_keeps_requested_branches() {
         let branch_ref = RowsBranchRefReader::new(vec![BranchHead {
             branch_id: "branch-a".to_string(),
-            commit_id: "commit-branch-a".to_string(),
+            commit_id: CommitId::for_test_label("commit-branch-a"),
         }]);
         let ids = resolve_provider_branch_ids(
             &branch_ref,
@@ -306,11 +307,11 @@ mod tests {
         let branch_ref = RowsBranchRefReader::new(vec![
             BranchHead {
                 branch_id: "branch-b".to_string(),
-                commit_id: "commit-branch-b".to_string(),
+                commit_id: CommitId::for_test_label("commit-branch-b"),
             },
             BranchHead {
                 branch_id: "branch-a".to_string(),
-                commit_id: "commit-branch-a".to_string(),
+                commit_id: CommitId::for_test_label("commit-branch-a"),
             },
         ]);
         let ids = resolve_provider_branch_ids(&branch_ref, &BranchBinding::explicit(), Vec::new())
