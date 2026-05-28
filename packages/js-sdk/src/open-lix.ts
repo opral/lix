@@ -124,52 +124,28 @@ function valueToNative(value: Value): LixNativeValue {
 	}
 }
 
-export type BackendKvScanRange =
-	| { kind: "prefix"; prefix: Uint8Array }
-	| { kind: "range"; start: Uint8Array; end: Uint8Array };
+export type BackendKvBound =
+	| { kind: "included"; key: Uint8Array }
+	| { kind: "excluded"; key: Uint8Array }
+	| { kind: "unbounded" };
 
-export type BackendKvGetRequest = {
-	groups: BackendKvGetGroup[];
+export type BackendKvScanRange = {
+	lower: BackendKvBound;
+	upper: BackendKvBound;
 };
 
-export type BackendKvGetGroup = {
-	namespace: string;
+export type BackendKvGetRequest = {
 	keys: Uint8Array[];
 };
 
 export type BackendKvValueBatch = {
-	groups: BackendKvValueGroup[];
-};
-
-export type BackendKvValueGroup = {
-	namespace: string;
 	values: Array<Uint8Array | null>;
 };
 
-export type BackendKvExistsBatch = {
-	groups: BackendKvExistsGroup[];
-};
-
-export type BackendKvExistsGroup = {
-	namespace: string;
-	exists: boolean[];
-};
-
 export type BackendKvScanRequest = {
-	namespace: string;
 	range: BackendKvScanRange;
 	after?: Uint8Array | null;
 	limit: number;
-};
-
-export type BackendKvKeyPage = {
-	keys: Uint8Array[];
-	resumeAfter?: Uint8Array | null;
-};
-
-export type BackendKvValuePage = {
-	values: Uint8Array[];
-	resumeAfter?: Uint8Array | null;
 };
 
 export type BackendKvEntryPage = {
@@ -194,11 +170,6 @@ export type BackendKvWriteOp =
 	  };
 
 export type BackendKvWriteBatch = {
-	groups: BackendKvWriteGroup[];
-};
-
-export type BackendKvWriteGroup = {
-	namespace: string;
 	ops: BackendKvWriteOp[];
 };
 
@@ -211,9 +182,6 @@ export type BackendKvWriteStats = {
 
 export type LixBackendReadTransaction = {
 	getValues(request: BackendKvGetRequest): BackendKvValueBatch;
-	existsMany(request: BackendKvGetRequest): BackendKvExistsBatch;
-	scanKeys(request: BackendKvScanRequest): BackendKvKeyPage;
-	scanValues(request: BackendKvScanRequest): BackendKvValuePage;
 	scanEntries(request: BackendKvScanRequest): BackendKvEntryPage;
 	rollback(): void;
 };
