@@ -453,7 +453,7 @@ impl InsertSink for LixDirectoryInsertSink {
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
-                    &mut || self.functions.call_uuid_v7(),
+                    &mut || self.functions.call_uuid_v7().to_string(),
                 )?);
             } else {
                 rows.extend(

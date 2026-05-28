@@ -57,7 +57,7 @@ impl ScalarUDFImpl for LixUuidV7 {
             return plan_err!("lix_uuid_v7 requires no arguments");
         }
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            self.functions.call_uuid_v7(),
+            self.functions.call_uuid_v7().to_string(),
         ))))
     }
 }

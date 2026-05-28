@@ -81,9 +81,9 @@ pub struct InitReceipt {
 /// The initial commit tracks durable content rows. Branch refs are moving
 /// pointers and therefore live in untracked local state instead of the commit.
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
-    let main_branch_id = functions.call_uuid_v7();
-    let lix_id = functions.call_uuid_v7();
-    let initial_commit_id = CommitId::parse_lix(&functions.call_uuid_v7(), "initial commit_id")?;
+    let main_branch_id = functions.call_uuid_v7().to_string();
+    let lix_id = functions.call_uuid_v7().to_string();
+    let initial_commit_id = CommitId::from(functions.call_uuid_v7());
     let timestamp_text = functions.call_timestamp();
     let timestamp = LixTimestamp::parse(&timestamp_text).map_err(|error| {
         LixError::unknown(format!(
@@ -127,7 +127,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let initial_commit = InitSeedCommit {
         id: initial_commit_id,
-        change_id: ChangeId::parse_lix(&functions.call_uuid_v7(), "initial commit change_id")?,
+        change_id: ChangeId::from(functions.call_uuid_v7()),
         parent_ids: Vec::new(),
         author_account_ids: Vec::new(),
         created_at: timestamp,
@@ -381,15 +381,14 @@ fn untracked_row(
 }
 
 fn canonical_change(
-    id: String,
+    id: uuid::Uuid,
     entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
     created_at: LixTimestamp,
 ) -> InitSeedChange {
     InitSeedChange {
-        id: ChangeId::parse_lix(&id, "init seed change_id")
-            .expect("uuid_v7 provider must return a valid UUID"),
+        id: ChangeId::from(id),
         entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
@@ -697,9 +696,9 @@ mod tests {
     }
 
     impl FunctionProvider for TestFunctionProvider {
-        fn uuid_v7(&mut self) -> String {
+        fn uuid_v7(&mut self) -> uuid::Uuid {
             self.uuid_count += 1;
-            test_uuid(self.uuid_count)
+            test_uuid_value(self.uuid_count)
         }
 
         fn timestamp(&mut self) -> String {
@@ -709,6 +708,10 @@ mod tests {
     }
 
     fn test_uuid(index: usize) -> String {
-        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128).to_string()
+        test_uuid_value(index).to_string()
+    }
+
+    fn test_uuid_value(index: usize) -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
     }
 }

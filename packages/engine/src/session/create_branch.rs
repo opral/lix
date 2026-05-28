@@ -48,7 +48,7 @@ where
             Box::pin(async move {
                 let branch_id = options
                     .id
-                    .unwrap_or_else(|| transaction.functions().call_uuid_v7());
+                    .unwrap_or_else(|| transaction.functions().call_uuid_v7().to_string());
                 let source_head = if let Some(from_commit_id) = options.from_commit_id {
                     let from_commit_id = BranchLifecycle::parse_commit_id(
                         &from_commit_id,

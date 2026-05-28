@@ -16,7 +16,9 @@ where
     let mut context = Context::default();
 
     let uuid_functions = functions.clone();
-    context.add_function("lix_uuid_v7", move || uuid_functions.call_uuid_v7());
+    context.add_function("lix_uuid_v7", move || {
+        uuid_functions.call_uuid_v7().to_string()
+    });
     let timestamp_functions = functions.clone();
     context.add_function("lix_timestamp", move || {
         timestamp_functions.call_timestamp()
@@ -62,8 +64,8 @@ mod tests {
     struct FixedFunctions;
 
     impl CelFunctionProvider for FixedFunctions {
-        fn call_uuid_v7(&self) -> String {
-            "uuid-fixed".to_string()
+        fn call_uuid_v7(&self) -> uuid::Uuid {
+            uuid::Uuid::nil()
         }
 
         fn call_timestamp(&self) -> String {
@@ -81,6 +83,9 @@ mod tests {
             .expect("build context");
         let program = Program::compile("lix_uuid_v7()").expect("compile CEL");
         let value = program.execute(&context).expect("execute CEL");
-        assert_eq!(value.json().expect("to json").as_str(), Some("uuid-fixed"));
+        assert_eq!(
+            value.json().expect("to json").as_str(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
     }
 }

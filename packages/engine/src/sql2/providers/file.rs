@@ -509,7 +509,7 @@ impl InsertSink for LixFileInsertSink {
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
-                    &mut || self.functions.call_uuid_v7(),
+                    &mut || self.functions.call_uuid_v7().to_string(),
                     self.include_data_writes,
                 )?);
             } else {
@@ -521,7 +521,7 @@ impl InsertSink for LixFileInsertSink {
                         path_resolvers
                             .as_mut()
                             .expect("path resolver should be initialized"),
-                        &mut || self.functions.call_uuid_v7(),
+                        &mut || self.functions.call_uuid_v7().to_string(),
                         self.include_data_writes,
                     )?,
                 );
@@ -867,7 +867,7 @@ impl ExecutionPlan for LixFileUpdateExec {
                 branch_binding.active_branch_id(),
                 update_columns,
                 path_resolvers.as_mut(),
-                &mut || functions.call_uuid_v7(),
+                &mut || functions.call_uuid_v7().to_string(),
             )?;
             let count = staged.count;
 

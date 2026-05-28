@@ -4,7 +4,7 @@ use crate::cel::CelFunctionProvider;
 
 /// Engine-owned runtime function provider trait.
 pub(crate) trait FunctionProvider: Send {
-    fn uuid_v7(&mut self) -> String;
+    fn uuid_v7(&mut self) -> uuid::Uuid;
     fn timestamp(&mut self) -> String;
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
@@ -55,7 +55,7 @@ impl<P> SharedFunctionProvider<P>
 where
     P: FunctionProvider,
 {
-    pub(crate) fn call_uuid_v7(&self) -> String {
+    pub(crate) fn call_uuid_v7(&self) -> uuid::Uuid {
         self.with_lock_mut(|provider| provider.uuid_v7())
     }
 
@@ -72,7 +72,7 @@ impl<P> CelFunctionProvider for SharedFunctionProvider<P>
 where
     P: FunctionProvider + Send + 'static,
 {
-    fn call_uuid_v7(&self) -> String {
+    fn call_uuid_v7(&self) -> uuid::Uuid {
         SharedFunctionProvider::call_uuid_v7(self)
     }
 
@@ -85,7 +85,7 @@ impl<P> FunctionProvider for SharedFunctionProvider<P>
 where
     P: FunctionProvider,
 {
-    fn uuid_v7(&mut self) -> String {
+    fn uuid_v7(&mut self) -> uuid::Uuid {
         self.call_uuid_v7()
     }
 
@@ -102,7 +102,7 @@ impl<T> FunctionProvider for Box<T>
 where
     T: FunctionProvider + ?Sized,
 {
-    fn uuid_v7(&mut self) -> String {
+    fn uuid_v7(&mut self) -> uuid::Uuid {
         (**self).uuid_v7()
     }
 
@@ -120,8 +120,8 @@ where
 pub(crate) struct SystemFunctionProvider;
 
 impl FunctionProvider for SystemFunctionProvider {
-    fn uuid_v7(&mut self) -> String {
-        uuid::Uuid::now_v7().to_string()
+    fn uuid_v7(&mut self) -> uuid::Uuid {
+        uuid::Uuid::now_v7()
     }
 
     fn timestamp(&mut self) -> String {
