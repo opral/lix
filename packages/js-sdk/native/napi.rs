@@ -1,11 +1,11 @@
-use base64::Engine;
 use lix_rs_sdk::{
-    open_lix_with_backend, CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
-    MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SqliteBackend,
-    SqliteBackendOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value,
+    open_lix, open_lix_with_backend, CreateBranchOptions as RsCreateBranchOptions,
+    CreateBranchReceipt, ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix,
+    LixError, LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
+    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind,
+    MergeConflictSide, OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -14,11 +14,141 @@ use tokio::runtime::{Builder, Runtime};
 #[napi(js_name = "Lix")]
 pub struct NativeLix {
     rt: Runtime,
-    lix: Option<RsLix<SqliteBackend>>,
+    lix: Option<NativeLixInner>,
+}
+
+enum NativeLixInner {
+    Memory(RsLix<InMemoryBackend>),
+    Sqlite(RsLix<SqliteBackend>),
+}
+
+enum NativeLixTransactionInner {
+    Memory(RsLixTransaction<InMemoryBackend>),
+    Sqlite(RsLixTransaction<SqliteBackend>),
+}
+
+impl NativeLixInner {
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> std::result::Result<RsExecuteResult, LixError> {
+        match self {
+            Self::Memory(lix) => lix.execute(sql, params).await,
+            Self::Sqlite(lix) => lix.execute(sql, params).await,
+        }
+    }
+
+    async fn begin_transaction(&self) -> std::result::Result<NativeLixTransactionInner, LixError> {
+        match self {
+            Self::Memory(lix) => Ok(NativeLixTransactionInner::Memory(
+                lix.begin_transaction().await?,
+            )),
+            Self::Sqlite(lix) => Ok(NativeLixTransactionInner::Sqlite(
+                lix.begin_transaction().await?,
+            )),
+        }
+    }
+
+    async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
+        match self {
+            Self::Memory(lix) => lix.active_branch_id().await,
+            Self::Sqlite(lix) => lix.active_branch_id().await,
+        }
+    }
+
+    async fn create_branch(
+        &self,
+        options: RsCreateBranchOptions,
+    ) -> std::result::Result<CreateBranchReceipt, LixError> {
+        match self {
+            Self::Memory(lix) => lix.create_branch(options).await,
+            Self::Sqlite(lix) => lix.create_branch(options).await,
+        }
+    }
+
+    async fn switch_branch(
+        &self,
+        options: RsSwitchBranchOptions,
+    ) -> std::result::Result<SwitchBranchReceipt, LixError> {
+        match self {
+            Self::Memory(lix) => lix.switch_branch(options).await,
+            Self::Sqlite(lix) => lix.switch_branch(options).await,
+        }
+    }
+
+    async fn merge_branch_preview(
+        &self,
+        options: MergeBranchPreviewOptions,
+    ) -> std::result::Result<MergeBranchPreview, LixError> {
+        match self {
+            Self::Memory(lix) => lix.merge_branch_preview(options).await,
+            Self::Sqlite(lix) => lix.merge_branch_preview(options).await,
+        }
+    }
+
+    async fn merge_branch(
+        &self,
+        options: RsMergeBranchOptions,
+    ) -> std::result::Result<MergeBranchReceipt, LixError> {
+        match self {
+            Self::Memory(lix) => lix.merge_branch(options).await,
+            Self::Sqlite(lix) => lix.merge_branch(options).await,
+        }
+    }
+
+    async fn close(&self) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Memory(lix) => lix.close().await,
+            Self::Sqlite(lix) => lix.close().await,
+        }
+    }
+}
+
+impl NativeLixTransactionInner {
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> std::result::Result<RsExecuteResult, LixError> {
+        match self {
+            Self::Memory(transaction) => transaction.execute(sql, params).await,
+            Self::Sqlite(transaction) => transaction.execute(sql, params).await,
+        }
+    }
+
+    async fn commit(self) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Memory(transaction) => transaction.commit().await,
+            Self::Sqlite(transaction) => transaction.commit().await,
+        }
+    }
+
+    async fn rollback(self) -> std::result::Result<(), LixError> {
+        match self {
+            Self::Memory(transaction) => transaction.rollback().await,
+            Self::Sqlite(transaction) => transaction.rollback().await,
+        }
+    }
 }
 
 #[napi]
 impl NativeLix {
+    #[napi(factory, js_name = "openMemory")]
+    pub fn open_memory(env: Env) -> Result<Self> {
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(to_napi_error)?;
+        let lix = rt
+            .block_on(open_lix(RsOpenLixOptions::default()))
+            .map_err(|error| throw_lix_error(&env, error))?;
+        Ok(Self {
+            rt,
+            lix: Some(NativeLixInner::Memory(lix)),
+        })
+    }
+
     #[napi(factory, js_name = "openSqlite")]
     pub fn open_sqlite(env: Env, path: String) -> Result<Self> {
         let rt = Builder::new_current_thread()
@@ -30,7 +160,10 @@ impl NativeLix {
         let lix = rt
             .block_on(open_lix_with_backend(backend))
             .map_err(|error| throw_lix_error(&env, error))?;
-        Ok(Self { rt, lix: Some(lix) })
+        Ok(Self {
+            rt,
+            lix: Some(NativeLixInner::Sqlite(lix)),
+        })
     }
 
     #[napi]
@@ -50,11 +183,9 @@ impl NativeLix {
         };
         let result = self
             .rt
-            .block_on(
-                self.lix()
-                    .map_err(|error| throw_lix_error(&env, error))?
-                    .execute(&sql, &params),
-            )
+            .block_on(self.lix().map_err(|error| throw_lix_error(&env, error))?.execute(
+                &sql, &params,
+            ))
             .map_err(|error| throw_lix_error(&env, error))?;
         ExecuteResult::try_from(result).map_err(|error| throw_lix_error(&env, error))
     }
@@ -153,17 +284,19 @@ impl NativeLix {
 
     #[napi]
     pub fn close(&mut self, env: Env) -> Result<()> {
-        if let Some(lix) = self.lix.take() {
-            self.rt
-                .block_on(lix.close())
-                .map_err(|error| throw_lix_error(&env, error))?;
-        }
+        let Some(lix) = self.lix.as_ref() else {
+            return Ok(());
+        };
+        self.rt
+            .block_on(lix.close())
+            .map_err(|error| throw_lix_error(&env, error))?;
+        self.lix = None;
         Ok(())
     }
 }
 
 impl NativeLix {
-    fn lix(&self) -> std::result::Result<&RsLix<SqliteBackend>, LixError> {
+    fn lix(&self) -> std::result::Result<&NativeLixInner, LixError> {
         self.lix.as_ref().ok_or_else(|| {
             LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
                 .with_hint("Open a new Lix handle before calling this method.")
@@ -174,12 +307,12 @@ impl NativeLix {
 #[napi(js_name = "LixTransaction")]
 pub struct NativeLixTransaction {
     rt: Runtime,
-    transaction: Option<RsLixTransaction<SqliteBackend>>,
+    transaction: Option<NativeLixTransactionInner>,
 }
 
 #[napi]
 impl NativeLixTransaction {
-    fn new(transaction: RsLixTransaction<SqliteBackend>) -> Result<Self> {
+    fn new(transaction: NativeLixTransactionInner) -> Result<Self> {
         let rt = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -208,11 +341,9 @@ impl NativeLixTransaction {
         let mut transaction = self
             .take_transaction()
             .map_err(|error| throw_lix_error(&env, error))?;
-        let result = self
-            .rt
-            .block_on(transaction.execute(&sql, &params))
-            .map_err(|error| throw_lix_error(&env, error))?;
+        let result = self.rt.block_on(transaction.execute(&sql, &params));
         self.transaction = Some(transaction);
+        let result = result.map_err(|error| throw_lix_error(&env, error))?;
         ExecuteResult::try_from(result).map_err(|error| throw_lix_error(&env, error))
     }
 
@@ -238,9 +369,7 @@ impl NativeLixTransaction {
 }
 
 impl NativeLixTransaction {
-    fn take_transaction(
-        &mut self,
-    ) -> std::result::Result<RsLixTransaction<SqliteBackend>, LixError> {
+    fn take_transaction(&mut self) -> std::result::Result<NativeLixTransactionInner, LixError> {
         self.transaction.take().ok_or_else(|| {
             LixError::new("LIX_INVALID_TRANSACTION_STATE", "Lix transaction is closed")
         })
@@ -474,7 +603,7 @@ fn merge_conflict_change_kind_to_string(kind: MergeConflictChangeKind) -> String
 pub struct LixValue {
     pub kind: String,
     pub value: Option<serde_json::Value>,
-    pub base64: Option<String>,
+    pub blob: Option<Buffer>,
 }
 
 impl TryFrom<LixValue> for Value {
@@ -521,21 +650,13 @@ impl TryFrom<LixValue> for Value {
             )),
             "json" => Ok(Value::Json(value.value.unwrap_or(serde_json::Value::Null))),
             "blob" => {
-                let base64 = value.base64.ok_or_else(|| {
+                let bytes = value.blob.ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
-                        "blob value must include base64",
+                        "blob value must include bytes",
                     )
                 })?;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(base64)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            format!("blob base64 must be valid base64: {error}"),
-                        )
-                    })?;
-                Ok(Value::Blob(bytes))
+                Ok(Value::Blob(bytes.to_vec()))
             }
             other => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -553,17 +674,17 @@ impl TryFrom<&Value> for LixValue {
             Value::Null => Ok(Self {
                 kind: "null".to_string(),
                 value: Some(serde_json::Value::Null),
-                base64: None,
+                blob: None,
             }),
             Value::Boolean(value) => Ok(Self {
                 kind: "boolean".to_string(),
                 value: Some(serde_json::json!(value)),
-                base64: None,
+                blob: None,
             }),
             Value::Integer(value) => Ok(Self {
                 kind: "integer".to_string(),
                 value: Some(serde_json::json!(value)),
-                base64: None,
+                blob: None,
             }),
             Value::Real(value) => {
                 if !value.is_finite() {
@@ -575,23 +696,23 @@ impl TryFrom<&Value> for LixValue {
                 Ok(Self {
                     kind: "real".to_string(),
                     value: Some(serde_json::json!(value)),
-                    base64: None,
+                    blob: None,
                 })
             }
             Value::Text(value) => Ok(Self {
                 kind: "text".to_string(),
                 value: Some(serde_json::json!(value)),
-                base64: None,
+                blob: None,
             }),
             Value::Json(value) => Ok(Self {
                 kind: "json".to_string(),
                 value: Some(value.clone()),
-                base64: None,
+                blob: None,
             }),
             Value::Blob(value) => Ok(Self {
                 kind: "blob".to_string(),
                 value: None,
-                base64: Some(base64::engine::general_purpose::STANDARD.encode(value)),
+                blob: Some(Buffer::from(value.clone())),
             }),
         }
     }

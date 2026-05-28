@@ -4,14 +4,6 @@ export type LixJsError = Error & {
 	hint?: string;
 };
 
-export function withLixError<T>(fn: () => T): T {
-	try {
-		return fn();
-	} catch (error) {
-		throw error;
-	}
-}
-
 export function invalidArgument(
 	operation: string,
 	argument: string,
