@@ -5,6 +5,7 @@ use serde_json::{json, Value as JsonValue};
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::BranchContext;
 use crate::catalog::CatalogContext;
+use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
@@ -20,7 +21,7 @@ use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::untracked_state::UntrackedStateContext;
 use crate::{NullableKeyFilter, GLOBAL_BRANCH_ID};
 
-const SCHEMA_FIXTURE_COMMIT_ID: &str = "tracked-crud-schema-fixture";
+const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";
 const TIMESTAMP: &str = "2026-05-19T00:00:00.000Z";
 const BENCH_BRANCH_ID: &str = "tracked-crud-branch";
 
@@ -349,20 +350,20 @@ async fn seed_visible_schema_rows<B>(
                 deleted: false,
                 created_at: TIMESTAMP.to_string(),
                 updated_at: TIMESTAMP.to_string(),
-                change_id: format!("schema-fixture-{}", key.schema_key),
-                commit_id: SCHEMA_FIXTURE_COMMIT_ID.to_string(),
+                change_id: ChangeId::for_test_label(&format!("schema-fixture-{}", key.schema_key)),
+                commit_id: CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
             }
         })
         .collect::<Vec<_>>();
     let global_branch_ref_row = crate::transaction::prepare_branch_ref_row(
         GLOBAL_BRANCH_ID,
-        SCHEMA_FIXTURE_COMMIT_ID,
+        &CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
         TIMESTAMP,
     )
     .expect("schema fixture branch ref should stage");
     let bench_branch_ref_row = crate::transaction::prepare_branch_ref_row(
         BENCH_BRANCH_ID,
-        SCHEMA_FIXTURE_COMMIT_ID,
+        &CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID),
         TIMESTAMP,
     )
     .expect("bench fixture branch ref should stage");

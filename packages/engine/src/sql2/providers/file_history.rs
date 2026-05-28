@@ -870,7 +870,7 @@ fn file_history_column_array(
                 format!(
                     "sql2 lix_file_history provider does not support projected column '{other}'"
                 ),
-            ))
+            ));
         }
     })
 }

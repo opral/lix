@@ -1257,8 +1257,16 @@ fn entity_system_column_array(
         "global" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.global).collect::<Vec<_>>(),
         )) as ArrayRef,
-        "change_id" => string_array(rows.iter().map(|row| row.change_id.as_deref())),
-        "commit_id" => string_array(rows.iter().map(|row| row.commit_id.as_deref())),
+        "change_id" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.change_id.map(|id| id.to_string()))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        "commit_id" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.commit_id.map(|id| id.to_string()))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
         "untracked" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
         )) as ArrayRef,
@@ -1266,7 +1274,7 @@ fn entity_system_column_array(
         other => {
             return Err(DataFusionError::Execution(format!(
                 "sql2 entity provider does not support system column 'lixcol_{other}'"
-            )))
+            )));
         }
     })
 }
@@ -1360,6 +1368,7 @@ mod tests {
 
     use super::entity_record_batch;
     use crate::branch::{BranchHead, BranchRefReader};
+    use crate::changelog::{ChangeId, CommitId};
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
@@ -1416,8 +1425,8 @@ mod tests {
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
             branch_id: "branch-a".to_string(),
-            change_id: Some("change-a".to_string()),
-            commit_id: Some("commit-a".to_string()),
+            change_id: Some(ChangeId::for_test_label("change-a")),
+            commit_id: Some(CommitId::for_test_label("commit-a")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

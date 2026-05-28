@@ -590,9 +590,9 @@ fn directory_history_column_array(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                "sql2 lix_directory_history provider does not support projected column '{other}'"
-            ),
-            ))
+                    "sql2 lix_directory_history provider does not support projected column '{other}'"
+                ),
+            ));
         }
     })
 }

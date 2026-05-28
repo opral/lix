@@ -19,7 +19,7 @@ use datafusion::physical_plan::{
 use futures_util::stream;
 
 use crate::changelog::{
-    ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitLoadEntry,
+    ChangeId, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitLoadEntry,
     CommitProjection, CommitScanRequest,
 };
 use crate::serialize_row_metadata;
@@ -259,7 +259,7 @@ where
         let Some(next) = scan.next_start_after else {
             break;
         };
-        start_after = Some(next);
+        start_after = Some(next.to_string());
     }
     let mut start_after = None::<String>;
     loop {
@@ -281,9 +281,9 @@ where
         let Some(next) = scan.next_start_after else {
             break;
         };
-        start_after = Some(next);
+        start_after = Some(next.to_string());
     }
-    changes.sort_by(|left, right| left.change_id().cmp(right.change_id()));
+    changes.sort_by_key(|row| row.change_id());
     if let Some(limit) = limit {
         changes.truncate(limit);
     }
@@ -296,10 +296,10 @@ enum LixChangeRow {
 }
 
 impl LixChangeRow {
-    fn change_id(&self) -> &str {
+    fn change_id(&self) -> ChangeId {
         match self {
-            Self::Direct(change) => &change.change_id,
-            Self::DerivedCommit(change) => &change.id,
+            Self::Direct(change) => change.change_id,
+            Self::DerivedCommit(change) => change.id,
         }
     }
 }
@@ -308,11 +308,11 @@ fn commit_record_canonical_change(
     commit: &crate::changelog::CommitRecord,
 ) -> crate::commit_graph::CommitGraphChange {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": commit.commit_id,
+        "id": commit.commit_id.to_string(),
     }))
     .expect("lix_commit snapshot serialization should not fail");
     crate::commit_graph::CommitGraphChange {
-        id: commit.change_id.clone(),
+        id: commit.change_id,
         entity_pk: crate::entity_pk::EntityPk::single(&commit.commit_id),
         schema_key: "lix_commit".to_string(),
         file_id: None,
@@ -320,7 +320,7 @@ fn commit_record_canonical_change(
             snapshot_content.as_bytes(),
         )),
         metadata_ref: None,
-        created_at: commit.created_at.clone(),
+        created_at: commit.created_at,
     }
 }
 

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+#[cfg(test)]
+use crate::changelog::CommitId;
 use crate::storage::{PointReadPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
     StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId, StorageValue,
@@ -57,10 +59,44 @@ pub(crate) async fn load_commit_root(
     )
     .await?
     else {
+        #[cfg(test)]
+        {
+            let test_commit_id = CommitId::for_test_label(commit_id).to_string();
+            if test_commit_id != commit_id {
+                return load_commit_root_by_storage_key(store, &test_commit_id).await;
+            }
+        }
         return Ok(None);
     };
     let metadata = decode_commit_root(&bytes)?;
-    if metadata.commit_id != commit_id {
+    if metadata.commit_id.to_string() != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state commit_root key for commit '{commit_id}' contains root metadata for commit '{}'",
+                metadata.commit_id
+            ),
+        ));
+    }
+    Ok(Some(metadata))
+}
+
+#[cfg(test)]
+async fn load_commit_root_by_storage_key(
+    store: &(impl StorageRead + ?Sized),
+    commit_id: &str,
+) -> Result<Option<TrackedStateCommitRoot>, LixError> {
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_ROOT_SPACE,
+        commit_id.as_bytes().to_vec(),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let metadata = decode_commit_root(&bytes)?;
+    if metadata.commit_id.to_string() != commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -78,7 +114,7 @@ pub(crate) fn stage_commit_root(
 ) -> Result<(), LixError> {
     writes.put(
         TRACKED_STATE_COMMIT_ROOT_SPACE,
-        key(metadata.commit_id.as_bytes().to_vec()),
+        key(metadata.commit_id.to_string().into_bytes()),
         value(encode_commit_root(metadata)?),
     );
     Ok(())
@@ -182,7 +218,7 @@ mod tests {
     use crate::binary_cas::kv::{
         BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
     };
-    use crate::changelog::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
+    use crate::changelog::{CommitId, CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
     use crate::json_store::store::JSON_SPACE;
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
@@ -224,10 +260,10 @@ mod tests {
     #[test]
     fn commit_root_codec_roundtrips_with_parent_metadata() {
         let metadata = TrackedStateCommitRoot {
-            commit_id: "child".to_string(),
+            commit_id: CommitId::for_test_label("child"),
             root_id: TrackedStateRootId::new([2; 32]),
             parent_roots: vec![TrackedStateCommitRootParent {
-                commit_id: "parent".to_string(),
+                commit_id: CommitId::for_test_label("parent"),
                 root_id: TrackedStateRootId::new([1; 32]),
             }],
             changed_key_count: 7,
@@ -256,7 +292,7 @@ mod tests {
     #[test]
     fn commit_root_codec_rejects_trailing_bytes() {
         let metadata = TrackedStateCommitRoot {
-            commit_id: "commit".to_string(),
+            commit_id: CommitId::for_test_label("commit"),
             root_id: TrackedStateRootId::new([9; 32]),
             parent_roots: Vec::new(),
             changed_key_count: 1,

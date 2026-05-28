@@ -1,5 +1,6 @@
 use serde_json::Value as JsonValue;
 
+use crate::changelog::CommitId;
 use crate::common::validate_row_metadata;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
@@ -69,29 +70,29 @@ async fn execute_entity_write(
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                entity_insert_rows(ctx, plan, &spec, params, active_branch_commit_id.as_deref())?;
+                entity_insert_rows(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
                 return Ok(0);
             }
-            entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_deref()).await
+            entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
         }
         BoundWriteOp::Update => {
             if no_op {
                 return Ok(0);
             }
-            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_deref()).await
+            entity_update(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
         }
         BoundWriteOp::Delete => {
             if no_op {
                 return Ok(0);
             }
-            entity_delete(ctx, plan, &spec, params, active_branch_commit_id.as_deref()).await
+            entity_delete(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
         }
     }
 }
 
 async fn load_active_branch_commit_id(
     ctx: &mut dyn SqlWriteExecutionContext,
-) -> Result<Option<String>, LixError> {
+) -> Result<Option<CommitId>, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
         .await?
@@ -110,7 +111,7 @@ async fn entity_insert(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
     let write_rows = entity_insert_rows(ctx, plan, spec, params, active_branch_commit_id)?;
     stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await
@@ -121,7 +122,7 @@ fn entity_insert_rows(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Vec<TransactionWriteRow>, LixError> {
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
@@ -150,7 +151,7 @@ async fn entity_update(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec).await?;
     let mut write_rows = Vec::new();
@@ -219,7 +220,7 @@ async fn entity_delete(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec).await?;
     let mut write_rows = Vec::new();
@@ -361,7 +362,7 @@ fn entity_insert_row(
     layout: &InsertRowLayout,
     row: &[BoundExpr],
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<TransactionWriteRow, LixError> {
     if row.len() != layout.columns.len() {
         return Err(LixError::new(
@@ -473,7 +474,7 @@ fn entity_replace_row_from_live(
     snapshot: Option<JsonValue>,
     plan: &LogicalWritePlan,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<TransactionWriteRow, LixError> {
     let metadata = if let Some(expr) = assignment_value(plan, "lixcol_metadata") {
         let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
@@ -591,7 +592,7 @@ fn eval_expr(
     context: &EntityEvalContext<'_>,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<JsonValue, LixError> {
     eval_expr_value(expr, context, ctx, params, active_branch_commit_id)
         .map(EntityEvalValue::into_json)
@@ -602,7 +603,7 @@ fn eval_expr_value(
     context: &EntityEvalContext<'_>,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<EntityEvalValue, LixError> {
     match expr {
         BoundExpr::Literal(BoundLiteral::Null) => Ok(EntityEvalValue::SqlNull),
@@ -738,7 +739,7 @@ fn predicate_matches(
     spec: &EntitySurfaceSpec,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<bool, LixError> {
     use crate::sql2::plan::predicate::BoundPredicate;
     match predicate {
@@ -824,7 +825,7 @@ fn eval_comparison_operands(
     spec: &EntitySurfaceSpec,
     ctx: &mut dyn SqlWriteExecutionContext,
     params: &[Value],
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<&CommitId>,
 ) -> Result<(JsonValue, JsonValue), LixError> {
     let left_value = eval_expr(left, context, ctx, params, active_branch_commit_id)?;
     let right_value = eval_expr(right, context, ctx, params, active_branch_commit_id)?;
@@ -1364,7 +1365,7 @@ fn column_eval_value(
         "lixcol_change_id" => Ok(row
             .change_id
             .as_ref()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_created_at" => Ok(EntityEvalValue::Json(JsonValue::String(
             row.created_at.clone(),
@@ -1375,7 +1376,7 @@ fn column_eval_value(
         "lixcol_commit_id" => Ok(row
             .commit_id
             .as_ref()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
         "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),

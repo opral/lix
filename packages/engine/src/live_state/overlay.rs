@@ -27,6 +27,7 @@ pub(crate) fn overlay_untracked_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::ChangeId;
 
     #[test]
     fn untracked_row_wins_for_same_identity() {
@@ -66,7 +67,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
-            change_id: change_id.map(str::to_string),
+            change_id: change_id.map(ChangeId::for_test_label),
             commit_id: None,
             untracked,
             branch_id: "global".to_string(),

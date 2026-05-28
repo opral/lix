@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::changelog::ChangeId;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRow,
 };
@@ -30,7 +31,7 @@ pub(crate) struct TrackedStateMergePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateMergePick {
     pub(crate) identity: TrackedStateDiffIdentity,
-    pub(crate) change_id: String,
+    pub(crate) change_id: ChangeId,
     pub(crate) selected_row: TrackedStateDiffRow,
 }
 
@@ -41,8 +42,8 @@ impl TrackedStateMergePick {
     }
 
     #[cfg(test)]
-    pub(crate) fn source_change_id(&self) -> &str {
-        &self.change_id
+    pub(crate) fn source_change_id(&self) -> String {
+        self.change_id.to_string()
     }
 
     #[cfg(test)]
@@ -146,7 +147,7 @@ fn source_change_pick(
     };
     Ok(TrackedStateMergePick {
         identity,
-        change_id: row.change_id.clone(),
+        change_id: row.change_id,
         selected_row: row,
     })
 }
@@ -173,9 +174,14 @@ fn tracked_row_payload_eq(left: &TrackedStateDiffRow, right: &TrackedStateDiffRo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changelog::CommitId;
     use crate::entity_pk::EntityPk;
     use crate::json_store::JsonRef;
     use crate::tracked_state::TrackedStateDiffKind;
+
+    fn change_id(label: &str) -> String {
+        ChangeId::for_test_label(label).to_string()
+    }
 
     #[test]
     fn source_add_applies() {
@@ -209,7 +215,7 @@ mod tests {
 
         assert_eq!(pick_ids(&plan), vec!["entity-a"]);
         assert!(plan.picks[0].source_row().snapshot_ref.is_some());
-        assert_eq!(plan.picks[0].source_change_id(), "source");
+        assert_eq!(plan.picks[0].source_change_id(), change_id("source"));
     }
 
     #[test]
@@ -227,7 +233,7 @@ mod tests {
 
         assert_eq!(pick_ids(&plan), vec!["entity-a"]);
         assert!(plan.picks[0].source_row().deleted);
-        assert_eq!(plan.picks[0].source_change_id(), "source-delete");
+        assert_eq!(plan.picks[0].source_change_id(), change_id("source-delete"));
     }
 
     #[test]
@@ -469,10 +475,16 @@ mod tests {
             deleted: false,
             snapshot_ref: Some(JsonRef::for_content(snapshot.as_bytes())),
             metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: change_id.to_string(),
-            commit_id: change_id.replace("change", "commit"),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-01-01T00:00:00Z",
+            ),
+            change_id: ChangeId::for_test_label(change_id),
+            commit_id: CommitId::for_test_label(&change_id.replace("change", "commit")),
         }
     }
 }
