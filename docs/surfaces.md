@@ -132,7 +132,7 @@ WHERE path = '/orders.xlsx'
 ORDER BY lixcol_depth;
 ```
 
-In JavaScript, pass a `Uint8Array` or `ArrayBuffer` for `$1`. Read `data` with `row.value("data").asBlob()`.
+In JavaScript, pass a `Uint8Array` or `ArrayBuffer` for `$1`. Read `data` with `row.value("data").asBytes()`.
 
 ## Directories
 
