@@ -1589,9 +1589,7 @@ mod tests {
     use crate::binary_cas::BlobDataReader;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
-    use crate::functions::{
-        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-    };
+    use crate::functions::FunctionProviderHandle;
     use crate::sql2::dml::{InsertExec, InsertSink};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{
@@ -1760,9 +1758,7 @@ mod tests {
     }
 
     fn test_functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-        )
+        FunctionProviderHandle::system()
     }
 
     #[async_trait]

@@ -5,9 +5,7 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::functions::{
-    FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-};
+use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
@@ -191,9 +189,7 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
-    let functions = SharedFunctionProvider::new(
-        Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-    );
+    let functions = FunctionProviderHandle::system();
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
@@ -439,7 +435,7 @@ mod tests {
 
     use super::*;
     use crate::changelog::ChangelogReader;
-    use crate::functions::{FunctionProvider, SharedFunctionProvider};
+    use crate::functions::FunctionProvider;
     use crate::storage::InMemoryStorageBackend;
     use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateContext;
@@ -684,7 +680,7 @@ mod tests {
     }
 
     fn test_functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(
+        FunctionProviderHandle::shared(
             Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>
         )
     }

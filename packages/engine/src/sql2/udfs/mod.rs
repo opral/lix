@@ -16,9 +16,7 @@ use crate::functions::FunctionProviderHandle;
 
 #[cfg(test)]
 pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
-    use crate::functions::{FunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-
-    SharedFunctionProvider::new(Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>)
+    FunctionProviderHandle::system()
 }
 
 pub(crate) fn register_sql2_functions(

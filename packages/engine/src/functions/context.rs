@@ -1,6 +1,6 @@
 use crate::functions::{
     state, DeterministicFunctionProvider, DeterministicSequence, FunctionProvider,
-    FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
+    FunctionProviderHandle, SystemFunctionProvider,
 };
 use crate::live_state::LiveStateReader;
 use crate::storage::StorageWriteSet;
@@ -28,16 +28,14 @@ impl FunctionContext {
         let bookkeeping_timestamp = bookkeeping_functions.timestamp();
         if !mode.enabled {
             return Ok(Self {
-                functions: SharedFunctionProvider::new(
-                    Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-                ),
+                functions: FunctionProviderHandle::system(),
                 bookkeeping_timestamp,
             });
         }
 
         let sequence = state::load_sequence(live_state).await?;
         Ok(Self {
-            functions: SharedFunctionProvider::new(Box::new(DeterministicFunctionProvider::new(
+            functions: FunctionProviderHandle::shared(Box::new(DeterministicFunctionProvider::new(
                 sequence.next_sequence(),
                 mode.timestamp_shuffle,
             ))

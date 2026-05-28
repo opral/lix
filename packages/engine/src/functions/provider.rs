@@ -12,7 +12,52 @@ pub(crate) trait FunctionProvider: Send {
     }
 }
 
-pub(crate) type FunctionProviderHandle = SharedFunctionProvider<Box<dyn FunctionProvider + Send>>;
+#[derive(Clone)]
+pub(crate) enum FunctionProviderHandle {
+    System,
+    Shared(SharedFunctionProvider<Box<dyn FunctionProvider + Send>>),
+}
+
+impl FunctionProviderHandle {
+    pub(crate) fn system() -> Self {
+        Self::System
+    }
+
+    pub(crate) fn shared(provider: Box<dyn FunctionProvider + Send>) -> Self {
+        Self::Shared(SharedFunctionProvider::new(provider))
+    }
+
+    pub(crate) fn call_uuid_v7(&self) -> uuid::Uuid {
+        match self {
+            Self::System => SystemFunctionProvider::uuid_v7_now(),
+            Self::Shared(provider) => provider.call_uuid_v7(),
+        }
+    }
+
+    pub(crate) fn call_timestamp(&self) -> String {
+        match self {
+            Self::System => SystemFunctionProvider::timestamp_now(),
+            Self::Shared(provider) => provider.call_timestamp(),
+        }
+    }
+
+    pub(crate) fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
+        match self {
+            Self::System => None,
+            Self::Shared(provider) => provider.deterministic_sequence_persist_highest_seen(),
+        }
+    }
+}
+
+impl CelFunctionProvider for FunctionProviderHandle {
+    fn call_uuid_v7(&self) -> uuid::Uuid {
+        FunctionProviderHandle::call_uuid_v7(self)
+    }
+
+    fn call_timestamp(&self) -> String {
+        FunctionProviderHandle::call_timestamp(self)
+    }
+}
 
 /// Shareable function provider used across SQL planning, UDFs, and staging.
 pub(crate) struct SharedFunctionProvider<P> {
@@ -121,10 +166,20 @@ pub(crate) struct SystemFunctionProvider;
 
 impl FunctionProvider for SystemFunctionProvider {
     fn uuid_v7(&mut self) -> uuid::Uuid {
-        uuid::Uuid::now_v7()
+        Self::uuid_v7_now()
     }
 
     fn timestamp(&mut self) -> String {
+        Self::timestamp_now()
+    }
+}
+
+impl SystemFunctionProvider {
+    fn uuid_v7_now() -> uuid::Uuid {
+        uuid::Uuid::now_v7()
+    }
+
+    fn timestamp_now() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 }

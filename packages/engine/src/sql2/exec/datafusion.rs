@@ -1313,9 +1313,7 @@ mod tests {
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphReader, ReachableCommitGraphCommit,
     };
-    use crate::functions::{
-        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-    };
+    use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -1356,9 +1354,7 @@ mod tests {
     }
 
     fn test_functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-        )
+        FunctionProviderHandle::system()
     }
 
     #[derive(Default)]
