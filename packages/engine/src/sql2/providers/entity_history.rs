@@ -435,7 +435,7 @@ fn entity_history_system_column_array(
         other => {
             return Err(DataFusionError::Execution(format!(
                 "sql2 entity history provider does not support system column 'lixcol_{other}'"
-            )))
+            )));
         }
     })
 }

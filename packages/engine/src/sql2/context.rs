@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
+use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
@@ -75,7 +76,7 @@ pub(crate) trait SqlWriteExecutionContext {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
-    async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError>;
+    async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
 
     async fn stage_write(
         &mut self,
@@ -163,7 +164,7 @@ impl SqlWriteContext {
     pub(crate) async fn load_branch_head(
         &self,
         branch_id: &str,
-    ) -> Result<Option<String>, LixError> {
+    ) -> Result<Option<CommitId>, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr

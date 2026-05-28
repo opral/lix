@@ -1308,6 +1308,7 @@ mod tests {
     use super::{execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
+    use crate::changelog::{ChangeId, CommitId};
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphReader, ReachableCommitGraphCommit,
@@ -1528,11 +1529,16 @@ mod tests {
             self.live_state.scan_rows(request).await
         }
 
-        async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<String>, LixError> {
+        async fn load_branch_head(
+            &mut self,
+            branch_id: &str,
+        ) -> Result<Option<CommitId>, LixError> {
             if branch_id == "missing-branch" {
                 return Ok(None);
             }
-            Ok(Some(format!("commit-{branch_id}")))
+            Ok(Some(CommitId::for_test_label(&format!(
+                "commit-{branch_id}"
+            ))))
         }
 
         async fn stage_write(
@@ -1581,7 +1587,7 @@ mod tests {
             }
             Ok(Some(crate::branch::BranchHead {
                 branch_id: branch_id.to_string(),
-                commit_id: format!("commit-{branch_id}"),
+                commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
             }))
         }
 
@@ -1590,7 +1596,7 @@ mod tests {
                 .into_iter()
                 .map(|branch_id| crate::branch::BranchHead {
                     branch_id: branch_id.to_string(),
-                    commit_id: format!("commit-{branch_id}"),
+                    commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
                 })
                 .collect())
         }
@@ -1600,21 +1606,21 @@ mod tests {
     impl CommitGraphReader for DummyCommitGraphReader {
         async fn load_commit(
             &mut self,
-            _commit_id: &str,
+            _commit_id: &CommitId,
         ) -> Result<Option<CommitGraphCommit>, LixError> {
             Ok(None)
         }
 
         async fn reachable_commits(
             &mut self,
-            _head_commit_id: &str,
+            _head_commit_id: &CommitId,
         ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
             Ok(Vec::new())
         }
 
         async fn change_history_from_commit(
             &mut self,
-            _start_commit_id: &str,
+            _start_commit_id: &CommitId,
             _request: &CommitGraphChangeHistoryRequest,
         ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
             Ok(Vec::new())
@@ -1727,8 +1733,8 @@ mod tests {
             metadata: metadata.map(str::to_string),
             deleted: false,
             branch_id: "branch-a".to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1752,8 +1758,8 @@ mod tests {
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1784,8 +1790,8 @@ mod tests {
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1816,8 +1822,8 @@ mod tests {
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1845,8 +1851,12 @@ mod tests {
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
             branch_id: branch_id.to_string(),
-            change_id: Some(format!("change-{entity_pk}-blob")),
-            commit_id: Some(format!("commit-{entity_pk}-blob")),
+            change_id: Some(ChangeId::for_test_label(&format!(
+                "change-{entity_pk}-blob"
+            ))),
+            commit_id: Some(CommitId::for_test_label(&format!(
+                "commit-{entity_pk}-blob"
+            ))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -5060,11 +5070,17 @@ mod tests {
                 .expect("broad by-branch read should succeed");
 
                 assert!(
-					result.rows.iter().any(|row| row[0] == Value::Json(json!(["entity-a"])))
-						&& result.rows.iter().any(|row| row[0] == Value::Json(json!(["entity-b"]))),
-					"expected broad by-branch read to include rows from multiple visible branches: {:?}",
-					result.rows
-				);
+                    result
+                        .rows
+                        .iter()
+                        .any(|row| row[0] == Value::Json(json!(["entity-a"])))
+                        && result
+                            .rows
+                            .iter()
+                            .any(|row| row[0] == Value::Json(json!(["entity-b"]))),
+                    "expected broad by-branch read to include rows from multiple visible branches: {:?}",
+                    result.rows
+                );
             })
         });
     }

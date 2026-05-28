@@ -6,6 +6,7 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
+use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
 use crate::LixError;
@@ -237,20 +238,21 @@ where
 
     let mut rows = Vec::new();
     for start_commit_id in &route.start_commit_ids {
+        let start_commit_id = CommitId::parse_lix(start_commit_id, "history start_commit_id")?;
         let (entries, reachable_commits) = {
             let mut guard = commit_graph.lock().await;
             let entries = guard
-                .change_history_from_commit(start_commit_id, &request)
+                .change_history_from_commit(&start_commit_id, &request)
                 .await?;
-            let reachable_commits = guard.reachable_commits(start_commit_id).await?;
+            let reachable_commits = guard.reachable_commits(&start_commit_id).await?;
             (entries, reachable_commits)
         };
         let commit_created_at_by_id = reachable_commits
             .into_iter()
             .map(|reachable| {
                 (
-                    reachable.commit.commit_id.clone(),
-                    reachable.commit.change.created_at.clone(),
+                    reachable.commit.commit_id,
+                    reachable.commit.change.created_at.to_string(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -263,8 +265,8 @@ where
                     .cloned()
                     .unwrap_or_else(|| change.created_at.clone()),
                 change,
-                observed_commit_id: entry.observed_commit_id,
-                start_commit_id: entry.start_commit_id,
+                observed_commit_id: entry.observed_commit_id.to_string(),
+                start_commit_id: entry.start_commit_id.to_string(),
                 depth: entry.depth,
             });
         }

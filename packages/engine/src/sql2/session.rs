@@ -16,7 +16,7 @@ where
     let active_branch_commit_id = branch_ref
         .load_head(ctx.active_branch_id())
         .await?
-        .map(|head| head.commit_id);
+        .map(|head| head.commit_id.to_string());
     register_sql2_functions(&session, ctx.functions(), active_branch_commit_id);
     providers::register_read(&session, ctx).await?;
 
@@ -61,7 +61,7 @@ pub(crate) async fn build_write_session_with_options(
     register_sql2_functions(
         &session,
         write_ctx.functions(),
-        Some(active_branch_commit_id),
+        Some(active_branch_commit_id.to_string()),
     );
     providers::register_write(&session, write_ctx, options).await?;
 

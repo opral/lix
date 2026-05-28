@@ -1,33 +1,5 @@
 use crate::LixError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
-pub(crate) enum Either<L, R> {
-    Left(L),
-    Right(R),
-}
-
-pub(crate) fn compact_pair<T: Eq>(left: T, right: T) -> Either<T, (T, T)> {
-    if left == right {
-        Either::Left(left)
-    } else {
-        Either::Right((left, right))
-    }
-}
-
-pub(crate) fn compact_pair_left<T>(pair: &Either<T, (T, T)>) -> &T {
-    match pair {
-        Either::Left(value) => value,
-        Either::Right((left, _)) => left,
-    }
-}
-
-pub(crate) fn compact_pair_right<T>(pair: &Either<T, (T, T)>) -> &T {
-    match pair {
-        Either::Left(value) => value,
-        Either::Right((_, right)) => right,
-    }
-}
-
 pub(crate) mod option {
     use musli::de::SequenceDecoder;
     use musli::en::SequenceEncoder;

@@ -5,8 +5,9 @@
 use super::context::ChangelogContext;
 use super::store::{ChangelogReader, ChangelogWriter};
 use super::types::{
-    ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitChangeRef, CommitChangeRefSet,
-    CommitLoadRequest, CommitProjection, CommitRecord, GcPlan, GcRoot, RebuildIndexStats,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitChangeRef,
+    CommitChangeRefSet, CommitId, CommitLoadRequest, CommitProjection, CommitRecord, GcPlan,
+    GcRoot, RebuildIndexStats,
 };
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
@@ -38,7 +39,7 @@ impl BenchAppend {
         self.append
             .commits
             .iter()
-            .map(|commit| commit.commit_id.clone())
+            .map(|commit| commit.commit_id.to_string())
             .collect()
     }
 
@@ -47,7 +48,7 @@ impl BenchAppend {
             .changes
             .iter()
             .filter(|change| change.schema_key != "lix_commit")
-            .map(|change| change.change_id.clone())
+            .map(|change| change.change_id.to_string())
             .collect()
     }
 
@@ -59,20 +60,20 @@ impl BenchAppend {
         self.change_ids().len()
     }
 
-    pub fn append_id(&self) -> &str {
+    pub fn append_id(&self) -> String {
         self.append
             .commits
             .first()
-            .map(|commit| commit.commit_id.as_str())
-            .unwrap_or("empty-direct-changelog-bench")
+            .map(|commit| commit.commit_id.to_string())
+            .unwrap_or_else(|| "empty-direct-changelog-bench".to_string())
     }
 }
 
 #[derive(Clone)]
 pub struct BenchCorpus {
     append_batches: Vec<BenchAppend>,
-    commit_ids: Vec<String>,
-    change_ids: Vec<String>,
+    commit_ids: Vec<CommitId>,
+    change_ids: Vec<ChangeId>,
 }
 
 impl BenchCorpus {
@@ -84,12 +85,12 @@ impl BenchCorpus {
         self.append_batches.len()
     }
 
-    pub fn commit_ids(&self) -> &[String] {
-        &self.commit_ids
+    pub fn commit_ids(&self) -> Vec<String> {
+        self.commit_ids.iter().map(ToString::to_string).collect()
     }
 
-    pub fn change_ids(&self) -> &[String] {
-        &self.change_ids
+    pub fn change_ids(&self) -> Vec<String> {
+        self.change_ids.iter().map(ToString::to_string).collect()
     }
 
     pub fn first_append_commit_ids(&self) -> Vec<String> {
@@ -106,16 +107,16 @@ impl BenchCorpus {
             .unwrap_or_default()
     }
 
-    pub fn first_commit_id(&self) -> Option<&str> {
-        self.commit_ids.first().map(String::as_str)
+    pub fn first_commit_id(&self) -> Option<String> {
+        self.commit_ids.first().map(ToString::to_string)
     }
 
-    pub fn last_commit_id(&self) -> Option<&str> {
-        self.commit_ids.last().map(String::as_str)
+    pub fn last_commit_id(&self) -> Option<String> {
+        self.commit_ids.last().map(ToString::to_string)
     }
 
-    pub fn first_change_id(&self) -> Option<&str> {
-        self.change_ids.first().map(String::as_str)
+    pub fn first_change_id(&self) -> Option<String> {
+        self.change_ids.first().map(ToString::to_string)
     }
 }
 
@@ -442,9 +443,9 @@ where
     })
 }
 
-pub async fn load_commits_direct_by_id<B: BenchBackend>(
+pub async fn load_commits_direct_by_id<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    commit_ids: &[String],
+    commit_ids: &[S],
 ) -> Result<usize, LixError>
 where
     B: BenchBackend + Sync,
@@ -453,9 +454,9 @@ where
     load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Full).await
 }
 
-pub async fn load_commits_direct<B: BenchBackend>(
+pub async fn load_commits_direct<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    commit_ids: &[String],
+    commit_ids: &[S],
 ) -> Result<usize, LixError>
 where
     B: BenchBackend + Sync,
@@ -464,9 +465,9 @@ where
     load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Header).await
 }
 
-pub async fn load_commits_direct_with_lookup<B: BenchBackend>(
+pub async fn load_commits_direct_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    commit_ids: &[String],
+    commit_ids: &[S],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError>
 where
@@ -476,9 +477,9 @@ where
     load_commits_with_lookup(store, commit_ids, projection).await
 }
 
-pub async fn load_changes_direct_by_id<B: BenchBackend>(
+pub async fn load_changes_direct_by_id<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    change_ids: &[String],
+    change_ids: &[S],
 ) -> Result<usize, LixError>
 where
     B: BenchBackend + Sync,
@@ -487,9 +488,9 @@ where
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::DirectKey).await
 }
 
-pub async fn load_changes_direct<B: BenchBackend>(
+pub async fn load_changes_direct<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    change_ids: &[String],
+    change_ids: &[S],
 ) -> Result<usize, LixError>
 where
     B: BenchBackend + Sync,
@@ -498,9 +499,9 @@ where
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::Record).await
 }
 
-pub async fn load_changes_direct_with_lookup<B: BenchBackend>(
+pub async fn load_changes_direct_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    change_ids: &[String],
+    change_ids: &[S],
     lookup: BenchChangeLookup,
 ) -> Result<usize, LixError>
 where
@@ -552,8 +553,7 @@ where
     );
     let root_commit_id = corpus
         .first_commit_id()
-        .unwrap_or("bench-gc-0-commit-0")
-        .to_string();
+        .unwrap_or_else(|| "bench-gc-0-commit-0".to_string());
     let store = prepare_corpus_store(backend, &corpus).await?;
     Ok((store, root_commit_id))
 }
@@ -569,7 +569,7 @@ where
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
     let plan = reader
-        .plan_gc(&[GcRoot::BranchHead(root_commit_id.to_string())])
+        .plan_gc(&[GcRoot::BranchHead(CommitId::for_test_label(root_commit_id))])
         .await?;
     Ok(plan.into())
 }
@@ -587,7 +587,7 @@ where
     let plan = {
         let mut writer = store.context.writer(&mut *transaction, &mut writes);
         writer
-            .collect_garbage(&[GcRoot::BranchHead(root_commit_id.to_string())])
+            .collect_garbage(&[GcRoot::BranchHead(CommitId::for_test_label(root_commit_id))])
             .await?
     };
     writes.apply(&mut *transaction).await?;
@@ -613,15 +613,17 @@ fn direct_append_with_shape(
     for commit_index in 0..commit_count {
         let commit_id = format!("{name}-commit-{commit_index}");
         let commit_change_id = format!("{commit_id}:commit");
+        let typed_commit_id = CommitId::for_test_label(&commit_id);
         let mut refs = Vec::new();
         let remaining = change_count.saturating_sub(next_change);
         let take = remaining.min(changes_per_commit);
         for _ in 0..take {
             let change_id = format!("{name}-change-{next_change}");
+            let typed_change_id = ChangeId::for_test_label(&change_id);
             let entity_pk = EntityPk::single(format!("entity-{next_change}"));
             append.changes.push(ChangeRecord {
                 format_version: 1,
-                change_id: change_id.clone(),
+                change_id: typed_change_id,
                 schema_key: "message".to_string(),
                 entity_pk: entity_pk.clone(),
                 file_id: None,
@@ -629,26 +631,32 @@ fn direct_append_with_shape(
                     format!("{{\"value\":{next_change}}}").as_bytes(),
                 )),
                 metadata_ref: None,
-                created_at: "2026-05-20T00:00:00Z".to_string(),
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    "2026-05-20T00:00:00Z",
+                ),
             });
             refs.push(CommitChangeRef {
                 schema_key: "message".to_string(),
                 file_id: None,
                 entity_pk,
-                change_id,
+                change_id: typed_change_id,
             });
             next_change += 1;
         }
         append.commits.push(CommitRecord {
             format_version: 1,
-            commit_id: commit_id.clone(),
+            commit_id: typed_commit_id,
             parent_commit_ids: Vec::new(),
-            change_id: commit_change_id,
+            change_id: ChangeId::for_test_label(&commit_change_id),
             author_account_ids: Vec::new(),
-            created_at: "2026-05-20T00:00:00Z".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-05-20T00:00:00Z",
+            ),
         });
         append.commit_change_refs.push(CommitChangeRefSet {
-            commit_id,
+            commit_id: typed_commit_id,
             entries: refs,
         });
     }
@@ -659,11 +667,18 @@ impl BenchCorpus {
     fn from_append_batches(append_batches: Vec<BenchAppend>) -> Self {
         let commit_ids = append_batches
             .iter()
-            .flat_map(BenchAppend::commit_ids)
+            .flat_map(|append| append.append.commits.iter().map(|commit| commit.commit_id))
             .collect::<Vec<_>>();
         let change_ids = append_batches
             .iter()
-            .flat_map(BenchAppend::change_ids)
+            .flat_map(|append| {
+                append
+                    .append
+                    .changes
+                    .iter()
+                    .filter(|change| change.schema_key != "lix_commit")
+                    .map(|change| change.change_id)
+            })
             .collect::<Vec<_>>();
         Self {
             append_batches,
@@ -705,9 +720,9 @@ where
     Ok(stats.into())
 }
 
-async fn load_commits_with_lookup<B: BenchBackend>(
+async fn load_commits_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    commit_ids: &[String],
+    commit_ids: &[S],
     projection: BenchCommitProjection,
 ) -> Result<usize, LixError>
 where
@@ -716,18 +731,22 @@ where
 {
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
+    let commit_ids = commit_ids
+        .iter()
+        .map(|id| CommitId::for_test_label(id.as_ref()))
+        .collect::<Vec<_>>();
     let batch = reader
         .load_commits(CommitLoadRequest {
-            commit_ids,
+            commit_ids: &commit_ids,
             projection: projection.into_inner(),
         })
         .await?;
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-async fn load_changes_with_lookup<B: BenchBackend>(
+async fn load_changes_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
-    change_ids: &[String],
+    change_ids: &[S],
     _lookup: BenchChangeLookup,
 ) -> Result<usize, LixError>
 where
@@ -736,8 +755,14 @@ where
 {
     let read = store.storage.begin_read(StorageReadOptions::default())?;
     let mut reader = store.context.reader(read);
+    let change_ids = change_ids
+        .iter()
+        .map(|id| ChangeId::for_test_label(id.as_ref()))
+        .collect::<Vec<_>>();
     let batch = reader
-        .load_changes(ChangeLoadRequest { change_ids })
+        .load_changes(ChangeLoadRequest {
+            change_ids: &change_ids,
+        })
         .await?;
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }

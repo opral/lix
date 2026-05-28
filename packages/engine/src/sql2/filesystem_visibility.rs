@@ -124,6 +124,7 @@ struct BlobRefSnapshot {
 mod tests {
     use async_trait::async_trait;
 
+    use crate::changelog::{ChangeId, CommitId};
     use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::LixError;
@@ -271,8 +272,8 @@ mod tests {
             metadata: None,
             deleted: false,
             branch_id: "branch-a".to_string(),
-            change_id: Some(format!("change-{entity_pk}")),
-            commit_id: Some(format!("commit-{entity_pk}")),
+            change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
+            commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),

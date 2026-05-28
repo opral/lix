@@ -267,6 +267,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
 
     use crate::branch::{BranchHead, BranchRefReader};
+    use crate::changelog::CommitId;
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphReader, ReachableCommitGraphCommit,
@@ -470,7 +471,7 @@ mod tests {
         async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             Ok(Some(BranchHead {
                 branch_id: branch_id.to_string(),
-                commit_id: format!("commit-{branch_id}"),
+                commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
             }))
         }
 
@@ -485,21 +486,21 @@ mod tests {
     impl CommitGraphReader for EmptyCommitGraphReader {
         async fn load_commit(
             &mut self,
-            _commit_id: &str,
+            _commit_id: &CommitId,
         ) -> Result<Option<CommitGraphCommit>, LixError> {
             Ok(None)
         }
 
         async fn reachable_commits(
             &mut self,
-            _head_commit_id: &str,
+            _head_commit_id: &CommitId,
         ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
             Ok(Vec::new())
         }
 
         async fn change_history_from_commit(
             &mut self,
-            _start_commit_id: &str,
+            _start_commit_id: &CommitId,
             _request: &CommitGraphChangeHistoryRequest,
         ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
             Ok(Vec::new())
