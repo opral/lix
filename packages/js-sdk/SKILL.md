@@ -46,7 +46,7 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 ## Agent Quick Start
 
 1. Install `@lix-js/sdk` and `better-sqlite3`.
-2. Open with `createBetterSqlite3Backend({ path })`; do not open `.lix` with raw SQLite.
+2. Open with `new SqliteBackend({ path })`.
 3. Register a schema with `x-lix-key`, `x-lix-primary-key`, and `additionalProperties: false`.
 4. Write rows through the generated table named by `x-lix-key`.
 5. Use `beginTransaction()` for imports, migrations, and multi-row writes that should be one commit.
@@ -57,7 +57,7 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 ## Core Rules
 
 - Use the public `@lix-js/sdk` API only.
-- Use `createBetterSqlite3Backend()` for persistent apps, demos, and tests.
+- Use `new SqliteBackend({ path })` for persistent apps, demos, and tests.
 - Use numbered SQL placeholders: `$1`, `$2`, `$3`; bare `?` is rejected.
 - Use `lix_json($1)` when inserting JSON text into JSON-typed columns.
 - Use scalar SQL functions `SELECT lix_uuid_v7()` and `SELECT lix_timestamp()` when consumer code needs Lix-generated UUID v7 ids or ISO timestamps. Do not call them as table functions with `SELECT * FROM ...`.
@@ -78,14 +78,14 @@ npm i @lix-js/sdk better-sqlite3
 
 ```ts
 import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { SqliteBackend } from "@lix-js/sdk/sqlite";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "/path/to/app.lix" }),
+  backend: new SqliteBackend({ path: "/path/to/app.lix" }),
 });
 ```
 
-`better-sqlite3` is an optional peer dependency. Install it in projects that import `@lix-js/sdk/sqlite`.
+`better-sqlite3` is an optional peer dependency. Install it in projects that use `SqliteBackend`.
 
 `openLix()` without a backend is in-memory and dies with the process. For anything that should persist, pass a real `.lix` path. Reopening the same path picks up existing state.
 
@@ -96,11 +96,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { SqliteBackend } from "@lix-js/sdk/sqlite";
 
 const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: path.join(dir, "demo.lix") }),
+  backend: new SqliteBackend({ path: path.join(dir, "demo.lix") }),
 });
 ```
 
@@ -127,11 +127,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { SqliteBackend } from "@lix-js/sdk/sqlite";
 
 const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: path.join(dir, "demo.lix") }),
+  backend: new SqliteBackend({ path: path.join(dir, "demo.lix") }),
 });
 
 await lix.execute(
@@ -487,7 +487,7 @@ Other UDFs, such as `lix_json_get`, `lix_uuid_v7`, `lix_text_encode`, and `lix_e
 
 | Do | Avoid |
 | --- | --- |
-| Use `createBetterSqlite3Backend({ path })` for persistent state. | Opening `.lix` files with raw SQLite libraries. |
+| Use `new SqliteBackend({ path })` for persistent state. | Opening `.lix` files with raw SQLite libraries. |
 | Use public imports from `@lix-js/sdk` and `@lix-js/sdk/sqlite`. | Importing `engine-wasm` or private internals. |
 | Use `$1`, `$2`, `$3` placeholders. | Bare `?` placeholders. |
 | Use `lix_json($1)` for JSON parameters. | Inlining stringified JSON directly into SQL. |

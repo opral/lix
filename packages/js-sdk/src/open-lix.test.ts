@@ -6,13 +6,10 @@ import {
 	openLix,
 	Value,
 	type BackendKvEntryPage,
-	type BackendKvExistsBatch,
 	type BackendKvGetRequest,
-	type BackendKvKeyPage,
 	type BackendKvScanRange,
 	type BackendKvScanRequest,
 	type BackendKvValueBatch,
-	type BackendKvValuePage,
 	type BackendKvWriteBatch,
 	type BackendKvWriteStats,
 	type ExecuteResult,
@@ -202,30 +199,28 @@ test("custom backend applies ordered deleteRange write ops", () => {
 	const tx = backend.beginWriteTransaction();
 
 	tx.writeKvBatch({
-		groups: [
+		ops: [
 			{
-				namespace: "n",
-				ops: [
-					{
-						kind: "put",
-						key: new Uint8Array([1]),
-						value: new Uint8Array([10]),
-					},
-					{
-						kind: "put",
-						key: new Uint8Array([2]),
-						value: new Uint8Array([20]),
-					},
-					{
-						kind: "deleteRange",
-						range: { kind: "prefix", prefix: new Uint8Array([1]) },
-					},
-					{
-						kind: "put",
-						key: new Uint8Array([1]),
-						value: new Uint8Array([11]),
-					},
-				],
+				kind: "put",
+				key: new Uint8Array([1]),
+				value: new Uint8Array([10]),
+			},
+			{
+				kind: "put",
+				key: new Uint8Array([2]),
+				value: new Uint8Array([20]),
+			},
+			{
+				kind: "deleteRange",
+				range: {
+					lower: { kind: "included", key: new Uint8Array([1]) },
+					upper: { kind: "excluded", key: new Uint8Array([2]) },
+				},
+			},
+			{
+				kind: "put",
+				key: new Uint8Array([1]),
+				value: new Uint8Array([11]),
 			},
 		],
 	});
@@ -233,18 +228,10 @@ test("custom backend applies ordered deleteRange write ops", () => {
 
 	const read = backend.beginReadTransaction();
 	const values = read.getValues({
-		groups: [
-			{
-				namespace: "n",
-				keys: [new Uint8Array([1]), new Uint8Array([2])],
-			},
-		],
+		keys: [new Uint8Array([1]), new Uint8Array([2])],
 	});
 
-	expect(values.groups[0]?.values).toEqual([
-		new Uint8Array([11]),
-		new Uint8Array([20]),
-	]);
+	expect(values.values).toEqual([new Uint8Array([11]), new Uint8Array([20])]);
 	expect(read.rollback()).toBeUndefined();
 });
 
@@ -762,7 +749,6 @@ function expectRows(result: ExecuteResult) {
 }
 
 type StoredKvPair = {
-	namespace: string;
 	key: Uint8Array;
 	value: Uint8Array;
 };
@@ -788,54 +774,12 @@ function createMemoryBackend(options: MemoryBackendOptions = {}): LixBackend {
 			getValues(request): BackendKvValueBatch {
 				ensureOpen();
 				return {
-					groups: request.groups.map((group) => ({
-						namespace: group.namespace,
-						values: group.keys.map((key) => {
-							const row = transactionRows.find(
-								(row) =>
-									row.namespace === group.namespace &&
-									compareBytes(row.key, key) === 0,
-							);
-							return row ? new Uint8Array(row.value) : null;
-						}),
-					})),
-				};
-			},
-			existsMany(request): BackendKvExistsBatch {
-				ensureOpen();
-				return {
-					groups: request.groups.map((group) => ({
-						namespace: group.namespace,
-						exists: group.keys.map((key) =>
-							transactionRows.some(
-								(row) =>
-									row.namespace === group.namespace &&
-									compareBytes(row.key, key) === 0,
-							),
-						),
-					})),
-				};
-			},
-			scanKeys(request): BackendKvKeyPage {
-				ensureOpen();
-				const { pairs, resumeAfter } = scanPage(
-					transactionRows,
-					limitScanRequest(request, options.scanPageSize),
-				);
-				return {
-					keys: pairs.map((row) => new Uint8Array(row.key)),
-					resumeAfter,
-				};
-			},
-			scanValues(request): BackendKvValuePage {
-				ensureOpen();
-				const { pairs, resumeAfter } = scanPage(
-					transactionRows,
-					limitScanRequest(request, options.scanPageSize),
-				);
-				return {
-					values: pairs.map((row) => new Uint8Array(row.value)),
-					resumeAfter,
+					values: request.keys.map((key) => {
+						const row = transactionRows.find(
+							(row) => compareBytes(row.key, key) === 0,
+						);
+						return row ? new Uint8Array(row.value) : null;
+					}),
 				};
 			},
 			scanEntries(request): BackendKvEntryPage {
@@ -858,38 +802,29 @@ function createMemoryBackend(options: MemoryBackendOptions = {}): LixBackend {
 					deleteRanges: 0,
 					bytesWritten: 0,
 				};
-				for (const group of batch.groups) {
-					for (const op of group.ops) {
-						if (op.kind === "put") {
-							stats.puts += 1;
-							stats.bytesWritten += op.key.length + op.value.length;
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									compareBytes(row.key, op.key) !== 0,
-							);
-							transactionRows.push({
-								namespace: group.namespace,
-								key: new Uint8Array(op.key),
-								value: new Uint8Array(op.value),
-							});
-						} else if (op.kind === "delete") {
-							stats.deletes += 1;
-							stats.bytesWritten += op.key.length;
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									compareBytes(row.key, op.key) !== 0,
-							);
-						} else {
-							stats.deleteRanges += 1;
-							stats.bytesWritten += deleteRangeBytes(op.range);
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									!keyMatchesRange(row.key, op.range),
-							);
-						}
+				for (const op of batch.ops) {
+					if (op.kind === "put") {
+						stats.puts += 1;
+						stats.bytesWritten += op.key.length + op.value.length;
+						transactionRows = transactionRows.filter(
+							(row) => compareBytes(row.key, op.key) !== 0,
+						);
+						transactionRows.push({
+							key: new Uint8Array(op.key),
+							value: new Uint8Array(op.value),
+						});
+					} else if (op.kind === "delete") {
+						stats.deletes += 1;
+						stats.bytesWritten += op.key.length;
+						transactionRows = transactionRows.filter(
+							(row) => compareBytes(row.key, op.key) !== 0,
+						);
+					} else {
+						stats.deleteRanges += 1;
+						stats.bytesWritten += deleteRangeBytes(op.range);
+						transactionRows = transactionRows.filter(
+							(row) => !keyMatchesRange(row.key, op.range),
+						);
 					}
 				}
 				return stats;
@@ -929,7 +864,6 @@ function limitScanRequest(
 
 function cloneStoredPair(row: StoredKvPair): StoredKvPair {
 	return {
-		namespace: row.namespace,
 		key: new Uint8Array(row.key),
 		value: new Uint8Array(row.value),
 	};
@@ -942,7 +876,6 @@ function scanPage(
 	const matches = rows
 		.filter(
 			(row) =>
-				row.namespace === request.namespace &&
 				keyMatchesRange(row.key, request.range) &&
 				(!request.after || compareBytes(row.key, request.after) > 0),
 		)
@@ -956,20 +889,27 @@ function scanPage(
 }
 
 function keyMatchesRange(key: Uint8Array, range: BackendKvScanRange): boolean {
-	if (range.kind === "prefix") {
-		if (key.length < range.prefix.length) return false;
-		return range.prefix.every((byte, index) => key[index] === byte);
-	}
-	return (
-		compareBytes(key, range.start) >= 0 && compareBytes(key, range.end) < 0
-	);
+	return lowerBoundMatches(key, range.lower) && upperBoundMatches(key, range.upper);
+}
+
+function lowerBoundMatches(key: Uint8Array, bound: BackendKvScanRange["lower"]) {
+	if (bound.kind === "unbounded") return true;
+	const comparison = compareBytes(key, bound.key);
+	return bound.kind === "included" ? comparison >= 0 : comparison > 0;
+}
+
+function upperBoundMatches(key: Uint8Array, bound: BackendKvScanRange["upper"]) {
+	if (bound.kind === "unbounded") return true;
+	const comparison = compareBytes(key, bound.key);
+	return bound.kind === "included" ? comparison <= 0 : comparison < 0;
 }
 
 function deleteRangeBytes(range: BackendKvScanRange): number {
-	if (range.kind === "prefix") {
-		return range.prefix.length;
-	}
-	return range.start.length + range.end.length;
+	return boundBytes(range.lower) + boundBytes(range.upper);
+}
+
+function boundBytes(bound: BackendKvScanRange["lower"]): number {
+	return bound.kind === "unbounded" ? 0 : bound.key.length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {

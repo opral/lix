@@ -3005,7 +3005,10 @@ name = "lix_rs_sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "lix_engine",
+ "rusqlite",
+ "tempfile",
  "tokio",
 ]
 
