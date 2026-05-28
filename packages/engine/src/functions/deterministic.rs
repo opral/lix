@@ -1,3 +1,4 @@
+use crate::common::LixTimestamp;
 use crate::functions::FunctionProvider;
 
 const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -36,22 +37,20 @@ impl DeterministicFunctionProvider {
 }
 
 impl FunctionProvider for DeterministicFunctionProvider {
-    fn uuid_v7(&mut self) -> String {
+    fn uuid_v7(&mut self) -> uuid::Uuid {
         let counter = self.take_sequence();
         let counter_bits = (counter as u64) & DETERMINISTIC_UUID_COUNTER_MASK;
-        format!("01920000-0000-7000-8000-{counter_bits:012x}")
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + counter_bits as u128)
     }
 
-    fn timestamp(&mut self) -> String {
+    fn timestamp(&mut self) -> LixTimestamp {
         let counter = self.take_sequence();
         let millis = if self.timestamp_shuffle {
             shuffled_timestamp_millis(counter)
         } else {
             counter
         };
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        LixTimestamp::from_unix_millis_utc_lossy(millis)
     }
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
@@ -79,8 +78,14 @@ mod tests {
     fn deterministic_uuid_uses_sequence_counter() {
         let mut provider = DeterministicFunctionProvider::new(0, false);
 
-        assert_eq!(provider.uuid_v7(), "01920000-0000-7000-8000-000000000000");
-        assert_eq!(provider.uuid_v7(), "01920000-0000-7000-8000-000000000001");
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000000"
+        );
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-000000000001"
+        );
         assert_eq!(provider.highest_seen(), Some(1));
     }
 
@@ -88,7 +93,7 @@ mod tests {
     fn deterministic_timestamp_uses_sequence_counter() {
         let mut provider = DeterministicFunctionProvider::new(1, false);
 
-        assert_eq!(provider.timestamp(), "1970-01-01T00:00:00.001Z");
+        assert_eq!(provider.timestamp().to_string(), "1970-01-01T00:00:00.001Z");
         assert_eq!(provider.highest_seen(), Some(1));
     }
 
@@ -107,7 +112,10 @@ mod tests {
         let sequence = DeterministicSequence { highest_seen: 41 };
         let mut provider = DeterministicFunctionProvider::new(sequence.next_sequence(), false);
 
-        assert_eq!(provider.uuid_v7(), "01920000-0000-7000-8000-00000000002a");
+        assert_eq!(
+            provider.uuid_v7().to_string(),
+            "01920000-0000-7000-8000-00000000002a"
+        );
         assert_eq!(provider.highest_seen(), Some(42));
     }
 }

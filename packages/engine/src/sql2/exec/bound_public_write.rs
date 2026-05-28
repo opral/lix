@@ -643,12 +643,12 @@ fn eval_expr_value(
                 })
                 .map(EntityEvalValue::Json)
         }
-        BoundExpr::Function { name, args } if name == "lix_uuid_v7" && args.is_empty() => {
-            Ok(EntityEvalValue::SqlText(ctx.functions().call_uuid_v7()))
-        }
-        BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => {
-            Ok(EntityEvalValue::SqlText(ctx.functions().call_timestamp()))
-        }
+        BoundExpr::Function { name, args } if name == "lix_uuid_v7" && args.is_empty() => Ok(
+            EntityEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
+        ),
+        BoundExpr::Function { name, args } if name == "lix_timestamp" && args.is_empty() => Ok(
+            EntityEvalValue::SqlText(ctx.functions().call_timestamp().to_string()),
+        ),
         BoundExpr::Function { name, args } if name == "lix_empty_blob" && args.is_empty() => {
             Ok(EntityEvalValue::Json(JsonValue::Array(Vec::new())))
         }

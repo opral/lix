@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
@@ -51,7 +52,7 @@ pub(crate) async fn load_sequence(
 pub(crate) async fn stage_sequence(
     writes: &mut StorageWriteSet,
     sequence: DeterministicSequence,
-    timestamp: &str,
+    timestamp: LixTimestamp,
 ) -> Result<(), LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
@@ -151,7 +152,7 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 fn deterministic_key_value_row(
     key: &str,
     snapshot_content: &str,
-    timestamp: &str,
+    timestamp: LixTimestamp,
 ) -> Result<UntrackedStateRow, LixError> {
     Ok(UntrackedStateRow {
         entity_pk: crate::entity_pk::EntityPk::single(key),
@@ -159,8 +160,8 @@ fn deterministic_key_value_row(
         file_id: None,
         snapshot_content: Some(snapshot_content.to_string()),
         metadata: None,
-        created_at: crate::common::LixTimestamp::expect_parse("created_at", timestamp),
-        updated_at: crate::common::LixTimestamp::expect_parse("updated_at", timestamp),
+        created_at: timestamp,
+        updated_at: timestamp,
         global: true,
         branch_id: GLOBAL_BRANCH_ID.to_string(),
     })
@@ -282,7 +283,7 @@ mod tests {
         stage_sequence(
             &mut writes,
             DeterministicSequence { highest_seen: 7 },
-            "1970-01-01T00:00:00.000Z",
+            test_timestamp(),
         )
         .await
         .expect("sequence should stage");
@@ -322,7 +323,7 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let mut writes = storage.new_write_set();
-        let row = deterministic_key_value_row(key, &snapshot_content, "1970-01-01T00:00:00.000Z")
+        let row = deterministic_key_value_row(key, &snapshot_content, test_timestamp())
             .expect("test key-value should canonicalize");
         UntrackedStateContext::new()
             .writer(&mut writes)
@@ -331,5 +332,9 @@ mod tests {
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("test key-value should commit");
+    }
+
+    fn test_timestamp() -> LixTimestamp {
+        LixTimestamp::expect_parse("timestamp", "1970-01-01T00:00:00.000Z")
     }
 }

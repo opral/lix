@@ -16,6 +16,12 @@ static TIMESTAMP_PARSER: DateTimeParser = DateTimeParser::new();
 pub(crate) struct LixTimestamp(u64);
 
 impl LixTimestamp {
+    pub(crate) fn from_unix_millis_utc_lossy(millis: i64) -> Self {
+        let millis = (millis.max(0) as u64).min(MAX_PACKED_MILLIS);
+        Self::from_parts(millis, 0)
+            .unwrap_or_else(|_| Self::from_parts(0, 0).expect("Unix epoch is a valid timestamp"))
+    }
+
     pub(crate) fn parse(timestamp: &str) -> Result<Self, String> {
         let instant = TIMESTAMP_PARSER
             .parse_timestamp(timestamp)
@@ -181,6 +187,16 @@ mod tests {
 
         assert_eq!(timestamp.to_string(), "2026-05-19T00:00:00.000Z");
         assert_eq!(timestamp.offset_minutes(), 0);
+    }
+
+    #[test]
+    fn timestamp_builds_from_utc_millis() {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(1);
+        let negative = LixTimestamp::from_unix_millis_utc_lossy(-1);
+
+        assert_eq!(timestamp.to_string(), "1970-01-01T00:00:00.001Z");
+        assert_eq!(timestamp.offset_minutes(), 0);
+        assert_eq!(negative.to_string(), "1970-01-01T00:00:00.000Z");
     }
 
     #[test]

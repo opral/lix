@@ -5,9 +5,7 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::functions::{
-    FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-};
+use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
@@ -81,15 +79,10 @@ pub struct InitReceipt {
 /// The initial commit tracks durable content rows. Branch refs are moving
 /// pointers and therefore live in untracked local state instead of the commit.
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
-    let main_branch_id = functions.call_uuid_v7();
-    let lix_id = functions.call_uuid_v7();
-    let initial_commit_id = CommitId::parse_lix(&functions.call_uuid_v7(), "initial commit_id")?;
-    let timestamp_text = functions.call_timestamp();
-    let timestamp = LixTimestamp::parse(&timestamp_text).map_err(|error| {
-        LixError::unknown(format!(
-            "invalid init timestamp from function provider: {error}"
-        ))
-    })?;
+    let main_branch_id = functions.call_uuid_v7().to_string();
+    let lix_id = functions.call_uuid_v7().to_string();
+    let initial_commit_id = CommitId::from(functions.call_uuid_v7());
+    let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
     for schema in seed_schema_definitions() {
@@ -127,7 +120,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let initial_commit = InitSeedCommit {
         id: initial_commit_id,
-        change_id: ChangeId::parse_lix(&functions.call_uuid_v7(), "initial commit change_id")?,
+        change_id: ChangeId::from(functions.call_uuid_v7()),
         parent_ids: Vec::new(),
         author_account_ids: Vec::new(),
         created_at: timestamp,
@@ -191,9 +184,7 @@ where
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
-    let functions = SharedFunctionProvider::new(
-        Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-    );
+    let functions = FunctionProviderHandle::system();
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
@@ -381,15 +372,14 @@ fn untracked_row(
 }
 
 fn canonical_change(
-    id: String,
+    id: uuid::Uuid,
     entity_pk: EntityPk,
     schema_key: &str,
     snapshot_content: String,
     created_at: LixTimestamp,
 ) -> InitSeedChange {
     InitSeedChange {
-        id: ChangeId::parse_lix(&id, "init seed change_id")
-            .expect("uuid_v7 provider must return a valid UUID"),
+        id: ChangeId::from(id),
         entity_pk,
         schema_key: schema_key.to_string(),
         snapshot_content,
@@ -440,7 +430,7 @@ mod tests {
 
     use super::*;
     use crate::changelog::ChangelogReader;
-    use crate::functions::{FunctionProvider, SharedFunctionProvider};
+    use crate::functions::FunctionProvider;
     use crate::storage::InMemoryStorageBackend;
     use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateContext;
@@ -685,7 +675,7 @@ mod tests {
     }
 
     fn test_functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(
+        FunctionProviderHandle::shared(
             Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>
         )
     }
@@ -697,18 +687,25 @@ mod tests {
     }
 
     impl FunctionProvider for TestFunctionProvider {
-        fn uuid_v7(&mut self) -> String {
+        fn uuid_v7(&mut self) -> uuid::Uuid {
             self.uuid_count += 1;
-            test_uuid(self.uuid_count)
+            test_uuid_value(self.uuid_count)
         }
 
-        fn timestamp(&mut self) -> String {
+        fn timestamp(&mut self) -> LixTimestamp {
             self.timestamp_count += 1;
-            format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count)
+            LixTimestamp::expect_parse(
+                "timestamp",
+                &format!("2026-01-01T00:00:00.{:03}Z", self.timestamp_count),
+            )
         }
     }
 
     fn test_uuid(index: usize) -> String {
-        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128).to_string()
+        test_uuid_value(index).to_string()
+    }
+
+    fn test_uuid_value(index: usize) -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + index as u128)
     }
 }

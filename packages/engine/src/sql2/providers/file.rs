@@ -509,7 +509,7 @@ impl InsertSink for LixFileInsertSink {
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
-                    &mut || self.functions.call_uuid_v7(),
+                    &mut || self.functions.call_uuid_v7().to_string(),
                     self.include_data_writes,
                 )?);
             } else {
@@ -521,7 +521,7 @@ impl InsertSink for LixFileInsertSink {
                         path_resolvers
                             .as_mut()
                             .expect("path resolver should be initialized"),
-                        &mut || self.functions.call_uuid_v7(),
+                        &mut || self.functions.call_uuid_v7().to_string(),
                         self.include_data_writes,
                     )?,
                 );
@@ -867,7 +867,7 @@ impl ExecutionPlan for LixFileUpdateExec {
                 branch_binding.active_branch_id(),
                 update_columns,
                 path_resolvers.as_mut(),
-                &mut || functions.call_uuid_v7(),
+                &mut || functions.call_uuid_v7().to_string(),
             )?;
             let count = staged.count;
 
@@ -2641,9 +2641,7 @@ mod tests {
 
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::functions::{
-        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-    };
+    use crate::functions::FunctionProviderHandle;
     use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::dml::InsertSink;
@@ -2666,9 +2664,7 @@ mod tests {
     }
 
     fn test_functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-        )
+        FunctionProviderHandle::system()
     }
 
     fn string_literal(value: &str) -> Expr {

@@ -453,7 +453,7 @@ impl InsertSink for LixDirectoryInsertSink {
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
-                    &mut || self.functions.call_uuid_v7(),
+                    &mut || self.functions.call_uuid_v7().to_string(),
                 )?);
             } else {
                 rows.extend(
@@ -1869,9 +1869,7 @@ mod tests {
 
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{ChangeId, CommitId};
-    use crate::functions::{
-        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-    };
+    use crate::functions::FunctionProviderHandle;
     use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
@@ -1896,9 +1894,7 @@ mod tests {
     }
 
     fn test_functions() -> FunctionProviderHandle {
-        SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
-        )
+        FunctionProviderHandle::system()
     }
 
     #[derive(Default)]

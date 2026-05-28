@@ -590,7 +590,7 @@ where
         branch_id: &str,
         commit_id: crate::changelog::CommitId,
     ) -> Result<(), LixError> {
-        let timestamp = self.functions.call_timestamp();
+        let timestamp = self.functions.call_timestamp().to_string();
         let canonical_row = prepare_branch_ref_row(branch_id, &commit_id, &timestamp)?;
         self.branch_ctx
             .stage_canonical_ref_rows(&mut self.staged_storage_writes, &[canonical_row.row])
@@ -762,10 +762,14 @@ fn prepare_state_row(
         schema_plan_id,
         facts,
     } = normalized;
-    let updated_at = row.updated_at.unwrap_or_else(|| functions.call_timestamp());
-    let created_at = row.created_at.unwrap_or_else(|| updated_at.clone());
-    let created_at = parse_prepared_timestamp("created_at", &created_at)?;
-    let updated_at = parse_prepared_timestamp("updated_at", &updated_at)?;
+    let updated_at = match row.updated_at {
+        Some(updated_at) => parse_prepared_timestamp("updated_at", &updated_at)?,
+        None => functions.call_timestamp(),
+    };
+    let created_at = match row.created_at {
+        Some(created_at) => parse_prepared_timestamp("created_at", &created_at)?,
+        None => updated_at,
+    };
     let snapshot = snapshot
         .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
         .transpose()?;
@@ -796,10 +800,12 @@ fn prepare_state_row(
                 .map(|id| ChangeId::parse_lix(id, "prepared untracked row change_id"))
                 .transpose()?
         } else {
-            Some(ChangeId::parse_lix(
-                &row.change_id.unwrap_or_else(|| functions.call_uuid_v7()),
-                "prepared tracked row change_id",
-            )?)
+            Some(match row.change_id {
+                Some(change_id) => {
+                    ChangeId::parse_lix(&change_id, "prepared tracked row change_id")?
+                }
+                None => ChangeId::from(functions.call_uuid_v7()),
+            })
         },
         commit_id: row
             .commit_id

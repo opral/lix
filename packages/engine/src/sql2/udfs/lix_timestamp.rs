@@ -57,7 +57,7 @@ impl ScalarUDFImpl for LixTimestamp {
             return plan_err!("lix_timestamp requires no arguments");
         }
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            self.functions.call_timestamp(),
+            self.functions.call_timestamp().to_string(),
         ))))
     }
 }
