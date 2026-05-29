@@ -14,7 +14,7 @@ jobs:
     if: >
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'github-actions[bot]' &&
-      (!endsWith(github.actor, '[bot]') || github.actor == 'cursor[bot]') &&
+      !endsWith(github.actor, '[bot]') &&
       !startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
 
