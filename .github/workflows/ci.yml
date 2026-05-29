@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-test:
+    name: Cargo Test
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ github.job }}
+
+      - name: Run cargo tests
+        run: cargo test --workspace
+
+  js-sdk-test:
+    name: JS SDK Binding Test
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ github.job }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
+
+      - name: Install JS SDK dependencies
+        working-directory: packages/js-sdk
+        run: npm ci
+
+      - name: Run JS SDK binding tests
+        working-directory: packages/js-sdk
+        run: npm test

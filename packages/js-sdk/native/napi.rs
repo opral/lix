@@ -1,10 +1,10 @@
 use lix_rs_sdk::{
     open_lix, open_lix_with_backend, CreateBranchOptions as RsCreateBranchOptions,
-    CreateBranchReceipt, ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix,
-    LixError, LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
+    CreateBranchReceipt, ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix, LixError,
+    LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind,
-    MergeConflictSide, OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
+    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
+    OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
     SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use napi::bindgen_prelude::*;
@@ -183,9 +183,11 @@ impl NativeLix {
         };
         let result = self
             .rt
-            .block_on(self.lix().map_err(|error| throw_lix_error(&env, error))?.execute(
-                &sql, &params,
-            ))
+            .block_on(
+                self.lix()
+                    .map_err(|error| throw_lix_error(&env, error))?
+                    .execute(&sql, &params),
+            )
             .map_err(|error| throw_lix_error(&env, error))?;
         ExecuteResult::try_from(result).map_err(|error| throw_lix_error(&env, error))
     }
