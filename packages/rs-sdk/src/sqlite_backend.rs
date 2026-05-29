@@ -1,8 +1,7 @@
-use std::collections::VecDeque;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use lix_engine::backend::{
@@ -12,10 +11,11 @@ use lix_engine::backend::{
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Rows};
 use tempfile::TempDir;
 
 pub const SQLITE_FORMAT_VERSION: u32 = 1;
+const ENTRIES_TABLE: &str = "lix_internal_entries";
 
 #[derive(Debug)]
 pub struct SqliteBackendFactory {
@@ -31,9 +31,11 @@ pub struct SqliteBackendFixture {
 #[derive(Clone)]
 pub struct SqliteBackend {
     path: PathBuf,
+    read_pool: Arc<Mutex<Vec<Connection>>>,
     write_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
+#[derive(Clone, Debug)]
 pub struct SqliteBackendOptions {
     pub path: PathBuf,
 }
@@ -41,14 +43,15 @@ pub struct SqliteBackendOptions {
 #[derive(Clone)]
 pub struct SqliteRead {
     state: Arc<Mutex<SqliteReadState>>,
+    read_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
 struct SqliteReadState {
     conn: Option<Connection>,
 }
 
-pub struct SqliteRangeScan {
-    rows: VecDeque<SqlitePendingRow>,
+pub struct SqliteRangeScan<'stmt> {
+    rows: Rows<'stmt>,
     projection: CoreProjection,
     pending: Option<SqlitePendingRow>,
     done: bool,
@@ -114,6 +117,7 @@ impl SqliteBackend {
         initialize_database(&path)?;
         Ok(Self {
             path,
+            read_pool: Arc::new(Mutex::new(Vec::new())),
             write_pool: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -121,13 +125,6 @@ impl SqliteBackend {
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    #[allow(dead_code)]
-    pub fn checkpoint(&self) -> Result<(), BackendError> {
-        let conn = self.connect()?;
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(sqlite_error)
     }
 
     pub fn format_version(&self) -> Result<u32, BackendError> {
@@ -138,6 +135,13 @@ impl SqliteBackend {
     pub fn busy_timeout_ms(&self) -> Result<i64, BackendError> {
         let conn = self.connect()?;
         conn.pragma_query_value(None, "busy_timeout", |row| row.get::<_, i64>(0))
+            .map_err(sqlite_error)
+    }
+
+    #[allow(dead_code)]
+    pub fn checkpoint(&self) -> Result<(), BackendError> {
+        let conn = self.connect()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(sqlite_error)
     }
 
@@ -157,11 +161,18 @@ impl Backend for SqliteBackend {
     where
         Self: 'a;
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        let conn = self.connect()?;
+        let conn = self
+            .read_pool
+            .lock()
+            .map_err(|error| BackendError::Io(format!("sqlite read pool poisoned: {error}")))?
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| self.connect())?;
         execute_cached(&conn, "BEGIN DEFERRED TRANSACTION")?;
         pin_read_snapshot(&conn)?;
         Ok(SqliteRead {
             state: Arc::new(Mutex::new(SqliteReadState { conn: Some(conn) })),
+            read_pool: Arc::clone(&self.read_pool),
         })
     }
 
@@ -184,7 +195,7 @@ impl Backend for SqliteBackend {
 }
 
 impl BackendRead for SqliteRead {
-    type RangeScan<'a> = SqliteRangeScan;
+    type RangeScan<'a> = SqliteRangeScan<'a>;
 
     fn visit_keys<V>(
         &self,
@@ -215,16 +226,16 @@ impl BackendRead for SqliteRead {
     where
         F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
-        let rows = {
-            let state = self.state.lock().map_err(|error| {
-                BackendError::Io(format!("sqlite read state poisoned: {error}"))
-            })?;
-            let conn = state
-                .conn
-                .as_ref()
-                .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))?;
-            collect_range_rows(conn, range, opts)?
-        };
+        let state = self.lock_state()?;
+        let conn = state
+            .conn
+            .as_ref()
+            .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))?;
+        let (sql, values) = scan_sql(range, opts)?;
+        let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+        let rows = stmt
+            .query(rusqlite::params_from_iter(values))
+            .map_err(sqlite_error)?;
         let mut cursor = SqliteRangeScan {
             rows,
             projection: opts.projection,
@@ -239,7 +250,7 @@ impl BackendRead for SqliteRead {
     }
 }
 
-impl BackendRangeScan for SqliteRangeScan {
+impl BackendRangeScan for SqliteRangeScan<'_> {
     fn visit_next<V>(
         &mut self,
         limit_rows: usize,
@@ -263,14 +274,23 @@ impl BackendRangeScan for SqliteRangeScan {
                 continue;
             }
 
-            let Some(row) = self.rows.pop_front() else {
+            let Some(row) = self.rows.next().map_err(sqlite_error)? else {
                 self.done = true;
                 return Ok(ScanResult {
                     emitted,
                     has_more: false,
                 });
             };
-            visit_sqlite_pending_row(row, self.projection, visitor)?;
+            let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
+            match self.projection {
+                CoreProjection::KeyOnly => {
+                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?
+                }
+                CoreProjection::FullValue => {
+                    let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
+                    visitor.visit(KeyRef(key), ProjectedValueRef::FullValue(value))?;
+                }
+            }
             emitted += 1;
         }
 
@@ -279,16 +299,22 @@ impl BackendRangeScan for SqliteRangeScan {
     }
 }
 
-impl SqliteRangeScan {
+impl SqliteRangeScan<'_> {
     fn ensure_pending(&mut self) -> Result<bool, BackendError> {
         if self.pending.is_some() {
             return Ok(true);
         }
-        let Some(row) = self.rows.pop_front() else {
+        let Some(row) = self.rows.next().map_err(sqlite_error)? else {
             self.done = true;
             return Ok(false);
         };
-        self.pending = Some(row);
+        let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?.to_vec();
+        let value = if matches!(self.projection, CoreProjection::FullValue) {
+            Some(blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?.to_vec())
+        } else {
+            None
+        };
+        self.pending = Some(SqlitePendingRow { key, value });
         Ok(true)
     }
 }
@@ -319,6 +345,12 @@ where
 }
 
 impl SqliteRead {
+    fn lock_state(&self) -> Result<MutexGuard<'_, SqliteReadState>, BackendError> {
+        self.state
+            .lock()
+            .map_err(|error| BackendError::Io(format!("sqlite read state poisoned: {error}")))
+    }
+
     fn finish(&self) -> Result<(), BackendError> {
         if Arc::strong_count(&self.state) > 1 {
             return Ok(());
@@ -330,7 +362,13 @@ impl SqliteRead {
         let Some(conn) = state.conn.take() else {
             return Ok(());
         };
-        execute_cached(&conn, "ROLLBACK").or_else(ignore_no_transaction)
+        let result = execute_cached(&conn, "ROLLBACK").or_else(ignore_no_transaction);
+        if result.is_ok() {
+            if let Ok(mut pool) = self.read_pool.lock() {
+                pool.push(conn);
+            }
+        }
+        result
     }
 }
 
@@ -347,8 +385,8 @@ impl BackendWrite for SqliteWrite {
         {
             let conn = self.conn();
             let mut stmt = conn
-                .prepare(
-                    "INSERT INTO lix_entries(key, value)
+                .prepare_cached(
+                    "INSERT INTO lix_internal_entries(key, value)
                      VALUES (?1, ?2)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 )
@@ -372,7 +410,7 @@ impl BackendWrite for SqliteWrite {
         {
             let conn = self.conn();
             let mut stmt = conn
-                .prepare("DELETE FROM lix_entries WHERE key = ?1")
+                .prepare_cached("DELETE FROM lix_internal_entries WHERE key = ?1")
                 .map_err(sqlite_error)?;
 
             for key in keys {
@@ -386,7 +424,7 @@ impl BackendWrite for SqliteWrite {
     }
 
     fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
-        let mut sql = String::from("DELETE FROM lix_entries WHERE 1 = 1");
+        let mut sql = String::from("DELETE FROM lix_internal_entries WHERE 1 = 1");
         let mut values = Vec::new();
         append_bound_sql(&mut sql, &mut values, "key", ">=", ">", &range.lower);
         append_bound_sql(&mut sql, &mut values, "key", "<=", "<", &range.upper);
@@ -442,24 +480,29 @@ impl Drop for SqliteWrite {
 
 fn initialize_database(path: &Path) -> Result<(), BackendError> {
     let conn = open_connection(path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(sqlite_error)?;
     let user_version = sqlite_user_version(&conn)?;
     if user_version > SQLITE_FORMAT_VERSION {
         return Err(BackendError::Io(format!(
-            "sqlite file format version {user_version} is newer than supported version {SQLITE_FORMAT_VERSION}"
+            "sqlite backend format version {user_version} is newer than supported version {SQLITE_FORMAT_VERSION}"
         )));
     }
+
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(sqlite_error)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS lix_entries (
+        "CREATE TABLE IF NOT EXISTS lix_internal_entries (
             key BLOB NOT NULL,
             value BLOB NOT NULL,
             PRIMARY KEY (key)
         ) WITHOUT ROWID;",
     )
     .map_err(sqlite_error)?;
-    conn.pragma_update(None, "user_version", SQLITE_FORMAT_VERSION)
-        .map_err(sqlite_error)?;
+
+    if user_version == 0 {
+        conn.pragma_update(None, "user_version", SQLITE_FORMAT_VERSION)
+            .map_err(sqlite_error)?;
+    }
+
     Ok(())
 }
 
@@ -467,20 +510,30 @@ fn open_connection(path: &Path) -> Result<Connection, BackendError> {
     let conn = Connection::open(path).map_err(sqlite_error)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(sqlite_error)?;
+    conn.execute_batch(
+        "PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -20000;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA wal_autocheckpoint = 10000;",
+    )
+    .map_err(sqlite_error)?;
     Ok(conn)
 }
 
-fn sqlite_user_version(conn: &Connection) -> Result<u32, BackendError> {
-    conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-        .map_err(sqlite_error)
-}
-
 fn pin_read_snapshot(conn: &Connection) -> Result<(), BackendError> {
-    let mut stmt = conn
-        .prepare_cached("SELECT COUNT(*) FROM lix_entries")
-        .map_err(sqlite_error)?;
+    let sql = format!("SELECT COUNT(*) FROM {ENTRIES_TABLE}");
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
     let _: i64 = stmt.query_row([], |row| row.get(0)).map_err(sqlite_error)?;
     Ok(())
+}
+
+fn sqlite_user_version(conn: &Connection) -> Result<u32, BackendError> {
+    let value = conn
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(sqlite_error)?;
+    u32::try_from(value)
+        .map_err(|_| BackendError::Corruption(format!("sqlite user_version was negative: {value}")))
 }
 
 fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
@@ -516,7 +569,7 @@ where
         "WITH requested(ord, key) AS (VALUES {placeholders})
          SELECT r.ord, e.value
          FROM requested r
-         LEFT JOIN lix_entries e ON e.key = r.key
+         LEFT JOIN lix_internal_entries e ON e.key = r.key
          ORDER BY r.ord ASC"
     );
 
@@ -549,36 +602,15 @@ where
     Ok(())
 }
 
-fn collect_range_rows(
-    conn: &Connection,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-) -> Result<VecDeque<SqlitePendingRow>, BackendError> {
-    let (sql, values) = scan_sql(range, opts)?;
-    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(values))
-        .map_err(sqlite_error)?;
-    let mut collected = VecDeque::new();
-    while let Some(row) = rows.next().map_err(sqlite_error)? {
-        let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?.to_vec();
-        let value = if matches!(opts.projection, CoreProjection::FullValue) {
-            Some(blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?.to_vec())
-        } else {
-            None
-        };
-        collected.push_back(SqlitePendingRow { key, value });
-    }
-    Ok(collected)
-}
-
 fn scan_sql(
     range: KeyRange,
     opts: ScanOptions<'_>,
 ) -> Result<(String, Vec<SqlValue>), BackendError> {
     let mut sql = match opts.projection {
-        CoreProjection::KeyOnly => String::from("SELECT key FROM lix_entries WHERE 1 = 1"),
-        CoreProjection::FullValue => String::from("SELECT key, value FROM lix_entries WHERE 1 = 1"),
+        CoreProjection::KeyOnly => String::from("SELECT key FROM lix_internal_entries WHERE 1 = 1"),
+        CoreProjection::FullValue => {
+            String::from("SELECT key, value FROM lix_internal_entries WHERE 1 = 1")
+        }
     };
     let mut values = Vec::new();
 
