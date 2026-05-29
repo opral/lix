@@ -15,9 +15,8 @@ pub(crate) use archive::{
 };
 #[allow(unused_imports)]
 pub(crate) use manifest::{
-    glob_matches_path, parse_plugin_manifest_json, select_best_glob_match, DetectChangesConfig,
-    DetectStateContextConfig, PluginContentType, PluginManifest, PluginMatch, PluginRuntime,
-    StateContextColumn, ValidatedPluginManifest,
+    glob_matches_path, parse_plugin_manifest_json, select_best_glob_match, PluginContentType,
+    PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,
 };
 #[allow(unused_imports)]
 pub(crate) use materializer::{

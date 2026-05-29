@@ -12,9 +12,9 @@ This establishes a deterministic block-level projection baseline with unit tests
 
 ## Identity Model (v2)
 
-`plugin-md-v2` detect expects active state context for top-level block IDs:
+`plugin-md-v2` detect uses active state context for top-level block IDs:
 
-- With `detect_changes.state_context.include_active_state: true`: existing IDs are reused from active state rows whenever blocks can be matched (exact + fuzzy matching).
+- Existing IDs are reused from active state rows whenever blocks can be matched (exact + fuzzy matching).
 - Fingerprint normalization includes:
   - line ending normalization (`CRLF`/`CR` -> `LF`)
   - Unicode NFC normalization for all string fields
