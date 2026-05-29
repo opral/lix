@@ -113,12 +113,7 @@ fn parse_state_context_projection(
             blocks_by_id: BTreeMap::new(),
         });
     };
-    let Some(rows) = state_context.active_state.as_ref() else {
-        return Ok(BeforeProjection {
-            order: Vec::new(),
-            blocks_by_id: BTreeMap::new(),
-        });
-    };
+    let rows = &state_context.active_state;
 
     let mut document_order = None::<Vec<String>>;
     let mut blocks_by_id = BTreeMap::<String, ParsedBlock>::new();

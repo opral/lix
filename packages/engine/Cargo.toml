@@ -100,8 +100,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 zstd = "0.13"
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(target_family = "wasm")'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }

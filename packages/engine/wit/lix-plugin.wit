@@ -3,8 +3,7 @@ package lix:plugin@0.1.0;
 interface api {
   type canonical-json = string;
 
-  /// Current materialized file payload. Plugins should treat this as an
-  /// implementation detail cache and must not rely on mutation order.
+  /// Current materialized file payload supplied to `detect-changes`.
   record file {
     id: string,
     path: string,
@@ -13,9 +12,9 @@ interface api {
 
   /// Represents the latest visible row for an entity.
   ///
-  /// `apply-changes` receives an unordered set of these rows for a single file.
-  /// Implementations must be order-independent and produce the same output for
-  /// any ordering of `changes`.
+  /// `render` receives an unordered set of these rows for a single file through
+  /// `detect-state-context.active-state`. Implementations must be
+  /// order-independent and produce the same output for any row ordering.
   ///
   /// Uniqueness: callers provide at most one row per
   /// (`schema-key`, `entity-pk`) for the same (`file.id`, branch).
@@ -26,8 +25,8 @@ interface api {
     snapshot-content: option<canonical-json>,
   }
 
-  /// Optional active-state row payload passed to detect-changes when requested
-  /// by the plugin manifest. Omitted fields are represented as `none`.
+  /// Active-state row payload passed to plugin calls when requested by the
+  /// plugin manifest. Omitted row fields are represented as `none`.
   ///
   /// Scope is implicit and engine-defined: same plugin + same file + active rows.
   record active-state-row {
@@ -46,7 +45,7 @@ interface api {
   }
 
   record detect-state-context {
-    active-state: option<list<active-state-row>>,
+    active-state: list<active-state-row>,
   }
 
   variant plugin-error {
@@ -54,10 +53,10 @@ interface api {
     internal(string),
   }
 
-  /// Computes row-level state transitions between two file payloads.
-  detect-changes: func(before: option<file>, after: file, state-context: option<detect-state-context>) -> result<list<entity-change>, plugin-error>;
+  /// Computes row-level state transitions between active state and a file payload.
+  detect-changes: func(state: detect-state-context, file: file) -> result<list<entity-change>, plugin-error>;
   /// Rebuilds file bytes from the unordered latest-state row set.
-  apply-changes: func(file: file, changes: list<entity-change>) -> result<list<u8>, plugin-error>;
+  render: func(state: detect-state-context) -> result<list<u8>, plugin-error>;
 }
 
 world plugin {

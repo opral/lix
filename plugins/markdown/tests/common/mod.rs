@@ -87,7 +87,7 @@ pub fn assert_invalid_input(error: PluginApiError) {
     }
 }
 
-pub fn apply_delta(state: &mut StateRows, delta: Vec<PluginEntityChange>) {
+pub fn merge_delta(state: &mut StateRows, delta: Vec<PluginEntityChange>) {
     for change in delta {
         let key = (change.schema_key.clone(), change.entity_pk.clone());
         if change.snapshot_content.is_some() {

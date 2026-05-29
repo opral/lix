@@ -32,7 +32,7 @@ name = "detect_changes"
 harness = false
 
 [[bench]]
-name = "apply_changes"
+name = "render_changes"
 harness = false
 
 [[bench]]

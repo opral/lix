@@ -1,32 +1,31 @@
 mod common;
 
 use common::{
-    StateRows, apply_delta, collect_state_rows, decode_utf8, empty_file, file_from_markdown,
-    is_document_change,
+    StateRows, collect_state_rows, decode_utf8, empty_file, file_from_markdown, is_document_change,
+    merge_delta,
 };
 use plugin_md_v2::{
     BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, PluginActiveStateRow, PluginDetectStateContext,
-    PluginEntityChange, apply_changes, detect_changes, detect_changes_with_state_context,
+    PluginEntityChange, detect_changes, detect_changes_with_state_context, render_changes,
 };
 
 fn to_state_context(rows: &[PluginEntityChange]) -> PluginDetectStateContext {
     PluginDetectStateContext {
-        active_state: Some(
-            rows.iter()
-                .map(|row| PluginActiveStateRow {
-                    entity_pk: row.entity_pk.clone(),
-                    schema_key: Some(row.schema_key.clone()),
-                    snapshot_content: row.snapshot_content.clone(),
-                    file_id: None,
-                    plugin_key: None,
-                    branch_id: None,
-                    change_id: None,
-                    metadata: None,
-                    created_at: None,
-                    updated_at: None,
-                })
-                .collect::<Vec<_>>(),
-        ),
+        active_state: rows
+            .iter()
+            .map(|row| PluginActiveStateRow {
+                entity_pk: row.entity_pk.clone(),
+                schema_key: Some(row.schema_key.clone()),
+                snapshot_content: row.snapshot_content.clone(),
+                file_id: None,
+                plugin_key: None,
+                branch_id: None,
+                change_id: None,
+                metadata: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .collect::<Vec<_>>(),
     }
 }
 
@@ -83,17 +82,17 @@ fn upsert_block_types(changes: &[PluginEntityChange]) -> Vec<String> {
 }
 
 #[test]
-fn roundtrip_file_detect_state_apply_markdown() {
+fn roundtrip_file_detect_state_render_markdown() {
     let markdown = "# Title\n\nParagraph one.\n\nParagraph two.\n";
     let file = file_from_markdown("f1", "/notes.md", markdown);
 
     let delta = detect_changes(None, file).expect("detect_changes should succeed");
 
     let mut state = StateRows::new();
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(materialized), markdown);
 }
@@ -108,7 +107,7 @@ fn roundtrip_edit_move_delete_across_block_rows() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let delta = detect_changes(
         Some(before_file),
@@ -128,10 +127,10 @@ fn roundtrip_edit_move_delete_across_block_rows() {
         change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
     }));
 
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
@@ -164,16 +163,16 @@ fn roundtrip_multi_step_evolution() {
     let mut state = StateRows::new();
 
     let delta_a = detect_changes(None, a_file.clone()).expect("detect_changes should succeed");
-    apply_delta(&mut state, delta_a);
+    merge_delta(&mut state, delta_a);
 
     let delta_b = detect_with_state_context(&state, a_file, b_file.clone());
-    apply_delta(&mut state, delta_b);
+    merge_delta(&mut state, delta_b);
 
     let delta_c = detect_with_state_context(&state, b_file, c_file);
-    apply_delta(&mut state, delta_c);
+    merge_delta(&mut state, delta_c);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(materialized), c);
 }
@@ -186,14 +185,14 @@ fn roundtrip_delete_all_blocks_to_empty_document() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let delta = detect_changes(Some(before_file), file_from_markdown("f1", "/notes.md", ""))
         .expect("detect_changes should succeed");
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(materialized), "");
 }
@@ -207,7 +206,7 @@ fn roundtrip_list_internal_edit_keeps_top_level_block_model() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let delta = detect_with_state_context(
         &state,
@@ -220,10 +219,10 @@ fn roundtrip_list_internal_edit_keeps_top_level_block_model() {
     assert_eq!(count_document_rows(&delta), 0);
     assert_eq!(upsert_block_types(&delta), vec!["list".to_string()]);
 
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
     assert_eq!(decode_utf8(materialized), after);
 }
 
@@ -238,7 +237,7 @@ fn roundtrip_table_row_add_remove_reorder() {
     let initial_file = file_from_markdown("f1", "/notes.md", initial);
     let bootstrap =
         detect_changes(None, initial_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let delta_add = detect_with_state_context(
         &state,
@@ -249,7 +248,7 @@ fn roundtrip_table_row_add_remove_reorder() {
     assert_eq!(count_upserts(&delta_add), 1);
     assert_eq!(count_document_rows(&delta_add), 0);
     assert_eq!(upsert_block_types(&delta_add), vec!["table".to_string()]);
-    apply_delta(&mut state, delta_add);
+    merge_delta(&mut state, delta_add);
 
     let delta_reorder = detect_with_state_context(
         &state,
@@ -263,7 +262,7 @@ fn roundtrip_table_row_add_remove_reorder() {
         upsert_block_types(&delta_reorder),
         vec!["table".to_string()]
     );
-    apply_delta(&mut state, delta_reorder);
+    merge_delta(&mut state, delta_reorder);
 
     let delta_remove = detect_with_state_context(
         &state,
@@ -274,10 +273,10 @@ fn roundtrip_table_row_add_remove_reorder() {
     assert_eq!(count_upserts(&delta_remove), 1);
     assert_eq!(count_document_rows(&delta_remove), 0);
     assert_eq!(upsert_block_types(&delta_remove), vec!["table".to_string()]);
-    apply_delta(&mut state, delta_remove);
+    merge_delta(&mut state, delta_remove);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
     assert_eq!(decode_utf8(materialized), remove);
 }
 
@@ -290,7 +289,7 @@ fn roundtrip_large_shuffle_500_with_state_context_low_noise() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let mut after = paragraphs;
     after.rotate_left(123);
@@ -304,10 +303,10 @@ fn roundtrip_large_shuffle_500_with_state_context_low_noise() {
     assert_eq!(count_tombstones(&delta), 0);
     assert_eq!(count_upserts(&delta), 0);
     assert_eq!(count_document_rows(&delta), 1);
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
 
@@ -320,7 +319,7 @@ fn roundtrip_large_tiny_edits_500_with_state_context_low_noise() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let mut after = paragraphs;
     for idx in [10usize, 111, 222, 333, 444] {
@@ -336,10 +335,10 @@ fn roundtrip_large_tiny_edits_500_with_state_context_low_noise() {
     assert_eq!(count_tombstones(&delta), 0);
     assert_eq!(count_upserts(&delta), 5);
     assert_eq!(count_document_rows(&delta), 0);
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
 
@@ -352,7 +351,7 @@ fn roundtrip_large_duplicate_edit_with_state_context_low_noise() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let mut after = before_paragraphs;
     after[349] = "Same updated".to_string();
@@ -366,10 +365,10 @@ fn roundtrip_large_duplicate_edit_with_state_context_low_noise() {
     assert_eq!(count_tombstones(&delta), 0);
     assert_eq!(count_upserts(&delta), 1);
     assert!(count_document_rows(&delta) <= 1);
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
 
@@ -382,7 +381,7 @@ fn roundtrip_move_insert_delete_large_with_state_context_low_noise() {
     let mut state = StateRows::new();
     let bootstrap =
         detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
-    apply_delta(&mut state, bootstrap);
+    merge_delta(&mut state, bootstrap);
 
     let moved = paragraphs[450..460].to_vec();
     let mut remaining = paragraphs[..450].to_vec();
@@ -411,9 +410,9 @@ fn roundtrip_move_insert_delete_large_with_state_context_low_noise() {
     assert_eq!(upserts, 1);
     assert_eq!(docs, 1);
     assert!(tombstones + upserts <= 2);
-    apply_delta(&mut state, delta);
+    merge_delta(&mut state, delta);
 
-    let materialized = apply_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
-        .expect("apply_changes should succeed");
+    let materialized = render_changes(empty_file("f1", "/notes.md"), collect_state_rows(&state))
+        .expect("render_changes should succeed");
     assert_eq!(decode_utf8(materialized), after_markdown);
 }

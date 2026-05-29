@@ -1,10 +1,10 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use plugin_json_v2::apply_changes;
+use plugin_json_v2::render_changes;
 
-fn bench_apply_changes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("apply_changes");
+fn bench_render_changes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("render_changes");
     group.sample_size(30);
 
     for (name, (before, after)) in [
@@ -19,7 +19,8 @@ fn bench_apply_changes(c: &mut Criterion) {
             b.iter_batched(
                 || (seed.clone(), projection.clone()),
                 |(seed_file, rows)| {
-                    apply_changes(seed_file, rows).expect("apply_changes benchmark should succeed")
+                    render_changes(seed_file, rows)
+                        .expect("render_changes benchmark should succeed")
                 },
                 BatchSize::SmallInput,
             );
@@ -29,5 +30,5 @@ fn bench_apply_changes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_apply_changes);
+criterion_group!(benches, bench_render_changes);
 criterion_main!(benches);

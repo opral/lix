@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::file_from_json;
-use plugin_json_v2::{PluginEntityChange, SCHEMA_KEY, apply_changes, detect_changes};
+use plugin_json_v2::{PluginEntityChange, SCHEMA_KEY, detect_changes, render_changes};
 use serde_json::Value;
 
 fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<PluginEntityChange> {
@@ -36,15 +36,15 @@ fn projected_changes_for_transition(
     merge_latest_state_rows(vec![baseline, delta])
 }
 
-fn apply_projection(changes: Vec<PluginEntityChange>) -> Value {
+fn render_projection(changes: Vec<PluginEntityChange>) -> Value {
     let seed = file_from_json("f1", "/x.json", r#"{"stale":"cache"}"#);
-    let reconstructed = apply_changes(seed, changes).expect("apply_changes should succeed");
+    let reconstructed = render_changes(seed, changes).expect("render_changes should succeed");
     serde_json::from_slice(&reconstructed).expect("reconstructed bytes should parse")
 }
 
 fn assert_projection_roundtrip(before_json: &str, after_json: &str) {
     let reconstructed_json =
-        apply_projection(projected_changes_for_transition(before_json, after_json));
+        render_projection(projected_changes_for_transition(before_json, after_json));
     let expected_json: Value =
         serde_json::from_str(after_json).expect("expected JSON should parse");
     assert_eq!(reconstructed_json, expected_json);
@@ -275,7 +275,7 @@ fn roundtrip_is_invariant_to_change_order_permutations() {
     permutations.push(reverse_lexicographic);
 
     for changes in permutations {
-        let reconstructed = apply_projection(changes);
+        let reconstructed = render_projection(changes);
         assert_eq!(reconstructed, expected);
     }
 }
@@ -287,7 +287,7 @@ fn roundtrip_reconstructs_with_lexicographic_entity_pk_order() {
     let mut projected = projected_changes_for_transition(before_json, after_json);
     projected.sort_by(|a, b| a.entity_pk.cmp(&b.entity_pk));
 
-    let reconstructed = apply_projection(projected);
+    let reconstructed = render_projection(projected);
     let expected: Value = serde_json::from_str(after_json).expect("expected JSON should parse");
     assert_eq!(reconstructed, expected);
 }

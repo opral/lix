@@ -11,7 +11,7 @@ pub(crate) struct CachedPluginComponent {
     pub(crate) instance: Arc<dyn WasmComponentInstance>,
 }
 
-const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
+const RENDER_EXPORTS: &[&str] = &["render", "api#render"];
 
 pub(crate) trait PluginComponentHost {
     fn plugin_component_cache(
@@ -64,21 +64,21 @@ pub(crate) async fn load_or_init_plugin_component(
     Ok(initialized)
 }
 
-pub(crate) async fn apply_changes_with_plugin(
+pub(crate) async fn render_with_plugin(
     host: &impl PluginComponentHost,
     plugin: &InstalledPlugin,
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let instance = load_or_init_plugin_component(host, plugin).await?;
-    invoke_apply_changes_export(instance.as_ref(), payload).await
+    invoke_render_export(instance.as_ref(), payload).await
 }
 
-async fn invoke_apply_changes_export(
+async fn invoke_render_export(
     instance: &dyn WasmComponentInstance,
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let mut errors = Vec::new();
-    for export in APPLY_CHANGES_EXPORTS {
+    for export in RENDER_EXPORTS {
         match instance.call(export, payload).await {
             Ok(output) => return Ok(output),
             Err(error) => errors.push(format!("{export}: {}", error.message)),
@@ -88,7 +88,7 @@ async fn invoke_apply_changes_export(
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!(
-            "plugin materialization: failed to call apply-changes export ({})",
+            "plugin materialization: failed to call render export ({})",
             errors.join("; ")
         ),
         hint: None,

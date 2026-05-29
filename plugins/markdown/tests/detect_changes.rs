@@ -102,22 +102,21 @@ fn upsert_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
 
 fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginDetectStateContext {
     PluginDetectStateContext {
-        active_state: Some(
-            rows.iter()
-                .map(|row| plugin_md_v2::PluginActiveStateRow {
-                    entity_pk: row.entity_pk.clone(),
-                    schema_key: Some(row.schema_key.clone()),
-                    snapshot_content: row.snapshot_content.clone(),
-                    file_id: None,
-                    plugin_key: None,
-                    branch_id: None,
-                    change_id: None,
-                    metadata: None,
-                    created_at: None,
-                    updated_at: None,
-                })
-                .collect::<Vec<_>>(),
-        ),
+        active_state: rows
+            .iter()
+            .map(|row| plugin_md_v2::PluginActiveStateRow {
+                entity_pk: row.entity_pk.clone(),
+                schema_key: Some(row.schema_key.clone()),
+                snapshot_content: row.snapshot_content.clone(),
+                file_id: None,
+                plugin_key: None,
+                branch_id: None,
+                change_id: None,
+                metadata: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .collect::<Vec<_>>(),
     }
 }
 

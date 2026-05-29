@@ -1,6 +1,6 @@
 use crate::LixError;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixError> {
     zstd::bulk::compress(json_data, 1).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -10,7 +10,7 @@ pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixErro
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixError> {
     Ok(ruzstd::encoding::compress_to_vec(
         json_data,
@@ -18,7 +18,7 @@ pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixErro
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn decode_json_zstd_payload(
     compressed_payload: &[u8],
     uncompressed_len: usize,
@@ -32,7 +32,7 @@ pub(crate) fn decode_json_zstd_payload(
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub(crate) fn decode_json_zstd_payload(
     compressed_payload: &[u8],
     _uncompressed_len: usize,
