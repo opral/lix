@@ -11,15 +11,21 @@
 		}
 	},
 	"files": [
-		"dist",
-		"*.node"
+		"dist"
 	],
 	"scripts": {
 		"build": "npm run build:native && npm run build:ts",
 		"build:native": "node ./scripts/build-native.js",
+		"prepare:native-package": "node ./scripts/prepare-native-package.js",
 		"build:ts": "tsc -p tsconfig.json",
 		"test": "npm run build && vitest run",
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
+	},
+	"optionalDependencies": {
+		"@lix-js/sdk-darwin-arm64": "0.6.0",
+		"@lix-js/sdk-linux-arm64": "0.6.0",
+		"@lix-js/sdk-linux-x64": "0.6.0",
+		"@lix-js/sdk-win32-x64": "0.6.0"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.2",

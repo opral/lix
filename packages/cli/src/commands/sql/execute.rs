@@ -5,7 +5,7 @@ use crate::error::CliError;
 use crate::hints::{self, CommandOutput};
 use crate::output;
 use base64::Engine as _;
-use lix_rs_sdk::Value;
+use lix_sdk::Value;
 use serde_json::Value as JsonValue;
 use std::io::Read;
 

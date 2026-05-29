@@ -2,7 +2,7 @@ use crate::app::AppContext;
 use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
-use lix_rs_sdk::{
+use lix_sdk::{
     open_lix_with_backend, Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite,
     CommitResult, CoreProjection, GetOptions, Key, KeyRange, Lix, LixError, PointVisitor,
     ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,

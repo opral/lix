@@ -3,16 +3,15 @@ resolver = "3"
 members = [
   "packages/*",
 ]
-exclude = [
-  "packages/js-kysely",
-  "packages/react-utils",
-  "packages/website",
-]
 
 [workspace.package]
-version = "0.0.0"
-authors = ["Opral Team"]
+version = "0.6.0"
+authors = ["Opral"]
 edition = "2024"
 license = "LicenseRef-opral"
 publish = false
 rust-version = "1.93"
+
+[workspace.dependencies]
+lix_engine = { path = "packages/engine", version = "0.6.0" }
+lix_sdk = { path = "packages/rs-sdk", version = "0.6.0" }

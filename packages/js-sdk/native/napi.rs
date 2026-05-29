@@ -1,4 +1,4 @@
-use lix_rs_sdk::{
+use lix_sdk::{
     open_lix, open_lix_with_backend, CreateBranchOptions as RsCreateBranchOptions,
     CreateBranchReceipt, ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix, LixError,
     LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,

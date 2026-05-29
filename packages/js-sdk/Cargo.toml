@@ -1,6 +1,6 @@
 [package]
 name = "lix_js_sdk"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 
 [lib]
@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 path = "native/lib.rs"
 
 [dependencies]
-lix_rs_sdk = { path = "../rs-sdk", features = ["sqlite"] }
+lix_sdk = { workspace = true, features = ["sqlite"] }
 
 napi = { version = "3.9.0", default-features = false, features = ["napi6", "serde-json"] }
 napi-derive = "3.5.6"

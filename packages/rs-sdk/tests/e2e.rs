@@ -1,4 +1,4 @@
-use lix_rs_sdk::{
+use lix_sdk::{
     open_lix, CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
 };
@@ -347,7 +347,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
     lix.close().await.unwrap();
 }
 
-async fn register_crm_task_schema(lix: &lix_rs_sdk::Lix) {
+async fn register_crm_task_schema(lix: &lix_sdk::Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "crm_task",
@@ -371,7 +371,7 @@ async fn register_crm_task_schema(lix: &lix_rs_sdk::Lix) {
     .unwrap();
 }
 
-fn assert_crm_task_projection(result: &lix_rs_sdk::ExecuteResult) {
+fn assert_crm_task_projection(result: &lix_sdk::ExecuteResult) {
     assert_eq!(result.len(), 1);
     let row = &result.rows()[0];
     assert_eq!(
@@ -417,7 +417,7 @@ fn assert_crm_task_projection(result: &lix_rs_sdk::ExecuteResult) {
     assert_eq!(missing.code, "LIX_COLUMN_NOT_FOUND");
 }
 
-async fn register_poison_task_schema(lix: &lix_rs_sdk::Lix) {
+async fn register_poison_task_schema(lix: &lix_sdk::Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "poison_task",
@@ -440,7 +440,7 @@ async fn register_poison_task_schema(lix: &lix_rs_sdk::Lix) {
     .unwrap();
 }
 
-async fn task_done(lix: &lix_rs_sdk::Lix, task_id: &str) -> bool {
+async fn task_done(lix: &lix_sdk::Lix, task_id: &str) -> bool {
     let result = lix
         .execute(
             "SELECT done FROM crm_task WHERE id = $1",

@@ -7,7 +7,7 @@ use crate::cli::version::{VersionCommand, VersionSubcommand};
 use crate::db::FileLix;
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{ExecuteResult, Row as LixRow, Value};
+use lix_sdk::{ExecuteResult, Row as LixRow, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VersionLookup<'a> {
@@ -112,7 +112,7 @@ mod tests {
     use crate::app::AppContext;
     use crate::cli::version::{CreateVersionCommand, MergeVersionCommand, SwitchVersionCommand};
     use crate::db::{init_lix_at, open_lix_at};
-    use lix_rs_sdk::{CreateBranchOptions, ExecuteResult, Value};
+    use lix_sdk::{CreateBranchOptions, ExecuteResult, Value};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 

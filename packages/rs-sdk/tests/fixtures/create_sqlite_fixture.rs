@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use lix_rs_sdk::SqliteBackend;
+use lix_sdk::SqliteBackend;
 
 fn main() {
     let path = std::env::args_os()
