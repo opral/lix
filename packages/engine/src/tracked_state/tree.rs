@@ -7,18 +7,18 @@ use std::{
 
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::codec::{
-    boundary_trigger, child_summary_from_node, decode_key, decode_key_with_trusted_prefix,
-    decode_node, decode_node_ref, decode_value, decode_visible_value, encode_internal_node,
+    ChildSummary, ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef,
+    EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite, boundary_trigger,
+    child_summary_from_node, decode_key, decode_key_with_trusted_prefix, decode_node,
+    decode_node_ref, decode_value, decode_visible_value, encode_internal_node,
     encode_internal_node_refs, encode_key, encode_leaf_node, encode_leaf_node_refs,
-    encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary, ChildSummaryRef,
-    DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef,
-    PendingChunkWrite,
+    encode_schema_file_prefix, encode_schema_key_prefix,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::types::{
-    TrackedStateApplyResult, TrackedStateIndexValue, TrackedStateKey, TrackedStateMutation,
-    TrackedStateRootId, TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
-    TRACKED_STATE_HASH_BYTES,
+    TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateIndexValue, TrackedStateKey,
+    TrackedStateMutation, TrackedStateRootId, TrackedStateTreeDiffEntry,
+    TrackedStateTreeScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -597,6 +597,7 @@ impl TrackedStateTree {
         Ok(())
     }
 
+    #[expect(clippy::unused_self)]
     fn push_removed_diff(
         &self,
         entry: &EncodedLeafEntry,
@@ -613,6 +614,7 @@ impl TrackedStateTree {
         Ok(())
     }
 
+    #[expect(clippy::unused_self)]
     fn push_added_diff(
         &self,
         entry: &EncodedLeafEntry,
@@ -629,6 +631,7 @@ impl TrackedStateTree {
         Ok(())
     }
 
+    #[expect(clippy::unused_self)]
     fn push_modified_diff(
         &self,
         left: &EncodedLeafEntry,
@@ -647,6 +650,7 @@ impl TrackedStateTree {
         Ok(())
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     async fn apply_sorted_mutations_chunker(
         &self,
         store: &(impl StorageRead + Send + Sync + ?Sized),
@@ -741,7 +745,7 @@ impl TrackedStateTree {
                         let (key, value) = mutations
                             .pop_front()
                             .expect("front mutation should be present");
-                        window_mutation_ceiling = key.clone();
+                        window_mutation_ceiling.clone_from(&key);
                         window_entries.insert(key, value);
                     }
                     leaf_index += 1;
@@ -756,7 +760,7 @@ impl TrackedStateTree {
                     let (key, value) = mutations
                         .pop_front()
                         .expect("front mutation should be present");
-                    window_mutation_ceiling = key.clone();
+                    window_mutation_ceiling.clone_from(&key);
                     window_entries.insert(key, value);
                 }
 
@@ -814,6 +818,7 @@ impl TrackedStateTree {
         ))
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     async fn apply_single_mutation_from_seek_path(
         &self,
         store: &(impl StorageRead + Send + Sync + ?Sized),
@@ -1039,6 +1044,7 @@ impl TrackedStateTree {
         })
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn build_tree_from_leaf_summaries(
         &self,
         leaf_summaries: Vec<ChildSummary>,
@@ -1071,6 +1077,7 @@ impl TrackedStateTree {
         })
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn build_tree_from_leaf_patch(
         &self,
         levels: &[Vec<ChildSummary>],
@@ -1492,16 +1499,17 @@ impl TrackedStateTree {
                             break;
                         }
 
-                        let mut end = start;
-                        if child_index + 1 == children.len() {
-                            end = encoded_keys.len();
+                        let end = if child_index + 1 == children.len() {
+                            encoded_keys.len()
                         } else {
+                            let mut end = start;
                             while end < encoded_keys.len()
                                 && encoded_keys[end].1.as_slice() <= child.last_key.as_slice()
                             {
                                 end += 1;
                             }
-                        }
+                            end
+                        };
 
                         if start < end {
                             self.get_many_node(
@@ -1826,9 +1834,8 @@ impl LeafSummaryCursor {
                     if children_are_leaves {
                         self.current = Some(first_child);
                         return Ok(());
-                    } else {
-                        summary = first_child;
                     }
+                    summary = first_child;
                 }
             }
         }
@@ -1961,7 +1968,7 @@ fn chunk_internal_entries(
         let item_size = child.first_key.len()
             + child.last_key.len()
             + TRACKED_STATE_HASH_BYTES
-            + std::mem::size_of::<u64>();
+            + size_of::<u64>();
         let projected_size = estimate_internal_chunk_size(
             current.children.len() + 1,
             current.first_key_bytes + child.first_key.len(),
@@ -2011,7 +2018,7 @@ fn chunk_internal_entry_refs<'a>(
         let item_size = child.first_key.len()
             + child.last_key.len()
             + TRACKED_STATE_HASH_BYTES
-            + std::mem::size_of::<u64>();
+            + size_of::<u64>();
         let projected_size = estimate_internal_chunk_size(
             current.children.len() + 1,
             current.first_key_bytes + child.first_key.len(),
@@ -2067,7 +2074,7 @@ fn estimate_internal_chunk_size(
     first_key_bytes: usize,
     last_key_bytes: usize,
 ) -> usize {
-    16 + child_count * (8 + TRACKED_STATE_HASH_BYTES + std::mem::size_of::<u64>())
+    16 + child_count * (8 + TRACKED_STATE_HASH_BYTES + size_of::<u64>())
         + first_key_bytes
         + last_key_bytes
 }
@@ -2521,8 +2528,8 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    entity_pks: vec![crate::entity_pk::EntityPk::single("entity-a")],
-                    file_ids: vec![crate::NullableKeyFilter::Value("file-a".to_string())],
+                    entity_pks: vec![EntityPk::single("entity-a")],
+                    file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
                     ..Default::default()
                 },
             )
@@ -2582,7 +2589,7 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    file_ids: vec![crate::NullableKeyFilter::Value("file-a".to_string())],
+                    file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
                     include_tombstones: false,
                     limit: Some(2),
                     ..Default::default()
@@ -2709,16 +2716,18 @@ mod tests {
                 .expect("branch b shared row should load"),
             Some(value("shared-change", Some("{\"shared\":true}")))
         );
-        assert!(tree
-            .get(&store, &branch_a.root_id, &branch_b_key)
-            .await
-            .expect("branch a should read")
-            .is_none());
-        assert!(tree
-            .get(&store, &branch_b.root_id, &branch_a_key)
-            .await
-            .expect("branch b should read")
-            .is_none());
+        assert!(
+            tree.get(&store, &branch_a.root_id, &branch_b_key)
+                .await
+                .expect("branch a should read")
+                .is_none()
+        );
+        assert!(
+            tree.get(&store, &branch_b.root_id, &branch_a_key)
+                .await
+                .expect("branch b should read")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2758,9 +2767,11 @@ mod tests {
             .collect_leaf_entries(&read, &base.root_id)
             .await
             .expect("base entries should collect");
-        assert!(canonical_entries
-            .windows(2)
-            .all(|window| window[0].key < window[1].key));
+        assert!(
+            canonical_entries
+                .windows(2)
+                .all(|window| window[0].key < window[1].key)
+        );
         let encoded_changed_key = encode_key(&changed_key);
         let encoded_changed_value = encode_value(&changed_value);
         let index = canonical_entries

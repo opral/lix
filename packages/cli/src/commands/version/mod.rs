@@ -90,6 +90,7 @@ fn resolve_version_by_name(lix: &FileLix, name: &str) -> Result<ResolvedVersionR
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn statement_rows(result: &ExecuteResult) -> Result<&[LixRow], CliError> {
     Ok(result.rows())
 }
@@ -108,7 +109,7 @@ fn text_at(row: &LixRow, index: usize, field: &str) -> Result<String, CliError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{create, merge, resolve_version_ref, switch, VersionLookup};
+    use super::{VersionLookup, create, merge, resolve_version_ref, switch};
     use crate::app::AppContext;
     use crate::cli::version::{CreateVersionCommand, MergeVersionCommand, SwitchVersionCommand};
     use crate::db::{init_lix_at, open_lix_at};

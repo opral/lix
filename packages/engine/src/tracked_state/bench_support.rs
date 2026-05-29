@@ -10,7 +10,7 @@ use crate::tracked_state::{
     TrackedStateReadColumns, TrackedStateScanRequest,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BenchTrackedRow {
     pub schema_key: String,
     pub file_id: Option<String>,
@@ -19,6 +19,7 @@ pub struct BenchTrackedRow {
     pub updated_value: Vec<u8>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct BenchTrackedFixture<B: StorageBackend> {
     storage: StorageContext<B>,
     context: TrackedStateContext,
@@ -27,7 +28,7 @@ pub struct BenchTrackedFixture<B: StorageBackend> {
     next_commit_index: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BenchWriteAccounting {
     pub logical_rows: usize,
     pub staged_puts: u64,
@@ -39,7 +40,7 @@ pub struct BenchWriteAccounting {
     pub written_bytes: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BenchLayoutAccounting {
     pub space_id: u32,
     pub space: &'static str,

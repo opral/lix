@@ -1,6 +1,6 @@
 use std::fmt;
 
-use jiff::{fmt::temporal::DateTimeParser, tz::Offset, Timestamp};
+use jiff::{Timestamp, fmt::temporal::DateTimeParser, tz::Offset};
 use musli::{Allocator, Context, Decode, Decoder, Encode, Encoder};
 
 const MILLIS_BITS: u32 = 52;
@@ -16,6 +16,7 @@ static TIMESTAMP_PARSER: DateTimeParser = DateTimeParser::new();
 pub(crate) struct LixTimestamp(u64);
 
 impl LixTimestamp {
+    #[expect(clippy::cast_sign_loss)]
     pub(crate) fn from_unix_millis_utc_lossy(millis: i64) -> Self {
         let millis = (millis.max(0) as u64).min(MAX_PACKED_MILLIS);
         Self::from_parts(millis, 0)
@@ -53,6 +54,7 @@ impl LixTimestamp {
         decode_offset_minutes(self.0)
     }
 
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn from_jiff(timestamp: Timestamp, offset: Offset) -> Result<Self, String> {
         let offset_seconds = offset.seconds();
         if offset_seconds % 60 != 0 {
@@ -66,6 +68,11 @@ impl LixTimestamp {
         Self::from_parts(millis, (offset_seconds / 60) as i16)
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
     fn from_parts(millis: u64, offset_minutes: i16) -> Result<Self, String> {
         if millis > MAX_PACKED_MILLIS {
             return Err(format!(
@@ -86,6 +93,7 @@ impl LixTimestamp {
         Ok(Self((millis << OFFSET_BITS) | offset_bits))
     }
 
+    #[expect(clippy::cast_possible_wrap)]
     fn from_packed(packed: u64) -> Result<Self, String> {
         let timestamp = Self(packed);
         if !valid_offset_minutes(timestamp.offset_minutes()) {
@@ -101,6 +109,7 @@ impl LixTimestamp {
         Ok(timestamp)
     }
 
+    #[expect(clippy::cast_possible_wrap)]
     fn to_jiff(self) -> Timestamp {
         Timestamp::from_millisecond(self.milliseconds_since_unix_epoch() as i64)
             .expect("packed timestamp milliseconds are validated")
@@ -141,11 +150,11 @@ impl<M> Encode<M> for LixTimestamp {
         E: Encoder<Mode = M>,
     {
         let packed = self.packed();
-        encoder.encode(&packed)
+        encoder.encode(packed)
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(std::mem::size_of::<u64>())
+        Some(size_of::<u64>())
     }
 
     fn as_encode(&self) -> &Self::Encode {
@@ -163,7 +172,7 @@ where
     {
         let cx = decoder.cx();
         let packed = u64::decode(decoder)?;
-        LixTimestamp::from_packed(packed).map_err(|error| cx.message(format_args!("{error}")))
+        Self::from_packed(packed).map_err(|error| cx.message(format_args!("{error}")))
     }
 }
 

@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::LixError;
 use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::live_state::{
-    overlay_scan_rows, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateRow,
+    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    overlay_scan_rows,
 };
 use crate::transaction::staging::PreparedStateRowOverlay;
-use crate::LixError;
 
 pub(crate) struct TransactionSchemaResolver {
     context: Arc<CatalogContext>,

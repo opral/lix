@@ -59,7 +59,7 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     "invalid JSON pointer escape",
-                ))
+                ));
             }
         }
     }

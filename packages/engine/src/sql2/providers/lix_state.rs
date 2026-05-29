@@ -1,3 +1,9 @@
+#![allow(
+    clippy::manual_let_else,
+    clippy::missing_fields_in_debug,
+    clippy::unnecessary_literal_bound
+)]
+
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -8,13 +14,13 @@ use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, SchemaExt};
+use datafusion::common::{DFSchema, DataFusionError, Result, SchemaExt, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -22,22 +28,22 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use futures_util::{stream, TryStreamExt};
+use futures_util::{TryStreamExt, stream};
 use serde_json::Value as JsonValue;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::branch::BranchRefReader;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
-use crate::sql2::branch_scope::{resolve_provider_branch_ids, BranchBinding};
+use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::read_only::reject_read_only_stage_rows;
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::GLOBAL_BRANCH_ID;
-use crate::{parse_row_metadata_value, serialize_row_metadata, LixError, NullableKeyFilter};
+use crate::{LixError, NullableKeyFilter, parse_row_metadata_value, serialize_row_metadata};
 
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
@@ -218,7 +224,7 @@ impl TableProvider for LixStateProvider {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let route = LixStateByBranchRoute::from_filters(filters);
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = lix_state_scan_request(
@@ -258,7 +264,7 @@ impl TableProvider for LixStateProvider {
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
 
-        let sink = LixStateInsertSink::new(write_ctx.clone(), branch_binding);
+        let sink = LixStateInsertSink::new(write_ctx, branch_binding);
         Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
@@ -283,7 +289,7 @@ impl TableProvider for LixStateProvider {
             lix_state_scan_request(&self.schema, branch_binding.as_deref(), None, &route, None);
 
         Ok(Arc::new(LixStateDeleteExec::new(
-            write_ctx.clone(),
+            write_ctx,
             Arc::clone(&self.schema),
             branch_binding,
             request,
@@ -323,7 +329,7 @@ impl TableProvider for LixStateProvider {
             lix_state_scan_request(&self.schema, branch_binding.as_deref(), None, &route, None);
 
         Ok(Arc::new(LixStateUpdateExec::new(
-            write_ctx.clone(),
+            write_ctx,
             Arc::clone(&self.schema),
             branch_binding,
             request,
@@ -450,7 +456,7 @@ impl DisplayAs for LixStateDeleteExec {
 }
 
 impl ExecutionPlan for LixStateDeleteExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixStateDeleteExec"
     }
 
@@ -597,7 +603,7 @@ impl DisplayAs for LixStateUpdateExec {
 }
 
 impl ExecutionPlan for LixStateUpdateExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixStateUpdateExec"
     }
 
@@ -869,6 +875,7 @@ fn dml_count_schema() -> SchemaRef {
     )]))
 }
 
+#[expect(trivial_casts)]
 fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
     RecordBatch::try_new(
         schema,
@@ -970,13 +977,17 @@ fn optional_string_value(
 ) -> Result<Option<String>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        | Some(
+            ScalarValue::Null
+            | ScalarValue::Utf8(None)
+            | ScalarValue::Utf8View(None)
+            | ScalarValue::LargeUtf8(None),
+        ) => Ok(None),
+        Some(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        ) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_state expected text-compatible column '{column_name}', got {other:?}"
         ))),
@@ -1026,7 +1037,7 @@ fn optional_bool_value(
 ) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        None | Some(ScalarValue::Null | ScalarValue::Boolean(None)) => Ok(None),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_state expected boolean column '{column_name}', got {other:?}"
         ))),
@@ -1106,7 +1117,7 @@ impl DisplayAs for LixStateScanExec {
 }
 
 impl ExecutionPlan for LixStateScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixStateScanExec"
     }
 
@@ -1317,7 +1328,7 @@ fn projection_column_names(schema: &SchemaRef, projection: Option<&Vec<usize>>) 
             indices
                 .iter()
                 .filter_map(|index| schema.fields().get(*index))
-                .map(|field| field.name().to_string())
+                .map(|field| field.name().clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -1481,6 +1492,7 @@ fn is_null_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(ScalarValue::Null, _))
 }
 
+#[expect(trivial_casts)]
 fn lix_state_record_batch(
     schema: SchemaRef,
     rows: &[MaterializedLiveStateRow],
@@ -1512,7 +1524,7 @@ fn lix_state_record_batch(
                 }
                 "metadata" => Arc::new(StringArray::from(
                     rows.iter()
-                        .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                        .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
                         .collect::<Vec<_>>(),
                 )),
                 "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
@@ -1552,6 +1564,7 @@ fn lix_state_record_batch(
     })
 }
 
+#[expect(trivial_casts)]
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     let values = values
         .map(|value| value.map(ToOwned::to_owned))
@@ -1579,12 +1592,13 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 }
 
 #[cfg(test)]
+#[expect(trivial_casts)]
 mod tests {
     use super::{
-        lix_state_scan_request, lix_state_schema, lix_state_write_rows_from_batch,
-        parse_lix_state_filter, register_lix_state_active_write_provider,
-        register_lix_state_by_branch_write_provider, LixStateByBranchRoute, LixStateDeleteExec,
-        LixStateFilterPredicate, LixStateInsertSink, LixStateProvider, LixStateUpdateExec,
+        LixStateByBranchRoute, LixStateDeleteExec, LixStateFilterPredicate, LixStateInsertSink,
+        LixStateProvider, LixStateUpdateExec, lix_state_scan_request, lix_state_schema,
+        lix_state_write_rows_from_batch, parse_lix_state_filter,
+        register_lix_state_active_write_provider, register_lix_state_by_branch_write_provider,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::{BranchHead, BranchRefReader};
@@ -1596,13 +1610,13 @@ mod tests {
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
         TransactionWriteRow,
     };
+    use crate::{LixError, NullableKeyFilter};
     use crate::{
         entity_pk::EntityPk,
         live_state::{
             LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
         },
     };
-    use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
     use datafusion::arrow::datatypes::DataType;
@@ -2103,14 +2117,16 @@ mod tests {
         let error = super::datafusion_error_to_lix_error(error);
 
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
-        assert!(error
-            .message
-            .contains("branch 'missing-branch' was not found"));
+        assert!(
+            error
+                .message
+                .contains("branch 'missing-branch' was not found")
+        );
     }
 
     #[test]
     fn active_branch_view_pins_branch_filter() {
-        let schema = super::lix_state_schema();
+        let schema = lix_state_schema();
         let route = LixStateByBranchRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("schema_key")),
             Operator::Eq,
@@ -2297,7 +2313,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![TransactionWriteRow {
-                entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
+                entity_pk: Some(EntityPk::single("entity-1")),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(
@@ -2348,7 +2364,7 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: vec![TransactionWriteRow {
-                    entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
+                    entity_pk: Some(EntityPk::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(
@@ -2456,7 +2472,7 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![TransactionWriteRow {
-                    entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
+                    entity_pk: Some(EntityPk::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(
@@ -2515,7 +2531,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
                     TransactionWriteRow {
-                        entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
+                        entity_pk: Some(EntityPk::single("entity-1")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot: None,
@@ -2532,7 +2548,7 @@ mod tests {
                         branch_id: "branch-a".to_string(),
                     },
                     TransactionWriteRow {
-                        entity_pk: Some(crate::entity_pk::EntityPk::single("entity-2")),
+                        entity_pk: Some(EntityPk::single("entity-2")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot: None,

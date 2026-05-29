@@ -1,6 +1,6 @@
 use crate::app::AppContext;
 use crate::cli::version::SwitchVersionCommand;
-use crate::commands::version::{resolve_version_ref, VersionLookup};
+use crate::commands::version::{VersionLookup, resolve_version_ref};
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;

@@ -328,9 +328,9 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     println!("[git-replay] ref: {}", args.branch);
     println!("[git-replay] output: {}", output_lix_path.display());
     println!("[git-replay] commits replayed: {}", commits.len());
-    println!("[git-replay] commits applied: {}", applied);
-    println!("[git-replay] commits noop: {}", noop);
-    println!("[git-replay] changed paths total: {}", changed_paths);
+    println!("[git-replay] commits applied: {applied}");
+    println!("[git-replay] commits noop: {noop}");
+    println!("[git-replay] changed paths total: {changed_paths}");
     if args.verify_state {
         println!(
             "[git-replay] verified commits: {verified}/{}",
@@ -379,7 +379,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
 fn init_and_open_lix_at_path(path: &Path) -> Result<FileLix, CliError> {
     db::init_lix_at(path)?;
     let lix = db::open_lix_at(path)?;
-    crate::db::block_on(lix.execute(
+    db::block_on(lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('lix_deterministic_mode', '{\"enabled\":true}')",
         &[],
     ))
@@ -398,7 +398,7 @@ fn execute_statements_as_transaction(
         .flat_map(|statement| statement.params.iter().cloned())
         .collect::<Vec<_>>();
 
-    crate::db::block_on(lix.execute(&script, &params)).map_err(|error| {
+    db::block_on(lix.execute(&script, &params)).map_err(|error| {
         let sql_preview = script.chars().take(160).collect::<String>();
         CliError::msg(format!(
             "failed at commit {commit_sha} while executing replay SQL '{sql_preview}': {error}"
@@ -522,24 +522,19 @@ fn resolve_trace_commit_target(
         .collect::<Vec<_>>();
     match matches.len() {
         0 => Err(CliError::msg(format!(
-            "--trace-commit {} did not match any replayed commit",
-            raw
+            "--trace-commit {raw} did not match any replayed commit"
         ))),
         1 => Ok(Some(SqlTraceCommitTarget {
             commit_sha: matches.into_iter().next().expect("exactly one trace match"),
         })),
         _ => Err(CliError::msg(format!(
-            "--trace-commit {} matched multiple replayed commits; provide a longer prefix",
-            raw
+            "--trace-commit {raw} matched multiple replayed commits; provide a longer prefix"
         ))),
     }
 }
 
 fn should_trace_commit(commit_sha: &str, target: Option<&SqlTraceCommitTarget>) -> bool {
-    match target {
-        Some(target) => target.commit_sha == commit_sha,
-        None => true,
-    }
+    target.is_none_or(|target| target.commit_sha == commit_sha)
 }
 
 fn select_replay_commits(
@@ -553,8 +548,7 @@ fn select_replay_commits(
             .position(|commit| commit == from_commit)
             .ok_or_else(|| {
                 CliError::msg(format!(
-                    "--from-commit {} is not reachable from selected ref",
-                    from_commit
+                    "--from-commit {from_commit} is not reachable from selected ref"
                 ))
             })?;
         commits = commits.split_off(from_index);
@@ -579,16 +573,12 @@ fn resolve_commit_oid(repo_path: &Path, raw: &str) -> Result<String, CliError> {
         format!("{trimmed}^{{commit}}"),
     ];
     let output = run_git_text(repo_path, &args, None).map_err(|error| {
-        CliError::msg(format!(
-            "failed to resolve --from-commit {}: {}",
-            raw, error
-        ))
+        CliError::msg(format!("failed to resolve --from-commit {raw}: {error}"))
     })?;
     let oid = output.trim();
     if oid.is_empty() {
         return Err(CliError::msg(format!(
-            "failed to resolve --from-commit {}: empty rev-parse output",
-            raw
+            "failed to resolve --from-commit {raw}: empty rev-parse output"
         )));
     }
     Ok(oid.to_string())
@@ -821,9 +811,8 @@ fn prepare_commit_changes(
             continue;
         }
 
-        let new_path = match &change.new_path {
-            Some(path) => path,
-            None => continue,
+        let Some(new_path) = &change.new_path else {
+            continue;
         };
 
         let target = resolve_write_target(state, change, status)?;
@@ -1024,13 +1013,14 @@ fn verify_commit_state_hashes(
     expected_state_by_id: &HashMap<String, ExpectedFile>,
     commit_sha: &str,
 ) -> Result<(), CliError> {
-    let result =
-        crate::db::block_on(lix.execute("SELECT id, path, data FROM lix_file", &[] as &[Value]))
-            .map_err(|err| {
-                CliError::msg(format!(
-                    "failed to query replay state for verification: {err}"
-                ))
-            })?;
+    let params: &[Value] = &[];
+    let result = db::block_on(lix.execute("SELECT id, path, data FROM lix_file", params)).map_err(
+        |err| {
+            CliError::msg(format!(
+                "failed to query replay state for verification: {err}"
+            ))
+        },
+    )?;
     let rows = result.rows();
     if rows.len() != expected_state_by_id.len() {
         return Err(CliError::msg(format!(
@@ -1425,9 +1415,11 @@ mod tests {
         );
         assert!(prepared.inserts.is_empty());
         assert!(prepared.updates.is_empty());
-        assert!(!state
-            .path_to_file_id
-            .contains_key("artifact/spa-prerender-repro"));
+        assert!(
+            !state
+                .path_to_file_id
+                .contains_key("artifact/spa-prerender-repro")
+        );
     }
 
     #[test]

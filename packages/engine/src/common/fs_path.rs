@@ -69,9 +69,14 @@
 //! - Boundary URI form: an ASCII-only serialization used when interoperating
 //!   with URI-only systems.
 
-use precis_profiles::precis_core::profile::Profile;
+#![allow(
+    clippy::redundant_closure_for_method_calls,
+    clippy::semicolon_if_nothing_returned
+)]
+
 use precis_profiles::UsernameCasePreserved;
-use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+use precis_profiles::precis_core::profile::Profile;
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 use crate::LixError;
 use std::fmt;
@@ -215,12 +220,16 @@ impl PathError {
             Self::InvalidPercentEncoding => (
                 "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING",
                 "path contains invalid percent encoding",
-                Some("use valid percent triplets only for URI boundary input; '%' is not allowed in canonical path segments"),
+                Some(
+                    "use valid percent triplets only for URI boundary input; '%' is not allowed in canonical path segments",
+                ),
             ),
             Self::InvalidPathSegmentCodePoint => (
                 "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
                 "path segment contains a character that is not allowed in canonical Lix paths",
-                Some("canonical paths use RFC 8264 PRECIS IdentifierClass segments; use URI percent encoding only at boundaries"),
+                Some(
+                    "canonical paths use RFC 8264 PRECIS IdentifierClass segments; use URI percent encoding only at boundaries",
+                ),
             ),
             Self::PathTooLong => (
                 "LIX_ERROR_PATH_TOO_LONG",
@@ -290,7 +299,7 @@ fn validate_path_segment_chars(normalized: &str) -> PathResult<String> {
     if normalized.contains('\\') {
         return Err(PathError::Backslash);
     }
-    if !segment_has_valid_percent_encoding(&normalized) {
+    if !segment_has_valid_percent_encoding(normalized) {
         return Err(PathError::InvalidPercentEncoding);
     }
     let decoded = decode_percent_encoded_segment(normalized)?;
@@ -561,8 +570,7 @@ pub(crate) fn parent_directory_path(path: &str) -> Option<String> {
 pub(crate) fn directory_name_from_path(path: &str) -> Option<String> {
     path.trim_matches('/')
         .split('/')
-        .filter(|segment| !segment.is_empty())
-        .next_back()
+        .rfind(|segment| !segment.is_empty())
         .map(|segment| segment.to_string())
 }
 
@@ -1303,7 +1311,9 @@ mod tests {
         assert_eq!(bad_percent.code, "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING");
         assert_eq!(
             bad_percent.hint(),
-            Some("use valid percent triplets only for URI boundary input; '%' is not allowed in canonical path segments")
+            Some(
+                "use valid percent triplets only for URI boundary input; '%' is not allowed in canonical path segments"
+            )
         );
 
         let root_file = normalize_file_path("/").expect_err("root as file");

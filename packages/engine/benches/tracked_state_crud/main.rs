@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkGroup, Criterion};
+use criterion::{BatchSize, BenchmarkGroup, Criterion, black_box, criterion_group, criterion_main};
 
 mod accounting;
 mod backends;
@@ -11,8 +11,8 @@ mod sql_session;
 mod transaction_api;
 mod workload;
 
-use backends::{BackendProfile, BACKEND_PROFILES};
-use workload::{fixture_rows, row_label, WorkloadRow, REAL_WORKLOAD_ROWS, SMOKE_ROWS};
+use backends::{BACKEND_PROFILES, BackendProfile};
+use workload::{REAL_WORKLOAD_ROWS, SMOKE_ROWS, WorkloadRow, fixture_rows, row_label};
 
 const READ_MANY_PK_COUNT: usize = 10;
 
@@ -156,6 +156,7 @@ impl TransactionBenchOp {
     }
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn bench_transaction_op(
     group: &mut BenchmarkGroup<'_, WallTime>,
     runtime: &tokio::runtime::Runtime,
@@ -183,7 +184,7 @@ fn bench_transaction_op(
             }
             drop(fixtures);
             elapsed
-        })
+        });
     });
 }
 
@@ -202,28 +203,28 @@ fn bench_sql_session(
             || runtime.block_on(sql_session::empty_fixture(&rows)),
             |fixture| black_box(runtime.block_on(fixture.insert_all())),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("read_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(&rows)),
             |fixture| black_box(runtime.block_on(fixture.read_all())),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(&rows)),
             |fixture| black_box(runtime.block_on(fixture.read_one_by_pk())),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(&rows)),
             |fixture| black_box(runtime.block_on(fixture.read_many_by_pk())),
             BatchSize::LargeInput,
-        )
+        );
     });
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_SQL_UPDATE").is_some() {
         group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
@@ -231,14 +232,14 @@ fn bench_sql_session(
                 || runtime.block_on(sql_session::seeded_fixture(&rows)),
                 |fixture| black_box(runtime.block_on(fixture.update_all())),
                 BatchSize::LargeInput,
-            )
+            );
         });
         group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
             b.iter_batched_ref(
                 || runtime.block_on(sql_session::seeded_fixture(&rows)),
                 |fixture| black_box(runtime.block_on(fixture.update_one_by_pk())),
                 BatchSize::LargeInput,
-            )
+            );
         });
     }
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
@@ -246,14 +247,14 @@ fn bench_sql_session(
             || runtime.block_on(sql_session::seeded_fixture(&rows)),
             |fixture| black_box(runtime.block_on(fixture.delete_all())),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(&rows)),
             |fixture| black_box(runtime.block_on(fixture.delete_one_by_pk())),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.finish();
 }
@@ -320,7 +321,7 @@ impl SyncOps for KvOps {
 }
 
 fn bench_sync_ops<O: SyncOps>(
-    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    group: &mut BenchmarkGroup<'_, WallTime>,
     profile: BackendProfile,
     rows: &[WorkloadRow],
     _layer: &str,
@@ -332,63 +333,60 @@ fn bench_sync_ops<O: SyncOps>(
             || O::empty_fixture(profile, &rows),
             |fixture| black_box(O::insert_all(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("read_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::read_all(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::read_one_by_pk(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::read_many_by_pk(fixture, READ_MANY_PK_COUNT)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::update_all(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::update_one_by_pk(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::delete_all(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || O::seeded_fixture(profile, &rows),
             |fixture| black_box(O::delete_one_by_pk(fixture)),
             BatchSize::LargeInput,
-        )
+        );
     });
 }
 
-fn configure_group(
-    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    row_count: usize,
-) {
+fn configure_group(group: &mut BenchmarkGroup<'_, WallTime>, row_count: usize) {
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(250));
     group.measurement_time(if row_count >= REAL_WORKLOAD_ROWS {

@@ -1,6 +1,15 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::clone_on_copy,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_ref_mut,
+    clippy::redundant_closure_for_method_calls,
+    clippy::unnecessary_mut_passed,
+    clippy::unnecessary_wraps
+)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[cfg(test)]
 use crate::changelog::ChangeId;
 use crate::changelog::{
     ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
@@ -10,8 +19,8 @@ use crate::entity_pk::EntityPk;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{
-    diff_commits, diff_commits_with_validation, TrackedStateDiff, TrackedStateDiffRequest,
-    TrackedStateDiffRow,
+    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateDiffRow, diff_commits,
+    diff_commits_with_validation,
 };
 use crate::tracked_state::materialize_rows_from_index_entries;
 #[cfg(test)]
@@ -103,7 +112,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
 }
 
 struct DiffCommitRootValidationCache {
-    commit_ref_winners: HashMap<String, HashMap<TrackedStateIdentity, crate::changelog::ChangeId>>,
+    commit_ref_winners: HashMap<String, HashMap<TrackedStateIdentity, ChangeId>>,
     commit_root_metadata: HashMap<String, TrackedStateCommitRoot>,
     commit_roots: HashMap<String, TrackedStateRootId>,
     tree_values: HashMap<(TrackedStateRootId, TrackedStateKey), Option<TrackedStateIndexValue>>,
@@ -131,13 +140,13 @@ where
         commit_id: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? else {
+        let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? else {
             return Err(missing_commit_root_error(commit_id));
         };
         let rows = self
             .tree
             .scan(
-                &mut self.store,
+                &self.store,
                 &root_id,
                 &tree_scan_request_from_tracked(request),
             )
@@ -146,7 +155,7 @@ where
             &request.read_columns.columns,
         );
         let mut rows =
-            materialize_rows_from_index_entries(&mut self.store, rows, &materialization).await?;
+            materialize_rows_from_index_entries(&self.store, rows, &materialization).await?;
         if !request.filter.include_tombstones {
             rows.retain(|row| !row.deleted);
         }
@@ -165,7 +174,7 @@ where
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let values = self.commit_root_values_for_keys(commit_id, &keys).await?;
+        let values = self.commit_root_values_for_keys(commit_id, keys).await?;
         let mut entry_indices = Vec::new();
         let mut entries = Vec::new();
         for (index, (key, value)) in keys.iter().cloned().zip(values).enumerate() {
@@ -175,7 +184,7 @@ where
             }
         }
         let materialized = materialize_rows_from_index_entries(
-            &mut self.store,
+            &self.store,
             entries,
             &crate::tracked_state::TrackedRowMaterialization::full(),
         )
@@ -226,7 +235,7 @@ where
         let mut change_ids = rows
             .iter()
             .filter(|(row, _)| row.schema_key != "lix_commit")
-            .map(|(row, _)| row.change_id.clone())
+            .map(|(row, _)| row.change_id)
             .collect::<Vec<_>>();
         change_ids.sort();
         change_ids.dedup();
@@ -249,7 +258,7 @@ where
         let commit_ids = rows
             .iter()
             .filter(|(row, _)| row.schema_key == "lix_commit")
-            .map(|(row, _)| row.commit_id.clone())
+            .map(|(row, _)| row.commit_id)
             .collect::<Vec<_>>();
         if !commit_ids.is_empty() {
             let batch = changelog_reader
@@ -264,10 +273,7 @@ where
                         "tracked-state diff row references missing changelog commit '{commit_id}'"
                     )));
                 };
-                changes.insert(
-                    commit.change_id.clone(),
-                    change_record_from_commit_record(&commit)?,
-                );
+                changes.insert(commit.change_id, change_record_from_commit_record(&commit)?);
             }
         }
 
@@ -384,18 +390,16 @@ where
         match (expected_parent, metadata.parent_roots.first()) {
             (None, None) => Ok(()),
             (Some((expected_parent_id, expected_root)), Some(parent))
-                if parent.commit_id.to_string() == expected_parent_id
-                    && parent.root_id == expected_root =>
+                if parent.commit_id == expected_parent_id && parent.root_id == expected_root =>
             {
                 Ok(())
             }
             (Some((expected_parent_id, expected_root)), Some(parent))
-                if parent.commit_id.to_string() == expected_parent_id =>
+                if parent.commit_id == expected_parent_id =>
             {
                 let _ = expected_root;
                 Err(LixError::unknown(format!(
-                    "tracked-state commit-root metadata for commit '{}' references stale root for commit-root parent '{}'",
-                    commit_id, expected_parent_id
+                    "tracked-state commit-root metadata for commit '{commit_id}' references stale root for commit-root parent '{expected_parent_id}'"
                 )))
             }
             (Some((expected_parent_id, _)), Some(parent)) => Err(LixError::unknown(format!(
@@ -403,8 +407,7 @@ where
                 commit_id, parent.commit_id, expected_parent_id
             ))),
             (Some((expected_parent_id, _)), None) => Err(LixError::unknown(format!(
-                "tracked-state commit-root metadata for commit '{}' is missing commit-root parent '{}'",
-                commit_id, expected_parent_id
+                "tracked-state commit-root metadata for commit '{commit_id}' is missing commit-root parent '{expected_parent_id}'"
             ))),
             (None, Some(parent)) => Err(LixError::unknown(format!(
                 "tracked-state commit-root metadata for root commit '{}' references unexpected parent '{}'",
@@ -444,7 +447,7 @@ where
         &mut self,
         commit_id: &str,
         cache: &mut DiffCommitRootValidationCache,
-    ) -> Result<HashMap<TrackedStateIdentity, crate::changelog::ChangeId>, LixError> {
+    ) -> Result<HashMap<TrackedStateIdentity, ChangeId>, LixError> {
         if let Some(winners) = cache.commit_ref_winners.get(commit_id) {
             return Ok(winners.clone());
         }
@@ -478,7 +481,7 @@ where
             TrackedStateIdentity {
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single(&record.commit_id),
+                entity_pk: EntityPk::single(record.commit_id),
             },
             record.change_id,
         );
@@ -506,7 +509,7 @@ where
         if let Some(metadata) = cache.commit_root_metadata.get(commit_id) {
             return Ok(metadata.clone());
         }
-        let metadata = storage::load_commit_root(&mut self.store, commit_id)
+        let metadata = storage::load_commit_root(&self.store, commit_id)
             .await?
             .ok_or_else(|| missing_commit_root_error(commit_id))?;
         cache
@@ -544,7 +547,7 @@ where
         }
         let value = self
             .tree
-            .get_many(&mut self.store, root_id, std::slice::from_ref(key))
+            .get_many(&self.store, root_id, std::slice::from_ref(key))
             .await?
             .into_iter()
             .next()
@@ -559,7 +562,7 @@ where
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<Option<CommitId>, LixError> {
         if let Some(parent_id) = cache.changelog_first_parents.get(commit_id) {
-            return Ok(parent_id.clone());
+            return Ok(*parent_id);
         }
         let commit_ids = [CommitId::parse_lix(
             commit_id,
@@ -582,10 +585,10 @@ where
                 "changelog commit '{commit_id}' did not return a commit record"
             )));
         };
-        let parent_id = record.parent_commit_ids.first().cloned();
+        let parent_id = record.parent_commit_ids.first().copied();
         cache
             .changelog_first_parents
-            .insert(commit_id.to_string(), parent_id.clone());
+            .insert(commit_id.to_string(), parent_id);
         Ok(parent_id)
     }
 
@@ -597,13 +600,13 @@ where
         change_created_at: crate::common::LixTimestamp,
     ) -> Result<(), LixError> {
         let mut expected_created_at = change_created_at;
-        let Some(metadata) = storage::load_commit_root(&mut self.store, commit_id).await? else {
+        let Some(metadata) = storage::load_commit_root(&self.store, commit_id).await? else {
             return Err(missing_commit_root_error(commit_id));
         };
         if let Some(parent) = metadata.parent_roots.first() {
             let parent_value = self
                 .tree
-                .get_many(&mut self.store, &parent.root_id, std::slice::from_ref(key))
+                .get_many(&self.store, &parent.root_id, std::slice::from_ref(key))
                 .await?
                 .into_iter()
                 .next()
@@ -661,7 +664,7 @@ where
             };
             let parent_value = self
                 .tree
-                .get_many(&mut self.store, &parent_root, std::slice::from_ref(key))
+                .get_many(&self.store, &parent_root, std::slice::from_ref(key))
                 .await?
                 .into_iter()
                 .next()
@@ -681,8 +684,7 @@ where
         key: &TrackedStateKey,
     ) -> Result<Option<crate::common::LixTimestamp>, LixError> {
         let row_commit_id = row.commit_id.to_string();
-        let Some(metadata) = storage::load_commit_root(&mut self.store, &row_commit_id).await?
-        else {
+        let Some(metadata) = storage::load_commit_root(&self.store, &row_commit_id).await? else {
             return Ok(None);
         };
         let Some(parent) = metadata.parent_roots.first() else {
@@ -690,7 +692,7 @@ where
         };
         let parent_value = self
             .tree
-            .get_many(&mut self.store, &parent.root_id, std::slice::from_ref(key))
+            .get_many(&self.store, &parent.root_id, std::slice::from_ref(key))
             .await?
             .into_iter()
             .next()
@@ -704,7 +706,7 @@ where
         request: &TrackedStateTreeScanRequest,
     ) -> Result<(), LixError> {
         let root = self.load_ensured_root(commit_id).await?;
-        let rows = self.tree.scan(&mut self.store, &root, request).await?;
+        let rows = self.tree.scan(&self.store, &root, request).await?;
         self.validate_commit_root_coverage(commit_id, request, &rows)
             .await?;
         let rows = rows
@@ -736,8 +738,7 @@ where
             }
             let Some(value) = row_map.get(identity) else {
                 return Err(LixError::unknown(format!(
-                    "tracked-state commit-root for commit '{commit_id}' omits current changelog change '{change_id}' for identity {:?}",
-                    identity
+                    "tracked-state commit-root for commit '{commit_id}' omits current changelog change '{change_id}' for identity {identity:?}"
                 )));
             };
             if &value.change_id != change_id {
@@ -756,7 +757,7 @@ where
         };
         let parent_rows = self
             .tree
-            .scan(&mut self.store, &parent.root_id, request)
+            .scan(&self.store, &parent.root_id, request)
             .await?;
         for (parent_key, parent_value) in parent_rows {
             let identity = tracked_state_identity_from_key(&parent_key);
@@ -788,21 +789,13 @@ where
         let left_root = self.load_ensured_root(left_commit_id).await?;
         let right_root = self.load_ensured_root(right_commit_id).await?;
         self.tree
-            .diff(
-                &mut self.store,
-                Some(&left_root),
-                Some(&right_root),
-                request,
-            )
+            .diff(&self.store, Some(&left_root), Some(&right_root), request)
             .await
     }
 
-    async fn load_ensured_root(
-        &mut self,
-        commit_id: &str,
-    ) -> Result<crate::tracked_state::types::TrackedStateRootId, LixError> {
+    async fn load_ensured_root(&mut self, commit_id: &str) -> Result<TrackedStateRootId, LixError> {
         self.tree
-            .load_root(&mut self.store, commit_id)
+            .load_root(&self.store, commit_id)
             .await?
             .ok_or_else(|| missing_commit_root_error(commit_id))
     }
@@ -814,7 +807,7 @@ where
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
         let root_id = self.load_ensured_root(commit_id).await?;
-        self.tree.get_many(&mut self.store, &root_id, keys).await
+        self.tree.get_many(&self.store, &root_id, keys).await
     }
 
     /// Plans a three-way merge by diffing both heads against the same base.
@@ -843,7 +836,7 @@ where
 /// Writer for changelog-backed tracked-state commit roots.
 pub(crate) struct TrackedStateWriter<'a, S: ?Sized> {
     chunk_overlay: storage::TrackedStateChunkOverlay,
-    staged_roots: BTreeMap<String, crate::tracked_state::types::TrackedStateRootId>,
+    staged_roots: BTreeMap<String, TrackedStateRootId>,
     tree: TrackedStateTree,
     store: &'a S,
     writes: &'a mut StorageWriteSet,
@@ -1043,7 +1036,7 @@ fn tree_scan_request_from_tracked(
 
 fn validate_diff_row_against_changelog(
     row: &TrackedStateDiffRow,
-    changes: &HashMap<crate::changelog::ChangeId, ChangeRecord>,
+    changes: &HashMap<ChangeId, ChangeRecord>,
 ) -> Result<(), LixError> {
     let Some(change) = changes.get(&row.change_id) else {
         return Err(LixError::unknown(format!(
@@ -1087,7 +1080,7 @@ fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecor
         format_version: 1,
         change_id: commit.change_id,
         schema_key: "lix_commit".to_string(),
-        entity_pk: EntityPk::single(&commit.commit_id),
+        entity_pk: EntityPk::single(commit.commit_id),
         file_id: None,
         snapshot_ref: Some(crate::json_store::JsonRef::for_content(
             snapshot_content.as_bytes(),
@@ -1153,9 +1146,9 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NullableKeyFilter;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::NullableKeyFilter;
 
     fn commit_id(label: &str) -> String {
         CommitId::for_test_label(label).to_string()
@@ -1677,7 +1670,7 @@ mod tests {
             writes.put(
                 crate::changelog::COMMIT_SPACE,
                 crate::storage::StorageKey(bytes::Bytes::copy_from_slice(commit_a_text.as_bytes())),
-                crate::changelog::encode_commit_record(&crate::changelog::CommitRecord {
+                crate::changelog::encode_commit_record(&CommitRecord {
                     format_version: 1,
                     commit_id: commit_a,
                     parent_commit_ids: vec![commit_b],
@@ -2828,7 +2821,7 @@ mod tests {
         value: &str,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),

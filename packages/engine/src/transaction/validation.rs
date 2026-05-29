@@ -1,7 +1,17 @@
+#![allow(
+    clippy::match_same_arms,
+    clippy::needless_borrow,
+    clippy::needless_continue,
+    clippy::redundant_closure_for_method_calls,
+    clippy::ref_option,
+    clippy::unnecessary_wraps
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::catalog::{
     CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
@@ -14,27 +24,26 @@ use crate::common::format_json_pointer;
 use crate::common::parse_json_pointer;
 use crate::common::{json_pointer_get, validate_row_metadata};
 use crate::domain::{Domain, DomainFileScope, DomainRowIdentity};
-use crate::entity_pk::{canonical_json_text, EntityPk, EntityPkError};
+use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 #[cfg(test)]
 use crate::live_state::LiveStateRowIdentity;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
+#[cfg(test)]
+use crate::schema::{
+    SchemaKey, is_seed_schema_key, validate_lix_schema, validate_lix_schema_definition,
+};
 use crate::schema::{
     format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
 };
 #[cfg(test)]
-use crate::schema::{
-    is_seed_schema_key, validate_lix_schema, validate_lix_schema_definition, SchemaKey,
-};
-use crate::transaction::staging::duplicate_insert_identity_message;
-#[cfg(test)]
 use crate::transaction::staging::PreparedWriteSet;
+use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
 #[cfg(test)]
 use crate::transaction::types::PreparedStateRow;
 use crate::transaction::types::TransactionWriteOrigin;
-use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -1166,7 +1175,7 @@ fn validate_snapshot_content<'a>(
     let Some(snapshot) = row.snapshot_json() else {
         return Ok(None);
     };
-    if let Err(errors) = schema_plan.compiled_schema.validate(&snapshot) {
+    if let Err(errors) = schema_plan.compiled_schema.validate(snapshot) {
         let details = format_lix_schema_validation_errors(errors);
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
@@ -1187,8 +1196,8 @@ fn validate_primary_key_identity(
     let Some(primary_key_paths) = schema_plan.primary_key.as_ref() else {
         return Ok(());
     };
-    let derived = EntityPk::from_primary_key_paths(snapshot, &primary_key_paths)
-        .map_err(|error| primary_key_identity_error(row, &primary_key_paths, error))?;
+    let derived = EntityPk::from_primary_key_paths(snapshot, primary_key_paths)
+        .map_err(|error| primary_key_identity_error(row, primary_key_paths, error))?;
     if row.entity_pk() != &derived {
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
@@ -1244,7 +1253,7 @@ impl PendingConstraintIndexes {
         snapshot: &JsonValue,
     ) {
         if let Some(primary_key_paths) = schema_plan.primary_key.as_ref() {
-            self.remember_fk_target(row, &primary_key_paths, snapshot);
+            self.remember_fk_target(row, primary_key_paths, snapshot);
         }
     }
 
@@ -1255,10 +1264,10 @@ impl PendingConstraintIndexes {
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
         for unique_paths in &schema_plan.uniques {
-            let Some(value) = UniqueConstraintValue::from_snapshot(snapshot, &unique_paths) else {
+            let Some(value) = UniqueConstraintValue::from_snapshot(snapshot, unique_paths) else {
                 continue;
             };
-            self.remember_fk_target(row, &unique_paths, snapshot);
+            self.remember_fk_target(row, unique_paths, snapshot);
             let key = PendingUniqueKey {
                 schema_key: row.schema_key().to_string(),
                 domain: row.domain(),
@@ -2504,15 +2513,10 @@ fn validate_schema_field_pointer(schema: &JsonValue, pointer: &[String]) -> Resu
         let properties = current
             .get("properties")
             .and_then(JsonValue::as_object)
-            .ok_or_else(|| {
-                format!(
-                    "schema segment before '{}' has no object properties",
-                    segment
-                )
-            })?;
+            .ok_or_else(|| format!("schema segment before '{segment}' has no object properties"))?;
         current = properties
             .get(segment)
-            .ok_or_else(|| format!("property '{}' does not exist", segment))?;
+            .ok_or_else(|| format!("property '{segment}' does not exist"))?;
     }
     Ok(())
 }
@@ -2689,7 +2693,7 @@ mod tests {
         visible_schemas: &[JsonValue],
     ) -> Result<CatalogSnapshot, LixError> {
         let catalog = catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)?;
-        let mut pending_keys = BTreeMap::<SchemaCatalogKey, crate::entity_pk::EntityPk>::new();
+        let mut pending_keys = BTreeMap::<SchemaCatalogKey, EntityPk>::new();
         for row in staged_writes
             .validation_rows()
             .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY)
@@ -3599,8 +3603,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_deleting_tracked_file_descriptor_referenced_by_committed_untracked_row(
-    ) {
+    async fn validation_rejects_deleting_tracked_file_descriptor_referenced_by_committed_untracked_row()
+     {
         let visible_schemas = vec![
             unique_schema(),
             file_descriptor_schema(),
@@ -3681,7 +3685,7 @@ mod tests {
     async fn validation_rejects_primary_key_duplicate_with_different_identity() {
         let visible_schemas = vec![unique_schema()];
         let mut conflicting = unique_row("post-1", "hello-world", "first");
-        conflicting.entity_pk = crate::entity_pk::EntityPk::single("post-2");
+        conflicting.entity_pk = EntityPk::single("post-2");
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), conflicting],
             ..empty_staged_write_set()
@@ -4761,11 +4765,12 @@ mod tests {
             .plan_for_key("lix_key_value")
             .expect("lix_key_value plan should exist");
 
-        assert!(plan
-            .1
-            .compiled_schema
-            .validate(&json!({ "key": "k", "value": "v" }))
-            .is_ok());
+        assert!(
+            plan.1
+                .compiled_schema
+                .validate(&json!({ "key": "k", "value": "v" }))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -4788,24 +4793,28 @@ mod tests {
             )
             .expect("parent row should index");
 
-        assert!(indexes
-            .has_fk_target(
-                "fk_parent_schema",
-                "branch-a",
-                Some("file-a"),
-                &["/id"],
-                UniqueConstraintValue::string_values(["parent-1"]),
-            )
-            .expect("lookup should build"));
-        assert!(!indexes
-            .has_fk_target(
-                "fk_parent_schema",
-                "branch-b",
-                Some("file-a"),
-                &["/id"],
-                UniqueConstraintValue::string_values(["parent-1"]),
-            )
-            .expect("lookup should build"));
+        assert!(
+            indexes
+                .has_fk_target(
+                    "fk_parent_schema",
+                    "branch-a",
+                    Some("file-a"),
+                    &["/id"],
+                    UniqueConstraintValue::string_values(["parent-1"]),
+                )
+                .expect("lookup should build")
+        );
+        assert!(
+            !indexes
+                .has_fk_target(
+                    "fk_parent_schema",
+                    "branch-b",
+                    Some("file-a"),
+                    &["/id"],
+                    UniqueConstraintValue::string_values(["parent-1"]),
+                )
+                .expect("lookup should build")
+        );
     }
 
     #[test]
@@ -4828,15 +4837,17 @@ mod tests {
             )
             .expect("unique row should index");
 
-        assert!(indexes
-            .has_fk_target(
-                "unique_schema",
-                "branch-a",
-                Some("file-a"),
-                &["/slug"],
-                UniqueConstraintValue::string_values(["hello-world"]),
-            )
-            .expect("lookup should build"));
+        assert!(
+            indexes
+                .has_fk_target(
+                    "unique_schema",
+                    "branch-a",
+                    Some("file-a"),
+                    &["/slug"],
+                    UniqueConstraintValue::string_values(["hello-world"]),
+                )
+                .expect("lookup should build")
+        );
     }
 
     #[test]
@@ -4863,24 +4874,28 @@ mod tests {
             )
             .expect("child row should index FK reference");
 
-        assert!(indexes
-            .has_fk_reference_to_key(
-                "fk_parent_schema",
-                "branch-a",
-                Some("file-a"),
-                &["/id"],
-                UniqueConstraintValue::string_values(["parent-1"]),
-            )
-            .expect("lookup should build"));
-        assert!(!indexes
-            .has_fk_reference_to_key(
-                "fk_parent_schema",
-                "branch-b",
-                Some("file-a"),
-                &["/id"],
-                UniqueConstraintValue::string_values(["parent-1"]),
-            )
-            .expect("lookup should build"));
+        assert!(
+            indexes
+                .has_fk_reference_to_key(
+                    "fk_parent_schema",
+                    "branch-a",
+                    Some("file-a"),
+                    &["/id"],
+                    UniqueConstraintValue::string_values(["parent-1"]),
+                )
+                .expect("lookup should build")
+        );
+        assert!(
+            !indexes
+                .has_fk_reference_to_key(
+                    "fk_parent_schema",
+                    "branch-b",
+                    Some("file-a"),
+                    &["/id"],
+                    UniqueConstraintValue::string_values(["parent-1"]),
+                )
+                .expect("lookup should build")
+        );
     }
 
     #[test]
@@ -5407,8 +5422,8 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_pk(schema_key: &str) -> crate::entity_pk::EntityPk {
-        crate::entity_pk::EntityPk::from_primary_key_paths(
+    fn registered_schema_entity_pk(schema_key: &str) -> EntityPk {
+        EntityPk::from_primary_key_paths(
             &serde_json::json!({
                 "value": {
                     "x-lix-key": schema_key,
@@ -5559,7 +5574,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
+        row.entity_pk = EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
         row.branch_id = "branch-a".to_string();
         row.global = false;
@@ -5578,7 +5593,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
+        row.entity_pk = EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
         row.branch_id = "branch-a".to_string();
         row.global = false;
@@ -5590,7 +5605,7 @@ mod tests {
             "fk_parent_schema",
             Some(json!({ "id": entity_pk }).to_string()),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
+        row.entity_pk = EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
         row.branch_id = branch_id.to_string();
         row.global = false;
@@ -5602,7 +5617,7 @@ mod tests {
             "fk_child_schema",
             Some(json!({ "id": entity_pk, "parent_id": parent_id }).to_string()),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
+        row.entity_pk = EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
         row.branch_id = branch_id.to_string();
         row.global = false;
@@ -5659,7 +5674,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(entity_pk);
+        row.entity_pk = EntityPk::single(entity_pk);
         row.file_id = Some("file-a".to_string());
         row.branch_id = "branch-a".to_string();
         row.global = false;
@@ -5691,7 +5706,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(file_id);
+        row.entity_pk = EntityPk::single(file_id);
         row.file_id = None;
         row.branch_id = branch_id.to_string();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
@@ -5720,7 +5735,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = crate::entity_pk::EntityPk::single(directory_id);
+        row.entity_pk = EntityPk::single(directory_id);
         row.file_id = None;
         row.branch_id = branch_id.to_string();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
@@ -5758,7 +5773,7 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             schema_key: schema_key.to_string(),
             file_id: None,
             snapshot: snapshot_content.as_deref().map(test_stage_json),

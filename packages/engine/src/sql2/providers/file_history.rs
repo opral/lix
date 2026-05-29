@@ -21,22 +21,22 @@ use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::LixError;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
-use crate::LixError;
 
+use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::change_materialization::MaterializedChange;
-use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
+use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
+    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
+    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
+    HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor,
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
-    HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
-    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SCHEMA_KEY,
-    HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::SqlHistoryQuerySource;
 use crate::storage::StorageRead;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -167,6 +167,7 @@ struct LixFileHistoryScanExec<S> {
     properties: Arc<PlanProperties>,
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl<S> std::fmt::Debug for LixFileHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixFileHistoryScanExec")
@@ -222,7 +223,7 @@ impl<S> ExecutionPlan for LixFileHistoryScanExec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixFileHistoryScanExec"
     }
 
@@ -804,6 +805,7 @@ fn file_history_record_batch(
     })
 }
 
+#[expect(trivial_casts)]
 fn file_history_column_array(
     column_name: &str,
     rows: &[FileHistoryOutputRow],
@@ -842,7 +844,7 @@ fn file_history_column_array(
                 .map(|row| {
                     row.descriptor_change
                         .metadata
-                        .as_ref()
+                        .as_deref()
                         .map(serialize_row_metadata)
                 })
                 .collect::<Vec<_>>(),
@@ -903,6 +905,7 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
     Ok(Arc::new(base_schema.project(projection)?))
 }
 
+#[expect(trivial_casts)]
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }

@@ -17,8 +17,8 @@ pub(crate) use codec::{
     view_commit_change_ref_chunk,
 };
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
-pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
+pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
     ChangeScanRequest, ChangelogAppend, CommitChangeRef, CommitChangeRefChunk,

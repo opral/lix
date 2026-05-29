@@ -1,8 +1,8 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix_engine::changelog::bench as changelog_bench;
 use lix_engine::LixError;
+use lix_engine::changelog::bench as changelog_bench;
 
 mod backends;
 
@@ -40,7 +40,7 @@ async fn run(backend: ChangelogBenchBackend, op: &str, duration: Duration) -> Re
     let direct_store = changelog_bench::prepare_store(backend.create(), &append).await?;
     let direct_by_id_store = changelog_bench::prepare_store(backend.create(), &append).await?;
     let corpus_store = changelog_bench::prepare_corpus_store(backend.create(), &corpus).await?;
-    let corpus_change_ids = corpus.change_ids().to_vec();
+    let corpus_change_ids = corpus.change_ids().clone();
     let deadline = Instant::now() + duration;
     let mut iterations = 0u64;
 

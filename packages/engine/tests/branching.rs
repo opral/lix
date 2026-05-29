@@ -64,7 +64,7 @@ simulation_test!(create_branch_rejects_duplicate_name, |sim| async move {
         .await
         .expect_err("creating a branch with an existing name should fail");
 
-    assert_eq!(error.code, lix_engine::LixError::CODE_UNIQUE);
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
     assert!(
         error.to_string().contains("/name"),
         "error should explain the duplicate branch name: {error:?}"
@@ -1429,10 +1429,7 @@ simulation_test!(merge_branch_rejects_self_merge, |sim| async move {
     );
 });
 
-async fn delete_key_value(
-    session: &crate::support::simulation_test::engine::SimSession,
-    key: &str,
-) {
+async fn delete_key_value(session: &support::simulation_test::engine::SimSession, key: &str) {
     session
         .execute(
             &format!("DELETE FROM lix_key_value WHERE key = '{key}'"),
@@ -1443,11 +1440,11 @@ async fn delete_key_value(
 }
 
 async fn create_draft_after_shared_write(
-    sim: &crate::support::simulation_test::engine::Simulation,
+    sim: &support::simulation_test::engine::Simulation,
 ) -> (
     Engine,
-    crate::support::simulation_test::engine::SimSession,
-    crate::support::simulation_test::engine::SimSession,
+    support::simulation_test::engine::SimSession,
+    support::simulation_test::engine::SimSession,
 ) {
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
@@ -1469,11 +1466,11 @@ async fn create_draft_after_shared_write(
 }
 
 async fn create_draft_from_main(
-    sim: &crate::support::simulation_test::engine::Simulation,
+    sim: &support::simulation_test::engine::Simulation,
 ) -> (
     Engine,
-    crate::support::simulation_test::engine::SimSession,
-    crate::support::simulation_test::engine::SimSession,
+    support::simulation_test::engine::SimSession,
+    support::simulation_test::engine::SimSession,
 ) {
     let engine = sim.boot_engine().await;
     let main = sim.wrap_session(
@@ -1489,8 +1486,8 @@ async fn create_draft_from_main(
 
 async fn create_draft(
     engine: &Engine,
-    main: &crate::support::simulation_test::engine::SimSession,
-) -> crate::support::simulation_test::engine::SimSession {
+    main: &support::simulation_test::engine::SimSession,
+) -> support::simulation_test::engine::SimSession {
     let receipt = main
         .create_branch(CreateBranchOptions {
             id: Some("draft-branch".to_string()),
@@ -1528,7 +1525,7 @@ async fn create_draft(
 }
 
 async fn assert_key_value(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     key: &str,
     expected: Option<&str>,
 ) {
@@ -1552,7 +1549,7 @@ async fn assert_key_value(
 }
 
 async fn assert_branch_descriptor(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     branch_id: &str,
     expected_name: &str,
 ) {
@@ -1575,7 +1572,7 @@ async fn assert_branch_descriptor(
 }
 
 async fn count_branch_descriptors(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     branch_id: &str,
 ) -> i64 {
     select_single_integer(
@@ -1586,7 +1583,7 @@ async fn count_branch_descriptors(
 }
 
 async fn count_branch_refs(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     branch_id: &str,
 ) -> i64 {
     select_single_integer(
@@ -1599,8 +1596,8 @@ async fn count_branch_refs(
     .await
 }
 
-fn assert_branch_pair_delete_restricted(error: &lix_engine::LixError) {
-    assert_eq!(error.code, lix_engine::LixError::CODE_READ_ONLY);
+fn assert_branch_pair_delete_restricted(error: &LixError) {
+    assert_eq!(error.code, LixError::CODE_READ_ONLY);
     assert!(
         error.to_string().contains("lix_branch"),
         "error should explain the branch pair restriction: {error:?}"
@@ -1614,7 +1611,7 @@ fn assert_branch_pair_delete_restricted(error: &lix_engine::LixError) {
     );
 }
 
-fn assert_merge_conflict_error(error: &lix_engine::LixError) {
+fn assert_merge_conflict_error(error: &LixError) {
     assert_eq!(error.code, "LIX_MERGE_CONFLICT");
     assert!(
         error.message.contains("tracked-state conflict"),
@@ -1656,7 +1653,7 @@ fn assert_merge_conflict_error(error: &lix_engine::LixError) {
 }
 
 async fn select_single_integer(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     sql: &str,
 ) -> i64 {
     let result = session
@@ -1671,7 +1668,7 @@ async fn select_single_integer(
 }
 
 async fn commit_parent_edges(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     commit_id: &str,
 ) -> Vec<(String, i64)> {
     let result = session
@@ -1703,7 +1700,7 @@ async fn commit_parent_edges(
 
 async fn assert_empty_merge_commit(
     engine: &Engine,
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     merge_commit_id: &str,
     target_head_before: &str,
     source_head: &str,

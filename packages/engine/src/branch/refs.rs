@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
@@ -11,7 +12,6 @@ use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow,
     UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
-use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 /// Typed access to moving branch heads stored in untracked state.
@@ -123,15 +123,15 @@ where
     S: StorageRead + Send + Sync,
 {
     async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        BranchRefStoreReader::load_head(self, branch_id).await
+        Self::load_head(self, branch_id).await
     }
 
     async fn load_head_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
-        BranchRefStoreReader::load_head_commit_id(self, branch_id).await
+        Self::load_head_commit_id(self, branch_id).await
     }
 
     async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        BranchRefStoreReader::scan_heads(self).await
+        Self::scan_heads(self).await
     }
 }
 
@@ -244,7 +244,7 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("branch-a"),
+                entity_pk: EntityPk::single("branch-a"),
                 file_id: NullableKeyFilter::Null,
             })
             .await

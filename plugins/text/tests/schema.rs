@@ -1,6 +1,6 @@
 use text_plugin::{
-    document_schema_definition, document_schema_json, line_schema_definition, line_schema_json,
-    manifest_json, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY,
+    DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, document_schema_definition, document_schema_json,
+    line_schema_definition, line_schema_json, manifest_json,
 };
 
 #[test]

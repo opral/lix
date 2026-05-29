@@ -1,12 +1,12 @@
+use crate::LixError;
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::{JsonReadScopeRef, JsonRef};
 use crate::storage::{PointReadPlan, StorageRead, StorageSpace};
 use crate::storage::{StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpaceId};
-use crate::LixError;
 use bytes::Bytes;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
 pub(crate) const JSON_SPACE: StorageSpace =
@@ -92,7 +92,7 @@ pub(crate) fn encode_json_str_for_storage_with_ref(
     json_ref: JsonRef,
 ) -> Result<(JsonRef, Vec<u8>), LixError> {
     let encoded_json = encode_json_for_storage_with_ref(json, json_ref)?;
-    let json_ref = encoded_json.json_ref.clone();
+    let json_ref = encoded_json.json_ref;
     Ok((json_ref, encode_stored_json_payload(&encoded_json)))
 }
 
@@ -152,16 +152,16 @@ async fn load_json_bytes_many_in_scope_with_hash_check(
     let mut has_duplicate_refs = false;
     for json_ref in json_refs {
         let hash = *json_ref.as_hash_array();
-        let index = match key_indexes.get(&hash) {
-            Some(index) => {
+        let index = match key_indexes.entry(hash) {
+            Entry::Occupied(entry) => {
                 has_duplicate_refs = true;
-                *index
+                *entry.get()
             }
-            None => {
+            Entry::Vacant(entry) => {
                 let index = unique_keys.len();
-                key_indexes.insert(hash, index);
-                unique_keys.push(hash.to_vec());
+                unique_keys.push(entry.key().to_vec());
                 unique_refs.push(*json_ref);
+                entry.insert(index);
                 index
             }
         };
@@ -231,11 +231,13 @@ fn json_values_in_request_order(
 ) -> Vec<Option<Vec<u8>>> {
     if !has_duplicate_refs {
         debug_assert_eq!(requested_indexes.len(), unique_values.len());
-        debug_assert!(requested_indexes
-            .iter()
-            .copied()
-            .enumerate()
-            .all(|(request_index, unique_index)| request_index == unique_index));
+        debug_assert!(
+            requested_indexes
+                .iter()
+                .copied()
+                .enumerate()
+                .all(|(request_index, unique_index)| request_index == unique_index)
+        );
         return unique_values;
     }
     requested_indexes
@@ -274,6 +276,7 @@ fn encode_stored_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
     out
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn decode_stored_json_payload(bytes: &[u8]) -> Result<StoredJsonPayload<'_>, LixError> {
     if bytes.len() < STORED_JSON_HEADER_LEN {
         return Err(LixError::new(

@@ -4,14 +4,15 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::backend::conformance::{
+    BackendFactory, ConformanceReport, ConformanceResult,
     fixtures::{full_put, key, put_batch, space},
-    open_backend, BackendFactory, ConformanceReport, ConformanceResult,
+    open_backend,
 };
 use crate::backend::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
-    BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange, KeyRef,
-    ProjectedValue, ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    WriteOptions,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions,
+    Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SpaceId, WriteOptions, get_many as backend_get_many,
+    visit_range as backend_visit_range,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -757,7 +758,7 @@ where
     )
     .map_err(|error| format!("get_many before commit failed: {error}"))?;
     if !before_commit
-        .entries_for_requested_keys(&[key_a.clone(), key_b.clone()])
+        .entries_for_requested_keys(&[key_a, key_b])
         .is_empty()
     {
         return Err("uncommitted writes were visible to an independent read".to_string());
@@ -995,7 +996,7 @@ fn scan_range<R>(
     _test_space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanChunk, crate::backend::BackendError>
+) -> Result<ScanChunk, BackendError>
 where
     R: BackendRead,
 {

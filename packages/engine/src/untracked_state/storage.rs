@@ -1,3 +1,5 @@
+#![allow(clippy::ref_option, clippy::uninlined_format_args)]
+
 use bytes::Bytes;
 
 use super::types::{
@@ -297,7 +299,7 @@ fn append_file_prefixes(
             NullableKeyFilter::Null => {
                 prefixes.push(encode_untracked_branch_schema_entity_file_prefix(
                     branch_id, schema_key, entity_pk, None,
-                )?)
+                )?);
             }
             NullableKeyFilter::Value(file_id) => {
                 prefixes.push(encode_untracked_branch_schema_entity_file_prefix(
@@ -305,7 +307,7 @@ fn append_file_prefixes(
                     schema_key,
                     entity_pk,
                     Some(file_id),
-                )?)
+                )?);
             }
             NullableKeyFilter::Any => unreachable!("Any handled before exact file prefixes"),
         }
@@ -432,7 +434,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             file_id: None,
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -448,7 +450,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             file_id: Some(String::new()),
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -464,7 +466,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "json_pointer".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single(""),
+            entity_pk: EntityPk::single(""),
             file_id: Some("file-1".to_string()),
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -480,11 +482,8 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-東京".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::tuple(vec![
-                "entity-1".to_string(),
-                "ключ".to_string(),
-            ])
-            .expect("entity primary key should build"),
+            entity_pk: EntityPk::tuple(vec!["entity-1".to_string(), "ключ".to_string()])
+                .expect("entity primary key should build"),
             file_id: Some("file-δ".to_string()),
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
@@ -500,18 +499,16 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::tuple(vec![
-                "entity/1".to_string(),
-                "quote\"part".to_string(),
-            ])
-            .expect("entity primary key should build"),
+            entity_pk: EntityPk::tuple(vec!["entity/1".to_string(), "quote\"part".to_string()])
+                .expect("entity primary key should build"),
             file_id: None,
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref()).expect("key should encode");
 
-        assert!(!key
-            .windows(2)
-            .any(|window| window == br#"[""# || window == br#""]"#));
+        assert!(
+            !key.windows(2)
+                .any(|window| window == br#"[""# || window == br#""]"#)
+        );
         assert_eq!(
             decode_untracked_state_row_key_ref(&key).expect("key should decode"),
             identity
@@ -522,9 +519,11 @@ mod tests {
     fn key_decode_rejects_malformed_storage_bytes() {
         let error = decode_untracked_state_row_key_ref(b"LXUQ\x01")
             .expect_err("malformed storage key should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to decode untracked-state key"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode untracked-state key")
+        );
     }
 
     #[test]
@@ -532,7 +531,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             file_id: None,
         };
         let mut key =
@@ -540,9 +539,11 @@ mod tests {
         key.push(0);
         let error =
             decode_untracked_state_row_key_ref(&key).expect_err("trailing key bytes should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to decode untracked-state key"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode untracked-state key")
+        );
     }
 
     #[test]
@@ -550,7 +551,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             file_id: None,
         };
         let mut key =
@@ -558,9 +559,11 @@ mod tests {
         key.truncate(key.len() - 2);
         let error =
             decode_untracked_state_row_key_ref(&key).expect_err("truncated key should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to decode untracked-state key"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode untracked-state key")
+        );
     }
 
     #[test]
@@ -568,7 +571,7 @@ mod tests {
         let identity = UntrackedStateIdentity {
             branch_id: "branch-1".to_string(),
             schema_key: "schema-1".to_string(),
-            entity_pk: crate::entity_pk::EntityPk { parts: Vec::new() },
+            entity_pk: EntityPk { parts: Vec::new() },
             file_id: None,
         };
         let key = encode_untracked_state_row_key_ref(identity.as_ref())
@@ -577,9 +580,11 @@ mod tests {
         let error =
             decode_untracked_state_row_key_ref(&key).expect_err("empty entity pk should reject");
 
-        assert!(error
-            .message
-            .contains("entity primary key decoded from storage is invalid"));
+        assert!(
+            error
+                .message
+                .contains("entity primary key decoded from storage is invalid")
+        );
     }
 
     async fn write_materialized_rows_to_store(
@@ -619,7 +624,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: "global".to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single("ui-tab"),
+                    entity_pk: EntityPk::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -662,10 +667,7 @@ mod tests {
         .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].entity_pk,
-            crate::entity_pk::EntityPk::single("branch-ui")
-        );
+        assert_eq!(rows[0].entity_pk, EntityPk::single("branch-ui"));
     }
 
     #[tokio::test]
@@ -699,7 +701,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: "global".to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single("ui-tab"),
+                    entity_pk: EntityPk::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -734,7 +736,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     branch_id: "global".to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single("legacy-row-key"),
+                    entity_pk: EntityPk::single("legacy-row-key"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -767,7 +769,7 @@ mod tests {
         entity_pk: &str,
     ) -> MaterializedUntrackedStateRow {
         MaterializedUntrackedStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"key\":\"{}\",\"value\":\"value\"}}", entity_pk)),

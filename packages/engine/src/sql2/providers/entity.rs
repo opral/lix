@@ -7,7 +7,7 @@ use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array,
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DataFusionError, Result, ScalarValue};
+use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -20,7 +20,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use futures_util::{stream, TryStreamExt};
+use futures_util::{TryStreamExt, stream};
 use serde_json::Value as JsonValue;
 
 use crate::branch::BranchRefReader;
@@ -30,12 +30,12 @@ use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
-use crate::sql2::branch_scope::{resolve_provider_branch_ids, BranchBinding};
+use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
-    entity_surface_schema, EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog,
-    PublicSurfaceKind,
+    EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
+    entity_surface_schema,
 };
-use crate::{serialize_row_metadata, LixError};
+use crate::{LixError, serialize_row_metadata};
 
 use crate::sql2::{
     SqlHistoryQuerySource, SqlWriteContext, WriteContextBranchRefReader,
@@ -161,6 +161,7 @@ pub(crate) struct EntityProvider {
     branch_binding: BranchBinding,
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for EntityProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityProvider")
@@ -190,7 +191,7 @@ impl EntityProvider {
     fn active_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx));
         Self {
             schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
             spec,
@@ -218,7 +219,7 @@ impl EntityProvider {
 
     fn by_branch_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
-        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
+        let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx));
         Self {
             schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
             spec,
@@ -403,6 +404,7 @@ impl ExactBranchIdFilterAnalyzer {
             .is_ok_and(|constraint| constraint.is_some())
     }
 
+    #[expect(clippy::self_only_used_in_recursion)]
     fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<String>>> {
         match expr {
             Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
@@ -492,7 +494,7 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
     fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<EntityPk>>> {
         if self.primary_key_columns.is_empty() {
             return Ok(None);
-        };
+        }
         let Some(constraint) = self.analyze_constraint(expr)? else {
             return Ok(None);
         };
@@ -591,6 +593,7 @@ impl<'a> EntityRowFilterAnalyzer<'a> {
         self.analyze(expr).is_some()
     }
 
+    #[expect(clippy::unnecessary_wraps)]
     fn analyze_filters(&self, filters: &[Expr]) -> Result<Vec<EntityRowFilter>> {
         Ok(filters
             .iter()
@@ -703,8 +706,8 @@ enum EntityRowFilter {
         column_type: EntityColumnType,
         values: Vec<EntityFilterValue>,
     },
-    And(Box<EntityRowFilter>, Box<EntityRowFilter>),
-    Or(Box<EntityRowFilter>, Box<EntityRowFilter>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
 }
 
 impl EntityRowFilter {
@@ -778,6 +781,7 @@ fn entity_snapshot_value(
     }
 }
 
+#[expect(clippy::cast_precision_loss, clippy::float_cmp)]
 fn entity_filter_values_equal(
     actual: &EntityFilterValue,
     expected: &EntityFilterValue,
@@ -960,6 +964,7 @@ struct EntityScanExec {
     properties: Arc<PlanProperties>,
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for EntityScanExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityScanExec")
@@ -1009,7 +1014,7 @@ impl DisplayAs for EntityScanExec {
 }
 
 impl ExecutionPlan for EntityScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "EntityScanExec"
     }
 
@@ -1177,6 +1182,7 @@ fn entity_record_batch(
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
+#[expect(trivial_casts)]
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
@@ -1229,6 +1235,7 @@ fn entity_column_array(
     })
 }
 
+#[expect(trivial_casts)]
 fn entity_system_column_array(
     column_name: &str,
     rows: &[MaterializedLiveStateRow],
@@ -1249,7 +1256,7 @@ fn entity_system_column_array(
         "snapshot_content" => string_array(rows.iter().map(|row| row.snapshot_content.as_deref())),
         "metadata" => Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
@@ -1296,7 +1303,7 @@ pub(super) fn entity_json_text_value(
     column_type: EntityColumnType,
 ) -> Result<Option<String>> {
     Ok(match (column_type, value) {
-        (_, None) | (_, Some(JsonValue::Null)) => None,
+        (_, None | Some(JsonValue::Null)) => None,
         (EntityColumnType::String, Some(JsonValue::Bool(value))) => Some(if *value {
             "true".to_string()
         } else {
@@ -1331,6 +1338,7 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
     })
 }
 
+#[expect(trivial_casts)]
 pub(super) fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     let values = values
         .map(|value| value.map(ToOwned::to_owned))
@@ -1354,6 +1362,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 }
 
 #[cfg(test)]
+#[expect(trivial_casts)]
 mod tests {
     use std::sync::Arc;
 
@@ -1367,16 +1376,16 @@ mod tests {
     use serde_json::json;
 
     use super::entity_record_batch;
+    use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::catalog::{
-        derive_entity_surface_spec_from_schema, entity_surface_schema,
-        schema_exposed_as_entity_surface, EntityColumnType, EntitySurfaceShape,
+        EntityColumnType, EntitySurfaceShape, derive_entity_surface_spec_from_schema,
+        entity_surface_schema, schema_exposed_as_entity_surface,
     };
-    use crate::LixError;
 
     struct EmptyLiveStateReader;
     struct EmptyBranchRefReader;
@@ -1612,6 +1621,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp)]
     fn record_batch_projects_payload_and_system_columns() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
@@ -1774,10 +1784,12 @@ mod tests {
             )),
         ];
 
-        assert!(super::entity_pks_from_primary_key_filters(&spec, &filters)
-            .expect("ignored filters should analyze")
-            .unwrap_or_default()
-            .is_empty());
+        assert!(
+            super::entity_pks_from_primary_key_filters(&spec, &filters)
+                .expect("ignored filters should analyze")
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::{NullableKeyFilter, GLOBAL_BRANCH_ID};
+use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 /// Validation/storage coordinate for repository facts.
 ///
@@ -72,6 +72,7 @@ impl Domain {
         &self.file_scope
     }
 
+    #[expect(clippy::ref_option)]
     pub(crate) fn is_exact_file(&self, file_id: &Option<String>) -> bool {
         matches!(&self.file_scope, DomainFileScope::Exact(exact) if exact == file_id)
     }
@@ -99,7 +100,7 @@ impl Domain {
     pub(crate) fn file_filters(&self) -> Vec<NullableKeyFilter<String>> {
         match &self.file_scope {
             DomainFileScope::Any => Vec::new(),
-            DomainFileScope::Exact(file_id) => vec![nullable_filter_from_option(file_id)],
+            DomainFileScope::Exact(file_id) => vec![nullable_filter_from_option(file_id.as_ref())],
         }
     }
 
@@ -312,9 +313,8 @@ pub(crate) fn committed_row_is_exact_branch_scoped(
     row.branch_id == branch_id && row.global == (row.branch_id == GLOBAL_BRANCH_ID)
 }
 
-fn nullable_filter_from_option(value: &Option<String>) -> NullableKeyFilter<String> {
-    match value {
-        Some(value) => NullableKeyFilter::Value(value.clone()),
-        None => NullableKeyFilter::Null,
-    }
+fn nullable_filter_from_option(value: Option<&String>) -> NullableKeyFilter<String> {
+    value.map_or(NullableKeyFilter::Null, |value| {
+        NullableKeyFilter::Value(value.clone())
+    })
 }

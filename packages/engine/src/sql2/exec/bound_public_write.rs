@@ -4,23 +4,23 @@ use crate::changelog::CommitId;
 use crate::common::validate_row_metadata;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
+use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
     BoundInsertValues, BoundWriteInput, BoundWriteOp, BoundWriteTarget, EntityWriteSurface,
 };
 use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
 use crate::sql2::catalog::{
-    derive_entity_surface_spec_from_schema, EntityColumnType, EntitySurfaceSpec,
+    EntityColumnType, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
 };
+use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::FilterSet;
-use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::read_only::reject_read_only_entity_surface;
-use crate::sql2::SqlWriteExecutionContext;
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
-use crate::{parse_row_metadata_value, LixError, Value};
+use crate::{LixError, Value, parse_row_metadata_value};
 
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     matches!(plan.bound.target, BoundWriteTarget::Entity(_))
@@ -393,12 +393,9 @@ fn entity_insert_row(
             )?;
             continue;
         }
-        match target {
-            InsertColumnTarget::Visible { name, column_type } => {
-                snapshot.insert(name.clone(), entity_json_value(eval_value, *column_type)?);
-                continue;
-            }
-            _ => {}
+        if let InsertColumnTarget::Visible { name, column_type } = target {
+            snapshot.insert(name.clone(), entity_json_value(eval_value, *column_type)?);
+            continue;
         }
         let value = eval_value.into_json();
         match target {
@@ -930,13 +927,7 @@ fn validate_predicate_supported(
     use crate::sql2::plan::predicate::BoundPredicate;
     match predicate {
         BoundPredicate::True | BoundPredicate::False => Ok(()),
-        BoundPredicate::And(predicates) => {
-            for predicate in predicates {
-                validate_predicate_supported(predicate)?;
-            }
-            Ok(())
-        }
-        BoundPredicate::Or(predicates) => {
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
             for predicate in predicates {
                 validate_predicate_supported(predicate)?;
             }
@@ -965,21 +956,17 @@ fn validate_json_predicate_types(
 ) -> Result<(), LixError> {
     use crate::sql2::plan::predicate::BoundPredicate;
     match predicate {
-        BoundPredicate::True | BoundPredicate::False => Ok(()),
-        BoundPredicate::And(predicates) => {
-            for predicate in predicates {
-                validate_json_predicate_types(predicate, spec)?;
-            }
-            Ok(())
-        }
-        BoundPredicate::Or(predicates) => {
+        BoundPredicate::True
+        | BoundPredicate::False
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_) => Ok(()),
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
             for predicate in predicates {
                 validate_json_predicate_types(predicate, spec)?;
             }
             Ok(())
         }
         BoundPredicate::Eq(left, right) => validate_json_comparison_operands(left, right, spec),
-        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(()),
         BoundPredicate::In { expr, values } => {
             if bound_expr_is_json(expr, spec) {
                 for value in values {
@@ -1116,6 +1103,7 @@ fn candidate_snapshot(
         .transpose()
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn entity_json_value(
     value: EntityEvalValue,
     column_type: EntityColumnType,
@@ -1126,14 +1114,8 @@ fn entity_json_value(
             serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
         }
         (EntityEvalValue::SqlText(value), _) => JsonValue::String(value),
-        (EntityEvalValue::Json(value), EntityColumnType::Json) => value,
         (EntityEvalValue::Json(JsonValue::String(value)), EntityColumnType::String) => {
             JsonValue::String(value)
-        }
-        (EntityEvalValue::Json(JsonValue::Number(value)), EntityColumnType::Integer)
-            if value.is_i64() =>
-        {
-            JsonValue::Number(value)
         }
         (
             EntityEvalValue::Json(JsonValue::Number(value)),
@@ -1290,10 +1272,10 @@ fn text_like_bytes(value: &JsonValue, fn_name: &str) -> Result<Vec<u8>, LixError
             .map(byte_from_json_value)
             .collect::<Result<Vec<_>, _>>()?,
         JsonValue::Null => Vec::new(),
-        other => {
+        JsonValue::Object(_) => {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
-                format!("{fn_name}() expected text or binary-compatible input, got {other}"),
+                format!("{fn_name}() expected text or binary-compatible input, got {value}"),
             ));
         }
     })
@@ -1489,10 +1471,9 @@ fn entity_row_branch_id(
     }
     match &plan.bound.branch_scope {
         BranchScope::Active { branch_id } => Ok(branch_id.clone()),
-        BranchScope::ExplicitRequired { branch_ids } if branch_ids.len() == 1 => {
-            Ok(branch_ids.iter().next().expect("len checked").clone())
-        }
-        BranchScope::Explicit { branch_ids } if branch_ids.len() == 1 => {
+        BranchScope::ExplicitRequired { branch_ids } | BranchScope::Explicit { branch_ids }
+            if branch_ids.len() == 1 =>
+        {
             Ok(branch_ids.iter().next().expect("len checked").clone())
         }
         BranchScope::ExplicitDynamic { .. } | BranchScope::ExplicitRequiredDynamic { .. } => {
@@ -1501,8 +1482,7 @@ fn entity_row_branch_id(
                 "parameterized branch scope was not resolved before write execution",
             ))
         }
-        BranchScope::Global => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
-        BranchScope::Empty => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
+        BranchScope::Global | BranchScope::Empty => Ok(crate::GLOBAL_BRANCH_ID.to_string()),
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "entity write requires exactly one target branch",

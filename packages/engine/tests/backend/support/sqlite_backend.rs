@@ -11,7 +11,7 @@ use lix_engine::backend::{
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
-use rusqlite::{params, Connection, Rows};
+use rusqlite::{Connection, Rows, params};
 use tempfile::TempDir;
 
 #[derive(Debug)]
@@ -243,7 +243,7 @@ impl BackendRangeScan for SqliteRangeScan<'_> {
             let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
             match self.projection {
                 CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?
+                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?;
                 }
                 CoreProjection::FullValue => {
                     let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
@@ -466,6 +466,7 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+#[expect(clippy::cast_possible_wrap)]
 fn visit_keys<V>(
     conn: &Connection,
     keys: &[Key],
@@ -526,6 +527,7 @@ where
     Ok(())
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn scan_sql(
     range: KeyRange,
     opts: ScanOptions<'_>,

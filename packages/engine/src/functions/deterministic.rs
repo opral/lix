@@ -37,10 +37,11 @@ impl DeterministicFunctionProvider {
 }
 
 impl FunctionProvider for DeterministicFunctionProvider {
+    #[expect(clippy::cast_sign_loss)]
     fn uuid_v7(&mut self) -> uuid::Uuid {
         let counter = self.take_sequence();
         let counter_bits = (counter as u64) & DETERMINISTIC_UUID_COUNTER_MASK;
-        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + counter_bits as u128)
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000 + u128::from(counter_bits))
     }
 
     fn timestamp(&mut self) -> LixTimestamp {

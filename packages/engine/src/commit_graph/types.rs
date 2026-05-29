@@ -1,8 +1,8 @@
+use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
-use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {

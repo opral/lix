@@ -301,6 +301,7 @@ where
     /// and transaction statements such as `sqlite_master`, `BEGIN`, and
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
+    #[expect(unused_mut)]
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
@@ -355,7 +356,7 @@ where
                 Arc::new(self.live_state.reader(read_store.clone()));
             let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
             let functions = runtime_functions.provider();
-            let active_branch_id = self.active_branch_id_from_reader(&mut read_store).await?;
+            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
             let visible_schemas = self
                 .catalog_context
                 .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)

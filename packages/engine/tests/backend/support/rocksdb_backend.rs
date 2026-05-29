@@ -1,7 +1,7 @@
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use lix_engine::backend::{
@@ -10,8 +10,8 @@ use lix_engine::backend::{
     ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
+use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
 use rocksdb::{DBIteratorWithThreadMode, Snapshot};
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
 
 #[derive(Debug)]
@@ -149,8 +149,7 @@ impl<'db> BackendRead for RocksDbRead<'db> {
             .iter()
             .zip(
                 self.snapshot
-                    .multi_get(keys.iter().map(|key| key.0.as_ref()))
-                    .into_iter(),
+                    .multi_get(keys.iter().map(|key| key.0.as_ref())),
             )
             .enumerate()
         {
@@ -216,7 +215,7 @@ impl BackendRangeScan for RocksDbRangeScan<'_> {
 
             match self.projection {
                 CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(encoded_key.as_ref()), ProjectedValueRef::KeyOnly)?
+                    visitor.visit(KeyRef(encoded_key.as_ref()), ProjectedValueRef::KeyOnly)?;
                 }
                 CoreProjection::FullValue => visitor.visit(
                     KeyRef(encoded_key.as_ref()),
@@ -449,6 +448,7 @@ fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
     let mut bytes = key.0.to_vec();
     bytes.push(0);

@@ -114,8 +114,8 @@ impl ProjectedValueRef<'_> {
 impl ProjectedValue {
     pub fn as_ref(&self) -> ProjectedValueRef<'_> {
         match self {
-            ProjectedValue::KeyOnly => ProjectedValueRef::KeyOnly,
-            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
+            Self::KeyOnly => ProjectedValueRef::KeyOnly,
+            Self::FullValue(value) => ProjectedValueRef::FullValue(value.as_ref()),
         }
     }
 }
@@ -166,7 +166,7 @@ pub enum Durability {
     Durable,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriteStats {
     pub put_entries: u64,
     pub deleted_entries: u64,

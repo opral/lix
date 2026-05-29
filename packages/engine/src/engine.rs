@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
@@ -13,10 +14,10 @@ use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
-use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     storage: StorageContext<B>,
     tracked_state: Arc<TrackedStateContext>,
@@ -164,9 +165,7 @@ where
             .root_rebuilder(&read, &mut writes)
             .rebuild_commit_root_at(&head_commit_id)
             .await;
-        if let Err(error) = rebuild_result {
-            return Err(error);
-        }
+        rebuild_result?;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .map(|_| ())

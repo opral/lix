@@ -1,12 +1,12 @@
 mod common;
 
 use common::{
-    apply_delta, collect_state_rows, decode_utf8, empty_file, file_from_markdown,
-    is_document_change, StateRows,
+    StateRows, apply_delta, collect_state_rows, decode_utf8, empty_file, file_from_markdown,
+    is_document_change,
 };
 use plugin_md_v2::{
-    apply_changes, detect_changes, detect_changes_with_state_context, PluginActiveStateRow,
-    PluginDetectStateContext, PluginEntityChange, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY,
+    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, PluginActiveStateRow, PluginDetectStateContext,
+    PluginEntityChange, apply_changes, detect_changes, detect_changes_with_state_context,
 };
 
 fn to_state_context(rows: &[PluginEntityChange]) -> PluginDetectStateContext {
@@ -116,9 +116,11 @@ fn roundtrip_edit_move_delete_across_block_rows() {
     )
     .expect("delta detect should succeed");
 
-    assert!(delta
-        .iter()
-        .any(|change| change.schema_key == DOCUMENT_SCHEMA_KEY));
+    assert!(
+        delta
+            .iter()
+            .any(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
+    );
     assert!(delta.iter().any(|change| {
         change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none()
     }));

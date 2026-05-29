@@ -3,12 +3,12 @@ use std::{collections::BTreeMap, sync::Arc};
 use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::LixError;
 use crate::common::{format_json_pointer, parse_json_pointer};
 use crate::domain::{Domain, DomainSchemaIdentity};
 use crate::entity_pk::canonical_json_text;
 use crate::functions::FunctionProviderHandle;
-use crate::schema::{compile_lix_schema, validate_schema_amendment, SchemaKey};
-use crate::LixError;
+use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {
@@ -31,6 +31,7 @@ struct CatalogEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CatalogFingerprint(String);
 
+#[expect(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for CatalogSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogSnapshot")
@@ -90,7 +91,7 @@ impl CatalogSnapshot {
         let mut entries = self.entries.clone();
         let mut candidate = Self::from_entries(entries.clone())?;
         let plan_id = candidate.remember_schema_identity(identity.clone(), key, schema)?;
-        entries = candidate.entries.clone();
+        entries.clone_from(&candidate.entries);
         let candidate = Self::from_entries(entries)?;
         *self = candidate;
         Ok(self.by_identity.get(&identity).copied().unwrap_or(plan_id))
@@ -105,6 +106,7 @@ impl CatalogSnapshot {
         Ok(catalog)
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn remember_schema_identity(
         &mut self,
         identity: DomainSchemaIdentity,
@@ -123,7 +125,10 @@ impl CatalogSnapshot {
             }
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!("schema '{}' is already registered with a different definition in the same schema domain", key.schema_key),
+                format!(
+                    "schema '{}' is already registered with a different definition in the same schema domain",
+                    key.schema_key
+                ),
             ));
         }
         if let Some(existing) = self.by_key.get(&key).copied() {
@@ -345,7 +350,7 @@ impl DefaultPlan {
             return Self::default();
         };
         let mut ordered_properties = properties.iter().collect::<Vec<_>>();
-        ordered_properties.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+        ordered_properties.sort_by_key(|(left_name, _)| *left_name);
 
         let properties = ordered_properties
             .into_iter()
@@ -754,15 +759,10 @@ fn schema_field_at_pointer<'a>(
         let properties = current
             .get("properties")
             .and_then(JsonValue::as_object)
-            .ok_or_else(|| {
-                format!(
-                    "schema segment before '{}' has no object properties",
-                    segment
-                )
-            })?;
+            .ok_or_else(|| format!("schema segment before '{segment}' has no object properties"))?;
         current = properties
             .get(segment)
-            .ok_or_else(|| format!("property '{}' does not exist", segment))?;
+            .ok_or_else(|| format!("property '{segment}' does not exist"))?;
     }
     Ok(current)
 }

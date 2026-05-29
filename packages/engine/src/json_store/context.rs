@@ -1,3 +1,4 @@
+use crate::LixError;
 use crate::json_store::store;
 use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonProjection, JsonProjectionBatch,
@@ -5,7 +6,6 @@ use crate::json_store::types::{
     NormalizedJsonRef,
 };
 use crate::storage::{StorageKey, StorageRead, StorageValue, StorageWriteSet};
-use crate::LixError;
 use bytes::Bytes;
 use std::collections::HashSet;
 
@@ -17,6 +17,7 @@ impl JsonStoreContext {
         Self
     }
 
+    #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> JsonStoreReader<S>
     where
         S: StorageRead,
@@ -24,6 +25,7 @@ impl JsonStoreContext {
         JsonStoreReader { store }
     }
 
+    #[expect(clippy::unused_self)]
     pub(crate) fn writer(&self) -> JsonStoreWriter {
         JsonStoreWriter::new()
     }
@@ -58,6 +60,7 @@ impl<S> JsonStoreReader<S>
 where
     S: StorageRead,
 {
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn load_bytes_many(
         &mut self,
         request: JsonLoadRequestRef<'_>,
@@ -78,17 +81,18 @@ where
             .into_values()
             .into_iter()
             .enumerate()
-            .map(|(index, bytes)| match bytes {
-                Some(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "json ref '{}' is invalid JSON: {error}",
-                            refs[index].to_hex()
-                        ),
-                    )
-                }),
-                None => Ok(None),
+            .map(|(index, bytes)| {
+                bytes.map_or(Ok(None), |bytes| {
+                    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "json ref '{}' is invalid JSON: {error}",
+                                refs[index].to_hex()
+                            ),
+                        )
+                    })
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(JsonValueBatch::new(values))
@@ -129,6 +133,7 @@ impl JsonStoreWriter {
         Self
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     pub(crate) fn stage_batch<'a>(
         &mut self,
         writes: &mut StorageWriteSet,

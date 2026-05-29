@@ -17,7 +17,7 @@ pub enum BackendError {
     Io(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
     EnvelopeProjection,
     KeyOrderedPoints,
@@ -60,13 +60,13 @@ pub struct PreconditionSupportReport {
     pub items: Vec<PreconditionItemSupport>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreconditionItemSupport {
     pub index: usize,
     pub support: Support,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreconditionFailure {
     pub index: usize,
 }
@@ -74,19 +74,19 @@ pub struct PreconditionFailure {
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BackendError::Unsupported(capability) => {
+            Self::Unsupported(capability) => {
                 write!(f, "unsupported capability: {capability:?}")
             }
-            BackendError::InvalidKey => f.write_str("invalid key encoding"),
-            BackendError::InvalidCursor => f.write_str("cursor is invalid for this read view"),
-            BackendError::ReadExpired => f.write_str("read transaction is no longer valid"),
-            BackendError::WriteConflict => f.write_str("write conflict"),
-            BackendError::PreconditionFailed(failures) => {
+            Self::InvalidKey => f.write_str("invalid key encoding"),
+            Self::InvalidCursor => f.write_str("cursor is invalid for this read view"),
+            Self::ReadExpired => f.write_str("read transaction is no longer valid"),
+            Self::WriteConflict => f.write_str("write conflict"),
+            Self::PreconditionFailed(failures) => {
                 write!(f, "precondition failed: {failures:?}")
             }
-            BackendError::Durability => f.write_str("durability failure"),
-            BackendError::Corruption(message) => write!(f, "backend corruption: {message}"),
-            BackendError::Io(message) => write!(f, "io error: {message}"),
+            Self::Durability => f.write_str("durability failure"),
+            Self::Corruption(message) => write!(f, "backend corruption: {message}"),
+            Self::Io(message) => write!(f, "io error: {message}"),
         }
     }
 }

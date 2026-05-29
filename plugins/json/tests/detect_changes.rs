@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_json, parse_snapshot_value_from_change};
-use plugin_json_v2::{detect_changes, SCHEMA_KEY};
+use plugin_json_v2::{SCHEMA_KEY, detect_changes};
 use serde_json::Value;
 
 #[test]
@@ -106,7 +106,7 @@ fn detects_multi_delete_array_in_descending_order() {
 #[test]
 fn deleting_non_empty_container_emits_subtree_tombstones() {
     let before = file_from_json("f1", "/x.json", r#"{"a":{"b":1}}"#);
-    let after = file_from_json("f1", "/x.json", r#"{}"#);
+    let after = file_from_json("f1", "/x.json", r"{}");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -120,7 +120,7 @@ fn deleting_non_empty_container_emits_subtree_tombstones() {
 #[test]
 fn replacing_non_empty_container_with_scalar_tombstones_subtree() {
     let before = file_from_json("f1", "/x.json", r#"{"a":{"b":1}}"#);
-    let after = file_from_json("f1", "/x.json", r#"2"#);
+    let after = file_from_json("f1", "/x.json", r"2");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -156,9 +156,11 @@ fn deleting_whole_object_property_emits_subtree_tombstones() {
         entity_pks,
         vec!["/obj", "/obj/k", "/obj/nested", "/obj/nested/z"]
     );
-    assert!(changes
-        .iter()
-        .all(|change| change.snapshot_content.is_none()));
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.snapshot_content.is_none())
+    );
 }
 
 #[test]
@@ -177,9 +179,11 @@ fn deleting_whole_array_property_emits_subtree_tombstones() {
         entity_pks,
         vec!["/arr", "/arr/0", "/arr/0/x", "/arr/1", "/arr/2"]
     );
-    assert!(changes
-        .iter()
-        .all(|change| change.snapshot_content.is_none()));
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.snapshot_content.is_none())
+    );
 }
 
 #[test]
@@ -195,7 +199,9 @@ fn deleting_nested_subtree_emits_all_descendant_tombstones() {
     entity_pks.sort_unstable();
 
     assert_eq!(entity_pks, vec!["/a/b", "/a/b/c", "/a/b/d"]);
-    assert!(changes
-        .iter()
-        .all(|change| change.snapshot_content.is_none()));
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.snapshot_content.is_none())
+    );
 }

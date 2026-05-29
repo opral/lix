@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
-use crate::entity_pk::EntityPk;
 use crate::LixError;
+use crate::entity_pk::EntityPk;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SchemaKey {
@@ -80,7 +80,9 @@ pub(crate) fn registered_schema_entity_pk(schema_key: &str) -> Result<EntityPk, 
     .map_err(|error| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
-            format!("registered schema identity could not be derived for schema '{schema_key}': {error}"),
+            format!(
+                "registered schema identity could not be derived for schema '{schema_key}': {error}"
+            ),
         )
     })
 }
@@ -89,7 +91,7 @@ pub(crate) fn registered_schema_entity_pk(schema_key: &str) -> Result<EntityPk, 
 mod tests {
     use serde_json::json;
 
-    use super::{schema_from_registered_snapshot, schema_key_from_definition, SchemaKey};
+    use super::{SchemaKey, schema_from_registered_snapshot, schema_key_from_definition};
 
     #[test]
     fn schema_from_registered_snapshot_extracts_key_and_schema() {

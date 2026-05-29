@@ -10,8 +10,8 @@ pub(crate) enum FilterSet {
 pub(crate) enum BoundPredicate {
     True,
     False,
-    And(Vec<BoundPredicate>),
-    Or(Vec<BoundPredicate>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
     Eq(BoundExpr, BoundExpr),
     IsNull(BoundExpr),
     IsNotNull(BoundExpr),

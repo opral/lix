@@ -1,5 +1,5 @@
-use crate::sql2::optimize::simple_write::{FastDeletePlan, FastUpdatePlan, FastWritePlan};
 use crate::sql2::SqlWriteExecutionContext;
+use crate::sql2::optimize::simple_write::{FastDeletePlan, FastUpdatePlan, FastWritePlan};
 use crate::{LixError, Value};
 
 pub(crate) async fn try_execute_simple_write(

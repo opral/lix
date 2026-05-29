@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage::StorageBackend;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::LixError;
-use crate::GLOBAL_BRANCH_ID;
 
 use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
 
@@ -38,7 +38,7 @@ where
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<(SessionContext<B>, SwitchBranchReceipt), LixError> {
+    ) -> Result<(Self, SwitchBranchReceipt), LixError> {
         let branch_id = options.branch_id;
         let receipt_branch_id = branch_id.clone();
         let current_mode = self.mode.clone();
@@ -71,7 +71,7 @@ where
             })
             .await?;
 
-        let session = SessionContext::new_with_transaction_manager(
+        let session = Self::new_with_transaction_manager(
             next_mode,
             self.storage.clone(),
             Arc::clone(&self.live_state),
@@ -91,6 +91,7 @@ where
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
     Ok(TransactionWriteRow {
         entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)),

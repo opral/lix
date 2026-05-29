@@ -2,7 +2,7 @@ use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::untracked_state::UntrackedStateRow;
-use crate::{LixError, GLOBAL_BRANCH_ID};
+use crate::{GLOBAL_BRANCH_ID, LixError};
 
 pub(crate) struct PreparedBranchRefRow {
     pub(crate) row: UntrackedStateRow,

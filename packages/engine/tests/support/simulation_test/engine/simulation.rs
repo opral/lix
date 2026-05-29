@@ -70,6 +70,7 @@ impl Simulation {
     }
 
     /// Returns a fresh, empty backend for lifecycle tests.
+    #[expect(clippy::unused_self)]
     pub fn uninitialized_backend(&self) -> InMemoryBackend {
         InMemoryBackend::new()
     }
@@ -103,8 +104,8 @@ pub struct SimSession {
 
 #[allow(dead_code)]
 impl SimSession {
-    pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> SimSession {
-        SimSession {
+    pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> Self {
+        Self {
             sim: self.sim.clone(),
             engine: engine.clone(),
             session,
@@ -182,10 +183,10 @@ impl SimSession {
     pub async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
-    ) -> Result<(SimSession, SwitchBranchReceipt), LixError> {
+    ) -> Result<(Self, SwitchBranchReceipt), LixError> {
         let (session, receipt) = self.session.switch_branch(options).await?;
         Ok((
-            SimSession {
+            Self {
                 sim: self.sim.clone(),
                 engine: self.engine.clone(),
                 session,
@@ -221,8 +222,7 @@ impl SimTransaction {
                     .before_read(&self.engine, &active_branch_id)
                     .await?;
             }
-            StatementKind::Write => {}
-            StatementKind::Utility => {}
+            StatementKind::Write | StatementKind::Utility => {}
         }
         let result = self.transaction.execute(sql, params).await;
         if let Ok(result) = &result {
@@ -261,9 +261,8 @@ fn classify_statement(sql: &str) -> StatementKind {
 
     let (keyword, _rest) = first_keyword_and_rest(sql);
     match keyword.as_str() {
-        "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" => StatementKind::Read,
+        "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "EXPLAIN" => StatementKind::Read,
         "INSERT" | "UPDATE" | "DELETE" => StatementKind::Write,
-        "EXPLAIN" => StatementKind::Read,
         _ => StatementKind::Utility,
     }
 }

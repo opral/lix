@@ -7,7 +7,7 @@ use lix_engine::storage::{
 use lix_engine::{Backend, Key, ProjectedValue, SpaceId};
 
 use crate::backends::{BackendProfile, ProfileBackend, RedbBackend, RocksDbBackend, SqliteBackend};
-use crate::workload::{snapshot_value, WorkloadRow};
+use crate::workload::{WorkloadRow, snapshot_value};
 
 const ROW_SPACE: StorageSpace =
     StorageSpace::new(SpaceId(0x0002_0001), "tracked_state.crud.row.v1");
@@ -91,6 +91,7 @@ impl KvFixture {
         self.insert_all_accounting().logical_rows
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn insert_all_accounting(&mut self) -> KvWriteAccounting {
         self.storage.insert_all(&self.rows).accounting()
     }
@@ -114,6 +115,7 @@ impl KvFixture {
         self.update_all_accounting().logical_rows
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn update_all_accounting(&mut self) -> KvWriteAccounting {
         self.storage.update_all(&self.rows).accounting()
     }
@@ -122,6 +124,7 @@ impl KvFixture {
         self.update_one_by_pk_accounting().logical_rows
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn update_one_by_pk_accounting(&mut self) -> KvWriteAccounting {
         self.storage.update_all(&self.rows[..1]).accounting()
     }
@@ -130,6 +133,7 @@ impl KvFixture {
         self.delete_all_accounting().logical_rows
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn delete_all_accounting(&mut self) -> KvWriteAccounting {
         self.storage.delete_all(self.rows.len()).accounting()
     }
@@ -138,6 +142,7 @@ impl KvFixture {
         self.delete_one_by_pk_accounting().logical_rows
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn delete_one_by_pk_accounting(&mut self) -> KvWriteAccounting {
         self.storage
             .delete_one(&self.rows[self.rows.len() / 2])
@@ -293,9 +298,11 @@ where
     let _commit = storage
         .clear_space(ROW_SPACE, StorageWriteOptions::default())
         .expect("clear tracked-state crud rows");
-    let mut stats = StorageWriteSetStats::default();
-    stats.backend_calls = 1;
-    stats.delete_batches = 1;
+    let stats = StorageWriteSetStats {
+        backend_calls: 1,
+        delete_batches: 1,
+        ..StorageWriteSetStats::default()
+    };
     KvWriteOutcome {
         logical_rows: row_count,
         stats,

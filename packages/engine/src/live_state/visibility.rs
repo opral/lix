@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::live_state::{
     LiveStateReader, LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::LixError;
-use crate::GLOBAL_BRANCH_ID;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VisibilityRequest {
@@ -176,7 +176,7 @@ fn project_global_rows_into_requested_branches(
         for row in &rows {
             if row.branch_id == GLOBAL_BRANCH_ID {
                 let mut projected = row.clone();
-                projected.branch_id = requested_branch_id.clone();
+                projected.branch_id.clone_from(requested_branch_id);
                 insert_row_preferring_untracked(&mut rows_by_identity, projected);
             }
         }

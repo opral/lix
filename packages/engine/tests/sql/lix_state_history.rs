@@ -26,9 +26,11 @@ simulation_test!(
             .await
             .expect_err("history queries must provide start_commit_id");
 
-        assert!(error
-            .to_string()
-            .contains("requires a start_commit_id filter"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires a start_commit_id filter")
+        );
         assert_eq!(
             error.code,
             lix_engine::LixError::CODE_HISTORY_FILTER_REQUIRED

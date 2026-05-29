@@ -210,9 +210,11 @@ mod tests {
         .expect_err("system table collisions should be rejected");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error
-            .message
-            .contains("duplicate public SQL surface 'lix_file'"));
+        assert!(
+            error
+                .message
+                .contains("duplicate public SQL surface 'lix_file'")
+        );
     }
 
     #[test]

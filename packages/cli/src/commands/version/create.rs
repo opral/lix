@@ -1,7 +1,7 @@
 use crate::app::AppContext;
 use crate::cli::version::CreateVersionCommand;
 use crate::commands::version::{
-    resolve_active_version_ref, resolve_version_ref, ResolvedVersionRef, VersionLookup,
+    ResolvedVersionRef, VersionLookup, resolve_active_version_ref, resolve_version_ref,
 };
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;

@@ -44,11 +44,8 @@ impl Visitor for PublicUdfCallVisitor {
         }
     }
 
-    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-        match statement {
-            Statement::CreateFunction(_) | Statement::DropFunction(_) => ControlFlow::Continue(()),
-            _ => ControlFlow::Continue(()),
-        }
+    fn pre_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
+        ControlFlow::Continue(())
     }
 }
 
@@ -60,10 +57,9 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
 
     match name {
         "lix_json" => expect_exact_arity(name, arity, 1),
-        "lix_empty_blob" => expect_exact_arity(name, arity, 0),
-        "lix_timestamp" => expect_exact_arity(name, arity, 0),
-        "lix_uuid_v7" => expect_exact_arity(name, arity, 0),
-        "lix_active_branch_commit_id" => expect_exact_arity(name, arity, 0),
+        "lix_empty_blob" | "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
+            expect_exact_arity(name, arity, 0)
+        }
         "lix_text_encode" | "lix_text_decode" => {
             expect_arity_range(name, arity, 1, 2)?;
             validate_literal_utf8_encoding(name, &function.args)
@@ -218,17 +214,17 @@ fn function_arg(args: &FunctionArguments, index: usize) -> Option<&FunctionArg> 
 }
 
 fn string_literal_arg(arg: &FunctionArg) -> Option<&str> {
-    let expr = match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-        | FunctionArg::Named {
-            arg: FunctionArgExpr::Expr(expr),
-            ..
-        }
-        | FunctionArg::ExprNamed {
-            arg: FunctionArgExpr::Expr(expr),
-            ..
-        } => expr,
-        _ => return None,
+    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+    | FunctionArg::Named {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }
+    | FunctionArg::ExprNamed {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }) = arg
+    else {
+        return None;
     };
     let Expr::Value(value) = expr else {
         return None;
@@ -278,9 +274,11 @@ mod tests {
         let error = validate_public_udf_calls("SELECT lix_text_encode('Ada', 'base64')")
             .expect_err("unsupported encoding should be rejected");
         assert_eq!(error.code, "LIX_INVALID_PARAM");
-        assert!(error
-            .message
-            .contains("lix_text_encode() only supports UTF8 encoding"));
+        assert!(
+            error
+                .message
+                .contains("lix_text_encode() only supports UTF8 encoding")
+        );
     }
 
     #[test]

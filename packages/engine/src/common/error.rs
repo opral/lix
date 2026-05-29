@@ -1,4 +1,6 @@
-use serde_json::{json, Value as JsonValue};
+use std::fmt::Write as _;
+
+use serde_json::{Value as JsonValue, json};
 
 /// Structured error type surfaced by Lix to every SDK binding.
 ///
@@ -268,7 +270,7 @@ impl LixError {
     pub fn format(&self) -> String {
         let mut s = format!("code: {}\nmessage: {}", self.code, self.message);
         if let Some(hint) = &self.hint {
-            s.push_str(&format!("\nhint: {hint}"));
+            let _ = write!(s, "\nhint: {hint}");
         }
         s
     }

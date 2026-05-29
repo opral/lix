@@ -192,7 +192,13 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name)] = values else {
+        let [
+            Value::Text(id),
+            Value::Text(path),
+            Value::Null,
+            Value::Text(name),
+        ] = values
+        else {
             panic!("expected generated directory row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted directory id should be non-empty");
@@ -231,7 +237,13 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name)] = values else {
+        let [
+            Value::Text(id),
+            Value::Text(path),
+            Value::Null,
+            Value::Text(name),
+        ] = values
+        else {
             panic!("expected generated directory path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted directory id should be non-empty");

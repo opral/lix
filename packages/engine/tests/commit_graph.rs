@@ -157,7 +157,7 @@ simulation_test!(
 );
 
 async fn commit_parent_ids(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     commit_id: &str,
 ) -> Vec<String> {
     let result = session
@@ -183,7 +183,7 @@ async fn commit_parent_ids(
 }
 
 async fn commit_ids(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     commit_id: &str,
 ) -> Vec<String> {
     let result = session

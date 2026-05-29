@@ -5,8 +5,8 @@ use common::{
     parse_document_order,
 };
 use plugin_md_v2::{
-    detect_changes, detect_changes_with_state_context, PluginDetectStateContext, BLOCK_SCHEMA_KEY,
-    DOCUMENT_SCHEMA_KEY,
+    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, PluginDetectStateContext, detect_changes,
+    detect_changes_with_state_context,
 };
 use std::collections::BTreeSet;
 
@@ -160,13 +160,13 @@ fn emits_document_and_block_rows_for_new_file() {
     let document_rows = changes
         .iter()
         .filter(|change| is_document_change(change))
-        .collect::<Vec<_>>();
+        .count();
     let block_rows = changes
         .iter()
         .filter(|change| is_block_change(change))
         .collect::<Vec<_>>();
 
-    assert_eq!(document_rows.len(), 1);
+    assert_eq!(document_rows, 1);
     assert_eq!(block_rows.len(), 2);
 
     for row in block_rows {
@@ -348,7 +348,7 @@ fn large_doc_pure_shuffle_emits_document_row_only() {
     let paragraphs = (0..140).map(|idx| format!("P{idx}")).collect::<Vec<_>>();
     let before_markdown = paragraphs.join("\n\n") + "\n";
 
-    let mut after = paragraphs.clone();
+    let mut after = paragraphs;
     after.rotate_left(37);
     let after_markdown = after.join("\n\n") + "\n";
 
@@ -512,7 +512,7 @@ fn id_stability_large_pure_shuffle_preserves_id_set() {
     let before_order = bootstrap_order(&before_markdown);
     assert_eq!(before_order.len(), 500);
 
-    let mut after = paragraphs.clone();
+    let mut after = paragraphs;
     after.rotate_left(123);
     let after_markdown = after.join("\n\n") + "\n";
 
@@ -1057,9 +1057,11 @@ fn with_state_context_large_500_delete_insert_move_emits_minimal_noise() {
     } else {
         assert_eq!(inserted_id, deleted_id);
     }
-    assert!(upsert_markdowns(&changes)
-        .iter()
-        .any(|markdown| markdown.contains("PX")));
+    assert!(
+        upsert_markdowns(&changes)
+            .iter()
+            .any(|markdown| markdown.contains("PX"))
+    );
 
     let order = document_order_from_changes(&changes).expect("document row should be present");
     assert_eq!(order.len(), 500);

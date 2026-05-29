@@ -45,8 +45,7 @@ fn classify_ast_statement(statement: &SqlStatement) -> SqlStatementKind {
         SqlStatement::Insert(_) | SqlStatement::Update(_) | SqlStatement::Delete(_) => {
             SqlStatementKind::Write
         }
-        SqlStatement::Query(_) => SqlStatementKind::Read,
-        SqlStatement::Explain { .. } => SqlStatementKind::Read,
+        SqlStatement::Query(_) | SqlStatement::Explain { .. } => SqlStatementKind::Read,
         _ => SqlStatementKind::Other,
     }
 }

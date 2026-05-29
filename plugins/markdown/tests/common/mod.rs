@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use plugin_md_v2::{
-    PluginApiError, PluginEntityChange, PluginFile, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY,
+    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, PluginApiError, PluginEntityChange, PluginFile,
     ROOT_ENTITY_PK,
 };
 use std::collections::BTreeMap;

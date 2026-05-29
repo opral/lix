@@ -17,18 +17,18 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use futures_util::{stream, TryStreamExt};
+use futures_util::{TryStreamExt, stream};
 use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphReader;
-use crate::{serialize_row_metadata, LixError};
+use crate::{LixError, serialize_row_metadata};
 
+use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::history_route::{
-    load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
-    HistoryViewDescriptor,
+    HistoryColumnStyle, HistoryRoute, HistoryViewDescriptor, load_history_entries,
+    parse_history_filter,
 };
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::SqlHistoryQuerySource;
 use crate::storage::StorageRead;
 
 pub(super) async fn register_history_provider<S>(
@@ -137,6 +137,7 @@ struct LixStateHistoryScanExec<S> {
     properties: Arc<PlanProperties>,
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl<S> std::fmt::Debug for LixStateHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixStateHistoryScanExec")
@@ -192,7 +193,7 @@ impl<S> ExecutionPlan for LixStateHistoryScanExec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixStateHistoryScanExec"
     }
 
@@ -237,10 +238,7 @@ where
         let schema = Arc::clone(&self.schema);
         let stream_schema = Arc::clone(&schema);
         let limit = self.limit;
-        let zero_column_projection = self
-            .projection
-            .as_ref()
-            .is_some_and(|projection| projection.is_empty());
+        let zero_column_projection = self.projection.as_ref().is_some_and(Vec::is_empty);
 
         let stream = stream::once(async move {
             let rows = if route.is_contradictory() {
@@ -292,18 +290,23 @@ pub(super) fn lix_state_history_schema() -> SchemaRef {
     ]))
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
-    let fields = match projection {
-        Some(indices) => indices
-            .iter()
-            .map(|index| base_schema.field(*index).as_ref().clone())
-            .collect::<Vec<_>>(),
-        None => base_schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>(),
-    };
+    let fields = projection.map_or_else(
+        || {
+            base_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>()
+        },
+        |indices| {
+            indices
+                .iter()
+                .map(|index| base_schema.field(*index).as_ref().clone())
+                .collect::<Vec<_>>()
+        },
+    );
     Ok(Arc::new(Schema::new(fields)))
 }
 
@@ -321,6 +324,7 @@ struct StateHistorySqlRow {
     depth: i64,
 }
 
+#[expect(trivial_casts)]
 fn state_history_record_batch(
     schema: SchemaRef,
     rows: &[StateHistorySqlRow],
@@ -338,7 +342,7 @@ fn state_history_record_batch(
                 }
                 "metadata" => Arc::new(StringArray::from(
                     rows.iter()
-                        .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                        .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
                         .collect::<Vec<_>>(),
                 )),
                 "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
@@ -365,6 +369,7 @@ fn state_history_record_batch(
     RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
 }
 
+#[expect(trivial_casts)]
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }

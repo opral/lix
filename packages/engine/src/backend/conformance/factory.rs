@@ -59,7 +59,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendTestConfig {
     pub max_key_len: usize,
     pub max_value_len: usize,

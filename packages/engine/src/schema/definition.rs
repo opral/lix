@@ -4,8 +4,8 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
-use crate::common::parse_json_pointer;
 use crate::LixError;
+use crate::common::parse_json_pointer;
 
 static LIX_SCHEMA_DEFINITION: OnceLock<JsonValue> = OnceLock::new();
 static LIX_SCHEMA_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
@@ -144,6 +144,7 @@ fn collect_schema_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a s
 fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
     let mut offenders: Vec<(String, String)> = Vec::new();
 
+    #[expect(clippy::items_after_statements)]
     fn collect(items: Option<&Vec<JsonValue>>, label: &str, out: &mut Vec<(String, String)>) {
         let Some(items) = items else {
             return;
@@ -328,12 +329,13 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
             .then(|| schema_property(schema, &segments))
             .flatten()
         else {
-            return Err(LixError { code: LixError::CODE_SCHEMA_DEFINITION.to_string(), message: format!(
-                    "Invalid Lix schema definition: x-lix-primary-key references missing property \"{}\".",
-                    pointer
+            return Err(LixError {
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
+                message: format!(
+                    "Invalid Lix schema definition: x-lix-primary-key references missing property \"{pointer}\"."
                 ),
                 hint: None,
-            details: None,
+                details: None,
             });
         };
         if !schema_property_is_string_only(property_schema) {
@@ -375,12 +377,13 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
             };
             let segments = parse_json_pointer(pointer)?;
             if segments.is_empty() || !schema_has_property(schema, &segments) {
-                return Err(LixError { code: LixError::CODE_SCHEMA_DEFINITION.to_string(), message: format!(
-                        "Invalid Lix schema definition: x-lix-unique references missing property \"{}\".",
-                        pointer
+                return Err(LixError {
+                    code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
+                    message: format!(
+                        "Invalid Lix schema definition: x-lix-unique references missing property \"{pointer}\"."
                     ),
                     hint: None,
-            details: None,
+                    details: None,
                 });
             }
         }
@@ -477,10 +480,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
         if !known {
             return Err(LixError {
                 code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
-                message: format!(
-                    "Invalid Lix schema definition: unknown x-lix field '{}'.",
-                    key
-                ),
+                message: format!("Invalid Lix schema definition: unknown x-lix field '{key}'."),
                 hint: None,
                 details: None,
             });

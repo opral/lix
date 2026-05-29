@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
-use crate::entity_pk::EntityPk;
 use crate::LixError;
+use crate::entity_pk::EntityPk;
 
 /// Shared projection contract for typed history views.
 ///

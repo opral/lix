@@ -4,14 +4,15 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::backend::conformance::{
+    BackendFactory, ConformanceReport, ConformanceResult,
     fixtures::{full_put, key, put_batch},
     model::ReferenceModel,
-    open_backend, BackendFactory, ConformanceReport, ConformanceResult,
+    open_backend,
 };
 use crate::backend::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendRead,
-    BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadEntry,
-    ReadOptions, ScanChunk, ScanOptions, WriteOptions,
+    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
+    ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, WriteOptions,
+    get_many as backend_get_many, visit_range as backend_visit_range,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -30,7 +31,7 @@ where
 {
     let backend = open_backend(factory);
     let mut model = ReferenceModel::default();
-    let mut rng = TinyRng::new(0x51cedeed);
+    let mut rng = TinyRng::new(0x51ce_deed);
     let keys = [
         key("a"),
         key("b"),
@@ -62,7 +63,7 @@ where
                 staged.put(target_key, value);
             } else {
                 write
-                    .delete_many(&[target_key.clone()])
+                    .delete_many(std::slice::from_ref(&target_key))
                     .map_err(|error| format!("step {step}: delete_many failed: {error}"))?;
                 staged.delete(&target_key);
             }
@@ -212,14 +213,14 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
     lower_matches && upper_matches
 }
 
-fn chunk_entries(entries: &[crate::backend::ReadEntry]) -> Vec<(Key, Bytes)> {
+fn chunk_entries(entries: &[ReadEntry]) -> Vec<(Key, Bytes)> {
     entries
         .iter()
         .map(|entry| (entry.key.clone(), projected_value_bytes(&entry.value)))
         .collect()
 }
 
-fn entries_to_map(entries: &[crate::backend::ReadEntry]) -> BTreeMap<Key, Bytes> {
+fn entries_to_map(entries: &[ReadEntry]) -> BTreeMap<Key, Bytes> {
     chunk_entries(entries).into_iter().collect()
 }
 
@@ -242,11 +243,12 @@ impl TinyRng {
     fn next(&mut self) -> u64 {
         self.state = self
             .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         self.state
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn usize(&mut self, upper: usize) -> usize {
         (self.next() as usize) % upper
     }

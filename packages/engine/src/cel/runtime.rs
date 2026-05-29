@@ -44,6 +44,7 @@ impl CelEvaluator {
         cel_to_json(&value)
     }
 
+    #[expect(clippy::significant_drop_in_scrutinee)]
     fn compile(&self, expression: &str) -> Result<Arc<CompiledProgram>, LixError> {
         if let Some(existing) = self.programs.read().unwrap().get(expression).cloned() {
             return Ok(existing);
@@ -71,7 +72,7 @@ pub(crate) fn shared_runtime() -> &'static CelEvaluator {
 mod tests {
     use super::CelEvaluator;
     use crate::cel::CelFunctionProvider;
-    use serde_json::{json, Map as JsonMap, Value as JsonValue};
+    use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
     #[derive(Clone)]
     struct FixedFunctions;
@@ -125,9 +126,10 @@ mod tests {
         let err = evaluator
             .evaluate_with_functions("1 / 0", &JsonMap::new(), fixed_functions())
             .expect_err("expected runtime error");
-        assert!(err
-            .to_string()
-            .contains("failed to evaluate CEL expression"));
+        assert!(
+            err.to_string()
+                .contains("failed to evaluate CEL expression")
+        );
     }
 
     #[test]

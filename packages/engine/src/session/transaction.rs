@@ -4,16 +4,17 @@ use crate::functions::{DeterministicRuntimeGuard, FunctionContext};
 use crate::storage::{InMemoryStorageBackend, StorageBackend};
 use tokio::sync::Notify;
 
+use crate::LixError;
 #[cfg(test)]
 use crate::transaction::CommitBoundaryGuard;
 use crate::transaction::{
-    open_transaction, CommitBoundaryState, Transaction, TransactionCommitBoundary,
+    CommitBoundaryState, Transaction, TransactionCommitBoundary, open_transaction,
 };
-use crate::LixError;
 
-use super::context::{closed_error, SessionWriteAccess};
 use super::SessionContext;
+use super::context::{SessionWriteAccess, closed_error};
 
+#[expect(missing_debug_implementations)]
 pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) transaction: Option<Transaction<B>>,
     pub(super) runtime_functions: FunctionContext,
@@ -85,7 +86,7 @@ where
         self.ensure_session_open()?;
         self.transaction
             .as_ref()
-            .map(|transaction| transaction.active_branch_id())
+            .map(Transaction::active_branch_id)
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 
@@ -108,8 +109,8 @@ where
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        let result = transaction.rollback().await;
-        result
+
+        transaction.rollback().await
     }
 
     pub(super) fn ensure_session_open(&self) -> Result<(), LixError> {
@@ -204,7 +205,7 @@ impl SessionTransactionManager {
 
             let notified = self.inner.state_changed.notified();
             tokio::select! {
-                _ = notified => {}
+                () = notified => {}
                 result = commit_rx.changed() => {
                     if result.is_err() {
                         self.inner.state_changed.notify_waiters();
@@ -227,7 +228,7 @@ impl SessionTransactionManager {
                 }
             }
             tokio::select! {
-                _ = notified => {}
+                () = notified => {}
                 result = commit_rx.changed() => {
                     if result.is_err() {
                         self.inner.state_changed.notify_waiters();
@@ -521,8 +522,7 @@ impl SessionTransactionState {
             } => {
                 *self = Self::OpenIdle;
             }
-            Self::OpenTransaction { .. } => {}
-            Self::Closing { .. } | Self::Closed => {}
+            Self::OpenTransaction { .. } | Self::Closing { .. } | Self::Closed => {}
             Self::OpenIdle | Self::OpenOperation { .. } => {
                 panic!("session transaction should be active before it is finished");
             }

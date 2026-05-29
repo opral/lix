@@ -1,7 +1,10 @@
+#![allow(clippy::needless_raw_string_hashes, clippy::redundant_clone)]
+
 use std::sync::Arc;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::LixError;
 use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanId};
 use crate::common::format_json_pointer;
 use crate::common::normalize_path_segment;
@@ -13,7 +16,6 @@ use crate::schema::{
     validate_lix_schema_definition,
 };
 use crate::transaction::types::{PreparedRowFacts, TransactionJson, TransactionWriteRow};
-use crate::LixError;
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -234,7 +236,9 @@ fn resolve_entity_pk(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
                     "entity_pk '{}' does not match x-lix-primary-key derived entity_pk '{}' for schema '{}'",
-                    entity_pk.as_json_array_text()?, derived.as_json_array_text()?, row.schema_key
+                    entity_pk.as_json_array_text()?,
+                    derived.as_json_array_text()?,
+                    row.schema_key
                 ),
             ));
         }
@@ -294,9 +298,9 @@ pub(crate) fn remember_pending_registered_schema(
                     "lix_registered_schema schema is not visible to this transaction",
                 )
             })?;
-        validate_lix_schema(registered_schema_definition, &snapshot)?;
+        validate_lix_schema(registered_schema_definition, snapshot)?;
     }
-    let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
+    let (key, schema) = schema_from_registered_snapshot(snapshot)?;
     if is_seed_schema_key(&key.schema_key) {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -336,7 +340,7 @@ mod tests {
 
         assert_eq!(
             row.row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("entity-from-snapshot"))
+            Some(&EntityPk::single("entity-from-snapshot"))
         );
     }
 
@@ -356,9 +360,7 @@ mod tests {
 
         assert_eq!(
             row.row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single(
-                "00000000-0000-0000-0000-000000000000"
-            ))
+            Some(&EntityPk::single("00000000-0000-0000-0000-000000000000"))
         );
         assert_eq!(snapshot["id"], "00000000-0000-0000-0000-000000000000");
         assert_eq!(snapshot["value"], "literal-default");
@@ -453,7 +455,7 @@ mod tests {
     fn normalization_rejects_entity_pk_that_disagrees_with_primary_key() {
         let mut catalog = catalog_with(vec![schema_with_default_id()]);
         let row = TransactionWriteRow {
-            entity_pk: Some(crate::entity_pk::EntityPk::single("wrong-id")),
+            entity_pk: Some(EntityPk::single("wrong-id")),
             schema_key: "normalization_schema".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"right-id","value":"hello"}"#)),
             ..base_stage_row()
@@ -462,9 +464,11 @@ mod tests {
         let error = normalize_transaction_write_row(row, &mut catalog, functions())
             .expect_err("id mismatch fails");
 
-        assert!(error
-            .message
-            .contains("does not match x-lix-primary-key derived entity_pk"));
+        assert!(
+            error
+                .message
+                .contains("does not match x-lix-primary-key derived entity_pk")
+        );
     }
 
     #[test]
@@ -501,9 +505,11 @@ mod tests {
             .expect_err("non-string primary key values should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(error
-            .message
-            .contains("non-string value at primary-key pointer '/key'"));
+        assert!(
+            error
+                .message
+                .contains("non-string value at primary-key pointer '/key'")
+        );
     }
 
     #[test]
@@ -533,9 +539,11 @@ mod tests {
 
     #[test]
     fn normalization_makes_pending_registered_schema_visible_to_later_rows() {
-        let mut catalog = catalog_with(vec![seed_schema_definition(REGISTERED_SCHEMA_KEY)
-            .expect("registered schema builtin")
-            .clone()]);
+        let mut catalog = catalog_with(vec![
+            seed_schema_definition(REGISTERED_SCHEMA_KEY)
+                .expect("registered schema builtin")
+                .clone(),
+        ]);
         let registered = TransactionWriteRow {
             entity_pk: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
@@ -559,7 +567,7 @@ mod tests {
 
         assert_eq!(
             dynamic.row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("dynamic-1"))
+            Some(&EntityPk::single("dynamic-1"))
         );
     }
 
@@ -726,7 +734,7 @@ mod tests {
 
     fn base_stage_row() -> TransactionWriteRow {
         TransactionWriteRow {
-            entity_pk: Some(crate::entity_pk::EntityPk::single("entity-1")),
+            entity_pk: Some(EntityPk::single("entity-1")),
             schema_key: "normalization_schema".to_string(),
             file_id: None,
             snapshot: Some(snapshot_json(r#"{"id":"entity-1","value":"hello"}"#)),
@@ -861,6 +869,7 @@ mod tests {
         })
     }
 
+    #[expect(trivial_casts)]
     fn functions() -> FunctionProviderHandle {
         FunctionProviderHandle::shared(Box::new(FixedFunctions) as Box<dyn FunctionProvider + Send>)
     }

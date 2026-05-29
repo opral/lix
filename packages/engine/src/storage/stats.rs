@@ -1,4 +1,4 @@
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageReadStats {
     pub requested_keys: u64,
     pub unique_backend_keys: u64,
@@ -16,7 +16,7 @@ pub struct StorageReadStats {
 }
 
 impl StorageReadStats {
-    pub fn add(&mut self, other: StorageReadStats) {
+    pub fn add(&mut self, other: Self) {
         self.requested_keys += other.requested_keys;
         self.unique_backend_keys += other.unique_backend_keys;
         self.backend_calls += other.backend_calls;
@@ -33,7 +33,7 @@ impl StorageReadStats {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageReadStatsCollector {
     stats: StorageReadStats,
 }
@@ -48,7 +48,7 @@ impl StorageReadStatsCollector {
     }
 
     pub fn snapshot(&self) -> StorageReadStats {
-        self.stats.clone()
+        self.stats
     }
 
     pub fn reset(&mut self) {
@@ -68,7 +68,7 @@ impl<T> StorageReadResult<T> {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageWriteSetStats {
     pub staged_puts: u64,
     pub staged_deletes: u64,

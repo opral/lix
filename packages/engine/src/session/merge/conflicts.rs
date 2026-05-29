@@ -1,7 +1,7 @@
+use crate::LixError;
 use crate::tracked_state::{
     TrackedStateDiffEntry, TrackedStateDiffKind, TrackedStateMergeConflict, TrackedStateMergePlan,
 };
-use crate::LixError;
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

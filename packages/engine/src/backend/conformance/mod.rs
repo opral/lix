@@ -18,13 +18,13 @@ mod runner;
 pub(crate) use factory::open_backend;
 pub use factory::{BackendFactory, BackendFixture, BackendTestConfig};
 pub use runner::{
-    run_backend_conformance, ConformanceReport, ConformanceResult, ConformanceStatus,
-    ConformanceTest,
+    ConformanceReport, ConformanceResult, ConformanceStatus, ConformanceTest,
+    run_backend_conformance,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{run_backend_conformance, ConformanceStatus};
+    use super::{ConformanceStatus, run_backend_conformance};
     use crate::backend::InMemoryBackendFactory;
 
     #[test]

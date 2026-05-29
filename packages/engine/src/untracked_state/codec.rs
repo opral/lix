@@ -1,7 +1,7 @@
 use super::types::UntrackedPayloadRef;
+use crate::LixError;
 use crate::storage_codec;
 use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
-use crate::LixError;
 
 #[cfg_attr(not(feature = "storage-benches"), allow(dead_code))]
 pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
@@ -132,9 +132,11 @@ mod tests {
         let entity_pk = EntityPk::single("id-1");
         let error = decode_payload_with_identity(identity(entity_pk), b"not-musli-payload")
             .expect_err("malformed storage payload is rejected");
-        assert!(error
-            .to_string()
-            .contains("failed to decode untracked-state payload"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode untracked-state payload")
+        );
     }
 
     #[test]
@@ -145,9 +147,11 @@ mod tests {
         bytes.push(0);
         let error = decode_payload_with_identity(identity(entity_pk), &bytes)
             .expect_err("trailing bytes should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to decode untracked-state payload"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode untracked-state payload")
+        );
     }
 
     #[test]
@@ -158,9 +162,11 @@ mod tests {
         bytes.truncate(bytes.len() - 2);
         let error = decode_payload_with_identity(identity(entity_pk), &bytes)
             .expect_err("truncated payload should fail");
-        assert!(error
-            .to_string()
-            .contains("failed to decode untracked-state payload"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode untracked-state payload")
+        );
     }
 
     #[test]
@@ -190,8 +196,10 @@ mod tests {
 
         let error = decode_row(&bytes).expect_err("empty entity pk should reject");
 
-        assert!(error
-            .message
-            .contains("entity primary key decoded from storage is invalid"));
+        assert!(
+            error
+                .message
+                .contains("entity primary key decoded from storage is invalid")
+        );
     }
 }

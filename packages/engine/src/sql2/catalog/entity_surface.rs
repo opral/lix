@@ -4,13 +4,13 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value as JsonValue;
 
+use crate::LixError;
 use crate::sql2::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
     HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use crate::sql2::result_metadata::{json_field, mark_json_field};
-use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EntitySurfaceShape {
@@ -231,7 +231,7 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("invalid JSON pointer segment '{segment}'"),
-                    ))
+                    ));
                 }
             }
         } else {

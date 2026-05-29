@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-
-use plugin_json_v2::{detect_changes, PluginEntityChange, PluginFile, SCHEMA_KEY};
+use plugin_json_v2::{PluginEntityChange, PluginFile, SCHEMA_KEY, detect_changes};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+#[expect(clippy::cast_possible_wrap)]
 fn make_document(scale: usize, mutate: bool) -> Value {
     let mut root = Map::new();
 

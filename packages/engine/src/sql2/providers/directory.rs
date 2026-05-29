@@ -1,3 +1,11 @@
+#![allow(
+    clippy::manual_let_else,
+    clippy::option_if_let_else,
+    clippy::redundant_closure,
+    clippy::unnecessary_literal_bound,
+    clippy::unnecessary_wraps
+)]
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -10,19 +18,19 @@ use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue, SchemaExt};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, SchemaExt, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use futures_util::{stream, TryStreamExt};
+use futures_util::{TryStreamExt, stream};
 use serde::Deserialize;
 
 use crate::branch::BranchRefReader;
@@ -32,12 +40,12 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::branch_scope::{
-    explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids, resolve_write_branch_scope,
-    BranchBinding,
+    BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
+    resolve_write_branch_scope,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::filesystem_predicates::{
-    canonicalize_filesystem_path_filters, FilesystemPathKind,
+    FilesystemPathKind, canonicalize_filesystem_path_filters,
 };
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
@@ -47,12 +55,12 @@ use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
 };
-use crate::{parse_row_metadata_value, serialize_row_metadata, LixError};
+use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
 
 use crate::sql2::filesystem_planner::{
-    directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
-    filesystem_storage_scope_key, plan_recursive_directory_delete, DirectoryDescriptorWriteIntent,
-    DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
+    DirectoryDescriptorWriteIntent, DirectoryPathResolver, FilesystemDeletePlan,
+    FilesystemRowContext, directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
+    filesystem_storage_scope_key, plan_recursive_directory_delete,
 };
 use crate::sql2::filesystem_visibility::VisibleFilesystem;
 use crate::sql2::result_metadata::json_field;
@@ -543,7 +551,7 @@ impl DisplayAs for LixDirectoryDeleteExec {
 }
 
 impl ExecutionPlan for LixDirectoryDeleteExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixDirectoryDeleteExec"
     }
 
@@ -703,7 +711,7 @@ impl DisplayAs for LixDirectoryUpdateExec {
 }
 
 impl ExecutionPlan for LixDirectoryUpdateExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixDirectoryUpdateExec"
     }
 
@@ -855,7 +863,7 @@ impl DisplayAs for LixDirectoryScanExec {
 }
 
 impl ExecutionPlan for LixDirectoryScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixDirectoryScanExec"
     }
 
@@ -992,7 +1000,7 @@ fn lix_directory_update_write_rows_from_batch(
         if let Some(directory_id) = id.as_ref() {
             let resolver = path_resolvers
                 .entry(directory_path_resolver_key(&context))
-                .or_insert_with(DirectoryPathResolver::default);
+                .or_default();
             resolver
                 .reserve_directory(parent_id.clone(), name.clone(), directory_id.clone())
                 .map_err(lix_error_to_datafusion_error)?;
@@ -1391,7 +1399,13 @@ fn lix_directory_record_batch(
         updated_ats.push(directory.live.updated_at);
         commit_ids.push(directory.live.commit_id.map(|id| id.to_string()));
         untracked_values.push(Some(directory.live.untracked));
-        metadata_values.push(directory.live.metadata.as_ref().map(serialize_row_metadata));
+        metadata_values.push(
+            directory
+                .live
+                .metadata
+                .as_deref()
+                .map(serialize_row_metadata),
+        );
         branch_ids.push(Some(directory.live.branch_id));
     }
 
@@ -1632,6 +1646,7 @@ fn dml_count_schema() -> SchemaRef {
     )]))
 }
 
+#[expect(trivial_casts)]
 fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
     RecordBatch::try_new(
         schema,
@@ -1749,13 +1764,17 @@ fn optional_string_value(
 ) -> Result<Option<String>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        | Some(
+            ScalarValue::Null
+            | ScalarValue::Utf8(None)
+            | ScalarValue::Utf8View(None)
+            | ScalarValue::LargeUtf8(None),
+        ) => Ok(None),
+        Some(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        ) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_directory expected text-compatible column '{column_name}', got {other:?}"
         ))),
@@ -1784,7 +1803,7 @@ fn optional_bool_value(
     column_name: &str,
 ) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        None | Some(ScalarValue::Null | ScalarValue::Boolean(None)) => Ok(None),
         Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_directory expected boolean column '{column_name}', got {other:?}"
@@ -1856,6 +1875,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 }
 
 #[cfg(test)]
+#[expect(trivial_casts)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
@@ -1867,6 +1887,7 @@ mod tests {
     use datafusion::execution::TaskContext;
     use serde_json::json;
 
+    use crate::LixError;
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{ChangeId, CommitId};
     use crate::functions::FunctionProviderHandle;
@@ -1877,14 +1898,13 @@ mod tests {
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
         TransactionWriteRow,
     };
-    use crate::LixError;
 
     use super::{
+        BranchBinding, DirectoryDescriptorRecord, LixDirectoryInsertSink,
         derive_directory_path_for, directory_path_resolvers_from_state_rows,
         lix_directory_by_branch_schema, lix_directory_insert_origin, lix_directory_record_batch,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
-        lix_directory_write_rows_from_batch_with_path_resolvers, BranchBinding,
-        DirectoryDescriptorRecord, LixDirectoryInsertSink,
+        lix_directory_write_rows_from_batch_with_path_resolvers,
     };
     use crate::sql2::filesystem_visibility::VisibleFilesystem;
 
@@ -1947,11 +1967,11 @@ mod tests {
         async fn load_branch_head(
             &mut self,
             branch_id: &str,
-        ) -> Result<Option<crate::changelog::CommitId>, LixError> {
+        ) -> Result<Option<CommitId>, LixError> {
             if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(crate::changelog::CommitId::for_test_label(&format!(
+            Ok(Some(CommitId::for_test_label(&format!(
                 "commit-{branch_id}"
             ))))
         }
@@ -2342,7 +2362,7 @@ mod tests {
                     row.branch_id.clone(),
                 )
             })
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         assert_eq!(identities.len(), rows.len());
         assert_eq!(rows.len(), 5);
     }

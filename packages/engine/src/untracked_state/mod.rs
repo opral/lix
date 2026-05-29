@@ -6,7 +6,7 @@ mod types;
 
 #[allow(unused_imports)]
 pub(crate) use context::{UntrackedStateContext, UntrackedStateStoreReader, UntrackedStateWriter};
-pub(crate) use materialization::{materialize_row, UntrackedMaterializationProjection};
+pub(crate) use materialization::{UntrackedMaterializationProjection, materialize_row};
 #[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateIdentity,

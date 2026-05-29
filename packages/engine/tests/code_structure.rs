@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -62,7 +61,14 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     ForbiddenDependencyRule {
         from_scope: "execution",
         reason: "execution is the public SQL runner leaf; it may consume sql-owned prepared artifacts but must not depend on higher orchestration owners or transaction internals",
-        forbidden_scopes: &["canonical", "api", "init", "services", "session", "transaction"],
+        forbidden_scopes: &[
+            "canonical",
+            "api",
+            "init",
+            "services",
+            "session",
+            "transaction",
+        ],
     },
     ForbiddenDependencyRule {
         from_scope: "session",
@@ -508,7 +514,7 @@ fn strip_test_code(source: &str) -> String {
     }
 
     let mut result = stripped;
-    ranges.sort_by(|left, right| right.0.cmp(&left.0));
+    ranges.sort_by_key(|range| std::cmp::Reverse(range.0));
     for (start, end) in ranges {
         result.replace_range(start..end, "");
     }
@@ -919,10 +925,7 @@ fn resolve_relative_path(path_parts: &[String], current_module_path: &[String]) 
 fn skip_until_boundary(tokens: &[UseToken], index: usize) -> usize {
     let mut cursor = index;
     while cursor < tokens.len()
-        && !matches!(
-            tokens.get(cursor),
-            Some(UseToken::Comma) | Some(UseToken::RBrace)
-        )
+        && !matches!(tokens.get(cursor), Some(UseToken::Comma | UseToken::RBrace))
     {
         cursor += 1;
     }
@@ -1079,10 +1082,7 @@ fn is_ident_continue(byte: u8) -> bool {
 }
 
 fn skip_whitespace(bytes: &[u8], mut index: usize) -> usize {
-    while bytes
-        .get(index)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
         index += 1;
     }
     index
@@ -1639,10 +1639,7 @@ fn collect_explicit_paths_from_source(
         let mut cursor = skip_whitespace(bytes, after_separator + 2);
         let mut segments = Vec::new();
 
-        loop {
-            let Some((segment, after_segment)) = parse_identifier(bytes, cursor) else {
-                break;
-            };
+        while let Some((segment, after_segment)) = parse_identifier(bytes, cursor) {
             segments.push(normalize_identifier(&segment));
             let after_whitespace = skip_whitespace(bytes, after_segment);
             if bytes.get(after_whitespace..after_whitespace + 2) == Some(&b"::"[..]) {
@@ -2281,8 +2278,8 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
         || relative_path == "transaction/live_state_write_transaction.rs"
 }
 
-fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations(
-) -> Vec<RawSqlExecutionViolation> {
+fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations()
+-> Vec<RawSqlExecutionViolation> {
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
@@ -2318,8 +2315,8 @@ fn is_orchestration_runtime_path(relative_path: &str) -> bool {
         || relative_path.starts_with("transaction/")
 }
 
-fn current_scattered_internal_metadata_crud_outside_owner_storage_violations(
-) -> Vec<RawSqlExecutionViolation> {
+fn current_scattered_internal_metadata_crud_outside_owner_storage_violations()
+-> Vec<RawSqlExecutionViolation> {
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {

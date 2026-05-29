@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::LixError;
 use crate::changelog::ChangeId;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRow,
 };
-use crate::LixError;
 
 /// Planned tracked-state merge result.
 ///

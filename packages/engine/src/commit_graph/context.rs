@@ -1,5 +1,14 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::clone_on_copy,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_pass_by_ref_mut,
+    clippy::unused_self
+)]
+
 use std::collections::BTreeSet;
 
+use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId,
     CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord, CommitScanRequest,
@@ -11,7 +20,6 @@ use crate::commit_graph::{
 };
 use crate::entity_pk::EntityPk;
 use crate::storage::StorageRead;
-use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
@@ -87,7 +95,7 @@ where
             };
             start_after = Some(next.to_string());
         }
-        commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+        commits.sort_by_key(|left| left.commit_id);
         Ok(commits)
     }
 
@@ -151,8 +159,8 @@ where
             .flat_map(|commit| {
                 commit.parent_commit_ids.iter().enumerate().map(
                     |(parent_order, parent_commit_id)| CommitGraphEdge {
-                        parent_commit_id: parent_commit_id.clone(),
-                        child_commit_id: commit.commit_id.clone(),
+                        parent_commit_id: *parent_commit_id,
+                        child_commit_id: commit.commit_id,
                         parent_order: parent_order as u32,
                     },
                 )
@@ -182,7 +190,7 @@ where
 
             let commit_id = reachable.commit.commit_id;
             let canonical_change = reachable.commit.canonical_change;
-            if seen_change_ids.insert(canonical_change.id.clone())
+            if seen_change_ids.insert(canonical_change.id)
                 && change_matches_history_request(&canonical_change, request)
             {
                 entries.push(CommitGraphChangeHistoryEntry {
@@ -300,14 +308,14 @@ where
         &mut self,
         commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
-        CommitGraphStoreReader::load_commit(self, commit_id).await
+        Self::load_commit(self, commit_id).await
     }
 
     async fn reachable_commits(
         &mut self,
         head_commit_id: &CommitId,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
-        CommitGraphStoreReader::reachable_commits(self, head_commit_id).await
+        Self::reachable_commits(self, head_commit_id).await
     }
 
     async fn change_history_from_commit(
@@ -315,13 +323,13 @@ where
         start_commit_id: &CommitId,
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
-        CommitGraphStoreReader::change_history_from_commit(self, start_commit_id, request).await
+        Self::change_history_from_commit(self, start_commit_id, request).await
     }
 }
 
 fn depth_matches(depth: u32, request: &CommitGraphChangeHistoryRequest) -> bool {
-    request.min_depth.map_or(true, |min| depth >= min)
-        && request.max_depth.map_or(true, |max| depth <= max)
+    request.min_depth.is_none_or(|min| depth >= min)
+        && request.max_depth.is_none_or(|max| depth <= max)
 }
 
 fn change_matches_history_request(
@@ -360,7 +368,7 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
     .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
         id: record.change_id,
-        entity_pk: EntityPk::single(&record.commit_id),
+        entity_pk: EntityPk::single(record.commit_id),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_ref: Some(crate::json_store::JsonRef::for_content(

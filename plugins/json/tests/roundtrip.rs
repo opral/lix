@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::file_from_json;
-use plugin_json_v2::{apply_changes, detect_changes, PluginEntityChange, SCHEMA_KEY};
+use plugin_json_v2::{PluginEntityChange, SCHEMA_KEY, apply_changes, detect_changes};
 use serde_json::Value;
 
 fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<PluginEntityChange> {
@@ -61,14 +61,14 @@ fn roundtrip_reconstructs_after_document() {
 #[test]
 fn roundtrip_file_creation_from_empty_seed() {
     assert_projection_roundtrip(
-        r#"{}"#,
+        r"{}",
         r#"{"profile":{"name":"Anna"},"roles":["admin","editor"]}"#,
     );
 }
 
 #[test]
 fn roundtrip_handles_numeric_object_keys() {
-    assert_projection_roundtrip(r#"{}"#, r#"{"foo":{"0":"x","1":"y"}}"#);
+    assert_projection_roundtrip(r"{}", r#"{"foo":{"0":"x","1":"y"}}"#);
 }
 
 #[test]
@@ -96,12 +96,12 @@ fn roundtrip_replacing_empty_array_with_empty_object_in_array_index_keeps_neighb
 
 #[test]
 fn roundtrip_deleting_non_empty_container_removes_descendants() {
-    assert_projection_roundtrip(r#"{"a":{"b":1}}"#, r#"{}"#);
+    assert_projection_roundtrip(r#"{"a":{"b":1}}"#, r"{}");
 }
 
 #[test]
 fn roundtrip_replacing_non_empty_container_with_scalar_removes_descendants() {
-    assert_projection_roundtrip(r#"{"a":{"b":1}}"#, r#"2"#);
+    assert_projection_roundtrip(r#"{"a":{"b":1}}"#, r"2");
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn roundtrip_deleting_nested_subtree_removes_descendants() {
 
 #[test]
 fn roundtrip_replacing_root_array_with_scalar_removes_descendants() {
-    assert_projection_roundtrip(r#"[{"a":1},{"b":2},3]"#, r#"7"#);
+    assert_projection_roundtrip(r#"[{"a":1},{"b":2},3]"#, r"7");
 }
 
 #[test]
@@ -140,17 +140,17 @@ fn roundtrip_with_proto_like_keys_is_supported() {
 
 #[test]
 fn roundtrip_handles_object_key_dash() {
-    assert_projection_roundtrip(r#"{}"#, r#"{"obj":{"-":{"x":1}}}"#);
+    assert_projection_roundtrip(r"{}", r#"{"obj":{"-":{"x":1}}}"#);
 }
 
 #[test]
 fn roundtrip_handles_pointer_escape_edge_keys() {
-    assert_projection_roundtrip(r#"{}"#, r#"{"":{"/":1,"~":2,"~1":3,"~0":4}}"#);
+    assert_projection_roundtrip(r"{}", r#"{"":{"/":1,"~":2,"~1":3,"~0":4}}"#);
 }
 
 #[test]
 fn roundtrip_replacing_root_object_with_array_allows_non_numeric_old_keys() {
-    assert_projection_roundtrip(r#"{"~1":"x"}"#, r#"[]"#);
+    assert_projection_roundtrip(r#"{"~1":"x"}"#, r"[]");
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn roundtrip_replacing_nested_object_with_array_allows_non_numeric_old_keys() {
 
 #[test]
 fn roundtrip_replacing_object_with_array_allows_dash_and_leading_zero_keys() {
-    assert_projection_roundtrip(r#"{"-":"dash","01":"lead","foo":"bar"}"#, r#"[]"#);
+    assert_projection_roundtrip(r#"{"-":"dash","01":"lead","foo":"bar"}"#, r"[]");
 }
 
 #[derive(Clone)]
@@ -174,7 +174,10 @@ impl Lcg {
     }
 
     fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         (self.state >> 32) as u32
     }
 
@@ -194,7 +197,7 @@ fn random_scalar(rng: &mut Lcg) -> Value {
     match rng.next_usize(5) {
         0 => Value::Null,
         1 => Value::Bool(rng.next_bool()),
-        2 => Value::Number(((rng.next_u32() % 100) as i64).into()),
+        2 => Value::Number(i64::from(rng.next_u32() % 100).into()),
         3 => Value::String(format!("s{}", rng.next_u32() % 10)),
         _ => Value::String(String::new()),
     }
@@ -232,7 +235,7 @@ fn random_json(rng: &mut Lcg, depth: usize) -> Value {
 
 #[test]
 fn roundtrip_randomized_transition_invariant() {
-    let mut rng = Lcg::new(0xA11CE5EEDu64);
+    let mut rng = Lcg::new(0x000A_11CE_5EED_u64);
 
     for _ in 0..300 {
         let before = random_json(&mut rng, 3);
@@ -267,7 +270,7 @@ fn roundtrip_is_invariant_to_change_order_permutations() {
     lexicographic.sort_by(|a, b| a.entity_pk.cmp(&b.entity_pk));
     permutations.push(lexicographic);
 
-    let mut reverse_lexicographic = projected.clone();
+    let mut reverse_lexicographic = projected;
     reverse_lexicographic.sort_by(|a, b| b.entity_pk.cmp(&a.entity_pk));
     permutations.push(reverse_lexicographic);
 

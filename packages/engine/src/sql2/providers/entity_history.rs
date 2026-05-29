@@ -20,23 +20,23 @@ use futures_util::stream;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
+use crate::LixError;
 use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
 use crate::sql2::change_materialization::MaterializedChange;
-use crate::LixError;
 
+use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::catalog::{
-    entity_surface_schema, EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec,
+    EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, entity_surface_schema,
 };
-use crate::sql2::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
+use crate::sql2::history_projection::{HistoryIdentityProjection, tombstone_identity_column_value};
 use crate::sql2::history_route::{
-    load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
-    HistoryViewDescriptor, HISTORY_COL_START_COMMIT_ID,
+    HISTORY_COL_START_COMMIT_ID, HistoryColumnStyle, HistoryRoute, HistoryViewDescriptor,
+    load_history_entries, parse_history_filter,
 };
 use crate::sql2::providers::entity::{
     entity_f64_value, entity_i64_value, entity_json_text_value, parse_snapshot, string_array,
 };
-use crate::sql2::SqlHistoryQuerySource;
 use crate::storage::StorageRead;
 
 /// Schema-specific history surface backed directly by the commit graph.
@@ -51,6 +51,7 @@ pub(crate) struct EntityHistoryProvider<S> {
     query_source: SqlHistoryQuerySource<S>,
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl<S> std::fmt::Debug for EntityHistoryProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityHistoryProvider")
@@ -137,6 +138,7 @@ struct EntityHistoryScanExec<S> {
     properties: Arc<PlanProperties>,
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl<S> std::fmt::Debug for EntityHistoryScanExec<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityHistoryScanExec")
@@ -191,7 +193,7 @@ impl<S> ExecutionPlan for EntityHistoryScanExec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "EntityHistoryScanExec"
     }
 
@@ -315,6 +317,7 @@ fn entity_history_record_batch(
     )?)
 }
 
+#[expect(trivial_casts)]
 fn entity_history_column_array(
     column_name: &str,
     spec: &EntitySurfaceSpec,
@@ -389,6 +392,7 @@ fn entity_history_column_value(
     .map_err(|error| DataFusionError::Execution(error.to_string()))
 }
 
+#[expect(trivial_casts)]
 fn entity_history_system_column_array(
     column_name: &str,
     rows: &[EntityHistoryRow],
@@ -414,7 +418,7 @@ fn entity_history_system_column_array(
         ),
         "metadata" => Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| row.change.metadata.as_ref().map(serialize_row_metadata))
+                .map(|row| row.change.metadata.as_deref().map(serialize_row_metadata))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         "change_id" => string_array(rows.iter().map(|row| Some(row.change.id.as_str()))),

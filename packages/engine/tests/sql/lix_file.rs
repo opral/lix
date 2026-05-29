@@ -106,9 +106,11 @@ simulation_test!(
             .await
             .expect_err("overlong canonical segment should be rejected");
         assert_eq!(encoded_segment_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(encoded_segment_error
-            .message
-            .contains("path segment is too long"));
+        assert!(
+            encoded_segment_error
+                .message
+                .contains("path segment is too long")
+        );
 
         let huge_path = format!("/{}", "a".repeat(1024 * 1024));
         let huge_error = session
@@ -486,7 +488,12 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     let row_set = result;
     assert_eq!(row_set.len(), 1);
     let values = row_set.rows()[0].values();
-    let [Value::Text(id), Value::Text(path), Value::Text(directory_id), Value::Text(name)] = values
+    let [
+        Value::Text(id),
+        Value::Text(path),
+        Value::Text(directory_id),
+        Value::Text(name),
+    ] = values
     else {
         panic!("expected generated file row, got {values:?}");
     };

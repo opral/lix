@@ -1,17 +1,21 @@
+#[expect(clippy::same_length_and_capacity)]
+mod bindings {
+    wit_bindgen::generate!({
+        path: "../../packages/engine/wit",
+        world: "plugin",
+    });
+}
+pub use bindings::*;
+
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
-
-wit_bindgen::generate!({
-    path: "../engine/wit",
-    world: "plugin",
-});
 
 pub const LINE_SCHEMA_KEY: &str = "text_line";
 pub const DOCUMENT_SCHEMA_KEY: &str = "text_document";
@@ -76,7 +80,7 @@ impl Guest for TextLinesPlugin {
     fn detect_changes(
         before: Option<File>,
         after: File,
-        _state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+        _state_context: Option<exports::lix::plugin::api::DetectStateContext>,
     ) -> Result<Vec<EntityChange>, PluginError> {
         if let Some(previous) = before.as_ref() {
             if previous.data == after.data {
@@ -297,6 +301,7 @@ fn parse_line_snapshot(raw: &str, entity_pk: &str) -> Result<ParsedLine, PluginE
     })
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn serialize_line_snapshot(line: &ParsedLine) -> Result<String, PluginError> {
     let content_base64 = bytes_to_base64(&line.content);
     let ending = line_ending_json_literal(line.ending);
@@ -366,16 +371,17 @@ fn parse_after_lines_with_histogram_matching(
         let canonical_occurrence = *occurrence;
         *occurrence += 1;
 
-        let entity_pk = if let Some(before_index) = matched_after_to_before.get(&after_index) {
-            before_lines[*before_index].entity_pk.clone()
-        } else {
-            let canonical_entity_pk = format!(
-                "line:{}:{}",
-                bytes_to_hex(&fingerprint),
-                canonical_occurrence
-            );
-            allocate_inserted_line_id(&canonical_entity_pk, &used_ids)
-        };
+        let entity_pk = matched_after_to_before.get(&after_index).map_or_else(
+            || {
+                let canonical_entity_pk = format!(
+                    "line:{}:{}",
+                    bytes_to_hex(&fingerprint),
+                    canonical_occurrence
+                );
+                allocate_inserted_line_id(&canonical_entity_pk, &used_ids)
+            },
+            |before_index| before_lines[*before_index].entity_pk.clone(),
+        );
         used_ids.insert(entity_pk.clone());
 
         after_lines.push(ParsedLine {
@@ -545,7 +551,7 @@ pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityCha
 pub fn detect_changes_with_state_context(
     before: Option<File>,
     after: File,
-    state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+    state_context: Option<exports::lix::plugin::api::DetectStateContext>,
 ) -> Result<Vec<EntityChange>, PluginError> {
     <TextLinesPlugin as Guest>::detect_changes(before, after, state_context)
 }

@@ -1,8 +1,8 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix_engine::changelog::bench as changelog_bench;
 use lix_engine::LixError;
+use lix_engine::changelog::bench as changelog_bench;
 
 fn main() {
     let mut args = std::env::args().skip(1);

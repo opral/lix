@@ -6,13 +6,13 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::expressions::{CastExpr, Literal};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_expr::expressions::{CastExpr, Literal};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 
-use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 use crate::LixError;
+use crate::sql2::exec::datafusion::LIX_INSERT_COLUMN_OMITTED_METADATA_KEY;
 
 #[derive(Debug, Clone)]
 pub(crate) enum SqlCell {
@@ -321,9 +321,10 @@ impl UpdateAssignmentValues {
         match self.assigned_cell(row_index, column_name)? {
             UpdateCell::Assigned(value) => Ok(InsertCell::Provided(value)),
             UpdateCell::Unassigned => {
-                optional_scalar_value(batch, row_index, column_name).map(|value| match value {
-                    None => InsertCell::Omitted,
-                    Some(value) => InsertCell::Provided(SqlCell::from_scalar(value)),
+                optional_scalar_value(batch, row_index, column_name).map(|value| {
+                    value.map_or(InsertCell::Omitted, |value| {
+                        InsertCell::Provided(SqlCell::from_scalar(value))
+                    })
                 })
             }
         }
@@ -336,9 +337,8 @@ pub(crate) fn optional_scalar_value(
     column_name: &str,
 ) -> Result<Option<ScalarValue>> {
     let schema = batch.schema();
-    let column_index = match schema.index_of(column_name) {
-        Ok(column_index) => column_index,
-        Err(_) => return Ok(None),
+    let Ok(column_index) = schema.index_of(column_name) else {
+        return Ok(None);
     };
     if row_index >= batch.num_rows() {
         return Err(DataFusionError::Execution(format!(

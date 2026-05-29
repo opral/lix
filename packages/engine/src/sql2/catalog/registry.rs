@@ -12,9 +12,9 @@ use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapab
 #[cfg(test)]
 use crate::sql2::catalog::entity_surface_schema;
 use crate::sql2::catalog::{
-    derive_entity_surface_spec_from_schema, entity_system_fields,
-    schema_exposed_as_entity_history_surface, schema_exposed_as_entity_surface, EntitySurfaceShape,
-    EntitySurfaceSpec,
+    EntitySurfaceShape, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
+    entity_system_fields, schema_exposed_as_entity_history_surface,
+    schema_exposed_as_entity_surface,
 };
 use crate::sql2::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK,
@@ -210,14 +210,13 @@ impl PublicCatalog {
     }
 
     fn insert_entity_surfaces_from_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
-        let spec = match derive_entity_surface_spec_from_schema(schema) {
-            Ok(spec) => spec,
-            Err(_) => return Ok(()),
+        let Ok(spec) = derive_entity_surface_spec_from_schema(schema) else {
+            return Ok(());
         };
 
         if !schema_exposed_as_entity_surface(&spec.schema_key) {
             return Ok(());
-        };
+        }
 
         let mut columns = entity_columns(&spec);
         columns.extend(entity_hidden_columns(false));
