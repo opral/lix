@@ -21,6 +21,7 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use crate::functions::FunctionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundInsertValues, FileWriteSurface};
 use crate::sql2::bind::write::{
@@ -55,35 +56,37 @@ pub(crate) struct DataFusionLogicalPlan {
     pub(super) json_predicate_params: BTreeSet<usize>,
 }
 
-/// Minimal top-level sql2 entrypoint.
-///
-/// The final implementation will build the DataFusion session from the
-/// execution context and source rows from `live_state()`.
-///
-/// `catalog()` is intentionally omitted from the MVP boundary for now.
+pub(crate) struct SessionReadSqlResult {
+    pub(crate) runtime_functions: FunctionContext,
+    pub(crate) query: SqlQueryResult,
+}
+
 #[cfg(test)]
-pub(crate) async fn execute_sql<C>(
+async fn execute_sql<C>(ctx: &C, sql: &str, params: &[Value]) -> Result<SqlQueryResult, LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let statement = crate::sql2::parse::parse_statement(sql)?;
+    execute_read_statement_from_parsed(ctx, sql, statement, params).await
+}
+
+pub(crate) async fn execute_read_statement_from_parsed<C>(
     ctx: &C,
     sql: &str,
+    statement: DataFusionStatement,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let plan = create_logical_plan(ctx, sql).await?;
+    // Keep read-backed DataFusion providers scoped to this call. The returned
+    // value is fully materialized, so callers cannot retain a plan/provider
+    // that may carry an execution read handle.
+    let plan = create_logical_plan_from_parsed(ctx, sql, statement).await?;
     execute_logical_plan(plan, params).await
 }
 
-#[cfg(test)]
-pub(crate) async fn create_logical_plan<C>(ctx: &C, sql: &str) -> Result<SqlLogicalPlan, LixError>
-where
-    C: SqlExecutionContext + ?Sized,
-{
-    let statement = crate::sql2::parse::parse_statement(sql)?;
-    create_logical_plan_from_parsed(ctx, sql, statement).await
-}
-
-pub(crate) async fn create_logical_plan_from_parsed<C>(
+async fn create_logical_plan_from_parsed<C>(
     ctx: &C,
     sql: &str,
     statement: DataFusionStatement,
@@ -107,7 +110,22 @@ where
     }))
 }
 
-pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
+pub(crate) async fn execute_transaction_read_statement_from_parsed(
+    read_ctx: &impl SqlExecutionContext,
+    write_ctx: &mut dyn SqlWriteExecutionContext,
+    sql: &str,
+    statement: DataFusionStatement,
+    params: &[Value],
+) -> Result<SqlQueryResult, LixError> {
+    // Same fence as session reads, with the transaction overlay available
+    // during planning/execution but not returned to the caller.
+    let plan =
+        create_transaction_read_logical_plan_from_parsed(read_ctx, write_ctx, sql, statement)
+            .await?;
+    execute_logical_plan(plan, params).await
+}
+
+async fn create_transaction_read_logical_plan_from_parsed(
     read_ctx: &impl SqlExecutionContext,
     write_ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
@@ -195,7 +213,7 @@ fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> 
     params
 }
 
-pub(crate) async fn execute_logical_plan(
+async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
@@ -1336,8 +1354,8 @@ mod tests {
         plan_write,
     };
     use crate::storage::{
-        InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
-        StorageReadScope,
+        InMemoryStorageBackend, InMemoryStorageRead, SharedStorageRead, StorageContext,
+        StorageReadOptions, StorageReadScope,
     };
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
@@ -1451,7 +1469,7 @@ mod tests {
     }
 
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
-        type ReadStore = StorageReadScope<InMemoryStorageRead>;
+        type ReadStore = SharedStorageRead<InMemoryStorageRead>;
 
         fn active_branch_id(&self) -> &str {
             self.active_branch_id
@@ -1471,18 +1489,18 @@ mod tests {
 
         fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
             let storage = StorageContext::new(InMemoryStorageBackend::new());
-            let read_scope = test_read_scope(&storage);
+            let read_scope = SharedStorageRead::new(test_read_scope(&storage));
             HistoryQuerySource {
-                json_reader: JsonStoreContext::new().reader(read_scope.store()),
+                json_reader: JsonStoreContext::new().reader(read_scope),
             }
         }
 
         fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
             let storage = StorageContext::new(InMemoryStorageBackend::new());
-            let read_scope = test_read_scope(&storage);
+            let read_scope = SharedStorageRead::new(test_read_scope(&storage));
             ChangelogQuerySource {
                 store: read_scope.clone(),
-                json_reader: JsonStoreContext::new().reader(read_scope.store()),
+                json_reader: JsonStoreContext::new().reader(read_scope),
             }
         }
 

@@ -29,8 +29,8 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
         for profile in BACKEND_PROFILES {
             bench_kv_layout(c, profile, &rows[..row_count], label);
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
+            bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
-        bench_sql_session(c, &runtime, &rows[..row_count], label);
     }
 }
 
@@ -191,37 +191,41 @@ fn bench_transaction_op(
 fn bench_sql_session(
     c: &mut Criterion,
     runtime: &tokio::runtime::Runtime,
+    profile: BackendProfile,
     rows: &[WorkloadRow],
     label: &str,
 ) {
-    let mut group = c.benchmark_group(format!("tracked_state_crud/sql_session/in_memory/{label}"));
+    let mut group = c.benchmark_group(format!(
+        "tracked_state_crud/sql_session/{}/{label}",
+        profile.name()
+    ));
     configure_group(&mut group, rows.len());
     let rows = rows.to_vec();
 
     group.bench_function(format!("insert_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || runtime.block_on(sql_session::empty_fixture(&rows)),
+            || runtime.block_on(sql_session::empty_fixture(profile, &rows)),
             |fixture| black_box(runtime.block_on(fixture.insert_all())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("read_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || runtime.block_on(sql_session::seeded_fixture(&rows)),
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
             |fixture| black_box(runtime.block_on(fixture.read_all())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || runtime.block_on(sql_session::seeded_fixture(&rows)),
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
             |fixture| black_box(runtime.block_on(fixture.read_one_by_pk())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
-            || runtime.block_on(sql_session::seeded_fixture(&rows)),
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
             |fixture| black_box(runtime.block_on(fixture.read_many_by_pk())),
             BatchSize::LargeInput,
         );
@@ -229,14 +233,14 @@ fn bench_sql_session(
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_SQL_UPDATE").is_some() {
         group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
             b.iter_batched_ref(
-                || runtime.block_on(sql_session::seeded_fixture(&rows)),
+                || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
                 |fixture| black_box(runtime.block_on(fixture.update_all())),
                 BatchSize::LargeInput,
             );
         });
         group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
             b.iter_batched_ref(
-                || runtime.block_on(sql_session::seeded_fixture(&rows)),
+                || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
                 |fixture| black_box(runtime.block_on(fixture.update_one_by_pk())),
                 BatchSize::LargeInput,
             );
@@ -244,14 +248,14 @@ fn bench_sql_session(
     }
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || runtime.block_on(sql_session::seeded_fixture(&rows)),
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
             |fixture| black_box(runtime.block_on(fixture.delete_all())),
             BatchSize::LargeInput,
         );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
-            || runtime.block_on(sql_session::seeded_fixture(&rows)),
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
             |fixture| black_box(runtime.block_on(fixture.delete_one_by_pk())),
             BatchSize::LargeInput,
         );

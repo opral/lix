@@ -102,8 +102,9 @@ impl PointReadPlan {
     where
         R: StorageRead + ?Sized,
     {
-        let unique_values =
-            collect_physical_unique_values(read.backend_read(), &self.physical_unique_keys, opts)?;
+        let unique_values = read.with_backend(|backend_read| {
+            collect_physical_unique_values(backend_read, &self.physical_unique_keys, opts)
+        })?;
         Ok(StorageReadResult::new(
             PointValues {
                 unique_values,
@@ -137,12 +138,14 @@ impl PointReadPlan {
     where
         R: StorageRead + ?Sized,
     {
-        collect_physical_unique_values_into(
-            read.backend_read(),
-            &self.physical_unique_keys,
-            opts,
-            buffer,
-        )?;
+        read.with_backend(|backend_read| {
+            collect_physical_unique_values_into(
+                backend_read,
+                &self.physical_unique_keys,
+                opts,
+                buffer,
+            )
+        })?;
 
         Ok(StorageReadResult::new(
             PointValuesRef {
@@ -185,14 +188,16 @@ impl PointReadPlan {
             }
         }
 
-        read.backend_read().visit_keys(
-            &self.physical_unique_keys,
-            opts,
-            &mut LogicalPointVisitor {
-                logical_keys: &self.logical_unique_keys,
-                inner: visitor,
-            },
-        )?;
+        read.with_backend(|backend_read| {
+            backend_read.visit_keys(
+                &self.physical_unique_keys,
+                opts,
+                &mut LogicalPointVisitor {
+                    logical_keys: &self.logical_unique_keys,
+                    inner: visitor,
+                },
+            )
+        })?;
         Ok(self.stats())
     }
 

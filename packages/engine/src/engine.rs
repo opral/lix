@@ -10,7 +10,7 @@ use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::session::SessionContext;
-use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions};
+use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
@@ -31,7 +31,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
 impl<B> Engine<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     /// Seeds an empty backend with the engine repository bootstrap facts.
@@ -100,10 +100,10 @@ where
         &self,
         branch_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
         let result = self
             .branch_ctx
-            .ref_reader(&read)
+            .ref_reader(read)
             .load_head_commit_id(branch_id)
             .await?
             .map(|commit_id| commit_id.to_string());
@@ -158,7 +158,7 @@ where
                 )
             })?;
         let storage = self.storage();
-        let read = storage.begin_read(StorageReadOptions::default())?;
+        let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default())?);
         let mut writes = StorageWriteSet::new();
         let rebuild_result = self
             .tracked_state
@@ -179,11 +179,11 @@ async fn assert_initialized<B>(
 ) -> Result<(), LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    let read = storage.begin_read(StorageReadOptions::default())?;
-    let reader = live_state.reader(&read);
+    let read = SharedStorageRead::new(storage.begin_read(StorageReadOptions::default())?);
+    let reader = live_state.reader(read);
     let initialized = reader
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),

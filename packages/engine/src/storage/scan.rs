@@ -86,12 +86,12 @@ impl ScanPlan {
         R: StorageRead + ?Sized,
     {
         match &self.kind {
-            ScanPlanKind::Range(range) => {
-                scan_range_with_stats(read.backend_read(), self.space.id, range.clone(), opts)
-            }
-            ScanPlanKind::Prefix(prefix) => {
-                scan_prefix_with_stats(read.backend_read(), self.space.id, prefix.clone(), opts)
-            }
+            ScanPlanKind::Range(range) => read.with_backend(|backend_read| {
+                scan_range_with_stats(backend_read, self.space.id, range.clone(), opts)
+            }),
+            ScanPlanKind::Prefix(prefix) => read.with_backend(|backend_read| {
+                scan_prefix_with_stats(backend_read, self.space.id, prefix.clone(), opts)
+            }),
         }
     }
 
@@ -105,20 +105,12 @@ impl ScanPlan {
         R: StorageRead + ?Sized,
     {
         let chunk = match &self.kind {
-            ScanPlanKind::Range(range) => scan_range_into(
-                read.backend_read(),
-                self.space.id,
-                range.clone(),
-                opts,
-                buffer,
-            )?,
-            ScanPlanKind::Prefix(prefix) => scan_prefix_into(
-                read.backend_read(),
-                self.space.id,
-                prefix.clone(),
-                opts,
-                buffer,
-            )?,
+            ScanPlanKind::Range(range) => read.with_backend(|backend_read| {
+                scan_range_into(backend_read, self.space.id, range.clone(), opts, buffer)
+            })?,
+            ScanPlanKind::Prefix(prefix) => read.with_backend(|backend_read| {
+                scan_prefix_into(backend_read, self.space.id, prefix.clone(), opts, buffer)
+            })?,
         };
         let backend_calls = u64::from(opts.limit_rows != 0);
         let kind = match self.kind {
@@ -149,20 +141,24 @@ impl ScanPlan {
         V: ScanVisitor + ?Sized,
     {
         match &self.kind {
-            ScanPlanKind::Range(range) => visit_scan_range_with_stats(
-                read.backend_read(),
-                self.space.id,
-                range.clone(),
-                opts,
-                visitor,
-            ),
-            ScanPlanKind::Prefix(prefix) => visit_scan_prefix_with_stats(
-                read.backend_read(),
-                self.space.id,
-                prefix.clone(),
-                opts,
-                visitor,
-            ),
+            ScanPlanKind::Range(range) => read.with_backend(|backend_read| {
+                visit_scan_range_with_stats(
+                    backend_read,
+                    self.space.id,
+                    range.clone(),
+                    opts,
+                    visitor,
+                )
+            }),
+            ScanPlanKind::Prefix(prefix) => read.with_backend(|backend_read| {
+                visit_scan_prefix_with_stats(
+                    backend_read,
+                    self.space.id,
+                    prefix.clone(),
+                    opts,
+                    visitor,
+                )
+            }),
         }
     }
 
@@ -174,12 +170,12 @@ impl ScanPlan {
         ) -> Result<T, BackendError>,
     {
         match &self.kind {
-            ScanPlanKind::Range(range) => {
-                with_range_scan(read.backend_read(), self.space.id, range.clone(), opts, f)
-            }
-            ScanPlanKind::Prefix(prefix) => {
-                with_prefix_scan(read.backend_read(), self.space.id, prefix.clone(), opts, f)
-            }
+            ScanPlanKind::Range(range) => read.with_backend(|backend_read| {
+                with_range_scan(backend_read, self.space.id, range.clone(), opts, f)
+            }),
+            ScanPlanKind::Prefix(prefix) => read.with_backend(|backend_read| {
+                with_prefix_scan(backend_read, self.space.id, prefix.clone(), opts, f)
+            }),
         }
     }
 }

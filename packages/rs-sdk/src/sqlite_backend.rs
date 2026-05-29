@@ -1,7 +1,7 @@
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::backend::{
@@ -16,6 +16,7 @@ use tempfile::TempDir;
 
 pub const SQLITE_FORMAT_VERSION: u32 = 1;
 const ENTRIES_TABLE: &str = "lix_internal_entries";
+const POINT_READ_CHUNK_KEYS: usize = 400;
 
 #[derive(Debug)]
 pub struct SqliteBackendFactory {
@@ -41,15 +42,10 @@ pub struct SqliteBackendOptions {
     pub path: PathBuf,
 }
 
-#[derive(Clone)]
 #[expect(missing_debug_implementations)]
 pub struct SqliteRead {
-    state: Arc<Mutex<SqliteReadState>>,
-    read_pool: Arc<Mutex<Vec<Connection>>>,
-}
-
-struct SqliteReadState {
     conn: Option<Connection>,
+    read_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -181,7 +177,7 @@ impl Backend for SqliteBackend {
         execute_cached(&conn, "BEGIN DEFERRED TRANSACTION")?;
         pin_read_snapshot(&conn)?;
         Ok(SqliteRead {
-            state: Arc::new(Mutex::new(SqliteReadState { conn: Some(conn) })),
+            conn: Some(conn),
             read_pool: Arc::clone(&self.read_pool),
         })
     }
@@ -216,15 +212,7 @@ impl BackendRead for SqliteRead {
     where
         V: PointVisitor + ?Sized,
     {
-        let state = self
-            .state
-            .lock()
-            .map_err(|error| BackendError::Io(format!("sqlite read state poisoned: {error}")))?;
-        let conn = state
-            .conn
-            .as_ref()
-            .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))?;
-        visit_keys(conn, keys, opts, visitor)
+        visit_keys(self.conn()?, keys, opts, visitor)
     }
 
     fn with_range_scan<T, F>(
@@ -236,13 +224,8 @@ impl BackendRead for SqliteRead {
     where
         F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
-        let state = self.lock_state()?;
-        let conn = state
-            .conn
-            .as_ref()
-            .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))?;
         let (sql, values) = scan_sql(range, opts)?;
-        let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+        let mut stmt = self.conn()?.prepare_cached(&sql).map_err(sqlite_error)?;
         let rows = stmt
             .query(rusqlite::params_from_iter(values))
             .map_err(sqlite_error)?;
@@ -255,7 +238,7 @@ impl BackendRead for SqliteRead {
         f(&mut cursor)
     }
 
-    fn close(self) -> Result<(), BackendError> {
+    fn close(mut self) -> Result<(), BackendError> {
         self.finish()
     }
 }
@@ -355,21 +338,14 @@ where
 }
 
 impl SqliteRead {
-    fn lock_state(&self) -> Result<MutexGuard<'_, SqliteReadState>, BackendError> {
-        self.state
-            .lock()
-            .map_err(|error| BackendError::Io(format!("sqlite read state poisoned: {error}")))
+    fn conn(&self) -> Result<&Connection, BackendError> {
+        self.conn
+            .as_ref()
+            .ok_or_else(|| BackendError::Io("sqlite read is closed".to_string()))
     }
 
-    fn finish(&self) -> Result<(), BackendError> {
-        if Arc::strong_count(&self.state) > 1 {
-            return Ok(());
-        }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|error| BackendError::Io(format!("sqlite read state poisoned: {error}")))?;
-        let Some(conn) = state.conn.take() else {
+    fn finish(&mut self) -> Result<(), BackendError> {
+        let Some(conn) = self.conn.take() else {
             return Ok(());
         };
         let result = execute_cached(&conn, "ROLLBACK").or_else(ignore_no_transaction);
@@ -532,9 +508,10 @@ fn open_connection(path: &Path) -> Result<Connection, BackendError> {
 }
 
 fn pin_read_snapshot(conn: &Connection) -> Result<(), BackendError> {
-    let sql = format!("SELECT COUNT(*) FROM {ENTRIES_TABLE}");
+    let sql = format!("SELECT key FROM {ENTRIES_TABLE} LIMIT 1");
     let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-    let _: i64 = stmt.query_row([], |row| row.get(0)).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let _ = rows.next().map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -566,14 +543,131 @@ where
         return Ok(());
     }
 
-    let mut placeholders = String::with_capacity(keys.len() * 8);
-    let mut values = Vec::with_capacity(keys.len() * 2);
-    for (index, key) in keys.iter().enumerate() {
+    match opts.projection {
+        CoreProjection::KeyOnly => visit_key_only_points(conn, keys, visitor),
+        CoreProjection::FullValue => visit_full_value_points(conn, keys, visitor),
+    }
+}
+
+#[expect(clippy::cast_possible_wrap)]
+fn visit_key_only_points<V>(
+    conn: &Connection,
+    keys: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
+        visit_key_only_points_chunk(
+            conn,
+            keys,
+            chunk_index * POINT_READ_CHUNK_KEYS,
+            chunk,
+            visitor,
+        )?;
+    }
+    Ok(())
+}
+
+#[expect(clippy::cast_possible_wrap)]
+fn visit_key_only_points_chunk<V>(
+    conn: &Connection,
+    keys: &[Key],
+    offset: usize,
+    chunk: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    let mut placeholders = String::with_capacity(chunk.len() * 8);
+    let mut values = Vec::with_capacity(chunk.len() * 2);
+    for (index, key) in chunk.iter().enumerate() {
         if index > 0 {
             placeholders.push_str(", ");
         }
         placeholders.push_str("(?, ?)");
-        values.push(SqlValue::Integer(index as i64));
+        values.push(SqlValue::Integer((offset + index) as i64));
+        values.push(SqlValue::Blob(key.0.to_vec()));
+    }
+    let sql = format!(
+        "WITH requested(ord, key) AS (VALUES {placeholders})
+         SELECT r.ord, e.key
+         FROM requested r
+         LEFT JOIN lix_internal_entries e ON e.key = r.key
+         ORDER BY r.ord ASC"
+    );
+
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(values))
+        .map_err(sqlite_error)?;
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let index: i64 = row.get(0).map_err(sqlite_error)?;
+        let index = usize::try_from(index).map_err(|_| {
+            BackendError::Corruption(format!("sqlite requested ordinal was negative: {index}"))
+        })?;
+        let Some(key) = keys.get(index) else {
+            return Err(BackendError::Corruption(format!(
+                "sqlite requested ordinal out of bounds: {index}"
+            )));
+        };
+        let key_ref = row.get_ref(1).map_err(sqlite_error)?;
+        let value = match key_ref {
+            SqlValueRef::Null => None,
+            SqlValueRef::Blob(_) => Some(ProjectedValueRef::KeyOnly),
+            other => {
+                return Err(BackendError::Corruption(format!(
+                    "sqlite key column was not a blob: {other:?}"
+                )));
+            }
+        };
+        visitor.visit(index, key, value)?;
+    }
+    Ok(())
+}
+
+#[expect(clippy::cast_possible_wrap)]
+fn visit_full_value_points<V>(
+    conn: &Connection,
+    keys: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
+        visit_full_value_points_chunk(
+            conn,
+            keys,
+            chunk_index * POINT_READ_CHUNK_KEYS,
+            chunk,
+            visitor,
+        )?;
+    }
+    Ok(())
+}
+
+#[expect(clippy::cast_possible_wrap)]
+fn visit_full_value_points_chunk<V>(
+    conn: &Connection,
+    keys: &[Key],
+    offset: usize,
+    chunk: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    let mut placeholders = String::with_capacity(chunk.len() * 8);
+    let mut values = Vec::with_capacity(chunk.len() * 2);
+    for (index, key) in chunk.iter().enumerate() {
+        if index > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push_str("(?, ?)");
+        values.push(SqlValue::Integer((offset + index) as i64));
         values.push(SqlValue::Blob(key.0.to_vec()));
     }
     let sql = format!(
@@ -601,7 +695,7 @@ where
         let value_ref = row.get_ref(1).map_err(sqlite_error)?;
         let value = match value_ref {
             SqlValueRef::Null => None,
-            SqlValueRef::Blob(value) => Some(project_value_ref(value, opts.projection)),
+            SqlValueRef::Blob(value) => Some(ProjectedValueRef::FullValue(value)),
             other => {
                 return Err(BackendError::Corruption(format!(
                     "sqlite value column was not a blob: {other:?}"
@@ -670,13 +764,6 @@ fn blob_ref<'a>(value: SqlValueRef<'a>, column: &str) -> Result<&'a [u8], Backen
         other => Err(BackendError::Corruption(format!(
             "sqlite {column} column was not a blob: {other:?}"
         ))),
-    }
-}
-
-fn project_value_ref(value: &[u8], projection: CoreProjection) -> ProjectedValueRef<'_> {
-    match projection {
-        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
     }
 }
 

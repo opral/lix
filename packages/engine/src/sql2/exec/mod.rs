@@ -4,8 +4,8 @@ pub(crate) mod fast_write;
 pub(crate) mod write;
 
 pub(crate) use datafusion::{
-    DataFusionLogicalPlan as SqlDataFusionLogicalPlan, create_logical_plan_from_parsed,
-    create_transaction_read_logical_plan_from_parsed, execute_logical_plan,
+    DataFusionLogicalPlan as SqlDataFusionLogicalPlan, SessionReadSqlResult,
+    execute_read_statement_from_parsed, execute_transaction_read_statement_from_parsed,
 };
 #[cfg(test)]
 pub(crate) use write::{

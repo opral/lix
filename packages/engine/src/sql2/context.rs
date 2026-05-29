@@ -34,7 +34,7 @@ pub(crate) struct ChangelogQuerySource<S> {
     pub(crate) json_reader: JsonStoreReader<S>,
 }
 
-/// Read-only execution boundary for `sql2::execute_sql(...)`.
+/// Read-only context used while executing one SQL statement.
 ///
 /// Session and transaction orchestration stay above `sql2`. They provide the
 /// execution-scoped committed read context for each call.

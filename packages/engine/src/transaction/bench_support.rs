@@ -13,8 +13,8 @@ use crate::live_state::{
 };
 use crate::session::SessionMode;
 use crate::storage::{
-    StorageBackend, StorageBackendRead, StorageBackendReadOf, StorageContext, StorageRead,
-    StorageReadOptions, StorageReadScope, StorageWriteSet, StorageWriteSetStats,
+    SharedStorageRead, StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions,
+    StorageWriteSet, StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
@@ -45,30 +45,6 @@ pub struct BenchTransactionFixture<B: StorageBackend> {
     rows: Vec<BenchTransactionRow>,
 }
 
-struct BenchRead<R> {
-    inner: StorageReadScope<R>,
-}
-
-impl<R> BenchRead<R> {
-    fn new(inner: StorageReadScope<R>) -> Self {
-        Self { inner }
-    }
-}
-
-unsafe impl<R: Send> Send for BenchRead<R> {}
-unsafe impl<R: Send> Sync for BenchRead<R> {}
-
-impl<R> StorageRead for BenchRead<R>
-where
-    R: StorageBackendRead,
-{
-    type BackendRead = R;
-
-    fn backend_read(&self) -> &Self::BackendRead {
-        self.inner.backend_read()
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct BenchWriteAccounting {
     pub logical_rows: usize,
@@ -93,7 +69,7 @@ pub struct BenchLayoutAccounting {
 impl<B> BenchTransactionFixture<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     pub async fn new(storage: StorageContext<B>, rows: Vec<BenchTransactionRow>) -> Self {
@@ -175,13 +151,14 @@ where
     }
 
     pub async fn read_all(&self) -> usize {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .expect("begin transaction bench read");
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .expect("begin transaction bench read"),
+        );
         let rows = self
             .live_state
-            .reader(&read)
+            .reader(read)
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["json_pointer".to_string()],
@@ -221,13 +198,14 @@ where
     }
 
     async fn read_one(&self, row: &BenchTransactionRow) -> usize {
-        let read = self
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .expect("begin transaction bench read");
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .expect("begin transaction bench read"),
+        );
         let row = self
             .live_state
-            .reader(&read)
+            .reader(read)
             .load_row(&LiveStateRowRequest {
                 schema_key: "json_pointer".to_string(),
                 branch_id: BENCH_BRANCH_ID.to_string(),
@@ -369,7 +347,7 @@ async fn seed_visible_schema_rows<B>(
         TIMESTAMP,
     )
     .expect("bench fixture branch ref should stage");
-    let mut read = BenchRead::new(
+    let mut read = SharedStorageRead::new(
         storage
             .begin_read(StorageReadOptions::default())
             .expect("schema fixture read should open"),

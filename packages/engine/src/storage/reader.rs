@@ -164,14 +164,18 @@ mod tests {
         .materialize(&read, GetOptions::default())
         .expect("caller order");
 
-        assert_eq!(
-            read.backend_read().get_many_keys.borrow().as_slice(),
-            [
-                space(1).encode_key(&key("b")),
-                space(1).encode_key(&key("a")),
-                space(1).encode_key(&key("missing"))
-            ]
-        );
+        read.with_backend(|backend_read| {
+            assert_eq!(
+                backend_read.get_many_keys.borrow().as_slice(),
+                [
+                    space(1).encode_key(&key("b")),
+                    space(1).encode_key(&key("a")),
+                    space(1).encode_key(&key("missing"))
+                ]
+            );
+            Ok(())
+        })
+        .expect("backend keys");
         assert_eq!(
             result.value,
             vec![
@@ -391,14 +395,18 @@ mod tests {
             .collect(&read, GetOptions::default())
             .expect("borrowed planned indexed read");
 
-        assert_eq!(
-            read.backend_read().get_many_keys.borrow().as_slice(),
-            [
-                space(1).encode_key(&key("b")),
-                space(1).encode_key(&key("missing")),
-                space(1).encode_key(&key("a"))
-            ]
-        );
+        read.with_backend(|backend_read| {
+            assert_eq!(
+                backend_read.get_many_keys.borrow().as_slice(),
+                [
+                    space(1).encode_key(&key("b")),
+                    space(1).encode_key(&key("missing")),
+                    space(1).encode_key(&key("a"))
+                ]
+            );
+            Ok(())
+        })
+        .expect("backend keys");
         assert_eq!(result.stats.requested_keys, 4);
         assert_eq!(result.stats.unique_backend_keys, 3);
         assert_eq!(result.stats.backend_calls, 1);
@@ -439,10 +447,14 @@ mod tests {
             .collect(&read, GetOptions::default())
             .expect("borrowed physical planned indexed read");
 
-        assert_eq!(
-            read.backend_read().get_many_keys.borrow().as_slice(),
-            plan.physical_unique_keys.as_slice()
-        );
+        read.with_backend(|backend_read| {
+            assert_eq!(
+                backend_read.get_many_keys.borrow().as_slice(),
+                plan.physical_unique_keys.as_slice()
+            );
+            Ok(())
+        })
+        .expect("backend keys");
         assert_eq!(result.stats.requested_keys, 4);
         assert_eq!(result.stats.unique_backend_keys, 3);
         assert_eq!(result.stats.backend_calls, 1);
@@ -734,10 +746,8 @@ mod tests {
         .expect("prefix scan");
 
         let range = read
-            .backend_read()
-            .scan_range
-            .borrow()
-            .clone()
+            .with_backend(|backend_read| Ok(backend_read.scan_range.borrow().clone()))
+            .expect("backend range")
             .expect("range captured");
         assert_eq!(
             range.lower,
@@ -793,7 +803,11 @@ mod tests {
         assert_eq!(result.stats.range_scan_chunks, 0);
         assert_eq!(result.stats.prefix_scan_chunks, 1);
         assert_eq!(result.stats.scan_full_value_chunks, 1);
-        assert_eq!(*read.backend_read().scan_range_calls.borrow(), 1);
+        read.with_backend(|backend_read| {
+            assert_eq!(*backend_read.scan_range_calls.borrow(), 1);
+            Ok(())
+        })
+        .expect("scan range calls");
     }
 
     #[test]
@@ -866,6 +880,10 @@ mod tests {
         assert!(result.value.entries.is_empty());
         assert_eq!(result.stats.backend_calls, 0);
         assert_eq!(result.stats.prefix_lowered, 1);
-        assert_eq!(*read.backend_read().scan_range_calls.borrow(), 0);
+        read.with_backend(|backend_read| {
+            assert_eq!(*backend_read.scan_range_calls.borrow(), 0);
+            Ok(())
+        })
+        .expect("scan range calls");
     }
 }

@@ -22,6 +22,7 @@ const ROWS: usize = 50_000;
 const POINT_KEYS: usize = 1_000;
 const VALUE_SIZE: usize = 256;
 const SCAN_CHUNK_ROWS: usize = 1_024;
+const POINT_READ_CHUNK_KEYS: usize = 400;
 
 struct SqliteFixture {
     _temp_dir: TempDir,
@@ -677,9 +678,10 @@ fn direct_open_connection(path: &Path) -> Result<Connection, BackendError> {
 
 fn direct_pin_read_snapshot(conn: &Connection) -> Result<(), BackendError> {
     let mut stmt = conn
-        .prepare_cached("SELECT COUNT(*) FROM lix_internal_entries")
+        .prepare_cached("SELECT key FROM lix_internal_entries LIMIT 1")
         .map_err(sqlite_error)?;
-    let _: i64 = stmt.query_row([], |row| row.get(0)).map_err(sqlite_error)?;
+    let mut rows = stmt.query([]).map_err(sqlite_error)?;
+    let _ = rows.next().map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -702,14 +704,131 @@ where
         return Ok(());
     }
 
-    let mut placeholders = String::with_capacity(keys.len() * 8);
-    let mut values = Vec::with_capacity(keys.len() * 2);
-    for (index, key) in keys.iter().enumerate() {
+    match opts.projection {
+        CoreProjection::KeyOnly => direct_visit_key_only_points(conn, keys, visitor),
+        CoreProjection::FullValue => direct_visit_full_value_points(conn, keys, visitor),
+    }
+}
+
+fn direct_visit_key_only_points<V>(
+    conn: &Connection,
+    keys: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
+        direct_visit_key_only_points_chunk(
+            conn,
+            keys,
+            chunk_index * POINT_READ_CHUNK_KEYS,
+            chunk,
+            visitor,
+        )?;
+    }
+    Ok(())
+}
+
+#[expect(clippy::cast_possible_wrap)]
+fn direct_visit_key_only_points_chunk<V>(
+    conn: &Connection,
+    keys: &[Key],
+    offset: usize,
+    chunk: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    let mut placeholders = String::with_capacity(chunk.len() * 8);
+    let mut values = Vec::with_capacity(chunk.len() * 2);
+    for (index, key) in chunk.iter().enumerate() {
         if index > 0 {
             placeholders.push_str(", ");
         }
         placeholders.push_str("(?, ?)");
-        values.push(SqlValue::Integer(index as i64));
+        values.push(SqlValue::Integer((offset + index) as i64));
+        values.push(SqlValue::Blob(key.0.to_vec()));
+    }
+    let sql = format!(
+        "WITH requested(ord, key) AS (VALUES {placeholders})
+         SELECT r.ord, e.key
+         FROM requested r
+         LEFT JOIN lix_internal_entries e ON e.key = r.key
+         ORDER BY r.ord ASC"
+    );
+
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(values))
+        .map_err(sqlite_error)?;
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let index: i64 = row.get(0).map_err(sqlite_error)?;
+        let index = usize::try_from(index).map_err(|_| {
+            BackendError::Corruption(format!(
+                "direct sqlite requested ordinal was negative: {index}"
+            ))
+        })?;
+        let Some(key) = keys.get(index) else {
+            return Err(BackendError::Corruption(format!(
+                "direct sqlite requested ordinal out of bounds: {index}"
+            )));
+        };
+        let key_ref = row.get_ref(1).map_err(sqlite_error)?;
+        let value = match key_ref {
+            SqlValueRef::Null => None,
+            SqlValueRef::Blob(_) => Some(ProjectedValueRef::KeyOnly),
+            other => {
+                return Err(BackendError::Corruption(format!(
+                    "direct sqlite key column was not a blob: {other:?}"
+                )));
+            }
+        };
+        visitor.visit(index, key, value)?;
+    }
+    Ok(())
+}
+
+fn direct_visit_full_value_points<V>(
+    conn: &Connection,
+    keys: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
+        direct_visit_full_value_points_chunk(
+            conn,
+            keys,
+            chunk_index * POINT_READ_CHUNK_KEYS,
+            chunk,
+            visitor,
+        )?;
+    }
+    Ok(())
+}
+
+#[expect(clippy::cast_possible_wrap)]
+fn direct_visit_full_value_points_chunk<V>(
+    conn: &Connection,
+    keys: &[Key],
+    offset: usize,
+    chunk: &[Key],
+    visitor: &mut V,
+) -> Result<(), BackendError>
+where
+    V: PointVisitor + ?Sized,
+{
+    let mut placeholders = String::with_capacity(chunk.len() * 8);
+    let mut values = Vec::with_capacity(chunk.len() * 2);
+    for (index, key) in chunk.iter().enumerate() {
+        if index > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push_str("(?, ?)");
+        values.push(SqlValue::Integer((offset + index) as i64));
         values.push(SqlValue::Blob(key.0.to_vec()));
     }
     let sql = format!(
@@ -739,10 +858,7 @@ where
         let value_ref = row.get_ref(1).map_err(sqlite_error)?;
         let value = match value_ref {
             SqlValueRef::Null => None,
-            SqlValueRef::Blob(value) => Some(match opts.projection {
-                CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-                CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
-            }),
+            SqlValueRef::Blob(value) => Some(ProjectedValueRef::FullValue(value)),
             other => {
                 return Err(BackendError::Corruption(format!(
                     "direct sqlite value column was not a blob: {other:?}"

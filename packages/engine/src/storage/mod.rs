@@ -41,6 +41,7 @@ pub use point::{
     PointReadBuffer, PointReadPlan, PointValues, PointValuesRef, RequestedToUnique,
     RequestedToUniqueRef,
 };
+pub(crate) use read_scope::SharedStorageRead;
 pub use read_scope::{StorageRead, StorageReadScope};
 pub use scan::{ScanBuffer, ScanChunkRef, ScanCursor, ScanPlan};
 pub use spaces::StorageSpace;

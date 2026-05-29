@@ -15,7 +15,7 @@ use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonR
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
-use crate::storage::StorageBackend;
+use crate::storage::{SharedStorageRead, StorageBackend};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
@@ -183,14 +183,15 @@ pub(crate) async fn initialize<B>(
 ) -> Result<InitReceipt, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     let functions = FunctionProviderHandle::system();
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
-    let mut read = storage.begin_read(crate::storage::StorageReadOptions::default())?;
+    let mut read =
+        SharedStorageRead::new(storage.begin_read(crate::storage::StorageReadOptions::default())?);
     let mut writes = StorageWriteSet::new();
 
     let authored_changes = plan

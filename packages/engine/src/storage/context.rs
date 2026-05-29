@@ -186,8 +186,11 @@ where
 {
     type BackendRead = R;
 
-    fn backend_read(&self) -> &Self::BackendRead {
-        self.read.backend_read()
+    fn with_backend<T>(
+        &self,
+        f: impl FnOnce(&Self::BackendRead) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        self.read.with_backend(f)
     }
 }
 
@@ -230,8 +233,11 @@ where
 {
     type BackendRead = B::Read<'a>;
 
-    fn backend_read(&self) -> &Self::BackendRead {
-        self.read.backend_read()
+    fn with_backend<T>(
+        &self,
+        f: impl FnOnce(&Self::BackendRead) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        self.read.with_backend(f)
     }
 }
 

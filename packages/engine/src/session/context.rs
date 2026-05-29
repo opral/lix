@@ -22,7 +22,7 @@ use crate::sql2::{
     SqlHistoryQuerySource,
 };
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
-use crate::storage::{StorageContext, StorageRead, StorageReadScope};
+use crate::storage::{SharedStorageRead, StorageContext, StorageRead};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
 use crate::{LixError, NullableKeyFilter};
@@ -61,7 +61,7 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     pub(crate) async fn open_workspace(
@@ -192,7 +192,7 @@ where
     }
 
     pub(super) async fn deterministic_mode_enabled(&self) -> Result<bool, LixError> {
-        let read = self.storage.begin_read(StorageReadOptions::default())?;
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
         let live_state = self.live_state.reader(&read);
         crate::functions::deterministic_mode_enabled(&live_state).await
     }
@@ -254,8 +254,8 @@ where
     /// active workspace branch.
     pub async fn active_branch_id(&self) -> Result<String, LixError> {
         let _operation_guard = self.begin_session_operation()?;
-        let transaction = self.storage.begin_read(StorageReadOptions::default())?;
-        let result = self.active_branch_id_from_reader(&transaction).await;
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let result = self.active_branch_id_from_reader(&read).await;
         match result {
             Ok(branch_id) => Ok(branch_id),
             Err(error) => Err(error),
@@ -408,9 +408,9 @@ pub(super) fn closed_error() -> LixError {
 ///
 /// Write statements re-plan against `Transaction`; this context intentionally
 /// has no write stager.
-pub(super) struct SessionSqlExecutionContext<'a, R> {
+pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBackendRead> {
     pub(super) active_branch_id: &'a str,
-    pub(super) read_store: StorageReadScope<R>,
+    pub(super) read_store: SharedStorageRead<R>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
@@ -420,9 +420,9 @@ pub(super) struct SessionSqlExecutionContext<'a, R> {
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
 where
-    R: crate::storage::StorageBackendRead + Clone + Send + Sync + 'static,
+    R: crate::storage::StorageBackendRead + Send + 'static,
 {
-    type ReadStore = StorageReadScope<R>;
+    type ReadStore = SharedStorageRead<R>;
 
     fn active_branch_id(&self) -> &str {
         self.active_branch_id
@@ -435,14 +435,14 @@ where
 
     fn history_query_source(&self) -> SqlHistoryQuerySource<Self::ReadStore> {
         HistoryQuerySource {
-            json_reader: JsonStoreContext::new().reader(self.read_store.store()),
+            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
         }
     }
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
         ChangelogQuerySource {
             store: self.read_store.clone(),
-            json_reader: JsonStoreContext::new().reader(self.read_store.store()),
+            json_reader: JsonStoreContext::new().reader(self.read_store.clone()),
         }
     }
 
