@@ -157,3 +157,31 @@ jobs:
       - name: Publish JS SDK package
         working-directory: packages/js-sdk
         run: npm publish --provenance --access public
+
+  publish-status:
+    name: Publish status
+    runs-on: ubuntu-latest
+    needs:
+      - release-version
+      - build-js-sdk-native-packages
+      - publish-js-sdk-native-packages
+      - publish-js-sdk
+    if: ${{ always() }}
+
+    steps:
+      - name: Fail if any publish job failed
+        run: |
+          echo "release-version: ${{ needs.release-version.result }}"
+          echo "build-js-sdk-native-packages: ${{ needs.build-js-sdk-native-packages.result }}"
+          echo "publish-js-sdk-native-packages: ${{ needs.publish-js-sdk-native-packages.result }}"
+          echo "publish-js-sdk: ${{ needs.publish-js-sdk.result }}"
+
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            exit 1
+          fi
+          if [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            exit 1
+          fi
+          if [ "${{ contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            exit 1
+          fi
