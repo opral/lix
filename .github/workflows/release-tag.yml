@@ -1,6 +1,12 @@
 name: Release Tag
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, with or without a leading v
+        required: true
+        type: string
   push:
     branches:
       - main
@@ -22,7 +28,11 @@ jobs:
       - name: Detect release tag
         id: detect
         run: |
-          tag="$(node scripts/release-tag.mjs | tail -n 1)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="$(node scripts/release-tag.mjs "${{ inputs.version }}" | tail -n 1)"
+          else
+            tag="$(node scripts/release-tag.mjs | tail -n 1)"
+          fi
           if [ -z "$tag" ] || [ "$tag" = "No release tag needed for this commit." ]; then
             echo "has_tag=false" >> "$GITHUB_OUTPUT"
             exit 0
