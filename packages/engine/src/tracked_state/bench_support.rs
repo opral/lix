@@ -2,8 +2,8 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{
-    StorageBackend, StorageBackendRead, StorageBackendReadOf, StorageContext, StorageRead,
-    StorageReadOptions, StorageReadScope, StorageWriteOptions, StorageWriteSetStats,
+    SharedStorageRead, StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions,
+    StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
@@ -66,33 +66,6 @@ impl BenchWriteOutcome {
             delete_batches: self.stats.delete_batches,
             written_bytes: self.stats.written_bytes,
         }
-    }
-}
-
-struct BenchRead<R> {
-    inner: StorageReadScope<R>,
-}
-
-impl<R> BenchRead<R> {
-    fn new(inner: StorageReadScope<R>) -> Self {
-        Self { inner }
-    }
-}
-
-// The storage bench runs these fixtures on one thread. This wrapper lets the
-// tracked-state internals use their existing `Send + Sync` reader bound with
-// test backends such as SQLite whose read handle is not `Sync`.
-unsafe impl<R: Send> Send for BenchRead<R> {}
-unsafe impl<R: Send> Sync for BenchRead<R> {}
-
-impl<R> StorageRead for BenchRead<R>
-where
-    R: StorageBackendRead,
-{
-    type BackendRead = R;
-
-    fn backend_read(&self) -> &Self::BackendRead {
-        self.inner.backend_read()
     }
 }
 
@@ -187,7 +160,7 @@ where
     }
 
     pub async fn read_all(&self) -> usize {
-        let read = BenchRead::new(
+        let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .expect("begin tracked-state read"),
@@ -219,7 +192,7 @@ where
     }
 
     async fn read_by_pk(&self, keys: &[TrackedStateKey]) -> usize {
-        let read = BenchRead::new(
+        let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .expect("begin tracked-state read"),
@@ -264,7 +237,7 @@ where
             .collect::<Vec<_>>();
         let deltas = owned.iter().map(OwnedDelta::as_ref).collect::<Vec<_>>();
         {
-            let read = BenchRead::new(
+            let read = SharedStorageRead::new(
                 self.storage
                     .begin_read(StorageReadOptions::default())
                     .expect("begin tracked-state write read"),
@@ -291,7 +264,7 @@ where
     }
 
     pub fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
-        let read = BenchRead::new(
+        let read = SharedStorageRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .expect("begin tracked-state layout accounting read"),

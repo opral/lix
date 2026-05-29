@@ -16,7 +16,7 @@ pub struct OpenLixOptions<B = InMemoryBackend> {
 pub struct Lix<B = InMemoryBackend>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     _engine: Engine<B>,
@@ -35,7 +35,7 @@ pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
 pub async fn open_lix_with_backend<B>(backend: B) -> Result<Lix<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     let engine = open_or_initialize_engine(backend).await?;
@@ -49,7 +49,7 @@ where
 impl<B> Lix<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one DataFusion SQL statement against this Lix session.
@@ -113,7 +113,7 @@ where
 pub struct LixTransaction<B = InMemoryBackend>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     inner: lix_engine::SessionTransaction<B>,
@@ -122,7 +122,7 @@ where
 impl<B> LixTransaction<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one SQL statement inside this transaction.
@@ -149,7 +149,7 @@ where
 async fn open_or_initialize_engine<B>(backend: B) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     match Engine::new(backend.clone()).await {

@@ -16,5 +16,5 @@
 
 ## Opening a PR
 
-1. Run the package-specific tests and checks for the area you changed
-2. Include release notes in the package repository if the change affects a published package
+1. Run workspace checks and tests, for example `cargo check --workspace` and `cargo test --workspace`. Also run package-specific checks for any JavaScript or CLI package you changed.
+2. If the change affects a published core package, add a changenote in `.changenotes`. See `.changenotes/README.md` for the format and rules.

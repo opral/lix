@@ -103,7 +103,7 @@ pub enum MergeBranchOutcome {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     /// Previews merging `source_branch_id` into this session's active branch

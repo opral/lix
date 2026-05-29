@@ -282,8 +282,8 @@ mod tests {
     use crate::sql2::HistoryQuerySource;
     use crate::sql2::catalog::{PublicCatalog, derive_entity_surface_spec_from_schema};
     use crate::storage::{
-        InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
-        StorageReadScope,
+        InMemoryStorageBackend, InMemoryStorageRead, SharedStorageRead, StorageContext,
+        StorageReadOptions,
     };
 
     use super::{
@@ -437,13 +437,13 @@ mod tests {
     }
 
     async fn empty_history_query_source()
-    -> crate::sql2::SqlHistoryQuerySource<StorageReadScope<InMemoryStorageRead>> {
+    -> crate::sql2::SqlHistoryQuerySource<SharedStorageRead<InMemoryStorageRead>> {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         HistoryQuerySource {
-            json_reader: JsonStoreContext::new().reader(read_scope.store()),
+            json_reader: JsonStoreContext::new().reader(SharedStorageRead::new(read_scope)),
         }
     }
 

@@ -44,7 +44,7 @@ jobs:
           commit-message: Release v${{ steps.prepare.outputs.version }}
           title: Release v${{ steps.prepare.outputs.version }}
           body: |
-            This PR was generated from `.changes/*` fragments.
+            This PR was generated from `.changenotes/*` fragments.
 
             Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
             and enables the release tag workflow to create `v${{ steps.prepare.outputs.version }}`.

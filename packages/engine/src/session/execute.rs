@@ -1,8 +1,12 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use crate::functions::FunctionContext;
 use crate::sql2;
-use crate::storage::{StorageBackend, StorageReadOptions, StorageWriteOptions, StorageWriteSet};
+use crate::storage::{
+    SharedStorageRead, StorageBackend, StorageReadOptions, StorageReadScope, StorageWriteOptions,
+    StorageWriteSet,
+};
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
@@ -291,7 +295,7 @@ impl RowRef<'_> {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one DataFusion SQL statement against this Lix session.
@@ -301,7 +305,6 @@ where
     /// and transaction statements such as `sqlite_master`, `BEGIN`, and
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
-    #[expect(unused_mut)]
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = sql2::parse_statement(sql)?;
@@ -350,46 +353,48 @@ where
             None
         };
         let read_scope = self.storage.begin_read(StorageReadOptions::default())?;
-        let read_result = async {
-            let mut read_store = read_scope.store();
-            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
-            let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-            let functions = runtime_functions.provider();
-            let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-            let visible_schemas = self
-                .catalog_context
-                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
-                .await?;
-            let ctx = SessionSqlExecutionContext {
-                active_branch_id: &active_branch_id,
-                read_store,
-                live_state: Arc::clone(&self.live_state),
-                binary_cas: Arc::clone(&self.binary_cas),
-                branch_ctx: Arc::clone(&self.branch_ctx),
-                visible_schemas,
-                functions: functions.clone(),
-            };
+        let read_result =
+            with_static_session_sql_read::<B, _, _>(read_scope, |read_store| async move {
+                let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                    Arc::new(self.live_state.reader(read_store.clone()));
+                let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
+                let functions = runtime_functions.provider();
+                let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let visible_schemas = self
+                    .catalog_context
+                    .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_branch_id)
+                    .await?;
+                let ctx = SessionSqlExecutionContext {
+                    active_branch_id: &active_branch_id,
+                    read_store,
+                    live_state: Arc::clone(&self.live_state),
+                    binary_cas: Arc::clone(&self.binary_cas),
+                    branch_ctx: Arc::clone(&self.branch_ctx),
+                    visible_schemas,
+                    functions: functions.clone(),
+                };
 
-            let plan = sql2::create_logical_plan_from_parsed(&ctx, sql, statement).await?;
-            let result = sql2::execute_logical_plan(plan, params).await?;
-            drop(ctx);
-            drop(live_state);
-            Ok::<_, LixError>((runtime_functions, result))
-        };
-        let (runtime_functions, result) = match read_result.await {
-            Ok(result) => {
-                read_scope.close()?;
-                result
-            }
+                let result =
+                    sql2::execute_read_statement_from_parsed(&ctx, sql, statement, params).await?;
+                drop(ctx);
+                drop(live_state);
+                Ok::<_, LixError>(sql2::SessionReadSqlResult {
+                    runtime_functions,
+                    query: result,
+                })
+            });
+        let read_result = match read_result.await {
+            Ok(result) => result,
             Err(error) => {
-                let _ = read_scope.close();
                 return Err(normalize_sql_surface_error(error, sql));
             }
         };
-        self.persist_runtime_functions_if_needed(&runtime_functions, runtime_write_access.as_ref())
-            .await?;
-        Ok(ExecuteResult::from_sql_query_result(result))
+        self.persist_runtime_functions_if_needed(
+            &read_result.runtime_functions,
+            runtime_write_access.as_ref(),
+        )
+        .await?;
+        Ok(ExecuteResult::from_sql_query_result(read_result.query))
     }
 
     #[cfg(test)]
@@ -465,10 +470,58 @@ where
     }
 }
 
+/// Runs one session SQL read using a widened backend-read lifetime.
+///
+/// DataFusion requires providers and plans to be `'static`, while engine
+/// backends such as RocksDB/redb naturally expose borrowed read snapshots. Keep
+/// the lifetime erasure private to session SQL execution so callers cannot
+/// receive the widened read as a general crate capability.
+async fn with_static_session_sql_read<B, F, Fut>(
+    read: StorageReadScope<B::Read<'_>>,
+    f: F,
+) -> Result<sql2::SessionReadSqlResult, LixError>
+where
+    B: StorageBackend + 'static,
+    F: FnOnce(SharedStorageRead<B::Read<'static>>) -> Fut,
+    Fut: Future<Output = Result<sql2::SessionReadSqlResult, LixError>>,
+{
+    // SAFETY: the widened read is wrapped immediately in `SharedStorageRead`,
+    // only passed into this private SQL execution closure, and explicitly
+    // closed before returning. Escaped clones are detected by `close()`.
+    let read = unsafe { assume_static_backend_read::<B>(read) };
+    let read = SharedStorageRead::new(read);
+    let close = read.clone();
+    let result = f(read).await;
+    let close_result = close.close().map_err(LixError::from);
+    match (result, close_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(close_error)) => Err(close_error),
+    }
+}
+
+/// Erases the backend borrow lifetime for scoped session SQL execution.
+///
+/// # Safety
+///
+/// The returned read scope must not outlive the backend value that produced
+/// `read`, and it must be dropped before the enclosing SQL execution returns.
+unsafe fn assume_static_backend_read<B>(
+    read: StorageReadScope<B::Read<'_>>,
+) -> StorageReadScope<B::Read<'static>>
+where
+    B: StorageBackend + 'static,
+{
+    let read = std::mem::ManuallyDrop::new(read);
+    unsafe {
+        std::ptr::read(std::ptr::from_ref(&*read).cast::<StorageReadScope<B::Read<'static>>>())
+    }
+}
+
 impl<B> SessionTransaction<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     /// Executes one SQL statement inside this transaction.
@@ -491,29 +544,10 @@ where
                     .map_err(|error| normalize_sql_surface_error(error, sql))
             }
             sql2::BoundStatementRoute::Read => {
-                let read_ctx = transaction.sql_read_execution_context().await?;
-                let read_result = async {
-                    let plan = sql2::create_transaction_read_logical_plan_from_parsed(
-                        &read_ctx,
-                        transaction,
-                        sql,
-                        statement,
-                    )
-                    .await?;
-                    sql2::execute_logical_plan(plan, params).await
-                }
-                .await;
-                let close_result = read_ctx.close();
-                let result = match read_result {
-                    Ok(result) => {
-                        close_result?;
-                        result
-                    }
-                    Err(error) => {
-                        let _ = close_result;
-                        return Err(normalize_sql_surface_error(error, sql));
-                    }
-                };
+                let result = transaction
+                    .execute_read_sql_statement(sql, statement, params)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
                 Ok(ExecuteResult::from_sql_query_result(result))
             }
         }
@@ -583,7 +617,7 @@ async fn execute_transaction_write_auto<B>(
 ) -> Result<ExecuteResult, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     transaction.prepare_sql_visible_schemas().await?;
@@ -601,7 +635,7 @@ async fn execute_transaction_write_with_mode<B>(
 ) -> Result<ExecuteResult, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     transaction.prepare_sql_visible_schemas().await?;
@@ -620,7 +654,7 @@ async fn execute_transaction_write_with_mode_and_trace<B>(
 ) -> Result<(ExecuteResult, Option<sql2::WriteExecutorPath>), LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     transaction.prepare_sql_visible_schemas().await?;

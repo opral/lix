@@ -26,7 +26,7 @@ pub struct SessionTransaction<B: StorageBackend = InMemoryStorageBackend> {
 impl<B> SessionContext<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     pub async fn begin_transaction(&self) -> Result<SessionTransaction<B>, LixError> {
@@ -72,7 +72,7 @@ where
 impl<B> SessionTransaction<B>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<B>, LixError> {

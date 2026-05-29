@@ -10,9 +10,9 @@ use lix_engine::backend::{
     PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, SpaceId, WriteOptions,
 };
 use lix_engine::storage::{
-    InMemoryStorageBackend, PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection,
-    StorageGetOptions, StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace,
-    StorageValue, StorageWriteOptions,
+    PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions,
+    StoragePrefix, StorageReadOptions, StorageScanOptions, StorageSpace, StorageValue,
+    StorageWriteOptions,
 };
 use lix_engine::storage_bench;
 use lix_engine::{Engine, SessionContext};
@@ -642,23 +642,26 @@ fn bench_session_execute_untracked_insert(
     label: &str,
 ) {
     let rows = all_rows[..row_count].to_vec();
-    let mut group = c.benchmark_group(format!(
-        "untracked_state_crud/session_execute_untracked/in_memory/{label}"
-    ));
-    configure_group(&mut group, row_count);
+    for profile in LIX_BACKEND_PROFILES {
+        let mut group = c.benchmark_group(format!(
+            "untracked_state_crud/session_execute_untracked/{}/{label}",
+            profile.name()
+        ));
+        configure_group(&mut group, row_count);
 
-    group.bench_function(format!("insert_all_rows/{}", row_label(row_count)), |b| {
-        b.iter_batched(
-            || runtime.block_on(prepare_session_empty()),
-            |session| {
-                runtime.block_on(insert_untracked_json_pointer_rows(&session, &rows));
-                black_box(rows.len())
-            },
-            BatchSize::LargeInput,
-        );
-    });
+        group.bench_function(format!("insert_all_rows/{}", row_label(row_count)), |b| {
+            b.iter_batched(
+                || runtime.block_on(prepare_profile_session_empty(profile)),
+                |session| {
+                    runtime.block_on(session.insert_untracked_json_pointer_rows(&rows));
+                    black_box(rows.len())
+                },
+                BatchSize::LargeInput,
+            );
+        });
 
-    group.finish();
+        group.finish();
+    }
 }
 
 fn measure_lix_io(profile: LixBackendProfile, operation: &str, rows: &[BenchRow]) -> IoStats {
@@ -848,27 +851,51 @@ enum ProfileStorage {
     Redb(StorageContext<RedbBackend>),
 }
 
-async fn prepare_session_empty() -> SessionContext<InMemoryStorageBackend> {
-    let backend = InMemoryStorageBackend::new();
+enum ProfileSession {
+    Sqlite(SessionContext<SqliteBackend>),
+    RocksDb(SessionContext<RocksDbBackend>),
+    Redb(SessionContext<RedbBackend>),
+}
+
+async fn prepare_profile_session_empty(profile: LixBackendProfile) -> ProfileSession {
+    match profile {
+        LixBackendProfile::Sqlite => {
+            ProfileSession::Sqlite(prepare_session_empty(sqlite_backend()).await)
+        }
+        LixBackendProfile::RocksDb => {
+            ProfileSession::RocksDb(prepare_session_empty(rocksdb_backend()).await)
+        }
+        LixBackendProfile::Redb => {
+            ProfileSession::Redb(prepare_session_empty(redb_backend()).await)
+        }
+    }
+}
+
+async fn prepare_session_empty<B>(backend: B) -> SessionContext<B>
+where
+    B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
     Engine::initialize(backend.clone())
         .await
-        .expect("initialize in-memory engine");
+        .expect("initialize benchmark engine");
     let engine = Engine::new(backend).await.expect("open in-memory engine");
     let setup = engine
         .open_workspace_session()
         .await
-        .expect("open in-memory setup session");
+        .expect("open benchmark setup session");
     register_json_pointer_schema(&setup).await;
     engine
         .open_workspace_session()
         .await
-        .expect("open in-memory benchmark session")
+        .expect("open benchmark session")
 }
 
 async fn register_json_pointer_schema<B>(session: &SessionContext<B>)
 where
     B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     let sql = format!(
@@ -888,7 +915,7 @@ where
 async fn insert_untracked_json_pointer_rows<B>(session: &SessionContext<B>, rows: &[PointerRow])
 where
     B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     for chunk in rows.chunks(SESSION_INSERT_CHUNK_SIZE) {
@@ -948,6 +975,16 @@ impl ProfileStorage {
             Self::Sqlite(storage) => lix_select_points(storage, rows),
             Self::RocksDb(storage) => lix_select_points(storage, rows),
             Self::Redb(storage) => lix_select_points(storage, rows),
+        }
+    }
+}
+
+impl ProfileSession {
+    async fn insert_untracked_json_pointer_rows(&self, rows: &[PointerRow]) {
+        match self {
+            Self::Sqlite(session) => insert_untracked_json_pointer_rows(session, rows).await,
+            Self::RocksDb(session) => insert_untracked_json_pointer_rows(session, rows).await,
+            Self::Redb(session) => insert_untracked_json_pointer_rows(session, rows).await,
         }
     }
 }
