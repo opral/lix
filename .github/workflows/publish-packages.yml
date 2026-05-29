@@ -44,7 +44,7 @@ jobs:
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
-        run: npm ci
+        run: npm install
 
       - name: Build JS SDK native package
         working-directory: packages/js-sdk
@@ -113,7 +113,7 @@ jobs:
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
-        run: npm ci
+        run: npm install
 
       - name: Test JS SDK package
         working-directory: packages/js-sdk

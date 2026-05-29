@@ -61,7 +61,7 @@ jobs:
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
-        run: npm ci
+        run: npm install
 
       - name: Run JS SDK binding tests
         working-directory: packages/js-sdk
