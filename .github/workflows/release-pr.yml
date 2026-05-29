@@ -47,4 +47,4 @@ jobs:
             This PR was generated from `.changenotes/*` fragments.
 
             Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
-            and enables the release tag workflow to create `v${{ steps.prepare.outputs.version }}`.
+            and enables the release workflow to create `v${{ steps.prepare.outputs.version }}` and publish packages.
