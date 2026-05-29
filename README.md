@@ -184,7 +184,7 @@ order_id 1002 status:
 
 Agents burn fewer tokens and keep cleaner context when version-control questions are answered with SQL instead of whole-file rereads.
 
-<img src="./assets/claude-sql-question.svg" alt="Claude Code asks: Which orders changed status in this branch? Executing SQL" width="460" />
+<img src="./website/public/assets/claude-sql-question.svg" alt="Claude Code asks: Which orders changed status in this branch? Executing SQL" width="460" />
 
 ```ts
 const rows = await lix.execute(`
