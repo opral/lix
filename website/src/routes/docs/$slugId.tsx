@@ -1,0 +1,307 @@
+import { createFileRoute, notFound } from "@tanstack/react-router";
+import {
+  DocsLayout,
+  type PageTocItem,
+  type SidebarSection,
+} from "../../components/docs-layout";
+import { MarkdownPage } from "../../components/markdown-page";
+import tableOfContents from "../../../../docs/table_of_contents.json";
+import { DocsPrevNext } from "../../components/docs-prev-next";
+import {
+  buildDocMaps,
+  buildTocMap,
+  normalizeRelativePath,
+  resolveDocsMarkdownHref,
+  type Toc,
+  type TocItem,
+} from "../../lib/build-doc-map";
+import {
+  buildCanonicalUrl,
+  buildBreadcrumbJsonLd,
+  buildWebPageJsonLd,
+  extractOgMeta,
+  extractTwitterMeta,
+  getMarkdownDescription,
+  getMarkdownTitle,
+  resolveOgImage,
+} from "../../lib/seo";
+import { normalizeMarkdownHtml } from "../../lib/markdown-html";
+import { parse } from "@opral/markdown-wc";
+import markdownPageCss from "../../components/markdown-page.style.css?url";
+
+const docs = import.meta.glob<string>("../../../../docs/**/*.md", {
+  eager: true,
+  import: "default",
+  query: "?raw",
+});
+
+const tocMap = buildTocMap(tableOfContents as Toc);
+const { bySlug: docsBySlug } = buildDocMaps(docs);
+const docsByRelativePath = Object.values(docsBySlug).reduce(
+  (acc, doc) => {
+    acc[doc.relativePath] = doc;
+    return acc;
+  },
+  {} as Record<string, (typeof docsBySlug)[string]>,
+);
+
+/**
+ * Builds a list of heading links from rendered HTML for the "On this page" TOC.
+ *
+ * @example
+ * buildPageToc('<h2 id="intro">Intro</h2>') // [{ id: "intro", label: "Intro", level: 2 }]
+ */
+function buildPageToc(html: string): PageTocItem[] {
+  const headings: PageTocItem[] = [];
+  const regex = /<h2\b[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/h2>/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(html)) !== null) {
+    const id = match[1];
+    const label = decodeHtmlEntities(stripHtml(match[2])).trim();
+    if (!id || !label) continue;
+    headings.push({ id, label, level: 2 });
+  }
+
+  return headings;
+}
+
+/**
+ * Removes HTML tags from a string.
+ *
+ * @example
+ * stripHtml("<strong>Title</strong>") // "Title"
+ */
+function stripHtml(input: string): string {
+  return input.replace(/<[^>]*>/g, "");
+}
+
+/**
+ * Decodes a minimal set of HTML entities for heading labels.
+ *
+ * @example
+ * decodeHtmlEntities("Foo &amp; Bar") // "Foo & Bar"
+ */
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function buildSidebarSections(toc: Toc): SidebarSection[] {
+  return Object.entries(toc)
+    .map(([label, sectionItems]) => {
+      const items = sectionItems
+        .map((item) => {
+          const relativePath = normalizeRelativePath(item.path);
+          const doc = docsByRelativePath[relativePath];
+          if (!doc) {
+            return null;
+          }
+
+          return {
+            label: item.label,
+            href: `/docs/${doc.slug}`,
+            relativePath,
+          };
+        })
+        .filter((value): value is NonNullable<typeof value> => Boolean(value));
+
+      return { label, items };
+    })
+    .filter((section) => section.items.length > 0);
+}
+
+function buildDocsNavRoutes(toc: Toc) {
+  return Object.values(toc)
+    .flatMap((items) =>
+      items.map((item) => {
+        const relativePath = normalizeRelativePath(item.path);
+        const doc = docsByRelativePath[relativePath];
+        return {
+          slug: doc?.slug ?? "",
+          title: item.label,
+        };
+      }),
+    )
+    .filter((item) => item.slug);
+}
+
+type DocsLoaderData = {
+  doc: (typeof docsBySlug)[string];
+  tocEntry: TocItem | undefined;
+  sidebarSections: SidebarSection[];
+  html: string;
+  frontmatter: Record<string, unknown> & { imports?: string[] };
+  pageToc: PageTocItem[];
+};
+
+export function buildDocsPageHead(loaderData?: DocsLoaderData) {
+  const data = loaderData as DocsLoaderData | undefined;
+  const frontmatter = data?.frontmatter;
+  const rawMarkdown = data?.doc?.content ?? "";
+  const title = getMarkdownTitle({ rawMarkdown, frontmatter });
+  const description = getMarkdownDescription({ rawMarkdown, frontmatter });
+  const canonicalUrl = data?.doc?.slug
+    ? buildCanonicalUrl(`/docs/${data.doc.slug}`)
+    : buildCanonicalUrl("/docs/what-is-lix");
+  const ogImage = resolveOgImage(frontmatter);
+  const ogMeta = extractOgMeta(frontmatter);
+  const twitterMeta = extractTwitterMeta(frontmatter);
+  const pageTitle = title
+    ? `${title} | Lix Documentation`
+    : "Lix Documentation";
+  const jsonLd = buildWebPageJsonLd({
+    title: pageTitle,
+    description,
+    canonicalUrl,
+    image: ogImage.url,
+  });
+  const breadcrumbJsonLd = buildBreadcrumbJsonLd(
+    [
+      { name: "Lix", item: buildCanonicalUrl("/") },
+      { name: "Documentation", item: buildCanonicalUrl("/docs/what-is-lix") },
+      title ? { name: title, item: canonicalUrl } : undefined,
+    ].filter(Boolean) as Array<{ name: string; item: string }>,
+  );
+  const meta: Array<
+    | { title: string }
+    | { name: string; content: string }
+    | { property: string; content: string }
+  > = [
+    {
+      title: pageTitle,
+    },
+    { property: "og:url", content: canonicalUrl },
+    { property: "og:type", content: "article" },
+    { property: "og:site_name", content: "Lix" },
+    { property: "og:locale", content: "en_US" },
+    { property: "og:image", content: ogImage.url },
+    { property: "og:image:alt", content: ogImage.alt },
+    { name: "twitter:card", content: "summary_large_image" },
+    { name: "twitter:image", content: ogImage.url },
+    { name: "twitter:image:alt", content: ogImage.alt },
+  ];
+
+  if (description) {
+    meta.push(
+      { name: "description", content: description },
+      { property: "og:description", content: description },
+      { name: "twitter:description", content: description },
+    );
+  }
+
+  if (title) {
+    meta.push(
+      { property: "og:title", content: pageTitle },
+      { name: "twitter:title", content: pageTitle },
+    );
+  }
+
+  return {
+    meta: [...meta, ...ogMeta, ...twitterMeta],
+    links: [
+      {
+        rel: "stylesheet",
+        href: markdownPageCss,
+      },
+      {
+        rel: "canonical",
+        href: canonicalUrl,
+      },
+    ],
+    scripts: [
+      {
+        type: "application/ld+json",
+        children: JSON.stringify(jsonLd),
+      },
+      {
+        type: "application/ld+json",
+        children: JSON.stringify(breadcrumbJsonLd),
+      },
+    ],
+  };
+}
+
+export const Route = createFileRoute("/docs/$slugId")({
+  head: ({ loaderData }) => buildDocsPageHead(loaderData),
+  loader: (async ({ params }: { params: { slugId: string } }) => {
+    const doc = docsBySlug[params.slugId];
+
+    if (!doc) {
+      throw notFound();
+    }
+
+    const tocEntry = tocMap.get(doc.relativePath);
+    const parsedMarkdown = await parse(doc.content, {
+      externalLinks: true,
+      assetBaseUrl: `/docs/${doc.slug}/`,
+      resolveHref: (href) =>
+        resolveDocsMarkdownHref(href, doc, docsByRelativePath),
+    });
+    const html = normalizeMarkdownHtml(parsedMarkdown.html);
+    const pageToc = buildPageToc(html);
+
+    return {
+      doc,
+      tocEntry,
+      sidebarSections: buildSidebarSections(tableOfContents as Toc),
+      html,
+      frontmatter: parsedMarkdown.frontmatter,
+      pageToc,
+    };
+  }) as any,
+  component: DocsPage,
+});
+
+function DocsPage() {
+  const { doc, sidebarSections, html, frontmatter, pageToc } =
+    Route.useLoaderData() as DocsLoaderData;
+  const navRoutes = buildDocsNavRoutes(tableOfContents as Toc);
+  const editUrl = `https://github.com/opral/lix/blob/main/docs/${doc.relativePath.replace(
+    /^\.\//,
+    "",
+  )}`;
+
+  return (
+    <DocsLayout
+      sidebarSections={sidebarSections}
+      activeRelativePath={doc.relativePath}
+      pageToc={pageToc}
+    >
+      <MarkdownPage
+        html={html}
+        markdown={doc.content}
+        imports={(frontmatter.imports as string[] | undefined) ?? undefined}
+      />
+      <div className="mt-12">
+        <a
+          href={editUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-slate-700"
+        >
+          <svg
+            className="h-4 w-4"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+            aria-hidden="true"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+            />
+          </svg>
+          Edit this page on GitHub
+        </a>
+      </div>
+      <DocsPrevNext currentSlug={doc.slug} routes={navRoutes} />
+    </DocsLayout>
+  );
+}
