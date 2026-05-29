@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 wit_bindgen::generate!({
-    path: "../engine/wit",
+    path: "../../packages/engine/wit",
     world: "plugin",
 });
 

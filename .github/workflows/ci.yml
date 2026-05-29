@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#defaultsrun
+    # https://linux.die.net/man/1/bash
+    shell: bash --noprofile --norc -o errexit -o nounset -o pipefail -o xtrace -O nullglob -O dotglob {0}
+
 jobs:
   changelog:
     name: Changelog
@@ -31,13 +37,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: set envs
+        run: |
+          grep -v "^#" << "EOF" >> $GITHUB_ENV
+          CARGO_TERM_COLOR=always
+          CARGO_INCREMENTAL=0
+          # keep aligned with config.toml
+          CARGO_PROFILE_DEV_DEBUG=0
+          CARGO_PROFILE_TEST_DEBUG=0
+          CARGO_PROFILE_RELEASE_DEBUG=0
+          CARGO_PROFILE_BENCH_DEBUG=0
+          CARGO_NET_RETRY=10
+          RUSTUP_MAX_RETRIES=10
+          NODE_ENV=production
+          GIT_AUTHOR_NAME=github-actions[bot]
+          GIT_COMMITTER_NAME=github-actions[bot]
+          GIT_AUTHOR_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_EMAIL=41898282+github-actions[bot]@users.noreply.github.com
+          DEBIAN_FRONTEND=noninteractive
+          BINSTALL_NO_CONFIRM=true
+          EOF
+
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ github.job }}
 
-      - name: Run cargo tests
-        run: cargo test --workspace
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
 
   js-sdk-test:
     name: JS SDK Binding Test

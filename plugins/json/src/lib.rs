@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 wit_bindgen::generate!({
-    path: "../engine/wit",
+    path: "../../packages/engine/wit",
     world: "plugin",
 });
 

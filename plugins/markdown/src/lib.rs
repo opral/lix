@@ -1,7 +1,7 @@
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
 
 wit_bindgen::generate!({
-    path: "../engine/wit",
+    path: "../../packages/engine/wit",
     world: "plugin",
 });
 

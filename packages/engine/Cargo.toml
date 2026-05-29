@@ -1,8 +1,21 @@
 [package]
 name = "lix_engine"
 version.workspace = true
-edition = "2021"
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
 autobenches = false
+
+[lints]
+workspace = true
 
 [features]
 rocksdb = ["dep:rocksdb"]
