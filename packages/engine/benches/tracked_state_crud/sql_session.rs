@@ -49,7 +49,6 @@ pub(crate) async fn seeded_fixture(profile: BackendProfile, rows: &[WorkloadRow]
 }
 
 impl SqlFixture {
-    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn insert_all(&self) -> usize {
         match self {
             Self::Sqlite(fixture) => fixture.insert_all().await,

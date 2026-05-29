@@ -224,7 +224,7 @@ impl BackendRead for SqliteRead {
     where
         F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
-        let (sql, values) = scan_sql(range, opts)?;
+        let (sql, values) = scan_sql(range, opts);
         let mut stmt = self.conn()?.prepare_cached(&sql).map_err(sqlite_error)?;
         let rows = stmt
             .query(rusqlite::params_from_iter(values))
@@ -277,7 +277,7 @@ impl BackendRangeScan for SqliteRangeScan<'_> {
             let key = blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
             match self.projection {
                 CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?
+                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?;
                 }
                 CoreProjection::FullValue => {
                     let value = blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
@@ -529,7 +529,6 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
-#[expect(clippy::cast_possible_wrap)]
 fn visit_keys<V>(
     conn: &Connection,
     keys: &[Key],
@@ -549,7 +548,6 @@ where
     }
 }
 
-#[expect(clippy::cast_possible_wrap)]
 fn visit_key_only_points<V>(
     conn: &Connection,
     keys: &[Key],
@@ -628,7 +626,6 @@ where
     Ok(())
 }
 
-#[expect(clippy::cast_possible_wrap)]
 fn visit_full_value_points<V>(
     conn: &Connection,
     keys: &[Key],
@@ -707,10 +704,7 @@ where
     Ok(())
 }
 
-fn scan_sql(
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-) -> Result<(String, Vec<SqlValue>), BackendError> {
+fn scan_sql(range: KeyRange, opts: ScanOptions<'_>) -> (String, Vec<SqlValue>) {
     let mut sql = match opts.projection {
         CoreProjection::KeyOnly => String::from("SELECT key FROM lix_internal_entries WHERE 1 = 1"),
         CoreProjection::FullValue => {
@@ -726,7 +720,7 @@ fn scan_sql(
         values.push(SqlValue::Blob(resume_after.0.to_vec()));
     }
     sql.push_str(" ORDER BY key ASC");
-    Ok((sql, values))
+    (sql, values)
 }
 
 fn append_bound_sql(

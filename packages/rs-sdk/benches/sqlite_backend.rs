@@ -451,7 +451,7 @@ impl BackendRead for DirectSqliteRead {
     where
         F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
     {
-        let (sql, values) = direct_scan_sql(range, opts)?;
+        let (sql, values) = direct_scan_sql(range, opts);
         let mut stmt = self.conn()?.prepare_cached(&sql).map_err(sqlite_error)?;
         let rows = stmt
             .query(rusqlite::params_from_iter(values))
@@ -504,7 +504,7 @@ impl BackendRangeScan for DirectSqliteRangeScan<'_> {
             let key = direct_blob_ref(row.get_ref(0).map_err(sqlite_error)?, "key")?;
             match self.projection {
                 CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?
+                    visitor.visit(KeyRef(key), ProjectedValueRef::KeyOnly)?;
                 }
                 CoreProjection::FullValue => {
                     let value = direct_blob_ref(row.get_ref(1).map_err(sqlite_error)?, "value")?;
@@ -870,10 +870,7 @@ where
     Ok(())
 }
 
-fn direct_scan_sql(
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-) -> Result<(String, Vec<SqlValue>), BackendError> {
+fn direct_scan_sql(range: KeyRange, opts: ScanOptions<'_>) -> (String, Vec<SqlValue>) {
     let mut sql = match opts.projection {
         CoreProjection::KeyOnly => String::from("SELECT key FROM lix_internal_entries WHERE 1 = 1"),
         CoreProjection::FullValue => {
@@ -889,7 +886,7 @@ fn direct_scan_sql(
         values.push(SqlValue::Blob(resume_after.0.to_vec()));
     }
     sql.push_str(" ORDER BY key ASC");
-    Ok((sql, values))
+    (sql, values)
 }
 
 fn direct_append_bound_sql(
