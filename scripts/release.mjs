@@ -52,11 +52,11 @@ export function bumpVersion(version, type) {
 }
 
 export function changeFiles(root) {
-	const dir = join(root, ".changes");
+	const dir = join(root, ".changenotes");
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
-		.filter((file) => file.endsWith(".md"))
-		.map((file) => `.changes/${file}`)
+		.filter((file) => file.endsWith(".md") && file !== "README.md")
+		.map((file) => `.changenotes/${file}`)
 		.sort();
 }
 
@@ -79,17 +79,34 @@ export function parseChange(root, path) {
 	);
 	const type = metadata.type;
 	const scope = metadata.scope;
-	const body = match[2].trim().replace(/\s+/g, " ");
+	const scopes = scope
+		?.split(",")
+		.map((value) => value.trim())
+		.filter(Boolean);
+	const bodyParagraphs = changeBodyParagraphs(match[2]);
 	if (!CHANGE_TYPES.includes(type)) {
 		throw new Error(`${path}: type must be one of ${CHANGE_TYPES.join(", ")}`);
 	}
-	if (!CHANGE_SCOPES.includes(scope)) {
-		throw new Error(`${path}: scope must be one of ${CHANGE_SCOPES.join(", ")}`);
+	if (!scopes?.length) {
+		throw new Error(`${path}: scope must include at least one of ${CHANGE_SCOPES.join(", ")}`);
 	}
-	if (!body) {
+	for (const value of scopes) {
+		if (!CHANGE_SCOPES.includes(value)) {
+			throw new Error(`${path}: scope must only include ${CHANGE_SCOPES.join(", ")}`);
+		}
+	}
+	if (bodyParagraphs.length === 0) {
 		throw new Error(`${path}: changelog body must not be empty`);
 	}
-	return { path, type, scope, body };
+	return {
+		path,
+		type,
+		scope: scopes.join(", "),
+		scopes,
+		body: bodyParagraphs.join("\n\n"),
+		summary: bodyParagraphs[0],
+		details: bodyParagraphs.slice(1),
+	};
 }
 
 export function loadChanges(root) {
@@ -111,10 +128,29 @@ export function changelogEntry(version, date, changes) {
 		if (typed.length === 0) continue;
 		entry += `\n### ${labels[type]}\n\n`;
 		for (const change of typed) {
-			entry += `- ${change.scope}: ${change.body}\n`;
+			entry += changelogListItem(change);
 		}
 	}
 	return `${entry}\n`;
+}
+
+function changeBodyParagraphs(body) {
+	return body
+		.trim()
+		.replace(/\r\n/g, "\n")
+		.split(/\n{2,}/)
+		.map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim())
+		.filter(Boolean);
+}
+
+function changelogListItem(change) {
+	const paragraphs = change.summary ? [change.summary, ...(change.details ?? [])] : changeBodyParagraphs(change.body);
+	const [summary, ...details] = paragraphs;
+	let item = `- ${change.scope}: ${summary}\n`;
+	for (const detail of details) {
+		item += `\n  ${detail}\n`;
+	}
+	return item;
 }
 
 export function updateCargoToml(root, version) {

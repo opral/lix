@@ -14,17 +14,40 @@ test("bumpVersion applies semver changes", () => {
 
 test("loadChanges validates and parses fragments", () => {
 	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
-	mkdirSync(join(root, ".changes"));
+	mkdirSync(join(root, ".changenotes"));
 	writeFileSync(
-		join(root, ".changes", "pr-1.md"),
-		`---\ntype: patch\nscope: js-sdk\n---\n\nFixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)\n`,
+		join(root, ".changenotes", "native-bindings.md"),
+		`---\ntype: patch\nscope: js-sdk, lix-sdk\n---\n\nFixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)\n`,
 	);
 	assert.deepEqual(loadChanges(root), [
 		{
-			path: ".changes/pr-1.md",
+			path: ".changenotes/native-bindings.md",
 			type: "patch",
-			scope: "js-sdk",
+			scope: "js-sdk, lix-sdk",
+			scopes: ["js-sdk", "lix-sdk"],
 			body: "Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)",
+			summary: "Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)",
+			details: [],
+		},
+	]);
+});
+
+test("loadChanges preserves changelog summary and explainer paragraphs", () => {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-test-"));
+	mkdirSync(join(root, ".changenotes"));
+	writeFileSync(
+		join(root, ".changenotes", "sqlite-reads.md"),
+		`---\ntype: patch\nscope: lix-sdk, engine\n---\n\nImproved SQLite backend read performance.\n\nThe backend now avoids loading values for key-only reads.\nWrapped lines stay in the same paragraph.\n`,
+	);
+	assert.deepEqual(loadChanges(root), [
+		{
+			path: ".changenotes/sqlite-reads.md",
+			type: "patch",
+			scope: "lix-sdk, engine",
+			scopes: ["lix-sdk", "engine"],
+			body: "Improved SQLite backend read performance.\n\nThe backend now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph.",
+			summary: "Improved SQLite backend read performance.",
+			details: ["The backend now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph."],
 		},
 	]);
 });
@@ -38,8 +61,13 @@ test("changelogEntry groups entries by type", () => {
 				scope: "js-sdk",
 				body: "Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)",
 			},
+			{
+				type: "patch",
+				scope: "lix-sdk, engine",
+				body: "Improved SQLite backend read performance.\n\nThe backend now avoids loading values for key-only reads.",
+			},
 		]),
-		`## 0.7.0 - 2026-05-29\n\n### Minor\n\n- lix-sdk: Added branch merge preview support.\n\n### Patch\n\n- js-sdk: Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)\n\n`,
+		`## 0.7.0 - 2026-05-29\n\n### Minor\n\n- lix-sdk: Added branch merge preview support.\n\n### Patch\n\n- js-sdk: Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)\n- lix-sdk, engine: Improved SQLite backend read performance.\n\n  The backend now avoids loading values for key-only reads.\n\n`,
 	);
 });
 
