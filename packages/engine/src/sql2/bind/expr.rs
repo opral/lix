@@ -3,7 +3,7 @@ pub(crate) enum BoundExpr {
     Column(BoundColumnRef),
     Param(BoundParamRef),
     Literal(BoundLiteral),
-    Function { name: String, args: Vec<BoundExpr> },
+    Function { name: String, args: Vec<Self> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

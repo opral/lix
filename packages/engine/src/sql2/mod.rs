@@ -28,8 +28,8 @@ mod udfs;
 mod write_normalization;
 
 pub(crate) use bind::{
-    bind_read_statement, bind_statement, bind_statement_route,
-    statement_has_durable_runtime_function, BoundStatementRoute,
+    BoundStatementRoute, bind_read_statement, bind_statement, bind_statement_route,
+    statement_has_durable_runtime_function,
 };
 pub(crate) use context::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
@@ -38,14 +38,14 @@ pub(crate) use context::{
 };
 #[allow(unused_imports)]
 pub(crate) use exec::{
-    create_logical_plan_from_parsed, create_transaction_read_logical_plan_from_parsed,
-    create_write_logical_plan_from_parsed, execute_logical_plan, execute_write_logical_plan,
-    SqlLogicalPlan,
+    SqlLogicalPlan, create_logical_plan_from_parsed,
+    create_transaction_read_logical_plan_from_parsed, create_write_logical_plan_from_parsed,
+    execute_logical_plan, execute_write_logical_plan,
 };
 #[cfg(test)]
 pub(crate) use exec::{
-    create_write_logical_plan, execute_write_logical_plan_with_mode,
-    execute_write_logical_plan_with_mode_and_trace, WriteExecutorMode, WriteExecutorPath,
+    WriteExecutorMode, WriteExecutorPath, create_write_logical_plan,
+    execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
 };
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;

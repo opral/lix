@@ -3,8 +3,8 @@ use std::hint::black_box;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use lix_engine::changelog::bench as changelog_bench;
 use lix_engine::LixError;
+use lix_engine::changelog::bench as changelog_bench;
 
 mod backends;
 
@@ -123,7 +123,7 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     rows.push(
         stage_commit_noop_row(
             "stage_commit_noop / 1c_1ch",
-            || changelog_bench::append_1c_1ch(),
+            changelog_bench::append_1c_1ch,
             samples,
         )
         .await?,
@@ -131,7 +131,7 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     rows.push(
         stage_commit_noop_row(
             "stage_commit_noop / 1c_100ch",
-            || changelog_bench::append_1c_100ch(),
+            changelog_bench::append_1c_100ch,
             samples,
         )
         .await?,
@@ -139,7 +139,7 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
     rows.push(
         stage_commit_noop_row(
             "stage_commit_noop / 1c_1000ch single-shot",
-            || changelog_bench::append_1c_1000ch(),
+            changelog_bench::append_1c_1000ch,
             1,
         )
         .await?,
@@ -208,7 +208,7 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
                     let corpus = changelog_bench::corpus_100append_100c_1000ch()?;
                     let store =
                         changelog_bench::prepare_corpus_store(backend.create(), &corpus).await?;
-                    let change_ids = corpus.change_ids().to_vec();
+                    let change_ids = corpus.change_ids().clone();
                     let start = Instant::now();
                     black_box(
                         changelog_bench::load_changes_direct_by_id(&store, &change_ids).await?,
@@ -229,7 +229,7 @@ async fn backend_scorecard() -> Result<Vec<BackendScoreRow>, LixError> {
                     let corpus = changelog_bench::corpus_100append_100c_1000ch()?;
                     let store =
                         changelog_bench::prepare_corpus_store(backend.create(), &corpus).await?;
-                    let change_ids = corpus.change_ids().to_vec();
+                    let change_ids = corpus.change_ids().clone();
                     let start = Instant::now();
                     black_box(changelog_bench::load_changes_direct(&store, &change_ids).await?);
                     Ok(start.elapsed())

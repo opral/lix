@@ -1,6 +1,6 @@
 use lix_sdk::{
-    open_lix, CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions,
-    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
+    CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions, MergeBranchOutcome,
+    OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 
 #[tokio::test]
@@ -31,7 +31,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
         .unwrap();
     assert_crm_task_projection(&projected);
 
-    assert_eq!(task_done(&lix, "task-1").await, false);
+    assert!(!task_done(&lix, "task-1").await);
 
     let draft = lix
         .create_branch(CreateBranchOptions {
@@ -58,7 +58,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     .await
     .unwrap();
 
-    assert_eq!(task_done(&lix, "task-1").await, true);
+    assert!(task_done(&lix, "task-1").await);
 
     lix.switch_branch(SwitchBranchOptions {
         branch_id: main_branch_id.clone(),
@@ -66,7 +66,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     .await
     .unwrap();
 
-    assert_eq!(task_done(&lix, "task-1").await, false);
+    assert!(!task_done(&lix, "task-1").await);
 
     let merge = lix
         .merge_branch(MergeBranchOptions {
@@ -80,7 +80,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
     assert_eq!(merge.change_stats.total, 1);
     assert_eq!(merge.change_stats.modified, 1);
     assert_eq!(merge.created_merge_commit_id, None);
-    assert_eq!(task_done(&lix, "task-1").await, true);
+    assert!(task_done(&lix, "task-1").await);
 
     lix.close().await.unwrap();
 }
@@ -378,7 +378,7 @@ fn assert_crm_task_projection(result: &lix_sdk::ExecuteResult) {
         row.get::<String>("title").unwrap(),
         "Draft RS SDK flow".to_string()
     );
-    assert_eq!(row.get::<bool>("done").unwrap(), false);
+    assert!(!row.get::<bool>("done").unwrap());
 
     let meta = row.get::<Value>("meta").unwrap();
     let Value::Json(meta) = meta else {
@@ -391,7 +391,7 @@ fn assert_crm_task_projection(result: &lix_sdk::ExecuteResult) {
     assert_eq!(
         meta.get("tags")
             .and_then(|value| value.as_array())
-            .map(|tags| tags.len()),
+            .map(Vec::len),
         Some(2)
     );
 

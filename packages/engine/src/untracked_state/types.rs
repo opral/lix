@@ -1,6 +1,6 @@
+use crate::NullableKeyFilter;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
 ///

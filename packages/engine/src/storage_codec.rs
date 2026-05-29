@@ -4,6 +4,7 @@ pub(crate) mod option {
     use musli::de::SequenceDecoder;
     use musli::en::SequenceEncoder;
 
+    #[expect(clippy::ref_option)]
     pub(crate) fn encode<T, E>(value: &Option<T>, encoder: E) -> Result<(), E::Error>
     where
         T: musli::Encode<E::Mode>,
@@ -82,23 +83,23 @@ where
     })
 }
 
-pub(crate) fn decode<'de, T>(context: &str, bytes: &'de [u8]) -> Result<T, LixError>
+pub(crate) fn decode<'de, T>(context: &str, mut bytes: &'de [u8]) -> Result<T, LixError>
 where
     T: musli::Decode<'de, musli::mode::Binary, musli::alloc::Global>,
 {
-    let mut remaining = bytes;
-    let value = musli::storage::decode(&mut remaining).map_err(|error| {
+    #[expect(clippy::needless_borrows_for_generic_args)]
+    let value = musli::storage::decode(&mut bytes).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("failed to decode {context} with musli storage: {error}"),
         )
     })?;
-    if !remaining.is_empty() {
+    if !bytes.is_empty() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "failed to decode {context} with musli storage: {} trailing bytes",
-                remaining.len()
+                bytes.len()
             ),
         ));
     }

@@ -7,27 +7,30 @@ use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue, SchemaExt};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, SchemaExt, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
-use futures_util::{stream, TryStreamExt};
+use futures_util::{TryStreamExt, stream};
 use serde_json::Value as JsonValue;
 
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::branch::{
-    branch_descriptor_stage_row, branch_descriptor_tombstone_row, branch_ref_stage_row,
-    branch_ref_tombstone_row, BranchRefReader,
+    BranchRefReader, branch_descriptor_stage_row, branch_descriptor_tombstone_row,
+    branch_ref_stage_row, branch_ref_tombstone_row,
 };
 use crate::changelog::CommitId;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::record_batch::record_batch_with_row_count;
@@ -39,8 +42,6 @@ use crate::transaction::types::{
     LogicalPrimaryKey, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteRow,
 };
-use crate::LixError;
-use crate::GLOBAL_BRANCH_ID;
 
 pub(super) async fn register_lix_branch_read_provider(
     session: &datafusion::prelude::SessionContext,
@@ -337,7 +338,7 @@ impl DisplayAs for LixBranchDeleteExec {
 }
 
 impl ExecutionPlan for LixBranchDeleteExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixBranchDeleteExec"
     }
 
@@ -480,7 +481,7 @@ impl DisplayAs for LixBranchUpdateExec {
 }
 
 impl ExecutionPlan for LixBranchUpdateExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixBranchUpdateExec"
     }
 
@@ -614,7 +615,7 @@ impl DisplayAs for LixBranchScanExec {
 }
 
 impl ExecutionPlan for LixBranchScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixBranchScanExec"
     }
 
@@ -694,7 +695,7 @@ async fn load_branch_rows(
                 branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                 ..LiveStateFilter::default()
             },
-            projection: Default::default(),
+            projection: LiveStateProjection::default(),
             limit: None,
         })
         .await?;
@@ -1016,13 +1017,13 @@ fn update_string_value(
             "UPDATE lix_branch expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
-    .or_else(|error| {
+    .map_err(|error| {
         if batch.column(column_index).is_null(row_index) {
-            Err(DataFusionError::Execution(format!(
+            DataFusionError::Execution(format!(
                 "UPDATE lix_branch requires non-null text column '{column_name}'"
-            )))
+            ))
         } else {
-            Err(error)
+            error
         }
     })
 }
@@ -1045,13 +1046,13 @@ fn update_bool_value(
             "UPDATE lix_branch expected boolean column '{column_name}', got {other:?}"
         ))),
     }
-    .or_else(|error| {
+    .map_err(|error| {
         if batch.column(column_index).is_null(row_index) {
-            Err(DataFusionError::Execution(format!(
+            DataFusionError::Execution(format!(
                 "UPDATE lix_branch requires non-null boolean column '{column_name}'"
-            )))
+            ))
         } else {
-            Err(error)
+            error
         }
     })
 }
@@ -1077,13 +1078,17 @@ fn optional_string_value(
 ) -> Result<Option<String>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        | Some(
+            ScalarValue::Null
+            | ScalarValue::Utf8(None)
+            | ScalarValue::Utf8View(None)
+            | ScalarValue::LargeUtf8(None),
+        ) => Ok(None),
+        Some(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        ) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "{action} lix_branch expected text-compatible column '{column_name}', got {other:?}"
         ))),
@@ -1110,7 +1115,7 @@ fn optional_bool_value(
     action: &str,
 ) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        None | Some(ScalarValue::Null | ScalarValue::Boolean(None)) => Ok(None),
         Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "{action} lix_branch expected boolean column '{column_name}', got {other:?}"
@@ -1149,6 +1154,7 @@ fn dml_plan_properties(schema: SchemaRef) -> PlanProperties {
     )
 }
 
+#[expect(trivial_casts)]
 fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
     RecordBatch::try_new(
         schema,
@@ -1173,21 +1179,25 @@ fn branch_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<BranchColu
         BranchColumn::Hidden,
         BranchColumn::CommitId,
     ];
-    projection.map_or(all_columns.clone(), |indices| {
-        indices
-            .iter()
-            .filter_map(|index| all_columns.get(*index).copied())
-            .collect()
-    })
+    projection.map_or_else(
+        || all_columns.clone(),
+        |indices| {
+            indices
+                .iter()
+                .filter_map(|index| all_columns.get(*index).copied())
+                .collect()
+        },
+    )
 }
 
 fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> SchemaRef {
-    match projection {
-        Some(projection) => Arc::new(schema.project(projection).expect("projection is valid")),
-        None => Arc::clone(schema),
-    }
+    projection.map_or_else(
+        || Arc::clone(schema),
+        |projection| Arc::new(schema.project(projection).expect("projection is valid")),
+    )
 }
 
+#[expect(trivial_casts)]
 fn branch_record_batch(projection: &[BranchColumn], rows: &[BranchRow]) -> Result<RecordBatch> {
     let arrays = projection
         .iter()
@@ -1223,6 +1233,7 @@ fn branch_schema(projection: &[BranchColumn]) -> SchemaRef {
     ))
 }
 
+#[expect(trivial_casts)]
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }

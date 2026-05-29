@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::BranchContext;
@@ -19,13 +19,13 @@ use crate::storage::{
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::untracked_state::UntrackedStateContext;
-use crate::{NullableKeyFilter, GLOBAL_BRANCH_ID};
+use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";
 const TIMESTAMP: &str = "2026-05-19T00:00:00.000Z";
 const BENCH_BRANCH_ID: &str = "tracked-crud-branch";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BenchTransactionRow {
     pub schema_key: String,
     pub file_id: Option<String>,
@@ -34,6 +34,7 @@ pub struct BenchTransactionRow {
     pub updated_value: JsonValue,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct BenchTransactionFixture<B: StorageBackend> {
     storage: StorageContext<B>,
     live_state: Arc<LiveStateContext>,
@@ -68,7 +69,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BenchWriteAccounting {
     pub logical_rows: usize,
     pub staged_puts: u64,
@@ -80,7 +81,7 @@ pub struct BenchWriteAccounting {
     pub written_bytes: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BenchLayoutAccounting {
     pub space_id: u32,
     pub space: &'static str,
@@ -239,6 +240,7 @@ where
         1
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     async fn commit_rows(&mut self, rows: Vec<TransactionWriteRow>) -> BenchWriteAccounting {
         let logical_rows = rows.len();
         let opened = super::open_transaction(

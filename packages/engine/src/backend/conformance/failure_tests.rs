@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use super::{
-    run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
+    BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus, run_backend_conformance,
 };
 use crate::backend::{
     Backend, BackendError, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
@@ -180,6 +180,7 @@ fn detects_persistent_rollback_on_reopen_violation() {
     );
 }
 
+#[expect(clippy::uninlined_format_args)]
 fn assert_failed(mode: BrokenMode, test_name: &'static str) {
     let report = run_backend_conformance(&BrokenBackendFactory { mode });
     let failed = report
@@ -462,9 +463,9 @@ where
     if matches!(mode, BrokenMode::BadByteOrdering) {
         candidates.sort_by(|left, right| {
             left.0
-                 .0
+                .0
                 .len()
-                .cmp(&right.0 .0.len())
+                .cmp(&right.0.0.len())
                 .then(left.0.cmp(right.0))
         });
     }

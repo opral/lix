@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::common::{plan_err, DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, plan_err};
 use datafusion::logical_expr::ColumnarValue;
 use serde_json::Value as JsonValue;
 
@@ -145,7 +145,7 @@ pub(super) fn validate_utf8_encoding_arg(
     };
     let arrays = ColumnarValue::values_to_arrays(std::slice::from_ref(encoding))?;
     let array = &arrays[0];
-    if array.len() == 0 {
+    if array.is_empty() {
         return Ok(());
     }
     let Some(value) = text_like_value(array.as_ref(), 0)? else {

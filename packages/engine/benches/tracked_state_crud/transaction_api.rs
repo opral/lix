@@ -8,11 +8,11 @@ use lix_engine::{
     CoreProjection, Key, KeyRange, PointVisitor, ProjectedValue, PutBatch, ReadEntry, ReadOptions,
     ScanOptions, StoredValue, WriteOptions, WriteStats,
 };
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
 use std::sync::{Arc, Mutex};
 
 use crate::backends::{BackendProfile, ProfileBackend, RedbBackend, SqliteBackend};
-use crate::workload::{snapshot_value, WorkloadRow};
+use crate::workload::{WorkloadRow, snapshot_value};
 
 pub(crate) enum TransactionFixture {
     Sqlite(BenchTransactionFixture<BenchBackend<SqliteBackend>>),
@@ -333,11 +333,7 @@ impl BackendRead for OwnedRocksDbRead {
     {
         for (index, (key, value)) in keys
             .iter()
-            .zip(
-                self.db
-                    .multi_get(keys.iter().map(|key| key.0.as_ref()))
-                    .into_iter(),
-            )
+            .zip(self.db.multi_get(keys.iter().map(|key| key.0.as_ref())))
             .enumerate()
         {
             let value = value.map_err(rocksdb_error)?;

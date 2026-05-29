@@ -1,6 +1,6 @@
 mod common;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use plugin_json_v2::{apply_changes, detect_changes};
 
 fn bench_roundtrip_projection(c: &mut Criterion) {

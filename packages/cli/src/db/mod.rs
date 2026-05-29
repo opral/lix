@@ -3,10 +3,10 @@ use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_sdk::{
-    open_lix_with_backend, Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, Lix, LixError, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
-    WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, GetOptions, Key, KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef,
+    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions,
+    WriteStats, open_lix_with_backend,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -82,9 +82,9 @@ pub fn destroy_lix_at(path: &Path) -> Result<(), CliError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(CliError::io("failed to destroy lix file", error)),
     }
-    .and_then(|_| remove_sidecar(path, "wal"))
-    .and_then(|_| remove_sidecar(path, "shm"))
-    .and_then(|_| remove_sidecar(path, "journal"))
+    .and_then(|()| remove_sidecar(path, "wal"))
+    .and_then(|()| remove_sidecar(path, "shm"))
+    .and_then(|()| remove_sidecar(path, "journal"))
 }
 
 /// Prepares a `.lix` output target for initialization.
@@ -153,7 +153,7 @@ fn validate_lix_file_path(path: &Path) -> Result<(), CliError> {
     )))
 }
 
-pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -180,6 +180,7 @@ type KvMap = BTreeMap<Vec<u8>, Vec<u8>>;
 // or processes can still overwrite each other. SQLite should own CLI durability
 // and write concurrency instead.
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct FileBackend {
     path: Arc<PathBuf>,
     kv: Arc<Mutex<KvMap>>,
@@ -198,16 +199,19 @@ impl FileBackend {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct FileBackendRead {
     kv: KvMap,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct FileBackendRangeScan {
     rows: Vec<(Key, Vec<u8>)>,
     position: usize,
     projection: CoreProjection,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct FileBackendWrite {
     path: Arc<PathBuf>,
     parent: Arc<Mutex<KvMap>>,
@@ -403,7 +407,7 @@ impl BackendWrite for FileBackendWrite {
         self.clear_write_active();
         Ok(CommitResult {
             commit_id: None,
-            stats: self.stats.clone(),
+            stats: self.stats,
         })
     }
 

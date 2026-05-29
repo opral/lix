@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, FieldRef};
-use datafusion::common::{plan_err, DataFusionError, Result, ScalarValue};
+use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -21,7 +21,7 @@ impl ScalarUDFImpl for LixJson {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lix_json"
     }
 

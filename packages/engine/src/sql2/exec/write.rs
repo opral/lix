@@ -7,13 +7,13 @@ use serde_json::json;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::SqlLogicalPlan;
+use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{BoundWriteInput, BoundWriteTarget};
+use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::sql2::plan::LogicalWritePlan;
-use crate::sql2::SqlWriteExecutionContext;
-use crate::{LixError, Value, GLOBAL_BRANCH_ID};
+use crate::{GLOBAL_BRANCH_ID, LixError, Value};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +42,7 @@ pub(crate) async fn create_write_logical_plan(
     create_write_logical_plan_from_parsed(ctx, statement).await
 }
 
+#[expect(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn create_write_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     statement: DataFusionStatement,
@@ -225,11 +226,10 @@ fn normalize_lix_state_by_branch_scope(
     if !matches!(plan.bound.target, BoundWriteTarget::LixStateByBranch) {
         return Ok(());
     }
-    let branch_ids = match &plan.bound.branch_scope {
-        BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids } => {
-            branch_ids
-        }
-        _ => return Ok(()),
+    let (BranchScope::Explicit { branch_ids } | BranchScope::ExplicitRequired { branch_ids }) =
+        &plan.bound.branch_scope
+    else {
+        return Ok(());
     };
     let explicit_global = explicit_lix_state_global_value(&plan.bound.input, params)?.or(
         predicate_lix_state_global_value(&plan.bound.predicate, params)?,
@@ -461,8 +461,9 @@ impl ResolvedGlobalSelector {
     fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
-            (Self::Empty, selector) | (selector, Self::Empty) => selector,
+            (Self::Missing | Self::Empty, selector) | (selector, Self::Missing | Self::Empty) => {
+                selector
+            }
             (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
             (Self::Static(_), Self::Static(_)) => Self::Mixed,
         }
@@ -471,8 +472,9 @@ impl ResolvedGlobalSelector {
     fn intersect(self, other: Self) -> Self {
         match (self, other) {
             (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
-            (Self::Mixed, selector) | (selector, Self::Mixed) => selector,
+            (Self::Missing | Self::Mixed, selector) | (selector, Self::Missing | Self::Mixed) => {
+                selector
+            }
             (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
             (Self::Static(_), Self::Static(_)) => Self::Empty,
         }
@@ -591,8 +593,8 @@ fn global_selector_value(
 }
 
 fn insert_branch_param_values(
-    branch_ids: &mut std::collections::BTreeSet<String>,
-    param_indexes: &std::collections::BTreeSet<usize>,
+    branch_ids: &mut BTreeSet<String>,
+    param_indexes: &BTreeSet<usize>,
     params: &[Value],
 ) -> Result<(), LixError> {
     for index in param_indexes {

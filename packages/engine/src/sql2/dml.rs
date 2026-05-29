@@ -71,7 +71,7 @@ impl DisplayAs for InsertExec {
 }
 
 impl ExecutionPlan for InsertExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "InsertExec"
     }
 
@@ -139,6 +139,7 @@ fn dml_count_schema() -> SchemaRef {
     )]))
 }
 
+#[expect(trivial_casts)]
 fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
     RecordBatch::try_new(
         schema,

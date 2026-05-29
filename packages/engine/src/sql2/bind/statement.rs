@@ -10,16 +10,16 @@ use datafusion::sql::sqlparser::ast::{
 };
 use serde_json::Value as JsonValue;
 
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::LixError;
-use crate::GLOBAL_BRANCH_ID;
 
 use super::expr::{BoundExpr, BoundLiteral, BoundParamRef};
 use super::read::BoundRead;
 use super::table::{
-    bind_public_column_ref, bind_public_table, require_writable_column, BoundTable,
+    BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
 };
 use super::write::{
     BoundAssignment, BoundInsertValues, BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp,
@@ -495,10 +495,10 @@ fn bind_optional_predicate(
     expr: Option<&Expr>,
     params: &mut ParamBinder,
 ) -> Result<BoundPredicate, LixError> {
-    match expr {
-        Some(expr) => bind_predicate(table, expr, params),
-        None => Ok(BoundPredicate::True),
-    }
+    expr.map_or_else(
+        || Ok(BoundPredicate::True),
+        |expr| bind_predicate(table, expr, params),
+    )
 }
 
 fn bind_predicate(
@@ -665,7 +665,7 @@ fn bind_negative_number_expr(expr: &Expr) -> Result<BoundExpr, LixError> {
 }
 
 fn decode_hex_literal(value: &str) -> Result<BoundExpr, LixError> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(super::error::unsupported(format!(
             "hex literal has odd length '{value}'"
         )));
@@ -705,9 +705,8 @@ fn bind_insert_lix_json_literal(function: &Function) -> Result<Option<BoundExpr>
     let Expr::Value(value) = raw_args[0] else {
         return Ok(None);
     };
-    let raw = match &value.value {
-        Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => value,
-        _ => return Ok(None),
+    let (Value::SingleQuotedString(raw) | Value::DoubleQuotedString(raw)) = &value.value else {
+        return Ok(None);
     };
     let value = serde_json::from_str(raw).map_err(|error| {
         LixError::new(
@@ -770,10 +769,9 @@ fn reject_unsupported_function_modifiers(function: &Function) -> Result<(), LixE
 fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixError> {
     match name {
         "lix_json" => expect_exact_function_arity(name, actual, 1),
-        "lix_empty_blob" => expect_exact_function_arity(name, actual, 0),
-        "lix_timestamp" => expect_exact_function_arity(name, actual, 0),
-        "lix_uuid_v7" => expect_exact_function_arity(name, actual, 0),
-        "lix_active_branch_commit_id" => expect_exact_function_arity(name, actual, 0),
+        "lix_empty_blob" | "lix_timestamp" | "lix_uuid_v7" | "lix_active_branch_commit_id" => {
+            expect_exact_function_arity(name, actual, 0)
+        }
         "lix_json_get" | "lix_json_get_text" => expect_min_function_arity(name, actual, 2),
         "lix_text_encode" | "lix_text_decode" => {
             if (1..=2).contains(&actual) {
@@ -1112,7 +1110,9 @@ fn lix_state_by_branch_scope(
             BranchSelector::Static(_) => Err(super::error::unsupported(
                 "lix_state_by_branch writes cannot combine global = true with non-global branch_id",
             )),
-            BranchSelector::Dynamic { .. } => by_branch_scope(input, branch_column, branch_selector),
+            BranchSelector::Dynamic { .. } => {
+                by_branch_scope(input, branch_column, branch_selector)
+            }
         },
         GlobalSelector::Static(false) => match &branch_selector {
             BranchSelector::Static(branch_ids) if branch_ids.contains(GLOBAL_BRANCH_ID) => {
@@ -1210,8 +1210,9 @@ impl GlobalSelector {
         match (self, other) {
             (Self::Mixed, _) | (_, Self::Mixed) => Self::Mixed,
             (Self::Dynamic, _) | (_, Self::Dynamic) => Self::Dynamic,
-            (Self::Empty, selector) | (selector, Self::Empty) => selector,
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Empty | Self::Missing, selector) | (selector, Self::Empty | Self::Missing) => {
+                selector
+            }
             (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
             (Self::Static(_), Self::Static(_)) => Self::Mixed,
         }
@@ -1223,8 +1224,9 @@ impl GlobalSelector {
             (Self::Dynamic, Self::Missing) | (Self::Missing, Self::Dynamic) => Self::Dynamic,
             (Self::Dynamic, selector) | (selector, Self::Dynamic) => selector,
             (Self::Mixed, Self::Missing) | (Self::Missing, Self::Mixed) => Self::Mixed,
-            (Self::Mixed, selector) | (selector, Self::Mixed) => selector,
-            (Self::Missing, selector) | (selector, Self::Missing) => selector,
+            (Self::Mixed | Self::Missing, selector) | (selector, Self::Mixed | Self::Missing) => {
+                selector
+            }
             (Self::Static(left), Self::Static(right)) if left == right => Self::Static(left),
             (Self::Static(_), Self::Static(_)) => Self::Empty,
         }
@@ -1243,7 +1245,9 @@ fn insert_row_global_selector(
 
 fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelector, LixError> {
     match predicate {
-        BoundPredicate::True => Ok(GlobalSelector::Missing),
+        BoundPredicate::True | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
+            Ok(GlobalSelector::Missing)
+        }
         BoundPredicate::False => Ok(GlobalSelector::Empty),
         BoundPredicate::And(predicates) => {
             let mut result = GlobalSelector::Missing;
@@ -1277,7 +1281,6 @@ fn predicate_global_selector(predicate: &BoundPredicate) -> Result<GlobalSelecto
             .or_else(|| global_value_from_binary_exprs(right, left))
             .transpose()
             .map(|selector| selector.unwrap_or(GlobalSelector::Missing)),
-        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(GlobalSelector::Missing),
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
                 return Ok(GlobalSelector::Missing);
@@ -1447,7 +1450,9 @@ fn predicate_branch_selector(
     branch_column: &str,
 ) -> Result<BranchSelector, LixError> {
     match predicate {
-        BoundPredicate::True => Ok(BranchSelector::Missing),
+        BoundPredicate::True | BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => {
+            Ok(BranchSelector::Missing)
+        }
         BoundPredicate::False => Ok(BranchSelector::Static(BTreeSet::new())),
         BoundPredicate::And(predicates) => {
             let mut result = BranchSelector::Missing;
@@ -1473,7 +1478,6 @@ fn predicate_branch_selector(
                 .transpose()
                 .map(|selector| selector.unwrap_or(BranchSelector::Missing))
         }
-        BoundPredicate::IsNull(_) | BoundPredicate::IsNotNull(_) => Ok(BranchSelector::Missing),
         BoundPredicate::In { expr, values } => {
             let BoundExpr::Column(column) = expr else {
                 return Ok(BranchSelector::Missing);
@@ -1525,6 +1529,7 @@ fn active_branch_scope(active_branch_id: &str) -> BranchScope {
     }
 }
 
+#[derive(Default)]
 struct ParamBinder {
     next_implicit_index: usize,
     mode: Option<ParamMode>,
@@ -1535,16 +1540,6 @@ struct ParamBinder {
 enum ParamMode {
     Implicit,
     Numbered,
-}
-
-impl Default for ParamBinder {
-    fn default() -> Self {
-        Self {
-            next_implicit_index: 0,
-            mode: None,
-            params: BTreeMap::new(),
-        }
-    }
 }
 
 impl ParamBinder {
@@ -1629,9 +1624,11 @@ mod tests {
             .expect_err("implicit insert column list should fail closed");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("INSERT requires an explicit public column list"));
+        assert!(
+            error
+                .message
+                .contains("INSERT requires an explicit public column list")
+        );
     }
 
     #[test]
@@ -1652,9 +1649,11 @@ mod tests {
         .expect_err("entity INSERT SELECT should fail closed at binding");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("INSERT ... SELECT is not supported for entity SQL surfaces yet"));
+        assert!(
+            error
+                .message
+                .contains("INSERT ... SELECT is not supported for entity SQL surfaces yet")
+        );
     }
 
     #[test]
@@ -1680,9 +1679,11 @@ mod tests {
             .expect_err("duplicate lix_state_by_branch insert columns should be rejected");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(error
-            .message
-            .contains("duplicate write target column 'branch_id'"));
+        assert!(
+            error
+                .message
+                .contains("duplicate write target column 'branch_id'")
+        );
     }
 
     #[test]
@@ -1692,9 +1693,11 @@ mod tests {
             .expect_err("duplicate update columns should be rejected");
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(error
-            .message
-            .contains("duplicate write target column 'name'"));
+        assert!(
+            error
+                .message
+                .contains("duplicate write target column 'name'")
+        );
     }
 
     #[test]
@@ -1784,12 +1787,16 @@ mod tests {
         );
         assert_eq!(values.rows.len(), 1);
         assert_eq!(values.rows[0].len(), 2);
-        assert!(values.rows[0]
-            .iter()
-            .any(|value| matches!(value, BoundExpr::Param(param) if param.index == 1)));
-        assert!(values.rows[0]
-            .iter()
-            .any(|value| matches!(value, BoundExpr::Param(param) if param.index == 2)));
+        assert!(
+            values.rows[0]
+                .iter()
+                .any(|value| matches!(value, BoundExpr::Param(param) if param.index == 1))
+        );
+        assert!(
+            values.rows[0]
+                .iter()
+                .any(|value| matches!(value, BoundExpr::Param(param) if param.index == 2))
+        );
     }
 
     #[test]
@@ -1799,9 +1806,11 @@ mod tests {
             .expect_err("VALUES rows should not bind target table column refs");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("unsupported INSERT VALUES expression"));
+        assert!(
+            error
+                .message
+                .contains("unsupported INSERT VALUES expression")
+        );
     }
 
     #[test]
@@ -1991,9 +2000,11 @@ mod tests {
             .expect_err("parameterized global scope should fail closed until scope resolution");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("parameterized lix_state global scope selectors"));
+        assert!(
+            error
+                .message
+                .contains("parameterized lix_state global scope selectors")
+        );
     }
 
     #[test]
@@ -2005,9 +2016,11 @@ mod tests {
             .expect_err("global true and branch_id select contradictory scopes");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = true with non-global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = true with non-global branch_id")
+        );
     }
 
     #[test]
@@ -2030,9 +2043,11 @@ mod tests {
             .expect_err("global false cannot target the global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = false with global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = false with global branch_id")
+        );
     }
 
     #[test]
@@ -2178,9 +2193,11 @@ mod tests {
             .expect_err("mixed placeholder styles should be rejected");
 
         assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
-        assert!(error
-            .message
-            .contains("cannot mix SQL parameter placeholder styles"));
+        assert!(
+            error
+                .message
+                .contains("cannot mix SQL parameter placeholder styles")
+        );
     }
 
     #[test]
@@ -2212,9 +2229,11 @@ mod tests {
             .expect_err("EXPLAIN should not bind as a write");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("EXPLAIN statements are not supported"));
+        assert!(
+            error
+                .message
+                .contains("EXPLAIN statements are not supported")
+        );
     }
 
     #[test]
@@ -2225,9 +2244,11 @@ mod tests {
             .expect_err("target aliases should not be ignored");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("DML target aliases are not supported"));
+        assert!(
+            error
+                .message
+                .contains("DML target aliases are not supported")
+        );
     }
 
     fn parse_statement(sql: &str) -> DataFusionStatement {

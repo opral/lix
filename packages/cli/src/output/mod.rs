@@ -1,5 +1,5 @@
 use base64::Engine as _;
-use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, ContentArrangement, Row, Table};
+use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_BORDERS_ONLY};
 use lix_sdk::{ExecuteResult, Value};
 use serde_json::Value as JsonValue;
 

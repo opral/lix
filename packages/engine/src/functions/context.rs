@@ -1,11 +1,11 @@
+use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::functions::{
-    state, DeterministicFunctionProvider, DeterministicSequence, FunctionProvider,
-    FunctionProviderHandle, SystemFunctionProvider,
+    DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
+    SystemFunctionProvider, state,
 };
 use crate::live_state::LiveStateReader;
 use crate::storage::StorageWriteSet;
-use crate::LixError;
 
 /// Execution-scoped runtime function context.
 ///
@@ -23,6 +23,7 @@ impl FunctionContext {
     ///
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
+    #[expect(trivial_casts)]
     pub(crate) async fn prepare(live_state: &dyn LiveStateReader) -> Result<Self, LixError> {
         let mode = state::load_mode(live_state).await?;
         let mut bookkeeping_functions = SystemFunctionProvider;
@@ -73,12 +74,12 @@ impl FunctionContext {
 
 #[cfg(test)]
 mod tests {
+    use crate::GLOBAL_BRANCH_ID;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
-    use crate::functions::{state::load_sequence, DeterministicSequence};
+    use crate::functions::{DeterministicSequence, state::load_sequence};
     use crate::live_state::LiveStateContext;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::GLOBAL_BRANCH_ID;
 
     use super::*;
 
@@ -282,14 +283,8 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content),
             metadata: None,
-            created_at: crate::common::LixTimestamp::expect_parse(
-                "created_at",
-                "1970-01-01T00:00:00.000Z",
-            ),
-            updated_at: crate::common::LixTimestamp::expect_parse(
-                "updated_at",
-                "1970-01-01T00:00:00.000Z",
-            ),
+            created_at: LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "1970-01-01T00:00:00.000Z"),
             global: true,
             branch_id: GLOBAL_BRANCH_ID.to_string(),
         };

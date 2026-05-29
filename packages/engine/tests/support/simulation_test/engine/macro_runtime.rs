@@ -1,8 +1,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use lix_engine::backend::InMemoryBackend;
 use lix_engine::LixError;
+use lix_engine::backend::InMemoryBackend;
 use lix_engine::{Engine, InitReceipt};
 
 use super::expect_same::{

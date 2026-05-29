@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use lix_engine::backend::{KeyRef, PutEntry};
 use lix_sdk::{
@@ -15,7 +15,7 @@ use lix_sdk::{
     WriteStats,
 };
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
-use rusqlite::{params, Connection, Rows};
+use rusqlite::{Connection, Rows, params};
 use tempfile::TempDir;
 
 const ROWS: usize = 50_000;

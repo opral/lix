@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 
-use super::refs::BranchRefContext;
 use super::BranchRefReader;
+use super::refs::BranchRefContext;
 
 /// Aggregate entrypoint for branch-domain services.
 ///
@@ -23,7 +23,7 @@ impl BranchContext {
     }
 
     /// Creates a branch-ref reader over a caller-provided KV store.
-    pub(crate) fn ref_reader<S>(&self, store: S) -> impl BranchRefReader
+    pub(crate) fn ref_reader<S>(&self, store: S) -> impl BranchRefReader + use<S>
     where
         S: StorageRead + Send + Sync,
     {

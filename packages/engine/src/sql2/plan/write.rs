@@ -1,6 +1,6 @@
+use crate::LixError;
 use crate::sql2::bind::write::BoundWrite;
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
-use crate::LixError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LogicalWritePlan {
@@ -39,7 +39,12 @@ fn collect_predicate_filters(
     filters: &mut PlannedWriteFilters,
 ) -> Result<(), LixError> {
     match predicate {
-        BoundPredicate::True => Ok(()),
+        BoundPredicate::True
+        | BoundPredicate::Or(_)
+        | BoundPredicate::Eq(_, _)
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_)
+        | BoundPredicate::In { .. } => Ok(()),
         BoundPredicate::False => {
             filters.set_none();
             Ok(())
@@ -50,11 +55,6 @@ fn collect_predicate_filters(
             }
             Ok(())
         }
-        BoundPredicate::Or(_) => Ok(()),
-        BoundPredicate::Eq(_, _)
-        | BoundPredicate::IsNull(_)
-        | BoundPredicate::IsNotNull(_)
-        | BoundPredicate::In { .. } => Ok(()),
     }
 }
 

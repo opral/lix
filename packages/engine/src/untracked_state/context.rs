@@ -1,9 +1,9 @@
+use crate::LixError;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateIdentityRef,
     UntrackedStateRowRef, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
-use crate::LixError;
 
 /// Durable local overlay excluded from changelog and commit membership.
 ///
@@ -21,6 +21,7 @@ impl UntrackedStateContext {
     /// Creates a reader over a caller-provided KV store.
     ///
     /// The caller decides which KV store supplies visibility for the read.
+    #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateStoreReader<S>
     where
         S: StorageRead + Send + Sync,
@@ -32,6 +33,7 @@ impl UntrackedStateContext {
     ///
     /// The context never opens its own transaction; the caller applies the
     /// write set to choose the durable commit or rollback boundary.
+    #[expect(clippy::unused_self)]
     pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> UntrackedStateWriter<'a> {
         UntrackedStateWriter { writes }
     }
@@ -46,6 +48,7 @@ impl<S> UntrackedStateStoreReader<S>
 where
     S: StorageRead + Send + Sync,
 {
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn scan_rows(
         &mut self,
         request: &UntrackedStateScanRequest,
@@ -53,6 +56,7 @@ where
         crate::untracked_state::storage::scan_rows(&self.store, request).await
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn load_row(
         &mut self,
         request: &UntrackedStateRowRequest,
@@ -60,6 +64,7 @@ where
         crate::untracked_state::storage::load_row(&self.store, request).await
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn existing_identities<'a, I>(
         &mut self,
         identities: I,

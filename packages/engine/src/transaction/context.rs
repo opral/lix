@@ -1,10 +1,17 @@
+#![allow(
+    clippy::clone_on_copy,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_ref_mut
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
@@ -32,19 +39,18 @@ use crate::storage::{StorageContext, StorageRead, StorageReadScope, StorageWrite
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
-    normalize_transaction_write_row, remember_pending_registered_schema,
-    NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
+    NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY, normalize_transaction_write_row,
+    remember_pending_registered_schema,
 };
 use crate::transaction::prepare_branch_ref_row;
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
 use crate::transaction::types::{
-    stage_json_from_value, PreparedStateRow, PreparedTransactionWrite, StagedCommitChangeRef,
-    TransactionFileData, TransactionJson, TransactionWrite, TransactionWriteMode,
-    TransactionWriteOutcome, TransactionWriteRow,
+    PreparedStateRow, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
+    TransactionWriteRow, stage_json_from_value,
 };
-use crate::transaction::validation::{validate_prepared_writes, TransactionValidationInput};
-use crate::GLOBAL_BRANCH_ID;
+use crate::transaction::validation::{TransactionValidationInput, validate_prepared_writes};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -313,12 +319,9 @@ where
         };
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         check_commit_boundary(commit_boundary.as_ref())?;
-        if let Err(error) = transaction
+        transaction
             .validate_prepared_writes_by_branch(&prepared_writes)
-            .await
-        {
-            return Err(error);
-        }
+            .await?;
         let mut read = transaction
             .storage
             .begin_read(StorageReadOptions::default())?;
@@ -487,7 +490,7 @@ where
                 .await?;
             validate_prepared_writes(TransactionValidationInput::new(
                 &branch_prepared_writes,
-                &schema_catalog,
+                schema_catalog,
                 &live_state,
             ))
             .await?;
@@ -588,7 +591,7 @@ where
     pub(crate) async fn advance_branch_ref(
         &mut self,
         branch_id: &str,
-        commit_id: crate::changelog::CommitId,
+        commit_id: CommitId,
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp().to_string();
         let canonical_row = prepare_branch_ref_row(branch_id, &commit_id, &timestamp)?;
@@ -599,7 +602,7 @@ where
     pub(crate) fn stage_merge_commit(
         &self,
         branch_id: String,
-        source_parent_commit_id: crate::changelog::CommitId,
+        source_parent_commit_id: CommitId,
         selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
     ) -> Result<String, LixError> {
         let commit_id = self
@@ -890,24 +893,20 @@ where
         overlay_scan_rows(&base, &staged, request).await
     }
 
-    async fn load_branch_head(
-        &mut self,
-        branch_id: &str,
-    ) -> Result<Option<crate::changelog::CommitId>, LixError> {
+    async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
         let read = self.storage.begin_read(StorageReadOptions::default())?;
-        let result = self
-            .branch_ctx
+
+        self.branch_ctx
             .ref_reader(&read)
             .load_head_commit_id(branch_id)
-            .await;
-        result
+            .await
     }
 
     async fn stage_write(
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        Transaction::stage_write(self, write).await
+        Self::stage_write(self, write).await
     }
 }
 
@@ -1062,20 +1061,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::GLOBAL_BRANCH_ID;
+    use crate::NullableKeyFilter;
     use crate::branch::BranchContext;
     use crate::changelog::ChangelogReader;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions};
     use crate::tracked_state::{TrackedStateKey, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
-    use crate::NullableKeyFilter;
-    use crate::GLOBAL_BRANCH_ID;
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
-            crate::untracked_state::UntrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
+            TrackedStateContext::new(),
+            UntrackedStateContext::new(),
+            CommitGraphContext::new(),
         )
     }
 
@@ -1088,7 +1087,7 @@ mod tests {
         let live_state = Arc::new(live_state_context());
         seed_visible_schema_rows(storage.clone()).await;
         let binary_cas = Arc::new(BinaryCasContext::new());
-        let tracked_state = Arc::new(crate::tracked_state::TrackedStateContext::new());
+        let tracked_state = Arc::new(TrackedStateContext::new());
         let branch_ctx = Arc::new(BranchContext::new(Arc::new(UntrackedStateContext::new())));
         let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
@@ -1128,7 +1127,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("tracked-programmatic"),
+                entity_pk: EntityPk::single("tracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1171,7 +1170,7 @@ mod tests {
             .expect("branch ref should load")
             .expect("tracked commit should advance the global branch ref");
 
-        let tracked_row = crate::tracked_state::TrackedStateContext::new()
+        let tracked_row = TrackedStateContext::new()
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -1181,7 +1180,7 @@ mod tests {
                 &head_commit_id.to_string(),
                 &[TrackedStateKey {
                     schema_key: "lix_key_value".to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single("tracked-programmatic"),
+                    entity_pk: EntityPk::single("tracked-programmatic"),
                     file_id: None,
                 }],
             )
@@ -1196,7 +1195,7 @@ mod tests {
             Some(r#"{"key":"tracked-programmatic","value":"tracked"}"#)
         );
 
-        let untracked_row = crate::untracked_state::UntrackedStateContext::new()
+        let untracked_row = UntrackedStateContext::new()
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -1205,7 +1204,7 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("untracked-programmatic"),
+                entity_pk: EntityPk::single("untracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1222,10 +1221,10 @@ mod tests {
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .load_row(&crate::live_state::LiveStateRowRequest {
+            .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("untracked-programmatic"),
+                entity_pk: EntityPk::single("untracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1235,7 +1234,7 @@ mod tests {
         assert!(live_untracked_row.global);
         assert_eq!(live_untracked_row.branch_id, GLOBAL_BRANCH_ID);
 
-        let tracked_rows = crate::tracked_state::TrackedStateContext::new()
+        let tracked_rows = TrackedStateContext::new()
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -1276,7 +1275,7 @@ mod tests {
             .scan_live_state(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_pks: vec![crate::entity_pk::EntityPk::single("lossy-timestamp")],
+                    entity_pks: vec![EntityPk::single("lossy-timestamp")],
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     untracked: Some(true),
@@ -1308,7 +1307,7 @@ mod tests {
             },
             storage.clone(),
             Arc::clone(&live_state),
-            Arc::new(crate::tracked_state::TrackedStateContext::new()),
+            Arc::new(TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
@@ -1551,7 +1550,7 @@ mod tests {
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("right-id", "value", false);
-        row.entity_pk = Some(crate::entity_pk::EntityPk::single("wrong-id"));
+        row.entity_pk = Some(EntityPk::single("wrong-id"));
 
         let error = transaction
             .stage_rows(vec![row])
@@ -1588,7 +1587,7 @@ mod tests {
             },
             storage,
             Arc::clone(&live_state),
-            Arc::new(crate::tracked_state::TrackedStateContext::new()),
+            Arc::new(TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&branch_ctx),
             catalog_context,
@@ -1645,19 +1644,19 @@ mod tests {
         crate::test_support::stage_tracked_root_from_materialized(
             &mut read,
             &mut writes,
-            &crate::tracked_state::TrackedStateContext::new(),
+            &TrackedStateContext::new(),
             SCHEMA_FIXTURE_COMMIT_ID,
             None,
             &rows,
         )
         .await
         .expect("schema fixture rows should stage");
-        crate::untracked_state::UntrackedStateContext::new()
+        UntrackedStateContext::new()
             .writer(&mut writes)
             .stage_rows([branch_ref_row.row.as_ref()])
             .expect("schema fixture branch ref should stage");
         storage
-            .commit_write_set(writes, crate::storage::StorageWriteOptions::default())
+            .commit_write_set(writes, StorageWriteOptions::default())
             .expect("schema fixture transaction should commit");
     }
 
@@ -1687,10 +1686,10 @@ mod tests {
                     .begin_read(StorageReadOptions::default())
                     .expect("read should open"),
             )
-            .load_row(&crate::live_state::LiveStateRowRequest {
+            .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single(rejected_entity_pk),
+                entity_pk: EntityPk::single(rejected_entity_pk),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1703,7 +1702,7 @@ mod tests {
 
     fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> TransactionWriteRow {
         TransactionWriteRow {
-            entity_pk: Some(crate::entity_pk::EntityPk::single(key)),
+            entity_pk: Some(EntityPk::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(json!({

@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
@@ -9,7 +10,6 @@ use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveSt
 use crate::storage::StorageWriteSet;
 use crate::untracked_state::UntrackedStateContext;
 use crate::untracked_state::UntrackedStateRow;
-use crate::GLOBAL_BRANCH_ID;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
@@ -149,13 +149,14 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
     Ok(DeterministicSequence { highest_seen })
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn deterministic_key_value_row(
     key: &str,
     snapshot_content: &str,
     timestamp: LixTimestamp,
 ) -> Result<UntrackedStateRow, LixError> {
     Ok(UntrackedStateRow {
-        entity_pk: crate::entity_pk::EntityPk::single(key),
+        entity_pk: EntityPk::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content.to_string()),
@@ -178,7 +179,7 @@ mod tests {
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
-            crate::untracked_state::UntrackedStateContext::new(),
+            UntrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
     }
@@ -300,7 +301,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await

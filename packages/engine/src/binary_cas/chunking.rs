@@ -3,6 +3,7 @@ const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
 const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
 const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
 
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return Vec::new();
@@ -18,8 +19,8 @@ pub(crate) fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         FASTCDC_MAX_CHUNK_BYTES as u32,
     )
     .map(|chunk| {
-        let start = chunk.offset as usize;
-        let end = start + (chunk.length as usize);
+        let start = chunk.offset;
+        let end = start + chunk.length;
         (start, end)
     })
     .collect()

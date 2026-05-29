@@ -1,13 +1,13 @@
+use crate::ROOT_ENTITY_PK;
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
 use crate::exports::lix::plugin::api::{DetectStateContext, EntityChange, File, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
-use crate::ROOT_ENTITY_PK;
 use markdown::mdast::{Node, Root};
-use markdown::{to_mdast, ParseOptions};
+use markdown::{ParseOptions, to_mdast};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use strsim::normalized_levenshtein;
-use unicode_normalization::{is_nfc, UnicodeNormalization};
+use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 #[derive(Debug, Clone)]
 struct ParsedBlock {
@@ -183,6 +183,7 @@ fn parse_state_context_projection(
     })
 }
 
+#[expect(clippy::cast_precision_loss)]
 fn assign_ids_with_existing_state(
     candidates: Vec<ParsedBlockCandidate>,
     before_order: &[String],
@@ -341,9 +342,9 @@ fn assign_ids_with_existing_state(
                         .get(id)
                         .map(String::as_str)
                         .unwrap_or(&before.markdown);
-                    let similarity = normalized_levenshtein(&before_text, &after_text);
+                    let similarity = normalized_levenshtein(before_text, after_text);
                     let position = 1.0 - ((after_idx as f64 - *before_idx as f64).abs() / total);
-                    let score = similarity * 0.75 + position * 0.25;
+                    let score = similarity.mul_add(0.75, position * 0.25);
                     (id.clone(), similarity, score)
                 })
                 .collect::<Vec<_>>();
@@ -363,11 +364,7 @@ fn assign_ids_with_existing_state(
                 }
             };
 
-            if accept {
-                Some(top.0)
-            } else {
-                None
-            }
+            if accept { Some(top.0) } else { None }
         };
 
         if let Some(id) = chosen {
@@ -379,6 +376,11 @@ fn assign_ids_with_existing_state(
     assign_missing_ids(candidates, assigned_ids)
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn sampled_positions(total: usize, picks: usize) -> Vec<usize> {
     if picks == 0 || total == 0 {
         return Vec::new();
@@ -406,7 +408,7 @@ fn assign_missing_ids(
     let mut occurrence_counter: HashMap<(String, String), u32> = HashMap::new();
     let mut used_ids = assigned_ids
         .iter()
-        .filter_map(|id| id.clone())
+        .filter_map(Clone::clone)
         .collect::<HashSet<_>>();
 
     candidates
@@ -528,8 +530,7 @@ fn parse_top_level_block_candidates(
 fn parse_markdown_to_root(markdown: &str) -> Result<Root, PluginError> {
     let tree = to_mdast(markdown, &parse_options_all_extensions()).map_err(|error| {
         PluginError::InvalidInput(format!(
-            "markdown parse failed with configured extensions: {}",
-            error
+            "markdown parse failed with configured extensions: {error}"
         ))
     })?;
 
@@ -643,17 +644,17 @@ fn block_id(node_type: &str, fingerprint: &str, occurrence: u32) -> String {
 }
 
 fn fnv1a64(input: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in input {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }
 
 fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, PluginError> {
     std::str::from_utf8(bytes)
-        .map(|markdown| markdown.to_owned())
+        .map(ToOwned::to_owned)
         .map_err(|error| {
             PluginError::InvalidInput(format!(
                 "file.data must be valid UTF-8 markdown bytes: {error}"
@@ -662,8 +663,9 @@ fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, PluginError> {
 }
 
 fn is_markdown_path(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    path.ends_with(".md") || path.ends_with(".mdx")
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("mdx"))
 }
 
 fn parse_options_all_extensions() -> ParseOptions {

@@ -1,13 +1,13 @@
+use crate::LixError;
 use crate::changelog::CommitId;
 use crate::storage::StorageRead;
 use crate::tracked_state::{
-    plan_merge, TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan,
-    TrackedStateStoreReader,
+    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStateStoreReader,
+    plan_merge,
 };
-use crate::LixError;
 
-use super::conflicts::{conflicts_from_plan, MergeConflict};
-use super::stats::{stats_from_diff, stats_from_plan, MergeStats};
+use super::conflicts::{MergeConflict, conflicts_from_plan};
+use super::stats::{MergeStats, stats_from_diff, stats_from_plan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeOutcome {

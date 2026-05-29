@@ -1,3 +1,13 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::clone_on_copy,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_ref_mut,
+    clippy::redundant_closure,
+    clippy::unnecessary_wraps,
+    clippy::unused_self
+)]
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -9,8 +19,8 @@ use super::codec::{
     encode_commit_change_ref_chunk, encode_commit_record,
 };
 use super::store::{
-    change_key, commit_change_ref_chunk_key, commit_change_ref_chunk_prefix, commit_key,
-    CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE,
+    CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key,
+    commit_change_ref_chunk_key, commit_change_ref_chunk_prefix, commit_key,
 };
 use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
@@ -23,7 +33,7 @@ use crate::storage::{
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
     StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
 };
-use crate::{storage_codec, LixError};
+use crate::{LixError, storage_codec};
 
 const COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION: u32 = 1;
 const COMMIT_CHANGE_REF_CHUNK_TARGET_BYTES: usize = 64 * 1024;
@@ -208,7 +218,7 @@ where
         let entries = request
             .commit_ids
             .iter()
-            .zip(stored.entries.into_iter())
+            .zip(stored.entries)
             .map(|(commit_id, stored)| {
                 if let Some(record) = self.staged_commits.get(commit_id) {
                     return Some(project_commit_entry(
@@ -242,7 +252,7 @@ where
             })
             .cloned()
             .collect::<Vec<_>>();
-        staged.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+        staged.sort_by_key(|left| left.commit_id);
         for commit in staged {
             batch.entries.push(project_commit_entry(
                 request.projection,
@@ -253,9 +263,7 @@ where
                     .unwrap_or_default(),
             ));
         }
-        batch
-            .entries
-            .sort_by(|left, right| commit_entry_id(left).cmp(&commit_entry_id(right)));
+        batch.entries.sort_by_key(|left| commit_entry_id(left));
         let limit = request.limit.unwrap_or(usize::MAX);
         if batch.entries.len() > limit {
             batch.entries.truncate(limit);
@@ -272,7 +280,7 @@ where
         let entries = request
             .change_ids
             .iter()
-            .zip(stored.entries.into_iter())
+            .zip(stored.entries)
             .map(|(change_id, stored)| self.staged_changes.get(change_id).cloned().or(stored))
             .collect();
         Ok(ChangeLoadBatch { entries })
@@ -294,18 +302,16 @@ where
             })
             .cloned()
             .collect::<Vec<_>>();
-        staged.sort_by(|left, right| left.change_id.cmp(&right.change_id));
+        staged.sort_by_key(|left| left.change_id);
         batch.entries.extend(staged);
-        batch
-            .entries
-            .sort_by(|left, right| left.change_id.cmp(&right.change_id));
+        batch.entries.sort_by_key(|left| left.change_id);
         batch
             .entries
             .dedup_by(|left, right| left.change_id == right.change_id);
         let limit = request.limit.unwrap_or(usize::MAX);
         if batch.entries.len() > limit {
             batch.entries.truncate(limit);
-            batch.next_start_after = batch.entries.last().map(|change| change.change_id.clone());
+            batch.next_start_after = batch.entries.last().map(|change| change.change_id);
         }
         Ok(batch)
     }
@@ -322,27 +328,27 @@ where
         for change in append.changes {
             self.writes.put(
                 CHANGE_SPACE,
-                change_key(&change.change_id),
+                change_key(change.change_id),
                 encode_change_record(&change)?,
             );
-            self.staged_changes.insert(change.change_id.clone(), change);
+            self.staged_changes.insert(change.change_id, change);
         }
 
         let chunks = chunk_commit_change_refs(append.commit_change_refs)?;
         for commit in append.commits {
             self.writes.put(
                 COMMIT_SPACE,
-                commit_key(&commit.commit_id),
+                commit_key(commit.commit_id),
                 encode_commit_record(&commit)?,
             );
-            self.staged_commits.insert(commit.commit_id.clone(), commit);
+            self.staged_commits.insert(commit.commit_id, commit);
         }
 
         for (commit_id, commit_chunks) in chunks {
             for (chunk_no, chunk) in commit_chunks.iter().enumerate() {
                 self.writes.put(
                     COMMIT_CHANGE_REF_CHUNK_SPACE,
-                    commit_change_ref_chunk_key(&commit_id, chunk_no as u32),
+                    commit_change_ref_chunk_key(commit_id, chunk_no as u32),
                     encode_commit_change_ref_chunk(chunk)?,
                 );
             }
@@ -490,8 +496,7 @@ where
         {
             if found.is_some() || self.staged_commits.contains_key(commit_id) {
                 return Err(LixError::unknown(format!(
-                    "changelog commit '{}' already exists",
-                    commit_id
+                    "changelog commit '{commit_id}' already exists"
                 )));
             }
         }
@@ -510,8 +515,7 @@ where
         {
             if found.is_some() || self.staged_changes.contains_key(change_id) {
                 return Err(LixError::unknown(format!(
-                    "changelog change '{}' already exists",
-                    change_id
+                    "changelog change '{change_id}' already exists"
                 )));
             }
         }
@@ -536,8 +540,7 @@ where
         {
             if found.is_none() && !self.staged_commits.contains_key(parent_id) {
                 return Err(LixError::unknown(format!(
-                    "changelog parent commit '{}' does not exist",
-                    parent_id
+                    "changelog parent commit '{parent_id}' does not exist"
                 )));
             }
         }
@@ -666,7 +669,7 @@ async fn scan_commits_from_store(
     let mut entries = Vec::with_capacity(page.values.len());
     for (key, value) in page.keys.iter().zip(page.values.iter()) {
         let record: CommitRecord = storage_codec::decode("commit record", value)?;
-        if key.as_slice() != commit_key(&record.commit_id).as_slice() {
+        if key.as_slice() != commit_key(record.commit_id).as_slice() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -738,7 +741,7 @@ async fn scan_changes_from_store(
     let mut entries = Vec::with_capacity(page.values.len());
     for (key, value) in page.keys.iter().zip(page.values.iter()) {
         let record = decode_change_record(value)?;
-        if key.as_slice() != change_key(&record.change_id).as_slice() {
+        if key.as_slice() != change_key(record.change_id).as_slice() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -824,7 +827,7 @@ fn chunk_commit_change_refs(
 ) -> Result<HashMap<CommitId, Vec<CommitChangeRefChunk>>, LixError> {
     refs.into_iter()
         .map(|refs| {
-            let commit_id = refs.commit_id.clone();
+            let commit_id = refs.commit_id;
             Ok((
                 commit_id,
                 chunk_one_commit_change_refs(
@@ -860,7 +863,7 @@ fn chunk_one_commit_change_refs(
     });
 
     let mut chunks = Vec::new();
-    let mut builder = CommitChangeRefChunkBuilder::new(refs.commit_id.clone());
+    let mut builder = CommitChangeRefChunkBuilder::new(refs.commit_id);
     for entry in refs.entries {
         let candidate_size = builder.estimated_size_after(&entry);
         if !builder.is_empty()
@@ -869,7 +872,7 @@ fn chunk_one_commit_change_refs(
                 || candidate_size > max_bytes)
         {
             chunks.push(builder.finish()?);
-            builder = CommitChangeRefChunkBuilder::new(refs.commit_id.clone());
+            builder = CommitChangeRefChunkBuilder::new(refs.commit_id);
         }
 
         builder.push(entry);
@@ -989,7 +992,7 @@ fn encoded_commit_change_ref_entry_size(entry: &CommitChangeRef) -> usize {
 }
 
 fn encoded_change_id_size(_change_id: &ChangeId) -> usize {
-    std::mem::size_of::<uuid::Bytes>()
+    size_of::<uuid::Bytes>()
 }
 
 fn encoded_entity_pk_compact_size(identity: &crate::entity_pk::EntityPk) -> usize {
@@ -1239,9 +1242,11 @@ mod tests {
             .expect("refs should chunk under small test limit");
 
         assert!(chunks.len() > 1);
-        assert!(chunks
-            .iter()
-            .all(|chunk| encode_commit_change_ref_chunk(chunk).unwrap().len() <= 260));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| encode_commit_change_ref_chunk(chunk).unwrap().len() <= 260)
+        );
         assert_eq!(
             chunks
                 .iter()
@@ -1415,7 +1420,7 @@ mod tests {
         });
         append.commit_change_refs[0].entries.insert(
             0,
-            crate::changelog::CommitChangeRef {
+            CommitChangeRef {
                 schema_key: "alpha".to_string(),
                 file_id: None,
                 entity_pk: EntityPk::single("entity-0"),

@@ -1,4 +1,4 @@
-use crate::backend::conformance::{baseline, model_based, persistence, BackendFactory};
+use crate::backend::conformance::{BackendFactory, baseline, model_based, persistence};
 
 pub type ConformanceResult = Result<(), String>;
 

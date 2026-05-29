@@ -1,6 +1,17 @@
+#![allow(
+    clippy::cloned_instead_of_copied,
+    clippy::large_enum_variant,
+    clippy::option_as_ref_cloned,
+    clippy::option_if_let_else,
+    clippy::ref_option,
+    clippy::unnecessary_wraps,
+    clippy::unused_self
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::domain::{Domain, DomainRowIdentity};
@@ -11,15 +22,14 @@ use crate::functions::FunctionProviderHandle;
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
-#[cfg(test)]
-use crate::transaction::types::{stage_json_from_value, TransactionJson};
 use crate::transaction::types::{
     LogicalPrimaryKey, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
     TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome,
 };
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRefs};
-use crate::GLOBAL_BRANCH_ID;
+#[cfg(test)]
+use crate::transaction::types::{TransactionJson, stage_json_from_value};
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local write buffer after transaction-boundary preparation.
@@ -633,7 +643,7 @@ pub(crate) enum StagedExactRow {
 pub(crate) struct PreparedStateRowIdentity {
     untracked: bool,
     schema_key: String,
-    entity_pk: crate::entity_pk::EntityPk,
+    entity_pk: EntityPk,
     file_id: Option<String>,
     branch_id: String,
 }
@@ -670,7 +680,7 @@ impl PreparedStateRowIdentity {
         &self.schema_key
     }
 
-    pub(crate) fn entity_pk(&self) -> &crate::entity_pk::EntityPk {
+    pub(crate) fn entity_pk(&self) -> &EntityPk {
         &self.entity_pk
     }
 
@@ -733,7 +743,7 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    entity_pk: &crate::entity_pk::EntityPk,
+    entity_pk: &EntityPk,
     branch_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
 ) -> String {
@@ -805,7 +815,6 @@ fn add_row_to_commit_change_refs(
     }
     let change_id = row
         .change_id
-        .clone()
         .expect("tracked staged rows must carry change_id for commit change refs");
     let change_refs = change_refs_by_branch
         .entry(row.branch_id.clone())
@@ -817,7 +826,7 @@ fn add_row_to_commit_change_refs(
                 timestamp,
             )
         });
-    row.commit_id = Some(change_refs.commit_id.clone());
+    row.commit_id = Some(change_refs.commit_id);
     change_refs.add_change_id(change_id);
 }
 
@@ -928,7 +937,7 @@ mod tests {
             .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: "global".to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single("sql2-duplicate-key"),
+                entity_pk: EntityPk::single("sql2-duplicate-key"),
                 file_id: NullableKeyFilter::Null,
             })
             .expect("staged row should be visible");
@@ -994,10 +1003,12 @@ mod tests {
             .load_exact(&exact_request_for_key("sql2-delete-key"))
             .expect("staged tombstone should answer exact load");
         assert!(matches!(exact, StagedExactRow::Tombstone));
-        assert!(overlay
-            .scan(&scan_request_for_key("sql2-delete-key", false))
-            .expect("overlay scan should succeed")
-            .is_empty());
+        assert!(
+            overlay
+                .scan(&scan_request_for_key("sql2-delete-key", false))
+                .expect("overlay scan should succeed")
+                .is_empty()
+        );
 
         let tombstones = overlay
             .scan(&scan_request_for_key("sql2-delete-key", true))
@@ -1067,7 +1078,7 @@ mod tests {
 
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == crate::entity_pk::EntityPk::single("sql2-key-a")
+            row.entity_pk == EntityPk::single("sql2-key-a")
                 && row
                     .snapshot
                     .as_ref()
@@ -1075,7 +1086,7 @@ mod tests {
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == crate::entity_pk::EntityPk::single("sql2-key-b")
+            row.entity_pk == EntityPk::single("sql2-key-b")
                 && row
                     .snapshot
                     .as_ref()
@@ -1154,17 +1165,21 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![state_row("overwrite-key", "first")
-                    .with_tracked()
-                    .with_change_id("change-first")],
+                rows: vec![
+                    state_row("overwrite-key", "first")
+                        .with_tracked()
+                        .with_change_id("change-first"),
+                ],
             })
             .expect("initial tracked row should stage");
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![state_row("overwrite-key", "second")
-                    .with_tracked()
-                    .with_change_id("change-second")],
+                rows: vec![
+                    state_row("overwrite-key", "second")
+                        .with_tracked()
+                        .with_change_id("change-second"),
+                ],
             })
             .expect("tracked overwrite should stage");
 
@@ -1252,12 +1267,10 @@ mod tests {
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == crate::entity_pk::EntityPk::single("shared-domain-key")
-                && !row.untracked
+            row.entity_pk == EntityPk::single("shared-domain-key") && !row.untracked
         }));
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_pk == crate::entity_pk::EntityPk::single("shared-domain-key")
-                && row.untracked
+            row.entity_pk == EntityPk::single("shared-domain-key") && row.untracked
         }));
     }
 
@@ -1268,9 +1281,11 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![state_row("active-branch-key", "value")
-                    .with_tracked()
-                    .with_branch("branch-a")],
+                rows: vec![
+                    state_row("active-branch-key", "value")
+                        .with_tracked()
+                        .with_branch("branch-a"),
+                ],
             })
             .expect("active-branch tracked staging should accumulate change_refs");
 
@@ -1300,9 +1315,11 @@ mod tests {
             })
             .expect_err("global row with non-global branch should fail");
 
-        assert!(error
-            .message
-            .contains("global staged rows must use the global branch id"));
+        assert!(
+            error
+                .message
+                .contains("global staged rows must use the global branch id")
+        );
     }
 
     #[tokio::test]
@@ -1334,7 +1351,7 @@ mod tests {
         let rows = overlay
             .scan(&LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    entity_pks: vec![crate::entity_pk::EntityPk::single("shared-entity")],
+                    entity_pks: vec![EntityPk::single("shared-entity")],
                     include_tombstones: true,
                     ..LiveStateFilter::default()
                 },
@@ -1345,12 +1362,10 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
-                .filter(
-                    |row| row.entity_pk == crate::entity_pk::EntityPk::single("shared-entity")
-                        && row.branch_id == "global"
-                        && row.schema_key == "lix_key_value"
-                        && row.file_id.is_none()
-                )
+                .filter(|row| row.entity_pk == EntityPk::single("shared-entity")
+                    && row.branch_id == "global"
+                    && row.schema_key == "lix_key_value"
+                    && row.file_id.is_none())
                 .count(),
             1
         );
@@ -1408,6 +1423,7 @@ mod tests {
         );
     }
 
+    #[expect(trivial_casts)]
     fn test_staged_writes() -> Arc<TransactionWriteBuffer> {
         Arc::new(TransactionWriteBuffer::new(FunctionProviderHandle::shared(
             Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>,
@@ -1464,7 +1480,7 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
-            entity_pk: crate::entity_pk::EntityPk::single(key),
+            entity_pk: EntityPk::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot: Some(snapshot),
@@ -1496,7 +1512,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             branch_id: "global".to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single(key),
+            entity_pk: EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -1505,7 +1521,7 @@ mod tests {
         LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                entity_pks: vec![crate::entity_pk::EntityPk::single(key)],
+                entity_pks: vec![EntityPk::single(key)],
                 branch_ids: vec!["global".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,

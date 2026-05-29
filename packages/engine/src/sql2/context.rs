@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
+use crate::LixError;
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
@@ -12,12 +13,11 @@ use crate::commit_graph::CommitGraphReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
-use crate::LixError;
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
@@ -276,7 +276,7 @@ impl LiveStateReader for WriteContextLiveStateReader {
                     file_ids: vec![request.file_id.clone()],
                     ..LiveStateFilter::default()
                 },
-                projection: Default::default(),
+                projection: LiveStateProjection::default(),
                 limit: Some(1),
             })
             .await?;

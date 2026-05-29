@@ -14,7 +14,7 @@ impl ScalarUDFImpl for LixEmptyBlob {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lix_empty_blob"
     }
 

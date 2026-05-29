@@ -4,12 +4,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lix_engine::Engine;
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
     InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
     WriteOptions,
 };
-use lix_engine::Engine;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -26,10 +26,9 @@ fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
 
 fn join_thread<T>(handle: thread::JoinHandle<T>, description: &str) -> T {
     wait_until(description, || handle.is_finished());
-    match handle.join() {
-        Ok(result) => result,
-        Err(_) => panic!("{description} panicked"),
-    }
+    handle
+        .join()
+        .unwrap_or_else(|_| panic!("{description} panicked"))
 }
 
 #[tokio::test]
@@ -455,9 +454,8 @@ async fn close_during_transaction_open_rejects_opened_transaction() {
     );
 
     gate.release();
-    let open_error = match join_thread(opener, "blocked transaction opener") {
-        Ok(_) => panic!("transaction open that loses the close race should fail"),
-        Err(error) => error,
+    let Err(open_error) = join_thread(opener, "blocked transaction opener") else {
+        panic!("transaction open that loses the close race should fail");
     };
     assert_eq!(open_error.code, lix_engine::LixError::CODE_CLOSED);
     join_thread(closer, "close after blocked transaction opener")
@@ -599,7 +597,7 @@ fn spawn_close_waiter<B>(
     session: Arc<lix_engine::SessionContext<B>>,
 ) -> thread::JoinHandle<Result<(), lix_engine::LixError>>
 where
-    B: lix_engine::backend::Backend + Clone + Send + Sync + 'static,
+    B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Clone + Send + Sync + 'static,
     for<'backend> B::Write<'backend>: Send,
 {
@@ -645,9 +643,8 @@ async fn begin_transaction_cannot_race_with_opening_session_write() {
     });
 
     gate.wait_until_blocked();
-    let error = match session.begin_transaction().await {
-        Ok(_) => panic!("explicit transaction should not race past a session write reservation"),
-        Err(error) => error,
+    let Err(error) = session.begin_transaction().await else {
+        panic!("explicit transaction should not race past a session write reservation");
     };
     assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
 

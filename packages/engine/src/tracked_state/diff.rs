@@ -1,3 +1,6 @@
+#![allow(clippy::cast_possible_truncation, clippy::unnecessary_mut_passed)]
+
+use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -6,7 +9,6 @@ use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{TrackedStateFilter, TrackedStateStoreReader};
-use crate::LixError;
 
 /// Filter for comparing two tracked-state commit roots.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -113,7 +115,7 @@ where
             .await?;
     }
     let mut raw_rows = Vec::with_capacity(tree_entries.len());
-    for tree_entry in tree_entries.into_iter() {
+    for tree_entry in tree_entries {
         let before = tree_entry
             .before
             .map(|(key, value)| TrackedStateDiffRow::from_tree_entry(key, value));
@@ -262,6 +264,7 @@ impl TrackedStateDiffEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NullableKeyFilter;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::types::{
@@ -269,10 +272,9 @@ mod tests {
         TrackedStateRootId,
     };
     use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateContext};
-    use crate::NullableKeyFilter;
 
-    fn ts(value: &str) -> crate::common::LixTimestamp {
-        crate::common::LixTimestamp::expect_parse("timestamp", value)
+    fn ts(value: &str) -> LixTimestamp {
+        LixTimestamp::expect_parse("timestamp", value)
     }
 
     fn change_id(label: &str) -> String {
@@ -456,7 +458,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema-b".to_string()],
-                        entity_pks: vec![crate::entity_pk::EntityPk::single("entity-b")],
+                        entity_pks: vec![EntityPk::single("entity-b")],
                         file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
                         ..Default::default()
                     },
@@ -635,9 +637,8 @@ mod tests {
             .expect("child row should appear");
         let (key, mut value) = row.into_index_entry();
         let updated_at = value.updated_at().to_string();
-        value.created_at =
-            crate::common::LixTimestamp::expect_parse("created_at", "2026-01-03T00:00:00Z");
-        value.updated_at = crate::common::LixTimestamp::expect_parse("updated_at", &updated_at);
+        value.created_at = LixTimestamp::expect_parse("created_at", "2026-01-03T00:00:00Z");
+        value.updated_at = LixTimestamp::expect_parse("updated_at", &updated_at);
         let parent_commit_row = commit_root_row_entry(
             "parent",
             &commit_row_change_id("parent"),
@@ -2092,8 +2093,8 @@ mod tests {
                     format!("{{\"id\":\"{commit_id_text}\"}}").as_bytes(),
                 )),
                 metadata_ref: None,
-                created_at: crate::common::LixTimestamp::expect_parse("created_at", created_at),
-                updated_at: crate::common::LixTimestamp::expect_parse("updated_at", created_at),
+                created_at: LixTimestamp::expect_parse("created_at", created_at),
+                updated_at: LixTimestamp::expect_parse("updated_at", created_at),
             },
         )
     }

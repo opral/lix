@@ -1,7 +1,7 @@
+use crate::ROOT_ENTITY_PK;
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
 use crate::exports::lix::plugin::api::{EntityChange, File, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
-use crate::ROOT_ENTITY_PK;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn apply_changes(
@@ -26,8 +26,7 @@ pub(crate) fn apply_changes(
             }
             if document.is_some() {
                 return Err(PluginError::InvalidInput(format!(
-                    "duplicate entity_pk '{}' for schema_key '{}'",
-                    ROOT_ENTITY_PK, DOCUMENT_SCHEMA_KEY
+                    "duplicate entity_pk '{ROOT_ENTITY_PK}' for schema_key '{DOCUMENT_SCHEMA_KEY}'"
                 )));
             }
 
@@ -36,8 +35,7 @@ pub(crate) fn apply_changes(
                     let parsed: DocumentSnapshotContent =
                         serde_json::from_str(&raw).map_err(|error| {
                             PluginError::InvalidInput(format!(
-                                "invalid snapshot_content for entity_pk '{}': {error}",
-                                ROOT_ENTITY_PK
+                                "invalid snapshot_content for entity_pk '{ROOT_ENTITY_PK}': {error}"
                             ))
                         })?;
                     if parsed.id != ROOT_ENTITY_PK {

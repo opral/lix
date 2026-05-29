@@ -1,12 +1,17 @@
+#![allow(clippy::borrow_deref_ref, clippy::clone_on_copy)]
+
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
+use crate::NullableKeyFilter;
 use crate::branch::BRANCH_REF_SCHEMA_KEY;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
-    expanded_branch_ids, resolve_visible_rows, LiveStateReader, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope, VisibilityRequest,
+    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
 };
 use crate::storage::StorageRead;
 use crate::tracked_state::{
@@ -16,9 +21,6 @@ use crate::tracked_state::{
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
-use crate::LixError;
-use crate::NullableKeyFilter;
-use crate::GLOBAL_BRANCH_ID;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -182,14 +184,14 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        LiveStateStoreReader::scan_rows(self, request).await
+        Self::scan_rows(self, request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        LiveStateStoreReader::load_row(self, request).await
+        Self::load_row(self, request).await
     }
 }
 
@@ -286,7 +288,7 @@ fn commit_row(
         )
     })?;
     Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::single(commit.commit_id.clone()),
+        entity_pk: EntityPk::single(commit.commit_id),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content),
@@ -433,8 +435,8 @@ async fn load_branch_ref_commit_id(
         .load_row(&UntrackedStateRowRequest {
             schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single(branch_id),
-            file_id: crate::NullableKeyFilter::Null,
+            entity_pk: EntityPk::single(branch_id),
+            file_id: NullableKeyFilter::Null,
         })
         .await?
     else {
@@ -505,6 +507,7 @@ fn project_tracked_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NullableKeyFilter;
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
@@ -513,7 +516,6 @@ mod tests {
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
     use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
-    use crate::NullableKeyFilter;
     use serde_json::json;
 
     const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -528,15 +530,15 @@ mod tests {
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
+            TrackedStateContext::new(),
             crate::untracked_state::UntrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
+            CommitGraphContext::new(),
         )
     }
 
     async fn write_untracked_rows_to_store(
         storage: &StorageContext,
-        _read: &(impl crate::storage::StorageRead + Send + Sync + ?Sized),
+        _read: &(impl StorageRead + Send + Sync + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let mut writes = storage.new_write_set();
@@ -556,7 +558,7 @@ mod tests {
 
     async fn write_empty_commits_to_store(
         storage: &StorageContext,
-        read: &(impl crate::storage::StorageRead + Send + Sync),
+        read: &(impl StorageRead + Send + Sync),
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
@@ -646,7 +648,7 @@ mod tests {
 
         for row in rows {
             if row.untracked {
-                let materialized = crate::untracked_state::MaterializedUntrackedStateRow::from(row);
+                let materialized = MaterializedUntrackedStateRow::from(row);
                 let canonical = crate::test_support::untracked_state_row_from_materialized(
                     writes,
                     &materialized,
@@ -1077,7 +1079,7 @@ mod tests {
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
             UntrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
+            CommitGraphContext::new(),
         );
 
         let read = storage

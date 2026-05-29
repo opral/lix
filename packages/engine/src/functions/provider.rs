@@ -52,11 +52,11 @@ impl FunctionProviderHandle {
 
 impl CelFunctionProvider for FunctionProviderHandle {
     fn call_uuid_v7(&self) -> uuid::Uuid {
-        FunctionProviderHandle::call_uuid_v7(self)
+        Self::call_uuid_v7(self)
     }
 
     fn call_timestamp(&self) -> String {
-        FunctionProviderHandle::call_timestamp(self).to_string()
+        Self::call_timestamp(self).to_string()
     }
 }
 
@@ -102,15 +102,15 @@ where
     P: FunctionProvider,
 {
     pub(crate) fn call_uuid_v7(&self) -> uuid::Uuid {
-        self.with_lock_mut(|provider| provider.uuid_v7())
+        self.with_lock_mut(FunctionProvider::uuid_v7)
     }
 
     pub(crate) fn call_timestamp(&self) -> LixTimestamp {
-        self.with_lock_mut(|provider| provider.timestamp())
+        self.with_lock_mut(FunctionProvider::timestamp)
     }
 
     pub(crate) fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
-        self.with_lock(|provider| provider.deterministic_sequence_persist_highest_seen())
+        self.with_lock(FunctionProvider::deterministic_sequence_persist_highest_seen)
     }
 }
 
@@ -119,11 +119,11 @@ where
     P: FunctionProvider + Send + 'static,
 {
     fn call_uuid_v7(&self) -> uuid::Uuid {
-        SharedFunctionProvider::call_uuid_v7(self)
+        Self::call_uuid_v7(self)
     }
 
     fn call_timestamp(&self) -> String {
-        SharedFunctionProvider::call_timestamp(self).to_string()
+        Self::call_timestamp(self).to_string()
     }
 }
 
@@ -140,7 +140,7 @@ where
     }
 
     fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
-        SharedFunctionProvider::deterministic_sequence_persist_highest_seen(self)
+        Self::deterministic_sequence_persist_highest_seen(self)
     }
 }
 

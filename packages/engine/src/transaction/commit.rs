@@ -1,3 +1,10 @@
+#![allow(
+    clippy::implicit_clone,
+    clippy::unnecessary_mut_passed,
+    clippy::unnecessary_wraps
+)]
+
+use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::changelog::{
@@ -16,7 +23,6 @@ use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedC
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateIdentity, UntrackedStateIdentityRef, UntrackedStateRowRef,
 };
-use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
 
 type RowIndex = usize;
@@ -195,7 +201,7 @@ fn index_prepared_rows(rows: &[PreparedStateRow]) -> Result<PreparedRowIndex, Li
         };
         canonical_row_indices.push(row_index);
         tracked_row_indices_by_commit
-            .entry(commit_id.clone())
+            .entry(*commit_id)
             .or_default()
             .push(row_index);
     }
@@ -252,26 +258,26 @@ async fn stage_changelog_commits(
         }
         for change_ref in &commit_row.selected_change_refs {
             refs.push(commit_change_ref_from_selected_change_ref(change_ref));
-            change_ids.push(change_ref.change_id.clone());
+            change_ids.push(change_ref.change_id);
         }
         commits.push(CommitRecord {
             format_version: 1,
-            commit_id: commit_row.commit_id.clone(),
+            commit_id: commit_row.commit_id,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            change_id: commit_row.change_id.clone(),
+            change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
         });
         commit_change_refs.push(CommitChangeRefSet {
-            commit_id: commit_row.commit_id.clone(),
+            commit_id: commit_row.commit_id,
             entries: refs,
         });
         staged.insert(
-            commit_row.commit_id.clone(),
+            commit_row.commit_id,
             StagedChangelogCommit {
                 change_ids,
                 selected_change_refs: commit_row.selected_change_refs.clone(),
-                commit_change_id: commit_row.change_id.clone(),
+                commit_change_id: commit_row.change_id,
                 commit_created_at: commit_row.created_at,
             },
         );
@@ -390,10 +396,10 @@ fn tracked_delta_from_state_row(
     })
 }
 
-fn tracked_delta_from_selected_change_ref<'a>(
-    change_ref: &'a StagedCommitChangeRef,
+fn tracked_delta_from_selected_change_ref(
+    change_ref: &StagedCommitChangeRef,
     commit_id: CommitId,
-) -> Result<TrackedStateDeltaRef<'a>, LixError> {
+) -> Result<TrackedStateDeltaRef<'_>, LixError> {
     Ok(TrackedStateDeltaRef {
         schema_key: &change_ref.schema_key,
         file_id: change_ref.file_id.as_deref(),
@@ -478,12 +484,12 @@ async fn stage_tracked_roots(
     let extra_tracked = tracked_row_indices_by_commit
         .keys()
         .filter(|commit_id| !rooted_commit_ids.contains(commit_id))
-        .cloned()
+        .copied()
         .collect::<BTreeSet<_>>();
     if !extra_tracked.is_empty() {
         let mut commit_ids = tracked_row_indices_by_commit
             .keys()
-            .cloned()
+            .copied()
             .collect::<Vec<_>>();
         commit_ids.sort();
         commit_ids.dedup();
@@ -503,7 +509,7 @@ async fn stage_tracked_roots(
         let commit_ids = staged_commits
             .keys()
             .filter(|commit_id| !rooted_commit_ids.contains(commit_id))
-            .cloned()
+            .copied()
             .collect::<Vec<_>>();
         if commit_ids.is_empty() {
             return Ok(());
@@ -682,12 +688,12 @@ async fn finalize_commit_rows(
                 .cloned()
                 .unwrap_or_default(),
         );
-        let parent_commit_id = parent_commit_ids.first().cloned();
+        let parent_commit_id = parent_commit_ids.first().copied();
 
         commit_rows.push(FinalizedCommitRow {
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
-            created_at: timestamp.clone(),
+            created_at: timestamp,
             change_id: commit_change_id,
             selected_change_refs,
         });
@@ -722,11 +728,13 @@ fn merge_parent_commit_ids(mut base: Vec<CommitId>, extra: Vec<CommitId>) -> Vec
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
+    use crate::GLOBAL_BRANCH_ID;
+    use crate::NullableKeyFilter;
     use crate::backend::{Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch};
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
@@ -740,8 +748,6 @@ mod tests {
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
     };
-    use crate::NullableKeyFilter;
-    use crate::GLOBAL_BRANCH_ID;
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
@@ -752,7 +758,7 @@ mod tests {
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
+            TrackedStateContext::new(),
             crate::untracked_state::UntrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         )
@@ -790,7 +796,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should commit");
 
-        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
+        let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .expect("read should open"),
@@ -810,10 +816,12 @@ mod tests {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
-        assert!(change_ref_chunks
-            .iter()
-            .flat_map(|chunk| chunk.entries.iter())
-            .any(|entry| entry.change_id == change_id("change-1")));
+        assert!(
+            change_ref_chunks
+                .iter()
+                .flat_map(|chunk| chunk.entries.iter())
+                .any(|entry| entry.change_id == change_id("change-1"))
+        );
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &[change_id("change-1"), record.change_id],
@@ -831,7 +839,7 @@ mod tests {
             "commit row change is derived from changelog.commit, not stored as changelog.change"
         );
 
-        let mut tracked_reader = crate::tracked_state::TrackedStateContext::new().reader(
+        let mut tracked_reader = TrackedStateContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .expect("read should open"),
@@ -913,7 +921,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should persist");
 
-        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
+        let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .expect("read should open"),
@@ -971,7 +979,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+                    entity_pk: EntityPk::single("entity-1"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -1077,14 +1085,14 @@ mod tests {
             crate::test_support::stage_tracked_root_from_materialized(
                 &mut read,
                 &mut writes,
-                &crate::tracked_state::TrackedStateContext::new(),
+                &TrackedStateContext::new(),
                 crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID,
                 None,
                 &[],
             )
             .await
             .expect("empty tracked root should stage");
-            let branch_ref_row = crate::transaction::prepare_branch_ref_row(
+            let branch_ref_row = prepare_branch_ref_row(
                 GLOBAL_BRANCH_ID,
                 &CommitId::for_test_label(crate::test_support::TEST_EMPTY_ROOT_COMMIT_ID),
                 "1970-01-01T00:00:00.000Z",
@@ -1114,19 +1122,13 @@ mod tests {
                 )
                 .expect("deterministic mode snapshot should stage");
             let row = crate::untracked_state::UntrackedStateRow {
-                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_MODE_KEY),
+                entity_pk: EntityPk::single(DETERMINISTIC_MODE_KEY),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot_content: Some(mode_snapshot.to_string()),
                 metadata: None,
-                created_at: crate::common::LixTimestamp::expect_parse(
-                    "created_at",
-                    "2026-01-01T00:00:00Z",
-                ),
-                updated_at: crate::common::LixTimestamp::expect_parse(
-                    "updated_at",
-                    "2026-01-01T00:00:00Z",
-                ),
+                created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z"),
+                updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00Z"),
                 global: true,
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
             };
@@ -1156,7 +1158,7 @@ mod tests {
 
         let tracked_row = tracked_global_row("change-tracked");
         let mut untracked_row = untracked_global_row("change-untracked");
-        untracked_row.entity_pk = crate::entity_pk::EntityPk::single("entity-2");
+        untracked_row.entity_pk = EntityPk::single("entity-2");
 
         let writes = commit_prepared_writes(
             &binary_cas,
@@ -1187,7 +1189,7 @@ mod tests {
             .expect("writes should commit");
         assert_eq!(write_batches.load(Ordering::SeqCst), 1);
 
-        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
+        let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .expect("read should open"),
@@ -1238,7 +1240,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    entity_pk: crate::entity_pk::EntityPk::single("entity-2"),
+                    entity_pk: EntityPk::single("entity-2"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -1259,7 +1261,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1306,7 +1308,7 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .expect("writes should commit");
 
-        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
+        let mut changelog_reader = ChangelogContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
                 .expect("read should open"),
@@ -1491,7 +1493,7 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             schema_key: "test_schema".to_string(),
             file_id: None,
             snapshot: Some(
@@ -1550,7 +1552,7 @@ mod tests {
         UntrackedStateRowRequest {
             schema_key: "test_schema".to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -1559,7 +1561,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "test_schema".to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
-            entity_pk: crate::entity_pk::EntityPk::single("entity-1"),
+            entity_pk: EntityPk::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }

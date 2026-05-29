@@ -20,8 +20,8 @@ use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRow,
 };
 
-fn prepare_json_ref(value: &str) -> crate::json_store::JsonRef {
-    crate::json_store::JsonRef::for_content(value.as_bytes())
+fn prepare_json_ref(value: &str) -> JsonRef {
+    JsonRef::for_content(value.as_bytes())
 }
 use crate::GLOBAL_BRANCH_ID;
 
@@ -319,7 +319,7 @@ async fn stage_test_changelog_commit(
     let winner_indices = final_state_row_winner_indices(rows)?;
     let winner_change_ids = winner_indices
         .iter()
-        .map(|&index| changes[index].change_id.clone())
+        .map(|&index| changes[index].change_id)
         .collect::<Vec<_>>();
     let existing_change_ids = load_existing_changelog_change_ids(read, &winner_change_ids).await?;
     let mut append = ChangelogAppend::default();
@@ -339,7 +339,7 @@ async fn stage_test_changelog_commit(
             append.changes.push(change.clone());
         }
         refs.push(commit_change_ref_from_change(change));
-        change_commit_ids.push((row_index, row.commit_id.clone()));
+        change_commit_ids.push((row_index, row.commit_id));
     }
     let commit_snapshot = commit_row_snapshot_content(commit_id)?;
     let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
@@ -412,6 +412,7 @@ async fn load_existing_changelog_change_ids(
         .collect())
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn final_state_row_winner_indices(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<Vec<usize>, crate::LixError> {
@@ -432,9 +433,7 @@ fn final_state_row_winner_indices(
     Ok(indices)
 }
 
-fn json_payloads_from_materialized(
-    row: &MaterializedTrackedStateRow,
-) -> Vec<(crate::json_store::JsonRef, String)> {
+fn json_payloads_from_materialized(row: &MaterializedTrackedStateRow) -> Vec<(JsonRef, String)> {
     let mut payloads = Vec::new();
     if let Some(snapshot) = row.snapshot_content.as_deref() {
         payloads.push((prepare_json_ref(snapshot), snapshot.to_string()));
@@ -448,7 +447,7 @@ fn json_payloads_from_materialized(
 
 fn stage_json_payloads(
     writes: &mut StorageWriteSet,
-    payloads: &[(crate::json_store::JsonRef, String)],
+    payloads: &[(JsonRef, String)],
 ) -> Result<(), crate::LixError> {
     let payloads = payloads
         .iter()
@@ -467,16 +466,17 @@ fn commit_change_ref_from_change(change: &ChangeRecord) -> CommitChangeRef {
         schema_key: change.schema_key.clone(),
         file_id: change.file_id.clone(),
         entity_pk: change.entity_pk.clone(),
-        change_id: change.change_id.clone(),
+        change_id: change.change_id,
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 pub(crate) fn tracked_change_from_materialized(
     row: &MaterializedTrackedStateRow,
 ) -> Result<ChangeRecord, crate::LixError> {
     Ok(ChangeRecord {
         format_version: 1,
-        change_id: row.change_id.clone(),
+        change_id: row.change_id,
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
@@ -489,6 +489,7 @@ pub(crate) fn tracked_change_from_materialized(
     })
 }
 
+#[expect(clippy::unnecessary_wraps)]
 pub(crate) fn untracked_state_row_from_materialized(
     _writes: &mut StorageWriteSet,
     row: &MaterializedUntrackedStateRow,
@@ -498,7 +499,7 @@ pub(crate) fn untracked_state_row_from_materialized(
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         snapshot_content: row.snapshot_content.clone(),
-        metadata: row.metadata.as_ref().map(crate::serialize_row_metadata),
+        metadata: row.metadata.as_deref().map(crate::serialize_row_metadata),
         created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
         updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
         global: row.global,

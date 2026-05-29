@@ -59,10 +59,7 @@ mod tests {
     fn hint_returns_none_for_non_lix_variants() {
         assert_eq!(CliError::InvalidArgs("bad").hint(), None);
         assert_eq!(CliError::msg("oops").hint(), None);
-        let io_err = CliError::io(
-            "reading",
-            std::io::Error::new(std::io::ErrorKind::Other, "boom"),
-        );
+        let io_err = CliError::io("reading", std::io::Error::other("boom"));
         assert_eq!(io_err.hint(), None);
     }
 

@@ -178,7 +178,7 @@ impl StorageWriteSet {
         group.deletes.reserve(expected_deletes);
     }
 
-    pub fn extend(&mut self, other: StorageWriteSet) {
+    pub fn extend(&mut self, other: Self) {
         for group in other.groups {
             let space = group.space;
             let conflicting_declarations = group.conflicting_declarations;
@@ -197,7 +197,7 @@ impl StorageWriteSet {
     }
 
     pub fn stats(&self) -> StorageWriteSetStats {
-        self.stats.clone()
+        self.stats
     }
 
     /// Validates the canonical write-set contract.
@@ -256,7 +256,7 @@ impl StorageWriteSet {
     where
         W: BackendWrite,
     {
-        let StorageWriteSet {
+        let Self {
             groups, mut stats, ..
         } = self;
 
@@ -361,7 +361,7 @@ impl StorageWriteGroup {
 impl fmt::Display for StorageWriteSetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StorageWriteSetError::ConflictingSpaceDeclaration {
+            Self::ConflictingSpaceDeclaration {
                 id,
                 existing_name,
                 incoming_name,
@@ -369,10 +369,10 @@ impl fmt::Display for StorageWriteSetError {
                 f,
                 "conflicting storage space declarations for {id:?}: {existing_name} vs {incoming_name}"
             ),
-            StorageWriteSetError::DuplicateMutation { space, key } => {
+            Self::DuplicateMutation { space, key } => {
                 write!(f, "duplicate storage mutation for {space}/{key:?}")
             }
-            StorageWriteSetError::Backend(error) => write!(f, "{error}"),
+            Self::Backend(error) => write!(f, "{error}"),
         }
     }
 }
@@ -436,9 +436,11 @@ mod tests {
                 key: ref duplicate_key
             } if duplicate_space == space(1) && *duplicate_key == key("a")
         ));
-        assert!(error
-            .to_string()
-            .contains("duplicate storage mutation for test.space.one"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate storage mutation for test.space.one")
+        );
     }
 
     #[test]

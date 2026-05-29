@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::LixError;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
-use crate::LixError;
 
 use super::filesystem_planner::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -124,14 +124,14 @@ struct BlobRefSnapshot {
 mod tests {
     use async_trait::async_trait;
 
+    use crate::LixError;
     use crate::changelog::{ChangeId, CommitId};
     use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::LixError;
 
     use super::{
-        VisibleFilesystem, BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-        FILE_DESCRIPTOR_SCHEMA_KEY,
+        BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
+        VisibleFilesystem,
     };
 
     #[tokio::test]
@@ -152,14 +152,18 @@ mod tests {
         .await
         .expect("visible filesystem should load");
 
-        assert!(filesystem
-            .directory_children_by_parent_id
-            .get(&None)
-            .is_some_and(|children| children.contains("dir-docs")));
-        assert!(filesystem
-            .directory_children_by_parent_id
-            .get(&Some("dir-docs".to_string()))
-            .is_some_and(|children| children.contains("dir-guides")));
+        assert!(
+            filesystem
+                .directory_children_by_parent_id
+                .get(&None)
+                .is_some_and(|children| children.contains("dir-docs"))
+        );
+        assert!(
+            filesystem
+                .directory_children_by_parent_id
+                .get(&Some("dir-docs".to_string()))
+                .is_some_and(|children| children.contains("dir-guides"))
+        );
     }
 
     #[tokio::test]

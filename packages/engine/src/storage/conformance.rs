@@ -7,8 +7,8 @@ use crate::backend::{
     ProjectedValueRef, ReadOptions, ScanOptions, SpaceId, StoredValue, WriteOptions,
 };
 use crate::storage::{
-    PointReadPlan, ScanPlan, StorageContext, StorageReadStatsCollector, StorageSpace,
-    StorageWriteSetError,
+    PointReadPlan, ScanPlan, StorageContext, StorageReadStats, StorageReadStatsCollector,
+    StorageSpace, StorageWriteSetError,
 };
 
 type StorageConformanceResult = Result<(), String>;
@@ -274,7 +274,7 @@ fn scan_stats_collector_accumulates_chunked_drain_shape() -> StorageConformanceR
 
     let before_reset = stats;
     collector.reset();
-    assert_eq!(collector.snapshot(), Default::default());
+    assert_eq!(collector.snapshot(), StorageReadStats::default());
     assert_ne!(before_reset, collector.snapshot());
 
     Ok(())
@@ -370,7 +370,7 @@ fn value(bytes: &'static str) -> StoredValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_storage_conformance, StorageConformanceStatus};
+    use super::{StorageConformanceStatus, run_storage_conformance};
 
     #[test]
     fn in_memory_backend_passes_storage_conformance() {

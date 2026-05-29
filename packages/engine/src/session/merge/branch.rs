@@ -1,10 +1,10 @@
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
+use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage::StorageBackend;
-use crate::LixError;
 
-use super::analysis::{analyze, MergeCommits, MergeOutcome};
+use super::analysis::{MergeCommits, MergeOutcome, analyze};
 use super::conflicts::{
     MergeConflict as AnalysisMergeConflict,
     MergeConflictChangeKind as AnalysisMergeConflictChangeKind,
@@ -44,7 +44,7 @@ pub struct MergeBranchReceipt {
     pub change_stats: MergeChangeStats,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MergeChangeStats {
     pub total: usize,
     pub added: usize,
@@ -283,7 +283,7 @@ where
                     analysis.commits.source_commit_id,
                     selected_changes,
                 )?;
-                return Ok(MergeBranchReceipt {
+                Ok(MergeBranchReceipt {
                     outcome: MergeBranchOutcome::MergeCommitted,
                     target_branch_id: active_branch_id,
                     source_branch_id,
@@ -293,7 +293,7 @@ where
                     source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
                     created_merge_commit_id: Some(created_merge_commit_id),
                     change_stats: merge_change_stats_from_analysis(&analysis.stats),
-                });
+                })
             })
         })
         .await
@@ -305,12 +305,12 @@ fn selected_change_from_merge_pick(pick: &TrackedStateMergePick) -> StagedCommit
         schema_key: pick.selected_row.schema_key.clone(),
         file_id: pick.selected_row.file_id.clone(),
         entity_pk: pick.selected_row.entity_pk.clone(),
-        change_id: pick.change_id.clone(),
+        change_id: pick.change_id,
         snapshot_ref: pick.selected_row.snapshot_ref,
         metadata_ref: pick.selected_row.metadata_ref,
         deleted: pick.selected_row.deleted,
-        created_at: pick.selected_row.created_at.clone(),
-        updated_at: pick.selected_row.updated_at.clone(),
+        created_at: pick.selected_row.created_at,
+        updated_at: pick.selected_row.updated_at,
     }
 }
 
@@ -377,6 +377,7 @@ fn merge_conflict_side_from_analysis(side: &AnalysisMergeConflictSide) -> MergeC
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn merge_conflict_error(conflicts: &[MergeConflict]) -> Result<LixError, LixError> {
     let conflict_count = conflicts.len();
     Ok(LixError::new(

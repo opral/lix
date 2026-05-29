@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{plan_err, Result, ScalarValue};
+use datafusion::common::{Result, ScalarValue, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -28,7 +28,7 @@ impl ScalarUDFImpl for LixActiveBranchCommitId {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "lix_active_branch_commit_id"
     }
 

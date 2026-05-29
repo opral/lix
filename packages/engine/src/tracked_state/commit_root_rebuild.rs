@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitChangeRef, CommitId,
     CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
@@ -10,6 +11,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::storage::{StorageRead, StorageWriteSet};
+use crate::tracked_state::TrackedStateDeltaRef;
 use crate::tracked_state::context::{
     TrackedStateContext, TrackedStateRootRebuilder, TrackedStateWriteReport, TrackedStateWriter,
 };
@@ -18,8 +20,6 @@ use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateCommitRoot, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
-use crate::tracked_state::TrackedStateDeltaRef;
-use crate::LixError;
 
 /// Owned delta used only by explicit commit-root rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +89,7 @@ where
             break;
         }
         let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
-        let parent_commit_id = plan.parent_commit_id.clone();
+        let parent_commit_id = plan.parent_commit_id;
         plans.push(plan);
         let Some(parent_commit_id) = parent_commit_id else {
             break;
@@ -111,7 +111,7 @@ where
     Box::pin(async move {
         if !seen.insert(commit_id.to_string()) {
             return Ok(None);
-        };
+        }
         let Some(metadata) = storage::load_commit_root(store, commit_id).await? else {
             seen.remove(commit_id);
             return Ok(None);
@@ -240,7 +240,7 @@ where
         .await?;
     let mut deltas = change_refs
         .iter()
-        .zip(changes.entries.into_iter())
+        .zip(changes.entries)
         .map(|(change_ref, change)| {
             let change = change.ok_or_else(|| {
                 LixError::new(
@@ -304,7 +304,7 @@ fn rebuild_delta_from_commit_record(
     Ok(CommitRootRebuildDelta {
         schema_key: "lix_commit".to_string(),
         file_id: None,
-        entity_pk: EntityPk::single(&commit.commit_id),
+        entity_pk: EntityPk::single(commit.commit_id),
         change_id: commit.change_id,
         commit_id: commit.commit_id,
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),

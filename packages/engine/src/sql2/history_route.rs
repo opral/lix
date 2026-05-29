@@ -6,13 +6,13 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
+use crate::LixError;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
-use crate::LixError;
 
 use super::SqlJsonReader;
-use crate::sql2::change_materialization::{materialize_located_history_change, MaterializedChange};
+use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
 use crate::storage::StorageRead;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
@@ -415,16 +415,16 @@ fn parse_history_binary_filter(
     let column_name = canonical_history_column_name(column.name.as_str(), column_style)?;
     let right = &*binary_expr.right;
     match (column_name, &binary_expr.op, right) {
-        ("start_commit_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-        | ("schema_key", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-        | ("file_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            Some(match column_name {
-                "start_commit_id" => HistoryFilterTerm::StartCommitIds(vec![value.clone()]),
-                "schema_key" => HistoryFilterTerm::SchemaKeys(vec![value.clone()]),
-                "file_id" => HistoryFilterTerm::FileIds(vec![value.clone()]),
-                _ => unreachable!(),
-            })
-        }
+        (
+            "start_commit_id" | "schema_key" | "file_id",
+            Operator::Eq,
+            Expr::Literal(ScalarValue::Utf8(Some(value)), _),
+        ) => Some(match column_name {
+            "start_commit_id" => HistoryFilterTerm::StartCommitIds(vec![value.clone()]),
+            "schema_key" => HistoryFilterTerm::SchemaKeys(vec![value.clone()]),
+            "file_id" => HistoryFilterTerm::FileIds(vec![value.clone()]),
+            _ => unreachable!(),
+        }),
         ("entity_pk", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
             canonical_entity_pk_value(value).map(|value| HistoryFilterTerm::EntityPks(vec![value]))
         }
@@ -482,18 +482,18 @@ fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute, column_style: His
         match term {
             HistoryFilterTerm::StartCommitIds(values) => {
                 route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.start_commit_ids, values)
+                    apply_conjunctive_values_filter(&mut route.start_commit_ids, values);
             }
             HistoryFilterTerm::EntityPks(values) => {
                 route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.entity_pks, values)
+                    apply_conjunctive_values_filter(&mut route.entity_pks, values);
             }
             HistoryFilterTerm::SchemaKeys(values) => {
                 route.contradictory |=
-                    apply_conjunctive_values_filter(&mut route.schema_keys, values)
+                    apply_conjunctive_values_filter(&mut route.schema_keys, values);
             }
             HistoryFilterTerm::FileIds(values) => {
-                route.contradictory |= apply_conjunctive_values_filter(&mut route.file_ids, values)
+                route.contradictory |= apply_conjunctive_values_filter(&mut route.file_ids, values);
             }
             HistoryFilterTerm::ExactDepth(value) => {
                 route.min_depth = Some(value);
@@ -593,7 +593,7 @@ mod tests {
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 
-    use super::{parse_history_filter, HistoryColumnStyle, HistoryRoute};
+    use super::{HistoryColumnStyle, HistoryRoute, parse_history_filter};
 
     #[test]
     fn route_extraction_keeps_supported_terms_from_mixed_and_filter() {

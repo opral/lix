@@ -1,7 +1,7 @@
+use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
-use crate::LixError;
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -41,6 +41,7 @@ impl CommitId {
     }
 
     pub(crate) fn parse_lix(value: &str, context: &str) -> Result<Self, LixError> {
+        #[cfg_attr(not(test), expect(clippy::bind_instead_of_map))]
         Self::parse(value).or_else(|error| {
             #[cfg(test)]
             {
@@ -77,6 +78,7 @@ impl ChangeId {
     }
 
     pub(crate) fn parse_lix(value: &str, context: &str) -> Result<Self, LixError> {
+        #[cfg_attr(not(test), expect(clippy::bind_instead_of_map))]
         Self::parse(value).or_else(|error| {
             #[cfg(test)]
             {
@@ -115,8 +117,8 @@ fn uuid_text_str(text: &[u8; UUID_HYPHENATED_LEN]) -> &str {
 
 #[cfg(any(test, feature = "storage-benches"))]
 fn test_uuid_from_label(kind: u8, value: &str) -> Uuid {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
     fn hash(seed: u64, bytes: impl Iterator<Item = u8>) -> u64 {
         bytes.fold(seed, |hash, byte| {

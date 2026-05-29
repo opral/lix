@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
-use crate::common::json_pointer_get;
 use crate::LixError;
+use crate::common::json_pointer_get;
 use musli::{Allocator, Context, Decode, Decoder, Encode, Encoder};
 
 /// Logical entity primary key derived from a schema primary key.
@@ -217,7 +217,7 @@ fn canonical_json_value(value: &JsonValue) -> JsonValue {
         }
         JsonValue::Object(object) => {
             let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
 
             let mut canonical = serde_json::Map::new();
             for (key, value) in entries {
@@ -460,8 +460,10 @@ mod tests {
         let error = crate::storage_codec::decode::<EntityPk>("entity primary key", &bytes)
             .expect_err("empty entity primary key should reject");
 
-        assert!(error
-            .message
-            .contains("entity primary key decoded from storage is invalid"));
+        assert!(
+            error
+                .message
+                .contains("entity primary key decoded from storage is invalid")
+        );
     }
 }

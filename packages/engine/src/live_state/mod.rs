@@ -16,6 +16,6 @@ pub(crate) use types::{
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{
-    expanded_branch_ids, overlay_scan_rows, resolve_visible_rows, StagedLiveStateRows,
-    VisibilityBranchScope, VisibilityRequest,
+    StagedLiveStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
+    overlay_scan_rows, resolve_visible_rows,
 };

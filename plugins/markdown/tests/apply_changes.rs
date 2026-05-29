@@ -4,7 +4,7 @@ use common::{
     assert_invalid_input, block_change, decode_utf8, document_change, empty_file,
     file_from_markdown,
 };
-use plugin_md_v2::{apply_changes, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
+use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, apply_changes};
 
 #[test]
 fn materializes_markdown_from_document_order_and_blocks() {

@@ -7,8 +7,8 @@ mod tests {
     use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
-        deterministic_repro_cases, generated_dml_cases, DifferentialExpectation, DifferentialParam,
-        DifferentialProbe, DifferentialSqlCase, ExpectedExecution, ACTIVE_BRANCH_PROBE_ID,
+        ACTIVE_BRANCH_PROBE_ID, DifferentialExpectation, DifferentialParam, DifferentialProbe,
+        DifferentialSqlCase, ExpectedExecution, deterministic_repro_cases, generated_dml_cases,
     };
     use crate::sql2::{WriteExecutorMode, WriteExecutorPath};
     use crate::storage::InMemoryStorageBackend;
@@ -537,8 +537,8 @@ mod tests {
                 let rows = scan_transaction_live_state(
                     transaction,
                     schema_key,
-                    *entity_pks,
-                    *branch_ids,
+                    entity_pks,
+                    branch_ids,
                     active_branch_id,
                 )
                 .await;
@@ -554,7 +554,7 @@ mod tests {
                     transaction,
                     "lix_registered_schema",
                     &[],
-                    *branch_ids,
+                    branch_ids,
                     active_branch_id,
                 )
                 .await;
@@ -574,29 +574,28 @@ mod tests {
         branch_ids: &[&str],
         active_branch_id: &str,
     ) -> Vec<MaterializedLiveStateRow> {
-        let rows = transaction
-            .scan_live_state_for_test(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![schema_key.to_string()],
-                    entity_pks: entity_pks
-                        .iter()
-                        .map(|entity_pk| EntityPk::single(*entity_pk))
-                        .collect(),
-                    branch_ids: branch_ids
-                        .iter()
-                        .map(|branch_id| resolve_probe_branch_id(branch_id, active_branch_id))
-                        .collect(),
-                    ..LiveStateFilter::default()
-                },
-                ..LiveStateScanRequest::default()
-            })
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
+        transaction
+        .scan_live_state_for_test(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![schema_key.to_string()],
+                entity_pks: entity_pks
+                    .iter()
+                    .map(|entity_pk| EntityPk::single(*entity_pk))
+                    .collect(),
+                branch_ids: branch_ids
+                    .iter()
+                    .map(|branch_id| resolve_probe_branch_id(branch_id, active_branch_id))
+                    .collect(),
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
                 "staged live-state differential probe failed for schema '{schema_key}': {error:?}"
             )
-            });
-        rows
+        })
     }
 
     fn lix_state_by_branch_rows(
@@ -621,7 +620,7 @@ mod tests {
                         Value::Text(row.branch_id.clone()),
                         optional_text_value(row.snapshot_content.clone()),
                         row.metadata
-                            .as_ref()
+                            .as_deref()
                             .map(serialize_row_metadata)
                             .map(Value::Text)
                             .unwrap_or(Value::Null),
@@ -657,7 +656,7 @@ mod tests {
                         value,
                         Value::Text(row.branch_id.clone()),
                         row.metadata
-                            .as_ref()
+                            .as_deref()
                             .map(serialize_row_metadata)
                             .map(Value::Text)
                             .unwrap_or(Value::Null),

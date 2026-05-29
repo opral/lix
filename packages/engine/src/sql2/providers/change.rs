@@ -18,19 +18,19 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream;
 
+use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitLoadEntry,
     CommitProjection, CommitScanRequest,
 };
 use crate::serialize_row_metadata;
-use crate::LixError;
 
+use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::change_materialization::{
-    materialize_changelog_change_record, materialize_commit_graph_change, MaterializedChange,
+    MaterializedChange, materialize_changelog_change_record, materialize_commit_graph_change,
 };
 use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::result_metadata::json_field;
-use crate::sql2::SqlChangelogQuerySource;
 use crate::storage::StorageRead;
 
 pub(super) async fn register_lix_change_read_provider<S>(
@@ -169,7 +169,7 @@ impl<S> ExecutionPlan for LixChangeScanExec<S>
 where
     S: StorageRead + Clone + Send + Sync + 'static,
 {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixChangeScanExec"
     }
 
@@ -283,7 +283,7 @@ where
         };
         start_after = Some(next.to_string());
     }
-    changes.sort_by_key(|row| row.change_id());
+    changes.sort_by_key(LixChangeRow::change_id);
     if let Some(limit) = limit {
         changes.truncate(limit);
     }
@@ -313,7 +313,7 @@ fn commit_record_canonical_change(
     .expect("lix_commit snapshot serialization should not fail");
     crate::commit_graph::CommitGraphChange {
         id: commit.change_id,
-        entity_pk: crate::entity_pk::EntityPk::single(&commit.commit_id),
+        entity_pk: crate::entity_pk::EntityPk::single(commit.commit_id),
         schema_key: "lix_commit".to_string(),
         file_id: None,
         snapshot_ref: Some(crate::json_store::JsonRef::for_content(
@@ -357,21 +357,25 @@ fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeColu
         ChangeColumn::CreatedAt,
         ChangeColumn::SnapshotContent,
     ];
-    projection.map_or(all_columns.clone(), |indices| {
-        indices
-            .iter()
-            .filter_map(|index| all_columns.get(*index).copied())
-            .collect()
-    })
+    projection.map_or_else(
+        || all_columns.clone(),
+        |indices| {
+            indices
+                .iter()
+                .filter_map(|index| all_columns.get(*index).copied())
+                .collect()
+        },
+    )
 }
 
 fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> SchemaRef {
-    match projection {
-        Some(projection) => Arc::new(schema.project(projection).expect("projection is valid")),
-        None => Arc::clone(schema),
-    }
+    projection.map_or_else(
+        || Arc::clone(schema),
+        |projection| Arc::new(schema.project(projection).expect("projection is valid")),
+    )
 }
 
+#[expect(trivial_casts)]
 fn change_record_batch(
     projection: &[ChangeColumn],
     changes: &[MaterializedChange],
@@ -399,7 +403,7 @@ fn change_record_batch(
             ChangeColumn::Metadata => Arc::new(StringArray::from(
                 changes
                     .iter()
-                    .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                    .map(|row| row.metadata.as_deref().map(serialize_row_metadata))
                     .collect::<Vec<_>>(),
             )),
             ChangeColumn::CreatedAt => {
@@ -432,6 +436,7 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
     ))
 }
 
+#[expect(trivial_casts)]
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }

@@ -2,16 +2,98 @@
 resolver = "3"
 members = [
   "packages/*",
+  "plugins/*",
 ]
 
 [workspace.package]
 version = "0.6.0"
 authors = ["Opral"]
 edition = "2024"
+description = "Embeddable version control for apps and AI agents."
 license = "LicenseRef-opral"
-publish = false
+homepage = "https://lix.dev"
+repository = "https://github.com/opral/lix"
+documentation = "https://docs.rs/lix-sdk"
+readme = "README.md"
+keywords = ["version-control", "ai-agents", "semantic-diff", "change-tracking", "embeddable"]
+categories = ["development-tools", "artificial-intelligence", "filesystem"]
 rust-version = "1.93"
 
 [workspace.dependencies]
+lix_cli = { path = "packages/cli", version = "0.6.0" }
 lix_engine = { path = "packages/engine", version = "0.6.0" }
+lix_js_sdk = { path = "packages/js-sdk", version = "0.6.0" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.6.0" }
+plugin_json_v2 = { path = "plugins/json", version = "0.6.0" }
+plugin_md_v2 = { path = "plugins/markdown", version = "0.6.0" }
+text_plugin = { path = "plugins/text", version = "0.6.0" }
+
+[workspace.lints.rust]
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = [] }
+unused_import_braces = "warn"
+unused_qualifications = "warn"
+# unused_crate_dependencies = "warn"
+
+unconditional_recursion = "deny"
+
+[workspace.lints.clippy]
+# https://rust-lang.github.io/rust-clippy/master/index.html
+all = { level = "warn", priority = -2 }
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Our opinion
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+doc_link_with_quotes = "allow"
+doc_markdown = "allow"
+fallible_impl_from = "allow"
+future_not_send = "allow"
+if_not_else = "allow"
+inline_always = "allow"
+iter_on_empty_collections = "allow" # prefer [x].into_iter() for consitency with >1 els
+iter_on_single_items = "allow" # prefer [x].into_iter() for consitency with >1 els
+large_enum_variant = "allow"
+let_underscore_future = "allow"
+let_underscore_untyped = "allow" # Often using an `_` is a useful way to indicate something is being discarded, and naming the type every time can be burdensome.
+manual_string_new = "allow"
+map_unwrap_or = "allow"
+missing_const_for_fn = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+multiple_bound_locations = "allow"
+must_use_candidate = "allow" # instead, enforce unused_results everywhere (TODO)
+needless_bitwise_bool = "allow"
+needless_pass_by_value = "allow"
+redundant_pub_crate = "allow"
+result_unit_err = "allow"
+return_self_not_must_use = "allow"
+significant_drop_tightening = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+single_range_in_vec_init = "allow"
+struct_field_names = "allow"
+too_long_first_doc_paragraph = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+trivially_copy_pass_by_ref = "allow"
+type_complexity = "allow"
+unused_async = "allow"
+wildcard_imports = "allow"
+
+# clippy
+cargo_common_metadata = "allow"
+redundant_feature_names = "allow"
+multiple_crate_versions = "allow"

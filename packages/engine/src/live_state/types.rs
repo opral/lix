@@ -29,7 +29,7 @@ pub(crate) struct MaterializedLiveStateRow {
 
 impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
     fn from(row: MaterializedUntrackedStateRow) -> Self {
-        MaterializedLiveStateRow {
+        Self {
             entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -57,20 +57,20 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
                 "tracked_state cannot store untracked live-state rows",
             ));
         }
-        let Some(change_id) = row.change_id.clone() else {
+        let Some(change_id) = row.change_id else {
             return Err(crate::LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked_state rows require change_id",
             ));
         };
-        let Some(commit_id) = row.commit_id.clone() else {
+        let Some(commit_id) = row.commit_id else {
             return Err(crate::LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "tracked_state rows require commit_id",
             ));
         };
 
-        Ok(MaterializedTrackedStateRow {
+        Ok(Self {
             entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -87,7 +87,7 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
 
 impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
     fn from(row: &MaterializedLiveStateRow) -> Self {
-        MaterializedUntrackedStateRow {
+        Self {
             entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),

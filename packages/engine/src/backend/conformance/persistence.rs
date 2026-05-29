@@ -1,10 +1,10 @@
 use crate::backend::conformance::{
-    fixtures::{full_put, key, put_batch, space},
     BackendFactory, BackendFixture, ConformanceReport, ConformanceResult,
+    fixtures::{full_put, key, put_batch, space},
 };
 use crate::backend::{
-    get_many as backend_get_many, Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions,
-    WriteOptions,
+    Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions, WriteOptions,
+    get_many as backend_get_many,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -122,7 +122,7 @@ where
             .put_many(put_batch([full_put(overwritten.clone(), "new")]))
             .map_err(|error| format!("overwrite put_many failed: {error}"))?;
         write
-            .delete_many(&[deleted.clone()])
+            .delete_many(std::slice::from_ref(&deleted))
             .map_err(|error| format!("delete_many failed: {error}"))?;
         write
             .commit()
@@ -168,8 +168,7 @@ where
         };
         if actual != *expected_value {
             return Err(format!(
-                "key {:?} value mismatch: expected {:?}, got {:?}",
-                key, expected_value, actual
+                "key {key:?} value mismatch: expected {expected_value:?}, got {actual:?}"
             ));
         }
     }

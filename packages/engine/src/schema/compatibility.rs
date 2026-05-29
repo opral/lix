@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::LixError;
 use crate::common::top_level_property_name;
 use crate::entity_pk::canonical_json_text;
-use crate::LixError;
 
 const DOC_ONLY_SCHEMA_FIELDS: &[&str] = &["$comment", "deprecated", "description", "title"];
 const CONSTRAINT_FIELDS: &[&str] = &[
@@ -324,7 +324,7 @@ fn schema_amendment_error<T>(message: String) -> Result<T, LixError> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value as JsonValue};
+    use serde_json::{Value as JsonValue, json};
 
     use super::validate_schema_amendment;
 

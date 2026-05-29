@@ -11,7 +11,7 @@ use lix_engine::backend::{
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
-use rusqlite::{params, Connection, Rows};
+use rusqlite::{Connection, Rows, params};
 use tempfile::TempDir;
 
 pub const SQLITE_FORMAT_VERSION: u32 = 1;
@@ -29,6 +29,7 @@ pub struct SqliteBackendFixture {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct SqliteBackend {
     path: PathBuf,
     read_pool: Arc<Mutex<Vec<Connection>>>,
@@ -41,6 +42,7 @@ pub struct SqliteBackendOptions {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct SqliteRead {
     state: Arc<Mutex<SqliteReadState>>,
     read_pool: Arc<Mutex<Vec<Connection>>>,
@@ -50,6 +52,7 @@ struct SqliteReadState {
     conn: Option<Connection>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct SqliteRangeScan<'stmt> {
     rows: Rows<'stmt>,
     projection: CoreProjection,
@@ -62,10 +65,17 @@ struct SqlitePendingRow {
     value: Option<Vec<u8>>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct SqliteWrite {
     conn: Option<Connection>,
     write_pool: Arc<Mutex<Vec<Connection>>>,
     stats: WriteStats,
+}
+
+impl Default for SqliteBackendFactory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqliteBackendFactory {
@@ -542,6 +552,7 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+#[expect(clippy::cast_possible_wrap)]
 fn visit_keys<V>(
     conn: &Connection,
     keys: &[Key],

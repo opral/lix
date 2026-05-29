@@ -13,7 +13,7 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<CommandOutput, 
     let (sql, params) = resolve_sql_and_params(&args)?;
     let lix_path = db::resolve_db_path(context)?;
     let lix = db::open_lix_at(&lix_path)?;
-    let result = crate::db::block_on(lix.execute(&sql, &params))
+    let result = db::block_on(lix.execute(&sql, &params))
         .map_err(|err| CliError::from_lix("sql execution failed", err))?;
 
     match args.format {

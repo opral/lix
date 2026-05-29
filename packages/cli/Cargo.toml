@@ -1,7 +1,20 @@
 [package]
 name = "lix_cli"
 version.workspace = true
-edition = "2021"
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "development-tools", "artificial-intelligence", "filesystem"]
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "lix"
