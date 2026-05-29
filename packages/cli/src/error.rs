@@ -1,4 +1,4 @@
-use lix_rs_sdk::LixError;
+use lix_sdk::LixError;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]

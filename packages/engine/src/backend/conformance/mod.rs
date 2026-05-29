@@ -1,7 +1,7 @@
 //! Conformance harness for backend implementations.
 //!
 //! The harness is colocated with the experimental API for now. Once backend
-//! is stable, rs-sdk can re-export this as the public backend author test kit.
+//! is stable, lix-sdk can re-export this as the public backend author test kit.
 
 mod baseline;
 mod factory;

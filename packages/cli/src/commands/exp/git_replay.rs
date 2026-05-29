@@ -2,7 +2,7 @@ use crate::cli::exp::ExpGitReplayArgs;
 use crate::db;
 use crate::db::FileLix;
 use crate::error::CliError;
-use lix_rs_sdk::Value;
+use lix_sdk::Value;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -182,7 +182,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     }
     if trace_sql_json_path.is_some() {
         return Err(CliError::msg(
-            "--trace-sql-json is not available with the current rs-sdk backend API",
+            "--trace-sql-json is not available with the current lix-sdk backend API",
         ));
     }
     if args.trace_commit.is_some() && trace_sql_json_path.is_none() {

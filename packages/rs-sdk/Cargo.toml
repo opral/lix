@@ -1,10 +1,10 @@
 [package]
-name = "lix_rs_sdk"
-version = "0.1.0"
+name = "lix_sdk"
+version.workspace = true
 edition = "2021"
 
 [dependencies]
-lix_engine = { path = "../engine", version = "0.1.0" }
+lix_engine = { workspace = true }
 
 async-trait = "0.1"
 bytes = "1"

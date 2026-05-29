@@ -10,7 +10,7 @@ import {
 	type Lix,
 } from "./index.js";
 
-test("openLix exposes the rs-sdk e2e flow", async () => {
+test("openLix exposes the lix-sdk e2e flow", async () => {
 	const lix = await openLix();
 	const mainBranchId = await lix.activeBranchId();
 

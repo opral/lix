@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, ContentArrangement, Row, Table};
-use lix_rs_sdk::{ExecuteResult, Value};
+use lix_sdk::{ExecuteResult, Value};
 use serde_json::Value as JsonValue;
 
 pub fn print_execute_result_table(result: &ExecuteResult) {
@@ -53,7 +53,7 @@ fn execute_result_to_json(result: &ExecuteResult) -> JsonValue {
     })
 }
 
-fn row_to_json(columns: &[String], row: &lix_rs_sdk::Row) -> JsonValue {
+fn row_to_json(columns: &[String], row: &lix_sdk::Row) -> JsonValue {
     let mut object = serde_json::Map::new();
     for (index, column) in columns.iter().enumerate() {
         let value = row
