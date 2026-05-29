@@ -1,7 +1,7 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use plugin_json_v2::{apply_changes, detect_changes};
+use plugin_json_v2::{detect_changes, render_changes};
 
 fn bench_roundtrip_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("roundtrip_projection");
@@ -27,7 +27,7 @@ fn bench_roundtrip_projection(c: &mut Criterion) {
                         .expect("delta detect_changes should succeed");
                     let projection = common::merge_latest_state_rows(vec![baseline, delta]);
                     let seed = common::file_from_bytes("f1", "/x.json", br#"{"stale":"cache"}"#);
-                    apply_changes(seed, projection).expect("apply_changes should succeed")
+                    render_changes(seed, projection).expect("render_changes should succeed")
                 },
                 BatchSize::SmallInput,
             );

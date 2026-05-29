@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_json, snapshot_content};
-use plugin_json_v2::{PluginApiError, PluginEntityChange, SCHEMA_KEY, apply_changes};
+use plugin_json_v2::{PluginApiError, PluginEntityChange, SCHEMA_KEY, render_changes};
 use serde_json::Value;
 
 fn with_root_object(mut changes: Vec<PluginEntityChange>) -> Vec<PluginEntityChange> {
@@ -43,7 +43,7 @@ fn applies_insert_update_delete() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
 
     let parsed: Value = serde_json::from_slice(&output).expect("output should be valid JSON");
     assert_eq!(parsed, serde_json::json!({"Name":"Samuel","Age":20}));
@@ -81,7 +81,7 @@ fn applies_array_changes_with_indexes() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
 
     let parsed: Value = serde_json::from_slice(&output).expect("output should be valid JSON");
     assert_eq!(parsed, serde_json::json!({"list":["a","x","c","d"]}));
@@ -97,7 +97,7 @@ fn rejects_snapshot_missing_path() {
     }];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("must contain 'path'"));
@@ -136,7 +136,7 @@ fn infers_array_parent_for_numeric_pointer_segment() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"team":[{"name":"Ada"}]}));
 }
@@ -151,7 +151,7 @@ fn removing_root_sets_null() {
     }];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, Value::Null);
 }
@@ -173,7 +173,7 @@ fn rejects_duplicate_entity_pks_in_projection_set() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("duplicate entity_pk"));
@@ -194,7 +194,7 @@ fn rejects_mismatched_snapshot_path() {
     }];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("snapshot path '/bar'"));
@@ -215,7 +215,7 @@ fn rejects_invalid_json_pointer_escape() {
     }];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("invalid JSON pointer escape"));
@@ -246,7 +246,7 @@ fn rejects_invalid_dash_placement() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical '-' array token"));
@@ -280,7 +280,7 @@ fn allows_proto_like_keys_when_projection_rows_are_consistent() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"__proto__":{"x":"pwn"}}));
 }
@@ -302,7 +302,7 @@ fn rejects_descendant_upsert_under_tombstoned_ancestor() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("conflicts with tombstoned ancestor"));
@@ -330,7 +330,7 @@ fn rejects_root_tombstone_with_non_root_rows() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("root tombstone cannot coexist"));
@@ -351,7 +351,7 @@ fn rejects_snapshot_path_non_string() {
     }];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("must be a string"));
@@ -371,8 +371,8 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":"/safe","value":1,"extra":true}"#.to_string()),
     }];
-    let error = apply_changes(file.clone(), with_root_object(with_extra))
-        .expect_err("apply_changes should fail");
+    let error = render_changes(file.clone(), with_root_object(with_extra))
+        .expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("unsupported properties"));
@@ -387,8 +387,8 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":"/safe"}"#.to_string()),
     }];
-    let error = apply_changes(file, with_root_object(missing_value))
-        .expect_err("apply_changes should fail");
+    let error = render_changes(file, with_root_object(missing_value))
+        .expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("must contain 'value'"));
@@ -409,7 +409,7 @@ fn rejects_numeric_child_without_parent_container_row() {
     }];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("missing ancestor container row"));
@@ -440,7 +440,7 @@ fn rejects_huge_array_index_growth() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("exceeds max supported index"));
@@ -468,7 +468,7 @@ fn rejects_leading_zero_array_indices_under_array_ancestor() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical array index token"));
@@ -496,7 +496,7 @@ fn accepts_canonical_zero_array_index() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"arr":["A"]}));
 }
@@ -518,7 +518,7 @@ fn rejects_sparse_array_projection_rows() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("sparse array projection"));
@@ -551,7 +551,7 @@ fn rejects_aliasing_array_indices_via_non_canonical_form() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical array index token"));
@@ -584,7 +584,7 @@ fn rejects_tombstone_with_leading_zero_token_under_live_array_context() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical array index token"));
@@ -617,7 +617,7 @@ fn rejects_tombstone_with_dash_token_under_live_array_context() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical '-' array token"));
@@ -645,7 +645,7 @@ fn allows_tombstone_with_leading_zero_token_with_only_live_array_container() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"arr":[]}));
 }
@@ -667,7 +667,7 @@ fn allows_tombstone_with_dash_token_with_only_live_array_container() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"arr":[]}));
 }
@@ -699,7 +699,7 @@ fn rejects_live_array_row_with_non_canonical_tombstone_alias() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical array index token"));
@@ -732,7 +732,7 @@ fn allows_tombstone_non_numeric_token_under_live_array_context() {
     ];
 
     let output =
-        apply_changes(file, with_root_object(changes)).expect("apply_changes should succeed");
+        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"arr":[null]}));
 }
@@ -754,7 +754,7 @@ fn rejects_root_scalar_with_non_root_descendants() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("is not a container"));
@@ -782,7 +782,7 @@ fn rejects_scalar_ancestor_with_descendant_row() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("is not a container"));
@@ -810,7 +810,7 @@ fn rejects_final_dash_token_in_projection_rows() {
     ];
 
     let error =
-        apply_changes(file, with_root_object(changes)).expect_err("apply_changes should fail");
+        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-canonical '-' array token"));
@@ -830,7 +830,7 @@ fn rejects_non_root_rows_when_root_row_is_missing() {
         snapshot_content: Some(snapshot_content("/0", Value::String("x".to_string()))),
     }];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
     match error {
         PluginApiError::InvalidInput(message) => {
             assert!(message.contains("non-root projection rows require a root row"));

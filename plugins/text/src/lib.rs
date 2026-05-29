@@ -7,7 +7,9 @@ mod bindings {
 }
 pub use bindings::*;
 
-use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
+use crate::exports::lix::plugin::api::{
+    ActiveStateRow, DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use imara_diff::{Algorithm, Diff, InternedInput};
@@ -76,182 +78,191 @@ struct DocumentSnapshotOwned {
     line_ids: Vec<String>,
 }
 
-impl Guest for TextLinesPlugin {
+impl Plugin for TextLinesPlugin {
     fn detect_changes(
-        before: Option<File>,
-        after: File,
-        _state_context: Option<exports::lix::plugin::api::DetectStateContext>,
+        state: DetectStateContext,
+        file: File,
     ) -> Result<Vec<EntityChange>, PluginError> {
-        if let Some(previous) = before.as_ref() {
-            if previous.data == after.data {
-                return Ok(Vec::new());
-            }
-        }
-
-        let before_lines = before
-            .as_ref()
-            .map(|file| parse_lines_with_ids(&file.data))
-            .unwrap_or_default();
-        let after_lines = if let Some(before_file) = before.as_ref() {
-            parse_after_lines_with_histogram_matching(&before_lines, &before_file.data, &after.data)
-        } else {
-            parse_lines_with_ids(&after.data)
-        };
-
-        let before_ids = before_lines
-            .iter()
-            .map(|line| line.entity_pk.clone())
-            .collect::<Vec<_>>();
-        let after_ids = after_lines
-            .iter()
-            .map(|line| line.entity_pk.clone())
-            .collect::<Vec<_>>();
-
-        let before_id_set = before_ids.iter().cloned().collect::<HashSet<_>>();
-        let after_id_set = after_ids.iter().cloned().collect::<HashSet<_>>();
-        let mut changes = Vec::new();
-
-        if before.is_some() {
-            let mut removed_ids = HashSet::<String>::with_capacity(before_lines.len());
-            for line in &before_lines {
-                if after_id_set.contains(&line.entity_pk) {
-                    continue;
-                }
-                if removed_ids.insert(line.entity_pk.clone()) {
-                    changes.push(EntityChange {
-                        entity_pk: line.entity_pk.clone(),
-                        schema_key: LINE_SCHEMA_KEY.to_string(),
-                        snapshot_content: None,
-                    });
-                }
-            }
-        }
-
-        for line in &after_lines {
-            if before_id_set.contains(&line.entity_pk) {
-                continue;
-            }
-            changes.push(EntityChange {
-                entity_pk: line.entity_pk.clone(),
-                schema_key: LINE_SCHEMA_KEY.to_string(),
-                snapshot_content: Some(serialize_line_snapshot(line)?),
-            });
-        }
-
-        if before.is_none() || before_ids != after_ids {
-            let snapshot = serde_json::to_string(&DocumentSnapshot {
-                line_ids: &after_ids,
-            })
-            .map_err(|error| {
-                PluginError::Internal(format!("failed to encode document snapshot: {error}"))
-            })?;
-            changes.push(EntityChange {
-                entity_pk: DOCUMENT_ENTITY_PK.to_string(),
-                schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-                snapshot_content: Some(snapshot),
-            });
-        }
-
-        Ok(changes)
+        let before = file_from_state_context(state, &file)?;
+        detect_changes_from_files(before, file)
     }
 
-    fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-        let expected_line_changes = changes
-            .iter()
-            .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
-            .count();
-        let mut document_snapshot: Option<DocumentSnapshotOwned> = None;
-        let mut document_tombstoned = false;
-        let mut line_by_id = parse_lines_with_ids(&file.data)
-            .into_iter()
-            .map(|line| (line.entity_pk.clone(), line))
-            .collect::<HashMap<_, _>>();
-        line_by_id.reserve(expected_line_changes);
-        let mut seen_line_change_ids = HashSet::<String>::with_capacity(expected_line_changes);
+    fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
+        render_state_context(state)
+    }
+}
 
-        for change in changes {
-            if change.schema_key == LINE_SCHEMA_KEY {
-                if !seen_line_change_ids.insert(change.entity_pk.clone()) {
-                    return Err(PluginError::InvalidInput(
-                        "duplicate text_line snapshot in apply_changes input".to_string(),
-                    ));
-                }
-
-                match change.snapshot_content {
-                    Some(snapshot_raw) => {
-                        let snapshot = parse_line_snapshot(&snapshot_raw, &change.entity_pk)?;
-                        line_by_id.insert(
-                            change.entity_pk.clone(),
-                            ParsedLine {
-                                entity_pk: change.entity_pk,
-                                content: snapshot.content,
-                                ending: snapshot.ending,
-                            },
-                        );
-                    }
-                    None => {
-                        line_by_id.remove(&change.entity_pk);
-                    }
-                }
-                continue;
-            }
-
-            if change.schema_key == DOCUMENT_SCHEMA_KEY {
-                if change.entity_pk != DOCUMENT_ENTITY_PK {
-                    return Err(PluginError::InvalidInput(format!(
-                        "document snapshot entity_pk must be '{DOCUMENT_ENTITY_PK}', got '{}'",
-                        change.entity_pk
-                    )));
-                }
-
-                match change.snapshot_content {
-                    Some(snapshot_raw) => {
-                        if document_snapshot.is_some() || document_tombstoned {
-                            return Err(PluginError::InvalidInput(
-                                "duplicate text_document snapshot in apply_changes input"
-                                    .to_string(),
-                            ));
-                        }
-                        let parsed = parse_document_snapshot(&snapshot_raw)?;
-                        document_snapshot = Some(parsed);
-                    }
-                    None => {
-                        if document_snapshot.is_some() || document_tombstoned {
-                            return Err(PluginError::InvalidInput(
-                                "duplicate text_document snapshot in apply_changes input"
-                                    .to_string(),
-                            ));
-                        }
-                        document_tombstoned = true;
-                    }
-                }
-            }
-        }
-
-        if document_tombstoned {
+fn detect_changes_from_files(
+    before: Option<File>,
+    after: File,
+) -> Result<Vec<EntityChange>, PluginError> {
+    if let Some(previous) = before.as_ref() {
+        if previous.data == after.data {
             return Ok(Vec::new());
         }
+    }
 
-        let document_snapshot = document_snapshot.ok_or_else(|| {
-            PluginError::InvalidInput(
-                "missing text_document snapshot; apply_changes requires full latest projection"
-                    .to_string(),
-            )
+    let before_lines = before
+        .as_ref()
+        .map(|file| parse_lines_with_ids(&file.data))
+        .unwrap_or_default();
+    let after_lines = if let Some(before_file) = before.as_ref() {
+        parse_after_lines_with_histogram_matching(&before_lines, &before_file.data, &after.data)
+    } else {
+        parse_lines_with_ids(&after.data)
+    };
+
+    let before_ids = before_lines
+        .iter()
+        .map(|line| line.entity_pk.clone())
+        .collect::<Vec<_>>();
+    let after_ids = after_lines
+        .iter()
+        .map(|line| line.entity_pk.clone())
+        .collect::<Vec<_>>();
+
+    let before_id_set = before_ids.iter().cloned().collect::<HashSet<_>>();
+    let after_id_set = after_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut changes = Vec::new();
+
+    if before.is_some() {
+        let mut removed_ids = HashSet::<String>::with_capacity(before_lines.len());
+        for line in &before_lines {
+            if after_id_set.contains(&line.entity_pk) {
+                continue;
+            }
+            if removed_ids.insert(line.entity_pk.clone()) {
+                changes.push(EntityChange {
+                    entity_pk: line.entity_pk.clone(),
+                    schema_key: LINE_SCHEMA_KEY.to_string(),
+                    snapshot_content: None,
+                });
+            }
+        }
+    }
+
+    for line in &after_lines {
+        if before_id_set.contains(&line.entity_pk) {
+            continue;
+        }
+        changes.push(EntityChange {
+            entity_pk: line.entity_pk.clone(),
+            schema_key: LINE_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(serialize_line_snapshot(line)?),
+        });
+    }
+
+    if before.is_none() || before_ids != after_ids {
+        let snapshot = serde_json::to_string(&DocumentSnapshot {
+            line_ids: &after_ids,
+        })
+        .map_err(|error| {
+            PluginError::Internal(format!("failed to encode document snapshot: {error}"))
         })?;
+        changes.push(EntityChange {
+            entity_pk: DOCUMENT_ENTITY_PK.to_string(),
+            schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(snapshot),
+        });
+    }
 
-        let mut output = Vec::new();
-        for line_id in document_snapshot.line_ids {
-            let Some(line) = line_by_id.get(&line_id) else {
-                return Err(PluginError::InvalidInput(format!(
-                    "document references missing text_line entity_pk '{line_id}'"
-                )));
-            };
-            output.extend_from_slice(&line.content);
-            output.extend_from_slice(line.ending.as_str().as_bytes());
+    Ok(changes)
+}
+
+fn render_entity_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+    let expected_line_changes = changes
+        .iter()
+        .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
+        .count();
+    let mut document_snapshot: Option<DocumentSnapshotOwned> = None;
+    let mut document_tombstoned = false;
+    let mut line_by_id = parse_lines_with_ids(&file.data)
+        .into_iter()
+        .map(|line| (line.entity_pk.clone(), line))
+        .collect::<HashMap<_, _>>();
+    line_by_id.reserve(expected_line_changes);
+    let mut seen_line_change_ids = HashSet::<String>::with_capacity(expected_line_changes);
+
+    for change in changes {
+        if change.schema_key == LINE_SCHEMA_KEY {
+            if !seen_line_change_ids.insert(change.entity_pk.clone()) {
+                return Err(PluginError::InvalidInput(
+                    "duplicate text_line snapshot in render_changes input".to_string(),
+                ));
+            }
+
+            match change.snapshot_content {
+                Some(snapshot_raw) => {
+                    let snapshot = parse_line_snapshot(&snapshot_raw, &change.entity_pk)?;
+                    line_by_id.insert(
+                        change.entity_pk.clone(),
+                        ParsedLine {
+                            entity_pk: change.entity_pk,
+                            content: snapshot.content,
+                            ending: snapshot.ending,
+                        },
+                    );
+                }
+                None => {
+                    line_by_id.remove(&change.entity_pk);
+                }
+            }
+            continue;
         }
 
-        Ok(output)
+        if change.schema_key == DOCUMENT_SCHEMA_KEY {
+            if change.entity_pk != DOCUMENT_ENTITY_PK {
+                return Err(PluginError::InvalidInput(format!(
+                    "document snapshot entity_pk must be '{DOCUMENT_ENTITY_PK}', got '{}'",
+                    change.entity_pk
+                )));
+            }
+
+            match change.snapshot_content {
+                Some(snapshot_raw) => {
+                    if document_snapshot.is_some() || document_tombstoned {
+                        return Err(PluginError::InvalidInput(
+                            "duplicate text_document snapshot in render_changes input".to_string(),
+                        ));
+                    }
+                    let parsed = parse_document_snapshot(&snapshot_raw)?;
+                    document_snapshot = Some(parsed);
+                }
+                None => {
+                    if document_snapshot.is_some() || document_tombstoned {
+                        return Err(PluginError::InvalidInput(
+                            "duplicate text_document snapshot in render_changes input".to_string(),
+                        ));
+                    }
+                    document_tombstoned = true;
+                }
+            }
+        }
     }
+
+    if document_tombstoned {
+        return Ok(Vec::new());
+    }
+
+    let document_snapshot = document_snapshot.ok_or_else(|| {
+        PluginError::InvalidInput(
+            "missing text_document snapshot; render_changes requires full latest projection"
+                .to_string(),
+        )
+    })?;
+
+    let mut output = Vec::new();
+    for line_id in document_snapshot.line_ids {
+        let Some(line) = line_by_id.get(&line_id) else {
+            return Err(PluginError::InvalidInput(format!(
+                "document references missing text_line entity_pk '{line_id}'"
+            )));
+        };
+        output.extend_from_slice(&line.content);
+        output.extend_from_slice(line.ending.as_str().as_bytes());
+    }
+
+    Ok(output)
 }
 
 fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginError> {
@@ -544,20 +555,72 @@ fn base64_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("invalid base64: {error}"))
 }
 
+fn file_from_state_context(
+    state: DetectStateContext,
+    template: &File,
+) -> Result<Option<File>, PluginError> {
+    let active_state = state.active_state;
+    if active_state.is_empty() {
+        return Ok(None);
+    }
+
+    let data = render_active_state_rows(active_state)?;
+    Ok(Some(File {
+        id: template.id.clone(),
+        path: template.path.clone(),
+        data,
+    }))
+}
+
+fn render_state_context(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
+    render_active_state_rows(state.active_state)
+}
+
+fn render_active_state_rows(rows: Vec<ActiveStateRow>) -> Result<Vec<u8>, PluginError> {
+    render_entity_changes(empty_file(), entity_changes_from_active_state(rows))
+}
+
+fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
+    rows.into_iter()
+        .filter_map(|row| {
+            Some(EntityChange {
+                entity_pk: row.entity_pk,
+                schema_key: row.schema_key?,
+                snapshot_content: row.snapshot_content,
+            })
+        })
+        .collect()
+}
+
+fn empty_file() -> File {
+    File {
+        id: String::new(),
+        path: String::new(),
+        data: Vec::new(),
+    }
+}
+
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    <TextLinesPlugin as Guest>::detect_changes(before, after, None)
+    detect_changes_from_files(before, after)
 }
 
 pub fn detect_changes_with_state_context(
     before: Option<File>,
     after: File,
-    state_context: Option<exports::lix::plugin::api::DetectStateContext>,
+    state_context: Option<DetectStateContext>,
 ) -> Result<Vec<EntityChange>, PluginError> {
-    <TextLinesPlugin as Guest>::detect_changes(before, after, state_context)
+    match state_context {
+        Some(state) => <TextLinesPlugin as Plugin>::detect_changes(state, after),
+        None => detect_changes_from_files(before, after),
+    }
 }
 
-pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-    <TextLinesPlugin as Guest>::apply_changes(file, changes)
+pub fn render(state_context: DetectStateContext) -> Result<Vec<u8>, PluginError> {
+    <TextLinesPlugin as Plugin>::render(state_context)
+}
+
+pub fn render_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+    render_entity_changes(file, changes)
 }
 
 pub fn manifest_json() -> &'static str {
@@ -584,5 +647,5 @@ pub fn document_schema_definition() -> &'static Value {
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 export!(TextLinesPlugin);

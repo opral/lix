@@ -2,16 +2,16 @@ mod common;
 
 use common::file_from_bytes;
 use std::collections::BTreeMap;
-use text_plugin::{PluginEntityChange, apply_changes, detect_changes};
+use text_plugin::{PluginEntityChange, detect_changes, render_changes};
 
 #[test]
-fn detect_then_apply_roundtrips_exact_bytes() {
+fn detect_then_render_roundtrips_exact_bytes() {
     let payload = b"first line\nsecond line\r\nthird line\n";
     let file = file_from_bytes("f1", "/doc.txt", payload);
 
     let changes = detect_changes(None, file).expect("detect_changes should succeed");
-    let reconstructed = apply_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
-        .expect("apply_changes should succeed");
+    let reconstructed = render_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
+        .expect("render_changes should succeed");
 
     assert_eq!(reconstructed, payload);
 }
@@ -24,8 +24,8 @@ fn update_roundtrip_preserves_exact_target_bytes() {
     let after = file_from_bytes("f1", "/doc.txt", after_payload);
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
-    let reconstructed = apply_changes(file_from_bytes("f1", "/doc.txt", before_payload), changes)
-        .expect("apply_changes should succeed");
+    let reconstructed = render_changes(file_from_bytes("f1", "/doc.txt", before_payload), changes)
+        .expect("render_changes should succeed");
 
     assert_eq!(reconstructed, after_payload);
 }
@@ -44,8 +44,8 @@ fn projected_change_log_reconstructs_from_empty_base() {
         detect_changes(Some(before_for_delta), after).expect("delta detect_changes should succeed");
 
     let projected_changes = collapse_to_latest_projection([initial_changes, delta_changes]);
-    let reconstructed = apply_changes(file_from_bytes("f1", "/doc.txt", b""), projected_changes)
-        .expect("apply_changes should succeed for projected changes");
+    let reconstructed = render_changes(file_from_bytes("f1", "/doc.txt", b""), projected_changes)
+        .expect("render_changes should succeed for projected changes");
 
     assert_eq!(reconstructed, after_payload);
 }

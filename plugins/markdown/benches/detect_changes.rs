@@ -8,22 +8,21 @@ use plugin_md_v2::{
 
 fn to_state_context(rows: &[PluginEntityChange]) -> PluginDetectStateContext {
     PluginDetectStateContext {
-        active_state: Some(
-            rows.iter()
-                .map(|row| PluginActiveStateRow {
-                    entity_pk: row.entity_pk.clone(),
-                    schema_key: Some(row.schema_key.clone()),
-                    snapshot_content: row.snapshot_content.clone(),
-                    file_id: None,
-                    plugin_key: None,
-                    branch_id: None,
-                    change_id: None,
-                    metadata: None,
-                    created_at: None,
-                    updated_at: None,
-                })
-                .collect::<Vec<_>>(),
-        ),
+        active_state: rows
+            .iter()
+            .map(|row| PluginActiveStateRow {
+                entity_pk: row.entity_pk.clone(),
+                schema_key: Some(row.schema_key.clone()),
+                snapshot_content: row.snapshot_content.clone(),
+                file_id: None,
+                plugin_key: None,
+                branch_id: None,
+                change_id: None,
+                metadata: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .collect::<Vec<_>>(),
     }
 }
 

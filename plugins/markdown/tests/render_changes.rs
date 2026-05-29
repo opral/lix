@@ -4,7 +4,7 @@ use common::{
     assert_invalid_input, block_change, decode_utf8, document_change, empty_file,
     file_from_markdown,
 };
-use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, apply_changes};
+use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, render_changes};
 
 #[test]
 fn materializes_markdown_from_document_order_and_blocks() {
@@ -15,7 +15,7 @@ fn materializes_markdown_from_document_order_and_blocks() {
         block_change("b1", "heading", "# Title"),
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "# Title\n\nSecond paragraph.\n");
 }
@@ -29,7 +29,7 @@ fn document_tombstone_results_in_empty_file() {
         snapshot_content: None,
     }];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert!(data.is_empty());
 }
@@ -38,7 +38,7 @@ fn document_tombstone_results_in_empty_file() {
 fn passes_through_when_no_markdown_rows_are_present() {
     let file = file_from_markdown("f1", "/notes.md", "keep me");
 
-    let data = apply_changes(file, Vec::new()).expect("apply_changes should succeed");
+    let data = render_changes(file, Vec::new()).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "keep me");
 }
@@ -51,7 +51,7 @@ fn rejects_duplicate_document_rows() {
         document_change(vec!["b2".to_string()]),
     ];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -64,7 +64,7 @@ fn rejects_duplicate_block_rows() {
         block_change("b1", "paragraph", "b"),
     ];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -84,7 +84,7 @@ fn rejects_unknown_document_entity_pk() {
         ),
     }];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -98,7 +98,7 @@ fn rejects_invalid_block_snapshot_json() {
         snapshot_content: Some("{".to_string()),
     }];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -112,7 +112,7 @@ fn rejects_invalid_document_snapshot_json() {
         snapshot_content: Some("{".to_string()),
     }];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -134,7 +134,7 @@ fn rejects_block_snapshot_id_mismatch_with_entity_pk() {
         ),
     }];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -154,7 +154,7 @@ fn rejects_document_snapshot_id_mismatch_with_root() {
         ),
     }];
 
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
+    let error = render_changes(file, changes).expect_err("render_changes should fail");
 
     assert_invalid_input(error);
 }
@@ -175,7 +175,7 @@ fn ignores_unknown_schema_rows() {
         },
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "keep me");
 }
@@ -188,7 +188,7 @@ fn skips_missing_block_ids_referenced_in_document_order() {
         block_change("b1", "paragraph", "Only this exists."),
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "Only this exists.\n");
 }
@@ -202,7 +202,7 @@ fn appends_orphan_blocks_not_in_document_order() {
         block_change("b1", "paragraph", "First"),
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "First\n\nSecond\n");
 }
@@ -215,7 +215,7 @@ fn materializes_deterministically_without_document_row() {
         block_change("b1", "paragraph", "First"),
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     // BTreeMap key ordering makes this deterministic.
     assert_eq!(decode_utf8(data), "First\n\nSecond\n");
@@ -230,7 +230,7 @@ fn normalizes_block_markdown_whitespace_and_trailing_newline() {
         block_change("b2", "paragraph", "\n\nParagraph\n\n"),
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "# Title\n\nParagraph\n");
 }
@@ -248,7 +248,7 @@ fn tombstoned_block_is_not_rendered_even_if_order_mentions_it() {
         },
     ];
 
-    let data = apply_changes(file, changes).expect("apply_changes should succeed");
+    let data = render_changes(file, changes).expect("render_changes should succeed");
 
     assert_eq!(decode_utf8(data), "Alive\n");
 }

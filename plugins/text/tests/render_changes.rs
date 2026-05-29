@@ -2,8 +2,8 @@ mod common;
 
 use common::{file_from_bytes, parse_document_snapshot};
 use text_plugin::{
-    DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, PluginApiError, PluginEntityChange, apply_changes,
-    detect_changes,
+    DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, PluginApiError, PluginEntityChange, detect_changes,
+    render_changes,
 };
 
 #[test]
@@ -12,8 +12,8 @@ fn applies_full_projection_and_reconstructs_bytes() {
     let after = file_from_bytes("f1", "/doc.txt", expected);
 
     let changes = detect_changes(None, after).expect("detect_changes should succeed");
-    let output = apply_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
-        .expect("apply_changes should succeed");
+    let output = render_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
+        .expect("render_changes should succeed");
 
     assert_eq!(output, expected);
 }
@@ -24,8 +24,8 @@ fn supports_binary_bytes() {
     let after = file_from_bytes("f1", "/bin.dat", &expected);
 
     let changes = detect_changes(None, after).expect("detect_changes should succeed");
-    let output = apply_changes(file_from_bytes("f1", "/bin.dat", b""), changes)
-        .expect("apply_changes should succeed");
+    let output = render_changes(file_from_bytes("f1", "/bin.dat", b""), changes)
+        .expect("render_changes should succeed");
 
     assert_eq!(output, expected);
 }
@@ -38,8 +38,8 @@ fn rejects_missing_document_snapshot() {
         snapshot_content: Some(r#"{"content_base64":"YQ==","ending":"\n"}"#.to_string()),
     }];
 
-    let error = apply_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
-        .expect_err("apply_changes should fail");
+    let error = render_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
+        .expect_err("render_changes should fail");
 
     match error {
         PluginApiError::InvalidInput(message) => {
@@ -69,8 +69,8 @@ fn document_order_drives_output_order() {
         .to_string(),
     );
 
-    let output = apply_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
-        .expect("apply_changes should succeed");
+    let output = render_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
+        .expect("render_changes should succeed");
 
     assert_eq!(output, b"b\na\n");
 }

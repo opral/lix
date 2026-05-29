@@ -30,13 +30,13 @@ pub(crate) async fn collect_input_plan(
     Ok(batches)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 #[expect(clippy::unnecessary_wraps)]
 fn validate_physical_plan(_plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn validate_physical_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
     let operator_name = plan.name();
     if is_wasm_unsafe_operator(operator_name) {
@@ -52,7 +52,7 @@ fn validate_physical_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn is_wasm_unsafe_operator(operator_name: &str) -> bool {
     matches!(
         operator_name,

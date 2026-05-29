@@ -6,16 +6,6 @@
     "path_glob": "*.{md,mdx}",
     "content_type": "text"
   },
-  "detect_changes": {
-    "state_context": {
-      "include_active_state": true,
-      "columns": [
-        "entity_pk",
-        "schema_key",
-        "snapshot_content"
-      ]
-    }
-  },
   "entry": "plugin.wasm",
   "schemas": [
     "schema/markdown_document.json",

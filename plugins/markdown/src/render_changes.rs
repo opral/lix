@@ -4,7 +4,7 @@ use crate::exports::lix::plugin::api::{EntityChange, File, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn apply_changes(
+pub(crate) fn render_changes(
     file: File,
     changes: Vec<EntityChange>,
 ) -> Result<Vec<u8>, PluginError> {

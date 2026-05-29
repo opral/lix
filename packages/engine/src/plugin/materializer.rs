@@ -7,7 +7,7 @@ use crate::common::LixError;
 use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
 use crate::Backend;
 
-use super::component::{apply_changes_with_plugin, PluginComponentHost};
+use super::component::{render_with_plugin, PluginComponentHost};
 use super::{
     load_installed_plugin_from_archive_bytes, plugin_key_from_archive_path, PluginContentType,
     PluginRuntime,
@@ -29,7 +29,7 @@ pub struct InstalledPlugin {
 pub trait FilesystemPluginMaterializer {
     async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError>;
 
-    async fn apply_plugin_changes(
+    async fn render_plugin_state(
         &self,
         plugin: &InstalledPlugin,
         payload: &[u8],
@@ -192,11 +192,11 @@ where
         load_installed_plugins_with_runtime_cache(self).await
     }
 
-    async fn apply_plugin_changes(
+    async fn render_plugin_state(
         &self,
         plugin: &InstalledPlugin,
         payload: &[u8],
     ) -> Result<Vec<u8>, LixError> {
-        apply_changes_with_plugin(self, plugin, payload).await
+        render_with_plugin(self, plugin, payload).await
     }
 }
