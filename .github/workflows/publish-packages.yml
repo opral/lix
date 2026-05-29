@@ -1,0 +1,44 @@
+name: Publish Packages
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-js-sdk:
+    name: Publish @lix-js/sdk
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-js-sdk
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
+          registry-url: https://registry.npmjs.org
+
+      - name: Install JS SDK dependencies
+        working-directory: packages/js-sdk
+        run: npm ci
+
+      - name: Test JS SDK package
+        working-directory: packages/js-sdk
+        run: npm test
+
+      - name: Publish JS SDK package
+        working-directory: packages/js-sdk
+        run: npm publish --provenance --access public

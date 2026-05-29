@@ -1,0 +1,106 @@
+name: Changelog Suggest
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  suggest:
+    name: Suggest changelog fragment
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'github-actions[bot]' &&
+      !startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout pull request branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+
+      - name: Run Codex changelog suggester
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: gpt-5.5
+          effort: medium
+          sandbox: workspace-write
+          prompt: |
+            You are maintaining Lix release notes.
+
+            Inspect only this PR's changes:
+            git diff --stat origin/${{ github.event.pull_request.base.ref }}...HEAD
+            git diff origin/${{ github.event.pull_request.base.ref }}...HEAD
+
+            If the PR has a user-facing change that warrants a release note,
+            create or update exactly one file:
+
+            .changes/pr-${{ github.event.pull_request.number }}.md
+
+            Use this exact format:
+
+            ---
+            type: patch
+            scope: js-sdk
+            ---
+
+            One concise user-facing sentence with a PR link, for example:
+            Fixed native binding loading on Linux. [#${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }})
+
+            Rules:
+            - type must be exactly one of: major, minor, patch.
+            - scope must be exactly one of: engine, lix-sdk, js-sdk, cli.
+            - Only create a fragment for user-facing changes in those core packages.
+            - Use major only for breaking user-facing API or behavior changes.
+            - Use minor for backward-compatible user-facing capability additions.
+            - Use patch for user-facing fixes and compatibility fixes.
+            - If there is no user-facing release note, do not create or edit any file.
+            - End the sentence with [#${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }}).
+            - Do not edit files outside .changes/pr-${{ github.event.pull_request.number }}.md.
+            - Do not run tests or install dependencies.
+            - For repo-only, documentation-only, CI-only, test-only, and chore-only changes, do not create or edit any file.
+
+            Pull request title:
+            ${{ github.event.pull_request.title }}
+
+            Pull request body:
+            ${{ github.event.pull_request.body }}
+
+      - name: Ensure Codex only edited changelog fragment
+        run: |
+          unexpected="$(git diff --name-only | grep -v '^.changes/pr-${{ github.event.pull_request.number }}.md$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Codex edited files outside the allowed changelog fragment:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Validate suggested changelog
+        if: hashFiles(format('.changes/pr-{0}.md', github.event.pull_request.number)) != ''
+        run: |
+          node scripts/validate-changes.mjs
+
+      - name: Commit suggested changelog
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if git diff --quiet -- ".changes/pr-${PR_NUMBER}.md"; then
+            echo "No changelog suggestion to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ".changes/pr-${PR_NUMBER}.md"
+          git commit -m "chore: add changelog suggestion for PR #${PR_NUMBER}"
+          git push origin HEAD:"${PR_HEAD_REF}"

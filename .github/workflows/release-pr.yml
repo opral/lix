@@ -1,0 +1,50 @@
+name: Release PR
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    name: Open release PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release changes
+        id: prepare
+        run: |
+          output="$(node scripts/prepare-release.mjs)"
+          echo "$output"
+          version="$(printf '%s\n' "$output" | sed -n 's/^version=//p')"
+          if [ -z "$version" ]; then
+            echo "has_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release PR
+        if: steps.prepare.outputs.has_release == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: release/v${{ steps.prepare.outputs.version }}
+          delete-branch: true
+          commit-message: Release v${{ steps.prepare.outputs.version }}
+          title: Release v${{ steps.prepare.outputs.version }}
+          body: |
+            This PR was generated from `.changes/*` fragments.
+
+            Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
+            and enables the release tag workflow to create `v${{ steps.prepare.outputs.version }}`.

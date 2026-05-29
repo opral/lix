@@ -12,6 +12,17 @@ permissions:
   contents: read
 
 jobs:
+  changelog:
+    name: Changelog
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate change fragments
+        run: node scripts/validate-changes.mjs
+
   cargo-test:
     name: Cargo Test
     runs-on: blacksmith-32vcpu-ubuntu-2404
