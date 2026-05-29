@@ -120,10 +120,10 @@ jobs:
         working-directory: native-package
         run: npm publish --provenance --access public
 
-  publish-js-sdk:
-    name: Publish @lix-js/sdk
-    runs-on: ubuntu-latest
-    needs: publish-js-sdk-native-packages
+  build-js-sdk:
+    name: Build @lix-js/sdk
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: release-version
 
     steps:
       - name: Checkout repository
@@ -149,9 +149,77 @@ jobs:
         working-directory: packages/js-sdk
         run: npm install
 
+      - name: Build JS SDK package
+        working-directory: packages/js-sdk
+        run: npm run build
+
+      - name: Upload JS SDK package build
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-sdk-package-build
+          path: |
+            packages/js-sdk/dist
+            packages/js-sdk/lix_js_sdk.node
+          if-no-files-found: error
+
+  test-js-sdk:
+    name: Test @lix-js/sdk
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: build-js-sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
+
+      - name: Install JS SDK dependencies
+        working-directory: packages/js-sdk
+        run: npm install
+
+      - name: Download JS SDK package build
+        uses: actions/download-artifact@v4
+        with:
+          name: js-sdk-package-build
+          path: packages/js-sdk
+
       - name: Test JS SDK package
         working-directory: packages/js-sdk
-        run: npm test
+        run: npx vitest run
+
+  publish-js-sdk:
+    name: Publish @lix-js/sdk
+    runs-on: ubuntu-latest
+    needs:
+      - publish-js-sdk-native-packages
+      - test-js-sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
+          registry-url: https://registry.npmjs.org
+
+      - name: Install JS SDK dependencies
+        working-directory: packages/js-sdk
+        run: npm install
+
+      - name: Download JS SDK package build
+        uses: actions/download-artifact@v4
+        with:
+          name: js-sdk-package-build
+          path: packages/js-sdk
 
       - name: Publish JS SDK package
         working-directory: packages/js-sdk
@@ -164,6 +232,8 @@ jobs:
       - release-version
       - build-js-sdk-native-packages
       - publish-js-sdk-native-packages
+      - build-js-sdk
+      - test-js-sdk
       - publish-js-sdk
     if: ${{ always() }}
 
@@ -173,6 +243,8 @@ jobs:
           echo "release-version: ${{ needs.release-version.result }}"
           echo "build-js-sdk-native-packages: ${{ needs.build-js-sdk-native-packages.result }}"
           echo "publish-js-sdk-native-packages: ${{ needs.publish-js-sdk-native-packages.result }}"
+          echo "build-js-sdk: ${{ needs.build-js-sdk.result }}"
+          echo "test-js-sdk: ${{ needs.test-js-sdk.result }}"
           echo "publish-js-sdk: ${{ needs.publish-js-sdk.result }}"
 
           if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
