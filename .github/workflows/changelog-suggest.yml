@@ -14,6 +14,7 @@ jobs:
     if: >
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'github-actions[bot]' &&
+      (!endsWith(github.actor, '[bot]') || github.actor == 'cursor[bot]') &&
       !startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
 
@@ -34,6 +35,7 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           model: gpt-5.5
           effort: medium
+          allow-bots: true
           sandbox: workspace-write
           prompt: |
             You are maintaining Lix release notes.
