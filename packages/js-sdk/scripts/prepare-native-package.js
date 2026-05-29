@@ -41,6 +41,7 @@ await writeFile(
 			version: sdkPackage.version,
 			description: `Native binary for @lix-js/sdk on ${platform.os}-${platform.cpu}.`,
 			main: "./lix_js_sdk.node",
+			repository: sdkPackage.repository,
 			os: [platform.os],
 			cpu: [platform.cpu],
 			files: ["lix_js_sdk.node"],

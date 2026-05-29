@@ -33,6 +33,7 @@ function run(cmd, args, opts = {}) {
 
 const rustflags = [
 	process.env.RUSTFLAGS ?? "",
+	isRelease ? "-C strip=symbols" : "",
 	process.platform === "darwin"
 		? "-C link-arg=-undefined -C link-arg=dynamic_lookup"
 		: "",

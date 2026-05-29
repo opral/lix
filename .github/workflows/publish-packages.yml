@@ -7,9 +7,8 @@ on:
         description: Version to publish, with or without a leading v
         required: true
         type: string
-  push:
-    tags:
-      - v*
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -32,7 +31,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             version="${{ inputs.version }}"
           else
-            version="${GITHUB_REF_NAME}"
+            version="${{ github.event.release.tag_name }}"
           fi
           version="${version#v}"
           tag="$(node scripts/release-tag.mjs "$version" | tail -n 1)"

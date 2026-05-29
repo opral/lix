@@ -16,8 +16,8 @@ permissions:
   contents: write
 
 jobs:
-  tag:
-    name: Create release tag
+  release:
+    name: Create GitHub release
     runs-on: ubuntu-latest
 
     steps:
@@ -41,23 +41,14 @@ jobs:
           echo "has_tag=true" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push tag
-        if: steps.detect.outputs.has_tag == 'true'
-        run: |
-          tag="${{ steps.detect.outputs.tag }}"
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "$tag already exists."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "$tag"
-          git push origin "$tag"
-
-      - name: Trigger package publish
+      - name: Create GitHub release
         if: steps.detect.outputs.has_tag == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.detect.outputs.tag }}"
-          gh workflow run publish-packages.yml --ref main -f version="${tag#v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists."
+            exit 0
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes
