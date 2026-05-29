@@ -1,6 +1,12 @@
 name: Publish Packages
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish, with or without a leading v
+        required: true
+        type: string
   push:
     tags:
       - v*
@@ -10,9 +16,32 @@ permissions:
   id-token: write
 
 jobs:
+  release-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate release version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          version="${version#v}"
+          tag="$(node scripts/release-tag.mjs "$version" | tail -n 1)"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
   build-js-sdk-native-packages:
     name: Build @lix-js/sdk native package (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
+    needs: release-version
     strategy:
       fail-fast: false
       matrix:

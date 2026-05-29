@@ -12,6 +12,7 @@ on:
       - main
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -52,3 +53,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag "$tag"
           git push origin "$tag"
+
+      - name: Trigger package publish
+        if: steps.detect.outputs.has_tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.detect.outputs.tag }}"
+          gh workflow run publish-packages.yml --ref main -f version="${tag#v}"
