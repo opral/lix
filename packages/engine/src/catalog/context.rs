@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use crate::catalog::SchemaCatalogFact;
-use crate::domain::{committed_row_is_exact_branch_scoped, Domain};
+use crate::domain::{Domain, committed_row_is_exact_branch_scoped};
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::schema::schema_key_from_definition;
@@ -49,8 +49,7 @@ impl CatalogContext {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "SQL surface schema '{}' is visible from more than one schema catalog fact",
-                        schema_key
+                        "SQL surface schema '{schema_key}' is visible from more than one schema catalog fact"
                     ),
                 )
                 .with_hint("SQL entity surfaces are named by schema_key. Keep exactly one visible schema per schema_key for SQL planning."));
@@ -145,9 +144,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
     use crate::live_state::LiveStateRowRequest;
-    use crate::GLOBAL_BRANCH_ID;
 
     #[tokio::test]
     async fn visible_schemas_are_loaded_from_registered_schema_rows() {

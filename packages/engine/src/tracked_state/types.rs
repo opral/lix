@@ -1,8 +1,8 @@
+use crate::NullableKeyFilter;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
-use crate::NullableKeyFilter;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 

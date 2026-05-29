@@ -1,12 +1,12 @@
 use musli::{Decode, Encode};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::LixError;
 use crate::storage_codec;
 use crate::tracked_state::types::{
-    TrackedSchemaFilePrefixRef, TrackedSchemaKeyPrefixRef, TrackedStateIndexValue,
-    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
+    TRACKED_STATE_HASH_BYTES, TrackedSchemaFilePrefixRef, TrackedSchemaKeyPrefixRef,
+    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
 };
-use crate::LixError;
 
 #[cfg(test)]
 use crate::json_store::JsonRef;
@@ -111,10 +111,12 @@ impl<'a> DecodedLeafNodeRef<'a> {
         self.entries.len()
     }
 
+    #[expect(clippy::unnecessary_wraps)]
     pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'a>>, LixError> {
         Ok(self.entries.get(index).copied())
     }
 
+    #[expect(clippy::unnecessary_wraps)]
     pub(crate) fn key(&self, index: usize) -> Result<Option<&'a [u8]>, LixError> {
         Ok(self.entries.get(index).map(|entry| entry.key))
     }
@@ -350,6 +352,7 @@ pub(crate) fn child_summary_from_node(
     )
 }
 
+#[expect(clippy::cast_precision_loss)]
 pub(crate) fn boundary_trigger(
     encoded_key: &[u8],
     level: usize,
@@ -498,9 +501,11 @@ mod tests {
         encoded.truncate(encoded.len() - 1);
 
         let error = decode_key(&encoded).expect_err("truncated key should reject");
-        assert!(error
-            .to_string()
-            .contains("failed to decode tracked-state key"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode tracked-state key")
+        );
     }
 
     #[test]
@@ -513,9 +518,11 @@ mod tests {
 
         let error = decode_key(&encoded).expect_err("empty entity pk should reject");
 
-        assert!(error
-            .message
-            .contains("entity primary key decoded from storage is invalid"));
+        assert!(
+            error
+                .message
+                .contains("entity primary key decoded from storage is invalid")
+        );
     }
 
     #[test]
@@ -720,9 +727,11 @@ mod tests {
 
         let error = decode_node_ref(&encoded).expect_err("truncated leaf should reject");
 
-        assert!(error
-            .to_string()
-            .contains("failed to decode tracked-state tree node"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode tracked-state tree node")
+        );
     }
 
     #[test]

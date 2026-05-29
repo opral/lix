@@ -1,3 +1,7 @@
+#![allow(clippy::clone_on_copy, clippy::unnecessary_wraps)]
+
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
@@ -15,8 +19,6 @@ use crate::storage::StorageBackend;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
-use crate::LixError;
-use crate::GLOBAL_BRANCH_ID;
 use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
@@ -266,7 +268,7 @@ fn seed_commit_row_change_record(commit: &InitSeedCommit) -> Result<ChangeRecord
     Ok(ChangeRecord {
         format_version: 1,
         change_id: commit.change_id,
-        entity_pk: EntityPk::single(commit.id.clone()),
+        entity_pk: EntityPk::single(commit.id),
         schema_key: "lix_commit".to_string(),
         file_id: None,
         snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
@@ -522,10 +524,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(branch_refs.len(), 2);
-        assert!(plan
-            .changes
-            .iter()
-            .all(|change| change.schema_key != BRANCH_REF_SCHEMA_KEY));
+        assert!(
+            plan.changes
+                .iter()
+                .all(|change| change.schema_key != BRANCH_REF_SCHEMA_KEY)
+        );
         for row in branch_refs {
             assert_eq!(row.schema_key, BRANCH_REF_SCHEMA_KEY);
             assert_eq!(row.branch_id, GLOBAL_BRANCH_ID);
@@ -545,7 +548,7 @@ mod tests {
             .iter()
             .find(|row| {
                 row.schema_key == KEY_VALUE_SCHEMA_KEY
-                    && row.entity_pk == crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)
+                    && row.entity_pk == EntityPk::single(WORKSPACE_BRANCH_KEY)
             })
             .expect("workspace branch row should exist");
 
@@ -674,6 +677,7 @@ mod tests {
         serde_json::from_str(&row.snapshot_content).expect("snapshot should be JSON")
     }
 
+    #[expect(trivial_casts)]
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::shared(
             Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>

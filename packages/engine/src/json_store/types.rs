@@ -60,8 +60,15 @@ impl JsonRef {
         &self.hash
     }
 
-    pub(crate) fn to_hex(&self) -> String {
-        self.hash.iter().map(|byte| format!("{byte:02x}")).collect()
+    pub(crate) fn to_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut out = String::with_capacity(self.hash.len() * 2);
+        for byte in self.hash {
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        out
     }
 }
 
@@ -72,7 +79,7 @@ impl<M> Encode<M> for JsonRef {
     where
         E: Encoder<Mode = M>,
     {
-        encoder.encode(&self.hash)
+        encoder.encode(self.hash)
     }
 
     fn size_hint(&self) -> Option<usize> {

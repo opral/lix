@@ -1,9 +1,13 @@
-use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
+#[expect(clippy::same_length_and_capacity)]
+mod bindings {
+    wit_bindgen::generate!({
+        path: "../../packages/engine/wit",
+        world: "plugin",
+    });
+}
+pub use bindings::*;
 
-wit_bindgen::generate!({
-    path: "../../packages/engine/wit",
-    world: "plugin",
-});
+use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
 
 mod apply_changes;
 mod common;
@@ -25,7 +29,7 @@ impl Guest for MarkdownPlugin {
     fn detect_changes(
         before: Option<File>,
         after: File,
-        state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+        state_context: Option<exports::lix::plugin::api::DetectStateContext>,
     ) -> Result<Vec<EntityChange>, PluginError> {
         detect_changes::detect_changes(before, after, state_context)
     }

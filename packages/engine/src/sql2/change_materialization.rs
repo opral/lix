@@ -2,7 +2,7 @@ use crate::changelog::ChangeRecord;
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
 use crate::storage::StorageRead;
-use crate::{parse_row_metadata, LixError};
+use crate::{LixError, parse_row_metadata};
 
 /// Read-boundary view of a changelog change with JSON refs resolved.
 ///

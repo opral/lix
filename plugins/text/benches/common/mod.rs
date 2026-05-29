@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use text_plugin::{detect_changes, PluginEntityChange, PluginFile};
+use text_plugin::{PluginEntityChange, PluginFile, detect_changes};
 
 pub struct DetectScenario {
     pub name: &'static str,

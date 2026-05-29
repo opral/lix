@@ -61,6 +61,7 @@ impl SharedExpectSameRun {
         }
     }
 
+    #[expect(clippy::unused_self)]
     fn start_mode(&self) {}
 
     fn next_index(&self) -> usize {
@@ -114,50 +115,48 @@ impl SharedExpectSameRun {
     }
 
     fn wait_for_expected(&self, index: usize, label: &str) -> (String, String) {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_mins(2);
         let mut state = self
             .case
             .state
             .lock()
             .expect("engine shared expectation lock poisoned");
         loop {
-            if state.base_failed {
-                panic!(
-                    "simulation_test case `{}` base failed before `{}` could compare call #{}",
-                    self.case_id, label, index
-                );
-            }
+            assert!(
+                !state.base_failed,
+                "simulation_test case `{}` base failed before `{}` could compare call #{}",
+                self.case_id, label, index
+            );
             if let Some(expected) = state.expected.get(index) {
                 return expected.clone();
             }
-            if state.base_finished {
-                panic!(
-                    "simulation_test case `{}` mode `{}` called assert_same one extra time at call #{} ({label})",
-                    self.case_id,
-                    self.mode.name(),
-                    index
-                );
-            }
+            assert!(
+                !state.base_finished,
+                "simulation_test case `{}` mode `{}` called assert_same one extra time at call #{} ({label})",
+                self.case_id,
+                self.mode.name(),
+                index
+            );
 
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "simulation_test timed out waiting for base assert_same call #{} in case `{}`",
-                    index, self.case_id
-                );
-            }
+            assert!(
+                !remaining.is_zero(),
+                "simulation_test timed out waiting for base assert_same call #{} in case `{}`",
+                index,
+                self.case_id
+            );
             let (next_state, timeout) = self
                 .case
                 .condvar
                 .wait_timeout(state, remaining)
                 .expect("engine shared expectation condvar wait poisoned");
             state = next_state;
-            if timeout.timed_out() {
-                panic!(
-                    "simulation_test timed out waiting for base assert_same call #{} in case `{}`",
-                    index, self.case_id
-                );
-            }
+            assert!(
+                !timeout.timed_out(),
+                "simulation_test timed out waiting for base assert_same call #{} in case `{}`",
+                index,
+                self.case_id
+            );
         }
     }
 
@@ -180,7 +179,7 @@ impl SharedExpectSameRun {
     }
 
     fn finish_compare(&self) {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_mins(2);
         let mut state = self
             .case
             .state
@@ -188,32 +187,29 @@ impl SharedExpectSameRun {
             .expect("engine shared expectation lock poisoned");
         while !state.base_finished && !state.base_failed {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                panic!(
-                    "simulation_test timed out waiting for base completion in case `{}`",
-                    self.case_id
-                );
-            }
+            assert!(
+                !remaining.is_zero(),
+                "simulation_test timed out waiting for base completion in case `{}`",
+                self.case_id
+            );
             let (next_state, timeout) = self
                 .case
                 .condvar
                 .wait_timeout(state, remaining)
                 .expect("engine shared expectation condvar wait poisoned");
             state = next_state;
-            if timeout.timed_out() {
-                panic!(
-                    "simulation_test timed out waiting for base completion in case `{}`",
-                    self.case_id
-                );
-            }
-        }
-        if state.base_failed {
-            panic!(
-                "simulation_test case `{}` base failed before mode `{}` completed",
-                self.case_id,
-                self.mode.name()
+            assert!(
+                !timeout.timed_out(),
+                "simulation_test timed out waiting for base completion in case `{}`",
+                self.case_id
             );
         }
+        assert!(
+            !state.base_failed,
+            "simulation_test case `{}` base failed before mode `{}` completed",
+            self.case_id,
+            self.mode.name()
+        );
         assert_eq!(
             self.call_count(),
             state.expected.len(),

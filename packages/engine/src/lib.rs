@@ -59,25 +59,26 @@ pub use schema::{
 };
 
 pub use backend::conformance::{
-    run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig,
+    BackendFactory, BackendFixture, BackendTestConfig,
     ConformanceReport as BackendConformanceReport, ConformanceResult as BackendConformanceResult,
     ConformanceStatus as BackendConformanceStatus, ConformanceTest as BackendConformanceTest,
+    run_backend_conformance,
 };
 pub use backend::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
-    BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult, CoreProjection,
-    Durability, GetManyResult, GetOptions, InMemoryBackend, InMemoryBackendFactory,
-    InMemoryBackendFixture, InMemoryRangeScan, InMemoryRead, InMemoryScanVisitResult,
-    InMemoryWrite, Key, Key as BackendKey, KeyRange, KeyRef as BackendKeyRef, PointVisitor,
-    Prefix as BackendPrefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry,
-    ReadConsistency, ReadEntry, ReadOptions, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
-    SnapshotRef, SpaceId, StoredValue, Value as BackendValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, InMemoryBackend,
+    InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRangeScan, InMemoryRead,
+    InMemoryScanVisitResult, InMemoryWrite, Key, Key as BackendKey, KeyRange,
+    KeyRef as BackendKeyRef, PointVisitor, Prefix as BackendPrefix, ProjectedValue,
+    ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, ScanResult, ScanVisitor, SnapshotRef, SpaceId, StoredValue, Value as BackendValue,
+    WriteOptions, WriteStats, get_many as backend_get_many, visit_range as backend_visit_range,
 };
 pub use common::LixError;
-pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
+pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{

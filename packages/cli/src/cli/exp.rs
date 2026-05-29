@@ -1,4 +1,4 @@
-use clap::{value_parser, Args, Subcommand, ValueHint};
+use clap::{Args, Subcommand, ValueHint, value_parser};
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]

@@ -1,5 +1,5 @@
 use plugin_md_v2::schemas::{
-    schema_definitions, schema_jsons, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY,
+    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, schema_definitions, schema_jsons,
 };
 use std::collections::BTreeSet;
 

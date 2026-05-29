@@ -12,14 +12,11 @@ pub fn run() -> Result<(), CliError> {
     let no_hints = cli.no_hints;
     let lix_path = cli.path;
 
-    let command = match cli.command {
-        Some(command) => command,
-        None => {
-            welcome::print_banner(lix_path.as_deref());
-            Cli::command().print_help().ok();
-            println!();
-            return Ok(());
-        }
+    let Some(command) = cli.command else {
+        welcome::print_banner(lix_path.as_deref());
+        Cli::command().print_help().ok();
+        println!();
+        return Ok(());
     };
 
     let context = AppContext { lix_path, no_hints };

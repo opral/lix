@@ -1,3 +1,13 @@
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::elidable_lifetime_names,
+    clippy::match_same_arms,
+    clippy::option_if_let_else,
+    clippy::redundant_clone,
+    clippy::unnecessary_wraps
+)]
+
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
@@ -16,20 +26,20 @@ use crate::sql2::bind::write::{BoundInsertValues, FileWriteSurface};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
+use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
-use crate::sql2::plan::LogicalWritePlan;
-use crate::{LixError, LixNotice, SqlQueryResult, Value, GLOBAL_BRANCH_ID};
+use crate::{GLOBAL_BRANCH_ID, LixError, LixNotice, SqlQueryResult, Value};
 
 use crate::sql2::predicate_typecheck::{
     json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
 };
 use crate::sql2::result_metadata::{
-    field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY,
+    LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json,
 };
 use crate::sql2::session::{
-    build_read_session, build_transaction_read_session, build_write_session_with_options,
-    SqlWriteSessionOptions,
+    SqlWriteSessionOptions, build_read_session, build_transaction_read_session,
+    build_write_session_with_options,
 };
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
@@ -590,7 +600,7 @@ fn insert_field_expr(
 
 fn datafusion_assignments(
     session: &SessionContext,
-    schema: &datafusion::arrow::datatypes::Schema,
+    schema: &Schema,
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Vec<(String, Expr)>, LixError> {
@@ -612,7 +622,7 @@ fn datafusion_assignments(
 
 fn datafusion_write_filters(
     session: &SessionContext,
-    schema: &datafusion::arrow::datatypes::Schema,
+    schema: &Schema,
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Vec<Expr>, LixError> {
@@ -652,7 +662,7 @@ fn datafusion_write_filters(
 
 fn datafusion_filters_from_predicate(
     session: &SessionContext,
-    schema: &datafusion::arrow::datatypes::Schema,
+    schema: &Schema,
     predicate: &BoundPredicate,
     params: &[Value],
 ) -> Result<Vec<Expr>, LixError> {
@@ -745,7 +755,7 @@ fn datafusion_filters_from_predicate(
 
 fn datafusion_single_filter_from_predicate(
     session: &SessionContext,
-    schema: &datafusion::arrow::datatypes::Schema,
+    schema: &Schema,
     predicate: &BoundPredicate,
     params: &[Value],
 ) -> Result<Expr, LixError> {
@@ -856,7 +866,7 @@ fn bound_literal_metadata(literal: &BoundLiteral) -> Option<FieldMetadata> {
     }
 }
 
-fn bound_expr_is_json(expr: &BoundExpr, schema: &datafusion::arrow::datatypes::Schema) -> bool {
+fn bound_expr_is_json(expr: &BoundExpr, schema: &Schema) -> bool {
     match expr {
         BoundExpr::Column(column) => schema
             .fields()
@@ -1091,7 +1101,7 @@ fn query_result_from_batches(
 ) -> Result<SqlQueryResult, LixError> {
     let result_columns = result_fields
         .iter()
-        .map(|field| field.name().to_string())
+        .map(|field| field.name().clone())
         .collect::<Vec<_>>();
     let mut rows = Vec::<Vec<Value>>::new();
     for batch in batches {
@@ -1109,7 +1119,7 @@ fn query_result_from_batches(
 
     Ok(SqlQueryResult {
         rows,
-        columns: result_columns.to_vec(),
+        columns: result_columns.clone(),
         notices: Vec::new(),
     })
 }
@@ -1302,10 +1312,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use serde_json::json;
     use serde_json::Value as JsonValue;
+    use serde_json::json;
 
-    use super::{execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
+    use super::{SqlExecutionContext, SqlWriteExecutionContext, execute_sql};
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
     use crate::changelog::{ChangeId, CommitId};
@@ -1319,11 +1329,11 @@ mod tests {
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::{
-        bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
-        plan_write,
+        ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
     };
     use crate::sql2::{
-        ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
+        bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
+        plan_write,
     };
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
@@ -1333,7 +1343,7 @@ mod tests {
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
     use crate::{Engine, ExecuteResult, SessionContext};
-    use crate::{LixError, NullableKeyFilter, Value, GLOBAL_BRANCH_ID};
+    use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, Value};
 
     struct DummyBlobReader;
     struct StaticBlobReader {
@@ -1861,6 +1871,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(trivial_casts)]
     async fn sql_execution_context_exposes_live_state_and_blob_reader() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
@@ -1987,7 +1998,7 @@ mod tests {
     }
 
     async fn setup_engine_history_fixture() -> Result<(SessionContext, String), LixError> {
-        let backend = crate::storage::InMemoryStorageBackend::new();
+        let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone()).await?;
         let engine = Engine::new(backend).await?;
         let session = engine.open_session(init_receipt.main_branch_id).await?;
@@ -2041,7 +2052,7 @@ mod tests {
 
     #[tokio::test]
     async fn lix_file_path_predicates_canonicalize_bound_values_like_writes() {
-        let backend = crate::storage::InMemoryStorageBackend::new();
+        let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
@@ -2146,7 +2157,7 @@ mod tests {
 
     #[tokio::test]
     async fn lix_file_path_predicates_reject_non_literal_path_values() {
-        let backend = crate::storage::InMemoryStorageBackend::new();
+        let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
@@ -2179,7 +2190,7 @@ mod tests {
 
     #[tokio::test]
     async fn lix_directory_path_predicates_canonicalize_bound_values_like_writes() {
-        let backend = crate::storage::InMemoryStorageBackend::new();
+        let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
@@ -2233,7 +2244,7 @@ mod tests {
 
     #[tokio::test]
     async fn lix_directory_path_predicates_reject_non_literal_path_values() {
-        let backend = crate::storage::InMemoryStorageBackend::new();
+        let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone())
             .await
             .expect("engine should initialize");
@@ -2636,8 +2647,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_branch_parameterized_global_branch_defaults_global_true(
-    ) {
+    async fn execute_sql_insert_into_lix_state_by_branch_parameterized_global_branch_defaults_global_true()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -2785,8 +2796,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_null_global_branch(
-    ) {
+    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_null_global_branch()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -2811,14 +2822,16 @@ mod tests {
         .expect_err("explicit parameterized NULL global selector should be rejected");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(error
-            .message
-            .contains("global selectors must be boolean parameters"));
+        assert!(
+            error
+                .message
+                .contains("global selectors must be boolean parameters")
+        );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_false_global_branch(
-    ) {
+    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_false_global_branch()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -2843,14 +2856,16 @@ mod tests {
         .expect_err("global=false cannot target parameterized global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = false with global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = false with global branch_id")
+        );
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_true_non_global_branch(
-    ) {
+    async fn execute_sql_insert_into_lix_state_by_branch_rejects_parameterized_global_true_non_global_branch()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -2875,9 +2890,11 @@ mod tests {
         .expect_err("global=true cannot target parameterized non-global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = true with non-global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = true with non-global branch_id")
+        );
     }
 
     #[tokio::test]
@@ -2914,9 +2931,11 @@ mod tests {
         .expect_err("parameterized UPDATE should reject mixed global/non-global scopes");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot mix global and branch-specific rows"));
+        assert!(
+            error
+                .message
+                .contains("cannot mix global and branch-specific rows")
+        );
     }
 
     #[tokio::test]
@@ -2952,9 +2971,11 @@ mod tests {
         .expect_err("parameterized DELETE should reject mixed global/non-global scopes");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot mix global and branch-specific rows"));
+        assert!(
+            error
+                .message
+                .contains("cannot mix global and branch-specific rows")
+        );
     }
 
     #[tokio::test]
@@ -2990,11 +3011,13 @@ mod tests {
         .expect("conjunctive parameterized branch mismatch should be a no-op");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
-        assert!(staged_writes
-            .lock()
-            .expect("staged writes lock")
-            .deltas
-            .is_empty());
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3025,16 +3048,18 @@ mod tests {
         .expect("NULL parameterized branch predicate should be a no-op");
 
         assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
-        assert!(staged_writes
-            .lock()
-            .expect("staged writes lock")
-            .deltas
-            .is_empty());
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_true_non_global_predicate(
-    ) {
+    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_true_non_global_predicate()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
         branch_b_row.branch_id = "branch-b".to_string();
@@ -3061,14 +3086,16 @@ mod tests {
         .expect_err("global=true predicate cannot target parameterized non-global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = true with non-global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = true with non-global branch_id")
+        );
     }
 
     #[tokio::test]
-    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_predicate_true_non_global_branch(
-    ) {
+    async fn execute_sql_update_lix_state_by_branch_rejects_parameterized_global_predicate_true_non_global_branch()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let mut branch_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"branch\"}"));
         branch_b_row.branch_id = "branch-b".to_string();
@@ -3095,14 +3122,16 @@ mod tests {
         .expect_err("global=true parameter cannot target parameterized non-global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = true with non-global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = true with non-global branch_id")
+        );
     }
 
     #[tokio::test]
-    async fn execute_sql_delete_lix_state_by_branch_rejects_parameterized_global_false_global_predicate(
-    ) {
+    async fn execute_sql_delete_lix_state_by_branch_rejects_parameterized_global_false_global_predicate()
+     {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![global_lix_state_row(
@@ -3129,9 +3158,11 @@ mod tests {
         .expect_err("global=false predicate cannot target parameterized global branch");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("cannot combine global = false with global branch_id"));
+        assert!(
+            error
+                .message
+                .contains("cannot combine global = false with global branch_id")
+        );
     }
 
     #[tokio::test]
@@ -3564,9 +3595,11 @@ mod tests {
         .expect_err("missing active head should fail before staging");
 
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
-        assert!(error
-            .message
-            .contains("branch 'missing-branch' was not found"));
+        assert!(
+            error
+                .message
+                .contains("branch 'missing-branch' was not found")
+        );
     }
 
     #[tokio::test]
@@ -3768,11 +3801,13 @@ mod tests {
                 || error.message.contains("read-only column 'path'"),
             "unexpected error: {error:?}"
         );
-        assert!(staged_writes
-            .lock()
-            .expect("staged writes lock")
-            .deltas
-            .is_empty());
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3946,9 +3981,11 @@ mod tests {
                 .expect("blob ref snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["size_bytes"], 2);
-        assert!(snapshot["blob_hash"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()));
+        assert!(
+            snapshot["blob_hash"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -4057,9 +4094,11 @@ mod tests {
         let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
-        assert!(overlay
-            .visible_semantic_rows(false, "lix_file_descriptor")
-            .is_empty());
+        assert!(
+            overlay
+                .visible_semantic_rows(false, "lix_file_descriptor")
+                .is_empty()
+        );
         let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
         assert_eq!(blob_ref_rows.len(), 1);
         assert_eq!(blob_ref_rows[0].entity_pk, "[\"file-readme\"]");
@@ -4754,11 +4793,13 @@ mod tests {
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
-        assert!(staged_writes
-            .lock()
-            .expect("staged writes lock")
-            .deltas
-            .is_empty());
+        assert!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4796,9 +4837,11 @@ mod tests {
         .expect_err("unsupported reference writer target should not become a fast no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("currently supports only lix_state writes"));
+        assert!(
+            error
+                .message
+                .contains("currently supports only lix_state writes")
+        );
     }
 
     #[tokio::test]
@@ -4833,9 +4876,11 @@ mod tests {
         .expect_err("unsupported target with empty scope should not become a no-op");
 
         assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error
-            .message
-            .contains("currently supports only lix_state writes"));
+        assert!(
+            error
+                .message
+                .contains("currently supports only lix_state writes")
+        );
     }
 
     #[tokio::test]
@@ -4864,9 +4909,11 @@ mod tests {
         .expect_err("column contradiction should not bypass JSON predicate validation");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(error
-            .message
-            .contains("JSON columns can only be compared with JSON expressions"));
+        assert!(
+            error
+                .message
+                .contains("JSON columns can only be compared with JSON expressions")
+        );
     }
 
     #[tokio::test]
@@ -4894,9 +4941,11 @@ mod tests {
         .expect_err("false predicate should not bypass JSON predicate validation");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(error
-            .message
-            .contains("JSON columns can only be compared with JSON expressions"));
+        assert!(
+            error
+                .message
+                .contains("JSON columns can only be compared with JSON expressions")
+        );
     }
 
     #[tokio::test]
@@ -4925,9 +4974,11 @@ mod tests {
         .expect_err("empty branch scope should not bypass JSON predicate validation");
 
         assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        assert!(error
-            .message
-            .contains("JSON columns can only be compared with JSON expressions"));
+        assert!(
+            error
+                .message
+                .contains("JSON columns can only be compared with JSON expressions")
+        );
     }
 
     #[tokio::test]
@@ -4968,8 +5019,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.entity_pk == "[\"entity-2\"]"));
     }
 
-    async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, crate::LixError>
-    {
+    async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, LixError> {
         let schema_definition = json!({
             "x-lix-key": "test_state_schema",
             "type": "object",

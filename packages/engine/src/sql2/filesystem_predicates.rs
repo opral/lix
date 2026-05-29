@@ -3,8 +3,8 @@ use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::expr::{Between, InList};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 
-use crate::common::{normalize_directory_path, ParsedFilePath};
 use crate::LixError;
+use crate::common::{ParsedFilePath, normalize_directory_path};
 
 use super::error::lix_error_to_datafusion_error;
 

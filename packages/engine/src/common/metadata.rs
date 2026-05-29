@@ -35,6 +35,6 @@ pub(crate) fn validate_row_metadata(
     ))
 }
 
-pub(crate) fn serialize_row_metadata(metadata: &String) -> String {
-    metadata.clone()
+pub(crate) fn serialize_row_metadata(metadata: &str) -> String {
+    metadata.to_owned()
 }

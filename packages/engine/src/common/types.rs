@@ -11,17 +11,12 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum NullableKeyFilter<T> {
+    #[default]
     Any,
     Null,
     Value(T),
-}
-
-impl<T> Default for NullableKeyFilter<T> {
-    fn default() -> Self {
-        Self::Any
-    }
 }
 
 impl<T> NullableKeyFilter<T> {
@@ -42,7 +37,7 @@ where
         match self {
             Self::Any => NullableKeyFilter::Any,
             Self::Null => NullableKeyFilter::Null,
-            Self::Value(value) => NullableKeyFilter::Value(value.deref()),
+            Self::Value(value) => NullableKeyFilter::Value(&**value),
         }
     }
 }

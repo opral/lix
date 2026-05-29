@@ -22,7 +22,7 @@ enum EntriesState {
     Empty,
     Flat(InMemoryMap),
     Layered {
-        base: Arc<EntriesState>,
+        base: Arc<Self>,
         puts: InMemoryMap,
         deletes: BTreeSet<Key>,
     },
@@ -33,7 +33,7 @@ pub struct InMemoryBackend {
     entries: Arc<Mutex<Arc<EntriesState>>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct InMemoryBackendFactory;
 
 #[derive(Clone, Debug, Default)]
@@ -42,10 +42,12 @@ pub struct InMemoryBackendFixture {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct InMemoryRead {
     entries: Arc<EntriesState>,
 }
 
+#[expect(missing_debug_implementations)]
 pub enum InMemoryRangeScan<'a> {
     Flat {
         iter: Peekable<btree_map::Range<'a, Key, Bytes>>,
@@ -56,6 +58,7 @@ pub enum InMemoryRangeScan<'a> {
 
 pub type InMemoryScanVisitResult = ScanResult;
 
+#[expect(missing_debug_implementations)]
 pub struct InMemoryWrite {
     parent: Arc<Mutex<Arc<EntriesState>>>,
     base: Arc<EntriesState>,
@@ -386,21 +389,19 @@ impl BackendWrite for InMemoryWrite {
 impl EntriesState {
     fn get(&self, key: &Key) -> Option<&Bytes> {
         match self {
-            EntriesState::Empty => None,
-            EntriesState::Flat(entries) => entries.get(key),
-            EntriesState::Layered {
+            Self::Empty => None,
+            Self::Flat(entries) => entries.get(key),
+            Self::Layered {
                 base,
                 puts,
                 deletes,
-            } => {
-                if let Some(value) = puts.get(key) {
-                    Some(value)
-                } else if deletes.contains(key) {
+            } => puts.get(key).or_else(|| {
+                if deletes.contains(key) {
                     None
                 } else {
                     base.get(key)
                 }
-            }
+            }),
         }
     }
 }
@@ -605,9 +606,8 @@ fn bounds_are_empty(lower: &Bound<&Key>, upper: &Bound<&Key>) -> bool {
     match (lower, upper) {
         (_, Bound::Unbounded) | (Bound::Unbounded, _) => false,
         (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
-        (Bound::Included(lower), Bound::Excluded(upper))
-        | (Bound::Excluded(lower), Bound::Included(upper))
-        | (Bound::Excluded(lower), Bound::Excluded(upper)) => lower >= upper,
+        (Bound::Included(lower) | Bound::Excluded(lower), Bound::Excluded(upper))
+        | (Bound::Excluded(lower), Bound::Included(upper)) => lower >= upper,
     }
 }
 
@@ -638,7 +638,7 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::conformance::{run_backend_conformance, ConformanceStatus};
+    use crate::backend::conformance::{ConformanceStatus, run_backend_conformance};
 
     #[test]
     fn in_memory_backend_passes_backend_conformance() {

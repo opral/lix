@@ -31,6 +31,7 @@ pub(crate) async fn collect_input_plan(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[expect(clippy::unnecessary_wraps)]
 fn validate_physical_plan(_plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
     Ok(())
 }

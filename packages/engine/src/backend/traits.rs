@@ -141,7 +141,7 @@ where
             value: Option<ProjectedValueRef<'_>>,
         ) -> Result<(), BackendError> {
             if let Some(slot) = self.values.get_mut(index) {
-                *slot = value.map(|value| value.to_owned());
+                *slot = value.map(ProjectedValueRef::to_owned);
             }
             Ok(())
         }

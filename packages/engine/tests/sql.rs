@@ -138,7 +138,7 @@ use lix_engine::ExecuteResult;
 use lix_engine::Value;
 
 async fn select_rows(
-    session: &crate::support::simulation_test::engine::SimSession,
+    session: &support::simulation_test::engine::SimSession,
     sql: &str,
 ) -> Vec<Vec<Value>> {
     let result = session

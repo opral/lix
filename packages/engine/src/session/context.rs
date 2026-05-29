@@ -1,9 +1,12 @@
+#![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
+use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
@@ -21,8 +24,7 @@ use crate::sql2::{
 use crate::storage::{InMemoryStorageBackend, StorageBackend, StorageReadOptions};
 use crate::storage::{StorageContext, StorageRead, StorageReadScope};
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{open_transaction, Transaction};
-use crate::GLOBAL_BRANCH_ID;
+use crate::transaction::{Transaction, open_transaction};
 use crate::{LixError, NullableKeyFilter};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
@@ -43,6 +45,7 @@ pub(crate) enum SessionMode {
 /// commit or rollback, so all SQL during that window must run through the
 /// transaction handle.
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) mode: SessionMode,
     pub(super) storage: StorageContext<B>,
@@ -425,6 +428,7 @@ where
         self.active_branch_id
     }
 
+    #[expect(trivial_casts)]
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
     }
@@ -454,6 +458,7 @@ where
         self.functions.clone()
     }
 
+    #[expect(trivial_casts)]
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
         Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
     }
@@ -473,11 +478,11 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use crate::Engine;
     use crate::backend::{
         Backend, BackendError, InMemoryBackend, InMemoryRead, InMemoryWrite, ReadOptions,
         WriteOptions,
     };
-    use crate::Engine;
     use futures_util::task::noop_waker_ref;
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -689,7 +694,7 @@ mod tests {
 
         gate.block_next();
         let reader_session = std::sync::Arc::clone(&session);
-        let reader = std::thread::spawn(move || {
+        let reader = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("test runtime should build");
@@ -716,7 +721,7 @@ mod tests {
             .expect("transaction should begin");
 
         gate.block_next();
-        let reader = std::thread::spawn(move || {
+        let reader = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("test runtime should build");
@@ -752,7 +757,7 @@ mod tests {
             .expect("transaction write should stage");
 
         gate.block_next();
-        let committer = std::thread::spawn(move || {
+        let committer = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("test runtime should build");

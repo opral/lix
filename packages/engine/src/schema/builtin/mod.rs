@@ -85,9 +85,9 @@ pub(super) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
 
 pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
     match schema_key {
-        LIX_REGISTERED_SCHEMA_KEY => Some(
-            LIX_REGISTERED_SCHEMA.get_or_init(|| parse_registered_schema_with_inlined_definition()),
-        ),
+        LIX_REGISTERED_SCHEMA_KEY => {
+            Some(LIX_REGISTERED_SCHEMA.get_or_init(parse_registered_schema_with_inlined_definition))
+        }
         LIX_KEY_VALUE_SCHEMA_KEY => {
             Some(LIX_KEY_VALUE_SCHEMA.get_or_init(|| {
                 parse_builtin_schema("lix_key_value.json", LIX_KEY_VALUE_SCHEMA_JSON)
@@ -176,7 +176,7 @@ fn parse_registered_schema_with_inlined_definition() -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{seed_schema_definition, BUILTIN_SCHEMA_KEYS};
+    use super::{BUILTIN_SCHEMA_KEYS, seed_schema_definition};
 
     #[test]
     fn builtin_schemas_load_without_extra_override_metadata() {

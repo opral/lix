@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
+use crate::LixError;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateRowRequest, LiveStateScanRequest};
-use crate::LixError;
 
 /// Minimal engine read model for transaction planning and SQL providers.
 ///

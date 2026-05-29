@@ -1,7 +1,7 @@
+use crate::LixError;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffKind, TrackedStateMergePick, TrackedStateMergePlan,
 };
-use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct MergeStats {

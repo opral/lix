@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 
-use super::refs::BranchRefContext;
 use super::BranchRefReader;
+use super::refs::BranchRefContext;
 
 /// Aggregate entrypoint for branch-domain services.
 ///

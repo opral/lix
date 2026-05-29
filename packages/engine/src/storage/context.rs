@@ -14,6 +14,7 @@ pub struct StorageContext<B = InMemoryBackend> {
     backend: B,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct PreparedStorageCommit<'a, B>
 where
     B: Backend + 'a,
@@ -147,10 +148,7 @@ where
     }
 
     pub fn rollback(mut self) -> Result<(), BackendError> {
-        match self.write.take() {
-            Some(write) => write.rollback(),
-            None => Ok(()),
-        }
+        self.write.take().map_or(Ok(()), BackendWrite::rollback)
     }
 }
 
@@ -165,6 +163,7 @@ where
     }
 }
 
+#[expect(missing_debug_implementations)]
 pub struct StorageReadTransaction<R>
 where
     R: crate::backend::BackendRead,
@@ -192,6 +191,7 @@ where
     }
 }
 
+#[expect(missing_debug_implementations)]
 pub struct StorageWriteTransaction<'a, B>
 where
     B: Backend,
@@ -212,6 +212,7 @@ where
         Ok(())
     }
 
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub fn write_set(
         &mut self,
         write_set: StorageWriteSet,

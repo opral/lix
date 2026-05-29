@@ -1,7 +1,7 @@
-use crate::backends::{BackendProfile, BACKEND_PROFILES};
+use crate::backends::{BACKEND_PROFILES, BackendProfile};
 use crate::kv_layout::{self, KvLayoutAccounting, KvWriteAccounting};
 use crate::transaction_api::{self, TransactionLayoutAccounting, TransactionWriteAccounting};
-use crate::workload::{row_label, WorkloadRow};
+use crate::workload::{WorkloadRow, row_label};
 
 pub(crate) fn maybe_print_accounting_report(
     runtime: &tokio::runtime::Runtime,
@@ -270,6 +270,7 @@ fn print_layout_row(profile: BackendProfile, layer: &str, row: LayoutRow) {
     );
 }
 
+#[expect(clippy::cast_precision_loss)]
 fn amp(count: u64, logical_rows: usize) -> String {
     if logical_rows == 0 {
         return "-".to_string();

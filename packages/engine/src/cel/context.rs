@@ -19,7 +19,7 @@ where
     context.add_function("lix_uuid_v7", move || {
         uuid_functions.call_uuid_v7().to_string()
     });
-    let timestamp_functions = functions.clone();
+    let timestamp_functions = functions;
     context.add_function("lix_timestamp", move || {
         timestamp_functions.call_timestamp()
     });

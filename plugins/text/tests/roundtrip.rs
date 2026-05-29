@@ -2,7 +2,7 @@ mod common;
 
 use common::file_from_bytes;
 use std::collections::BTreeMap;
-use text_plugin::{apply_changes, detect_changes, PluginEntityChange};
+use text_plugin::{PluginEntityChange, apply_changes, detect_changes};
 
 #[test]
 fn detect_then_apply_roundtrips_exact_bytes() {

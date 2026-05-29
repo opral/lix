@@ -1,16 +1,18 @@
 use lix_sdk::{
-    open_lix, open_lix_with_backend, CreateBranchOptions as RsCreateBranchOptions,
-    CreateBranchReceipt, ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix, LixError,
+    CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
+    ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix, LixError,
     LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
     OpenLixOptions as RsOpenLixOptions, SqliteBackend, SqliteBackendOptions,
-    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, open_lix,
+    open_lix_with_backend,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::runtime::{Builder, Runtime};
 
+#[expect(missing_debug_implementations)]
 #[napi(js_name = "Lix")]
 pub struct NativeLix {
     rt: Runtime,
@@ -306,6 +308,7 @@ impl NativeLix {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(js_name = "LixTransaction")]
 pub struct NativeLixTransaction {
     rt: Runtime,
@@ -378,6 +381,7 @@ impl NativeLixTransaction {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct CreateBranchOptions {
     pub id: Option<String>,
@@ -395,6 +399,7 @@ impl From<CreateBranchOptions> for RsCreateBranchOptions {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct CreateBranchReceiptDto {
     pub id: String,
@@ -414,6 +419,7 @@ impl From<CreateBranchReceipt> for CreateBranchReceiptDto {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct SwitchBranchOptions {
     pub branch_id: String,
@@ -427,6 +433,7 @@ impl From<SwitchBranchOptions> for RsSwitchBranchOptions {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct SwitchBranchReceiptDto {
     pub branch_id: String,
@@ -440,6 +447,7 @@ impl From<SwitchBranchReceipt> for SwitchBranchReceiptDto {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeBranchOptions {
     pub source_branch_id: String,
@@ -461,6 +469,7 @@ impl From<MergeBranchOptions> for RsMergeBranchOptions {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeBranchReceiptDto {
     pub outcome: String,
@@ -490,6 +499,7 @@ impl From<MergeBranchReceipt> for MergeBranchReceiptDto {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeBranchPreviewDto {
     pub outcome: String,
@@ -526,6 +536,7 @@ fn merge_branch_outcome_to_string(outcome: MergeBranchOutcome) -> String {
     .to_string()
 }
 
+#[expect(missing_copy_implementations, missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeChangeStatsDto {
     pub total: u32,
@@ -535,6 +546,7 @@ pub struct MergeChangeStatsDto {
 }
 
 impl From<MergeChangeStats> for MergeChangeStatsDto {
+    #[expect(clippy::cast_possible_truncation)]
     fn from(stats: MergeChangeStats) -> Self {
         Self {
             total: stats.total as u32,
@@ -545,6 +557,7 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeConflictDto {
     pub kind: String,
@@ -575,6 +588,7 @@ fn merge_conflict_kind_to_string(kind: MergeConflictKind) -> String {
     .to_string()
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct MergeConflictSideDto {
     pub kind: String,
@@ -601,6 +615,7 @@ fn merge_conflict_change_kind_to_string(kind: MergeConflictChangeKind) -> String
     .to_string()
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct LixValue {
     pub kind: String,
@@ -613,8 +628,8 @@ impl TryFrom<LixValue> for Value {
 
     fn try_from(value: LixValue) -> std::result::Result<Self, Self::Error> {
         match value.kind.as_str() {
-            "null" => Ok(Value::Null),
-            "boolean" => Ok(Value::Boolean(
+            "null" => Ok(Self::Null),
+            "boolean" => Ok(Self::Boolean(
                 value.value.and_then(|v| v.as_bool()).ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
@@ -622,7 +637,7 @@ impl TryFrom<LixValue> for Value {
                     )
                 })?,
             )),
-            "integer" => Ok(Value::Integer(
+            "integer" => Ok(Self::Integer(
                 value.value.and_then(|v| v.as_i64()).ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
@@ -640,9 +655,9 @@ impl TryFrom<LixValue> for Value {
                         "real value must be a finite number",
                     ));
                 }
-                Ok(Value::Real(value))
+                Ok(Self::Real(value))
             }
-            "text" => Ok(Value::Text(
+            "text" => Ok(Self::Text(
                 value
                     .value
                     .and_then(|v| v.as_str().map(ToOwned::to_owned))
@@ -650,7 +665,7 @@ impl TryFrom<LixValue> for Value {
                         LixError::new(LixError::CODE_INVALID_PARAM, "text value must be a string")
                     })?,
             )),
-            "json" => Ok(Value::Json(value.value.unwrap_or(serde_json::Value::Null))),
+            "json" => Ok(Self::Json(value.value.unwrap_or(serde_json::Value::Null))),
             "blob" => {
                 let bytes = value.blob.ok_or_else(|| {
                     LixError::new(
@@ -658,7 +673,7 @@ impl TryFrom<LixValue> for Value {
                         "blob value must include bytes",
                     )
                 })?;
-                Ok(Value::Blob(bytes.to_vec()))
+                Ok(Self::Blob(bytes.to_vec()))
             }
             other => Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -720,6 +735,7 @@ impl TryFrom<&Value> for LixValue {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct ExecuteResult {
     pub columns: Vec<String>,
@@ -731,6 +747,7 @@ pub struct ExecuteResult {
 impl TryFrom<RsExecuteResult> for ExecuteResult {
     type Error = LixError;
 
+    #[expect(clippy::cast_possible_truncation)]
     fn try_from(result: RsExecuteResult) -> std::result::Result<Self, Self::Error> {
         let mut rows = Vec::with_capacity(result.rows().len());
         for row in result.rows() {
@@ -757,6 +774,7 @@ impl TryFrom<RsExecuteResult> for ExecuteResult {
     }
 }
 
+#[expect(missing_debug_implementations)]
 #[napi(object)]
 pub struct LixNotice {
     pub code: String,

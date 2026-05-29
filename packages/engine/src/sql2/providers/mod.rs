@@ -1,3 +1,5 @@
+#![allow(clippy::cloned_ref_to_slice_refs, clippy::match_same_arms)]
+
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
@@ -266,6 +268,7 @@ mod tests {
     use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::prelude::SessionContext;
 
+    use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::CommitId;
     use crate::commit_graph::{
@@ -276,13 +279,12 @@ mod tests {
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
-    use crate::sql2::catalog::{derive_entity_surface_spec_from_schema, PublicCatalog};
     use crate::sql2::HistoryQuerySource;
+    use crate::sql2::catalog::{PublicCatalog, derive_entity_surface_spec_from_schema};
     use crate::storage::{
         InMemoryStorageBackend, InMemoryStorageRead, StorageContext, StorageReadOptions,
         StorageReadScope,
     };
-    use crate::LixError;
 
     use super::{
         branch, change, directory, directory_history, entity, file, file_history, history,
@@ -434,8 +436,8 @@ mod tests {
         );
     }
 
-    async fn empty_history_query_source(
-    ) -> crate::sql2::SqlHistoryQuerySource<StorageReadScope<InMemoryStorageRead>> {
+    async fn empty_history_query_source()
+    -> crate::sql2::SqlHistoryQuerySource<StorageReadScope<InMemoryStorageRead>> {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let read_scope = storage
             .begin_read(StorageReadOptions::default())

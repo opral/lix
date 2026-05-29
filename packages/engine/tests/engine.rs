@@ -548,7 +548,7 @@ simulation_test!(
                 .await
                 .expect("transaction should commit");
         };
-        let (_, second_result) = tokio::join!(commit_after_yield, concurrent_read);
+        let ((), second_result) = tokio::join!(commit_after_yield, concurrent_read);
         assert_single_text(
             second_result.expect("concurrent deterministic uuid should succeed"),
             "01920000-0000-7000-8000-000000000001",

@@ -1,8 +1,8 @@
 use musli::{Decode, Encode};
 
 use super::types::BinaryCasChunkView;
-use crate::storage_codec;
 use crate::LixError;
+use crate::storage_codec;
 
 const HASH_BYTES: usize = 32;
 
@@ -237,9 +237,11 @@ mod tests {
         let mut encoded = encode_binary_cas_manifest(&BinaryCasManifest::Empty { size_bytes: 0 });
         encoded.truncate(encoded.len() - 1);
         let error = decode_binary_cas_manifest(&encoded).unwrap_err();
-        assert!(error
-            .message
-            .contains("failed to decode binary CAS manifest"));
+        assert!(
+            error
+                .message
+                .contains("failed to decode binary CAS manifest")
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use crate::backend::{
-    visit_range as backend_visit_range, BackendError, BackendRead, CoreProjection, Key, KeyRange,
-    KeyRef, Prefix, ProjectedValueRef, ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor,
-    SpaceId,
+    BackendError, BackendRead, CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef,
+    ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    visit_range as backend_visit_range,
 };
 use crate::storage::{
-    decode_logical_key_ref, StorageRead, StorageReadResult, StorageReadStats, StorageSpace,
+    StorageRead, StorageReadResult, StorageReadStats, StorageSpace, decode_logical_key_ref,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -42,6 +42,7 @@ pub struct ScanChunkRef<'a> {
     pub has_more: bool,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct ScanCursor<'a, C> {
     inner: &'a mut C,
     kind: ScanKind,
@@ -415,10 +416,12 @@ where
         ..opts
     };
 
+    #[expect(clippy::items_after_statements)]
     struct LogicalScanVisitor<'a, V: ?Sized> {
         inner: &'a mut V,
     }
 
+    #[expect(clippy::items_after_statements)]
     impl<V> ScanVisitor for LogicalScanVisitor<'_, V>
     where
         V: ScanVisitor + ?Sized,

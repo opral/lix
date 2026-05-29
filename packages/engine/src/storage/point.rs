@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ahash::RandomState;
 
@@ -257,7 +257,7 @@ impl RequestedToUnique {
     }
 }
 
-impl<'a> RequestedToUniqueRef<'a> {
+impl RequestedToUniqueRef<'_> {
     pub fn len(&self) -> usize {
         match self {
             Self::Identity { len } => *len,
@@ -284,7 +284,7 @@ impl<'a> RequestedToUniqueRef<'a> {
     }
 }
 
-impl<'plan> PointValues<'plan> {
+impl PointValues<'_> {
     pub fn len(&self) -> usize {
         self.requested_to_unique.len()
     }
@@ -322,7 +322,7 @@ impl PointReadBuffer {
     }
 }
 
-impl<'plan, 'buf> PointValuesRef<'plan, 'buf> {
+impl PointValuesRef<'_, '_> {
     pub fn len(&self) -> usize {
         self.requested_to_unique.len()
     }
@@ -394,7 +394,7 @@ where
             value: Option<ProjectedValueRef<'_>>,
         ) -> Result<(), BackendError> {
             if let Some(slot) = self.values.get_mut(index) {
-                *slot = value.map(|value| value.to_owned());
+                *slot = value.map(ProjectedValueRef::to_owned);
             }
             Ok(())
         }
@@ -404,11 +404,11 @@ where
 }
 
 fn keys_are_unique(keys: &[Key]) -> bool {
-    let mut seen = HashMap::<&Key, (), FastHashBuilder>::with_capacity_and_hasher(
+    let mut seen = HashSet::<&Key, FastHashBuilder>::with_capacity_and_hasher(
         keys.len(),
         FastHashBuilder::with_seeds(0, 0, 0, 0),
     );
-    keys.iter().all(|key| seen.insert(key, ()).is_none())
+    keys.iter().all(|key| seen.insert(key))
 }
 
 fn requested_to_unique_mapping(indexes: Vec<usize>, requested_len: usize) -> RequestedToUnique {

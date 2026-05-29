@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use lix_sdk::{open_lix_with_backend, SqliteBackend, Value};
+use lix_sdk::{SqliteBackend, Value, open_lix_with_backend};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

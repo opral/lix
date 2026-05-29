@@ -1,7 +1,9 @@
+use std::fmt::Write as _;
+
 use lix_engine::storage::InMemoryStorageBackend;
 use lix_engine::{Engine, ExecuteResult, SessionContext, Value};
 
-use crate::workload::{sql_string, WorkloadRow};
+use crate::workload::{WorkloadRow, sql_string};
 
 const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
@@ -31,6 +33,7 @@ pub(crate) async fn seeded_fixture(rows: &[WorkloadRow]) -> SqlFixture {
 }
 
 impl SqlFixture {
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn insert_all(&self) -> usize {
         let mut affected = 0;
         for sql in &self.insert_sql_chunks {
@@ -58,6 +61,7 @@ impl SqlFixture {
         result.len()
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn update_all(&self) -> usize {
         let mut affected = 0;
         for sql in &self.update_all_sql_rows {
@@ -67,6 +71,7 @@ impl SqlFixture {
         affected as usize
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn update_one_by_pk(&self) -> usize {
         let affected = execute(&self.session, &self.update_one_by_pk_sql)
             .await
@@ -75,6 +80,7 @@ impl SqlFixture {
         affected as usize
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn delete_all(&self) -> usize {
         let affected = execute(&self.session, &self.delete_all_sql)
             .await
@@ -83,6 +89,7 @@ impl SqlFixture {
         affected as usize
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn delete_one_by_pk(&self) -> usize {
         let affected = execute(&self.session, &self.delete_one_by_pk_sql)
             .await
@@ -169,11 +176,12 @@ fn insert_rows_sql(rows: &[WorkloadRow]) -> String {
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!(
+        let _ = write!(
+            sql,
             "('{}', lix_json('{}'))",
             sql_string(row.path.as_str()),
             sql_string(row.value_json.as_str())
-        ));
+        );
     }
     sql
 }

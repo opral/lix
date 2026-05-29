@@ -1,4 +1,4 @@
-use plugin_json_v2::{schema_definition, schema_json, SCHEMA_KEY};
+use plugin_json_v2::{SCHEMA_KEY, schema_definition, schema_json};
 
 #[test]
 fn schema_json_is_valid_and_matches_constants() {

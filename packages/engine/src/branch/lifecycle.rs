@@ -1,7 +1,7 @@
+use crate::LixError;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::common::validate_non_empty_identity_value;
-use crate::LixError;
 
 use super::{BranchHead, BranchRefReader};
 

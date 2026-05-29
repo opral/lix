@@ -1,8 +1,7 @@
 #![cfg(feature = "sqlite")]
-
 use lix_engine::run_backend_conformance;
 use lix_sdk::{
-    open_lix_with_backend, SqliteBackend, SqliteBackendFactory, Value, SQLITE_FORMAT_VERSION,
+    SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory, Value, open_lix_with_backend,
 };
 use rusqlite::Connection;
 
@@ -50,9 +49,8 @@ fn sqlite_backend_refuses_future_file_format_version() {
         .expect("future user_version should write");
     drop(conn);
 
-    let error = match SqliteBackend::open(&path) {
-        Ok(_) => panic!("future file format version should be refused"),
-        Err(error) => error,
+    let Err(error) = SqliteBackend::open(&path) else {
+        panic!("future file format version should be refused");
     };
 
     assert!(

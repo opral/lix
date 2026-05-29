@@ -1,8 +1,11 @@
+#![allow(clippy::cast_sign_loss)]
+
+use crate::LixError;
 use crate::binary_cas::chunking::fastcdc_chunk_ranges;
 use crate::binary_cas::codec::{
-    decode_binary_cas_chunk, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
-    encode_binary_cas_chunk, encode_binary_cas_manifest, encode_binary_cas_manifest_chunk,
-    encode_binary_chunk_payload, BinaryCasManifest, BinaryChunkCodec,
+    BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
+    decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
+    encode_binary_cas_manifest_chunk, encode_binary_chunk_payload,
 };
 use crate::binary_cas::{
     BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch, BlobWrite,
@@ -13,7 +16,6 @@ use crate::storage::{
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions,
     StorageSpaceId, StorageValue,
 };
-use crate::LixError;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 
@@ -265,7 +267,7 @@ pub(crate) async fn load_bytes_many(
     let chunk_rows = load_chunk_rows(store, &requested_chunks).await?;
     let chunk_rows_by_hash = requested_chunks
         .into_iter()
-        .zip(chunk_rows.into_iter())
+        .zip(chunk_rows)
         .collect::<HashMap<_, _>>();
     let chunked_manifests_by_index = chunked_manifests
         .into_iter()
@@ -871,9 +873,11 @@ mod tests {
         let error = load_bytes_many(&store, &[blob_hash])
             .await
             .expect_err("corrupt chunk should be rejected");
-        assert!(error
-            .message
-            .contains("failed content-address verification"));
+        assert!(
+            error
+                .message
+                .contains("failed content-address verification")
+        );
     }
 
     #[tokio::test]
@@ -924,9 +928,11 @@ mod tests {
         let error = load_bytes_many(&store, &[expected_blob_hash])
             .await
             .expect_err("wrong assembled blob should be rejected");
-        assert!(error
-            .message
-            .contains("failed content-address verification"));
+        assert!(
+            error
+                .message
+                .contains("failed content-address verification")
+        );
     }
 
     #[tokio::test]

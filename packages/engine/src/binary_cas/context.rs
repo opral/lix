@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
+use crate::LixError;
 use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobWrite, BlobWriteReceipt};
 use crate::storage::{StorageRead, StorageWriteSet};
-use crate::LixError;
 use std::collections::HashSet;
 
 #[async_trait]
@@ -26,6 +26,7 @@ impl BinaryCasContext {
     ///
     /// The reader can be a read transaction or the active write transaction
     /// when reads must participate in transaction-local visibility.
+    #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
         S: StorageRead,
@@ -33,6 +34,7 @@ impl BinaryCasContext {
         BinaryCasStoreReader { store }
     }
 
+    #[expect(clippy::unused_self)]
     pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> BinaryCasWriter<'a> {
         BinaryCasWriter::new(writes)
     }
@@ -44,10 +46,10 @@ where
     S: StorageRead + Clone + Send + Sync,
 {
     async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
-        let mut reader = BinaryCasStoreReader {
+        let mut reader = Self {
             store: self.store.clone(),
         };
-        BinaryCasStoreReader::load_bytes_many(&mut reader, hashes).await
+        Self::load_bytes_many(&mut reader, hashes).await
     }
 }
 
@@ -60,6 +62,7 @@ impl<S> BinaryCasStoreReader<S>
 where
     S: StorageRead,
 {
+    #[expect(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn load_bytes_many(
         &mut self,
         hashes: &[BlobHash],

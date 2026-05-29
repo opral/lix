@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use plugin_md_v2::PluginFile;
 
 pub fn file_from_markdown(id: &str, path: &str, markdown: &str) -> PluginFile {
@@ -21,11 +23,12 @@ pub fn dataset_medium() -> (String, String) {
     after.push_str("---\ntitle: Medium\n---\n\n");
 
     for idx in 0..120 {
-        before.push_str(&format!("## Section {idx}\n\nParagraph {idx}.\n\n"));
-        after.push_str(&format!(
+        let _ = write!(before, "## Section {idx}\n\nParagraph {idx}.\n\n");
+        let _ = write!(
+            after,
             "## Section {idx}\n\nParagraph {idx} changed with value {}.\n\n",
             idx * 3
-        ));
+        );
     }
 
     (before, after)
@@ -38,19 +41,14 @@ pub fn dataset_large() -> (String, String) {
     after.push_str("---\ntitle: Large\n---\n\n");
 
     for idx in 0..450 {
-        before.push_str(&format!(
-            "### Item {idx}\n\n- [x] done\n- [ ] pending\n\nInline math $a_{} + b_{}$\n\n<Component value={{ {} }} />\n\n",
-            idx,
-            idx,
-            idx
-        ));
-        after.push_str(&format!(
-            "### Item {idx}\n\n- [x] done\n- [x] pending\n\nInline math $a_{} + b_{} + c_{}$\n\n<Component value={{ {} }} flag />\n\n",
-            idx,
-            idx,
-            idx,
-            idx
-        ));
+        let _ = write!(
+            before,
+            "### Item {idx}\n\n- [x] done\n- [ ] pending\n\nInline math $a_{idx} + b_{idx}$\n\n<Component value={{ {idx} }} />\n\n"
+        );
+        let _ = write!(
+            after,
+            "### Item {idx}\n\n- [x] done\n- [x] pending\n\nInline math $a_{idx} + b_{idx} + c_{idx}$\n\n<Component value={{ {idx} }} flag />\n\n"
+        );
     }
 
     (before, after)

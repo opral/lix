@@ -314,6 +314,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::drop_non_drop,
+        reason = "the explicit drops end borrows before reusing the shared buffer"
+    )]
     fn planned_point_reads_can_reuse_value_buffer() {
         let storage = StorageContext::new(InMemoryBackend::new());
         let mut writes = storage.new_write_set();
@@ -475,7 +479,7 @@ mod tests {
                 visited.push((
                     unique_index,
                     key.clone(),
-                    value.map(|value| value.to_owned()),
+                    value.map(ProjectedValueRef::to_owned),
                 ));
                 Ok(())
             })

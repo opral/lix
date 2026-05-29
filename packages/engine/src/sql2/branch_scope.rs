@@ -5,9 +5,9 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
-use crate::branch::BranchRefReader;
-use crate::LixError;
 use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
+use crate::branch::BranchRefReader;
 
 /// Branch scope requested by a SQL surface.
 ///
@@ -297,9 +297,11 @@ mod tests {
         .expect_err("missing explicit branch should be rejected");
 
         assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
-        assert!(error
-            .message
-            .contains("branch 'missing-branch' was not found"));
+        assert!(
+            error
+                .message
+                .contains("branch 'missing-branch' was not found")
+        );
     }
 
     #[tokio::test]
@@ -353,9 +355,11 @@ mod tests {
         let error = resolve_write_branch_scope(None, None, None, "INSERT into surface", "surface")
             .expect_err("missing branch should be rejected");
 
-        assert!(error
-            .to_string()
-            .contains("INSERT into surface requires lixcol_branch_id"));
+        assert!(
+            error
+                .to_string()
+                .contains("INSERT into surface requires lixcol_branch_id")
+        );
     }
 
     #[test]
@@ -389,9 +393,11 @@ mod tests {
         )
         .expect_err("conflicting global/branch scope should be rejected");
 
-        assert!(error
-            .to_string()
-            .contains("surface cannot set lixcol_global=false with global lixcol_branch_id"));
+        assert!(
+            error
+                .to_string()
+                .contains("surface cannot set lixcol_global=false with global lixcol_branch_id")
+        );
     }
 
     #[test]
@@ -405,9 +411,11 @@ mod tests {
         )
         .expect_err("conflicting global/branch scope should be rejected");
 
-        assert!(error
-            .to_string()
-            .contains("surface cannot set lixcol_global=true with non-global lixcol_branch_id"));
+        assert!(
+            error
+                .to_string()
+                .contains("surface cannot set lixcol_global=true with non-global lixcol_branch_id")
+        );
     }
 
     struct RowsBranchRefReader {

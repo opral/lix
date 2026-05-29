@@ -12,7 +12,7 @@ use lix_engine::backend::{
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 pub const SQLITE_FORMAT_VERSION: u32 = 1;
@@ -29,16 +29,19 @@ pub struct SqliteBackendFixture {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct SqliteBackend {
     path: PathBuf,
     write_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct SqliteBackendOptions {
     pub path: PathBuf,
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct SqliteRead {
     state: Arc<Mutex<SqliteReadState>>,
 }
@@ -47,6 +50,7 @@ struct SqliteReadState {
     conn: Option<Connection>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct SqliteRangeScan {
     rows: VecDeque<SqlitePendingRow>,
     projection: CoreProjection,
@@ -59,10 +63,17 @@ struct SqlitePendingRow {
     value: Option<Vec<u8>>,
 }
 
+#[expect(missing_debug_implementations)]
 pub struct SqliteWrite {
     conn: Option<Connection>,
     write_pool: Arc<Mutex<Vec<Connection>>>,
     stats: WriteStats,
+}
+
+impl Default for SqliteBackendFactory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqliteBackendFactory {
@@ -280,6 +291,7 @@ impl BackendRangeScan for SqliteRangeScan {
 }
 
 impl SqliteRangeScan {
+    #[expect(clippy::unnecessary_wraps)]
     fn ensure_pending(&mut self) -> Result<bool, BackendError> {
         if self.pending.is_some() {
             return Ok(true);
@@ -489,6 +501,7 @@ fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+#[expect(clippy::cast_possible_wrap)]
 fn visit_keys<V>(
     conn: &Connection,
     keys: &[Key],
@@ -572,6 +585,7 @@ fn collect_range_rows(
     Ok(collected)
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn scan_sql(
     range: KeyRange,
     opts: ScanOptions<'_>,

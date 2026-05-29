@@ -1,9 +1,9 @@
 mod common;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use plugin_md_v2::{
-    detect_changes, detect_changes_with_state_context, PluginActiveStateRow,
-    PluginDetectStateContext, PluginEntityChange,
+    PluginActiveStateRow, PluginDetectStateContext, PluginEntityChange, detect_changes,
+    detect_changes_with_state_context,
 };
 
 fn to_state_context(rows: &[PluginEntityChange]) -> PluginDetectStateContext {

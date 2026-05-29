@@ -7,6 +7,7 @@ pub trait StorageRead {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct StorageReadScope<R> {
     read: R,
 }

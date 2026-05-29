@@ -43,8 +43,8 @@ pub use point::{
 };
 pub use read_scope::{StorageRead, StorageReadScope};
 pub use scan::{ScanBuffer, ScanChunkRef, ScanCursor, ScanPlan};
-pub(crate) use spaces::decode_logical_key_ref;
 pub use spaces::StorageSpace;
+pub(crate) use spaces::decode_logical_key_ref;
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };

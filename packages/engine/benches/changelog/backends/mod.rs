@@ -62,6 +62,7 @@ pub(crate) enum ChangelogScoreWrite {
 }
 
 impl ChangelogBenchBackend {
+    #[allow(dead_code)]
     pub(crate) const CI: [Self; 4] = [
         Self::Unit,
         Self::SqliteTempfile,

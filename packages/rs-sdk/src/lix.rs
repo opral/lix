@@ -6,11 +6,13 @@ use lix_engine::{
 
 /// Options for opening a Lix workspace session.
 #[derive(Default)]
+#[expect(missing_debug_implementations)]
 pub struct OpenLixOptions<B = InMemoryBackend> {
     pub backend: Option<B>,
 }
 
 /// Workspace-session handle for a Lix repository.
+#[expect(missing_debug_implementations)]
 pub struct Lix<B = InMemoryBackend>
 where
     B: Backend + Clone + Send + Sync + 'static,
@@ -107,6 +109,7 @@ where
     }
 }
 
+#[expect(missing_debug_implementations)]
 pub struct LixTransaction<B = InMemoryBackend>
 where
     B: Backend + Clone + Send + Sync + 'static,

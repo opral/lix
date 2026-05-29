@@ -1,3 +1,15 @@
+#![allow(
+    clippy::manual_let_else,
+    clippy::match_wildcard_for_single_variants,
+    clippy::needless_collect,
+    clippy::option_if_let_else,
+    clippy::redundant_closure,
+    clippy::unnecessary_literal_bound,
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    clippy::useless_let_if_seq
+)]
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -10,20 +22,20 @@ use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue, SchemaExt};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue, SchemaExt, not_impl_err};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use futures_util::{stream, TryStreamExt};
+use futures_util::{TryStreamExt, stream};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
@@ -35,35 +47,34 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::branch_scope::{
-    explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids, resolve_write_branch_scope,
-    BranchBinding,
+    BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
+    resolve_write_branch_scope,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::filesystem_predicates::{
-    canonicalize_filesystem_path_filters, FilesystemPathKind,
+    FilesystemPathKind, canonicalize_filesystem_path_filters,
 };
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
 use crate::sql2::write_normalization::{
-    is_binary_type, lix_file_data_type_error, lix_file_data_type_error_with_value,
-    logical_expr_is_binary_or_null, reject_non_binary_casts_for_insert_column,
-    scalar_is_binary_or_null, InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues,
-    UpdateCell,
+    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell, is_binary_type,
+    lix_file_data_type_error, lix_file_data_type_error_with_value, logical_expr_is_binary_or_null,
+    reject_non_binary_casts_for_insert_column, scalar_is_binary_or_null,
 };
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::{parse_row_metadata_value, serialize_row_metadata, LixError};
+use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 use crate::sql2::filesystem_planner::{
+    BlobRefRowInput, DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput,
+    FileDescriptorWriteIntent, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
     blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row,
     file_descriptor_write_row, filesystem_storage_scope_key, plan_file_delete,
-    plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
-    FileDescriptorRowInput, FileDescriptorWriteIntent, FilePathWriteInput, FilesystemDeletePlan,
-    FilesystemRowContext,
+    plan_file_path_update,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -620,7 +631,7 @@ impl DisplayAs for LixFileDeleteExec {
 }
 
 impl ExecutionPlan for LixFileDeleteExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixFileDeleteExec"
     }
 
@@ -785,7 +796,7 @@ impl DisplayAs for LixFileUpdateExec {
 }
 
 impl ExecutionPlan for LixFileUpdateExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixFileUpdateExec"
     }
 
@@ -968,7 +979,7 @@ impl DisplayAs for LixFileScanExec {
 }
 
 impl ExecutionPlan for LixFileScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "LixFileScanExec"
     }
 
@@ -1096,7 +1107,7 @@ struct LixFileStagedBatch {
 }
 
 impl LixFileStagedBatch {
-    fn extend(&mut self, other: LixFileStagedBatch) {
+    fn extend(&mut self, other: Self) {
         self.state_rows.extend(other.state_rows);
         self.file_data_writes.extend(other.file_data_writes);
         self.count += other.count;
@@ -1370,7 +1381,7 @@ fn lix_file_path_update_stage_from_batch(
 
         let resolver = path_resolvers
             .entry(file_path_resolver_key(&context))
-            .or_insert_with(DirectoryPathResolver::default);
+            .or_default();
         let plan = plan_file_path_update(
             resolver,
             id.clone(),
@@ -1687,9 +1698,7 @@ async fn lix_file_record_batch(
         .iter()
         .map(|field| field.name().as_str())
         .collect::<Vec<_>>();
-    let needs_data = projected_columns
-        .iter()
-        .any(|column_name| *column_name == "data");
+    let needs_data = projected_columns.contains(&"data");
 
     let mut file_rows = BTreeMap::<(String, String), FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<(String, String), BlobRefRecord>::new();
@@ -1823,7 +1832,7 @@ async fn lix_file_record_batch(
         updated_ats.push(file.live.updated_at);
         commit_ids.push(file.live.commit_id.map(|id| id.to_string()));
         untracked_values.push(Some(file.live.untracked));
-        metadata_values.push(file.live.metadata.as_ref().map(serialize_row_metadata));
+        metadata_values.push(file.live.metadata.as_deref().map(serialize_row_metadata));
         branch_ids.push(Some(branch_id));
     }
 
@@ -2276,10 +2285,10 @@ fn reject_non_binary_lix_file_data_assignment(expr: &Expr) -> Result<()> {
                 return Err(non_binary_lix_file_data_assignment_error());
             }
         }
-        Expr::Cast(cast) if is_binary_type(&cast.data_type) => {
-            if !logical_expr_is_binary_or_null(&cast.expr) {
-                return Err(non_binary_lix_file_data_assignment_error());
-            }
+        Expr::Cast(cast)
+            if is_binary_type(&cast.data_type) && !logical_expr_is_binary_or_null(&cast.expr) =>
+        {
+            return Err(non_binary_lix_file_data_assignment_error());
         }
         _ => {}
     }
@@ -2343,6 +2352,7 @@ fn dml_count_schema() -> SchemaRef {
     )]))
 }
 
+#[expect(trivial_casts)]
 fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
     RecordBatch::try_new(
         schema,
@@ -2467,8 +2477,9 @@ fn update_required_binary_value(
                 "use X'' for an empty file or omit data to leave contents unchanged",
             ))
         }
-        UpdateCell::Assigned(SqlCell::Value(ScalarValue::Binary(Some(value))))
-        | UpdateCell::Assigned(SqlCell::Value(ScalarValue::LargeBinary(Some(value)))) => Ok(value),
+        UpdateCell::Assigned(SqlCell::Value(
+            ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)),
+        )) => Ok(value),
         UpdateCell::Assigned(SqlCell::Value(ScalarValue::FixedSizeBinary(_, Some(value)))) => {
             Ok(value)
         }
@@ -2488,13 +2499,17 @@ fn optional_string_value(
 ) -> Result<Option<String>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        | Some(
+            ScalarValue::Null
+            | ScalarValue::Utf8(None)
+            | ScalarValue::Utf8View(None)
+            | ScalarValue::LargeUtf8(None),
+        ) => Ok(None),
+        Some(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        ) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_file expected text-compatible column '{column_name}', got {other:?}"
         ))),
@@ -2523,7 +2538,7 @@ fn optional_bool_value(
     column_name: &str,
 ) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        None | Some(ScalarValue::Null | ScalarValue::Boolean(None)) => Ok(None),
         Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_file expected boolean column '{column_name}', got {other:?}"
@@ -2538,15 +2553,17 @@ fn insert_optional_binary_value(
 ) -> Result<Option<Vec<u8>>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None => Ok(None),
-        Some(ScalarValue::Null)
-        | Some(ScalarValue::Binary(None))
-        | Some(ScalarValue::LargeBinary(None))
-        | Some(ScalarValue::FixedSizeBinary(_, None)) => Err(lix_file_data_type_error(
+        Some(
+            ScalarValue::Null
+            | ScalarValue::Binary(None)
+            | ScalarValue::LargeBinary(None)
+            | ScalarValue::FixedSizeBinary(_, None),
+        ) => Err(lix_file_data_type_error(
             "INSERT into lix_file",
             column_name,
             "use X'' for an empty file or omit data to create a descriptor without contents",
         )),
-        Some(ScalarValue::Binary(Some(value))) | Some(ScalarValue::LargeBinary(Some(value))) => {
+        Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => {
             Ok(Some(value))
         }
         Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(Some(value)),
@@ -2624,6 +2641,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 }
 
 #[cfg(test)]
+#[expect(trivial_casts)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
@@ -2639,6 +2657,7 @@ mod tests {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use serde_json::Value as JsonValue;
 
+    use crate::LixError;
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{ChangeId, CommitId};
     use crate::functions::FunctionProviderHandle;
@@ -2649,13 +2668,11 @@ mod tests {
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::LixError;
 
     use super::{
-        derive_directory_path_for, lix_file_delete_stage_from_batch,
-        lix_file_insert_stage_from_batch, lix_file_insert_stage_from_batch_with_path_resolvers,
-        lix_file_write_rows_from_batch, BranchBinding, DirectoryDescriptorRecord,
-        LixFileInsertSink,
+        BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, derive_directory_path_for,
+        lix_file_delete_stage_from_batch, lix_file_insert_stage_from_batch,
+        lix_file_insert_stage_from_batch_with_path_resolvers, lix_file_write_rows_from_batch,
     };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -2859,11 +2876,11 @@ mod tests {
         async fn load_branch_head(
             &mut self,
             branch_id: &str,
-        ) -> Result<Option<crate::changelog::CommitId>, LixError> {
+        ) -> Result<Option<CommitId>, LixError> {
             if branch_id == "ghost-branch" {
                 return Ok(None);
             }
-            Ok(Some(crate::changelog::CommitId::for_test_label(&format!(
+            Ok(Some(CommitId::for_test_label(&format!(
                 "commit-{branch_id}"
             ))))
         }
@@ -3278,10 +3295,12 @@ mod tests {
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.state_rows.len(), 1);
-        assert!(staged
-            .state_rows
-            .iter()
-            .all(|row| row.schema_key != "lix_directory_descriptor"));
+        assert!(
+            staged
+                .state_rows
+                .iter()
+                .all(|row| row.schema_key != "lix_directory_descriptor")
+        );
 
         let snapshot: JsonValue = staged.state_rows[0]
             .snapshot
@@ -3374,14 +3393,18 @@ mod tests {
         assert_eq!(staged.file_data_writes.len(), 1);
         assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
         assert_eq!(staged.file_data_writes[0].data, b"hello");
-        assert!(staged
-            .state_rows
-            .iter()
-            .any(|row| row.schema_key == "lix_file_descriptor"));
-        assert!(staged
-            .state_rows
-            .iter()
-            .any(|row| row.schema_key == "lix_binary_blob_ref"));
+        assert!(
+            staged
+                .state_rows
+                .iter()
+                .any(|row| row.schema_key == "lix_file_descriptor")
+        );
+        assert!(
+            staged
+                .state_rows
+                .iter()
+                .any(|row| row.schema_key == "lix_binary_blob_ref")
+        );
     }
 
     #[test]
@@ -3414,10 +3437,12 @@ mod tests {
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.state_rows.len(), 2);
-        assert!(staged
-            .state_rows
-            .iter()
-            .any(|row| row.schema_key == "lix_file_descriptor"));
+        assert!(
+            staged
+                .state_rows
+                .iter()
+                .any(|row| row.schema_key == "lix_file_descriptor")
+        );
         let blob_ref_row = staged
             .state_rows
             .iter()
@@ -3617,12 +3642,14 @@ mod tests {
                 assert_eq!(*mode, TransactionWriteMode::Insert);
                 assert_eq!(*count, 1);
                 assert_eq!(rows.len(), 2);
-                assert!(rows
-                    .iter()
-                    .any(|row| row.schema_key == "lix_file_descriptor"));
-                assert!(rows
-                    .iter()
-                    .any(|row| row.schema_key == "lix_binary_blob_ref"));
+                assert!(
+                    rows.iter()
+                        .any(|row| row.schema_key == "lix_file_descriptor")
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row.schema_key == "lix_binary_blob_ref")
+                );
                 assert_eq!(file_data.len(), 1);
                 assert_eq!(file_data[0].file_id, "file-readme");
                 assert_eq!(file_data[0].data, b"hello");

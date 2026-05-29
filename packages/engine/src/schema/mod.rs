@@ -13,7 +13,7 @@ pub use definition::{
     validate_lix_schema_definition,
 };
 pub(crate) use key::registered_schema_entity_pk;
-pub use key::{schema_from_registered_snapshot, schema_key_from_definition, SchemaKey};
+pub use key::{SchemaKey, schema_from_registered_snapshot, schema_key_from_definition};
 #[cfg(test)]
 pub(crate) use seed::seed_schema_definition;
 pub(crate) use seed::{is_seed_schema_key, seed_schema_definitions};

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lix_engine::Engine;
 use lix_engine::LixError;

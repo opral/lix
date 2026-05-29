@@ -1,10 +1,10 @@
+use crate::LixError;
 use crate::branch::{
-    branch_descriptor_stage_row, branch_ref_stage_row, BranchLifecycle, BranchOperation,
-    BranchReferenceRole,
+    BranchLifecycle, BranchOperation, BranchReferenceRole, branch_descriptor_stage_row,
+    branch_ref_stage_row,
 };
 use crate::storage::StorageBackend;
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
-use crate::LixError;
 
 use super::context::SessionContext;
 

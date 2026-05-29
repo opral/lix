@@ -1,5 +1,5 @@
 use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateRow};
-use crate::{parse_row_metadata, LixError};
+use crate::{LixError, parse_row_metadata};
 
 pub(crate) fn materialize_row(
     row: UntrackedStateRow,

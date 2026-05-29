@@ -1,9 +1,11 @@
+#![allow(clippy::clone_on_copy, clippy::iter_cloned_collect)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::LixError;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphStoreReader, ReachableCommitGraphCommit};
 use crate::storage::StorageRead;
-use crate::LixError;
 
 /// Walks parent links from `head_commit_id` and returns reachable commits
 /// nearest-first.
@@ -95,7 +97,7 @@ where
 
         best.push(reachable.commit);
     }
-    best.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+    best.sort_by_key(|left| left.commit_id);
     Ok(best)
 }
 
@@ -221,6 +223,7 @@ struct TraversalFrame {
 mod tests {
     use serde_json::json;
 
+    use crate::LixError;
     use crate::changelog::{
         ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitId,
         CommitRecord,
@@ -229,7 +232,6 @@ mod tests {
     use crate::commit_graph::CommitGraphContext;
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
-    use crate::LixError;
 
     fn ts(value: &str) -> crate::common::LixTimestamp {
         crate::common::LixTimestamp::expect_parse("timestamp", value)
@@ -316,9 +318,11 @@ mod tests {
         .await
         .expect_err("changelog should reject missing parent");
 
-        assert!(error
-            .message
-            .contains(&commit_id("missing-parent").to_string()));
+        assert!(
+            error
+                .message
+                .contains(&commit_id("missing-parent").to_string())
+        );
     }
 
     #[tokio::test]
@@ -771,10 +775,12 @@ mod tests {
                 .details
                 .as_ref()
                 .and_then(|details| details.get("candidates")),
-            Some(&json!(sorted_commit_ids(["commit-left", "commit-right"])
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()))
+            Some(&json!(
+                sorted_commit_ids(["commit-left", "commit-right"])
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+            ))
         );
     }
 

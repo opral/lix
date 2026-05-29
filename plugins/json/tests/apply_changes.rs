@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_json, snapshot_content};
-use plugin_json_v2::{apply_changes, PluginApiError, PluginEntityChange, SCHEMA_KEY};
+use plugin_json_v2::{PluginApiError, PluginEntityChange, SCHEMA_KEY, apply_changes};
 use serde_json::Value;
 
 fn with_root_object(mut changes: Vec<PluginEntityChange>) -> Vec<PluginEntityChange> {
@@ -110,7 +110,7 @@ fn rejects_snapshot_missing_path() {
 
 #[test]
 fn infers_array_parent_for_numeric_pointer_segment() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/team".to_string(),
@@ -158,7 +158,7 @@ fn removing_root_sets_null() {
 
 #[test]
 fn rejects_duplicate_entity_pks_in_projection_set() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/foo".to_string(),
@@ -259,7 +259,7 @@ fn rejects_invalid_dash_placement() {
 
 #[test]
 fn allows_proto_like_keys_when_projection_rows_are_consistent() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/__proto__".to_string(),
@@ -287,7 +287,7 @@ fn allows_proto_like_keys_when_projection_rows_are_consistent() {
 
 #[test]
 fn rejects_descendant_upsert_under_tombstoned_ancestor() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/a".to_string(),
@@ -315,7 +315,7 @@ fn rejects_descendant_upsert_under_tombstoned_ancestor() {
 
 #[test]
 fn rejects_root_tombstone_with_non_root_rows() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "".to_string(),
@@ -343,7 +343,7 @@ fn rejects_root_tombstone_with_non_root_rows() {
 
 #[test]
 fn rejects_snapshot_path_non_string() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![PluginEntityChange {
         entity_pk: "/safe".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
@@ -364,7 +364,7 @@ fn rejects_snapshot_path_non_string() {
 
 #[test]
 fn rejects_snapshot_with_additional_properties_or_missing_value() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
 
     let with_extra = vec![PluginEntityChange {
         entity_pk: "/safe".to_string(),
@@ -401,7 +401,7 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
 
 #[test]
 fn rejects_numeric_child_without_parent_container_row() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![PluginEntityChange {
         entity_pk: "/foo/0".to_string(),
         schema_key: SCHEMA_KEY.to_string(),
@@ -422,7 +422,7 @@ fn rejects_numeric_child_without_parent_container_row() {
 
 #[test]
 fn rejects_huge_array_index_growth() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -453,7 +453,7 @@ fn rejects_huge_array_index_growth() {
 
 #[test]
 fn rejects_leading_zero_array_indices_under_array_ancestor() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -481,7 +481,7 @@ fn rejects_leading_zero_array_indices_under_array_ancestor() {
 
 #[test]
 fn accepts_canonical_zero_array_index() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -503,7 +503,7 @@ fn accepts_canonical_zero_array_index() {
 
 #[test]
 fn rejects_sparse_array_projection_rows() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -531,7 +531,7 @@ fn rejects_sparse_array_projection_rows() {
 
 #[test]
 fn rejects_aliasing_array_indices_via_non_canonical_form() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -564,7 +564,7 @@ fn rejects_aliasing_array_indices_via_non_canonical_form() {
 
 #[test]
 fn rejects_tombstone_with_leading_zero_token_under_live_array_context() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -597,7 +597,7 @@ fn rejects_tombstone_with_leading_zero_token_under_live_array_context() {
 
 #[test]
 fn rejects_tombstone_with_dash_token_under_live_array_context() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -630,7 +630,7 @@ fn rejects_tombstone_with_dash_token_under_live_array_context() {
 
 #[test]
 fn allows_tombstone_with_leading_zero_token_with_only_live_array_container() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -652,7 +652,7 @@ fn allows_tombstone_with_leading_zero_token_with_only_live_array_container() {
 
 #[test]
 fn allows_tombstone_with_dash_token_with_only_live_array_container() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -674,7 +674,7 @@ fn allows_tombstone_with_dash_token_with_only_live_array_container() {
 
 #[test]
 fn rejects_live_array_row_with_non_canonical_tombstone_alias() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -712,7 +712,7 @@ fn rejects_live_array_row_with_non_canonical_tombstone_alias() {
 
 #[test]
 fn allows_tombstone_non_numeric_token_under_live_array_context() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -739,7 +739,7 @@ fn allows_tombstone_non_numeric_token_under_live_array_context() {
 
 #[test]
 fn rejects_root_scalar_with_non_root_descendants() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "".to_string(),
@@ -767,7 +767,7 @@ fn rejects_root_scalar_with_non_root_descendants() {
 
 #[test]
 fn rejects_scalar_ancestor_with_descendant_row() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/a".to_string(),
@@ -795,7 +795,7 @@ fn rejects_scalar_ancestor_with_descendant_row() {
 
 #[test]
 fn rejects_final_dash_token_in_projection_rows() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![
         PluginEntityChange {
             entity_pk: "/arr".to_string(),
@@ -823,7 +823,7 @@ fn rejects_final_dash_token_in_projection_rows() {
 
 #[test]
 fn rejects_non_root_rows_when_root_row_is_missing() {
-    let file = file_from_json("f1", "/x.json", r#"{}"#);
+    let file = file_from_json("f1", "/x.json", r"{}");
     let changes = vec![PluginEntityChange {
         entity_pk: "/0".to_string(),
         schema_key: SCHEMA_KEY.to_string(),

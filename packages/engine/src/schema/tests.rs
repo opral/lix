@@ -201,9 +201,10 @@ fn validate_lix_schema_definition_rejects_missing_primary_key_properties() {
     });
 
     let err = validate_lix_schema_definition(&schema).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("x-lix-primary-key references missing property"));
+    assert!(
+        err.to_string()
+            .contains("x-lix-primary-key references missing property")
+    );
 }
 
 #[test]
@@ -221,9 +222,10 @@ fn validate_lix_schema_definition_rejects_non_string_primary_key_properties() {
     });
 
     let err = validate_lix_schema_definition(&schema).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("x-lix-primary-key property \"/id\" must have type \"string\""));
+    assert!(
+        err.to_string()
+            .contains("x-lix-primary-key property \"/id\" must have type \"string\"")
+    );
 }
 
 #[test]
@@ -242,9 +244,10 @@ fn validate_lix_schema_definition_rejects_optional_primary_key_properties() {
 
     let err = validate_lix_schema_definition(&schema)
         .expect_err("primary-key property should be required");
-    assert!(err
-        .to_string()
-        .contains("x-lix-primary-key property \"/id\" must be required"));
+    assert!(
+        err.to_string()
+            .contains("x-lix-primary-key property \"/id\" must be required")
+    );
 }
 
 #[test]
@@ -260,9 +263,10 @@ fn validate_lix_schema_definition_rejects_missing_unique_constraint_properties()
     });
 
     let err = validate_lix_schema_definition(&schema).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("x-lix-unique references missing property"));
+    assert!(
+        err.to_string()
+            .contains("x-lix-unique references missing property")
+    );
 }
 
 #[test]
@@ -384,7 +388,7 @@ fn x_lix_primary_key_must_include_at_least_one_unique_pointer() {
     duplicate_pk["x-lix-primary-key"] = json!(["/id", "/id"]);
     assert!(validate_lix_schema_definition(&duplicate_pk).is_err());
 
-    let mut valid_pk = base_schema.clone();
+    let mut valid_pk = base_schema;
     valid_pk["x-lix-primary-key"] = json!(["/id"]);
     assert!(validate_lix_schema_definition(&valid_pk).is_ok());
 }
@@ -410,7 +414,7 @@ fn x_lix_unique_groups_must_include_unique_pointers() {
     duplicate_pointers["x-lix-unique"] = json!([["/email", "/email"]]);
     assert!(validate_lix_schema_definition(&duplicate_pointers).is_err());
 
-    let mut valid_unique = base_schema.clone();
+    let mut valid_unique = base_schema;
     valid_unique["x-lix-unique"] = json!([["/email"]]);
     assert!(validate_lix_schema_definition(&valid_unique).is_ok());
 }

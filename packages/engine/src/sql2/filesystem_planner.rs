@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
-use serde_json::{json, Map as JsonMap, Value as JsonValue};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
+use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::common::{
-    directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
-    parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
+    ParsedFilePath, directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
+    parent_directory_path, stable_content_fingerprint_hex,
 };
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::LixError;
-use crate::GLOBAL_BRANCH_ID;
 
 use super::filesystem_visibility::VisibleFilesystem;
 use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
@@ -365,6 +365,7 @@ fn duplicate_directory_path_error(path: &str) -> LixError {
     )
 }
 
+#[expect(clippy::ref_option)]
 fn filesystem_namespace_conflict_error(
     parent_id: &Option<String>,
     entry_name: &str,
@@ -468,7 +469,7 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow
         )
     })?;
     let snapshot = json!({
-        "id": input.file_id.clone(),
+        "id": input.file_id,
         "blob_hash": stable_content_fingerprint_hex(&input.data),
         "size_bytes": size_bytes,
     });
@@ -880,10 +881,10 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
 
     use super::{
+        BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput, DirectoryPathResolver,
+        FileDeleteInput, FileDescriptorRowInput, FilePathWriteInput, FilesystemRowContext,
         blob_ref_row, directory_descriptor_row, file_descriptor_row, plan_file_path_update,
-        plan_file_path_write, BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
-        DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput, FilePathWriteInput,
-        FilesystemRowContext,
+        plan_file_path_write,
     };
     use crate::sql2::filesystem_visibility::VisibleFilesystem;
     use crate::{entity_pk::EntityPk, live_state::MaterializedLiveStateRow};
@@ -903,10 +904,7 @@ mod tests {
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
-        assert_eq!(
-            row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("dir-docs"))
-        );
+        assert_eq!(row.entity_pk.as_ref(), Some(&EntityPk::single("dir-docs")));
         assert_eq!(row.schema_key, "lix_directory_descriptor");
         assert_eq!(row.branch_id, "branch-a");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
@@ -928,7 +926,7 @@ mod tests {
 
         assert_eq!(
             row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&EntityPk::single("file-readme"))
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
@@ -947,16 +945,18 @@ mod tests {
 
         assert_eq!(
             row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&EntityPk::single("file-readme"))
         );
         assert_eq!(row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["size_bytes"], 5);
-        assert!(snapshot["blob_hash"]
-            .as_str()
-            .is_some_and(|hash| !hash.is_empty()));
+        assert!(
+            snapshot["blob_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
     }
 
     #[test]
@@ -1106,10 +1106,11 @@ mod tests {
                 .count(),
             2
         );
-        assert!(plan
-            .rows
-            .iter()
-            .any(|row| row.schema_key == "lix_binary_blob_ref"));
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row.schema_key == "lix_binary_blob_ref")
+        );
 
         let file_row = plan
             .rows
@@ -1179,10 +1180,11 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert!(plan.file_data.is_empty());
         assert_eq!(plan.rows.len(), 1);
-        assert!(plan
-            .rows
-            .iter()
-            .all(|row| row.schema_key != "lix_binary_blob_ref"));
+        assert!(
+            plan.rows
+                .iter()
+                .all(|row| row.schema_key != "lix_binary_blob_ref")
+        );
 
         let snapshot: JsonValue = plan.rows[0].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
@@ -1216,10 +1218,11 @@ mod tests {
                 .count(),
             2
         );
-        assert!(plan
-            .rows
-            .iter()
-            .all(|row| row.schema_key != "lix_binary_blob_ref"));
+        assert!(
+            plan.rows
+                .iter()
+                .all(|row| row.schema_key != "lix_binary_blob_ref")
+        );
 
         let file_row = plan
             .rows
@@ -1277,7 +1280,7 @@ mod tests {
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
             descriptor.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&EntityPk::single("file-readme"))
         );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot, None);
@@ -1289,7 +1292,7 @@ mod tests {
             .expect("blob ref tombstone should be planned");
         assert_eq!(
             blob_ref.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&EntityPk::single("file-readme"))
         );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot, None);
@@ -1320,7 +1323,7 @@ mod tests {
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
             plan.rows[0].entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("dir-docs"))
+            Some(&EntityPk::single("dir-docs"))
         );
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);

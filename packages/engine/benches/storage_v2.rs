@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use lix_engine::backend::{
-    get_many as backend_get_many, visit_range as backend_visit_range, Backend, BackendError,
-    BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, CommitResult, CoreProjection,
-    GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
-    ProjectedValueRef, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
-    StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
+    CommitResult, CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor,
+    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, StoredValue, WriteOptions, WriteStats,
+    get_many as backend_get_many, visit_range as backend_visit_range,
 };
 use lix_engine::storage::{
     PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageReadScope,
@@ -811,7 +811,7 @@ fn bench_write_set_lowering(c: &mut Criterion) {
             "write cases must divide cleanly across spaces"
         );
         let mutations = write_mutations(case);
-        group.throughput(Throughput::Elements(case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(case.writes)));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
                 || {
@@ -826,18 +826,21 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                         .expect("commit write set");
                     let expected_deletes = case.expected_deletes();
                     let expected_puts = case.writes - expected_deletes;
-                    assert_eq!(stats.staged_puts, expected_puts as u64);
-                    assert_eq!(stats.staged_deletes, expected_deletes as u64);
-                    assert_eq!(stats.touched_spaces, case.spaces as u64);
-                    assert_eq!(stats.put_batches, case.expected_put_batches() as u64);
-                    assert_eq!(stats.delete_batches, case.expected_delete_batches() as u64);
+                    assert_eq!(stats.staged_puts, u64::from(expected_puts));
+                    assert_eq!(stats.staged_deletes, u64::from(expected_deletes));
+                    assert_eq!(stats.touched_spaces, u64::from(case.spaces));
+                    assert_eq!(stats.put_batches, u64::from(case.expected_put_batches()));
+                    assert_eq!(
+                        stats.delete_batches,
+                        u64::from(case.expected_delete_batches())
+                    );
                     assert_eq!(
                         backend.state.put_many_calls.get(),
-                        case.expected_put_batches() as u64
+                        u64::from(case.expected_put_batches())
                     );
                     assert_eq!(
                         backend.state.delete_many_calls.get(),
-                        case.expected_delete_batches() as u64
+                        u64::from(case.expected_delete_batches())
                     );
                     assert_eq!(backend.state.commit_calls.get(), 1);
                     black_box(stats);
@@ -860,7 +863,7 @@ fn bench_write_set_construction(c: &mut Criterion) {
             "write cases must divide cleanly across spaces"
         );
         let mutations = write_mutations(case);
-        group.throughput(Throughput::Elements(case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(case.writes)));
 
         group.bench_with_input(BenchmarkId::new("checked", case.name), case, |b, case| {
             b.iter(|| {
@@ -868,10 +871,10 @@ fn bench_write_set_construction(c: &mut Criterion) {
                 let stats = writes.stats();
                 assert_eq!(
                     stats.staged_puts,
-                    (case.writes - case.expected_deletes()) as u64
+                    u64::from(case.writes - case.expected_deletes())
                 );
-                assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
-                assert_eq!(stats.touched_spaces, case.spaces as u64);
+                assert_eq!(stats.staged_deletes, u64::from(case.expected_deletes()));
+                assert_eq!(stats.touched_spaces, u64::from(case.spaces));
                 black_box(writes);
             });
         });
@@ -882,10 +885,10 @@ fn bench_write_set_construction(c: &mut Criterion) {
                 let stats = writes.stats();
                 assert_eq!(
                     stats.staged_puts,
-                    (case.writes - case.expected_deletes()) as u64
+                    u64::from(case.writes - case.expected_deletes())
                 );
-                assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
-                assert_eq!(stats.touched_spaces, case.spaces as u64);
+                assert_eq!(stats.staged_deletes, u64::from(case.expected_deletes()));
+                assert_eq!(stats.touched_spaces, u64::from(case.spaces));
                 black_box(writes);
             });
         });
@@ -914,7 +917,7 @@ where
         .filter(|case| case.writes == 1_024 || case.writes == 128)
     {
         let mutations = write_mutations(case);
-        group.throughput(Throughput::Elements(case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(case.writes)));
 
         group.bench_with_input(BenchmarkId::new("checked", case.name), case, |b, case| {
             b.iter_batched(
@@ -929,9 +932,9 @@ where
                         .expect("checked build and commit");
                     assert_eq!(
                         stats.staged_puts,
-                        (case.writes - case.expected_deletes()) as u64
+                        u64::from(case.writes - case.expected_deletes())
                     );
-                    assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
+                    assert_eq!(stats.staged_deletes, u64::from(case.expected_deletes()));
                     black_box(stats);
                 },
                 BatchSize::LargeInput,
@@ -951,9 +954,9 @@ where
                         .expect("canonical build and commit");
                     assert_eq!(
                         stats.staged_puts,
-                        (case.writes - case.expected_deletes()) as u64
+                        u64::from(case.writes - case.expected_deletes())
                     );
-                    assert_eq!(stats.staged_deletes, case.expected_deletes() as u64);
+                    assert_eq!(stats.staged_deletes, u64::from(case.expected_deletes()));
                     black_box(stats);
                 },
                 BatchSize::LargeInput,
@@ -976,7 +979,9 @@ where
         group.measurement_time(Duration::from_millis(250));
     }
 
+    #[expect(clippy::items_after_statements)]
     const WRITES: usize = 10_000;
+    #[expect(clippy::items_after_statements)]
     const VALUE_SIZE: usize = 32;
     let storage_space = space(1);
     for order in [
@@ -1013,7 +1018,9 @@ where
 fn bench_write_batch_seal_sort(c: &mut Criterion) {
     let mut group = storage_benchmark_group(c, "storage_v2/write_batch_seal_sort");
 
+    #[expect(clippy::items_after_statements)]
     const WRITES: usize = 10_000;
+    #[expect(clippy::items_after_statements)]
     const VALUE_SIZE: usize = 32;
     let storage_space = space(1);
     for order in [
@@ -1039,6 +1046,7 @@ fn bench_write_batch_seal_sort(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn bench_delete_range_fallback<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
@@ -1082,6 +1090,7 @@ where
     group.finish();
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn bench_delete_range_native<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
@@ -1120,6 +1129,7 @@ where
     group.finish();
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn bench_delete_range_storage_helpers<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
@@ -1312,7 +1322,7 @@ where
         mix: WriteMix::PutsOnly,
     };
     let mutations = write_mutations(&case);
-    group.throughput(Throughput::Elements(case.writes as u64));
+    group.throughput(Throughput::Elements(u64::from(case.writes)));
     group.bench_function(BenchmarkId::new("durable", case.name), |b| {
         b.iter_batched(
             || {
@@ -1325,8 +1335,8 @@ where
                 let (_commit, stats) = storage
                     .commit_write_set(writes, WriteOptions::default())
                     .expect("durable commit");
-                assert_eq!(stats.staged_puts, case.writes as u64);
-                assert_eq!(stats.put_batches, case.spaces as u64);
+                assert_eq!(stats.staged_puts, u64::from(case.writes));
+                assert_eq!(stats.put_batches, u64::from(case.spaces));
                 black_box(stats);
             },
             BatchSize::LargeInput,
@@ -1463,6 +1473,7 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn bench_storage_backend_matrix<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
@@ -1483,7 +1494,7 @@ where
         mix: WriteMix::PutsOnly,
     };
     let commit_mutations = write_mutations(&commit_case);
-    group.throughput(Throughput::Elements(commit_case.writes as u64));
+    group.throughput(Throughput::Elements(u64::from(commit_case.writes)));
     group.bench_function(commit_case.name, |b| {
         b.iter_batched(
             || {
@@ -1512,7 +1523,7 @@ where
         mix: WriteMix::PutDelete80_20,
     };
     let mixed_mutations = write_mutations(&mixed_case);
-    group.throughput(Throughput::Elements(mixed_case.writes as u64));
+    group.throughput(Throughput::Elements(u64::from(mixed_case.writes)));
     group.bench_function(mixed_case.name, |b| {
         b.iter_batched(
             || {
@@ -1544,7 +1555,7 @@ where
     };
     let touched_mutations = write_mutations(&touched_case);
     let touched_seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
-    group.throughput(Throughput::Elements(touched_case.writes as u64));
+    group.throughput(Throughput::Elements(u64::from(touched_case.writes)));
     group.bench_function(touched_case.name, |b| {
         b.iter_batched(
             || {
@@ -1816,7 +1827,7 @@ where
         let warm_backend = backend_family.open_empty();
         commit_direct_write_batches(&warm_backend, direct_put_batches.clone())
             .expect("warm direct put backend");
-        group.throughput(Throughput::Elements(direct_put_case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(direct_put_case.writes)));
         group.bench_function(direct_put_case.name, |b| {
             b.iter_batched(
                 || (backend_family.open_empty(), direct_put_batches.clone()),
@@ -1847,7 +1858,9 @@ where
         let backend = backend_family.open_empty();
         commit_direct_write_batches(&backend, clean_direct_put_batches.clone())
             .expect("warm reused direct put backend");
-        group.throughput(Throughput::Elements(clean_direct_put_case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(
+            clean_direct_put_case.writes,
+        )));
         group.bench_function(clean_direct_put_case.name, |b| {
             b.iter(|| {
                 let commit = commit_direct_write_batches(
@@ -1876,7 +1889,7 @@ where
         let warm_backend = backend_family.open_empty();
         commit_direct_write_batches(&warm_backend, mixed_batches.clone())
             .expect("warm direct mixed backend");
-        group.throughput(Throughput::Elements(mixed_case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(mixed_case.writes)));
         group.bench_function(mixed_case.name, |b| {
             b.iter_batched(
                 || (backend_family.open_empty(), mixed_batches.clone()),
@@ -1907,7 +1920,7 @@ where
         let warm_backend = backend_family.fork_for_write(&touched_seed);
         commit_direct_write_batches(&warm_backend, touched_batches.clone())
             .expect("warm direct touched backend");
-        group.throughput(Throughput::Elements(touched_case.writes as u64));
+        group.throughput(Throughput::Elements(u64::from(touched_case.writes)));
         group.bench_function(touched_case.name, |b| {
             b.iter_batched(
                 || {
@@ -2485,6 +2498,7 @@ fn bench_in_memory_backend(c: &mut Criterion) {
     group.finish();
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn bench_scan_visitor_baseline(c: &mut Criterion) {
     let mut group = storage_benchmark_group(c, "storage_v2/scan_visitor_baseline");
     if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_none() {
@@ -2932,7 +2946,7 @@ impl LeanPointReadBackend {
                 let key = key(format!("point-{index:04}"));
                 ReadEntry {
                     key: key.clone(),
-                    value: ProjectedValue::FullValue(key.0.clone()),
+                    value: ProjectedValue::FullValue(key.0),
                 }
             })
             .collect();
@@ -3010,6 +3024,7 @@ impl BackendRead for EmptyRead {
 }
 
 impl WriteCase {
+    #[expect(clippy::cast_possible_truncation)]
     fn expected_deletes(&self) -> u32 {
         let writes_per_space = self.writes / self.spaces;
         match self.mix {
@@ -3077,7 +3092,7 @@ fn seed_backend_points<B>(
     let (_commit, stats) = storage
         .commit_write_set(writes, WriteOptions::default())
         .unwrap_or_else(|error| panic!("seed {backend_name}: {error}"));
-    assert_eq!(stats.staged_puts, rows as u64);
+    assert_eq!(stats.staged_puts, u64::from(rows));
 }
 
 fn layered_in_memory_backend(
@@ -3101,7 +3116,7 @@ fn layered_in_memory_backend(
             .put_many(PutBatch { entries })
             .expect("write overlay layer");
         let commit = write.commit().expect("commit overlay layer");
-        assert_eq!(commit.stats.put_entries, rows_per_layer as u64);
+        assert_eq!(commit.stats.put_entries, u64::from(rows_per_layer));
     }
     backend
 }
@@ -3167,6 +3182,7 @@ where
     write.commit()
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn fallback_delete_range<B>(
     storage: &StorageContext<B>,
     storage_space: StorageSpace,
@@ -3354,7 +3370,7 @@ where
         ScanChunkingMode::Range => {
             ScanPlan::range(storage_space, point_scan_range()).cursor(read, opts, |cursor| {
                 drain_storage_cursor(cursor, chunk_size, &mut stats)
-            })?
+            })?;
         }
         ScanChunkingMode::Prefix => ScanPlan::prefix(
             storage_space,
@@ -3536,10 +3552,10 @@ fn materialize_scan_visit(
             resume_after,
         },
         |key, value| {
-            let value = match value {
-                None => ProjectedValue::KeyOnly,
-                Some(value) => ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
-            };
+            let value = value.map_or_else(
+                || ProjectedValue::KeyOnly,
+                |value| ProjectedValue::FullValue(Bytes::copy_from_slice(value)),
+            );
             entries.push(ReadEntry {
                 key: key.to_owned_key(),
                 value,
@@ -3672,6 +3688,7 @@ fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {
     mutations
 }
 
+#[expect(clippy::cast_possible_truncation)]
 fn direct_ordered_put_batch(
     storage_space: StorageSpace,
     writes: usize,

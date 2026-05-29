@@ -1,7 +1,7 @@
 mod common;
 
 use common::{apply_scenarios, file_from_bytes};
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use std::time::Duration;
 use text_plugin::apply_changes;
 

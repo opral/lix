@@ -1,3 +1,9 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cmp_owned
+)]
+
 use std::collections::HashMap;
 
 #[cfg(test)]
@@ -8,13 +14,13 @@ use crate::storage::{
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
+    TRACKED_STATE_HASH_BYTES, TrackedStateCommitRoot, TrackedStateRootId,
 };
-use crate::{storage_codec, LixError};
+use crate::{LixError, storage_codec};
 use bytes::Bytes;
 
-pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree_chunk";
-pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &'static str = "tracked_state.commit_root";
+pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &str = "tracked_state.tree_chunk";
+pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &str = "tracked_state.commit_root";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
@@ -69,7 +75,7 @@ pub(crate) async fn load_commit_root(
         return Ok(None);
     };
     let metadata = decode_commit_root(&bytes)?;
-    if metadata.commit_id.to_string() != commit_id {
+    if metadata.commit_id != commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -218,7 +224,7 @@ mod tests {
     use crate::binary_cas::kv::{
         BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE,
     };
-    use crate::changelog::{CommitId, CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
+    use crate::changelog::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId};
     use crate::json_store::store::JSON_SPACE;
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
@@ -226,8 +232,8 @@ mod tests {
     use crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE;
 
     use super::{
-        decode_commit_root, encode_commit_root, TRACKED_STATE_COMMIT_ROOT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE,
+        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_root,
+        encode_commit_root,
     };
 
     #[test]
@@ -284,9 +290,11 @@ mod tests {
         let error = decode_commit_root(b"LXTR1not-musli")
             .expect_err("old hand-rolled bytes should not decode as musli");
 
-        assert!(error
-            .to_string()
-            .contains("failed to decode tracked_state commit_root"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode tracked_state commit_root")
+        );
     }
 
     #[test]
@@ -307,9 +315,11 @@ mod tests {
         let error = decode_commit_root(&encoded)
             .expect_err("trailing bytes should fail commit root decode");
 
-        assert!(error
-            .to_string()
-            .contains("failed to decode tracked_state commit_root"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode tracked_state commit_root")
+        );
     }
 
     #[test]

@@ -87,7 +87,7 @@ mod tests {
             Cli::try_parse_from(["lix", "undo", "--version", "branch-1"]).expect("parse succeeds");
         match cli.command {
             Some(Command::Undo(command)) => {
-                assert_eq!(command.version.as_deref(), Some("branch-1"))
+                assert_eq!(command.version.as_deref(), Some("branch-1"));
             }
             _ => panic!("expected undo command"),
         }

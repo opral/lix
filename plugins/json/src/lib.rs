@@ -1,12 +1,16 @@
+#[expect(clippy::same_length_and_capacity)]
+mod bindings {
+    wit_bindgen::generate!({
+        path: "../../packages/engine/wit",
+        world: "plugin",
+    });
+}
+pub use bindings::*;
+
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
-
-wit_bindgen::generate!({
-    path: "../../packages/engine/wit",
-    world: "plugin",
-});
 
 pub const SCHEMA_KEY: &str = "json_pointer";
 const MAX_ARRAY_INDEX: usize = 100_000;
@@ -84,7 +88,7 @@ impl Guest for JsonPlugin {
     fn detect_changes(
         before: Option<File>,
         after: File,
-        _state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+        _state_context: Option<exports::lix::plugin::api::DetectStateContext>,
     ) -> Result<Vec<EntityChange>, PluginError> {
         let before_json = before
             .as_ref()
@@ -833,7 +837,7 @@ pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityCha
 pub fn detect_changes_with_state_context(
     before: Option<File>,
     after: File,
-    state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+    state_context: Option<exports::lix::plugin::api::DetectStateContext>,
 ) -> Result<Vec<EntityChange>, PluginError> {
     <JsonPlugin as Guest>::detect_changes(before, after, state_context)
 }

@@ -275,9 +275,9 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
-                    lix_engine::Value::Json(serde_json::json!("one")),
+                    Value::Json(serde_json::json!("one")),
                     Value::Json(serde_json::json!(["history-pk-backfill"])),
-                    lix_engine::Value::Json(serde_json::json!({
+                    Value::Json(serde_json::json!({
                         "key": "history-pk-backfill",
                         "value": "one"
                     })),
@@ -356,7 +356,7 @@ simulation_test!(
                     Value::Text("messages".to_string()),
                     Value::Text("7".to_string()),
                     Value::Text("one".to_string()),
-                    lix_engine::Value::Json(serde_json::json!({
+                    Value::Json(serde_json::json!({
                         "namespace": "messages",
                         "id": "7",
                         "value": "one"

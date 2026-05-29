@@ -10,7 +10,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 use crate::LixError;
 
 use super::error::lix_error_to_datafusion_error;
-use super::result_metadata::{field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY};
+use super::result_metadata::{LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY, field_is_json};
 
 pub(crate) fn validate_json_predicate_filters(
     schema: &Schema,
@@ -42,7 +42,7 @@ pub(crate) fn validate_json_predicate_expr_with_dfschema(
         schema
             .field_with_name(column.relation.as_ref(), &column.name)
             .ok()
-            .map(|field| field.as_ref())
+            .map(AsRef::as_ref)
     })
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn json_predicate_placeholder_indexes_with_dfschema(
         schema
             .field_with_name(column.relation.as_ref(), &column.name)
             .ok()
-            .map(|field| field.as_ref())
+            .map(AsRef::as_ref)
     });
     indexes
 }
@@ -145,10 +145,10 @@ fn canonicalize_json_text_literal(expr: Expr) -> Result<Expr, DataFusionError> {
         | ScalarValue::LargeUtf8(Some(value)) => Some(canonical_json_text(value)?),
         _ => None,
     };
-    Ok(match canonical {
-        Some(value) => Expr::Literal(ScalarValue::Utf8(Some(value)), Some(json_field_metadata())),
-        None => Expr::Literal(literal, metadata),
-    })
+    Ok(canonical.map_or_else(
+        || Expr::Literal(literal, metadata),
+        |value| Expr::Literal(ScalarValue::Utf8(Some(value)), Some(json_field_metadata())),
+    ))
 }
 
 fn canonical_json_text(raw: &str) -> Result<String, DataFusionError> {
@@ -176,7 +176,7 @@ fn is_identity_json_expr_for_arrow_schema(schema: &Schema, expr: &Expr) -> bool 
                 .fields()
                 .iter()
                 .find(|field| field.name() == &column.name)
-                .map(|field| field.as_ref())
+                .map(AsRef::as_ref)
         })
 }
 
@@ -189,7 +189,7 @@ fn validate_json_predicate_expr_with_arrow_schema(
             .fields()
             .iter()
             .find(|field| field.name() == &column.name)
-            .map(|field| field.as_ref())
+            .map(AsRef::as_ref)
     })
 }
 
@@ -296,7 +296,7 @@ fn collect_json_predicate_placeholder_indexes<'a>(
             }
         }
         Expr::Alias(alias) => {
-            collect_json_predicate_placeholder_indexes(&alias.expr, indexes, lookup_field)
+            collect_json_predicate_placeholder_indexes(&alias.expr, indexes, lookup_field);
         }
         Expr::Not(inner)
         | Expr::IsNotNull(inner)
@@ -308,13 +308,13 @@ fn collect_json_predicate_placeholder_indexes<'a>(
         | Expr::IsNotFalse(inner)
         | Expr::IsNotUnknown(inner)
         | Expr::Negative(inner) => {
-            collect_json_predicate_placeholder_indexes(inner, indexes, lookup_field)
+            collect_json_predicate_placeholder_indexes(inner, indexes, lookup_field);
         }
         Expr::Cast(cast) => {
-            collect_json_predicate_placeholder_indexes(&cast.expr, indexes, lookup_field)
+            collect_json_predicate_placeholder_indexes(&cast.expr, indexes, lookup_field);
         }
         Expr::TryCast(cast) => {
-            collect_json_predicate_placeholder_indexes(&cast.expr, indexes, lookup_field)
+            collect_json_predicate_placeholder_indexes(&cast.expr, indexes, lookup_field);
         }
         Expr::ScalarFunction(function) => {
             for arg in &function.args {

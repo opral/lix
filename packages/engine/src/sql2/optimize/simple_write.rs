@@ -1,8 +1,8 @@
+use crate::LixError;
 use crate::sql2::bind::write::{BoundWriteOp, BoundWriteTarget};
+use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::FilterSet;
-use crate::sql2::plan::LogicalWritePlan;
-use crate::LixError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FastWritePlan {
@@ -16,6 +16,7 @@ pub(crate) struct FastUpdatePlan;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FastDeletePlan;
 
+#[expect(clippy::unnecessary_wraps)]
 pub(crate) fn try_make_fast_write_plan(
     plan: &LogicalWritePlan,
 ) -> Result<Option<FastWritePlan>, LixError> {

@@ -45,9 +45,8 @@ fn use_color() -> bool {
 }
 
 fn current_dir_display() -> String {
-    let cwd = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(_) => return String::new(),
+    let Ok(cwd) = std::env::current_dir() else {
+        return String::new();
     };
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
@@ -67,9 +66,8 @@ fn describe_lix_state(explicit: Option<&Path>) -> String {
     if let Some(path) = explicit {
         return format!("using {}", path.display());
     }
-    let cwd = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(_) => return String::new(),
+    let Ok(cwd) = std::env::current_dir() else {
+        return String::new();
     };
     let mut lix_files: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&cwd) {

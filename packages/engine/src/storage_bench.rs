@@ -35,7 +35,7 @@ pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
     JSON_STORE_STAGE_BYTES.fetch_add(hash.len() as u64, Ordering::Relaxed);
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct StorageLayoutAccounting {
     pub space_id: u32,
     pub space: &'static str,

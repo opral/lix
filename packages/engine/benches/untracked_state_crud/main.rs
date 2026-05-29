@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, Key, KeyRange,
     PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, SpaceId, WriteOptions,
@@ -16,7 +16,7 @@ use lix_engine::storage::{
 };
 use lix_engine::storage_bench;
 use lix_engine::{Engine, SessionContext};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -381,9 +381,15 @@ fn maybe_print_io_report(all_rows: &[PointerRow]) {
     };
 
     println!("\nuntracked_state_crud/io");
-    println!("logical storage_v2 backend request/result accounting; not physical disk, WAL, or compaction I/O");
-    println!("| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | delete ranges | write bytes | write bytes/row |");
-    println!("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "logical storage_v2 backend request/result accounting; not physical disk, WAL, or compaction I/O"
+    );
+    println!(
+        "| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | delete ranges | write bytes | write bytes/row |"
+    );
+    println!(
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
 
     for (label, row_count) in workloads {
         let rows = bench_rows(&all_rows[..row_count]);
@@ -439,7 +445,7 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             prepare_raw_sqlite_empty,
             |fixture| black_box(raw_sqlite_insert_all(fixture, &rows)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(
         format!(
@@ -451,7 +457,7 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
                 prepare_raw_sqlite_empty,
                 |fixture| black_box(raw_sqlite_insert_all_unprepared_per_row(fixture, &rows)),
                 BatchSize::LargeInput,
-            )
+            );
         },
     );
     group.bench_function(
@@ -464,7 +470,7 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
                 prepare_raw_sqlite_empty,
                 |fixture| black_box(raw_sqlite_insert_all_unprepared_chunked(fixture, &rows)),
                 BatchSize::LargeInput,
-            )
+            );
         },
     );
     group.bench_function(format!("select_all_rows/{}", row_label(row_count)), |b| {
@@ -472,42 +478,42 @@ fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize
             || prepare_raw_sqlite_seeded(&rows),
             |fixture| black_box(raw_sqlite_select_all(fixture, row_count)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("select_one_by_pk/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
             |fixture| black_box(raw_sqlite_select_one_by_pk(fixture, pick_pk_row(&rows))),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
             |fixture| black_box(raw_sqlite_update_all(fixture, &rows)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
             |fixture| black_box(raw_sqlite_update_one_by_pk(fixture, pick_pk_row(&rows))),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
             |fixture| black_box(raw_sqlite_delete_all(fixture, row_count)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(row_count)), |b| {
         b.iter_batched(
             || prepare_raw_sqlite_seeded(&rows),
             |fixture| black_box(raw_sqlite_delete_one_by_pk(fixture, pick_pk_row(&rows))),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.finish();
 }
@@ -534,63 +540,63 @@ fn bench_lix_profile(
             || profile_storage(profile),
             |storage| black_box(storage.insert_all(rows)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("select_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.select_all(rows.len(), StorageCoreProjection::FullValue)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("select_keys_only/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.select_all(rows.len(), StorageCoreProjection::KeyOnly)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("select_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.select_points(std::slice::from_ref(&rows[rows.len() / 2]))),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("select_all_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.select_points(rows)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.update_all(rows)),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.update_all(&rows[..1])),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.delete_all()),
             BatchSize::LargeInput,
-        )
+        );
     });
     group.bench_function(format!("delete_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched(
             || prepare_lix_seeded(profile, rows),
             |storage| black_box(storage.delete_one(&rows[rows.len() / 2])),
             BatchSize::LargeInput,
-        )
+        );
     });
 }
 
@@ -619,7 +625,7 @@ fn bench_lix_physical_layout(
                         || (profile_storage(profile), physical_layout_rows(rows, layout)),
                         |(storage, rows)| black_box(storage.insert_all(&rows)),
                         BatchSize::LargeInput,
-                    )
+                    );
                 },
             );
         }
@@ -649,7 +655,7 @@ fn bench_session_execute_untracked_insert(
                 black_box(rows.len())
             },
             BatchSize::LargeInput,
-        )
+        );
     });
 
     group.finish();
@@ -707,8 +713,8 @@ where
         }
         _ => unreachable!("unknown operation"),
     }
-    let snapshot = stats.lock().expect("io stats mutex").clone();
-    snapshot
+
+    stats.lock().expect("io stats mutex").clone()
 }
 
 fn record_scan_result(stats: &Arc<Mutex<IoStats>>, rows: &[BenchRow], include_values: bool) {
@@ -878,6 +884,7 @@ where
     assert_eq!(affected, 1);
 }
 
+#[expect(clippy::cast_possible_truncation)]
 async fn insert_untracked_json_pointer_rows<B>(session: &SessionContext<B>, rows: &[PointerRow])
 where
     B: lix_engine::storage::StorageBackend + Clone + Send + Sync + 'static,
@@ -1096,11 +1103,12 @@ fn insert_untracked_json_pointer_sql(rows: &[PointerRow]) -> String {
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!(
+        let _ = write!(
+            sql,
             "('{}', lix_json('{}'), true)",
             sql_string(row.path.as_str()),
             sql_string(row.value_json.as_str())
-        ));
+        );
     }
     sql
 }
@@ -1137,10 +1145,10 @@ fn sql_string(value: &str) -> String {
 }
 
 fn optional_sql_string(value: Option<&str>) -> String {
-    match value {
-        Some(value) => format!("'{}'", sql_string(value)),
-        None => "NULL".to_string(),
-    }
+    value.map_or_else(
+        || "NULL".to_string(),
+        |value| format!("'{}'", sql_string(value)),
+    )
 }
 
 fn prepare_raw_sqlite_empty() -> RawSqliteFixture {
@@ -1203,7 +1211,7 @@ fn raw_sqlite_insert_all(
                     row.metadata,
                     row.created_at,
                     row.updated_at,
-                    row.global as i64,
+                    i64::from(row.global),
                 ])
                 .expect("execute raw sqlite insert");
         }
@@ -1286,7 +1294,7 @@ fn append_raw_sqlite_insert_values_tuple(sql: &mut String, row: &RawUntrackedRow
         optional_sql_string(row.metadata.as_deref()),
         sql_string(row.created_at.as_str()),
         sql_string(row.updated_at.as_str()),
-        row.global as i64,
+        i64::from(row.global),
     )
     .expect("write raw sqlite insert tuple SQL");
 }
@@ -1443,6 +1451,7 @@ fn operation_logical_rows(operation: &str, row_count: usize) -> usize {
     }
 }
 
+#[expect(clippy::cast_precision_loss)]
 fn ratio(numerator: usize, denominator: usize) -> String {
     if denominator == 0 {
         "-".to_string()

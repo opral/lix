@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
+use crate::LixError;
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
@@ -7,7 +8,6 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::untracked_state::MaterializedUntrackedStateRow;
-use crate::LixError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
@@ -236,6 +236,7 @@ impl StageJson {
     }
 }
 
+#[expect(clippy::unnecessary_wraps)]
 pub(crate) fn stage_json_from_value(
     value: TransactionJson,
     _context: &str,
@@ -285,7 +286,7 @@ pub(crate) struct PreparedStateRow {
 impl From<PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: PreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
-        MaterializedLiveStateRow {
+        Self {
             entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -305,7 +306,7 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
 
 impl From<&PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: &PreparedStateRow) -> Self {
-        MaterializedLiveStateRow {
+        Self {
             entity_pk: row.entity_pk.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -315,8 +316,8 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
             created_at: row.created_at.to_string(),
             updated_at: row.updated_at.to_string(),
             global: row.global,
-            change_id: row.change_id.clone(),
-            commit_id: row.commit_id.clone(),
+            change_id: row.change_id,
+            commit_id: row.commit_id,
             untracked: row.untracked,
             branch_id: row.branch_id.clone(),
         }
@@ -326,7 +327,7 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
 impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
     fn from(row: PreparedStateRow) -> Self {
         let deleted = row.snapshot.is_none();
-        MaterializedUntrackedStateRow {
+        Self {
             entity_pk: row.entity_pk,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -403,7 +404,7 @@ impl StagedCommitChangeRefs {
     }
 
     pub(crate) fn add_selected_change_ref(&mut self, change_ref: StagedCommitChangeRef) {
-        if self.change_ids.insert(change_ref.change_id.clone()) {
+        if self.change_ids.insert(change_ref.change_id) {
             self.selected_change_refs.push(change_ref);
         }
     }

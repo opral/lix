@@ -59,10 +59,10 @@ pub(crate) fn encode_commit_change_ref_chunk(
     )
 }
 
-pub(crate) fn view_commit_change_ref_chunk<'a>(
-    bytes: &'a [u8],
+pub(crate) fn view_commit_change_ref_chunk(
+    bytes: &[u8],
     commit_id: CommitId,
-) -> Result<ExpandedCommitChangeRefChunkView<'a>, LixError> {
+) -> Result<ExpandedCommitChangeRefChunkView<'_>, LixError> {
     let CommitChangeRefChunkView {
         format_version,
         schema_keys,
@@ -81,7 +81,7 @@ pub(crate) fn view_commit_change_ref_chunk<'a>(
         let schema_index = schema_index as usize;
         let file_index = file_index as usize;
         entries.push(CommitChangeRefView {
-            schema_key: *schema_keys.get(schema_index).ok_or_else(|| {
+            schema_key: schema_keys.get(schema_index).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("changelog {context}.schema_index is out of bounds"),

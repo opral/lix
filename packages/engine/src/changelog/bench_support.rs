@@ -9,12 +9,12 @@ use super::types::{
     CommitChangeRefSet, CommitId, CommitLoadRequest, CommitProjection, CommitRecord, GcPlan,
     GcRoot, RebuildIndexStats,
 };
+use crate::LixError;
 use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::storage::{
     StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions, StorageWriteSetStats,
 };
-use crate::LixError;
 
 pub trait BenchBackend: StorageBackend + Clone
 where
@@ -30,6 +30,7 @@ where
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct BenchAppend {
     append: ChangelogAppend,
 }
@@ -70,6 +71,7 @@ impl BenchAppend {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct BenchCorpus {
     append_batches: Vec<BenchAppend>,
     commit_ids: Vec<CommitId>,
@@ -121,6 +123,7 @@ impl BenchCorpus {
 }
 
 #[derive(Clone)]
+#[expect(missing_debug_implementations)]
 pub struct BenchStore<B = crate::storage::InMemoryStorageBackend>
 where
     B: BenchBackend + Sync,
@@ -187,6 +190,7 @@ pub enum BenchChangeLookup {
     Full,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct BenchDecodedAppendIndex {
     objects: usize,
 }
@@ -346,7 +350,7 @@ pub fn build_commit_change_ref_entries(append: &BenchAppend) -> usize {
 }
 
 pub fn project_first_change_to_logical(append: &BenchAppend) -> Result<usize, LixError> {
-    Ok(append.change_ids().first().map(|id| id.len()).unwrap_or(0))
+    Ok(append.change_ids().first().map(String::len).unwrap_or(0))
 }
 
 pub fn validate_first_commit_checksum(_append: &BenchAppend) -> Result<(), LixError> {
@@ -361,7 +365,7 @@ pub fn validate_publication_closure(append: &BenchAppend) -> Result<usize, LixEr
     Ok(append.change_count())
 }
 
-pub async fn stage_append_raw_once<B: BenchBackend>(
+pub async fn stage_append_raw_once<B>(
     backend: B,
     append: &BenchAppend,
 ) -> Result<BenchWriteStats, LixError>
@@ -372,7 +376,7 @@ where
     stage_append_once(backend, append).await
 }
 
-pub async fn stage_append_once<B: BenchBackend>(
+pub async fn stage_append_once<B>(
     backend: B,
     append: &BenchAppend,
 ) -> Result<BenchWriteStats, LixError>
@@ -384,7 +388,7 @@ where
     stage_append_in_store(&store, &append.append).await
 }
 
-pub async fn stage_corpus_once<B: BenchBackend>(
+pub async fn stage_corpus_once<B>(
     backend: B,
     corpus: &BenchCorpus,
 ) -> Result<BenchWriteStats, LixError>
@@ -400,10 +404,7 @@ where
     Ok(total)
 }
 
-pub async fn prepare_store<B: BenchBackend>(
-    backend: B,
-    append: &BenchAppend,
-) -> Result<BenchStore<B>, LixError>
+pub async fn prepare_store<B>(backend: B, append: &BenchAppend) -> Result<BenchStore<B>, LixError>
 where
     B: BenchBackend + Sync,
     for<'a> StorageBackendReadOf<'a, B>: Send,
@@ -413,7 +414,7 @@ where
     Ok(store)
 }
 
-pub async fn prepare_corpus_store<B: BenchBackend>(
+pub async fn prepare_corpus_store<B>(
     backend: B,
     corpus: &BenchCorpus,
 ) -> Result<BenchStore<B>, LixError>
@@ -428,7 +429,7 @@ where
     Ok(store)
 }
 
-pub async fn stage_first_commit_noop_in_store<B: BenchBackend>(
+pub async fn stage_first_commit_noop_in_store<B>(
     _store: &BenchStore<B>,
     append: &BenchAppend,
 ) -> Result<BenchWriteStats, LixError>
@@ -443,7 +444,7 @@ where
     })
 }
 
-pub async fn load_commits_direct_by_id<B: BenchBackend, S: AsRef<str> + Sync>(
+pub async fn load_commits_direct_by_id<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     commit_ids: &[S],
 ) -> Result<usize, LixError>
@@ -454,7 +455,7 @@ where
     load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Full).await
 }
 
-pub async fn load_commits_direct<B: BenchBackend, S: AsRef<str> + Sync>(
+pub async fn load_commits_direct<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     commit_ids: &[S],
 ) -> Result<usize, LixError>
@@ -465,7 +466,7 @@ where
     load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Header).await
 }
 
-pub async fn load_commits_direct_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
+pub async fn load_commits_direct_with_lookup<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     commit_ids: &[S],
     projection: BenchCommitProjection,
@@ -477,7 +478,7 @@ where
     load_commits_with_lookup(store, commit_ids, projection).await
 }
 
-pub async fn load_changes_direct_by_id<B: BenchBackend, S: AsRef<str> + Sync>(
+pub async fn load_changes_direct_by_id<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     change_ids: &[S],
 ) -> Result<usize, LixError>
@@ -488,7 +489,7 @@ where
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::DirectKey).await
 }
 
-pub async fn load_changes_direct<B: BenchBackend, S: AsRef<str> + Sync>(
+pub async fn load_changes_direct<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     change_ids: &[S],
 ) -> Result<usize, LixError>
@@ -499,7 +500,7 @@ where
     load_changes_with_lookup(store, change_ids, BenchChangeLookup::Record).await
 }
 
-pub async fn load_changes_direct_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
+pub async fn load_changes_direct_with_lookup<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     change_ids: &[S],
     lookup: BenchChangeLookup,
@@ -511,7 +512,7 @@ where
     load_changes_with_lookup(store, change_ids, lookup).await
 }
 
-pub async fn prepare_rebuild_store<B: BenchBackend>(
+pub async fn prepare_rebuild_store<B>(
     backend: B,
     corpus: &BenchCorpus,
     _mode: BenchRebuildMode,
@@ -523,7 +524,7 @@ where
     prepare_corpus_store(backend, corpus).await
 }
 
-pub async fn rebuild_mandatory_indexes<B: BenchBackend>(
+pub async fn rebuild_mandatory_indexes<B>(
     _store: &BenchStore<B>,
 ) -> Result<BenchRebuildStats, LixError>
 where
@@ -533,7 +534,7 @@ where
     Ok(RebuildIndexStats::default().into())
 }
 
-pub async fn prepare_gc_store<B: BenchBackend>(
+pub async fn prepare_gc_store<B>(
     backend: B,
     live_percent: usize,
     dead_percent: usize,
@@ -558,7 +559,7 @@ where
     Ok((store, root_commit_id))
 }
 
-pub async fn plan_gc<B: BenchBackend>(
+pub async fn plan_gc<B>(
     store: &BenchStore<B>,
     root_commit_id: &str,
 ) -> Result<BenchGcStats, LixError>
@@ -574,7 +575,7 @@ where
     Ok(plan.into())
 }
 
-pub async fn collect_garbage<B: BenchBackend>(
+pub async fn collect_garbage<B>(
     store: &BenchStore<B>,
     root_commit_id: &str,
 ) -> Result<BenchGcStats, LixError>
@@ -602,6 +603,7 @@ pub enum BenchRebuildMode {
     StaleExtraRows,
 }
 
+#[expect(clippy::unnecessary_wraps)]
 fn direct_append_with_shape(
     name: &str,
     commit_count: usize,
@@ -701,7 +703,7 @@ where
     }
 }
 
-async fn stage_append_in_store<B: BenchBackend>(
+async fn stage_append_in_store<B>(
     store: &BenchStore<B>,
     append: &ChangelogAppend,
 ) -> Result<BenchWriteStats, LixError>
@@ -720,7 +722,7 @@ where
     Ok(stats.into())
 }
 
-async fn load_commits_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
+async fn load_commits_with_lookup<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     commit_ids: &[S],
     projection: BenchCommitProjection,
@@ -744,7 +746,7 @@ where
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
-async fn load_changes_with_lookup<B: BenchBackend, S: AsRef<str> + Sync>(
+async fn load_changes_with_lookup<B, S: AsRef<str> + Sync>(
     store: &BenchStore<B>,
     change_ids: &[S],
     _lookup: BenchChangeLookup,
@@ -767,6 +769,7 @@ where
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
 }
 
+#[expect(clippy::cast_possible_truncation)]
 impl From<StorageWriteSetStats> for BenchWriteStats {
     fn from(stats: StorageWriteSetStats) -> Self {
         Self {
