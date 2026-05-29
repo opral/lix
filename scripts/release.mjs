@@ -4,6 +4,12 @@ import { execFileSync } from "node:child_process";
 
 export const CHANGE_TYPES = ["major", "minor", "patch"];
 export const CHANGE_SCOPES = ["engine", "lix-sdk", "js-sdk", "cli"];
+export const JS_SDK_NATIVE_PACKAGES = [
+	"@lix-js/sdk-darwin-arm64",
+	"@lix-js/sdk-linux-arm64",
+	"@lix-js/sdk-linux-x64",
+	"@lix-js/sdk-win32-x64",
+];
 
 export function readText(root, path) {
 	return readFileSync(join(root, path), "utf8");
@@ -133,12 +139,18 @@ export function updatePackageVersion(root, version) {
 	const lockPath = "packages/js-sdk/package-lock.json";
 	const packageJson = readJson(root, packageJsonPath);
 	packageJson.version = version;
+	packageJson.optionalDependencies = Object.fromEntries(
+		JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
+	);
 	writeJson(root, packageJsonPath, packageJson);
 
 	const lock = readJson(root, lockPath);
 	lock.version = version;
 	if (lock.packages?.[""]) {
 		lock.packages[""].version = version;
+		lock.packages[""].optionalDependencies = Object.fromEntries(
+			JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
+		);
 	}
 	writeJson(root, lockPath, lock);
 }
@@ -147,7 +159,10 @@ export function updateChangelog(root, version, date, changes) {
 	const path = "CHANGELOG.md";
 	const existing = existsSync(join(root, path)) ? readText(root, path).trimEnd() : "# Changelog\n";
 	const entry = changelogEntry(version, date, changes).trimEnd();
-	const next = existing.trim() === "# Changelog" ? `# Changelog\n\n${entry}\n` : `${existing}\n\n${entry}\n`;
+	const next =
+		existing.trim() === "# Changelog"
+			? `# Changelog\n\n${entry}\n`
+			: `${existing.replace(/^# Changelog\n*/, `# Changelog\n\n${entry}\n\n`)}\n`;
 	writeText(root, path, next);
 }
 

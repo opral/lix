@@ -2,6 +2,9 @@ self-hosted-runner:
   # Labels of self-hosted runner in array of strings.
   labels:
     - blacksmith-32vcpu-ubuntu-2404
+    - blacksmith-32vcpu-ubuntu-2404-arm
+    - blacksmith-12vcpu-macos-15
+    - blacksmith-16vcpu-windows-2025
 
 # Configuration variables in array of strings defined in your repository or
 # organization. `null` means disabling configuration variables check.

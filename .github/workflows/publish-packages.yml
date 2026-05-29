@@ -10,9 +10,89 @@ permissions:
   id-token: write
 
 jobs:
+  build-js-sdk-native-packages:
+    name: Build @lix-js/sdk native package (${{ matrix.suffix }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: linux-x64
+            runner: blacksmith-32vcpu-ubuntu-2404
+          - suffix: linux-arm64
+            runner: blacksmith-32vcpu-ubuntu-2404-arm
+          - suffix: darwin-arm64
+            runner: blacksmith-12vcpu-macos-15
+          - suffix: win32-x64
+            runner: blacksmith-16vcpu-windows-2025
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-js-sdk-${{ matrix.suffix }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
+
+      - name: Install JS SDK dependencies
+        working-directory: packages/js-sdk
+        run: npm ci
+
+      - name: Build JS SDK native package
+        working-directory: packages/js-sdk
+        run: |
+          npm run build:native
+          npm run prepare:native-package -- --suffix=${{ matrix.suffix }}
+
+      - name: Upload JS SDK native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-sdk-native-${{ matrix.suffix }}
+          path: packages/js-sdk/native-packages/${{ matrix.suffix }}
+          if-no-files-found: error
+
+  publish-js-sdk-native-packages:
+    name: Publish @lix-js/sdk native package (${{ matrix.suffix }})
+    runs-on: ubuntu-latest
+    needs: build-js-sdk-native-packages
+    strategy:
+      fail-fast: false
+      matrix:
+        suffix:
+          - linux-x64
+          - linux-arm64
+          - darwin-arm64
+          - win32-x64
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Download JS SDK native package
+        uses: actions/download-artifact@v4
+        with:
+          name: js-sdk-native-${{ matrix.suffix }}
+          path: native-package
+
+      - name: Publish JS SDK native package
+        working-directory: native-package
+        run: npm publish --provenance --access public
+
   publish-js-sdk:
     name: Publish @lix-js/sdk
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    needs: publish-js-sdk-native-packages
 
     steps:
       - name: Checkout repository
