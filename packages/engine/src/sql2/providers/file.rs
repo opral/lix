@@ -69,7 +69,7 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-use crate::sql2::filesystem_planner::{
+use crate::filesystem::{
     BlobRefRowInput, DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput,
     FileDescriptorWriteIntent, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
     blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row,
@@ -1111,10 +1111,7 @@ impl LixFileStagedBatch {
         self.count += other.count;
     }
 
-    fn extend_filesystem_plan(
-        &mut self,
-        plan: crate::sql2::filesystem_planner::FilesystemWritePlan,
-    ) {
+    fn extend_filesystem_plan(&mut self, plan: crate::filesystem::FilesystemWritePlan) {
         self.state_rows.extend(plan.rows);
         self.file_data_writes.extend(plan.file_data);
         self.count += plan.count;
@@ -1463,7 +1460,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 ));
             };
             let file_id = id.unwrap_or_else(|| generate_directory_id());
-            let mut plan = crate::sql2::filesystem_planner::plan_file_path_write(
+            let mut plan = crate::filesystem::plan_file_path_write(
                 resolver,
                 FilePathWriteInput {
                     id: Some(file_id.clone()),

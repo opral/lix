@@ -57,12 +57,12 @@ use crate::transaction::types::{
 };
 use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
 
-use crate::sql2::filesystem_planner::{
+use crate::filesystem::VisibleFilesystem;
+use crate::filesystem::{
     DirectoryDescriptorWriteIntent, DirectoryPathResolver, FilesystemDeletePlan,
     FilesystemRowContext, directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
     filesystem_storage_scope_key, plan_recursive_directory_delete,
 };
-use crate::sql2::filesystem_visibility::VisibleFilesystem;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
@@ -1880,7 +1880,7 @@ mod tests {
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
-    use crate::sql2::filesystem_visibility::VisibleFilesystem;
+    use crate::filesystem::VisibleFilesystem;
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();

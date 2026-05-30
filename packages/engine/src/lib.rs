@@ -26,6 +26,7 @@ mod common;
 pub(crate) mod domain;
 pub mod engine;
 pub(crate) mod entity_pk;
+pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod init;
 #[allow(dead_code)]
