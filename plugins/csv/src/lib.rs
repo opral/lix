@@ -26,7 +26,7 @@ use std::{cmp, iter};
 pub mod schemas;
 
 pub const ROOT_ENTITY_PK: &str = "root";
-pub const DOCUMENT_SCHEMA_KEY: &str = schemas::DOCUMENT_SCHEMA_KEY;
+pub const TABLE_SCHEMA_KEY: &str = schemas::TABLE_SCHEMA_KEY;
 pub const ROW_SCHEMA_KEY: &str = schemas::ROW_SCHEMA_KEY;
 
 const MANIFEST_JSON: &str = include_str!("../manifest.json");
@@ -42,7 +42,7 @@ struct CsvPlugin;
 struct Projection {
     rows_by_id: BTreeMap<String, RowSnapshot>,
     dialect: CsvDialect,
-    document_present: bool,
+    table_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +74,7 @@ impl Default for CsvDialect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DocumentSnapshot {
+struct TableSnapshot {
     dialect: CsvDialect,
 }
 
@@ -218,10 +218,10 @@ fn detect_changes_from_projection(
     }
 
     if before.dialect != after_dialect
-        || (!before.document_present
+        || (!before.table_present
             && (!file_rows.is_empty() || after_dialect != CsvDialect::default()))
     {
-        changes.push(document_upsert_change(after_dialect)?);
+        changes.push(table_upsert_change(after_dialect)?);
     }
 
     Ok(changes)
@@ -261,33 +261,33 @@ fn projection_from_entity_changes(
     changes: Vec<EntityChange>,
 ) -> Result<Projection, PluginError> {
     let mut projection = projection_from_file_with_index_ids(&file)?;
-    let mut document_snapshot = None::<DocumentSnapshot>;
-    let mut document_seen = false;
+    let mut table_snapshot = None::<TableSnapshot>;
+    let mut table_seen = false;
     let mut seen_row_change_ids = BTreeSet::<String>::new();
 
     for change in changes {
         match change.schema_key.as_str() {
-            DOCUMENT_SCHEMA_KEY => {
+            TABLE_SCHEMA_KEY => {
                 if change.entity_pk != ROOT_ENTITY_PK {
                     return Err(PluginError::InvalidInput(format!(
                         "unsupported entity_pk '{}' for schema_key '{}', expected '{}'",
-                        change.entity_pk, DOCUMENT_SCHEMA_KEY, ROOT_ENTITY_PK
+                        change.entity_pk, TABLE_SCHEMA_KEY, ROOT_ENTITY_PK
                     )));
                 }
-                if document_seen {
+                if table_seen {
                     return Err(PluginError::InvalidInput(format!(
-                        "duplicate entity_pk '{ROOT_ENTITY_PK}' for schema_key '{DOCUMENT_SCHEMA_KEY}'"
+                        "duplicate entity_pk '{ROOT_ENTITY_PK}' for schema_key '{TABLE_SCHEMA_KEY}'"
                     )));
                 }
-                document_seen = true;
+                table_seen = true;
                 let snapshot_present = change.snapshot_content.is_some();
-                document_snapshot = Some(match change.snapshot_content {
-                    Some(raw) => parse_document_snapshot(&raw)?,
-                    None => DocumentSnapshot {
+                table_snapshot = Some(match change.snapshot_content {
+                    Some(raw) => parse_table_snapshot(&raw)?,
+                    None => TableSnapshot {
                         dialect: CsvDialect::default(),
                     },
                 });
-                projection.document_present = snapshot_present;
+                projection.table_present = snapshot_present;
             }
             ROW_SCHEMA_KEY => {
                 if !seen_row_change_ids.insert(change.entity_pk.clone()) {
@@ -311,8 +311,8 @@ fn projection_from_entity_changes(
         }
     }
 
-    if let Some(document) = document_snapshot {
-        projection.dialect = document.dialect;
+    if let Some(table) = table_snapshot {
+        projection.dialect = table.dialect;
     }
 
     Ok(projection)
@@ -338,7 +338,7 @@ fn projection_from_file_with_index_ids(file: &File) -> Result<Projection, Plugin
     Ok(Projection {
         rows_by_id,
         dialect,
-        document_present: false,
+        table_present: false,
     })
 }
 
@@ -363,7 +363,7 @@ impl Projection {
             .into_iter()
             .map(|(id, row)| row_upsert_change(&id, row.order_key, &row.cells))
             .collect::<Result<Vec<_>, _>>()?;
-        changes.push(document_upsert_change(self.dialect)?);
+        changes.push(table_upsert_change(self.dialect)?);
         Ok(changes)
     }
 }
@@ -387,16 +387,16 @@ fn row_upsert_change(
     })
 }
 
-fn document_upsert_change(dialect: CsvDialect) -> Result<EntityChange, PluginError> {
+fn table_upsert_change(dialect: CsvDialect) -> Result<EntityChange, PluginError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": ROOT_ENTITY_PK,
         "dialect": dialect_snapshot_content(dialect),
     }))
-    .map_err(|error| PluginError::Internal(format!("failed to serialize CSV document: {error}")))?;
+    .map_err(|error| PluginError::Internal(format!("failed to serialize CSV table: {error}")))?;
 
     Ok(EntityChange {
         entity_pk: ROOT_ENTITY_PK.to_string(),
-        schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
+        schema_key: TABLE_SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
     })
 }
@@ -411,40 +411,36 @@ fn dialect_snapshot_content(dialect: CsvDialect) -> Value {
     })
 }
 
-fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshot, PluginError> {
+fn parse_table_snapshot(raw: &str) -> Result<TableSnapshot, PluginError> {
     let value: Value = serde_json::from_str(raw).map_err(|error| {
-        PluginError::InvalidInput(format!("invalid csv document snapshot_content: {error}"))
+        PluginError::InvalidInput(format!("invalid csv table snapshot_content: {error}"))
     })?;
     let object = value.as_object().ok_or_else(|| {
-        PluginError::InvalidInput("csv document snapshot_content must be an object".to_string())
+        PluginError::InvalidInput("csv table snapshot_content must be an object".to_string())
     })?;
-    reject_unknown_fields(object.keys(), &["id", "dialect"], "csv document")?;
+    reject_unknown_fields(object.keys(), &["id", "dialect"], "csv table")?;
 
     let id = object.get("id").and_then(Value::as_str).ok_or_else(|| {
-        PluginError::InvalidInput("csv document snapshot must contain string 'id'".to_string())
+        PluginError::InvalidInput("csv table snapshot must contain string 'id'".to_string())
     })?;
     if id != ROOT_ENTITY_PK {
         return Err(PluginError::InvalidInput(format!(
-            "csv document snapshot id '{id}' does not match expected '{ROOT_ENTITY_PK}'"
+            "csv table snapshot id '{id}' does not match expected '{ROOT_ENTITY_PK}'"
         )));
     }
 
     let dialect = parse_dialect_snapshot(object.get("dialect").ok_or_else(|| {
-        PluginError::InvalidInput("csv document snapshot must contain object 'dialect'".to_string())
+        PluginError::InvalidInput("csv table snapshot must contain object 'dialect'".to_string())
     })?)?;
 
-    Ok(DocumentSnapshot { dialect })
+    Ok(TableSnapshot { dialect })
 }
 
 fn parse_dialect_snapshot(value: &Value) -> Result<CsvDialect, PluginError> {
     let object = value.as_object().ok_or_else(|| {
-        PluginError::InvalidInput("csv document dialect must be an object".to_string())
+        PluginError::InvalidInput("csv table dialect must be an object".to_string())
     })?;
-    reject_unknown_fields(
-        object.keys(),
-        &["delimiter", "quote"],
-        "csv document dialect",
-    )?;
+    reject_unknown_fields(object.keys(), &["delimiter", "quote"], "csv table dialect")?;
 
     let delimiter = parse_dialect_byte_string(object.get("delimiter"), "delimiter")?;
     let quote = match object.get("quote") {
@@ -452,7 +448,7 @@ fn parse_dialect_snapshot(value: &Value) -> Result<CsvDialect, PluginError> {
         Some(value) => Quote::Some(parse_dialect_byte_string(Some(value), "quote")?),
         None => {
             return Err(PluginError::InvalidInput(
-                "csv document dialect must contain 'quote'".to_string(),
+                "csv table dialect must contain 'quote'".to_string(),
             ));
         }
     };
@@ -467,23 +463,23 @@ fn byte_to_latin1_string(byte: u8) -> String {
 fn parse_dialect_byte_string(value: Option<&Value>, field: &str) -> Result<u8, PluginError> {
     let raw = value.and_then(Value::as_str).ok_or_else(|| {
         PluginError::InvalidInput(format!(
-            "csv document dialect field '{field}' must be a single-byte string"
+            "csv table dialect field '{field}' must be a single-byte string"
         ))
     })?;
     let mut chars = raw.chars();
     let Some(ch) = chars.next() else {
         return Err(PluginError::InvalidInput(format!(
-            "csv document dialect field '{field}' must not be empty"
+            "csv table dialect field '{field}' must not be empty"
         )));
     };
     if chars.next().is_some() {
         return Err(PluginError::InvalidInput(format!(
-            "csv document dialect field '{field}' must contain exactly one character"
+            "csv table dialect field '{field}' must contain exactly one character"
         )));
     }
     u8::try_from(u32::from(ch)).map_err(|_| {
         PluginError::InvalidInput(format!(
-            "csv document dialect field '{field}' must be in the range U+0000 through U+00FF"
+            "csv table dialect field '{field}' must be in the range U+0000 through U+00FF"
         ))
     })
 }

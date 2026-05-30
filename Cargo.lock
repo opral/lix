@@ -3113,7 +3113,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin_csv_v2"
+name = "plugin_csv"
 version = "0.6.1"
 dependencies = [
  "bytecount",

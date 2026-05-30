@@ -1,15 +1,15 @@
 {
-  "x-lix-key": "csv_v2_document",
+  "x-lix-key": "csv_table",
   "x-lix-primary-key": [
     "/id"
   ],
-  "description": "Projection root for a CSV/TSV file. Document-level CSV dialect metadata is stored here; row content and order are stored in csv_v2_row snapshots.",
+  "description": "Projection root for a CSV/TSV file. Table-level CSV dialect metadata is stored here; row content and order are stored in csv_row snapshots.",
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
       "const": "root",
-      "description": "Stable root document id."
+      "description": "Stable root table id."
     },
     "dialect": {
       "type": "object",

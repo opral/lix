@@ -1,5 +1,5 @@
 [package]
-name = "plugin_csv_v2"
+name = "plugin_csv"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

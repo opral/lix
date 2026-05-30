@@ -1,8 +1,7 @@
-use plugin_csv_v2::manifest_json;
-use plugin_csv_v2::schemas::{
-    DOCUMENT_SCHEMA_KEY, DOCUMENT_SCHEMA_PATH, ROW_SCHEMA_KEY, ROW_SCHEMA_PATH,
-    document_schema_definition, document_schema_json, row_schema_definition, row_schema_json,
-    schema_definitions, schema_jsons,
+use plugin_csv::manifest_json;
+use plugin_csv::schemas::{
+    ROW_SCHEMA_KEY, ROW_SCHEMA_PATH, TABLE_SCHEMA_KEY, TABLE_SCHEMA_PATH, row_schema_definition,
+    row_schema_json, schema_definitions, schema_jsons, table_schema_definition, table_schema_json,
 };
 use std::collections::BTreeSet;
 
@@ -12,7 +11,7 @@ fn schema_definitions_have_expected_keys() {
 
     assert_eq!(schemas.len(), 2);
 
-    let expected_keys = BTreeSet::from([DOCUMENT_SCHEMA_KEY, ROW_SCHEMA_KEY]);
+    let expected_keys = BTreeSet::from([TABLE_SCHEMA_KEY, ROW_SCHEMA_KEY]);
 
     let mut actual_keys = BTreeSet::new();
     for schema in schemas {
@@ -36,13 +35,13 @@ fn schema_definitions_have_expected_keys() {
 #[test]
 fn schema_json_accessors_return_expected_text() {
     let raw = schema_jsons().join("\n");
-    assert!(raw.contains("\"x-lix-key\": \"csv_v2_document\""));
-    assert!(raw.contains("\"x-lix-key\": \"csv_v2_row\""));
+    assert!(raw.contains("\"x-lix-key\": \"csv_table\""));
+    assert!(raw.contains("\"x-lix-key\": \"csv_row\""));
     assert_eq!(
-        document_schema_definition()
+        table_schema_definition()
             .get("x-lix-key")
             .and_then(serde_json::Value::as_str),
-        Some(DOCUMENT_SCHEMA_KEY)
+        Some(TABLE_SCHEMA_KEY)
     );
     assert_eq!(
         row_schema_definition()
@@ -50,7 +49,7 @@ fn schema_json_accessors_return_expected_text() {
             .and_then(serde_json::Value::as_str),
         Some(ROW_SCHEMA_KEY)
     );
-    assert!(document_schema_json().contains("\"dialect\""));
+    assert!(table_schema_json().contains("\"dialect\""));
     assert!(row_schema_json().contains("\"order_key\""));
     assert!(row_schema_json().contains("\"cells\""));
 }
@@ -64,7 +63,7 @@ fn manifest_json_has_expected_plugin_identity() {
             .get("key")
             .and_then(serde_json::Value::as_str)
             .expect("manifest.key must be string"),
-        "plugin_csv_v2"
+        "plugin_csv"
     );
     assert_eq!(
         manifest
@@ -88,5 +87,5 @@ fn manifest_json_has_expected_plugin_identity() {
         .iter()
         .map(|value| value.as_str().expect("schema paths must be strings"))
         .collect::<Vec<_>>();
-    assert_eq!(schemas, [DOCUMENT_SCHEMA_PATH, ROW_SCHEMA_PATH]);
+    assert_eq!(schemas, [TABLE_SCHEMA_PATH, ROW_SCHEMA_PATH]);
 }

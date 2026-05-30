@@ -1,5 +1,5 @@
 {
-  "key": "plugin_csv_v2",
+  "key": "plugin_csv",
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
   "match": {
@@ -8,7 +8,7 @@
   },
   "entry": "plugin.wasm",
   "schemas": [
-    "schema/csv_document.json",
+    "schema/csv_table.json",
     "schema/csv_row.json"
   ]
 }

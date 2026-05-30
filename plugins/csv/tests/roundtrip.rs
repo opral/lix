@@ -1,7 +1,6 @@
-use plugin_csv_v2::{
-    DOCUMENT_SCHEMA_KEY, PluginActiveStateRow, PluginApiError, PluginDetectStateContext,
-    PluginEntityChange, PluginFile, ROOT_ENTITY_PK, ROW_SCHEMA_KEY, apply_changes, detect_changes,
-    render,
+use plugin_csv::{
+    PluginActiveStateRow, PluginApiError, PluginDetectStateContext, PluginEntityChange, PluginFile,
+    ROOT_ENTITY_PK, ROW_SCHEMA_KEY, TABLE_SCHEMA_KEY, apply_changes, detect_changes, render,
 };
 use serde_json::Value;
 
@@ -59,14 +58,14 @@ fn detects_initial_projection_and_renders_csv() {
             .count(),
         2
     );
-    let document = changes
+    let table = changes
         .iter()
-        .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
-        .expect("document snapshot should exist");
-    assert_eq!(document.entity_pk, ROOT_ENTITY_PK);
-    assert!(snapshot_value(document).get("row_ids").is_none());
+        .find(|change| change.schema_key == TABLE_SCHEMA_KEY)
+        .expect("table snapshot should exist");
+    assert_eq!(table.entity_pk, ROOT_ENTITY_PK);
+    assert!(snapshot_value(table).get("row_ids").is_none());
     assert_eq!(
-        snapshot_value(document)
+        snapshot_value(table)
             .get("dialect")
             .and_then(|value| value.get("delimiter"))
             .and_then(Value::as_str),
@@ -163,7 +162,7 @@ fn render_rebuilds_from_unordered_active_state() {
 }
 
 #[test]
-fn render_uses_quote_byte_from_document_dialect() {
+fn render_uses_quote_byte_from_table_dialect() {
     let changes = vec![
         PluginEntityChange {
             entity_pk: "row:0".to_string(),
@@ -175,7 +174,7 @@ fn render_uses_quote_byte_from_document_dialect() {
         },
         PluginEntityChange {
             entity_pk: ROOT_ENTITY_PK.to_string(),
-            schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
+            schema_key: TABLE_SCHEMA_KEY.to_string(),
             snapshot_content: Some(
                 r#"{"id":"root","dialect":{"delimiter":";","quote":"'"}}"#.to_string(),
             ),

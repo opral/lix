@@ -1,5 +1,5 @@
 {
-  "x-lix-key": "csv_v2_row",
+  "x-lix-key": "csv_row",
   "x-lix-primary-key": [
     "/id"
   ],
