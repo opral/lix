@@ -24,6 +24,7 @@ lix_cli = { path = "packages/cli", version = "0.6.0" }
 lix_engine = { path = "packages/engine", version = "0.6.1" }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.6.0" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.6.1" }
+plugin_csv = { path = "plugins/csv", version = "0.6.0" }
 plugin_json_v2 = { path = "plugins/json", version = "0.6.0" }
 plugin_md_v2 = { path = "plugins/markdown", version = "0.6.0" }
 text_plugin = { path = "plugins/text", version = "0.6.0" }
