@@ -1,0 +1,25 @@
+{
+  "x-lix-key": "csv_v2_row",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cells": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "CSV cell values for this row, in column order."
+    }
+  },
+  "required": [
+    "id",
+    "cells"
+  ],
+  "additionalProperties": false
+}

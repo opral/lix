@@ -1,0 +1,27 @@
+{
+  "x-lix-key": "csv_v2_document",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "const": "root"
+    },
+    "row_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true,
+      "description": "Ordered row entity pks for the projected CSV document."
+    }
+  },
+  "required": [
+    "id",
+    "row_ids"
+  ],
+  "additionalProperties": false
+}
