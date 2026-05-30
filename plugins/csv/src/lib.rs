@@ -7,36 +7,38 @@ mod bindings {
 }
 pub use bindings::*;
 
+mod csv;
+mod order_key;
+pub mod schemas;
+
+use crate::csv::{
+    CsvDialect, TableSnapshot, parse_file, parse_table_snapshot, render_projection,
+    table_upsert_change,
+};
 use crate::exports::lix::plugin::api::{
     ActiveStateRow, DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
 };
-use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
-use csv::{ByteRecord, QuoteStyle, ReaderBuilder, Terminator, WriterBuilder};
-use csv_nose::{Quote, Sniffer};
-use encoding_rs::{CoderResult, Encoding};
+use crate::order_key::FractionalIndex;
 use itertools::Itertools;
 use rand::Rng;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::str;
 use std::{cmp, iter};
-
-pub mod schemas;
 
 pub const ROOT_ENTITY_PK: &str = "root";
 pub const TABLE_SCHEMA_KEY: &str = schemas::TABLE_SCHEMA_KEY;
 pub const ROW_SCHEMA_KEY: &str = schemas::ROW_SCHEMA_KEY;
 
-const MANIFEST_JSON: &str = include_str!("../manifest.json");
+pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
 
 pub use crate::exports::lix::plugin::api::{
     ActiveStateRow as PluginActiveStateRow, DetectStateContext as PluginDetectStateContext,
     EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
 };
 
-struct CsvPlugin;
+#[derive(Clone, Copy, Debug)]
+pub struct CsvPlugin;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Projection {
@@ -59,26 +61,6 @@ struct RowSnapshot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct CsvDialect {
-    delimiter: u8,
-    quote: Quote,
-}
-
-impl Default for CsvDialect {
-    fn default() -> Self {
-        Self {
-            delimiter: b',',
-            quote: Quote::Some(b'"'),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TableSnapshot {
-    dialect: CsvDialect,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
     Equal,
     Replace,
@@ -91,80 +73,20 @@ impl Plugin for CsvPlugin {
         state: DetectStateContext,
         file: File,
     ) -> Result<Vec<EntityChange>, PluginError> {
-        let before = projection_from_active_state(state.active_state)?;
+        let before = projection_from_entity_changes(
+            empty_file(),
+            entity_changes_from_active_state(state.active_state),
+        )?;
         detect_changes_from_projection(&before, &file)
     }
 
     fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-        render_state_context(state)
+        let projection = projection_from_entity_changes(
+            empty_file(),
+            entity_changes_from_active_state(state.active_state),
+        )?;
+        render_projection(&projection)
     }
-}
-
-pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    let state_context = project_state_context_from_before(before)?;
-    <CsvPlugin as Plugin>::detect_changes(state_context, after)
-}
-
-pub fn detect_changes_with_state_context(
-    before: Option<File>,
-    after: File,
-    state_context: Option<PluginDetectStateContext>,
-) -> Result<Vec<EntityChange>, PluginError> {
-    let state_context = match state_context {
-        Some(state_context) => state_context,
-        None => project_state_context_from_before(before)?,
-    };
-    <CsvPlugin as Plugin>::detect_changes(state_context, after)
-}
-
-pub fn render(state_context: PluginDetectStateContext) -> Result<Vec<u8>, PluginError> {
-    <CsvPlugin as Plugin>::render(state_context)
-}
-
-pub fn render_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-    render_entity_changes(file, changes)
-}
-
-pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-    render_changes(file, changes)
-}
-
-pub fn manifest_json() -> &'static str {
-    MANIFEST_JSON
-}
-
-fn empty_state_context() -> PluginDetectStateContext {
-    PluginDetectStateContext {
-        active_state: Vec::new(),
-    }
-}
-
-fn project_state_context_from_before(
-    before: Option<File>,
-) -> Result<PluginDetectStateContext, PluginError> {
-    let Some(before_file) = before else {
-        return Ok(empty_state_context());
-    };
-
-    let projection = projection_from_file_with_index_ids(&before_file)?;
-    Ok(PluginDetectStateContext {
-        active_state: projection
-            .into_entity_changes()?
-            .into_iter()
-            .map(|row| PluginActiveStateRow {
-                entity_pk: row.entity_pk,
-                schema_key: Some(row.schema_key),
-                snapshot_content: row.snapshot_content,
-                file_id: None,
-                plugin_key: None,
-                branch_id: None,
-                change_id: None,
-                metadata: None,
-                created_at: None,
-                updated_at: None,
-            })
-            .collect(),
-    })
 }
 
 fn detect_changes_from_projection(
@@ -208,7 +130,7 @@ fn detect_changes_from_projection(
             }
             Op::Insert => {
                 let next_order_key = base.get(base_index).map(|row| row.order_key);
-                let order_key = fractional_index_between(previous_order_key, next_order_key)?;
+                let order_key = FractionalIndex::between(previous_order_key, next_order_key)?;
                 let id = RowId::random(&mut rng).to_entity_pk();
                 changes.push(row_upsert_change(&id, order_key, &file_rows[file_index])?);
                 previous_order_key = Some(order_key);
@@ -225,23 +147,6 @@ fn detect_changes_from_projection(
     }
 
     Ok(changes)
-}
-
-fn render_state_context(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-    render_active_state_rows(state.active_state)
-}
-
-fn render_active_state_rows(rows: Vec<ActiveStateRow>) -> Result<Vec<u8>, PluginError> {
-    render_entity_changes(empty_file(), entity_changes_from_active_state(rows))
-}
-
-fn render_entity_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-    let projection = projection_from_entity_changes(file, changes)?;
-    render_projection(&projection)
-}
-
-fn projection_from_active_state(rows: Vec<ActiveStateRow>) -> Result<Projection, PluginError> {
-    projection_from_entity_changes(empty_file(), entity_changes_from_active_state(rows))
 }
 
 fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
@@ -328,7 +233,7 @@ fn projection_from_file_with_index_ids(file: &File) -> Result<Projection, Plugin
             (
                 format!("row:{offset}"),
                 RowSnapshot {
-                    order_key: evenly_spaced_fractional_index(offset, len),
+                    order_key: FractionalIndex::evenly_spaced(offset, len),
                     cells,
                 },
             )
@@ -356,16 +261,6 @@ impl Projection {
         rows.sort_by(|a, b| a.order_key.cmp(&b.order_key).then_with(|| a.id.cmp(&b.id)));
         rows
     }
-
-    fn into_entity_changes(self) -> Result<Vec<EntityChange>, PluginError> {
-        let mut changes = self
-            .rows_by_id
-            .into_iter()
-            .map(|(id, row)| row_upsert_change(&id, row.order_key, &row.cells))
-            .collect::<Result<Vec<_>, _>>()?;
-        changes.push(table_upsert_change(self.dialect)?);
-        Ok(changes)
-    }
 }
 
 fn row_upsert_change(
@@ -384,103 +279,6 @@ fn row_upsert_change(
         entity_pk: id.to_string(),
         schema_key: ROW_SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
-    })
-}
-
-fn table_upsert_change(dialect: CsvDialect) -> Result<EntityChange, PluginError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": ROOT_ENTITY_PK,
-        "dialect": dialect_snapshot_content(dialect),
-    }))
-    .map_err(|error| PluginError::Internal(format!("failed to serialize CSV table: {error}")))?;
-
-    Ok(EntityChange {
-        entity_pk: ROOT_ENTITY_PK.to_string(),
-        schema_key: TABLE_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(snapshot_content),
-    })
-}
-
-fn dialect_snapshot_content(dialect: CsvDialect) -> Value {
-    serde_json::json!({
-        "delimiter": byte_to_latin1_string(dialect.delimiter),
-        "quote": match dialect.quote {
-            Quote::None => Value::Null,
-            Quote::Some(quote) => Value::from(byte_to_latin1_string(quote)),
-        },
-    })
-}
-
-fn parse_table_snapshot(raw: &str) -> Result<TableSnapshot, PluginError> {
-    let value: Value = serde_json::from_str(raw).map_err(|error| {
-        PluginError::InvalidInput(format!("invalid csv table snapshot_content: {error}"))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        PluginError::InvalidInput("csv table snapshot_content must be an object".to_string())
-    })?;
-    reject_unknown_fields(object.keys(), &["id", "dialect"], "csv table")?;
-
-    let id = object.get("id").and_then(Value::as_str).ok_or_else(|| {
-        PluginError::InvalidInput("csv table snapshot must contain string 'id'".to_string())
-    })?;
-    if id != ROOT_ENTITY_PK {
-        return Err(PluginError::InvalidInput(format!(
-            "csv table snapshot id '{id}' does not match expected '{ROOT_ENTITY_PK}'"
-        )));
-    }
-
-    let dialect = parse_dialect_snapshot(object.get("dialect").ok_or_else(|| {
-        PluginError::InvalidInput("csv table snapshot must contain object 'dialect'".to_string())
-    })?)?;
-
-    Ok(TableSnapshot { dialect })
-}
-
-fn parse_dialect_snapshot(value: &Value) -> Result<CsvDialect, PluginError> {
-    let object = value.as_object().ok_or_else(|| {
-        PluginError::InvalidInput("csv table dialect must be an object".to_string())
-    })?;
-    reject_unknown_fields(object.keys(), &["delimiter", "quote"], "csv table dialect")?;
-
-    let delimiter = parse_dialect_byte_string(object.get("delimiter"), "delimiter")?;
-    let quote = match object.get("quote") {
-        Some(Value::Null) => Quote::None,
-        Some(value) => Quote::Some(parse_dialect_byte_string(Some(value), "quote")?),
-        None => {
-            return Err(PluginError::InvalidInput(
-                "csv table dialect must contain 'quote'".to_string(),
-            ));
-        }
-    };
-
-    Ok(CsvDialect { delimiter, quote })
-}
-
-fn byte_to_latin1_string(byte: u8) -> String {
-    char::from(byte).to_string()
-}
-
-fn parse_dialect_byte_string(value: Option<&Value>, field: &str) -> Result<u8, PluginError> {
-    let raw = value.and_then(Value::as_str).ok_or_else(|| {
-        PluginError::InvalidInput(format!(
-            "csv table dialect field '{field}' must be a single-byte string"
-        ))
-    })?;
-    let mut chars = raw.chars();
-    let Some(ch) = chars.next() else {
-        return Err(PluginError::InvalidInput(format!(
-            "csv table dialect field '{field}' must not be empty"
-        )));
-    };
-    if chars.next().is_some() {
-        return Err(PluginError::InvalidInput(format!(
-            "csv table dialect field '{field}' must contain exactly one character"
-        )));
-    }
-    u8::try_from(u32::from(ch)).map_err(|_| {
-        PluginError::InvalidInput(format!(
-            "csv table dialect field '{field}' must be in the range U+0000 through U+00FF"
-        ))
     })
 }
 
@@ -552,157 +350,6 @@ fn reject_unknown_fields<'a>(
     Ok(())
 }
 
-fn parse_file(file: &File) -> Result<(Vec<Vec<String>>, CsvDialect), PluginError> {
-    let decoded = decode(&file.data)?;
-    let dialect = dialect_for_filename(Some(file.path.as_str()), &decoded);
-    let rows = parse_rows(&decoded, dialect)?;
-    Ok((rows, dialect))
-}
-
-fn decode(csv: &[u8]) -> Result<Cow<'_, str>, PluginError> {
-    let (buf, encoding) = buffer_with_encoding(csv);
-    if encoding == encoding_rs::UTF_8 {
-        return Ok(String::from_utf8_lossy(buf));
-    }
-    let mut decoder = encoding.new_decoder_without_bom_handling();
-    let capacity = decoder.max_utf8_buffer_length(buf.len()).ok_or_else(|| {
-        PluginError::Internal("CSV input is too large to decode as UTF-8".to_string())
-    })?;
-    let mut decoded = String::with_capacity(capacity);
-    let (result, read, _replaced) = decoder.decode_to_string(buf, &mut decoded, true);
-    if result != CoderResult::InputEmpty || read != buf.len() {
-        return Err(PluginError::InvalidInput(
-            "failed to decode complete CSV input".to_string(),
-        ));
-    }
-    Ok(Cow::Owned(decoded))
-}
-
-fn parse_rows(csv: &str, dialect: CsvDialect) -> Result<Vec<Vec<String>>, PluginError> {
-    let mut reader_builder = ReaderBuilder::new();
-    reader_builder
-        .flexible(true)
-        .has_headers(false)
-        .delimiter(dialect.delimiter);
-    match dialect.quote {
-        Quote::None => {
-            reader_builder.quoting(false);
-        }
-        Quote::Some(quote) => {
-            reader_builder.quoting(true).quote(quote);
-        }
-    }
-    let mut reader = reader_builder.from_reader(csv.as_bytes());
-
-    let mut rows = Vec::new();
-    let mut record = ByteRecord::new();
-    while reader.read_byte_record(&mut record).map_err(|error| {
-        PluginError::InvalidInput(format!("failed to parse CSV input as records: {error}"))
-    })? {
-        let mut row = Vec::with_capacity(record.len());
-        for field in &record {
-            let field = str::from_utf8(field).map_err(|error| {
-                PluginError::InvalidInput(format!("CSV field is not valid UTF-8: {error}"))
-            })?;
-            row.push(field.to_string());
-        }
-        rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn buffer_with_encoding(buf: &[u8]) -> (&[u8], &'static Encoding) {
-    if let Some((encoding, skip)) = Encoding::for_bom(buf) {
-        (&buf[skip..], encoding)
-    } else {
-        let mut detector = EncodingDetector::new(Iso2022JpDetection::Allow);
-        detector.feed(buf, true);
-        (buf, detector.guess(None, Utf8Detection::Allow))
-    }
-}
-
-fn dialect_for_filename(filename: Option<&str>, decoded: &str) -> CsvDialect {
-    let sniffer = Sniffer::new();
-    if let Ok(metadata) = sniffer.sniff_bytes(decoded.as_bytes()) {
-        return CsvDialect {
-            delimiter: metadata.dialect.delimiter,
-            quote: metadata.dialect.quote,
-        };
-    }
-
-    CsvDialect {
-        delimiter: fallback_delimiter(filename, decoded),
-        quote: Quote::Some(b'"'),
-    }
-}
-
-fn fallback_delimiter(filename: Option<&str>, decoded: &str) -> u8 {
-    match filename.and_then(|f| Path::new(f).extension().and_then(|ext| ext.to_str())) {
-        Some(extension) if extension.eq_ignore_ascii_case("tsv") => b'\t',
-        Some(extension) if extension.eq_ignore_ascii_case("csv") => b',',
-        _ => {
-            let buf = decoded.as_bytes();
-            let sample = &buf[..buf.len().min(8 * 1024)];
-            let comma_count = bytecount::count(sample, b',');
-            let tab_count = bytecount::count(sample, b'\t');
-            if tab_count > comma_count { b'\t' } else { b',' }
-        }
-    }
-}
-
-fn render_projection(projection: &Projection) -> Result<Vec<u8>, PluginError> {
-    let mut writer_builder = WriterBuilder::new();
-    writer_builder
-        .has_headers(false)
-        .delimiter(projection.dialect.delimiter)
-        .terminator(Terminator::Any(b'\n'));
-    match projection.dialect.quote {
-        Quote::None => {
-            writer_builder.quote_style(QuoteStyle::Never);
-        }
-        Quote::Some(quote) => {
-            writer_builder.quote(quote);
-        }
-    }
-    let mut writer = writer_builder.from_writer(Vec::new());
-
-    for row in projection.to_rows() {
-        writer.write_record(&row.cells).map_err(|error| {
-            PluginError::Internal(format!("failed to render CSV row '{}': {error}", row.id))
-        })?;
-    }
-
-    writer.into_inner().map_err(|error| {
-        PluginError::Internal(format!("failed to finish rendering CSV: {}", error.error()))
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct FractionalIndex(u128);
-
-impl FractionalIndex {
-    fn to_snapshot_string(self) -> String {
-        format!("{:032x}", self.0)
-    }
-
-    fn from_snapshot_string(raw: &str) -> Result<Self, String> {
-        if raw.len() != 32 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err("must be a 32-character hexadecimal string".to_string());
-        }
-        if raw.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            return Err("must use lowercase hexadecimal digits".to_string());
-        }
-
-        let value = u128::from_str_radix(raw, 16)
-            .map_err(|error| format!("must parse as a u128 hexadecimal value: {error}"))?;
-        if value == 0 || value == u128::MAX {
-            return Err("must be between the reserved lower and upper sentinels".to_string());
-        }
-
-        Ok(Self(value))
-    }
-}
-
 fn parse_order_key_snapshot(
     value: Option<&Value>,
     entity_pk: &str,
@@ -718,38 +365,6 @@ fn parse_order_key_snapshot(
             "invalid csv row order_key for entity_pk '{entity_pk}': {message}"
         ))
     })
-}
-
-fn evenly_spaced_fractional_index(offset: usize, len: usize) -> FractionalIndex {
-    let step = u128::MAX / (len as u128 + 1);
-    FractionalIndex(step * (offset as u128 + 1))
-}
-
-fn fractional_index_between(
-    previous: Option<FractionalIndex>,
-    next: Option<FractionalIndex>,
-) -> Result<FractionalIndex, PluginError> {
-    let lower = previous.map_or(0, |index| index.0);
-    let upper = next.map_or(u128::MAX, |index| index.0);
-    if lower > upper {
-        return Err(PluginError::InvalidInput(format!(
-            "fractional index bounds are out of order: previous={previous:?}, next={next:?}"
-        )));
-    }
-    if lower == upper {
-        return Err(PluginError::InvalidInput(format!(
-            "cannot generate fractional index between identical indexes: {previous:?}"
-        )));
-    }
-
-    let gap = upper - lower;
-    if gap <= 1 {
-        return Err(PluginError::InvalidInput(format!(
-            "fractional index space exhausted between previous={previous:?} and next={next:?}"
-        )));
-    }
-
-    Ok(FractionalIndex(lower + gap / 2))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -1,4 +1,4 @@
-use plugin_csv::manifest_json;
+use plugin_csv::MANIFEST_JSON;
 use plugin_csv::schemas::{
     ROW_SCHEMA_KEY, ROW_SCHEMA_PATH, TABLE_SCHEMA_KEY, TABLE_SCHEMA_PATH, row_schema_definition,
     row_schema_json, schema_definitions, schema_jsons, table_schema_definition, table_schema_json,
@@ -57,7 +57,7 @@ fn schema_json_accessors_return_expected_text() {
 #[test]
 fn manifest_json_has_expected_plugin_identity() {
     let manifest: serde_json::Value =
-        serde_json::from_str(manifest_json()).expect("manifest must be valid JSON");
+        serde_json::from_str(MANIFEST_JSON).expect("manifest must be valid JSON");
     assert_eq!(
         manifest
             .get("key")
