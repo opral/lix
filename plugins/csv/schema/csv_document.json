@@ -3,25 +3,50 @@
   "x-lix-primary-key": [
     "/id"
   ],
+  "description": "Projection root for a CSV/TSV file. Document-level CSV dialect metadata is stored here; row content and order are stored in csv_v2_row snapshots.",
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
-      "const": "root"
+      "const": "root",
+      "description": "Stable root document id."
     },
-    "row_ids": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
+    "dialect": {
+      "type": "object",
+      "description": "CSV dialect metadata used to render the file.",
+      "properties": {
+        "delimiter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1,
+          "pattern": "^[\\u0000-\\u00FF]$",
+          "description": "Field delimiter byte encoded as a single Latin-1 character, for example comma or tab."
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1,
+              "pattern": "^[\\u0000-\\u00FF]$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Quote byte encoded as a single Latin-1 character, or null when quoting is disabled."
+        }
       },
-      "uniqueItems": true,
-      "description": "Ordered row entity pks for the projected CSV document."
+      "required": [
+        "delimiter",
+        "quote"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
     "id",
-    "row_ids"
+    "dialect"
   ],
   "additionalProperties": false
 }

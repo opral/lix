@@ -1,6 +1,8 @@
 use plugin_csv_v2::manifest_json;
 use plugin_csv_v2::schemas::{
-    DOCUMENT_SCHEMA_KEY, ROW_SCHEMA_KEY, schema_definitions, schema_jsons,
+    DOCUMENT_SCHEMA_KEY, DOCUMENT_SCHEMA_PATH, ROW_SCHEMA_KEY, ROW_SCHEMA_PATH,
+    document_schema_definition, document_schema_json, row_schema_definition, row_schema_json,
+    schema_definitions, schema_jsons,
 };
 use std::collections::BTreeSet;
 
@@ -36,6 +38,21 @@ fn schema_json_accessors_return_expected_text() {
     let raw = schema_jsons().join("\n");
     assert!(raw.contains("\"x-lix-key\": \"csv_v2_document\""));
     assert!(raw.contains("\"x-lix-key\": \"csv_v2_row\""));
+    assert_eq!(
+        document_schema_definition()
+            .get("x-lix-key")
+            .and_then(serde_json::Value::as_str),
+        Some(DOCUMENT_SCHEMA_KEY)
+    );
+    assert_eq!(
+        row_schema_definition()
+            .get("x-lix-key")
+            .and_then(serde_json::Value::as_str),
+        Some(ROW_SCHEMA_KEY)
+    );
+    assert!(document_schema_json().contains("\"dialect\""));
+    assert!(row_schema_json().contains("\"order_key\""));
+    assert!(row_schema_json().contains("\"cells\""));
 }
 
 #[test]
@@ -56,4 +73,20 @@ fn manifest_json_has_expected_plugin_identity() {
             .expect("manifest.runtime must be string"),
         "wasm-component-v1"
     );
+    assert_eq!(
+        manifest
+            .get("match")
+            .and_then(|value| value.get("path_glob"))
+            .and_then(serde_json::Value::as_str)
+            .expect("manifest.match.path_glob must be string"),
+        "*.{csv,tsv}"
+    );
+    let schemas = manifest
+        .get("schemas")
+        .and_then(serde_json::Value::as_array)
+        .expect("manifest.schemas must be an array")
+        .iter()
+        .map(|value| value.as_str().expect("schema paths must be strings"))
+        .collect::<Vec<_>>();
+    assert_eq!(schemas, [DOCUMENT_SCHEMA_PATH, ROW_SCHEMA_PATH]);
 }

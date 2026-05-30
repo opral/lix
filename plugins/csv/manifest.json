@@ -3,7 +3,7 @@
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
   "match": {
-    "path_glob": "*.csv",
+    "path_glob": "*.{csv,tsv}",
     "content_type": "text"
   },
   "entry": "plugin.wasm",

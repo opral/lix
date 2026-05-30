@@ -3,22 +3,31 @@
   "x-lix-primary-key": [
     "/id"
   ],
+  "description": "One decoded CSV/TSV record. Row order is controlled by order_key.",
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Stable row entity pk. Must match the row entity_pk."
+    },
+    "order_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "Opaque U128 fractional row ordering key encoded as 32 lowercase hexadecimal digits."
     },
     "cells": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "description": "Decoded cell text."
       },
-      "description": "CSV cell values for this row, in column order."
+      "description": "Cell values for this row, in column order."
     }
   },
   "required": [
     "id",
+    "order_key",
     "cells"
   ],
   "additionalProperties": false
