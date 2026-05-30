@@ -129,8 +129,8 @@ SELECT lix_text_decode(data) FROM lix_file WHERE path = '/notes/readme.md';
 Inverse of `lix_text_decode`. Encodes text into a `BLOB`:
 
 ```sql
-INSERT INTO lix_file (id, path, data, hidden)
-VALUES (lix_uuid_v7(), '/notes/hello.txt', lix_text_encode('hello world'), false);
+INSERT INTO lix_file (path, data)
+VALUES ('/notes/hello.txt', lix_text_encode('hello world'));
 ```
 
 ### `lix_empty_blob()`
@@ -138,12 +138,12 @@ VALUES (lix_uuid_v7(), '/notes/hello.txt', lix_text_encode('hello world'), false
 Returns a zero-length `BLOB`. Handy for creating an empty file:
 
 ```sql
-INSERT INTO lix_file (id, path, data, hidden)
-VALUES (lix_uuid_v7(), '/empty.bin', lix_empty_blob(), false);
+INSERT INTO lix_file (path, data)
+VALUES ('/empty.bin', lix_empty_blob());
 ```
 
 ## Notes
 
 - Functions are pure scalars; they do not consume rows or take aggregates.
-- Bound parameters use `$1`, `$2`, … (not `?`).
+- Bound parameters can use `?` or `$1`, `$2`, …
 - `lix_active_version_commit_id()`, `lix_uuid_v7()`, and `lix_timestamp()` reflect the engine's current view at planning/execution time and are stable across the rows of a single statement.

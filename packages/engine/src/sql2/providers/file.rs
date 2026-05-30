@@ -1061,7 +1061,6 @@ struct FileDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: String,
-    hidden: bool,
     live: MaterializedLiveStateRow,
 }
 
@@ -1083,7 +1082,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1238,8 +1236,6 @@ fn lix_file_existing_update_stage_from_batch(
 
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
-        let hidden = update_optional_bool_value(batch, assignment_values, row_index, "hidden")?
-            .unwrap_or(false);
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
 
@@ -1261,7 +1257,6 @@ fn lix_file_existing_update_stage_from_batch(
                     id: id.clone(),
                     directory_id,
                     name,
-                    hidden,
                     context: context.clone(),
                 }));
         }
@@ -1364,8 +1359,6 @@ fn lix_file_path_update_stage_from_batch(
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
         let path = update_required_string_value(batch, assignment_values, row_index, "path")?;
-        let hidden = update_optional_bool_value(batch, assignment_values, row_index, "hidden")?
-            .unwrap_or(false);
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
         let assigned_data = if update_columns.data {
@@ -1386,7 +1379,6 @@ fn lix_file_path_update_stage_from_batch(
             resolver,
             id.clone(),
             path,
-            hidden,
             context.clone(),
             generate_directory_id,
         )
@@ -1446,7 +1438,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let path = optional_string_value(batch, row_index, "path")?;
         let id = optional_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         let data = if include_data_writes {
             insert_optional_binary_value(batch, row_index, "data")?
@@ -1478,7 +1469,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     id: Some(file_id.clone()),
                     path,
                     data,
-                    hidden,
                     context,
                 },
                 generate_directory_id,
@@ -1523,7 +1513,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 id: id.clone(),
                 directory_id: directory_id.clone(),
                 name: name.clone(),
-                hidden,
                 context: context.clone(),
             });
             if let Some(file_id) = id.as_ref() {
@@ -1723,7 +1712,6 @@ async fn lix_file_record_batch(
                         id: snapshot.id,
                         directory_id: snapshot.directory_id,
                         name: snapshot.name,
-                        hidden: snapshot.hidden,
                         live: row,
                     },
                 );
@@ -1773,7 +1761,6 @@ async fn lix_file_record_batch(
     let mut paths = Vec::new();
     let mut directory_ids = Vec::new();
     let mut names = Vec::new();
-    let mut hiddens = Vec::new();
     let mut data_values = Vec::new();
     let mut entity_pks = Vec::new();
     let mut schema_keys = Vec::new();
@@ -1821,7 +1808,6 @@ async fn lix_file_record_batch(
         paths.push(Some(path));
         directory_ids.push(file.directory_id);
         names.push(Some(file.name));
-        hiddens.push(Some(file.hidden));
         data_values.push(data);
         entity_pks.push(Some(file.live.entity_pk.as_json_array_text()?));
         schema_keys.push(Some(file.live.schema_key));
@@ -1843,7 +1829,6 @@ async fn lix_file_record_batch(
             "path" => Arc::new(StringArray::from(paths.clone())),
             "directory_id" => Arc::new(StringArray::from(directory_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "hidden" => Arc::new(BooleanArray::from(hiddens.clone())),
             "data" => Arc::new(BinaryArray::from(
                 data_values
                     .iter()
@@ -2011,7 +1996,7 @@ fn lix_file_live_state_projection(projected_schema: Option<&Schema>) -> LiveStat
     let needs_snapshot = schema.fields().iter().any(|field| {
         matches!(
             field.name().as_str(),
-            "path" | "directory_id" | "name" | "hidden" | "data"
+            "path" | "directory_id" | "name" | "data"
         )
     });
     if needs_snapshot {
@@ -2265,7 +2250,7 @@ fn validate_lix_file_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "path" | "directory_id" | "name" | "hidden" | "data" | "lixcol_metadata"
+            "path" | "directory_id" | "name" | "data" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
@@ -2448,21 +2433,6 @@ fn update_optional_metadata_value(
         .transpose()
 }
 
-fn update_optional_bool_value(
-    batch: &RecordBatch,
-    assignment_values: &UpdateAssignmentValues,
-    row_index: usize,
-    column_name: &str,
-) -> Result<Option<bool>> {
-    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
-        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
-        InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(Some(value)),
-        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
-            "UPDATE lix_file expected boolean column '{column_name}', got {other:?}"
-        ))),
-    }
-}
-
 fn update_required_binary_value(
     _batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -2607,7 +2577,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, false),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
         json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
@@ -2807,13 +2776,13 @@ mod tests {
     ) -> datafusion::common::Result<super::LixFileStagedBatch> {
         let mut columns = Vec::new();
         if update_columns.path {
-            columns.extend(["path", "hidden"]);
+            columns.push("path");
         }
         if update_columns.data {
             columns.push("data");
         }
         if update_columns.descriptor {
-            columns.extend(["directory_id", "name", "hidden"]);
+            columns.extend(["directory_id", "name"]);
         }
         let assignment_values = super::UpdateAssignmentValues::from_batch_columns(batch, &columns);
         super::lix_file_update_stage_from_batch(
@@ -2969,7 +2938,6 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("hidden", DataType::Boolean, false),
             Field::new("lixcol_global", DataType::Boolean, false),
             Field::new("lixcol_metadata", DataType::Utf8, true),
         ];
@@ -2977,7 +2945,6 @@ mod tests {
             string_column(vec![Some("file-readme")]),
             string_column(vec![Some("dir-docs")]),
             string_column(vec![Some("readme.md")]),
-            Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"file\"}")]),
         ];
@@ -2994,7 +2961,6 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
@@ -3002,7 +2968,6 @@ mod tests {
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("dir-docs")]),
                 string_column(vec![Some("readme.md")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
@@ -3015,14 +2980,12 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("/docs/guides/readme.md")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
@@ -3035,14 +2998,12 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("/docs/renamed.md")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
@@ -3105,7 +3066,7 @@ mod tests {
             vec![live_file_row(
                 "file-readme",
                 "branch-b",
-                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\",\"hidden\":false}",
+                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\"}",
             )],
         )
         .await
@@ -3138,7 +3099,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -3224,7 +3184,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]

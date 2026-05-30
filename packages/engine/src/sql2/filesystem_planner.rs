@@ -68,7 +68,6 @@ pub(crate) struct DirectoryDescriptorRowInput {
     pub(crate) id: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: bool,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -77,7 +76,6 @@ pub(crate) struct FileDescriptorRowInput {
     pub(crate) id: String,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: bool,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -86,7 +84,6 @@ pub(crate) struct DirectoryDescriptorWriteIntent {
     pub(crate) id: Option<String>,
     pub(crate) parent_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -95,7 +92,6 @@ pub(crate) struct FileDescriptorWriteIntent {
     pub(crate) id: Option<String>,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -111,7 +107,6 @@ pub(crate) struct FilePathWriteInput {
     pub(crate) id: Option<String>,
     pub(crate) path: String,
     pub(crate) data: Option<Vec<u8>>,
-    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -220,17 +215,9 @@ impl DirectoryPathResolver {
         &mut self,
         directory_path: &str,
         context: FilesystemRowContext,
-        hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        self.plan_directory_path(
-            directory_path,
-            None,
-            context,
-            hidden,
-            generate_directory_id,
-            false,
-        )
+        self.plan_directory_path(directory_path, None, context, generate_directory_id, false)
     }
 
     pub(crate) fn create_directory_path_with_leaf_id(
@@ -238,14 +225,12 @@ impl DirectoryPathResolver {
         directory_path: &str,
         leaf_id: Option<String>,
         context: FilesystemRowContext,
-        hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
         self.plan_directory_path(
             directory_path,
             leaf_id,
             context,
-            hidden,
             generate_directory_id,
             true,
         )
@@ -256,7 +241,6 @@ impl DirectoryPathResolver {
         directory_path: &str,
         leaf_id: Option<String>,
         context: FilesystemRowContext,
-        hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
         reject_existing_leaf: bool,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
@@ -299,7 +283,6 @@ impl DirectoryPathResolver {
                 id: id.clone(),
                 parent_id,
                 name,
-                hidden,
                 context: FilesystemRowContext {
                     // Directory descriptors are their own filesystem state row,
                     // even when they are implicitly planned from a file insert.
@@ -389,7 +372,6 @@ pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> Tr
         id: Some(input.id),
         parent_id: input.parent_id,
         name: input.name,
-        hidden: Some(input.hidden),
         context: input.context,
     })
 }
@@ -399,7 +381,6 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> TransactionW
         id: Some(input.id),
         directory_id: input.directory_id,
         name: input.name,
-        hidden: Some(input.hidden),
         context: input.context,
     })
 }
@@ -420,9 +401,6 @@ pub(crate) fn directory_descriptor_write_row(
             .unwrap_or(JsonValue::Null),
     );
     snapshot.insert("name".to_string(), JsonValue::String(input.name));
-    if let Some(hidden) = input.hidden {
-        snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
-    }
 
     partial_state_row(
         input.id,
@@ -446,9 +424,6 @@ pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> Tra
             .unwrap_or(JsonValue::Null),
     );
     snapshot.insert("name".to_string(), JsonValue::String(input.name));
-    if let Some(hidden) = input.hidden {
-        snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
-    }
 
     partial_state_row(
         input.id,
@@ -499,7 +474,6 @@ pub(crate) fn plan_file_path_write(
             rows.extend(resolver.ensure_directory_path(
                 directory_path.as_str(),
                 input.context.clone(),
-                false,
                 generate_directory_id,
             )?);
             resolver
@@ -514,7 +488,6 @@ pub(crate) fn plan_file_path_write(
         id: file_id.clone(),
         directory_id,
         name: parsed.name.clone(),
-        hidden: input.hidden.unwrap_or(false),
         context: input.context.clone(),
     }));
 
@@ -548,7 +521,6 @@ pub(crate) fn plan_file_path_update(
     resolver: &mut DirectoryPathResolver,
     existing_file_id: String,
     new_path: String,
-    existing_hidden: bool,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -560,7 +532,6 @@ pub(crate) fn plan_file_path_update(
             rows.extend(resolver.ensure_directory_path(
                 directory_path.as_str(),
                 context.clone(),
-                false,
                 generate_directory_id,
             )?);
             resolver
@@ -579,7 +550,6 @@ pub(crate) fn plan_file_path_update(
         id: existing_file_id,
         directory_id,
         name: parsed.name.clone(),
-        hidden: existing_hidden,
         context,
     }));
 
@@ -900,7 +870,6 @@ mod tests {
             id: "dir-docs".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            hidden: false,
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
@@ -911,7 +880,6 @@ mod tests {
         assert_eq!(snapshot["id"], "dir-docs");
         assert_eq!(snapshot["parent_id"], JsonValue::Null);
         assert_eq!(snapshot["name"], "docs");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -920,7 +888,6 @@ mod tests {
             id: "file-readme".to_string(),
             directory_id: Some("dir-docs".to_string()),
             name: "readme.md".to_string(),
-            hidden: false,
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
@@ -969,7 +936,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("directory path should plan");
@@ -996,7 +962,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-docs"]),
             )
             .expect("top-level directory should plan");
@@ -1006,7 +971,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("nested directory should plan");
@@ -1028,7 +992,6 @@ mod tests {
                 "/docs/nested/",
                 Some("dir-nested".to_string()),
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-docs"]),
             )
             .expect("directory path should plan");
@@ -1058,7 +1021,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-docs", "dir-generated-nested"]),
             )
             .expect("directory path should plan");
@@ -1068,7 +1030,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["should-not-be-used"]),
             )
             .expect("directory path should plan");
@@ -1086,7 +1047,6 @@ mod tests {
                 id: Some("file-readme".to_string()),
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                hidden: Some(false),
                 context: FilesystemRowContext::active_branch("branch-a"),
             },
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
@@ -1137,7 +1097,6 @@ mod tests {
                 id: Some("file-readme".to_string()),
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                hidden: Some(false),
                 context: FilesystemRowContext::active_branch("branch-a"),
             },
             &mut test_id_generator(&["should-not-be-used"]),
@@ -1171,7 +1130,6 @@ mod tests {
             &mut resolver,
             "file-readme".to_string(),
             "/docs/renamed.md".to_string(),
-            false,
             FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
@@ -1190,7 +1148,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -1202,7 +1159,6 @@ mod tests {
             &mut resolver,
             "file-readme".to_string(),
             "/docs/guides/readme.md".to_string(),
-            true,
             FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
@@ -1232,7 +1188,6 @@ mod tests {
         let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
-        assert_eq!(snapshot["hidden"], true);
     }
 
     #[test]

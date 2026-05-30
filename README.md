@@ -88,12 +88,12 @@ const tx = await lix.beginTransaction();
 
 try {
   await tx.execute(
-    "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-    ["spec-doc", "/spec.docx", body],
+    "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+    ["/spec.docx", body],
   );
   await tx.execute(
-    "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-    ["spec-preview", "/spec.png", image],
+    "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+    ["/spec.png", image],
   );
   await tx.commit();
 } catch (error) {
@@ -115,20 +115,20 @@ const qa = await lix.createBranch({ name: "QA draft" });
 
 await lix.switchBranch({ branchId: copy.id });
 await lix.execute(
-  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-  ["landing", "/landing.md", copyDraft],
+  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+  ["/landing.md", copyDraft],
 );
 
 await lix.switchBranch({ branchId: pricing.id });
 await lix.execute(
-  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-  ["plans", "/plans.json", priceModel],
+  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+  ["/plans.json", priceModel],
 );
 
 await lix.switchBranch({ branchId: qa.id });
 await lix.execute(
-  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-  ["qa-report", "/checks/report.json", testRun],
+  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+  ["/checks/report.json", testRun],
 );
 
 await lix.switchBranch({ branchId: main });

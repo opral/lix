@@ -37,10 +37,6 @@
     "name": {
       "type": "string",
       "pattern": "^(?!\\.{1,2}$)[^/\\\\]+$"
-    },
-    "hidden": {
-      "type": "boolean",
-      "x-lix-default": "false"
     }
   },
   "required": [

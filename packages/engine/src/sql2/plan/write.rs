@@ -104,7 +104,8 @@ mod tests {
 
     #[test]
     fn plan_write_false_conjunct_sets_no_match_sentinel() {
-        let plan = plan_sql("UPDATE lix_file SET hidden = true WHERE id = 'file1' AND false");
+        let plan =
+            plan_sql("UPDATE lix_file SET name = 'renamed.txt' WHERE id = 'file1' AND false");
 
         assert_eq!(plan.filters.rows, FilterSet::None);
     }

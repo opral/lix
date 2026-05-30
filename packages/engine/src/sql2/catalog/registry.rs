@@ -294,7 +294,6 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("hidden", DataType::Boolean, true),
             Field::new("data", DataType::Binary, true),
         ]
     } else {
@@ -303,7 +302,6 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, true),
             Field::new("parent_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("hidden", DataType::Boolean, true),
         ]
     };
     fields.extend([
@@ -332,7 +330,6 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, true),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, true),
-            Field::new("hidden", DataType::Boolean, true),
             Field::new("data", DataType::Binary, true),
         ]
     } else {
@@ -341,7 +338,6 @@ fn history_filesystem_schema(include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, true),
             Field::new("parent_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, true),
-            Field::new("hidden", DataType::Boolean, true),
         ]
     };
     fields.extend([
@@ -428,7 +424,6 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::public("path"),
         PublicColumn::public("directory_id"),
         PublicColumn::public("name"),
-        PublicColumn::public("hidden"),
         PublicColumn::public("data"),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
@@ -441,7 +436,6 @@ fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
         PublicColumn::public_insert_only("path"),
         PublicColumn::public("parent_id"),
         PublicColumn::public("name"),
-        PublicColumn::public("hidden"),
     ];
     columns.extend(filesystem_hidden_columns(by_branch));
     columns
@@ -519,7 +513,6 @@ fn file_history_columns() -> Vec<PublicColumn> {
         "path",
         "directory_id",
         "name",
-        "hidden",
         "data",
         HISTORY_COL_ENTITY_PK,
         HISTORY_COL_SCHEMA_KEY,
@@ -540,7 +533,6 @@ fn directory_history_columns() -> Vec<PublicColumn> {
         "path",
         "parent_id",
         "name",
-        "hidden",
         HISTORY_COL_ENTITY_PK,
         HISTORY_COL_SCHEMA_KEY,
         HISTORY_COL_FILE_ID,

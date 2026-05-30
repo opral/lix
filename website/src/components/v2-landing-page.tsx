@@ -17,16 +17,16 @@ const lix = await openLix({
 const main = await lix.activeBranchId();
 
 await lix.execute(
-  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
-  ["orders-file", "/orders.xlsx", bytes],
+  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+  ["/orders.xlsx", bytes],
 );
 
 const draft = await lix.createBranch({ name: "Explore" });
 await lix.switchBranch({ branchId: draft.id });
 
 await lix.execute(
-  "UPDATE lix_file SET data = $1 WHERE path = '/orders.xlsx'",
-  [draftBytes],
+  "UPDATE lix_file SET data = ? WHERE path = ?",
+  [draftBytes, "/orders.xlsx"],
 );
 
 await lix.switchBranch({ branchId: main });

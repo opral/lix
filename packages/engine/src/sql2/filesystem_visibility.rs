@@ -140,11 +140,11 @@ mod tests {
             live_state(vec![
                 directory_row(
                     "dir-docs",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs","hidden":false}"#,
+                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
                 ),
                 directory_row(
                     "dir-guides",
-                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides","hidden":false}"#,
+                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
                 ),
             ]),
             "branch-a",
@@ -171,7 +171,7 @@ mod tests {
         let filesystem = VisibleFilesystem::load(
             live_state(vec![file_row(
                 "file-readme",
-                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md","hidden":false}"#,
+                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md"}"#,
             )]),
             "branch-a",
         )

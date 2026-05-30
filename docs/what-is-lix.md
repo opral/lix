@@ -18,8 +18,8 @@ import { openLix } from "@lix-js/sdk";
 const lix = await openLix();
 
 await lix.execute(
-  "INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, lix_text_encode($3), false)",
-  ["hello-file", "/hello.txt", "hello"],
+  "INSERT INTO lix_file (path, data) VALUES (?, lix_text_encode(?))",
+  ["/hello.txt", "hello"],
 );
 
 const changes = await lix.execute(

@@ -941,7 +941,6 @@ struct DirectoryDescriptorRecord {
     id: String,
     parent_id: Option<String>,
     name: String,
-    hidden: bool,
     live: MaterializedLiveStateRow,
 }
 
@@ -950,7 +949,6 @@ struct DirectoryDescriptorSnapshot {
     id: String,
     parent_id: Option<String>,
     name: String,
-    hidden: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1010,7 +1008,6 @@ fn lix_directory_update_write_rows_from_batch(
                 id,
                 parent_id,
                 name,
-                hidden: update_optional_bool_value(batch, &assignment_values, row_index, "hidden")?,
                 context,
             },
         ));
@@ -1146,7 +1143,6 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 
         let path = optional_string_value(batch, row_index, "path")?;
         let id = optional_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = directory_row_context_from_batch(batch, row_index, branch_binding)?;
 
         if let Some(path) = path.filter(|_| reject_read_only_fields) {
@@ -1174,7 +1170,6 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                     &path,
                     Some(directory_id.clone()),
                     context,
-                    hidden.unwrap_or(false),
                     generate_directory_id,
                 )
                 .map_err(lix_error_to_datafusion_error)?;
@@ -1199,7 +1194,6 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
             id: id.clone(),
             parent_id,
             name,
-            hidden,
             context,
         });
         if let Some(directory_id) = id.as_ref() {
@@ -1357,7 +1351,6 @@ fn lix_directory_record_batch(
             id: snapshot.id,
             parent_id: snapshot.parent_id,
             name: snapshot.name,
-            hidden: snapshot.hidden.unwrap_or(false),
             live: row,
         });
     }
@@ -1367,7 +1360,6 @@ fn lix_directory_record_batch(
     let mut paths = Vec::new();
     let mut parent_ids = Vec::new();
     let mut names = Vec::new();
-    let mut hiddens = Vec::new();
     let mut entity_pks = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
@@ -1389,7 +1381,6 @@ fn lix_directory_record_batch(
         );
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
-        hiddens.push(Some(directory.hidden));
         entity_pks.push(Some(directory.live.entity_pk.as_json_array_text()?));
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
@@ -1416,7 +1407,6 @@ fn lix_directory_record_batch(
             "path" => Arc::new(StringArray::from(paths.clone())),
             "parent_id" => Arc::new(StringArray::from(parent_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "hidden" => Arc::new(BooleanArray::from(hiddens.clone())),
             "lixcol_entity_pk" => Arc::new(StringArray::from(entity_pks.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
@@ -1562,7 +1552,7 @@ fn lix_directory_live_state_projection(projected_schema: Option<&Schema>) -> Liv
     let needs_snapshot = schema
         .fields()
         .iter()
-        .any(|field| matches!(field.name().as_str(), "parent_id" | "name" | "hidden"));
+        .any(|field| matches!(field.name().as_str(), "parent_id" | "name"));
     if needs_snapshot {
         columns.push("snapshot_content".to_string());
     }
@@ -1588,7 +1578,7 @@ fn validate_lix_directory_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "parent_id" | "name" | "hidden" | "lixcol_metadata"
+            "parent_id" | "name" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_directory cannot stage read-only column '{column_name}'"
@@ -1742,21 +1732,6 @@ fn update_optional_metadata_value(
         .transpose()
 }
 
-fn update_optional_bool_value(
-    batch: &RecordBatch,
-    assignment_values: &UpdateAssignmentValues,
-    row_index: usize,
-    column_name: &str,
-) -> Result<Option<bool>> {
-    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
-        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
-        InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(Some(value)),
-        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
-            "UPDATE lix_directory expected boolean column '{column_name}', got {other:?}"
-        ))),
-    }
-}
-
 fn optional_string_value(
     batch: &RecordBatch,
     row_index: usize,
@@ -1842,7 +1817,6 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("hidden", DataType::Boolean, true),
         json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
@@ -2030,28 +2004,28 @@ mod tests {
                 "lix_directory_descriptor",
                 None,
                 "branch-a",
-                r#"{"id":"dir-docs","parent_id":null,"name":"docs","hidden":false}"#,
+                r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
             ),
             live_filesystem_row(
                 "dir-guides",
                 "lix_directory_descriptor",
                 None,
                 "branch-a",
-                r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides","hidden":false}"#,
+                r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
             ),
             live_filesystem_row(
                 "file-index",
                 "lix_file_descriptor",
                 None,
                 "branch-a",
-                r#"{"id":"file-index","directory_id":"dir-docs","name":"index.md","hidden":false}"#,
+                r#"{"id":"file-index","directory_id":"dir-docs","name":"index.md"}"#,
             ),
             live_filesystem_row(
                 "file-readme",
                 "lix_file_descriptor",
                 None,
                 "branch-a",
-                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md","hidden":false}"#,
+                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md"}"#,
             ),
             live_filesystem_row(
                 "file-readme",
@@ -2072,7 +2046,6 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("parent_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("hidden", DataType::Boolean, false),
             Field::new("lixcol_global", DataType::Boolean, false),
             Field::new("lixcol_metadata", DataType::Utf8, true),
         ];
@@ -2080,7 +2053,6 @@ mod tests {
             string_column(vec![Some("dir-docs")]),
             string_column(vec![None]),
             string_column(vec![Some("docs")]),
-            Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"directory\"}")]),
         ];
@@ -2097,13 +2069,11 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, true),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("dir-nested")]),
                 string_column(vec![Some(path)]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 string_column(vec![Some("branch-a")]),
             ],
         )
@@ -2130,22 +2100,20 @@ mod tests {
             id: "dir-docs".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            hidden: false,
             live: live_row(
                 "dir-docs",
                 "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
         };
         let child = DirectoryDescriptorRecord {
             id: "dir-guides".to_string(),
             parent_id: Some("dir-docs".to_string()),
             name: "guides".to_string(),
-            hidden: false,
             live: live_row(
                 "dir-guides",
                 "branch-a",
-                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\",\"hidden\":false}",
+                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
             ),
         };
         let mut records = BTreeMap::new();
@@ -2172,12 +2140,12 @@ mod tests {
             live_row(
                 "dir-docs",
                 "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_row(
                 "dir-guides",
                 "branch-a",
-                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\",\"hidden\":true}",
+                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
             ),
         ];
 
@@ -2219,7 +2187,7 @@ mod tests {
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(
-                    json!({"hidden":false,"id":"dir-docs","name":"docs","parent_id":null})
+                    json!({"id":"dir-docs","name":"docs","parent_id":null})
                 )),
                 metadata: Some(TransactionJson::from_value_for_test(
                     json!({"source": "directory"})
@@ -2277,7 +2245,7 @@ mod tests {
         let existing_rows = vec![live_row(
             "dir-docs",
             "branch-a",
-            "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
+            "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
         )];
         let mut resolvers = directory_path_resolvers_from_state_rows(existing_rows)
             .expect("existing directory rows should seed paths");
@@ -2389,7 +2357,7 @@ mod tests {
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(
-                        json!({"hidden":false,"id":"dir-docs","name":"docs","parent_id":null})
+                        json!({"id":"dir-docs","name":"docs","parent_id":null})
                     )),
                     metadata: Some(TransactionJson::from_value_for_test(
                         json!({"source": "directory"})
@@ -2416,7 +2384,7 @@ mod tests {
             rows: vec![live_row(
                 "dir-docs",
                 "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
         };

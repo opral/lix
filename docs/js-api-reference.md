@@ -84,8 +84,7 @@ Starts a transaction. While it is open, execute statements on the transaction ha
 ```ts
 const tx = await lix.beginTransaction();
 try {
-  await tx.execute("INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)", [
-    "hello-file",
+  await tx.execute("INSERT INTO lix_file (path, data) VALUES (?, ?)", [
     "/hello.txt",
     new TextEncoder().encode("hello"),
   ]);

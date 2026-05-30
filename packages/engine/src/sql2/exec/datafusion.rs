@@ -1191,12 +1191,12 @@ struct HistoryNoticeRule {
 const HISTORY_NOTICE_RULES: &[HistoryNoticeRule] = &[
     HistoryNoticeRule {
         table_name: "lix_file_history",
-        payload_columns: &["path", "directory_id", "name", "hidden", "data"],
+        payload_columns: &["path", "directory_id", "name", "data"],
         identity_columns: &["id", "lixcol_entity_pk"],
     },
     HistoryNoticeRule {
         table_name: "lix_directory_history",
-        payload_columns: &["path", "parent_id", "name", "hidden"],
+        payload_columns: &["path", "parent_id", "name"],
         identity_columns: &["id", "lixcol_entity_pk"],
     },
 ];
@@ -1796,7 +1796,6 @@ mod tests {
         branch_id: &str,
         parent_id: Option<&str>,
         name: &str,
-        hidden: bool,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
@@ -1806,8 +1805,7 @@ mod tests {
                 json!({
                     "id": entity_pk,
                     "parent_id": parent_id,
-                    "name": name,
-                    "hidden": hidden
+                    "name": name
                 })
                 .to_string(),
             ),
@@ -1828,7 +1826,6 @@ mod tests {
         branch_id: &str,
         directory_id: Option<&str>,
         name: &str,
-        hidden: bool,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
@@ -1838,8 +1835,7 @@ mod tests {
                 json!({
                     "id": entity_pk,
                     "directory_id": directory_id,
-                    "name": name,
-                    "hidden": hidden
+                    "name": name
                 })
                 .to_string(),
             ),
@@ -2042,15 +2038,15 @@ mod tests {
             .await?;
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden) \
-                 VALUES ('dir-docs', '/docs/', false)",
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('dir-docs', '/docs/')",
                 &[],
             )
             .await?;
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-                 VALUES ('file-a', '/docs/readme.md', X'68656C6C6F', false)",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-a', '/docs/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await?;
@@ -2156,7 +2152,7 @@ mod tests {
 
         let update_result = session
             .execute(
-                "UPDATE lix_file SET hidden = true WHERE path = $1 OR id = 'missing'",
+                "UPDATE lix_file SET data = X'42' WHERE path = $1 OR id = 'missing'",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
@@ -2388,7 +2384,7 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, parent_id, name, path, hidden, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, parent_id, name, path, lixcol_start_commit_id, lixcol_depth \
              FROM lix_directory_history \
              WHERE id = 'dir-docs' AND lixcol_start_commit_id = '{head_commit_id}'"
                 ),
@@ -2409,7 +2405,6 @@ mod tests {
                 "parent_id",
                 "name",
                 "path",
-                "hidden",
                 "lixcol_start_commit_id",
                 "lixcol_depth",
             ]
@@ -2419,9 +2414,8 @@ mod tests {
         assert_eq!(rows[0][1], Value::Null);
         assert_eq!(rows[0][2], Value::Text("docs".to_string()));
         assert_eq!(rows[0][3], Value::Text("/docs/".to_string()));
-        assert_eq!(rows[0][4], Value::Boolean(false));
-        assert_eq!(rows[0][5], Value::Text(head_commit_id.clone()));
-        assert!(matches!(rows[0][6], Value::Integer(_)));
+        assert_eq!(rows[0][4], Value::Text(head_commit_id.clone()));
+        assert!(matches!(rows[0][5], Value::Integer(_)));
 
         let name_filtered_result = session
             .execute(
@@ -2450,7 +2444,7 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data, hidden, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, data, lixcol_start_commit_id, lixcol_depth \
              FROM lix_file_history \
              WHERE id = 'file-a' \
                AND lixcol_start_commit_id = '{head_commit_id}' \
@@ -2473,7 +2467,6 @@ mod tests {
                 "id",
                 "path",
                 "data",
-                "hidden",
                 "lixcol_start_commit_id",
                 "lixcol_depth",
             ]
@@ -2482,9 +2475,8 @@ mod tests {
         assert_eq!(rows[0][0], Value::Text("file-a".to_string()));
         assert_eq!(rows[0][1], Value::Text("/docs/readme.md".to_string()));
         assert_eq!(rows[0][2], Value::Blob(b"hello".to_vec()));
-        assert_eq!(rows[0][3], Value::Boolean(false));
-        assert_eq!(rows[0][4], Value::Text(head_commit_id.clone()));
-        assert!(matches!(rows[0][5], Value::Integer(_)));
+        assert_eq!(rows[0][3], Value::Text(head_commit_id.clone()));
+        assert!(matches!(rows[0][4], Value::Integer(_)));
 
         let path_filtered_result = session
             .execute(
@@ -3674,8 +3666,8 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_directory_by_branch (\
-             id, parent_id, name, hidden, lixcol_branch_id\
-             ) VALUES ('dir-docs', NULL, 'docs', false, 'branch-b')",
+             id, parent_id, name, lixcol_branch_id\
+             ) VALUES ('dir-docs', NULL, 'docs', 'branch-b')",
             &[],
         )
         .await
@@ -3697,7 +3689,7 @@ mod tests {
         assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
+            Some("{\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
         );
     }
 
@@ -3716,8 +3708,8 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_directory (id, parent_id, name, hidden) \
-             VALUES ('dir-docs', NULL, 'docs', false)",
+            "INSERT INTO lix_directory (id, parent_id, name) \
+             VALUES ('dir-docs', NULL, 'docs')",
             &[],
         )
         .await
@@ -3744,8 +3736,8 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                live_directory_row("dir-guides", "branch-a", Some("dir-docs"), "guides", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_directory_row("dir-guides", "branch-a", Some("dir-docs"), "guides"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -3760,7 +3752,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "UPDATE lix_directory \
-             SET hidden = true, lixcol_metadata = '{\"source\":\"directory-update\"}' \
+             SET name = 'docs-updated', lixcol_metadata = '{\"source\":\"directory-update\"}' \
              WHERE id = 'dir-docs'",
             &[],
         )
@@ -3781,7 +3773,7 @@ mod tests {
         assert_eq!(rows[0].branch_id, "branch-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
-            Some("{\"hidden\":true,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
+            Some("{\"id\":\"dir-docs\",\"name\":\"docs-updated\",\"parent_id\":null}")
         );
         assert_eq!(
             rows[0].metadata.as_deref(),
@@ -3793,9 +3785,7 @@ mod tests {
     async fn execute_sql_update_directory_rejects_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![live_directory_row(
-                "dir-docs", "branch-a", None, "docs", false,
-            )],
+            rows: vec![live_directory_row("dir-docs", "branch-a", None, "docs")],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
@@ -3833,8 +3823,8 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                live_directory_row("dir-guides", "branch-b", Some("dir-docs"), "guides", false),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_directory_row("dir-guides", "branch-b", Some("dir-docs"), "guides"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -3887,8 +3877,8 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_file_by_branch (\
-             id, directory_id, name, hidden, lixcol_branch_id\
-             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, 'branch-b')",
+             id, directory_id, name, lixcol_branch_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme.md', 'branch-b')",
             &[],
         )
         .await
@@ -3914,7 +3904,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[tokio::test]
@@ -3932,8 +3921,8 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_file (id, directory_id, name, hidden) \
-             VALUES ('file-readme', 'dir-docs', 'readme.md', false)",
+            "INSERT INTO lix_file (id, directory_id, name) \
+             VALUES ('file-readme', 'dir-docs', 'readme.md')",
             &[],
         )
         .await
@@ -3971,8 +3960,8 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_file_by_branch (\
-             id, directory_id, name, hidden, data, lixcol_branch_id\
-             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, X'4142', 'branch-b')",
+             id, directory_id, name, data, lixcol_branch_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme.md', X'4142', 'branch-b')",
             &[],
         )
         .await
@@ -4011,21 +4000,9 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                live_file_row(
-                    "file-readme",
-                    "branch-a",
-                    Some("dir-docs"),
-                    "readme.md",
-                    false,
-                ),
-                live_file_row(
-                    "file-guide",
-                    "branch-a",
-                    Some("dir-docs"),
-                    "guide.md",
-                    false,
-                ),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
+                live_file_row("file-guide", "branch-a", Some("dir-docs"), "guide.md"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -4040,7 +4017,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "UPDATE lix_file \
-             SET name = 'readme-updated.txt', hidden = true, lixcol_metadata = '{\"source\":\"file-update\"}' \
+             SET name = 'readme-updated.txt', lixcol_metadata = '{\"source\":\"file-update\"}' \
              WHERE id = 'file-readme'",
             &[],
         )
@@ -4065,7 +4042,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme-updated.txt");
-        assert_eq!(snapshot["hidden"], true);
         assert_eq!(
             rows[0].metadata.as_deref(),
             Some("{\"source\":\"file-update\"}")
@@ -4077,14 +4053,8 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                live_file_row(
-                    "file-readme",
-                    "branch-a",
-                    Some("dir-docs"),
-                    "readme.md",
-                    false,
-                ),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -4132,14 +4102,8 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                live_file_row(
-                    "file-readme",
-                    "branch-a",
-                    Some("dir-docs"),
-                    "readme.md",
-                    false,
-                ),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -4181,22 +4145,10 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                live_directory_row("dir-docs", "branch-b", None, "docs", false),
-                live_file_row(
-                    "file-readme",
-                    "branch-a",
-                    Some("dir-docs"),
-                    "readme.md",
-                    false,
-                ),
-                live_file_row(
-                    "file-guide",
-                    "branch-b",
-                    Some("dir-docs"),
-                    "guide.md",
-                    false,
-                ),
+                live_directory_row("dir-docs", "branch-a", None, "docs"),
+                live_directory_row("dir-docs", "branch-b", None, "docs"),
+                live_file_row("file-readme", "branch-a", Some("dir-docs"), "readme.md"),
+                live_file_row("file-guide", "branch-b", Some("dir-docs"), "guide.md"),
             ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -5056,8 +5008,8 @@ mod tests {
                 rows: vec![
                     live_entity_row("entity-a", "branch-a", "A"),
                     live_entity_row("entity-b", "branch-b", "B"),
-                    live_directory_row("dir-docs", "branch-a", None, "docs", false),
-                    live_file_row("file-a", "branch-a", Some("dir-docs"), "readme.md", false),
+                    live_directory_row("dir-docs", "branch-a", None, "docs"),
+                    live_file_row("file-a", "branch-a", Some("dir-docs"), "readme.md"),
                     live_blob_ref_row("file-a", "branch-a", &[0x41, 0x42]),
                 ],
             }),
