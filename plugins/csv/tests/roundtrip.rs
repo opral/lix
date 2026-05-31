@@ -17,7 +17,7 @@ fn file_from_bytes(id: &str, path: &str, data: &[u8]) -> PluginFile {
 fn active_state_row(change: PluginEntityChange) -> PluginActiveStateRow {
     PluginActiveStateRow {
         entity_pk: change.entity_pk,
-        schema_key: Some(change.schema_key),
+        schema_key: change.schema_key,
         snapshot_content: change.snapshot_content,
         file_id: None,
         plugin_key: None,
@@ -62,7 +62,7 @@ fn apply_changes_to_active_state(
 ) -> Vec<PluginActiveStateRow> {
     let mut rows = active_state
         .into_iter()
-        .filter_map(|row| Some(((row.schema_key.clone()?, row.entity_pk.clone()), row)))
+        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
         .collect::<BTreeMap<_, _>>();
 
     for change in changes {
@@ -117,7 +117,7 @@ fn snapshot_order_key(change: &PluginEntityChange) -> u128 {
 fn row_order_keys_by_first_cell(active_state: &[PluginActiveStateRow]) -> BTreeMap<String, u128> {
     active_state
         .iter()
-        .filter(|row| row.schema_key.as_deref() == Some(ROW_SCHEMA_KEY))
+        .filter(|row| row.schema_key == ROW_SCHEMA_KEY)
         .map(|row| {
             let value = active_state_snapshot_value(row);
             let first_cell = value

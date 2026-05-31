@@ -869,12 +869,10 @@ fn render_active_state_rows(rows: Vec<ActiveStateRow>) -> Result<Vec<u8>, Plugin
 
 fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
     rows.into_iter()
-        .filter_map(|row| {
-            Some(EntityChange {
-                entity_pk: row.entity_pk,
-                schema_key: row.schema_key?,
-                snapshot_content: row.snapshot_content,
-            })
+        .map(|row| EntityChange {
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            snapshot_content: row.snapshot_content,
         })
         .collect()
 }

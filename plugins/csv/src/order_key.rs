@@ -1,9 +1,9 @@
 use crate::exports::lix::plugin::api::PluginError;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) struct FractionalIndex(u128);
+pub(crate) struct OrderKey(u128);
 
-impl FractionalIndex {
+impl OrderKey {
     pub(crate) fn between(previous: Option<Self>, next: Option<Self>) -> Result<Self, PluginError> {
         let lower = previous.map_or(0, |index| index.0);
         let upper = next.map_or(u128::MAX, |index| index.0);
@@ -25,6 +25,7 @@ impl FractionalIndex {
         Ok(Self(lower + gap / 2))
     }
 
+    #[cfg(test)]
     pub(crate) fn evenly_spaced(offset: usize, len: usize) -> Self {
         let step = u128::MAX / (len as u128 + 1);
         Self(step * (offset as u128 + 1))

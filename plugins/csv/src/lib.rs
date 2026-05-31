@@ -12,13 +12,12 @@ mod order_key;
 pub mod schemas;
 
 use crate::csv::{
-    CsvDialect, TableSnapshot, parse_file, parse_table_snapshot, render_projection,
-    table_upsert_change,
+    CsvDialect, parse_file, parse_table_snapshot, render_projection, table_upsert_change,
 };
 use crate::exports::lix::plugin::api::{
-    ActiveStateRow, DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
+    DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
 };
-use crate::order_key::FractionalIndex;
+use crate::order_key::OrderKey;
 use itertools::Itertools;
 use rand::Rng;
 use serde_json::Value;
@@ -50,13 +49,13 @@ struct Projection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
     id: String,
-    order_key: FractionalIndex,
+    order_key: OrderKey,
     cells: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RowSnapshot {
-    order_key: FractionalIndex,
+    order_key: OrderKey,
     cells: Vec<String>,
 }
 
@@ -73,29 +72,34 @@ impl Plugin for CsvPlugin {
         state: DetectStateContext,
         file: File,
     ) -> Result<Vec<EntityChange>, PluginError> {
-        let before = projection_from_entity_changes(
-            empty_file(),
-            entity_changes_from_active_state(state.active_state),
-        )?;
-        detect_changes_from_projection(&before, &file)
+        let entity_changes = state.active_state.into_iter().map(|row| EntityChange {
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            snapshot_content: row.snapshot_content,
+        });
+        let before = projection_from_entity_changes(entity_changes)?;
+        let (file_rows, after_dialect) = parse_file(&file)?;
+        detect_changes_for_rows(&before, &file_rows, after_dialect)
     }
 
     fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-        let projection = projection_from_entity_changes(
-            empty_file(),
-            entity_changes_from_active_state(state.active_state),
-        )?;
+        let entity_changes = state.active_state.into_iter().map(|row| EntityChange {
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            snapshot_content: row.snapshot_content,
+        });
+        let projection = projection_from_entity_changes(entity_changes)?;
         render_projection(&projection)
     }
 }
 
-fn detect_changes_from_projection(
+fn detect_changes_for_rows(
     before: &Projection,
-    after: &File,
+    file_rows: &[Vec<String>],
+    after_dialect: CsvDialect,
 ) -> Result<Vec<EntityChange>, PluginError> {
     let base = before.to_rows();
-    let (file_rows, after_dialect) = parse_file(after)?;
-    let ops = diff_by(&base, &file_rows, |row, file_row| row.cells == *file_row).collect_vec();
+    let ops = diff_by(&base, file_rows, |row, file_row| row.cells == *file_row).collect_vec();
     let mut changes = Vec::new();
     let mut rng = rand::rng();
     let mut base_index = 0;
@@ -130,7 +134,7 @@ fn detect_changes_from_projection(
             }
             Op::Insert => {
                 let next_order_key = base.get(base_index).map(|row| row.order_key);
-                let order_key = FractionalIndex::between(previous_order_key, next_order_key)?;
+                let order_key = OrderKey::between(previous_order_key, next_order_key)?;
                 let id = RowId::random(&mut rng).to_entity_pk();
                 changes.push(row_upsert_change(&id, order_key, &file_rows[file_index])?);
                 previous_order_key = Some(order_key);
@@ -149,24 +153,14 @@ fn detect_changes_from_projection(
     Ok(changes)
 }
 
-fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
-    rows.into_iter()
-        .filter_map(|row| {
-            Some(EntityChange {
-                entity_pk: row.entity_pk,
-                schema_key: row.schema_key?,
-                snapshot_content: row.snapshot_content,
-            })
-        })
-        .collect()
-}
-
 fn projection_from_entity_changes(
-    file: File,
-    changes: Vec<EntityChange>,
+    changes: impl Iterator<Item = EntityChange>,
 ) -> Result<Projection, PluginError> {
-    let mut projection = projection_from_file_with_index_ids(&file)?;
-    let mut table_snapshot = None::<TableSnapshot>;
+    let mut projection = Projection {
+        rows_by_id: BTreeMap::new(),
+        dialect: CsvDialect::default(),
+        table_present: false,
+    };
     let mut table_seen = false;
     let mut seen_row_change_ids = BTreeSet::<String>::new();
 
@@ -185,14 +179,11 @@ fn projection_from_entity_changes(
                     )));
                 }
                 table_seen = true;
-                let snapshot_present = change.snapshot_content.is_some();
-                table_snapshot = Some(match change.snapshot_content {
-                    Some(raw) => parse_table_snapshot(&raw)?,
-                    None => TableSnapshot {
-                        dialect: CsvDialect::default(),
-                    },
-                });
-                projection.table_present = snapshot_present;
+                projection.table_present = change.snapshot_content.is_some();
+                projection.dialect = match change.snapshot_content {
+                    Some(raw) => parse_table_snapshot(&raw)?.dialect,
+                    None => CsvDialect::default(),
+                };
             }
             ROW_SCHEMA_KEY => {
                 if !seen_row_change_ids.insert(change.entity_pk.clone()) {
@@ -216,35 +207,7 @@ fn projection_from_entity_changes(
         }
     }
 
-    if let Some(table) = table_snapshot {
-        projection.dialect = table.dialect;
-    }
-
     Ok(projection)
-}
-
-fn projection_from_file_with_index_ids(file: &File) -> Result<Projection, PluginError> {
-    let (rows, dialect) = parse_file(file)?;
-    let len = rows.len();
-    let rows_by_id = rows
-        .into_iter()
-        .enumerate()
-        .map(|(offset, cells)| {
-            (
-                format!("row:{offset}"),
-                RowSnapshot {
-                    order_key: FractionalIndex::evenly_spaced(offset, len),
-                    cells,
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    Ok(Projection {
-        rows_by_id,
-        dialect,
-        table_present: false,
-    })
 }
 
 impl Projection {
@@ -265,7 +228,7 @@ impl Projection {
 
 fn row_upsert_change(
     id: &str,
-    order_key: FractionalIndex,
+    order_key: OrderKey,
     cells: &[String],
 ) -> Result<EntityChange, PluginError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
@@ -353,14 +316,14 @@ fn reject_unknown_fields<'a>(
 fn parse_order_key_snapshot(
     value: Option<&Value>,
     entity_pk: &str,
-) -> Result<FractionalIndex, PluginError> {
+) -> Result<OrderKey, PluginError> {
     let raw = value.and_then(Value::as_str).ok_or_else(|| {
         PluginError::InvalidInput(format!(
             "csv row snapshot for entity_pk '{entity_pk}' must contain string 'order_key'"
         ))
     })?;
 
-    FractionalIndex::from_snapshot_string(raw).map_err(|message| {
+    OrderKey::from_snapshot_string(raw).map_err(|message| {
         PluginError::InvalidInput(format!(
             "invalid csv row order_key for entity_pk '{entity_pk}': {message}"
         ))
@@ -434,11 +397,112 @@ fn diff_by<'a, T, U>(
         .chain((0..suffix).map(|_| Op::Equal))
 }
 
-fn empty_file() -> File {
-    File {
-        id: String::new(),
-        path: String::new(),
-        data: Vec::new(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn fuzz_detect_changes_round_trips_rows() {
+        let mut rng = SmallRng::seed_from_u64(0);
+
+        for _ in 0..10_000 {
+            let base_rows = random_csv(&mut rng);
+            let file_rows = random_csv(&mut rng);
+            let before = projection_from_rows(base_rows.clone());
+
+            let changes =
+                detect_changes_for_rows(&before, &file_rows, CsvDialect::default()).unwrap();
+
+            let rows_are_equal = base_rows == file_rows;
+            assert!(
+                changes.is_empty() == rows_are_equal,
+                "changes emptiness did not match row equality: changes={}, rows_are_equal={rows_are_equal}",
+                changes.len()
+            );
+
+            let mut applied = before;
+            for change in changes {
+                apply_entity_change(&mut applied, change).unwrap();
+            }
+
+            let applied_rows = applied
+                .to_rows()
+                .into_iter()
+                .map(|row| row.cells)
+                .collect::<Vec<_>>();
+            assert_eq!(applied_rows, file_rows);
+        }
+    }
+
+    fn random_csv(rng: &mut (impl Rng + ?Sized)) -> Vec<Vec<String>> {
+        let random_cell_alphabet_len: u8 = rng.random_range(1..=6);
+        let width = rng.random_range(1..=10);
+        let height = rng.random_range(0..=10);
+
+        (0..height)
+            .map(|_| {
+                (0..width)
+                    .map(|_| {
+                        let offset = rng.random_range(0..random_cell_alphabet_len);
+                        char::from(b'a' + offset).to_string()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn projection_from_rows(rows: Vec<Vec<String>>) -> Projection {
+        let len = rows.len();
+        let rows_by_id = rows
+            .into_iter()
+            .enumerate()
+            .map(|(offset, cells)| {
+                (
+                    format!("row:{offset}"),
+                    RowSnapshot {
+                        order_key: OrderKey::evenly_spaced(offset, len),
+                        cells,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        Projection {
+            rows_by_id,
+            dialect: CsvDialect::default(),
+            table_present: true,
+        }
+    }
+
+    fn apply_entity_change(
+        projection: &mut Projection,
+        change: EntityChange,
+    ) -> Result<(), PluginError> {
+        match change.schema_key.as_str() {
+            TABLE_SCHEMA_KEY => {
+                if let Some(raw) = change.snapshot_content {
+                    projection.dialect = parse_table_snapshot(&raw)?.dialect;
+                    projection.table_present = true;
+                } else {
+                    projection.dialect = CsvDialect::default();
+                    projection.table_present = false;
+                }
+            }
+            ROW_SCHEMA_KEY => {
+                if let Some(raw) = change.snapshot_content {
+                    let row = parse_row_snapshot(&raw, &change.entity_pk)?;
+                    projection.rows_by_id.insert(change.entity_pk, row);
+                } else {
+                    projection.rows_by_id.remove(&change.entity_pk);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 }
 

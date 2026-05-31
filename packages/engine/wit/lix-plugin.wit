@@ -31,7 +31,7 @@ interface api {
   /// Scope is implicit and engine-defined: same plugin + same file + active rows.
   record active-state-row {
     entity-pk: string,
-    schema-key: option<string>,
+    schema-key: string,
     /// Deterministically encoded JSON text.
     snapshot-content: option<canonical-json>,
     file-id: option<string>,
