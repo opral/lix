@@ -1,8 +1,9 @@
 use lix_engine::backend::InMemoryBackend;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InitReceipt,
-    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry, FsMkdirOptions,
+    FsRmOptions, FsWriteOptions, InitReceipt, MergeBranchOptions, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, SessionContext, SessionTransaction,
+    SwitchBranchOptions, SwitchBranchReceipt,
 };
 use lix_engine::{LixError, Value};
 
@@ -65,6 +66,7 @@ impl Simulation {
         SimSession {
             sim: self.clone(),
             engine: engine.clone(),
+            fs: SimFs::new(self.clone(), engine.clone(), session.clone()),
             session,
         }
     }
@@ -100,6 +102,8 @@ pub struct SimSession {
     sim: Simulation,
     engine: Engine,
     session: SessionContext,
+    #[allow(dead_code)]
+    pub fs: SimFs,
 }
 
 #[allow(dead_code)]
@@ -108,6 +112,7 @@ impl SimSession {
         Self {
             sim: self.sim.clone(),
             engine: engine.clone(),
+            fs: SimFs::new(self.sim.clone(), engine.clone(), session.clone()),
             session,
         }
     }
@@ -189,10 +194,76 @@ impl SimSession {
             Self {
                 sim: self.sim.clone(),
                 engine: self.engine.clone(),
+                fs: SimFs::new(self.sim.clone(), self.engine.clone(), session.clone()),
                 session,
             },
             receipt,
         ))
+    }
+}
+
+#[derive(Clone)]
+pub struct SimFs {
+    sim: Simulation,
+    engine: Engine,
+    session: SessionContext,
+}
+
+#[allow(dead_code)]
+impl SimFs {
+    fn new(sim: Simulation, engine: Engine, session: SessionContext) -> Self {
+        Self {
+            sim,
+            engine,
+            session,
+        }
+    }
+
+    pub async fn write_file(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        options: FsWriteOptions,
+    ) -> Result<(), LixError> {
+        let result = self.session.fs().write_file(path, data, options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+        let active_branch_id = self.session.active_branch_id().await?;
+        self.sim
+            .rebuild_tracked_state
+            .before_read(&self.engine, &active_branch_id)
+            .await?;
+        self.session.fs().read_file(path).await
+    }
+
+    pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
+        let result = self.session.fs().mkdir(path, options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
+        let active_branch_id = self.session.active_branch_id().await?;
+        self.sim
+            .rebuild_tracked_state
+            .before_read(&self.engine, &active_branch_id)
+            .await?;
+        self.session.fs().readdir(path).await
+    }
+
+    pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
+        let result = self.session.fs().rm(path, options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
     }
 }
 
