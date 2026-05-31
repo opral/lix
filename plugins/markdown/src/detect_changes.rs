@@ -119,9 +119,7 @@ fn parse_state_context_projection(
     let mut blocks_by_id = BTreeMap::<String, ParsedBlock>::new();
 
     for row in rows {
-        let Some(schema_key) = row.schema_key.as_deref() else {
-            continue;
-        };
+        let schema_key = row.schema_key.as_str();
         let Some(snapshot_content) = row.snapshot_content.as_deref() else {
             continue;
         };

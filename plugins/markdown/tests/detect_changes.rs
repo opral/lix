@@ -106,7 +106,7 @@ fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginD
             .iter()
             .map(|row| plugin_md_v2::PluginActiveStateRow {
                 entity_pk: row.entity_pk.clone(),
-                schema_key: Some(row.schema_key.clone()),
+                schema_key: row.schema_key.clone(),
                 snapshot_content: row.snapshot_content.clone(),
                 file_id: None,
                 plugin_key: None,
