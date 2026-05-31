@@ -35,11 +35,21 @@
             }
           ],
           "description": "Quote byte encoded as a single Latin-1 character, or null when quoting is disabled."
+        },
+        "terminator": {
+          "type": "string",
+          "enum": [
+            "\n",
+            "\r\n",
+            "\r"
+          ],
+          "description": "Record terminator sequence used to render the file."
         }
       },
       "required": [
         "delimiter",
-        "quote"
+        "quote",
+        "terminator"
       ],
       "additionalProperties": false
     }

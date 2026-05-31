@@ -50,6 +50,7 @@ fn schema_json_accessors_return_expected_text() {
         Some(ROW_SCHEMA_KEY)
     );
     assert!(table_schema_json().contains("\"dialect\""));
+    assert!(table_schema_json().contains("\"terminator\""));
     assert!(row_schema_json().contains("\"order_key\""));
     assert!(row_schema_json().contains("\"cells\""));
 }

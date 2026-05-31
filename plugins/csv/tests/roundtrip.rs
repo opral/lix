@@ -160,6 +160,13 @@ fn detects_initial_projection_and_renders_csv() {
             .and_then(Value::as_str),
         Some(",")
     );
+    assert_eq!(
+        snapshot_value(table)
+            .get("dialect")
+            .and_then(|value| value.get("terminator"))
+            .and_then(Value::as_str),
+        Some("\n")
+    );
     for row in changes
         .iter()
         .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
@@ -277,7 +284,8 @@ fn render_uses_quote_byte_from_table_dialect() {
             entity_pk: ROOT_ENTITY_PK.to_string(),
             schema_key: TABLE_SCHEMA_KEY.to_string(),
             snapshot_content: Some(
-                r#"{"id":"root","dialect":{"delimiter":";","quote":"'"}}"#.to_string(),
+                r#"{"id":"root","dialect":{"delimiter":";","quote":"'","terminator":"\n"}}"#
+                    .to_string(),
             ),
         },
     ];
@@ -285,6 +293,31 @@ fn render_uses_quote_byte_from_table_dialect() {
     let output = render_changes(changes).expect("render should succeed");
 
     assert_eq!(output, b"'a;b';plain\n");
+}
+
+#[test]
+fn detects_and_renders_crlf_terminator() {
+    let expected = b"name,age\r\nAda,37\r\n";
+    let after = file_from_bytes("f1", "/people.csv", expected);
+
+    let changes =
+        plugin_detect_changes(empty_state_context(), after).expect("detect_changes should succeed");
+    let table = changes
+        .iter()
+        .find(|change| change.schema_key == TABLE_SCHEMA_KEY)
+        .expect("table snapshot should exist");
+
+    assert_eq!(
+        snapshot_value(table)
+            .get("dialect")
+            .and_then(|value| value.get("terminator"))
+            .and_then(Value::as_str),
+        Some("\r\n")
+    );
+
+    let output = render_changes(changes).expect("render should succeed");
+
+    assert_eq!(output, expected);
 }
 
 #[test]

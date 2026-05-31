@@ -13,6 +13,7 @@ use std::str;
 pub(crate) struct CsvDialect {
     delimiter: u8,
     quote: Quote,
+    terminator: CsvTerminator,
 }
 
 impl Default for CsvDialect {
@@ -20,6 +21,72 @@ impl Default for CsvDialect {
         Self {
             delimiter: b',',
             quote: Quote::Some(b'"'),
+            terminator: CsvTerminator::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CsvTerminator {
+    #[default]
+    Lf,
+    CrLf,
+    Cr,
+}
+
+impl CsvTerminator {
+    fn detect(decoded: &str) -> Self {
+        let mut crlf_count = 0;
+        let mut lf_count = 0;
+        let mut cr_count = 0;
+        let bytes = decoded.as_bytes();
+        let mut index = 0;
+
+        while index < bytes.len() {
+            if bytes[index] == b'\r' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                    crlf_count += 1;
+                    index += 2;
+                    continue;
+                }
+                cr_count += 1;
+            } else if bytes[index] == b'\n' {
+                lf_count += 1;
+            }
+            index += 1;
+        }
+
+        if crlf_count > 0 && crlf_count >= lf_count && crlf_count >= cr_count {
+            Self::CrLf
+        } else if lf_count >= cr_count {
+            Self::Lf
+        } else {
+            Self::Cr
+        }
+    }
+
+    fn from_snapshot(raw: &str) -> Option<Self> {
+        match raw {
+            "\n" => Some(Self::Lf),
+            "\r\n" => Some(Self::CrLf),
+            "\r" => Some(Self::Cr),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::CrLf => "\r\n",
+            Self::Cr => "\r",
+        }
+    }
+
+    fn to_csv_terminator(self) -> Terminator {
+        match self {
+            Self::Lf => Terminator::Any(b'\n'),
+            Self::CrLf => Terminator::CRLF,
+            Self::Cr => Terminator::Any(b'\r'),
         }
     }
 }
@@ -50,6 +117,7 @@ fn dialect_snapshot_content(dialect: CsvDialect) -> Value {
             Quote::None => Value::Null,
             Quote::Some(quote) => Value::from(byte_to_latin1_string(quote)),
         },
+        "terminator": dialect.terminator.as_str(),
     })
 }
 
@@ -82,7 +150,11 @@ fn parse_dialect_snapshot(value: &Value) -> Result<CsvDialect, PluginError> {
     let object = value.as_object().ok_or_else(|| {
         PluginError::InvalidInput("csv table dialect must be an object".to_string())
     })?;
-    reject_unknown_fields(object.keys(), &["delimiter", "quote"], "csv table dialect")?;
+    reject_unknown_fields(
+        object.keys(),
+        &["delimiter", "quote", "terminator"],
+        "csv table dialect",
+    )?;
 
     let delimiter = parse_dialect_byte_string(object.get("delimiter"), "delimiter")?;
     let quote = match object.get("quote") {
@@ -94,12 +166,31 @@ fn parse_dialect_snapshot(value: &Value) -> Result<CsvDialect, PluginError> {
             ));
         }
     };
+    let terminator = parse_dialect_terminator(object.get("terminator"))?;
 
-    Ok(CsvDialect { delimiter, quote })
+    Ok(CsvDialect {
+        delimiter,
+        quote,
+        terminator,
+    })
 }
 
 fn byte_to_latin1_string(byte: u8) -> String {
     char::from(byte).to_string()
+}
+
+fn parse_dialect_terminator(value: Option<&Value>) -> Result<CsvTerminator, PluginError> {
+    let raw = value.and_then(Value::as_str).ok_or_else(|| {
+        PluginError::InvalidInput(
+            "csv table dialect field 'terminator' must be a string".to_string(),
+        )
+    })?;
+    CsvTerminator::from_snapshot(raw).ok_or_else(|| {
+        PluginError::InvalidInput(
+            "csv table dialect field 'terminator' must be one of '\\n', '\\r\\n', or '\\r'"
+                .to_string(),
+        )
+    })
 }
 
 fn parse_dialect_byte_string(value: Option<&Value>, field: &str) -> Result<u8, PluginError> {
@@ -201,12 +292,14 @@ fn dialect_for_filename(filename: Option<&str>, decoded: &str) -> CsvDialect {
         return CsvDialect {
             delimiter: metadata.dialect.delimiter,
             quote: metadata.dialect.quote,
+            terminator: CsvTerminator::detect(decoded),
         };
     }
 
     CsvDialect {
         delimiter: fallback_delimiter(filename, decoded),
         quote: Quote::Some(b'"'),
+        terminator: CsvTerminator::detect(decoded),
     }
 }
 
@@ -229,7 +322,7 @@ pub(crate) fn render_projection(projection: &Projection) -> Result<Vec<u8>, Plug
     writer_builder
         .has_headers(false)
         .delimiter(projection.dialect.delimiter)
-        .terminator(Terminator::Any(b'\n'));
+        .terminator(projection.dialect.terminator.to_csv_terminator());
     match projection.dialect.quote {
         Quote::None => {
             writer_builder.quote_style(QuoteStyle::Never);
