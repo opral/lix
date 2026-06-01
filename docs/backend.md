@@ -1,5 +1,5 @@
 ---
-description: Lix's storage is pluggable. Implement the LixBackend interface (a synchronous, transactional, namespaced key-value store) and Lix runs on top of it.
+description: Backends are Lix's system interface for durable storage. Implement the LixBackend interface (a transactional, namespaced key-value store) and Lix runs on top of it.
 ---
 
 # Backends
@@ -13,40 +13,48 @@ physical layout underneath those rows: pages, B-trees, LSM/SST files, WALs,
 checksums, caches, locks, compaction, and file/object placement. In other
 words, Lix defines *what facts exist*; the backend decides *how bytes are stored*.
 
+## The system interface
+
+The backend is where Lix crosses from the engine into the host system. Local
+files, SQLite, OPFS, object storage, locks, caches, and durability belong behind
+`LixBackend`.
+
+Plugins are different: they run as sandboxed WebAssembly components. A plugin
+receives engine-provided file/state inputs and returns semantic changes or
+rendered bytes, but it does not get ambient filesystem, network, or operating
+system access. If code transforms Lix data, it is probably a plugin. If code
+talks to the outside system where Lix data lives, it is a backend.
+
 ## What ships today
 
-| Backend                        | Module                          | Use for                              |
-| ------------------------------ | ------------------------------- | ------------------------------------ |
-| In-memory                      | default (no `backend` argument) | tests, demos, ephemeral work         |
-| SQLite file (`better-sqlite3`) | `@lix-js/sdk/sqlite`            | persistent, single-process Node apps |
+| Backend     | Module                          | Use for                      |
+| ----------- | ------------------------------- | ---------------------------- |
+| In-memory   | default (no `backend` argument) | tests, demos, ephemeral work |
+| SQLite file | `@lix-js/sdk`                   | persistent Node apps         |
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "/var/data/app.lix" }),
+  backend: new SqliteBackend({ path: "/var/data/app.lix" }),
 });
 ```
 
-Anything beyond these two is not shipped by the Lix team. Implement the `LixBackend` interface yourself and pass it to `openLix({ backend })`. This page is the contract.
+Anything beyond these two is not shipped by the Lix team. Custom backends
+implement the same contract for the host/runtime they target. This page is the
+contract.
 
-## Sync today, async on the roadmap
+## Runtime shape
 
-> The current `LixBackend` contract is **synchronous**. All methods return values directly, not promises.
+A backend may use local files, a native database binding, an async service, or
+another host-side runtime. It must preserve Lix's transaction, scan, ordering,
+and durability semantics while hiding the physical storage details from the
+engine.
 
-The JS SDK runs the engine inside WebAssembly and calls backend methods through synchronous wasm imports. That makes synchronous JS bindings the natural fit (`better-sqlite3` is sync; an in-memory `Map` is sync; native sync KV bindings work). Async-only Node libraries (`pg`, the AWS S3 SDK, IndexedDB, Cloudflare Durable Objects' storage) cannot drive the contract directly today.
+## Contract shape
 
-Practical paths today:
-
-- **Synchronous bindings.** `better-sqlite3`, in-memory data structures, sync OPFS access (`createSyncAccessHandle`), Neon-binding RocksDB, `node:sqlite` in newer Node versions.
-- **Sync-over-async bridges.** Worker threads with `Atomics.wait`, `deasync`, or similar approaches. These add operational complexity and are best avoided for production workloads.
-
-An async backend variant (where methods return `Promise<T>`) is on the roadmap so Postgres, IndexedDB, S3, and Durable Objects become first-class. Until then, treat the substrate list below as guidance for what *will* fit, not what's possible from the JS SDK today.
-
-## The full TypeScript contract
-
-These are the actual exported types from `@lix-js/sdk`:
+At a high level, a backend provides transactions over namespaced key-value
+storage:
 
 ```ts
 type LixBackend = {
@@ -175,7 +183,10 @@ type BackendKvWriteStats = {
 
 Every batch operation is grouped by `namespace: string`. Treat namespaces as logical tables; implementations typically map them to separate column families, prefixes, tables, or buckets.
 
-The current JS/WASM engine bridge sends engine storage through one namespace, `"default"`, and encodes Lix storage-space identity into the key bytes. Backends must still implement namespace isolation because the public backend contract supports multiple namespaces and direct backend tests may exercise them, but engine traffic today does not require dynamic namespace creation.
+Engine storage may use a small fixed set of namespaces and encode additional
+storage-space identity into the key bytes. Backends must still implement
+namespace isolation because the public backend contract supports multiple
+namespaces and direct backend tests may exercise them.
 
 ### Physical boundary
 
@@ -213,21 +224,30 @@ backend to store many unrelated facts inside one opaque value.
 
 ## Implementation notes by storage type
 
-The contract is small enough that **any transactional KV store with a synchronous binding can host Lix today**. The substrates below are good fits in principle; ones marked async-only require either a sync-over-async bridge or the upcoming async backend variant.
+The contract is small enough that many transactional KV-shaped substrates can
+host Lix:
 
-**Synchronous, ready today.** `better-sqlite3` (shipping), `node:sqlite` (Node 22+, sync), in-memory `Map`, OPFS via `createSyncAccessHandle` (web workers only), Neon/NAPI bindings to RocksDB or LMDB that expose sync APIs.
+**Local and embedded.** SQLite, in-memory stores, OPFS, RocksDB, LMDB, sled, or
+similar systems. Map namespaces to tables, column families, prefixes, or
+buckets. Native ranged iterators map directly to `scanKeys`.
 
-**Relational (Postgres, MySQL, SQLite-elsewhere)** (*async-only Node bindings*. One table per namespace, or a shared `(namespace, key)` PK table. Wrap each Lix transaction in a SQL transaction. Use repeatable-read isolation for reads, serializable or `SELECT ... FOR UPDATE` for writes. Postgres `bytea` matches Lix's byte-ordered scan requirement. Let the database own page layout, indexes, WAL, checkpoints, and vacuum/compaction; Lix only needs ordered transactional rows.
+**Relational.** Postgres, MySQL, or SQLite. Use one table per namespace, or a
+shared `(namespace, key)` primary-key table. Wrap each Lix transaction in a
+database transaction. Let the database own page layout, indexes, WAL,
+checkpoints, and vacuum/compaction; Lix only needs ordered transactional rows.
 
-**Object storage (S3, R2, GCS)** (*async-only*, plus not natively transactional. Coordinate writes via a manifest object plus conditional PUT (`If-Match`). For atomic multi-key batches: stage chunks → upload → swap the manifest pointer in one CAS.
+**Object storage.** S3, R2, or GCS are not natively transactional. A backend can
+coordinate writes with a manifest object and conditional PUT (`If-Match`): stage
+chunks, upload, then swap the manifest pointer in one CAS.
 
-**Cloudflare.** *async-only*. D1 fits the relational pattern. Durable Objects give you a single-writer mailbox per object, a natural fit for a per-tenant Lix. Cloudflare KV is eventually consistent without transactions; not enough on its own.
+**Cloudflare and browser storage.** D1 fits the relational pattern. Durable
+Objects give you a single-writer mailbox per object. IndexedDB and OPFS can fit
+if the backend preserves the required transaction and scan semantics. Cloudflare
+KV is eventually consistent without transactions; not enough on its own.
 
-**Browser.** *async-only* for IndexedDB, *sync if used in a worker* for OPFS. IndexedDB needs object stores declared at `onupgradeneeded`, so the namespace set must be known up front. The auto-commit-on-event-loop trap means buffered-write strategies are the only safe path.
-
-**Embedded KV (RocksDB, LMDB, sled)** fit varies by binding. The closest-shaped substrates; map namespaces to column families or key prefixes. Native ranged iterators map directly to `scanKeys`. Sync via Neon binding or N-API works today; async-only bindings will need the future async backend. Do not mirror Lix's old segment idea inside the backend; these engines already have blocks, pages, caches, and compaction.
-
-**Distributed KV (DynamoDB, FoundationDB, TiKV)** (*async-only* in JS. Native transactional semantics. Redis with `MULTI`/`EXEC` is workable for single-instance setups, but its weak isolation makes multi-writer risky.
+**Distributed KV.** DynamoDB, FoundationDB, and TiKV can fit when the backend
+uses their native transactional semantics. Redis with `MULTI`/`EXEC` is workable
+for single-instance setups, but its weak isolation makes multi-writer risky.
 
 ## Testing your backend
 
@@ -240,11 +260,15 @@ A conformance test suite is the right way to validate an implementation:
 - **Scan ordering.** Keys come back byte-lex; the same `after` cursor yields the same next page absent writes.
 - **Durability.** Close and reopen; committed data is still there.
 
-Run the same suite against the in-memory and `better-sqlite3` backends as a baseline.
+Run the same suite against the in-memory and SQLite backends as a baseline.
 
 ## Why this design
 
-The engine that implements branches, merge, schemas, change journals, and SQL queries is one piece of code. The storage is another. Keeping the contract small (synchronous, namespaced, transactional KV) is what makes it tractable to put Lix on a SQLite file today and on Postgres, S3, or Durable Objects once the async variant lands, without forking the engine.
+The engine that implements branches, merge, schemas, change journals, and SQL
+queries is one piece of code. The storage is another. Keeping the contract small
+(namespaced, transactional KV) is what makes it tractable to put Lix on a
+SQLite file, Postgres, S3, Durable Objects, or another system interface without
+forking the engine.
 
 That boundary is also why Lix writes rows instead of owning a universal
 on-disk pack format. Backends are better positioned to decide physical layout

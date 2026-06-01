@@ -1,5 +1,5 @@
 ---
-description: Open Lix in memory for tests, or persist to a .lix SQLite file via the better-sqlite3 backend. For other storage targets, implement the backend interface.
+description: Open Lix in memory for tests, or persist to a .lix SQLite file via SqliteBackend. For other storage targets, implement the backend interface.
 ---
 
 # Persistence
@@ -18,18 +18,17 @@ await lix.close();
 
 ## SQLite file (Node.js)
 
-Persist a Lix as a single `.lix` file using the `better-sqlite3` backend. Install `better-sqlite3` as a peer dependency:
+Persist a Lix as a single `.lix` file using `SqliteBackend`:
 
 ```bash
-npm install @lix-js/sdk better-sqlite3
+npm install @lix-js/sdk
 ```
 
 ```ts
-import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "/var/data/app.lix" }),
+  backend: new SqliteBackend({ path: "/var/data/app.lix" }),
 });
 
 // ... use it ...
@@ -47,7 +46,7 @@ import path from "node:path";
 
 const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: path.join(dir, "demo.lix") }),
+  backend: new SqliteBackend({ path: path.join(dir, "demo.lix") }),
 });
 ```
 

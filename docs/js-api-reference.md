@@ -4,7 +4,9 @@ description: "Reference for the JavaScript SDK Lix instance, transactions, execu
 
 # JavaScript API Reference
 
-The JavaScript SDK exports `openLix()` from `@lix-js/sdk`. It returns a `Lix` instance: an in-process handle to one Lix repository.
+The JavaScript SDK exports `openLix()` and `SqliteBackend` from `@lix-js/sdk`.
+`openLix()` returns a `Lix` instance: an in-process handle to one Lix
+repository.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -20,9 +22,17 @@ const lix = await openLix(options?);
 
 Options:
 
-| Option    | Type         | Description                                                          |
-| --------- | ------------ | -------------------------------------------------------------------- |
-| `backend` | `LixBackend` | Optional storage backend. Omit it for the default in-memory backend. |
+| Option    | Type            | Description                                                          |
+| --------- | --------------- | -------------------------------------------------------------------- |
+| `backend` | `SqliteBackend` | Optional storage backend. Omit it for the default in-memory backend. |
+
+```ts
+import { openLix, SqliteBackend } from "@lix-js/sdk";
+
+const lix = await openLix({
+  backend: new SqliteBackend({ path: "app.lix" }),
+});
+```
 
 ## Lix instance
 

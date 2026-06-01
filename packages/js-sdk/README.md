@@ -61,6 +61,5 @@ try {
 - The SDK is Node/native only right now; it is not browser-compatible.
 - The package is ESM-only.
 - The native addon is built from Rust and loaded by the TypeScript wrapper.
-- The public API is promise-based, but the current native implementation performs local SQLite work synchronously under the hood.
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
 - Use `Value.integer(...)`, `Value.real(...)`, `Value.text(...)`, `Value.json(...)`, or `Value.blob(...)` only when you need to pass an explicit native Lix value.
