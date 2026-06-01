@@ -5,6 +5,7 @@ use plugin_csv::{
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 fn file_from_bytes(id: &str, path: &str, data: &[u8]) -> PluginFile {
     PluginFile {
@@ -12,6 +13,14 @@ fn file_from_bytes(id: &str, path: &str, data: &[u8]) -> PluginFile {
         path: path.to_string(),
         data: data.to_vec(),
     }
+}
+
+fn csv_rows(prefix: &str, row_count: usize) -> Vec<u8> {
+    let mut rows = String::new();
+    for offset in 0..row_count {
+        writeln!(&mut rows, "{prefix}{offset}").unwrap();
+    }
+    rows.into_bytes()
 }
 
 fn active_state_row(change: PluginEntityChange) -> PluginActiveStateRow {
@@ -186,6 +195,26 @@ fn detects_initial_projection_and_renders_csv() {
 }
 
 #[test]
+fn detects_initial_csv_larger_than_fractional_halving_limit() {
+    let expected = csv_rows("row", 200);
+    let after = file_from_bytes("f1", "/large.csv", &expected);
+
+    let changes =
+        plugin_detect_changes(empty_state_context(), after).expect("detect_changes should succeed");
+
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
+            .count(),
+        200
+    );
+
+    let output = render_changes(changes).expect("render should succeed");
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn applies_delta_to_existing_csv() {
     let before_bytes = b"name,age\nAda,36\n";
     let after_bytes = b"name,age\nAda,37\nGrace,85\n";
@@ -198,6 +227,30 @@ fn applies_delta_to_existing_csv() {
     let output = render_active_state(apply_changes_to_active_state(before_state, changes))
         .expect("render should succeed");
 
+    assert_eq!(output, after_bytes);
+}
+
+#[test]
+fn appends_csv_rows_larger_than_fractional_halving_limit() {
+    let before_bytes = csv_rows("row", 1);
+    let after_bytes = csv_rows("row", 201);
+    let before = file_from_bytes("f1", "/append.csv", &before_bytes);
+    let after = file_from_bytes("f1", "/append.csv", &after_bytes);
+    let before_state = active_state_from_file(before);
+
+    let changes = plugin_detect_changes(state_context(before_state.clone()), after)
+        .expect("detect_changes should succeed");
+
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
+            .count(),
+        200
+    );
+
+    let output = render_active_state(apply_changes_to_active_state(before_state, changes))
+        .expect("render should succeed");
     assert_eq!(output, after_bytes);
 }
 
