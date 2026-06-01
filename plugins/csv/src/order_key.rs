@@ -1,34 +1,58 @@
-use crate::exports::lix::plugin::api::PluginError;
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct OrderKey(u128);
 
+#[derive(Clone, Debug)]
+pub(crate) struct OrderKeyRange {
+    lower: u128,
+    step: u128,
+    remainder: u128,
+    denominator: u128,
+    rank: u128,
+    count: u128,
+}
+
 impl OrderKey {
-    pub(crate) fn between(previous: Option<Self>, next: Option<Self>) -> Result<Self, PluginError> {
+    pub(crate) fn evenly_between(
+        previous: Option<Self>,
+        next: Option<Self>,
+        count: usize,
+    ) -> OrderKeyRange {
+        if count == 0 {
+            return OrderKeyRange {
+                lower: 0,
+                step: 0,
+                remainder: 0,
+                denominator: 1,
+                rank: 1,
+                count: 0,
+            };
+        }
+
         let lower = previous.map_or(0, |index| index.0);
         let upper = next.map_or(u128::MAX, |index| index.0);
         assert!(
             lower <= upper,
             "fractional index bounds are out of order: previous={previous:?}, next={next:?}"
         );
-        if lower == upper {
-            return Err(PluginError::InvalidInput(format!(
-                "cannot generate fractional index between identical indexes: {previous:?}"
-            )));
-        }
-        let gap = upper - lower;
-        if gap <= 1 {
-            return Err(PluginError::InvalidInput(format!(
-                "fractional index space exhausted between previous={previous:?} and next={next:?}"
-            )));
-        }
-        Ok(Self(lower + gap / 2))
-    }
 
-    #[cfg(test)]
-    pub(crate) fn evenly_spaced(offset: usize, len: usize) -> Self {
-        let step = u128::MAX / (len as u128 + 1);
-        Self(step * (offset as u128 + 1))
+        let gap = upper - lower;
+        let count = u128::try_from(count).unwrap();
+        assert!(
+            count < gap,
+            "TODO: fractional index space exhausted between previous={previous:?} and next={next:?}"
+        );
+
+        let denominator = count + 1;
+        let step = gap / denominator;
+        let remainder = gap % denominator;
+        OrderKeyRange {
+            lower,
+            step,
+            remainder,
+            denominator,
+            rank: 1,
+            count,
+        }
     }
 
     pub(crate) fn to_snapshot_string(self) -> String {
@@ -50,5 +74,21 @@ impl OrderKey {
         }
 
         Ok(Self(value))
+    }
+}
+
+impl Iterator for OrderKeyRange {
+    type Item = OrderKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rank > self.count {
+            return None;
+        }
+
+        let rank = self.rank;
+        self.rank += 1;
+        Some(OrderKey(
+            self.lower + self.step * rank + (self.remainder * rank) / self.denominator,
+        ))
     }
 }

@@ -38,6 +38,8 @@ pub use crate::exports::lix::plugin::api::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct CsvPlugin;
+#[cfg(target_family = "wasm")]
+export!(CsvPlugin);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Projection {
@@ -65,6 +67,12 @@ enum Op {
     Replace,
     Insert,
     Delete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OpRun {
+    op: Op,
+    len: usize,
 }
 
 impl Plugin for CsvPlugin {
@@ -99,46 +107,55 @@ fn detect_changes_for_rows(
     after_dialect: CsvDialect,
 ) -> Result<Vec<EntityChange>, PluginError> {
     let base = before.to_rows();
-    let ops = diff_by(&base, file_rows, |row, file_row| row.cells == *file_row).collect_vec();
+    let op_runs = diff_runs_by(&base, file_rows, |row, file_row| row.cells == *file_row);
     let mut changes = Vec::new();
     let mut rng = rand::rng();
     let mut base_index = 0;
     let mut file_index = 0;
     let mut previous_order_key = None;
 
-    for op in ops {
-        match op {
+    for run in op_runs {
+        match run.op {
             Op::Equal => {
-                previous_order_key = Some(base[base_index].order_key);
-                base_index += 1;
-                file_index += 1;
+                for _ in 0..run.len {
+                    previous_order_key = Some(base[base_index].order_key);
+                    base_index += 1;
+                    file_index += 1;
+                }
             }
             Op::Replace => {
-                let row = &base[base_index];
-                changes.push(row_upsert_change(
-                    &row.id,
-                    row.order_key,
-                    &file_rows[file_index],
-                )?);
-                previous_order_key = Some(row.order_key);
-                base_index += 1;
-                file_index += 1;
+                for _ in 0..run.len {
+                    let row = &base[base_index];
+                    changes.push(row_upsert_change(
+                        &row.id,
+                        row.order_key,
+                        &file_rows[file_index],
+                    )?);
+                    previous_order_key = Some(row.order_key);
+                    base_index += 1;
+                    file_index += 1;
+                }
             }
             Op::Delete => {
-                changes.push(EntityChange {
-                    entity_pk: base[base_index].id.clone(),
-                    schema_key: ROW_SCHEMA_KEY.to_string(),
-                    snapshot_content: None,
-                });
-                base_index += 1;
+                for _ in 0..run.len {
+                    changes.push(EntityChange {
+                        entity_pk: base[base_index].id.clone(),
+                        schema_key: ROW_SCHEMA_KEY.to_string(),
+                        snapshot_content: None,
+                    });
+                    base_index += 1;
+                }
             }
             Op::Insert => {
                 let next_order_key = base.get(base_index).map(|row| row.order_key);
-                let order_key = OrderKey::between(previous_order_key, next_order_key)?;
-                let id = RowId::random(&mut rng).to_entity_pk();
-                changes.push(row_upsert_change(&id, order_key, &file_rows[file_index])?);
-                previous_order_key = Some(order_key);
-                file_index += 1;
+                let order_keys =
+                    OrderKey::evenly_between(previous_order_key, next_order_key, run.len);
+                for order_key in order_keys {
+                    let id = RowId::random(&mut rng).to_entity_pk();
+                    changes.push(row_upsert_change(&id, order_key, &file_rows[file_index])?);
+                    previous_order_key = Some(order_key);
+                    file_index += 1;
+                }
             }
         }
     }
@@ -362,6 +379,25 @@ fn hex_char(value: u8) -> char {
     }
 }
 
+fn diff_runs_by<'a, T, U>(
+    a: &'a [T],
+    b: &'a [U],
+    eq: impl FnMut(&T, &U) -> bool + 'a,
+) -> impl Iterator<Item = OpRun> + 'a {
+    diff_by(a, b, eq)
+        .map(|op| OpRun { op, len: 1 })
+        .coalesce(|left, right| {
+            if left.op == right.op {
+                Ok(OpRun {
+                    op: left.op,
+                    len: left.len + right.len,
+                })
+            } else {
+                Err((left, right))
+            }
+        })
+}
+
 fn diff_by<'a, T, U>(
     a: &'a [T],
     b: &'a [U],
@@ -408,7 +444,7 @@ mod tests {
     fn fuzz_detect_changes_round_trips_rows() {
         let mut rng = SmallRng::seed_from_u64(0);
 
-        for _ in 0..10_000 {
+        for _ in 0..100_000 {
             let base_rows = random_csv(&mut rng);
             let file_rows = random_csv(&mut rng);
             let before = projection_from_rows(base_rows.clone());
@@ -455,18 +491,13 @@ mod tests {
     }
 
     fn projection_from_rows(rows: Vec<Vec<String>>) -> Projection {
-        let len = rows.len();
+        let order_keys = OrderKey::evenly_between(None, None, rows.len());
         let rows_by_id = rows
             .into_iter()
+            .zip(order_keys)
             .enumerate()
-            .map(|(offset, cells)| {
-                (
-                    format!("row:{offset}"),
-                    RowSnapshot {
-                        order_key: OrderKey::evenly_spaced(offset, len),
-                        cells,
-                    },
-                )
+            .map(|(offset, (cells, order_key))| {
+                (format!("row:{offset}"), RowSnapshot { order_key, cells })
             })
             .collect::<BTreeMap<_, _>>();
 
@@ -505,6 +536,3 @@ mod tests {
         Ok(())
     }
 }
-
-#[cfg(target_family = "wasm")]
-export!(CsvPlugin);
