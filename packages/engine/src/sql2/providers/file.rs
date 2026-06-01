@@ -69,12 +69,12 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-use crate::sql2::filesystem_planner::{
+use crate::filesystem::{
     BlobRefRowInput, DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput,
-    FileDescriptorWriteIntent, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
-    blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row,
-    file_descriptor_write_row, filesystem_storage_scope_key, plan_file_delete,
-    plan_file_path_update,
+    FileDescriptorWriteIntent, FilePathWriteInput, FilesystemBlobRefKey, FilesystemDeletePlan,
+    FilesystemDescriptorKey, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
+    directory_path_resolvers_from_state_rows, file_descriptor_row, file_descriptor_write_row,
+    filesystem_storage_scope_key, plan_file_delete, plan_file_path_update,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::session::SqlWriteSessionOptions;
@@ -688,8 +688,8 @@ impl ExecutionPlan for LixFileDeleteExec {
             )
             .await
             .map_err(lix_error_to_datafusion_error)?;
-            let blob_ref_file_ids =
-                blob_ref_file_ids_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+            let blob_ref_keys =
+                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
@@ -697,7 +697,7 @@ impl ExecutionPlan for LixFileDeleteExec {
             let staged = lix_file_delete_stage_from_batch(
                 &matched_batch,
                 branch_binding.active_branch_id(),
-                &blob_ref_file_ids,
+                &blob_ref_keys,
             )?;
             let count = staged.count;
 
@@ -855,6 +855,8 @@ impl ExecutionPlan for LixFileUpdateExec {
             )
             .await
             .map_err(lix_error_to_datafusion_error)?;
+            let blob_ref_keys =
+                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
@@ -877,6 +879,7 @@ impl ExecutionPlan for LixFileUpdateExec {
                 &assignment_values,
                 branch_binding.active_branch_id(),
                 update_columns,
+                &blob_ref_keys,
                 path_resolvers.as_mut(),
                 &mut || functions.call_uuid_v7().to_string(),
             )?;
@@ -1061,7 +1064,7 @@ struct FileDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: String,
-    hidden: bool,
+    key: FilesystemDescriptorKey,
     live: MaterializedLiveStateRow,
 }
 
@@ -1072,10 +1075,9 @@ struct BlobRefRecord {
 
 #[derive(Debug, Clone)]
 struct DirectoryDescriptorRecord {
-    id: String,
     parent_id: Option<String>,
     name: String,
-    branch_id: String,
+    key: FilesystemDescriptorKey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1083,7 +1085,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1113,10 +1114,7 @@ impl LixFileStagedBatch {
         self.count += other.count;
     }
 
-    fn extend_filesystem_plan(
-        &mut self,
-        plan: crate::sql2::filesystem_planner::FilesystemWritePlan,
-    ) {
+    fn extend_filesystem_plan(&mut self, plan: crate::filesystem::FilesystemWritePlan) {
         self.state_rows.extend(plan.rows);
         self.file_data_writes.extend(plan.file_data);
         self.count += plan.count;
@@ -1139,7 +1137,7 @@ fn lix_file_write_rows_from_batch(
 fn lix_file_delete_stage_from_batch(
     batch: &RecordBatch,
     branch_binding: Option<&str>,
-    blob_ref_file_ids: &BTreeSet<String>,
+    blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
     for row_index in 0..batch.num_rows() {
@@ -1147,17 +1145,18 @@ fn lix_file_delete_stage_from_batch(
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         staged.extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
             file_id: file_id.clone(),
-            has_blob_ref: blob_ref_file_ids.contains(&file_id),
+            has_blob_ref: blob_ref_keys
+                .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
             context,
         }));
     }
     Ok(staged)
 }
 
-fn blob_ref_file_ids_from_live_rows(
+fn blob_ref_keys_from_live_rows(
     rows: &[MaterializedLiveStateRow],
-) -> std::result::Result<BTreeSet<String>, LixError> {
-    let mut file_ids = BTreeSet::new();
+) -> std::result::Result<BTreeSet<FilesystemBlobRefKey>, LixError> {
+    let mut keys = BTreeSet::new();
     for row in rows {
         if row.schema_key != BLOB_REF_SCHEMA_KEY {
             continue;
@@ -1172,9 +1171,9 @@ fn blob_ref_file_ids_from_live_rows(
                     format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
                 )
             })?;
-        file_ids.insert(snapshot.id);
+        keys.insert(FilesystemBlobRefKey::from_live_row(row, snapshot.id));
     }
-    Ok(file_ids)
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -1231,6 +1230,7 @@ fn lix_file_existing_update_stage_from_batch(
     branch_binding: Option<&str>,
     include_descriptor_writes: bool,
     include_data_writes: bool,
+    blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
@@ -1238,8 +1238,6 @@ fn lix_file_existing_update_stage_from_batch(
 
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
-        let hidden = update_optional_bool_value(batch, assignment_values, row_index, "hidden")?
-            .unwrap_or(false);
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
 
@@ -1261,14 +1259,22 @@ fn lix_file_existing_update_stage_from_batch(
                     id: id.clone(),
                     directory_id,
                     name,
-                    hidden,
                     context: context.clone(),
                 }));
         }
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
-            stage_lix_file_data_write(&mut staged, id, data, context, None)?;
+            let has_blob_ref =
+                blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
+            stage_lix_file_data_update_write(
+                &mut staged,
+                id.clone(),
+                data,
+                context,
+                has_blob_ref,
+                None,
+            )?;
         }
 
         staged.count = staged
@@ -1311,6 +1317,7 @@ fn lix_file_update_stage_from_batch(
     assignment_values: &UpdateAssignmentValues,
     branch_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
+    blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
@@ -1326,6 +1333,7 @@ fn lix_file_update_stage_from_batch(
                 assignment_values,
                 branch_binding,
                 update_columns,
+                blob_ref_keys,
                 path_resolvers,
                 generate_directory_id,
             )
@@ -1336,6 +1344,7 @@ fn lix_file_update_stage_from_batch(
                 branch_binding,
                 update_columns.descriptor,
                 update_columns.data,
+                blob_ref_keys,
                 Some(path_resolvers),
             )
         };
@@ -1347,6 +1356,7 @@ fn lix_file_update_stage_from_batch(
         branch_binding,
         update_columns.descriptor,
         update_columns.data,
+        blob_ref_keys,
         None,
     )
 }
@@ -1356,6 +1366,7 @@ fn lix_file_path_update_stage_from_batch(
     assignment_values: &UpdateAssignmentValues,
     branch_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
+    blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
@@ -1364,8 +1375,6 @@ fn lix_file_path_update_stage_from_batch(
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
         let path = update_required_string_value(batch, assignment_values, row_index, "path")?;
-        let hidden = update_optional_bool_value(batch, assignment_values, row_index, "hidden")?
-            .unwrap_or(false);
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
         let assigned_data = if update_columns.data {
@@ -1386,7 +1395,6 @@ fn lix_file_path_update_stage_from_batch(
             resolver,
             id.clone(),
             path,
-            hidden,
             context.clone(),
             generate_directory_id,
         )
@@ -1394,7 +1402,16 @@ fn lix_file_path_update_stage_from_batch(
         staged.extend_filesystem_plan(plan);
 
         if let Some(data) = assigned_data {
-            stage_lix_file_data_write(&mut staged, id, data, context, None)?;
+            let has_blob_ref =
+                blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
+            stage_lix_file_data_update_write(
+                &mut staged,
+                id.clone(),
+                data,
+                context,
+                has_blob_ref,
+                None,
+            )?;
         }
     }
 
@@ -1446,7 +1463,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let path = optional_string_value(batch, row_index, "path")?;
         let id = optional_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         let data = if include_data_writes {
             insert_optional_binary_value(batch, row_index, "data")?
@@ -1472,13 +1488,12 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 ));
             };
             let file_id = id.unwrap_or_else(|| generate_directory_id());
-            let mut plan = crate::sql2::filesystem_planner::plan_file_path_write(
+            let mut plan = crate::filesystem::plan_file_path_write(
                 resolver,
                 FilePathWriteInput {
                     id: Some(file_id.clone()),
                     path,
                     data,
-                    hidden,
                     context,
                 },
                 generate_directory_id,
@@ -1523,7 +1538,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 id: id.clone(),
                 directory_id: directory_id.clone(),
                 name: name.clone(),
-                hidden,
                 context: context.clone(),
             });
             if let Some(file_id) = id.as_ref() {
@@ -1534,7 +1548,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         if let (Some(id), Some(data)) = (id, data) {
             let origin = Some(lix_file_insert_origin(surface_name, &id));
-            stage_lix_file_data_write(&mut staged, id, data, context, origin)?;
+            stage_lix_file_data_insert_write(&mut staged, id, data, context, origin)?;
         }
         staged.count = staged
             .count
@@ -1545,7 +1559,39 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
     Ok(staged)
 }
 
-fn stage_lix_file_data_write(
+fn stage_lix_file_data_insert_write(
+    staged: &mut LixFileStagedBatch,
+    file_id: String,
+    data: Vec<u8>,
+    context: FilesystemRowContext,
+    origin: Option<TransactionWriteOrigin>,
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    stage_lix_file_data_blob_write(staged, file_id, data, context, origin)
+}
+
+fn stage_lix_file_data_update_write(
+    staged: &mut LixFileStagedBatch,
+    file_id: String,
+    data: Vec<u8>,
+    context: FilesystemRowContext,
+    has_blob_ref: bool,
+    origin: Option<TransactionWriteOrigin>,
+) -> Result<()> {
+    if data.is_empty() {
+        if has_blob_ref {
+            let mut row = blob_ref_tombstone_row(file_id, context);
+            row.origin = origin;
+            staged.state_rows.push(row);
+        }
+        return Ok(());
+    }
+    stage_lix_file_data_blob_write(staged, file_id, data, context, origin)
+}
+
+fn stage_lix_file_data_blob_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
     data: Vec<u8>,
@@ -1700,8 +1746,8 @@ async fn lix_file_record_batch(
         .collect::<Vec<_>>();
     let needs_data = projected_columns.contains(&"data");
 
-    let mut file_rows = BTreeMap::<(String, String), FileDescriptorRecord>::new();
-    let mut blob_rows = BTreeMap::<(String, String), BlobRefRecord>::new();
+    let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
+    let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
     for row in rows {
@@ -1717,13 +1763,14 @@ async fn lix_file_record_batch(
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
+                let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
                 file_rows.insert(
-                    (row.branch_id.clone(), snapshot.id.clone()),
+                    key.clone(),
                     FileDescriptorRecord {
                         id: snapshot.id,
                         directory_id: snapshot.directory_id,
                         name: snapshot.name,
-                        hidden: snapshot.hidden,
+                        key,
                         live: row,
                     },
                 );
@@ -1740,7 +1787,7 @@ async fn lix_file_record_batch(
                         )
                     })?;
                 blob_rows.insert(
-                    (row.branch_id.clone(), snapshot.id.clone()),
+                    FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
                     BlobRefRecord {
                         blob_hash: snapshot.blob_hash,
                     },
@@ -1758,10 +1805,9 @@ async fn lix_file_record_batch(
                         )
                     })?;
                 directory_rows.push(DirectoryDescriptorRecord {
-                    id: snapshot.id,
+                    key: FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone()),
                     parent_id: snapshot.parent_id,
                     name: snapshot.name,
-                    branch_id: row.branch_id,
                 });
             }
             _ => {}
@@ -1773,7 +1819,6 @@ async fn lix_file_record_batch(
     let mut paths = Vec::new();
     let mut directory_ids = Vec::new();
     let mut names = Vec::new();
-    let mut hiddens = Vec::new();
     let mut data_values = Vec::new();
     let mut entity_pks = Vec::new();
     let mut schema_keys = Vec::new();
@@ -1787,16 +1832,16 @@ async fn lix_file_record_batch(
     let mut metadata_values = Vec::new();
     let mut branch_ids = Vec::new();
 
-    for ((branch_id, _), file) in file_rows {
+    for (_, file) in file_rows {
         let directory_path = match file.directory_id.as_ref() {
             Some(directory_id) => {
-                let key = (branch_id.clone(), directory_id.clone());
+                let key = file.key.in_same_scope(directory_id);
                 let Some(path) = directory_paths.get(&key).cloned() else {
                     return Err(LixError::new(
                         LixError::CODE_FOREIGN_KEY,
                         format!(
                             "lix_file_descriptor '{}' references missing directory_id '{}' in branch '{}'",
-                            file.id, directory_id, branch_id
+                            file.id, directory_id, file.live.branch_id
                         ),
                     ));
                 };
@@ -1809,9 +1854,16 @@ async fn lix_file_record_batch(
             None => format!("/{}", file.name),
         };
         let data = if needs_data {
-            match blob_rows.get(&(branch_id.clone(), file.id.clone())) {
+            let context = FilesystemRowContext {
+                branch_id: file.live.branch_id.clone(),
+                global: file.live.global,
+                untracked: file.live.untracked,
+                file_id: file.live.file_id.clone(),
+                metadata: None,
+            };
+            match blob_rows.get(&FilesystemBlobRefKey::from_context(&context, &file.id)) {
                 Some(blob_ref) => load_single_blob_bytes(blob_reader, &blob_ref.blob_hash).await?,
-                None => None,
+                None => Some(Vec::new()),
             }
         } else {
             None
@@ -1821,7 +1873,6 @@ async fn lix_file_record_batch(
         paths.push(Some(path));
         directory_ids.push(file.directory_id);
         names.push(Some(file.name));
-        hiddens.push(Some(file.hidden));
         data_values.push(data);
         entity_pks.push(Some(file.live.entity_pk.as_json_array_text()?));
         schema_keys.push(Some(file.live.schema_key));
@@ -1833,7 +1884,7 @@ async fn lix_file_record_batch(
         commit_ids.push(file.live.commit_id.map(|id| id.to_string()));
         untracked_values.push(Some(file.live.untracked));
         metadata_values.push(file.live.metadata.as_deref().map(serialize_row_metadata));
-        branch_ids.push(Some(branch_id));
+        branch_ids.push(Some(file.live.branch_id));
     }
 
     let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
@@ -1843,7 +1894,6 @@ async fn lix_file_record_batch(
             "path" => Arc::new(StringArray::from(paths.clone())),
             "directory_id" => Arc::new(StringArray::from(directory_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "hidden" => Arc::new(BooleanArray::from(hiddens.clone())),
             "data" => Arc::new(BinaryArray::from(
                 data_values
                     .iter()
@@ -1896,42 +1946,30 @@ async fn load_single_blob_bytes(
 
 fn derive_directory_paths(
     rows: &[DirectoryDescriptorRecord],
-) -> Result<BTreeMap<(String, String), String>, LixError> {
-    let mut by_branch = BTreeMap::<String, BTreeMap<String, &DirectoryDescriptorRecord>>::new();
+) -> Result<BTreeMap<FilesystemDescriptorKey, String>, LixError> {
+    let mut records = BTreeMap::<FilesystemDescriptorKey, &DirectoryDescriptorRecord>::new();
     for row in rows {
-        by_branch
-            .entry(row.branch_id.clone())
-            .or_default()
-            .insert(row.id.clone(), row);
+        records.insert(row.key.clone(), row);
     }
 
-    let mut paths = BTreeMap::<(String, String), String>::new();
-    for (branch_id, records) in by_branch {
-        for directory_id in records.keys() {
-            derive_directory_path_for(
-                &branch_id,
-                directory_id,
-                &records,
-                &mut paths,
-                &mut BTreeSet::new(),
-            )?;
-        }
+    let mut paths = BTreeMap::<FilesystemDescriptorKey, String>::new();
+    for directory_id in records.keys() {
+        derive_directory_path_for(directory_id, &records, &mut paths, &mut BTreeSet::new())?;
     }
     Ok(paths)
 }
 
 fn derive_directory_path_for(
-    branch_id: &str,
-    directory_id: &str,
-    records: &BTreeMap<String, &DirectoryDescriptorRecord>,
-    paths: &mut BTreeMap<(String, String), String>,
-    visiting: &mut BTreeSet<String>,
+    directory_id: &FilesystemDescriptorKey,
+    records: &BTreeMap<FilesystemDescriptorKey, &DirectoryDescriptorRecord>,
+    paths: &mut BTreeMap<FilesystemDescriptorKey, String>,
+    visiting: &mut BTreeSet<FilesystemDescriptorKey>,
 ) -> Result<Option<String>, LixError> {
-    if let Some(path) = paths.get(&(branch_id.to_string(), directory_id.to_string())) {
+    if let Some(path) = paths.get(directory_id) {
         return Ok(Some(path.clone()));
     }
-    if !visiting.insert(directory_id.to_string()) {
-        return Err(directory_parent_cycle_error(branch_id, directory_id));
+    if !visiting.insert(directory_id.clone()) {
+        return Err(directory_parent_cycle_error(directory_id));
     }
     let Some(row) = records.get(directory_id) else {
         visiting.remove(directory_id);
@@ -1939,8 +1977,9 @@ fn derive_directory_path_for(
     };
     let path = match row.parent_id.as_deref() {
         Some(parent_id) => {
+            let parent_key = directory_id.in_same_scope(parent_id);
             let Some(parent_path) =
-                derive_directory_path_for(branch_id, parent_id, records, paths, visiting)?
+                derive_directory_path_for(&parent_key, records, paths, visiting)?
             else {
                 visiting.remove(directory_id);
                 return Ok(None);
@@ -1950,18 +1989,15 @@ fn derive_directory_path_for(
         None => format!("/{}/", row.name),
     };
     visiting.remove(directory_id);
-    paths.insert(
-        (branch_id.to_string(), directory_id.to_string()),
-        path.clone(),
-    );
+    paths.insert(directory_id.clone(), path.clone());
     Ok(Some(path))
 }
 
-fn directory_parent_cycle_error(branch_id: &str, directory_id: &str) -> LixError {
+fn directory_parent_cycle_error(directory_id: &FilesystemDescriptorKey) -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!(
-            "lix_directory_descriptor parent_id cycle in branch '{branch_id}' while resolving directory '{directory_id}'"
+            "lix_directory_descriptor parent_id cycle while resolving directory {directory_id:?}"
         ),
     )
 }
@@ -2011,7 +2047,7 @@ fn lix_file_live_state_projection(projected_schema: Option<&Schema>) -> LiveStat
     let needs_snapshot = schema.fields().iter().any(|field| {
         matches!(
             field.name().as_str(),
-            "path" | "directory_id" | "name" | "hidden" | "data"
+            "path" | "directory_id" | "name" | "data"
         )
     });
     if needs_snapshot {
@@ -2265,7 +2301,7 @@ fn validate_lix_file_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "path" | "directory_id" | "name" | "hidden" | "data" | "lixcol_metadata"
+            "path" | "directory_id" | "name" | "data" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
@@ -2448,21 +2484,6 @@ fn update_optional_metadata_value(
         .transpose()
 }
 
-fn update_optional_bool_value(
-    batch: &RecordBatch,
-    assignment_values: &UpdateAssignmentValues,
-    row_index: usize,
-    column_name: &str,
-) -> Result<Option<bool>> {
-    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
-        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
-        InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(Some(value)),
-        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
-            "UPDATE lix_file expected boolean column '{column_name}', got {other:?}"
-        ))),
-    }
-}
-
 fn update_required_binary_value(
     _batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -2561,7 +2582,7 @@ fn insert_optional_binary_value(
         ) => Err(lix_file_data_type_error(
             "INSERT into lix_file",
             column_name,
-            "use X'' for an empty file or omit data to create a descriptor without contents",
+            "use X'' for an empty file or omit data to create an empty file",
         )),
         Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => {
             Ok(Some(value))
@@ -2607,8 +2628,7 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, false),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("hidden", DataType::Boolean, true),
-        Field::new("data", DataType::Binary, true),
+        Field::new("data", DataType::Binary, false),
         json_field("lixcol_entity_pk", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
@@ -2647,7 +2667,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, StringArray};
+    use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::{Column, ScalarValue};
@@ -2660,6 +2680,7 @@ mod tests {
     use crate::LixError;
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
@@ -2805,15 +2826,33 @@ mod tests {
         path_resolvers: Option<&mut BTreeMap<String, super::DirectoryPathResolver>>,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> datafusion::common::Result<super::LixFileStagedBatch> {
+        lix_file_update_stage_from_batch_with_blob_keys_for_test(
+            batch,
+            branch_binding,
+            update_columns,
+            path_resolvers,
+            generate_directory_id,
+            &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
+        )
+    }
+
+    fn lix_file_update_stage_from_batch_with_blob_keys_for_test(
+        batch: &RecordBatch,
+        branch_binding: Option<&str>,
+        update_columns: super::LixFileUpdateColumns,
+        path_resolvers: Option<&mut BTreeMap<String, super::DirectoryPathResolver>>,
+        generate_directory_id: &mut dyn FnMut() -> String,
+        blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
+    ) -> datafusion::common::Result<super::LixFileStagedBatch> {
         let mut columns = Vec::new();
         if update_columns.path {
-            columns.extend(["path", "hidden"]);
+            columns.push("path");
         }
         if update_columns.data {
             columns.push("data");
         }
         if update_columns.descriptor {
-            columns.extend(["directory_id", "name", "hidden"]);
+            columns.extend(["directory_id", "name"]);
         }
         let assignment_values = super::UpdateAssignmentValues::from_batch_columns(batch, &columns);
         super::lix_file_update_stage_from_batch(
@@ -2821,8 +2860,27 @@ mod tests {
             &assignment_values,
             branch_binding,
             update_columns,
+            blob_ref_keys,
             path_resolvers,
             generate_directory_id,
+        )
+    }
+
+    fn blob_ref_key(
+        branch_id: &str,
+        global: bool,
+        untracked: bool,
+        file_id: &str,
+    ) -> FilesystemBlobRefKey {
+        FilesystemBlobRefKey::from_context(
+            &FilesystemRowContext {
+                branch_id: branch_id.to_string(),
+                global,
+                untracked,
+                file_id: None,
+                metadata: None,
+            },
+            file_id,
         )
     }
 
@@ -2969,7 +3027,6 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("hidden", DataType::Boolean, false),
             Field::new("lixcol_global", DataType::Boolean, false),
             Field::new("lixcol_metadata", DataType::Utf8, true),
         ];
@@ -2977,7 +3034,6 @@ mod tests {
             string_column(vec![Some("file-readme")]),
             string_column(vec![Some("dir-docs")]),
             string_column(vec![Some("readme.md")]),
-            Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"file\"}")]),
         ];
@@ -2994,7 +3050,6 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
@@ -3002,7 +3057,6 @@ mod tests {
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("dir-docs")]),
                 string_column(vec![Some("readme.md")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
@@ -3015,14 +3069,12 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("/docs/guides/readme.md")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
@@ -3035,19 +3087,33 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("path", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("/docs/renamed.md")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
         )
         .expect("file path update batch")
+    }
+
+    fn empty_data_update_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                Arc::new(BinaryArray::from_vec(vec![b""])) as ArrayRef,
+                string_column(vec![Some("branch-b")]),
+            ],
+        )
+        .expect("empty file data update batch")
     }
 
     fn file_delete_batch() -> RecordBatch {
@@ -3066,32 +3132,25 @@ mod tests {
 
     #[test]
     fn derives_nested_directory_paths() {
+        let context = FilesystemRowContext::active_branch("branch-a");
         let root = DirectoryDescriptorRecord {
-            id: "dir-docs".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            branch_id: "branch-a".to_string(),
+            key: FilesystemDescriptorKey::from_context(&context, "dir-docs"),
         };
         let child = DirectoryDescriptorRecord {
-            id: "dir-guides".to_string(),
             parent_id: Some("dir-docs".to_string()),
             name: "guides".to_string(),
-            branch_id: "branch-a".to_string(),
+            key: FilesystemDescriptorKey::from_context(&context, "dir-guides"),
         };
         let mut records = BTreeMap::new();
-        records.insert(root.id.clone(), &root);
-        records.insert(child.id.clone(), &child);
+        records.insert(root.key.clone(), &root);
+        records.insert(child.key.clone(), &child);
         let mut paths = BTreeMap::new();
 
         assert_eq!(
-            derive_directory_path_for(
-                "branch-a",
-                "dir-guides",
-                &records,
-                &mut paths,
-                &mut BTreeSet::new()
-            )
-            .expect("path derivation should succeed"),
+            derive_directory_path_for(&child.key, &records, &mut paths, &mut BTreeSet::new())
+                .expect("path derivation should succeed"),
             Some("/docs/guides/".to_string())
         );
     }
@@ -3105,7 +3164,7 @@ mod tests {
             vec![live_file_row(
                 "file-readme",
                 "branch-b",
-                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\",\"hidden\":false}",
+                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\"}",
             )],
         )
         .await
@@ -3113,6 +3172,49 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
         assert!(error.message.contains("missing-dir"));
+    }
+
+    #[tokio::test]
+    async fn file_projection_keeps_same_id_descriptors_in_distinct_file_scopes() {
+        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
+        let mut scoped_file = live_file_row(
+            "file-readme",
+            "branch-b",
+            "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"scoped.md\"}",
+        );
+        scoped_file.file_id = Some("owner-file".to_string());
+        let batch = super::lix_file_record_batch(
+            &super::lix_file_schema(),
+            &blob_reader,
+            vec![
+                live_file_row(
+                    "file-readme",
+                    "branch-b",
+                    "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"root.md\"}",
+                ),
+                scoped_file,
+            ],
+        )
+        .await
+        .expect("same descriptor id in different file scopes should project");
+
+        assert_eq!(batch.num_rows(), 2);
+        let file_id_column = batch
+            .column(batch.schema().index_of("lixcol_file_id").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("lixcol_file_id should be string array");
+        let values = (0..batch.num_rows())
+            .map(|index| {
+                if file_id_column.is_null(index) {
+                    None
+                } else {
+                    Some(file_id_column.value(index).to_string())
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(values.contains(&None));
+        assert!(values.contains(&Some("owner-file".to_string())));
     }
 
     #[test]
@@ -3138,7 +3240,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -3224,7 +3325,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -3430,6 +3530,29 @@ mod tests {
     }
 
     #[test]
+    fn file_data_update_to_empty_ignores_blob_ref_in_other_scope() {
+        let staged = lix_file_update_stage_from_batch_with_blob_keys_for_test(
+            &empty_data_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: false,
+                data: true,
+                descriptor: false,
+            },
+            None,
+            &mut test_id_generator(&["should-not-be-used"]),
+            &BTreeSet::from([blob_ref_key("branch-a", false, false, "file-readme")]),
+        )
+        .expect("decode empty file data update");
+
+        assert_eq!(staged.count, 1);
+        assert!(
+            staged.state_rows.is_empty(),
+            "blob ref from another branch must not produce a tombstone"
+        );
+    }
+
+    #[test]
     fn file_insert_stages_non_null_data() {
         let batch = data_insert_batch();
 
@@ -3465,7 +3588,7 @@ mod tests {
         let staged = lix_file_delete_stage_from_batch(
             &batch,
             None,
-            &BTreeSet::from(["file-readme".to_string()]),
+            &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
         )
         .expect("decode file delete");
 
@@ -3510,6 +3633,21 @@ mod tests {
             Some(&crate::entity_pk::EntityPk::single("file-readme"))
         );
         assert_eq!(staged.state_rows[0].snapshot, None);
+    }
+
+    #[test]
+    fn file_delete_ignores_blob_ref_in_other_scope() {
+        let batch = file_delete_batch();
+        let staged = lix_file_delete_stage_from_batch(
+            &batch,
+            None,
+            &BTreeSet::from([blob_ref_key("branch-a", false, false, "file-readme")]),
+        )
+        .expect("decode file delete");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 1);
+        assert_eq!(staged.state_rows[0].schema_key, "lix_file_descriptor");
     }
 
     #[test]

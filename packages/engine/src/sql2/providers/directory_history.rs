@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
+use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
@@ -265,7 +265,6 @@ struct DirectoryHistoryRecord {
     id: String,
     parent_id: Option<String>,
     name: Option<String>,
-    hidden: Option<bool>,
     entry: HistoryEntry,
 }
 
@@ -276,7 +275,6 @@ struct DirectoryHistoryOutputRow {
     path: Option<String>,
     parent_id: Option<String>,
     name: Option<String>,
-    hidden: Option<bool>,
     descriptor_change: MaterializedChange,
     event: DirectoryHistoryEvent,
 }
@@ -296,7 +294,6 @@ struct DirectoryDescriptorSnapshot {
     id: String,
     parent_id: Option<String>,
     name: String,
-    hidden: Option<bool>,
 }
 
 async fn load_directory_history_rows<S>(
@@ -365,7 +362,6 @@ where
             path,
             parent_id: visible_descriptor.parent_id.clone(),
             name: visible_descriptor.name.clone(),
-            hidden: visible_descriptor.hidden,
             descriptor_change: visible_descriptor.entry.change.clone(),
             event,
         });
@@ -407,7 +403,6 @@ fn parse_directory_history_records(
                     id: entry.change.entity_pk.as_single_string_owned()?,
                     parent_id: None,
                     name: None,
-                    hidden: None,
                     entry: entry.clone(),
                 });
             };
@@ -422,7 +417,6 @@ fn parse_directory_history_records(
                 id: snapshot.id,
                 parent_id: snapshot.parent_id,
                 name: Some(snapshot.name),
-                hidden: Some(snapshot.hidden.unwrap_or(false)),
                 entry: entry.clone(),
             })
         })
@@ -542,9 +536,6 @@ fn directory_history_column_array(
         "path" => string_array(rows.iter().map(|row| row.path.as_deref())),
         "parent_id" => string_array(rows.iter().map(|row| row.parent_id.as_deref())),
         "name" => string_array(rows.iter().map(|row| row.name.as_deref())),
-        "hidden" => Arc::new(BooleanArray::from(
-            rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
-        )) as ArrayRef,
         HISTORY_COL_ENTITY_PK => Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| entity_pk_json_array(&row.entity_pk).map(Some))
@@ -605,7 +596,6 @@ pub(super) fn lix_directory_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        Field::new("hidden", DataType::Boolean, true),
         json_field(HISTORY_COL_ENTITY_PK, false),
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),

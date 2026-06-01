@@ -850,7 +850,7 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	const lix = await openLix();
 
 	await lix.execute(
-		"INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+		"INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
 		[
 			"history-binary-native-repro",
 			"/history/native-repro.bin",

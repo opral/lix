@@ -541,6 +541,13 @@ function LandingPage({
                   <span className="text-indigo-600">await</span>{" "}
                   <span className="text-gray-900">openLix</span>
                   <span className="text-gray-900">{"()"}</span>
+                  <span className="text-gray-900">;</span>
+                  <br />
+                  <span className="text-indigo-600">await</span>{" "}
+                  <span className="text-gray-900">lix.fs.writeFile</span>
+                  <span className="text-gray-900">{"("}</span>
+                  <span className="text-amber-600">"/hello.json"</span>
+                  <span className="text-gray-900">{", bytes)"}</span>
                 </div>
               </div>
             </div>

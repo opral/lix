@@ -26,6 +26,7 @@ mod common;
 pub(crate) mod domain;
 pub mod engine;
 pub(crate) mod entity_pk;
+pub(crate) mod filesystem;
 pub(crate) mod functions;
 pub(crate) mod init;
 #[allow(dead_code)]
@@ -82,9 +83,10 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
-    CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions, MergeBranchOutcome,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
-    MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
+    CreateBranchOptions, CreateBranchReceipt, FsDirEntry, FsDirEntryKind, FsMkdirOptions,
+    FsRmOptions, FsWriteOptions, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
+    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext, SessionFs,
     SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};

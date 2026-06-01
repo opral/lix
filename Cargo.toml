@@ -55,6 +55,7 @@ style = { level = "warn", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 
 # Our opinion
+bool_assert_comparison = "allow"
 collapsible_else_if = "allow"
 collapsible_if = "allow"
 doc_link_with_quotes = "allow"

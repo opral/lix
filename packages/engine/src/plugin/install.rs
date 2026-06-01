@@ -219,7 +219,6 @@ fn prepare_plugin_archive_write_statement(
         directory_id: plugin_directory_id.to_string(),
         name: parsed_path.name.clone(),
         metadata: None,
-        hidden: false,
     };
     let target_branch_id = context.target_branch_id();
     let filesystem_state = PlannedFilesystemState {
@@ -312,7 +311,6 @@ fn plugin_archive_file_descriptor_row(
         "id": archive_id,
         "directory_id": descriptor.directory_id,
         "name": descriptor.name,
-        "hidden": descriptor.hidden,
     })
     .to_string();
     let mut values = BTreeMap::new();

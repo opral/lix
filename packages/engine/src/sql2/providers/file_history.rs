@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray};
+use datafusion::arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
@@ -299,7 +299,6 @@ struct FileHistoryDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: Option<String>,
-    hidden: Option<bool>,
     entry: HistoryEntry,
 }
 
@@ -336,7 +335,6 @@ struct FileHistoryOutputRow {
     path: Option<String>,
     directory_id: Option<String>,
     name: Option<String>,
-    hidden: Option<bool>,
     data: Option<Vec<u8>>,
     descriptor_change: MaterializedChange,
     event: FileHistoryEvent,
@@ -347,7 +345,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,10 +422,10 @@ where
             continue;
         };
         let blob = nearest_blob_ref(&blobs, &event);
-        let data = if needs_data {
+        let data = if needs_data && descriptor.name.is_some() {
             match blob.and_then(|blob| blob.blob_hash.as_deref()) {
                 Some(blob_hash) => load_single_blob_bytes(blob_reader, blob_hash).await?,
-                None => None,
+                None => Some(Vec::new()),
             }
         } else {
             None
@@ -448,7 +445,6 @@ where
             path,
             directory_id: descriptor.directory_id.clone(),
             name: descriptor.name.clone(),
-            hidden: descriptor.hidden,
             data,
             descriptor_change: descriptor.entry.change.clone(),
             event,
@@ -593,7 +589,6 @@ fn parse_file_history_descriptors(
                     id: entry.change.entity_pk.as_single_string_owned()?,
                     directory_id: None,
                     name: None,
-                    hidden: None,
                     entry: entry.clone(),
                 });
             };
@@ -608,7 +603,6 @@ fn parse_file_history_descriptors(
                 id: snapshot.id,
                 directory_id: snapshot.directory_id,
                 name: Some(snapshot.name),
-                hidden: Some(snapshot.hidden),
                 entry: entry.clone(),
             })
         })
@@ -815,9 +809,6 @@ fn file_history_column_array(
         "path" => string_array(rows.iter().map(|row| row.path.as_deref())),
         "directory_id" => string_array(rows.iter().map(|row| row.directory_id.as_deref())),
         "name" => string_array(rows.iter().map(|row| row.name.as_deref())),
-        "hidden" => Arc::new(BooleanArray::from(
-            rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
-        )) as ArrayRef,
         "data" => Arc::new(BinaryArray::from(
             rows.iter()
                 .map(|row| row.data.as_deref())
@@ -883,7 +874,6 @@ pub(super) fn lix_file_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
         json_field(HISTORY_COL_ENTITY_PK, false),
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),

@@ -5701,7 +5701,6 @@ mod tests {
                     "id": file_id,
                     "directory_id": null,
                     "name": file_id,
-                    "hidden": false,
                 })
                 .to_string(),
             ),
@@ -5730,7 +5729,6 @@ mod tests {
                     "id": directory_id,
                     "parent_id": parent_id,
                     "name": name,
-                    "hidden": false,
                 })
                 .to_string(),
             ),

@@ -1904,7 +1904,7 @@ mod tests {
     fn bind_statement_preserves_parameterized_by_branch_scope_selectors() {
         let update = bind_statement(
             &parse_statement(
-                "UPDATE lix_file_by_branch SET hidden = true WHERE id = 'file1' AND lixcol_branch_id = $1",
+                "UPDATE lix_file_by_branch SET name = 'renamed.txt' WHERE id = 'file1' AND lixcol_branch_id = $1",
             ),
             &[],
             "branch1",
@@ -2175,8 +2175,9 @@ mod tests {
 
     #[test]
     fn bind_statement_rejects_by_branch_writes_without_branch_selector() {
-        let statement =
-            parse_statement("UPDATE lix_file_by_branch SET hidden = true WHERE id = 'file1'");
+        let statement = parse_statement(
+            "UPDATE lix_file_by_branch SET name = 'renamed.txt' WHERE id = 'file1'",
+        );
         let error = bind_statement(&statement, &[], "branch1")
             .expect_err("by-branch writes should require explicit branch predicate");
 

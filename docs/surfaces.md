@@ -109,12 +109,12 @@ When you need the typed columns, reach for the per-entity sugar. When you're que
 | `lix_file_by_version` | Read or write files across versions. |
 | `lix_file_history` | Walk previous versions of a file's bytes through the commit graph. |
 
-User columns: `id`, `path`, `directory_id`, `name`, `hidden`, `data`. System columns are `lixcol_*` (`lixcol_version_id` on `_by_version`; `lixcol_start_commit_id`, `lixcol_depth`, `lixcol_observed_commit_id` on `_history`).
+User columns: `id`, `path`, `directory_id`, `name`, `data`. System columns are `lixcol_*` (`lixcol_version_id` on `_by_version`; `lixcol_start_commit_id`, `lixcol_depth`, `lixcol_observed_commit_id` on `_history`).
 
 ```sql
 -- Write a file into the active version
-INSERT INTO lix_file (id, path, data, hidden)
-VALUES ('orders-file', '/orders.xlsx', $1, false);
+INSERT INTO lix_file (path, data)
+VALUES ('/orders.xlsx', ?);
 
 -- Current bytes of a file
 SELECT data FROM lix_file WHERE path = '/orders.xlsx';
@@ -144,7 +144,7 @@ Same shape as files, minus the `data` column.
 | `lix_directory_by_version` | Cross-version directory reads/writes. |
 | `lix_directory_history` | Directory history walked through commits. |
 
-User columns: `id`, `path`, `parent_id`, `name`, `hidden`. Same `lixcol_*` system columns as files. Directory paths must end with a trailing slash (`/data/`, not `/data`).
+User columns: `id`, `path`, `parent_id`, `name`. Same `lixcol_*` system columns as files. Directory paths must end with a trailing slash (`/data/`, not `/data`).
 
 Inserting a `lix_file` at `/a/b/c.txt` auto-creates `lix_directory` rows for `/a/` and `/a/b/` if they don't already exist; you only need to insert directories explicitly when you want them to exist before any file does.
 

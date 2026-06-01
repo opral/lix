@@ -12,12 +12,11 @@ use crate::common::{
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 
-use super::filesystem_visibility::VisibleFilesystem;
+use super::keys::{
+    BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
+};
+use super::visibility::VisibleFilesystem;
 use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
-
-pub(crate) const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-pub(crate) const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-pub(crate) const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
 /// Planned filesystem write output after SQL surface columns have been lowered
 /// into state rows and optional file payload writes.
@@ -63,12 +62,83 @@ impl FilesystemRowContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FilesystemDescriptorKey {
+    branch_id: String,
+    global: bool,
+    untracked: bool,
+    file_id: Option<String>,
+    descriptor_id: String,
+}
+
+impl FilesystemDescriptorKey {
+    pub(crate) fn from_context(context: &FilesystemRowContext, descriptor_id: &str) -> Self {
+        Self {
+            branch_id: context.branch_id.clone(),
+            global: context.global,
+            untracked: context.untracked,
+            file_id: context.file_id.clone(),
+            descriptor_id: descriptor_id.to_string(),
+        }
+    }
+
+    pub(crate) fn from_live_row(
+        row: &MaterializedLiveStateRow,
+        descriptor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id: row.branch_id.clone(),
+            global: row.global,
+            untracked: row.untracked,
+            file_id: row.file_id.clone(),
+            descriptor_id: descriptor_id.into(),
+        }
+    }
+
+    pub(crate) fn in_same_scope(&self, descriptor_id: &str) -> Self {
+        Self {
+            branch_id: self.branch_id.clone(),
+            global: self.global,
+            untracked: self.untracked,
+            file_id: self.file_id.clone(),
+            descriptor_id: descriptor_id.to_string(),
+        }
+    }
+}
+
+/// Storage identity of a `lix_binary_blob_ref` row for a filesystem file.
+///
+/// File descriptors and their blob refs do not have identical row scopes:
+/// blob refs are file-scoped to the file they describe. Callers should derive
+/// this key from the descriptor lane plus the descriptor id instead of joining
+/// blob refs by id alone.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FilesystemBlobRefKey(FilesystemDescriptorKey);
+
+impl FilesystemBlobRefKey {
+    pub(crate) fn from_context(context: &FilesystemRowContext, file_id: &str) -> Self {
+        Self(FilesystemDescriptorKey {
+            branch_id: context.branch_id.clone(),
+            global: context.global,
+            untracked: context.untracked,
+            file_id: Some(file_id.to_string()),
+            descriptor_id: file_id.to_string(),
+        })
+    }
+
+    pub(crate) fn from_live_row(
+        row: &MaterializedLiveStateRow,
+        blob_ref_id: impl Into<String>,
+    ) -> Self {
+        Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectoryDescriptorRowInput {
     pub(crate) id: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: bool,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -77,7 +147,6 @@ pub(crate) struct FileDescriptorRowInput {
     pub(crate) id: String,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: bool,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -86,7 +155,6 @@ pub(crate) struct DirectoryDescriptorWriteIntent {
     pub(crate) id: Option<String>,
     pub(crate) parent_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -95,7 +163,6 @@ pub(crate) struct FileDescriptorWriteIntent {
     pub(crate) id: Option<String>,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -111,7 +178,6 @@ pub(crate) struct FilePathWriteInput {
     pub(crate) id: Option<String>,
     pub(crate) path: String,
     pub(crate) data: Option<Vec<u8>>,
-    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -220,17 +286,9 @@ impl DirectoryPathResolver {
         &mut self,
         directory_path: &str,
         context: FilesystemRowContext,
-        hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        self.plan_directory_path(
-            directory_path,
-            None,
-            context,
-            hidden,
-            generate_directory_id,
-            false,
-        )
+        self.plan_directory_path(directory_path, None, context, generate_directory_id, false)
     }
 
     pub(crate) fn create_directory_path_with_leaf_id(
@@ -238,14 +296,12 @@ impl DirectoryPathResolver {
         directory_path: &str,
         leaf_id: Option<String>,
         context: FilesystemRowContext,
-        hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
         self.plan_directory_path(
             directory_path,
             leaf_id,
             context,
-            hidden,
             generate_directory_id,
             true,
         )
@@ -256,7 +312,6 @@ impl DirectoryPathResolver {
         directory_path: &str,
         leaf_id: Option<String>,
         context: FilesystemRowContext,
-        hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
         reject_existing_leaf: bool,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
@@ -299,7 +354,6 @@ impl DirectoryPathResolver {
                 id: id.clone(),
                 parent_id,
                 name,
-                hidden,
                 context: FilesystemRowContext {
                     // Directory descriptors are their own filesystem state row,
                     // even when they are implicitly planned from a file insert.
@@ -389,7 +443,6 @@ pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> Tr
         id: Some(input.id),
         parent_id: input.parent_id,
         name: input.name,
-        hidden: Some(input.hidden),
         context: input.context,
     })
 }
@@ -399,7 +452,6 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> TransactionW
         id: Some(input.id),
         directory_id: input.directory_id,
         name: input.name,
-        hidden: Some(input.hidden),
         context: input.context,
     })
 }
@@ -420,9 +472,6 @@ pub(crate) fn directory_descriptor_write_row(
             .unwrap_or(JsonValue::Null),
     );
     snapshot.insert("name".to_string(), JsonValue::String(input.name));
-    if let Some(hidden) = input.hidden {
-        snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
-    }
 
     partial_state_row(
         input.id,
@@ -446,9 +495,6 @@ pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> Tra
             .unwrap_or(JsonValue::Null),
     );
     snapshot.insert("name".to_string(), JsonValue::String(input.name));
-    if let Some(hidden) = input.hidden {
-        snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
-    }
 
     partial_state_row(
         input.id,
@@ -485,6 +531,21 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow
     ))
 }
 
+pub(crate) fn blob_ref_tombstone_row(
+    file_id: String,
+    context: FilesystemRowContext,
+) -> TransactionWriteRow {
+    tombstone_row(
+        file_id.clone(),
+        BLOB_REF_SCHEMA_KEY,
+        FilesystemRowContext {
+            file_id: Some(file_id),
+            metadata: None,
+            ..context
+        },
+    )
+}
+
 pub(crate) fn plan_file_path_write(
     resolver: &mut DirectoryPathResolver,
     input: FilePathWriteInput,
@@ -499,7 +560,6 @@ pub(crate) fn plan_file_path_write(
             rows.extend(resolver.ensure_directory_path(
                 directory_path.as_str(),
                 input.context.clone(),
-                false,
                 generate_directory_id,
             )?);
             resolver
@@ -514,12 +574,11 @@ pub(crate) fn plan_file_path_write(
         id: file_id.clone(),
         directory_id,
         name: parsed.name.clone(),
-        hidden: input.hidden.unwrap_or(false),
         context: input.context.clone(),
     }));
 
     let mut file_data = Vec::new();
-    if let Some(data) = input.data {
+    if let Some(data) = input.data.filter(|data| !data.is_empty()) {
         rows.push(blob_ref_row(BlobRefRowInput {
             file_id: file_id.clone(),
             data: data.clone(),
@@ -548,7 +607,6 @@ pub(crate) fn plan_file_path_update(
     resolver: &mut DirectoryPathResolver,
     existing_file_id: String,
     new_path: String,
-    existing_hidden: bool,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
@@ -560,7 +618,6 @@ pub(crate) fn plan_file_path_update(
             rows.extend(resolver.ensure_directory_path(
                 directory_path.as_str(),
                 context.clone(),
-                false,
                 generate_directory_id,
             )?);
             resolver
@@ -579,7 +636,6 @@ pub(crate) fn plan_file_path_update(
         id: existing_file_id,
         directory_id,
         name: parsed.name.clone(),
-        hidden: existing_hidden,
         context,
     }));
 
@@ -596,22 +652,11 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
     let mut rows = vec![tombstone_row(
         input.file_id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        FilesystemRowContext {
-            file_id: None,
-            ..input.context.clone()
-        },
+        input.context.clone(),
     )];
 
     if input.has_blob_ref {
-        rows.push(tombstone_row(
-            input.file_id.clone(),
-            BLOB_REF_SCHEMA_KEY,
-            FilesystemRowContext {
-                file_id: Some(input.file_id),
-                metadata: None,
-                ..input.context
-            },
-        ));
+        rows.push(blob_ref_tombstone_row(input.file_id.clone(), input.context));
     }
 
     FilesystemDeletePlan { rows, count: 1 }
@@ -622,10 +667,7 @@ pub(crate) fn plan_directory_delete(input: DirectoryDeleteInput) -> FilesystemDe
         rows: vec![tombstone_row(
             input.directory_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            FilesystemRowContext {
-                file_id: None,
-                ..input.context
-            },
+            input.context,
         )],
         count: 1,
     }
@@ -738,8 +780,9 @@ pub(crate) fn filesystem_storage_scope_key(
     file_id: Option<&str>,
 ) -> String {
     format!(
-        "branch={branch_id}\0global={global}\0untracked={untracked}\0file_id={}",
-        file_id.unwrap_or("<null>")
+        "branch={branch_id}\0global={global}\0untracked={untracked}\0file_id_present={}\0file_id={}",
+        file_id.is_some(),
+        file_id.unwrap_or("")
     )
 }
 
@@ -842,21 +885,28 @@ fn collect_recursive_directory_delete(
 ) {
     if let Some(child_ids) = visible_filesystem
         .directory_children_by_parent_id
-        .get(&Some(directory_id.to_string()))
+        .get(&Some(FilesystemDescriptorKey::from_context(
+            context,
+            directory_id,
+        )))
     {
         for child_id in child_ids {
             collect_recursive_directory_delete(child_id, visible_filesystem, context, rows, count);
         }
     }
 
-    if let Some(files) = visible_filesystem
-        .files_by_directory_id
-        .get(&Some(directory_id.to_string()))
+    if let Some(files) =
+        visible_filesystem
+            .files_by_directory_id
+            .get(&Some(FilesystemDescriptorKey::from_context(
+                context,
+                directory_id,
+            )))
     {
         for file_id in files {
             let plan = plan_file_delete(FileDeleteInput {
                 file_id: file_id.clone(),
-                has_blob_ref: visible_filesystem.blob_refs_by_file_id.contains(file_id),
+                has_blob_ref: visible_filesystem.has_blob_ref(context, file_id),
                 context: context.clone(),
             });
             rows.extend(plan.rows);
@@ -876,17 +926,22 @@ fn collect_recursive_directory_delete(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use serde_json::Value as JsonValue;
+    use serde_json::{Value as JsonValue, json};
 
+    use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
+    use crate::transaction::types::TransactionJson;
 
     use super::{
-        BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput, DirectoryPathResolver,
-        FileDeleteInput, FileDescriptorRowInput, FilePathWriteInput, FilesystemRowContext,
-        blob_ref_row, directory_descriptor_row, file_descriptor_row, plan_file_path_update,
-        plan_file_path_write,
+        BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
+        DirectoryDescriptorWriteIntent, DirectoryPathResolver, FileDeleteInput,
+        FileDescriptorRowInput, FileDescriptorWriteIntent, FilePathWriteInput,
+        FilesystemRowContext, blob_ref_row, directory_descriptor_row,
+        directory_descriptor_write_row, file_descriptor_row, file_descriptor_write_row,
+        plan_file_path_update, plan_file_path_write,
     };
-    use crate::sql2::filesystem_visibility::VisibleFilesystem;
+    use crate::filesystem::VisibleFilesystem;
     use crate::{entity_pk::EntityPk, live_state::MaterializedLiveStateRow};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
@@ -900,7 +955,6 @@ mod tests {
             id: "dir-docs".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            hidden: false,
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
@@ -911,7 +965,6 @@ mod tests {
         assert_eq!(snapshot["id"], "dir-docs");
         assert_eq!(snapshot["parent_id"], JsonValue::Null);
         assert_eq!(snapshot["name"], "docs");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -920,7 +973,6 @@ mod tests {
             id: "file-readme".to_string(),
             directory_id: Some("dir-docs".to_string()),
             name: "readme.md".to_string(),
-            hidden: false,
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
@@ -960,6 +1012,31 @@ mod tests {
     }
 
     #[test]
+    fn directory_path_resolver_handles_root_directory() {
+        let mut resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+
+        let rows = resolver
+            .ensure_directory_path(
+                "/",
+                FilesystemRowContext::active_branch("branch-a"),
+                &mut test_id_generator(&["should-not-be-used"]),
+            )
+            .expect("root directory ensure should be a no-op");
+        assert!(rows.is_empty());
+
+        let error = resolver
+            .create_directory_path_with_leaf_id(
+                "/",
+                Some("dir-root".to_string()),
+                FilesystemRowContext::active_branch("branch-a"),
+                &mut test_id_generator(&["should-not-be-used"]),
+            )
+            .expect_err("explicit root directory create should be rejected");
+        assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
+    }
+
+    #[test]
     fn directory_path_resolver_reuses_existing_ancestor() {
         let mut resolver =
             DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
@@ -969,7 +1046,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("directory path should plan");
@@ -996,7 +1072,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-docs"]),
             )
             .expect("top-level directory should plan");
@@ -1006,7 +1081,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("nested directory should plan");
@@ -1028,7 +1102,6 @@ mod tests {
                 "/docs/nested/",
                 Some("dir-nested".to_string()),
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-docs"]),
             )
             .expect("directory path should plan");
@@ -1058,7 +1131,6 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["dir-generated-docs", "dir-generated-nested"]),
             )
             .expect("directory path should plan");
@@ -1068,11 +1140,37 @@ mod tests {
             .ensure_directory_path(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("branch-a"),
-                false,
                 &mut test_id_generator(&["should-not-be-used"]),
             )
             .expect("directory path should plan");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn file_path_write_supports_root_file_generated_id_and_no_data() {
+        let mut resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+
+        let plan = plan_file_path_write(
+            &mut resolver,
+            FilePathWriteInput {
+                id: None,
+                path: "/readme.md".to_string(),
+                data: None,
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&["file-generated-readme"]),
+        )
+        .expect("root file path write should plan");
+
+        assert_eq!(plan.count, 1);
+        assert!(plan.file_data.is_empty());
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(plan.rows[0].schema_key, "lix_file_descriptor");
+        let snapshot: JsonValue = plan.rows[0].snapshot.as_ref().unwrap().value().clone();
+        assert_eq!(snapshot["id"], "file-generated-readme");
+        assert_eq!(snapshot["directory_id"], JsonValue::Null);
+        assert_eq!(snapshot["name"], "readme.md");
     }
 
     #[test]
@@ -1086,7 +1184,6 @@ mod tests {
                 id: Some("file-readme".to_string()),
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                hidden: Some(false),
                 context: FilesystemRowContext::active_branch("branch-a"),
             },
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
@@ -1137,7 +1234,6 @@ mod tests {
                 id: Some("file-readme".to_string()),
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                hidden: Some(false),
                 context: FilesystemRowContext::active_branch("branch-a"),
             },
             &mut test_id_generator(&["should-not-be-used"]),
@@ -1162,6 +1258,121 @@ mod tests {
     }
 
     #[test]
+    fn file_path_planners_reject_representative_invalid_paths_before_staging() {
+        let mut file_resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+        let file_error = plan_file_path_write(
+            &mut file_resolver,
+            FilePathWriteInput {
+                id: Some("file-invalid".to_string()),
+                path: "/docs/".to_string(),
+                data: None,
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect_err("directory-looking path should not plan as a file");
+        assert!(!file_error.message.is_empty());
+        assert_eq!(file_resolver.directory_id("/docs/").unwrap(), None);
+
+        let mut directory_resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+        let directory_error = directory_resolver
+            .ensure_directory_path(
+                "/docs",
+                FilesystemRowContext::active_branch("branch-a"),
+                &mut test_id_generator(&["should-not-be-used"]),
+            )
+            .expect_err("file-looking path should not plan as a directory");
+        assert!(!directory_error.message.is_empty());
+        assert_eq!(directory_resolver.directory_id("/docs/").unwrap(), None);
+    }
+
+    #[test]
+    fn directory_path_resolver_rejects_namespace_conflicts() {
+        let mut existing_file_resolver = DirectoryPathResolver::from_existing_filesystem(
+            std::iter::empty(),
+            [(None, "docs".to_string(), "file-docs".to_string())],
+        )
+        .expect("resolver should seed existing file");
+        let error = existing_file_resolver
+            .ensure_directory_path(
+                "/docs/",
+                FilesystemRowContext::active_branch("branch-a"),
+                &mut test_id_generator(&["dir-docs"]),
+            )
+            .expect_err("existing file should block directory with same name");
+        assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
+
+        let mut existing_directory_resolver =
+            DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
+                .expect("resolver should seed existing directory");
+        let error = plan_file_path_write(
+            &mut existing_directory_resolver,
+            FilePathWriteInput {
+                id: Some("file-docs".to_string()),
+                path: "/docs".to_string(),
+                data: None,
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect_err("existing directory should block file with same name");
+        assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
+
+        let mut duplicate_file_resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+        plan_file_path_write(
+            &mut duplicate_file_resolver,
+            FilePathWriteInput {
+                id: Some("file-first".to_string()),
+                path: "/readme.md".to_string(),
+                data: None,
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&[]),
+        )
+        .expect("first file should plan");
+        let error = plan_file_path_write(
+            &mut duplicate_file_resolver,
+            FilePathWriteInput {
+                id: Some("file-second".to_string()),
+                path: "/readme.md".to_string(),
+                data: None,
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&[]),
+        )
+        .expect_err("same path with different file id should conflict");
+        assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
+    }
+
+    #[test]
+    fn directory_path_resolver_rejects_duplicate_explicit_directory_create() {
+        let mut resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+
+        resolver
+            .create_directory_path_with_leaf_id(
+                "/docs/",
+                Some("dir-docs".to_string()),
+                FilesystemRowContext::active_branch("branch-a"),
+                &mut test_id_generator(&[]),
+            )
+            .expect("first explicit directory create should plan");
+
+        let error = resolver
+            .create_directory_path_with_leaf_id(
+                "/docs/",
+                Some("dir-docs-again".to_string()),
+                FilesystemRowContext::active_branch("branch-a"),
+                &mut test_id_generator(&[]),
+            )
+            .expect_err("duplicate explicit directory create should be rejected");
+        assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
+    }
+
+    #[test]
     fn file_path_update_reuses_existing_parent_and_preserves_data() {
         let mut resolver =
             DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
@@ -1171,7 +1382,6 @@ mod tests {
             &mut resolver,
             "file-readme".to_string(),
             "/docs/renamed.md".to_string(),
-            false,
             FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
@@ -1190,7 +1400,6 @@ mod tests {
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
-        assert_eq!(snapshot["hidden"], false);
     }
 
     #[test]
@@ -1202,7 +1411,6 @@ mod tests {
             &mut resolver,
             "file-readme".to_string(),
             "/docs/guides/readme.md".to_string(),
-            true,
             FilesystemRowContext::active_branch("branch-a"),
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
@@ -1232,7 +1440,141 @@ mod tests {
         let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
-        assert_eq!(snapshot["hidden"], true);
+    }
+
+    #[test]
+    fn filesystem_rows_propagate_partial_ids_and_context() {
+        let metadata = TransactionJson::from_value_for_test(json!({"source":"filesystem-test"}));
+        let context = FilesystemRowContext {
+            branch_id: "branch-a".to_string(),
+            global: true,
+            untracked: true,
+            file_id: Some("context-file".to_string()),
+            metadata: Some(metadata.clone()),
+        };
+
+        let directory_row = directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
+            id: None,
+            parent_id: Some("dir-parent".to_string()),
+            name: "docs".to_string(),
+            context: context.clone(),
+        });
+        assert_eq!(directory_row.entity_pk, None);
+        assert_eq!(directory_row.schema_key, "lix_directory_descriptor");
+        assert!(
+            directory_row
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .value()
+                .get("id")
+                .is_none()
+        );
+        assert_eq!(directory_row.global, true);
+        assert_eq!(directory_row.untracked, true);
+        assert_eq!(directory_row.file_id.as_deref(), Some("context-file"));
+        assert_eq!(directory_row.metadata.as_ref(), Some(&metadata));
+
+        let file_row = file_descriptor_write_row(FileDescriptorWriteIntent {
+            id: None,
+            directory_id: Some("dir-parent".to_string()),
+            name: "readme.md".to_string(),
+            context: context.clone(),
+        });
+        assert_eq!(file_row.entity_pk, None);
+        assert_eq!(file_row.schema_key, "lix_file_descriptor");
+        assert!(
+            file_row
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .value()
+                .get("id")
+                .is_none()
+        );
+        assert_eq!(file_row.file_id.as_deref(), Some("context-file"));
+        assert_eq!(file_row.metadata.as_ref(), Some(&metadata));
+
+        let mut resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+        let plan = plan_file_path_write(
+            &mut resolver,
+            FilePathWriteInput {
+                id: Some("file-readme".to_string()),
+                path: "/docs/readme.md".to_string(),
+                data: Some(b"hello".to_vec()),
+                context,
+            },
+            &mut test_id_generator(&["dir-docs"]),
+        )
+        .expect("file path write should plan");
+
+        let directory = plan
+            .rows
+            .iter()
+            .find(|row| row.schema_key == "lix_directory_descriptor")
+            .expect("directory descriptor should be planned");
+        assert_eq!(directory.global, true);
+        assert_eq!(directory.untracked, true);
+        assert_eq!(directory.file_id, None);
+        assert_eq!(directory.metadata.as_ref(), Some(&metadata));
+
+        let descriptor = plan
+            .rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("file descriptor should be planned");
+        assert_eq!(descriptor.global, true);
+        assert_eq!(descriptor.untracked, true);
+        assert_eq!(descriptor.file_id.as_deref(), Some("context-file"));
+        assert_eq!(descriptor.metadata.as_ref(), Some(&metadata));
+
+        let blob = plan
+            .rows
+            .iter()
+            .find(|row| row.schema_key == "lix_binary_blob_ref")
+            .expect("blob ref should be planned");
+        assert_eq!(blob.global, true);
+        assert_eq!(blob.untracked, true);
+        assert_eq!(blob.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(blob.metadata, None);
+
+        assert_eq!(plan.file_data.len(), 1);
+        assert_eq!(plan.file_data[0].file_id, "file-readme");
+        assert_eq!(plan.file_data[0].branch_id, "branch-a");
+        assert_eq!(plan.file_data[0].untracked, true);
+        assert_eq!(plan.file_data[0].data, b"hello");
+    }
+
+    #[test]
+    fn file_path_write_omits_blob_ref_for_empty_data() {
+        let mut resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+        let plan = plan_file_path_write(
+            &mut resolver,
+            FilePathWriteInput {
+                id: Some("file-empty".to_string()),
+                path: "/empty.txt".to_string(),
+                data: Some(Vec::new()),
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&[]),
+        )
+        .expect("empty file path write should plan");
+
+        assert_eq!(plan.count, 1);
+        assert!(plan.file_data.is_empty());
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row.schema_key == "lix_file_descriptor")
+        );
+        assert!(
+            !plan
+                .rows
+                .iter()
+                .any(|row| row.schema_key == "lix_binary_blob_ref")
+        );
     }
 
     #[test]
@@ -1260,6 +1602,131 @@ mod tests {
         assert_eq!(
             resolver.directory_id("/docs/guides/").unwrap(),
             Some("dir-guides")
+        );
+    }
+
+    #[test]
+    fn directory_path_resolvers_from_state_rows_handles_parent_cycles() {
+        let error = super::directory_path_resolvers_from_state_rows(vec![
+            live_directory_row(
+                "dir-a",
+                "branch-a",
+                "{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\"}",
+            ),
+            live_directory_row(
+                "dir-b",
+                "branch-a",
+                "{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\"}",
+            ),
+        ])
+        .expect_err("cyclic directory parent graph should be rejected");
+
+        assert_eq!(error.code, crate::LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("parent_id cycle"));
+    }
+
+    #[test]
+    fn directory_path_resolvers_from_state_rows_separates_storage_scopes() {
+        let rows = vec![
+            live_directory_row_with_scope(
+                "dir-branch-a",
+                "branch-a",
+                false,
+                false,
+                None,
+                "{\"id\":\"dir-branch-a\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+            live_directory_row_with_scope(
+                "dir-branch-b",
+                "branch-b",
+                false,
+                false,
+                None,
+                "{\"id\":\"dir-branch-b\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+            live_directory_row_with_scope(
+                "dir-global",
+                "branch-a",
+                true,
+                false,
+                None,
+                "{\"id\":\"dir-global\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+            live_directory_row_with_scope(
+                "dir-untracked",
+                "branch-a",
+                false,
+                true,
+                None,
+                "{\"id\":\"dir-untracked\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+            live_directory_row_with_scope(
+                "dir-file-scoped",
+                "branch-a",
+                false,
+                false,
+                Some("scope-file".to_string()),
+                "{\"id\":\"dir-file-scoped\",\"parent_id\":null,\"name\":\"docs\"}",
+            ),
+        ];
+
+        let resolvers = super::directory_path_resolvers_from_state_rows(rows)
+            .expect("scoped rows should seed distinct resolvers");
+
+        let branch_a_key = super::filesystem_storage_scope_key("branch-a", false, false, None);
+        let branch_b_key = super::filesystem_storage_scope_key("branch-b", false, false, None);
+        let global_key = super::filesystem_storage_scope_key(GLOBAL_BRANCH_ID, true, false, None);
+        let untracked_key = super::filesystem_storage_scope_key("branch-a", false, true, None);
+        let file_scoped_key =
+            super::filesystem_storage_scope_key("branch-a", false, false, Some("scope-file"));
+        let literal_null_file_id_key =
+            super::filesystem_storage_scope_key("branch-a", false, false, Some("<null>"));
+
+        assert_ne!(branch_a_key, branch_b_key);
+        assert_ne!(branch_a_key, global_key);
+        assert_ne!(branch_a_key, untracked_key);
+        assert_ne!(branch_a_key, file_scoped_key);
+        assert_ne!(branch_a_key, literal_null_file_id_key);
+
+        assert_eq!(
+            resolvers
+                .get(&branch_a_key)
+                .unwrap()
+                .directory_id("/docs/")
+                .unwrap(),
+            Some("dir-branch-a")
+        );
+        assert_eq!(
+            resolvers
+                .get(&branch_b_key)
+                .unwrap()
+                .directory_id("/docs/")
+                .unwrap(),
+            Some("dir-branch-b")
+        );
+        assert_eq!(
+            resolvers
+                .get(&global_key)
+                .unwrap()
+                .directory_id("/docs/")
+                .unwrap(),
+            Some("dir-global")
+        );
+        assert_eq!(
+            resolvers
+                .get(&untracked_key)
+                .unwrap()
+                .directory_id("/docs/")
+                .unwrap(),
+            Some("dir-untracked")
+        );
+        assert_eq!(
+            resolvers
+                .get(&file_scoped_key)
+                .unwrap()
+                .directory_id("/docs/")
+                .unwrap(),
+            Some("dir-file-scoped")
         );
     }
 
@@ -1331,28 +1798,52 @@ mod tests {
     }
 
     #[test]
+    fn recursive_directory_delete_handles_empty_directory() {
+        let plan = super::plan_recursive_directory_delete(
+            "dir-empty",
+            &VisibleFilesystem::default(),
+            FilesystemRowContext::active_branch("branch-a"),
+        );
+
+        assert_eq!(plan.count, 1);
+        assert_eq!(plan.rows.len(), 1);
+        assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
+        assert_eq!(
+            plan.rows[0].entity_pk.as_ref(),
+            Some(&EntityPk::single("dir-empty"))
+        );
+        assert_eq!(plan.rows[0].snapshot, None);
+    }
+
+    #[test]
     fn recursive_directory_delete_plans_files_blobs_and_deepest_directories_first() {
         let context = FilesystemRowContext::active_branch("branch-a");
         let mut directory_children_by_parent_id = BTreeMap::new();
         directory_children_by_parent_id.insert(
-            Some("dir-docs".to_string()),
+            Some(FilesystemDescriptorKey::from_context(&context, "dir-docs")),
             BTreeSet::from(["dir-guides".to_string()]),
         );
 
         let mut files_by_directory_id = BTreeMap::new();
         files_by_directory_id.insert(
-            Some("dir-guides".to_string()),
+            Some(FilesystemDescriptorKey::from_context(
+                &context,
+                "dir-guides",
+            )),
             BTreeSet::from(["file-readme".to_string()]),
         );
         files_by_directory_id.insert(
-            Some("dir-docs".to_string()),
+            Some(FilesystemDescriptorKey::from_context(&context, "dir-docs")),
             BTreeSet::from(["file-index".to_string()]),
         );
 
         let visible_filesystem = VisibleFilesystem {
             directory_children_by_parent_id,
             files_by_directory_id,
-            blob_refs_by_file_id: BTreeSet::from(["file-readme".to_string()]),
+            blob_refs_by_key: BTreeSet::from([FilesystemBlobRefKey::from_context(
+                &context,
+                "file-readme",
+            )]),
         };
 
         let plan = super::plan_recursive_directory_delete("dir-docs", &visible_filesystem, context);
@@ -1388,18 +1879,29 @@ mod tests {
         branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
+        live_directory_row_with_scope(entity_pk, branch_id, false, false, None, snapshot_content)
+    }
+
+    fn live_directory_row_with_scope(
+        entity_pk: &str,
+        branch_id: &str,
+        global: bool,
+        untracked: bool,
+        file_id: Option<String>,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "lix_directory_descriptor".to_string(),
-            file_id: None,
+            file_id,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.to_string(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
-            global: false,
-            untracked: false,
+            global,
+            untracked,
             created_at: "2026-04-23T00:00:00Z".to_string(),
             updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
