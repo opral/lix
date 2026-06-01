@@ -111,10 +111,9 @@ const config = defineConfig(({ mode, command }) => {
           targets: [
             {
               src: "../blog/**",
-              dest: "../client/blog",
+              dest: "../client",
             },
           ],
-          watch: command === "serve" ? { reloadPageOnChange: true } : undefined,
         }),
       tanstackStart({
         prerender: {

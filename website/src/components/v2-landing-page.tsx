@@ -1,11 +1,11 @@
-import { useState, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import { getGithubStars } from "../github-stars-cache";
 import { GitHubIcon, LixLogo } from "./header";
 
 const githubUrl = "https://github.com/opral/lix";
-const issueUrl = "https://github.com/opral/lix/issues";
-const pythonIssueUrl = "https://github.com/opral/lix/issues/373";
-const goIssueUrl = "https://github.com/opral/lix/issues/370";
+const pythonIssueUrl = "https://github.com/opral/lix/issues/370";
+const rustIssueUrl = "https://github.com/opral/lix/issues/371";
+const goIssueUrl = "https://github.com/opral/lix/issues/373";
 const npmUrl = "https://www.npmjs.com/package/@lix-js/sdk";
 
 const jsHeroSample = `import { openLix, SqliteBackend } from "@lix-js/sdk";
@@ -34,26 +34,6 @@ const merge = await lix.mergeBranch({
 const changes = await lix.execute(
   "SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key"
 );`;
-
-const rustHeroSample = `use lix_sdk::{openLix, sqlite};
-
-let lix = openLix(Some(sqlite("app.lix"))).await?;
-
-lix.fs().write_file("/orders.xlsx", bytes).await?;
-
-let draft = lix.branch("explore").await?;
-
-let changes = lix.diff("main", &draft).await?;
-
-let last = lix
-    .history()
-    .entity("function", "applyDiscount")
-    .last()
-    .await?;
-
-let rows = lix.execute(
-    "SELECT path, count(*) FROM lix_change GROUP BY path",
-).await?;`;
 
 const stats = [
   ["Just a Library", "no daemon, no protocol, no remote"],
@@ -500,7 +480,6 @@ function SectionHeader({
 }
 
 function LangTabs() {
-  const [lang, setLang] = useState<"rust" | "js">("js");
   const tabs = [
     {
       key: "js",
@@ -513,8 +492,8 @@ function LangTabs() {
       key: "rust",
       label: "Rust",
       Icon: RustIcon,
-      stable: true,
-      href: undefined,
+      stable: false,
+      href: rustIssueUrl,
     },
     {
       key: "python",
@@ -531,23 +510,38 @@ function LangTabs() {
       <div className="flex items-center justify-between gap-[18px] border-b border-[#e7e6e1] bg-[#f3f2ec] max-md:flex-col max-md:items-stretch max-md:gap-0">
         <div className="flex overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           {tabs.map(({ key, label, Icon, stable, href }) => {
-            const active = key === lang;
+            const active = key === "js";
+            const className = cn(
+              fontMono,
+              focusClass,
+              "relative inline-flex items-center gap-2 whitespace-nowrap px-4 py-3 text-[13px] text-[#2b2b2b]",
+              active &&
+                "after:absolute after:bottom-0 after:left-3 after:right-3 after:h-0.5 after:bg-[#066f86] after:content-['']",
+            );
+            if (href) {
+              return (
+                <a
+                  className={className}
+                  href={href}
+                  key={key}
+                  rel="noopener noreferrer"
+                  target="_blank"
+                  title="Track support on GitHub"
+                >
+                  <Icon />
+                  <span>{label}</span>
+                </a>
+              );
+            }
             return (
               <button
                 className={cn(
-                  fontMono,
-                  focusClass,
-                  "relative inline-flex cursor-pointer items-center gap-2 whitespace-nowrap border-0 bg-transparent px-4 py-3 text-[13px] text-[#2b2b2b]",
-                  active &&
-                    "after:absolute after:bottom-0 after:left-3 after:right-3 after:h-0.5 after:bg-[#066f86] after:content-['']",
+                  className,
+                  "cursor-default border-0 bg-transparent",
                 )}
                 key={key}
                 type="button"
                 title={stable ? label : "Track support on GitHub"}
-                onClick={() => {
-                  if (stable) setLang(key);
-                  else window.open(href ?? issueUrl, "_blank", "noopener");
-                }}
               >
                 <Icon />
                 <span>{label}</span>
@@ -565,7 +559,7 @@ function LangTabs() {
         </div>
       </div>
       <div className="[&_pre]:border-0">
-        <CodeBlock>{lang === "rust" ? rustHeroSample : jsHeroSample}</CodeBlock>
+        <CodeBlock>{jsHeroSample}</CodeBlock>
       </div>
     </div>
   );

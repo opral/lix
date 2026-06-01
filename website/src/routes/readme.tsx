@@ -1,40 +1,30 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Header } from "../components/header";
-import { V2LandingPage } from "../components/v2-landing-page";
+import { LandingReadme } from "../components/landing-page";
+import { V2Footer, V2Hero } from "../components/v2-landing-page";
+import markdownPageCss from "../components/markdown-page.style.css?url";
+import { loadReadmeContent } from "../lib/readme-content";
 import {
   buildCanonicalUrl,
   buildWebSiteJsonLd,
   resolveOgImage,
 } from "../lib/seo";
 
-export const Route = createFileRoute("/")({
+export const Route = createFileRoute("/readme")({
+  loader: async () => {
+    return await loadReadmeContent();
+  },
   head: () => {
-    const title = "Lix | An embeddable version control system for AI agents";
+    const title = "Lix README | An embeddable version control system";
     const description =
-      "Lix gives agents branches, checkpoints, semantic diffs, rollback, immutable history, and SQL-queryable context without wrapping Git.";
-    const canonicalUrl = buildCanonicalUrl("/");
+      "Read the Lix project README, including package details, examples, and repository information.";
+    const canonicalUrl = buildCanonicalUrl("/readme");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
       title,
       description,
       canonicalUrl,
     });
-    const softwareJsonLd = {
-      "@context": "https://schema.org",
-      "@type": "SoftwareApplication",
-      name: "Lix",
-      description,
-      url: canonicalUrl,
-      applicationCategory: "DeveloperApplication",
-      operatingSystem: "Web, Node.js",
-      programmingLanguage: "TypeScript",
-      codeRepository: "https://github.com/opral/lix",
-      offers: {
-        "@type": "Offer",
-        price: "0",
-        priceCurrency: "USD",
-      },
-    };
 
     return {
       meta: [
@@ -54,27 +44,34 @@ export const Route = createFileRoute("/")({
         { name: "twitter:image", content: ogImage.url },
         { name: "twitter:image:alt", content: ogImage.alt },
       ],
-      links: [{ rel: "canonical", href: canonicalUrl }],
+      links: [
+        { rel: "canonical", href: canonicalUrl },
+        { rel: "stylesheet", href: markdownPageCss },
+      ],
       scripts: [
         {
           type: "application/ld+json",
           children: JSON.stringify(jsonLd),
         },
-        {
-          type: "application/ld+json",
-          children: JSON.stringify(softwareJsonLd),
-        },
       ],
     };
   },
-  component: HomeRoute,
+  component: ReadmeRoute,
 });
 
-function HomeRoute() {
+function ReadmeRoute() {
+  const { html } = Route.useLoaderData();
+
   return (
     <>
       <Header />
-      <V2LandingPage />
+      <div className="bg-[#fafaf7] text-[#0a0a0a] font-[Geist,ui-sans-serif,system-ui,sans-serif] tracking-[-0.005em] [font-feature-settings:'ss01','ss02','cv11']">
+        <main>
+          <V2Hero />
+          <LandingReadme readmeHtml={html} />
+          <V2Footer />
+        </main>
+      </div>
     </>
   );
 }
