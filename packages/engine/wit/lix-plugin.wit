@@ -1,13 +1,12 @@
-package lix:plugin@0.1.0;
+package lix:plugin@1.0.0;
 
 interface api {
-  type canonical-json = string;
+  type json-text = string;
+  type bytes = list<u8>;
 
   /// Current materialized file payload supplied to `detect-changes`.
   record file {
-    id: string,
-    path: string,
-    data: list<u8>,
+    data: bytes,
   }
 
   /// Represents the latest visible row for an entity.
@@ -18,34 +17,26 @@ interface api {
   ///
   /// Uniqueness: callers provide at most one row per
   /// (`schema-key`, `entity-pk`) for the same (`file.id`, branch).
-  record entity-change {
-    entity-pk: string,
+  record detected-change {
+    entity-pk: list<string>,
     schema-key: string,
     /// Deterministically encoded JSON text.
-    snapshot-content: option<canonical-json>,
+    snapshot-content: option<json-text>,
+    /// Deterministically encoded JSON text.
+    metadata: option<json-text>,
   }
 
   /// Active-state row payload passed to plugin calls when requested by the
   /// plugin manifest. Omitted row fields are represented as `none`.
   ///
   /// Scope is implicit and engine-defined: same plugin + same file + active rows.
-  record active-state-row {
-    entity-pk: string,
+  record entity-state {
+    entity-pk: list<string>,
     schema-key: string,
     /// Deterministically encoded JSON text.
-    snapshot-content: option<canonical-json>,
-    file-id: option<string>,
-    plugin-key: option<string>,
-    branch-id: option<string>,
-    change-id: option<string>,
+    snapshot-content: json-text,
     /// Deterministically encoded JSON text.
-    metadata: option<canonical-json>,
-    created-at: option<string>,
-    updated-at: option<string>,
-  }
-
-  record detect-state-context {
-    active-state: list<active-state-row>,
+    metadata: option<json-text>,
   }
 
   variant plugin-error {
@@ -54,9 +45,9 @@ interface api {
   }
 
   /// Computes row-level state transitions between active state and a file payload.
-  detect-changes: func(state: detect-state-context, file: file) -> result<list<entity-change>, plugin-error>;
+  detect-changes: func(state: list<entity-state>, file: file) -> result<list<detected-change>, plugin-error>;
   /// Rebuilds file bytes from the unordered latest-state row set.
-  render: func(state: detect-state-context) -> result<list<u8>, plugin-error>;
+  render: func(state: list<entity-state>) -> result<bytes, plugin-error>;
 }
 
 world plugin {
