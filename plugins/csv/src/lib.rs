@@ -8,12 +8,14 @@ mod bindings {
 pub use bindings::*;
 
 mod csv;
+mod diff;
 mod order_key;
 pub mod schemas;
 
 use crate::csv::{
     CsvDialect, parse_file, parse_table_snapshot, render_projection, table_upsert_change,
 };
+use crate::diff::{Op, imara_diff_runs};
 use crate::exports::lix::plugin::api::{
     DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
 };
@@ -23,7 +25,6 @@ use rand::Rng;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str;
-use std::{cmp, iter};
 
 pub const ROOT_ENTITY_PK: &str = "root";
 pub const TABLE_SCHEMA_KEY: &str = schemas::TABLE_SCHEMA_KEY;
@@ -61,20 +62,6 @@ struct RowSnapshot {
     cells: Vec<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Op {
-    Equal,
-    Replace,
-    Insert,
-    Delete,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct OpRun {
-    op: Op,
-    len: usize,
-}
-
 impl Plugin for CsvPlugin {
     fn detect_changes(
         state: DetectStateContext,
@@ -107,7 +94,7 @@ fn detect_changes_for_rows(
     after_dialect: CsvDialect,
 ) -> Result<Vec<EntityChange>, PluginError> {
     let base = before.to_rows();
-    let op_runs = diff_runs_by(&base, file_rows, |row, file_row| row.cells == *file_row);
+    let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut changes = Vec::new();
     let mut rng = rand::rng();
     let mut base_index = 0;
@@ -375,62 +362,8 @@ fn hex_char(value: u8) -> char {
     match value {
         0..=9 => (b'0' + value) as char,
         10..=15 => (b'a' + (value - 10)) as char,
-        _ => '?',
+        _ => unreachable!(),
     }
-}
-
-fn diff_runs_by<'a, T, U>(
-    a: &'a [T],
-    b: &'a [U],
-    eq: impl FnMut(&T, &U) -> bool + 'a,
-) -> impl Iterator<Item = OpRun> + 'a {
-    diff_by(a, b, eq)
-        .map(|op| OpRun { op, len: 1 })
-        .coalesce(|left, right| {
-            if left.op == right.op {
-                Ok(OpRun {
-                    op: left.op,
-                    len: left.len + right.len,
-                })
-            } else {
-                Err((left, right))
-            }
-        })
-}
-
-fn diff_by<'a, T, U>(
-    a: &'a [T],
-    b: &'a [U],
-    mut eq: impl FnMut(&T, &U) -> bool + 'a,
-) -> impl Iterator<Item = Op> + 'a {
-    let prefix = a.iter().zip(b.iter()).take_while(|(a, b)| eq(a, b)).count();
-
-    let a_rest = &a[prefix..];
-    let b_rest = &b[prefix..];
-    let suffix = a_rest
-        .iter()
-        .rev()
-        .zip(b_rest.iter().rev())
-        .take_while(|(a, b)| eq(a, b))
-        .count()
-        .min(a_rest.len())
-        .min(b_rest.len());
-
-    let a_mid = a.len() - prefix - suffix;
-    let b_mid = b.len() - prefix - suffix;
-    let replace = cmp::min(a_mid, b_mid);
-
-    iter::empty()
-        .chain((0..prefix).map(|_| Op::Equal))
-        .chain(
-            a[prefix..prefix + replace]
-                .iter()
-                .zip_eq(&b[prefix..prefix + replace])
-                .map(move |(a, b)| if eq(a, b) { Op::Equal } else { Op::Replace }),
-        )
-        .chain((replace..a_mid).map(|_| Op::Delete))
-        .chain((replace..b_mid).map(|_| Op::Insert))
-        .chain((0..suffix).map(|_| Op::Equal))
 }
 
 #[cfg(test)]
