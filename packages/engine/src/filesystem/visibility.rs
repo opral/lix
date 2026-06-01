@@ -10,6 +10,7 @@ use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
+use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 
 /// Execution-visible filesystem metadata decoded from live-state rows.
 ///
@@ -18,9 +19,10 @@ use super::keys::{
 /// sees pending writes without reaching into write-execution internals.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct VisibleFilesystem {
-    pub(crate) directory_children_by_parent_id: BTreeMap<Option<String>, BTreeSet<String>>,
-    pub(crate) files_by_directory_id: BTreeMap<Option<String>, BTreeSet<String>>,
-    pub(crate) blob_refs_by_file_id: BTreeSet<String>,
+    pub(crate) directory_children_by_parent_id:
+        BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<String>>,
+    pub(crate) files_by_directory_id: BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<String>>,
+    pub(crate) blob_refs_by_key: BTreeSet<FilesystemBlobRefKey>,
 }
 
 impl VisibleFilesystem {
@@ -65,9 +67,10 @@ impl VisibleFilesystem {
                                 format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
                             )
                         })?;
+                    let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
                     visible
                         .directory_children_by_parent_id
-                        .entry(snapshot.parent_id)
+                        .entry(snapshot.parent_id.map(|id| key.in_same_scope(&id)))
                         .or_default()
                         .insert(snapshot.id);
                 }
@@ -79,9 +82,10 @@ impl VisibleFilesystem {
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
+                    let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
                     visible
                         .files_by_directory_id
-                        .entry(snapshot.directory_id)
+                        .entry(snapshot.directory_id.map(|id| key.in_same_scope(&id)))
                         .or_default()
                         .insert(snapshot.id);
                 }
@@ -93,13 +97,22 @@ impl VisibleFilesystem {
                                 format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
                             )
                         })?;
-                    visible.blob_refs_by_file_id.insert(snapshot.id);
+                    visible
+                        .blob_refs_by_key
+                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id));
                 }
                 _ => {}
             }
         }
 
         Ok(visible)
+    }
+}
+
+impl VisibleFilesystem {
+    pub(crate) fn has_blob_ref(&self, context: &FilesystemRowContext, file_id: &str) -> bool {
+        self.blob_refs_by_key
+            .contains(&FilesystemBlobRefKey::from_context(context, file_id))
     }
 }
 
@@ -128,6 +141,7 @@ mod tests {
 
     use crate::LixError;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::filesystem::{FilesystemDescriptorKey, FilesystemRowContext};
     use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
 
@@ -222,7 +236,7 @@ mod tests {
         assert!(
             filesystem
                 .directory_children_by_parent_id
-                .get(&Some("dir-docs".to_string()))
+                .get(&Some(descriptor_key("branch-a", "dir-docs")))
                 .is_some_and(|children| children.contains("dir-guides"))
         );
     }
@@ -241,7 +255,7 @@ mod tests {
 
         let files = filesystem
             .files_by_directory_id
-            .get(&Some("dir-guides".to_string()))
+            .get(&Some(descriptor_key("branch-a", "dir-guides")))
             .expect("directory should have attached files");
         assert!(files.contains("file-readme"));
     }
@@ -258,7 +272,10 @@ mod tests {
         .await
         .expect("visible filesystem should load");
 
-        assert!(filesystem.blob_refs_by_file_id.contains("file-readme"));
+        assert!(filesystem.has_blob_ref(
+            &FilesystemRowContext::active_branch("branch-a"),
+            "file-readme"
+        ));
     }
 
     #[test]
@@ -308,7 +325,10 @@ mod tests {
             root_files,
             &std::collections::BTreeSet::from(["file-root".to_string()])
         );
-        assert!(!filesystem.blob_refs_by_file_id.contains("blob-tombstone"));
+        assert!(!filesystem.has_blob_ref(
+            &FilesystemRowContext::active_branch("branch-a"),
+            "blob-tombstone"
+        ));
     }
 
     #[test]
@@ -428,6 +448,13 @@ mod tests {
             Some(entity_pk.to_string()),
             Some(snapshot_content),
             "branch-a",
+        )
+    }
+
+    fn descriptor_key(branch_id: &str, descriptor_id: &str) -> FilesystemDescriptorKey {
+        FilesystemDescriptorKey::from_context(
+            &FilesystemRowContext::active_branch(branch_id),
+            descriptor_id,
         )
     }
 

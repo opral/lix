@@ -54,6 +54,123 @@ simulation_test!(fs_write_read_and_readdir_roundtrip, |sim| async move {
 });
 
 simulation_test!(
+    fs_session_reads_reject_active_explicit_transaction,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        let transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        let read_error = session
+            .fs()
+            .read_file("/docs/readme.txt")
+            .await
+            .expect_err("session fs read_file should reject active transaction");
+        assert_eq!(read_error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+        let readdir_error = session
+            .fs()
+            .readdir("/docs/")
+            .await
+            .expect_err("session fs readdir should reject active transaction");
+        assert_eq!(readdir_error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+    }
+);
+
+simulation_test!(
+    fs_read_file_treats_sql_path_only_file_as_empty,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_file (path) VALUES ('/empty.txt')", &[])
+            .await
+            .expect("path-only file insert should succeed");
+
+        assert_eq!(
+            session
+                .fs
+                .read_file("/empty.txt")
+                .await
+                .expect("read_file should succeed"),
+            Some(Vec::new())
+        );
+    }
+);
+
+simulation_test!(
+    fs_write_file_canonicalizes_empty_file_without_blob_ref,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .fs
+            .write_file("/empty-fs.txt", Vec::new(), FsWriteOptions::default())
+            .await
+            .expect("empty fs write should succeed");
+
+        assert_eq!(
+            session
+                .fs
+                .read_file("/empty-fs.txt")
+                .await
+                .expect("read_file should succeed"),
+            Some(Vec::new())
+        );
+
+        let file_result = session
+            .execute("SELECT id FROM lix_file WHERE path = '/empty-fs.txt'", &[])
+            .await
+            .expect("file id read should succeed");
+        let [lix_engine::Value::Text(file_id)] = file_result.rows()[0].values() else {
+            panic!(
+                "expected file id row, got {:?}",
+                file_result.rows()[0].values()
+            );
+        };
+
+        let blob_ref_result = session
+            .execute(
+                &format!(
+                    "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_binary_blob_ref' \
+                   AND entity_pk = lix_json('[\"{file_id}\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("blob ref state read should succeed");
+        assert_eq!(blob_ref_result.len(), 0);
+    }
+);
+
+simulation_test!(
     fs_mkdir_is_idempotent_and_readdir_distinguishes_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -130,6 +247,37 @@ simulation_test!(fs_write_file_upserts_existing_data, |sim| async move {
         .await
         .expect("query should succeed");
     assert_eq!(rows.len(), 1, "write_file should not duplicate descriptor");
+
+    session
+        .fs
+        .write_file("/orders.xlsx", Vec::new(), FsWriteOptions::default())
+        .await
+        .expect("empty overwrite should succeed");
+    assert_eq!(
+        session
+            .fs
+            .read_file("/orders.xlsx")
+            .await
+            .expect("read should succeed"),
+        Some(Vec::new())
+    );
+
+    let [lix_engine::Value::Text(file_id)] = rows.rows()[0].values() else {
+        panic!("expected file id row, got {:?}", rows.rows()[0].values());
+    };
+    let blob_ref_rows = session
+        .execute(
+            &format!(
+                "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_binary_blob_ref' \
+                   AND entity_pk = lix_json('[\"{file_id}\"]')"
+            ),
+            &[],
+        )
+        .await
+        .expect("blob ref query should succeed");
+    assert_eq!(blob_ref_rows.len(), 0);
 });
 
 simulation_test!(fs_rm_file_and_recursive_directory, |sim| async move {

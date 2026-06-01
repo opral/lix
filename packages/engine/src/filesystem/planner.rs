@@ -62,6 +62,78 @@ impl FilesystemRowContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FilesystemDescriptorKey {
+    branch_id: String,
+    global: bool,
+    untracked: bool,
+    file_id: Option<String>,
+    descriptor_id: String,
+}
+
+impl FilesystemDescriptorKey {
+    pub(crate) fn from_context(context: &FilesystemRowContext, descriptor_id: &str) -> Self {
+        Self {
+            branch_id: context.branch_id.clone(),
+            global: context.global,
+            untracked: context.untracked,
+            file_id: context.file_id.clone(),
+            descriptor_id: descriptor_id.to_string(),
+        }
+    }
+
+    pub(crate) fn from_live_row(
+        row: &MaterializedLiveStateRow,
+        descriptor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id: row.branch_id.clone(),
+            global: row.global,
+            untracked: row.untracked,
+            file_id: row.file_id.clone(),
+            descriptor_id: descriptor_id.into(),
+        }
+    }
+
+    pub(crate) fn in_same_scope(&self, descriptor_id: &str) -> Self {
+        Self {
+            branch_id: self.branch_id.clone(),
+            global: self.global,
+            untracked: self.untracked,
+            file_id: self.file_id.clone(),
+            descriptor_id: descriptor_id.to_string(),
+        }
+    }
+}
+
+/// Storage identity of a `lix_binary_blob_ref` row for a filesystem file.
+///
+/// File descriptors and their blob refs do not have identical row scopes:
+/// blob refs are file-scoped to the file they describe. Callers should derive
+/// this key from the descriptor lane plus the descriptor id instead of joining
+/// blob refs by id alone.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FilesystemBlobRefKey(FilesystemDescriptorKey);
+
+impl FilesystemBlobRefKey {
+    pub(crate) fn from_context(context: &FilesystemRowContext, file_id: &str) -> Self {
+        Self(FilesystemDescriptorKey {
+            branch_id: context.branch_id.clone(),
+            global: context.global,
+            untracked: context.untracked,
+            file_id: Some(file_id.to_string()),
+            descriptor_id: file_id.to_string(),
+        })
+    }
+
+    pub(crate) fn from_live_row(
+        row: &MaterializedLiveStateRow,
+        blob_ref_id: impl Into<String>,
+    ) -> Self {
+        Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectoryDescriptorRowInput {
     pub(crate) id: String,
@@ -459,6 +531,21 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow
     ))
 }
 
+pub(crate) fn blob_ref_tombstone_row(
+    file_id: String,
+    context: FilesystemRowContext,
+) -> TransactionWriteRow {
+    tombstone_row(
+        file_id.clone(),
+        BLOB_REF_SCHEMA_KEY,
+        FilesystemRowContext {
+            file_id: Some(file_id),
+            metadata: None,
+            ..context
+        },
+    )
+}
+
 pub(crate) fn plan_file_path_write(
     resolver: &mut DirectoryPathResolver,
     input: FilePathWriteInput,
@@ -491,7 +578,7 @@ pub(crate) fn plan_file_path_write(
     }));
 
     let mut file_data = Vec::new();
-    if let Some(data) = input.data {
+    if let Some(data) = input.data.filter(|data| !data.is_empty()) {
         rows.push(blob_ref_row(BlobRefRowInput {
             file_id: file_id.clone(),
             data: data.clone(),
@@ -565,22 +652,11 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
     let mut rows = vec![tombstone_row(
         input.file_id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        FilesystemRowContext {
-            file_id: None,
-            ..input.context.clone()
-        },
+        input.context.clone(),
     )];
 
     if input.has_blob_ref {
-        rows.push(tombstone_row(
-            input.file_id.clone(),
-            BLOB_REF_SCHEMA_KEY,
-            FilesystemRowContext {
-                file_id: Some(input.file_id),
-                metadata: None,
-                ..input.context
-            },
-        ));
+        rows.push(blob_ref_tombstone_row(input.file_id.clone(), input.context));
     }
 
     FilesystemDeletePlan { rows, count: 1 }
@@ -591,10 +667,7 @@ pub(crate) fn plan_directory_delete(input: DirectoryDeleteInput) -> FilesystemDe
         rows: vec![tombstone_row(
             input.directory_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            FilesystemRowContext {
-                file_id: None,
-                ..input.context
-            },
+            input.context,
         )],
         count: 1,
     }
@@ -812,21 +885,28 @@ fn collect_recursive_directory_delete(
 ) {
     if let Some(child_ids) = visible_filesystem
         .directory_children_by_parent_id
-        .get(&Some(directory_id.to_string()))
+        .get(&Some(FilesystemDescriptorKey::from_context(
+            context,
+            directory_id,
+        )))
     {
         for child_id in child_ids {
             collect_recursive_directory_delete(child_id, visible_filesystem, context, rows, count);
         }
     }
 
-    if let Some(files) = visible_filesystem
-        .files_by_directory_id
-        .get(&Some(directory_id.to_string()))
+    if let Some(files) =
+        visible_filesystem
+            .files_by_directory_id
+            .get(&Some(FilesystemDescriptorKey::from_context(
+                context,
+                directory_id,
+            )))
     {
         for file_id in files {
             let plan = plan_file_delete(FileDeleteInput {
                 file_id: file_id.clone(),
-                has_blob_ref: visible_filesystem.blob_refs_by_file_id.contains(file_id),
+                has_blob_ref: visible_filesystem.has_blob_ref(context, file_id),
                 context: context.clone(),
             });
             rows.extend(plan.rows);
@@ -850,6 +930,7 @@ mod tests {
 
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
     use crate::transaction::types::TransactionJson;
 
     use super::{
@@ -1466,6 +1547,37 @@ mod tests {
     }
 
     #[test]
+    fn file_path_write_omits_blob_ref_for_empty_data() {
+        let mut resolver =
+            DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
+        let plan = plan_file_path_write(
+            &mut resolver,
+            FilePathWriteInput {
+                id: Some("file-empty".to_string()),
+                path: "/empty.txt".to_string(),
+                data: Some(Vec::new()),
+                context: FilesystemRowContext::active_branch("branch-a"),
+            },
+            &mut test_id_generator(&[]),
+        )
+        .expect("empty file path write should plan");
+
+        assert_eq!(plan.count, 1);
+        assert!(plan.file_data.is_empty());
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row.schema_key == "lix_file_descriptor")
+        );
+        assert!(
+            !plan
+                .rows
+                .iter()
+                .any(|row| row.schema_key == "lix_binary_blob_ref")
+        );
+    }
+
+    #[test]
     fn directory_path_resolvers_from_state_rows_derives_nested_paths() {
         let resolvers = super::directory_path_resolvers_from_state_rows(vec![
             live_directory_row(
@@ -1708,24 +1820,30 @@ mod tests {
         let context = FilesystemRowContext::active_branch("branch-a");
         let mut directory_children_by_parent_id = BTreeMap::new();
         directory_children_by_parent_id.insert(
-            Some("dir-docs".to_string()),
+            Some(FilesystemDescriptorKey::from_context(&context, "dir-docs")),
             BTreeSet::from(["dir-guides".to_string()]),
         );
 
         let mut files_by_directory_id = BTreeMap::new();
         files_by_directory_id.insert(
-            Some("dir-guides".to_string()),
+            Some(FilesystemDescriptorKey::from_context(
+                &context,
+                "dir-guides",
+            )),
             BTreeSet::from(["file-readme".to_string()]),
         );
         files_by_directory_id.insert(
-            Some("dir-docs".to_string()),
+            Some(FilesystemDescriptorKey::from_context(&context, "dir-docs")),
             BTreeSet::from(["file-index".to_string()]),
         );
 
         let visible_filesystem = VisibleFilesystem {
             directory_children_by_parent_id,
             files_by_directory_id,
-            blob_refs_by_file_id: BTreeSet::from(["file-readme".to_string()]),
+            blob_refs_by_key: BTreeSet::from([FilesystemBlobRefKey::from_context(
+                &context,
+                "file-readme",
+            )]),
         };
 
         let plan = super::plan_recursive_directory_delete("dir-docs", &visible_filesystem, context);

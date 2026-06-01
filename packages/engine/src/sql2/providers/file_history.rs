@@ -422,10 +422,10 @@ where
             continue;
         };
         let blob = nearest_blob_ref(&blobs, &event);
-        let data = if needs_data {
+        let data = if needs_data && descriptor.name.is_some() {
             match blob.and_then(|blob| blob.blob_hash.as_deref()) {
                 Some(blob_hash) => load_single_blob_bytes(blob_reader, blob_hash).await?,
-                None => None,
+                None => Some(Vec::new()),
             }
         } else {
             None

@@ -10,29 +10,30 @@ use crate::transaction::types::TransactionJson;
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
 };
-use super::planner::FilesystemRowContext;
+use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 use super::visibility::VisibleFilesystem;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FilesystemIndex {
     entries_by_path: BTreeMap<String, FilesystemEntry>,
-    directories_by_parent_id: BTreeMap<Option<String>, BTreeSet<String>>,
-    files_by_directory_id: BTreeMap<Option<String>, BTreeSet<String>>,
+    directories_by_parent_id: BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<String>>,
+    files_by_directory_id: BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<String>>,
 }
 
 impl FilesystemIndex {
     pub(crate) fn from_live_rows(
         rows: Vec<crate::live_state::MaterializedLiveStateRow>,
     ) -> Result<Self, LixError> {
-        let mut directory_rows = BTreeMap::<String, DirectorySnapshot>::new();
+        let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectorySnapshot>::new();
         let mut file_rows = Vec::<(FileSnapshot, RowScope)>::new();
-        let mut blob_hashes_by_file_id = BTreeMap::<String, String>::new();
+        let mut blob_hashes_by_key = BTreeMap::<FilesystemBlobRefKey, String>::new();
 
         for row in rows {
             let scope = RowScope {
                 branch_id: row.branch_id.clone(),
                 global: row.global,
                 untracked: row.untracked,
+                file_id: row.file_id.clone(),
             };
             let Some(snapshot_content) = row.snapshot_content.as_deref() else {
                 continue;
@@ -45,7 +46,10 @@ impl FilesystemIndex {
                                 "invalid lix_directory_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    directory_rows.insert(snapshot.id.clone(), snapshot.with_scope(scope));
+                    directory_rows.insert(
+                        FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone()),
+                        snapshot.with_scope(scope),
+                    );
                 }
                 FILE_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: FileSnapshot =
@@ -63,7 +67,10 @@ impl FilesystemIndex {
                                 "invalid lix_binary_blob_ref snapshot JSON: {error}"
                             ))
                         })?;
-                    blob_hashes_by_file_id.insert(snapshot.id, snapshot.blob_hash);
+                    blob_hashes_by_key.insert(
+                        FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
+                        snapshot.blob_hash,
+                    );
                 }
                 _ => {}
             }
@@ -80,35 +87,40 @@ impl FilesystemIndex {
         }
 
         let mut entries_by_path = BTreeMap::new();
-        let mut directories_by_parent_id = BTreeMap::<Option<String>, BTreeSet<String>>::new();
-        let mut files_by_directory_id = BTreeMap::<Option<String>, BTreeSet<String>>::new();
+        let mut directories_by_parent_id =
+            BTreeMap::<Option<FilesystemDescriptorKey>, BTreeSet<String>>::new();
+        let mut files_by_directory_id =
+            BTreeMap::<Option<FilesystemDescriptorKey>, BTreeSet<String>>::new();
 
         for (directory_id, snapshot) in &directory_rows {
             let path = directory_paths_by_id.get(directory_id).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
-                    format!("directory {directory_id:?} is not reachable from root"),
+                    format!("directory {:?} is not reachable from root", snapshot.id),
                 )
             })?;
             insert_entry(
                 &mut entries_by_path,
                 path.clone(),
                 FilesystemEntry::Directory(FilesystemDirectoryEntry {
-                    id: directory_id.clone(),
+                    id: snapshot.id.clone(),
                     scope: snapshot.scope()?,
                 }),
             )?;
             directories_by_parent_id
-                .entry(snapshot.parent_id.clone())
+                .entry(snapshot.parent_key(directory_id))
                 .or_default()
-                .insert(directory_id.clone());
+                .insert(snapshot.id.clone());
         }
 
         for (snapshot, scope) in file_rows {
+            let file_key =
+                FilesystemDescriptorKey::from_context(&scope.context(None, None), &snapshot.id);
             let path = match snapshot.directory_id.as_ref() {
                 Some(directory_id) => {
+                    let directory_key = file_key.in_same_scope(directory_id);
                     let directory_path =
-                        directory_paths_by_id.get(directory_id).ok_or_else(|| {
+                        directory_paths_by_id.get(&directory_key).ok_or_else(|| {
                             LixError::new(
                                 LixError::CODE_CONSTRAINT_VIOLATION,
                                 format!(
@@ -128,12 +140,17 @@ impl FilesystemIndex {
                     id: snapshot.id.clone(),
                     directory_id: snapshot.directory_id.clone(),
                     name: snapshot.name,
-                    blob_hash: blob_hashes_by_file_id.get(&snapshot.id).cloned(),
+                    blob_hash: blob_hashes_by_key
+                        .get(&FilesystemBlobRefKey::from_context(
+                            &scope.context(Some(snapshot.id.clone()), None),
+                            &snapshot.id,
+                        ))
+                        .cloned(),
                     scope,
                 }),
             )?;
             files_by_directory_id
-                .entry(snapshot.directory_id)
+                .entry(snapshot.directory_id.map(|id| file_key.in_same_scope(&id)))
                 .or_default()
                 .insert(snapshot.id);
         }
@@ -171,10 +188,7 @@ impl FilesystemIndex {
             }
         };
         let Some(blob_hash) = file.blob_hash.as_deref() else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("fs.read_file found file {path:?} without binary data"),
-            ));
+            return Ok(Some(Vec::new()));
         };
         let hash = BlobHash::from_hex(blob_hash)?;
         let mut bytes = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
@@ -234,8 +248,8 @@ impl FilesystemIndex {
         Ok(Some(entries))
     }
 
-    pub(crate) fn has_children(&self, directory_id: &str) -> bool {
-        let key = Some(directory_id.to_string());
+    pub(crate) fn has_children(&self, directory: &FilesystemDirectoryEntry) -> bool {
+        let key = Some(directory.descriptor_key());
         self.directories_by_parent_id
             .get(&key)
             .is_some_and(|children| !children.is_empty())
@@ -249,13 +263,13 @@ impl FilesystemIndex {
         VisibleFilesystem {
             directory_children_by_parent_id: self.directories_by_parent_id.clone(),
             files_by_directory_id: self.files_by_directory_id.clone(),
-            blob_refs_by_file_id: self
+            blob_refs_by_key: self
                 .entries_by_path
                 .values()
                 .filter_map(|entry| match entry {
-                    FilesystemEntry::File(file) if file.blob_hash.is_some() => {
-                        Some(file.id.clone())
-                    }
+                    FilesystemEntry::File(file) if file.blob_hash.is_some() => Some(
+                        FilesystemBlobRefKey::from_context(&file.context(), &file.id),
+                    ),
                     _ => None,
                 })
                 .collect(),
@@ -362,6 +376,10 @@ impl FilesystemDirectoryEntry {
     pub(crate) fn context(&self) -> FilesystemRowContext {
         self.scope.context(None, None)
     }
+
+    pub(crate) fn descriptor_key(&self) -> FilesystemDescriptorKey {
+        FilesystemDescriptorKey::from_context(&self.context(), &self.id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +409,7 @@ pub(crate) struct RowScope {
     pub(crate) branch_id: String,
     pub(crate) global: bool,
     pub(crate) untracked: bool,
+    pub(crate) file_id: Option<String>,
 }
 
 impl RowScope {
@@ -403,7 +422,7 @@ impl RowScope {
             branch_id: self.branch_id.clone(),
             global: self.global,
             untracked: self.untracked,
-            file_id,
+            file_id: file_id.or_else(|| self.file_id.clone()),
             metadata,
         }
     }
@@ -445,6 +464,12 @@ impl DirectorySnapshot {
             )
         })
     }
+
+    fn parent_key(&self, key: &FilesystemDescriptorKey) -> Option<FilesystemDescriptorKey> {
+        self.parent_id
+            .as_deref()
+            .map(|parent_id| key.in_same_scope(parent_id))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,15 +486,15 @@ struct BlobRefSnapshot {
 }
 
 fn resolve_directory_path(
-    directory_id: &str,
-    rows: &BTreeMap<String, DirectorySnapshot>,
-    paths: &mut BTreeMap<String, String>,
-    visiting: &mut BTreeSet<String>,
+    directory_id: &FilesystemDescriptorKey,
+    rows: &BTreeMap<FilesystemDescriptorKey, DirectorySnapshot>,
+    paths: &mut BTreeMap<FilesystemDescriptorKey, String>,
+    visiting: &mut BTreeSet<FilesystemDescriptorKey>,
 ) -> Result<Option<String>, LixError> {
     if let Some(path) = paths.get(directory_id) {
         return Ok(Some(path.clone()));
     }
-    if !visiting.insert(directory_id.to_string()) {
+    if !visiting.insert(directory_id.clone()) {
         return Err(LixError::new(
             LixError::CODE_CONSTRAINT_VIOLATION,
             format!(
@@ -483,7 +508,8 @@ fn resolve_directory_path(
     };
     let path = match row.parent_id.as_deref() {
         Some(parent_id) => {
-            let Some(parent_path) = resolve_directory_path(parent_id, rows, paths, visiting)?
+            let parent_key = directory_id.in_same_scope(parent_id);
+            let Some(parent_path) = resolve_directory_path(&parent_key, rows, paths, visiting)?
             else {
                 visiting.remove(directory_id);
                 return Ok(None);
@@ -493,7 +519,7 @@ fn resolve_directory_path(
         None => format!("/{}/", row.name),
     };
     visiting.remove(directory_id);
-    paths.insert(directory_id.to_string(), path.clone());
+    paths.insert(directory_id.clone(), path.clone());
     Ok(Some(path))
 }
 
@@ -588,7 +614,8 @@ mod tests {
     use crate::live_state::MaterializedLiveStateRow;
 
     use super::{
-        DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY, FilesystemIndex, insert_entry,
+        BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
+        FilesystemIndex, insert_entry,
     };
     use super::{FilesystemDirectoryEntry, FilesystemEntry, FilesystemFileEntry, RowScope};
 
@@ -644,6 +671,70 @@ mod tests {
         .expect_err("file should conflict with directory namespace");
     }
 
+    #[test]
+    fn from_live_rows_attaches_blob_refs_by_storage_scope() {
+        let index = FilesystemIndex::from_live_rows(vec![
+            file_row(
+                "file-readme",
+                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+            ),
+            live_row_with_scope(
+                "file-readme",
+                BLOB_REF_SCHEMA_KEY,
+                r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
+                "branch-b",
+                false,
+                Some("file-readme".to_string()),
+            ),
+        ])
+        .expect("filesystem index should load");
+
+        let Some(FilesystemEntry::File(file)) = index.entry("/readme.md") else {
+            panic!("readme file should be indexed");
+        };
+        assert_eq!(file.blob_hash, None);
+    }
+
+    #[test]
+    fn from_live_rows_resolves_directories_by_storage_scope() {
+        let index = FilesystemIndex::from_live_rows(vec![
+            directory_row(
+                "dir-shared",
+                r#"{"id":"dir-shared","parent_id":null,"name":"docs"}"#,
+            ),
+            live_row_with_scope(
+                "dir-shared",
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                r#"{"id":"dir-shared","parent_id":null,"name":"scoped"}"#,
+                "branch-a",
+                false,
+                Some("owner-file".to_string()),
+            ),
+            file_row(
+                "file-root",
+                r#"{"id":"file-root","directory_id":"dir-shared","name":"root.txt"}"#,
+            ),
+            live_row_with_scope(
+                "file-scoped",
+                FILE_DESCRIPTOR_SCHEMA_KEY,
+                r#"{"id":"file-scoped","directory_id":"dir-shared","name":"scoped.txt"}"#,
+                "branch-a",
+                false,
+                Some("owner-file".to_string()),
+            ),
+        ])
+        .expect("filesystem index should keep scoped directories distinct");
+
+        assert!(matches!(
+            index.entry("/docs/root.txt"),
+            Some(FilesystemEntry::File(_))
+        ));
+        assert!(matches!(
+            index.entry("/scoped/scoped.txt"),
+            Some(FilesystemEntry::File(_))
+        ));
+    }
+
     fn directory_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(entity_pk, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, snapshot_content)
     }
@@ -657,18 +748,36 @@ mod tests {
         schema_key: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
+        live_row_with_scope(
+            entity_pk,
+            schema_key,
+            snapshot_content,
+            "branch-a",
+            false,
+            None,
+        )
+    }
+
+    fn live_row_with_scope(
+        entity_pk: &str,
+        schema_key: &str,
+        snapshot_content: &str,
+        branch_id: &str,
+        untracked: bool,
+        file_id: Option<String>,
+    ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
-            file_id: None,
+            file_id,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            branch_id: "branch-a".to_string(),
+            branch_id: branch_id.to_string(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
-            untracked: false,
+            untracked,
             created_at: "2026-04-23T00:00:00Z".to_string(),
             updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
@@ -696,6 +805,7 @@ mod tests {
             branch_id: "branch-a".to_string(),
             global: false,
             untracked: false,
+            file_id: None,
         }
     }
 }

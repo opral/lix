@@ -504,7 +504,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
 });
 
 simulation_test!(
-    lix_file_path_insert_applies_defaulted_id,
+    lix_file_path_insert_applies_defaulted_id_and_empty_data,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -526,7 +526,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name \
+                "SELECT id, path, name, data \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -536,12 +536,28 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Text(name)] = values else {
+        let [
+            Value::Text(id),
+            Value::Text(path),
+            Value::Text(name),
+            Value::Blob(data),
+        ] = values
+        else {
             panic!("expected generated file path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
         assert_eq!(name, "readme.md");
+        assert_eq!(data, b"");
+
+        let null_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/docs/readme.md' AND data IS NULL",
+                &[],
+            )
+            .await
+            .expect("file null predicate should succeed");
+        assert_eq!(null_result.len(), 0);
     }
 );
 
@@ -586,6 +602,31 @@ simulation_test!(
         assert_eq!(data, b"hello");
     }
 );
+
+simulation_test!(lix_file_data_is_not_nullable, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    let result = session
+        .execute(
+            "SELECT is_nullable \
+             FROM information_schema.columns \
+             WHERE table_name = 'lix_file' \
+               AND column_name = 'data'",
+            &[],
+        )
+        .await
+        .expect("information schema read should succeed");
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].values(), &[Value::Text("NO".to_string())]);
+});
 
 simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
     let engine = sim.boot_engine().await;
@@ -851,6 +892,18 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
         .expect("file read should succeed");
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
+
+    let blob_ref_result = session
+        .execute(
+            "SELECT entity_pk \
+             FROM lix_state \
+             WHERE schema_key = 'lix_binary_blob_ref' \
+               AND entity_pk = lix_json('[\"empty-data-file\"]')",
+            &[],
+        )
+        .await
+        .expect("blob ref state read should succeed");
+    assert_eq!(blob_ref_result.len(), 0);
 });
 
 simulation_test!(
@@ -1685,7 +1738,70 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
         .expect("file read should succeed");
     assert_eq!(result.len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
+
+    let blob_ref_result = session
+        .execute(
+            "SELECT entity_pk \
+             FROM lix_state \
+             WHERE schema_key = 'lix_binary_blob_ref' \
+               AND entity_pk = lix_json('[\"empty-update-file\"]')",
+            &[],
+        )
+        .await
+        .expect("blob ref state read should succeed");
+    assert_eq!(blob_ref_result.len(), 0);
 });
+
+simulation_test!(
+    lix_file_update_empty_data_on_empty_file_does_not_stage_blob_ref_tombstone,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) \
+                 VALUES ('already-empty-file', '/already-empty.bin')",
+                &[],
+            )
+            .await
+            .expect("path-only file insert should succeed");
+
+        session
+            .execute(
+                "UPDATE lix_file SET data = X'' WHERE id = 'already-empty-file'",
+                &[],
+            )
+            .await
+            .expect("empty data update should succeed");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("branch head should load")
+            .expect("branch head should exist");
+
+        let blob_ref_history = session
+            .execute(
+                &format!(
+                    "SELECT entity_pk \
+                     FROM lix_state_history \
+                     WHERE start_commit_id = '{commit_id}' \
+                       AND schema_key = 'lix_binary_blob_ref' \
+                       AND entity_pk = lix_json('[\"already-empty-file\"]')"
+                ),
+                &[],
+            )
+            .await
+            .expect("blob ref history read should succeed");
+        assert_eq!(blob_ref_history.len(), 0);
+    }
+);
 
 simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;

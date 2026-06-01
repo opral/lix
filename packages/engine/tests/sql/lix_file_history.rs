@@ -121,6 +121,55 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_history_treats_path_only_file_as_empty,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path) VALUES ('/empty-history.txt')",
+                &[],
+            )
+            .await
+            .expect("path-only file insert should succeed");
+        let commit_id = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("file commit head should load")
+            .expect("file commit head should exist");
+
+        let result = session
+            .execute(
+                &format!(
+                    "SELECT path, data \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{commit_id}' \
+                       AND path = '/empty-history.txt' \
+                       AND lixcol_depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .expect("file history read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("/empty-history.txt".to_string()),
+                Value::Blob(Vec::new()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
     lix_file_history_requires_start_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -5,7 +5,7 @@ use crate::common::{ParsedFilePath, directory_ancestor_paths, normalize_director
 use crate::filesystem::{
     BlobRefRowInput, DirectoryDeleteInput, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemDirEntryKind,
-    FilesystemEntry, FilesystemIndex, FilesystemRowContext, blob_ref_row,
+    FilesystemEntry, FilesystemIndex, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
     directory_path_resolvers_from_state_rows, file_descriptor_row, filesystem_conflict_error,
     filesystem_schema_keys, filesystem_storage_scope_key, load_filesystem_index,
     plan_directory_delete, plan_file_delete, plan_file_path_write, plan_recursive_directory_delete,
@@ -109,15 +109,31 @@ where
                         FilesystemEntry::File(file) => {
                             let mut rows = Vec::new();
                             let context = file.context_with_metadata(metadata);
-                            rows.push(blob_ref_row(BlobRefRowInput {
-                                file_id: file.id.clone(),
-                                data: data.clone(),
-                                context: FilesystemRowContext {
-                                    file_id: None,
-                                    metadata: None,
-                                    ..context.clone()
-                                },
-                            })?);
+                            let mut file_data = Vec::new();
+                            if data.is_empty() {
+                                if file.blob_hash.is_some() {
+                                    rows.push(blob_ref_tombstone_row(
+                                        file.id.clone(),
+                                        context.clone(),
+                                    ));
+                                }
+                            } else {
+                                rows.push(blob_ref_row(BlobRefRowInput {
+                                    file_id: file.id.clone(),
+                                    data: data.clone(),
+                                    context: FilesystemRowContext {
+                                        file_id: None,
+                                        metadata: None,
+                                        ..context.clone()
+                                    },
+                                })?);
+                                file_data.push(TransactionFileData {
+                                    file_id: file.id.clone(),
+                                    branch_id: context.branch_id.clone(),
+                                    untracked: context.untracked,
+                                    data,
+                                });
+                            }
                             if context.metadata.is_some() {
                                 rows.push(file_descriptor_row(FileDescriptorRowInput {
                                     id: file.id.clone(),
@@ -126,16 +142,14 @@ where
                                     context: context.clone(),
                                 }));
                             }
+                            if rows.is_empty() && file_data.is_empty() {
+                                return Ok(());
+                            }
                             transaction
                                 .stage_write(TransactionWrite::RowsWithFileData {
                                     mode: TransactionWriteMode::Replace,
                                     rows,
-                                    file_data: vec![TransactionFileData {
-                                        file_id: file.id.clone(),
-                                        branch_id: context.branch_id,
-                                        untracked: context.untracked,
-                                        data,
-                                    }],
+                                    file_data,
                                     count: 1,
                                 })
                                 .await?;
@@ -193,6 +207,7 @@ where
         let path = ParsedFilePath::try_from_path(path)?
             .normalized_path
             .to_string();
+        let _operation_guard = self.session.begin_session_operation()?;
         let read = SharedStorageRead::new(
             self.session
                 .storage
@@ -273,6 +288,7 @@ where
 
     pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
         let path = normalize_directory_path(path)?;
+        let _operation_guard = self.session.begin_session_operation()?;
         let read = SharedStorageRead::new(
             self.session
                 .storage
@@ -326,7 +342,7 @@ where
                         })
                     }
                     FilesystemEntry::Directory(directory) => {
-                        let has_children = filesystem.has_children(&directory.id);
+                        let has_children = filesystem.has_children(directory);
                         if has_children && !options.recursive {
                             return Err(LixError::new(
                                 LixError::CODE_CONSTRAINT_VIOLATION,

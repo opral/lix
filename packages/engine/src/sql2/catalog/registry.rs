@@ -294,7 +294,7 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
             Field::new("path", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("data", DataType::Binary, true),
+            Field::new("data", DataType::Binary, false),
         ]
     } else {
         vec![
