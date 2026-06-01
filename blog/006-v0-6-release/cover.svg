@@ -1,0 +1,22 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" fill="#FAFAF7"/>
+  <rect x="88" y="76" width="1024" height="478" rx="26" fill="#F3F2EC" stroke="#E7E6E1" stroke-width="2"/>
+  <rect x="134" y="128" width="932" height="74" rx="14" fill="#0A0A0A"/>
+  <circle cx="169" cy="165" r="8" fill="#08B5D6"/>
+  <circle cx="197" cy="165" r="8" fill="#E7E6E1"/>
+  <circle cx="225" cy="165" r="8" fill="#E7E6E1"/>
+  <text x="272" y="174" fill="#FAFAF7" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="28" font-weight="700">@lix-js/sdk v0.6</text>
+  <text x="134" y="282" fill="#0A0A0A" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="58" font-weight="760">Embeddable version control</text>
+  <text x="134" y="352" fill="#0A0A0A" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="58" font-weight="760">for AI agents</text>
+  <text x="138" y="420" fill="#2B2B2B" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="27">Import version control as a library. Bring your own backend.</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="22" font-weight="600">
+    <rect x="138" y="468" width="134" height="46" rx="23" fill="#ECFBFD" stroke="#9BE7F4"/>
+    <text x="172" y="498" fill="#066F86">SQLite</text>
+    <rect x="292" y="468" width="154" height="46" rx="23" fill="#F5F4EE" stroke="#E7E6E1"/>
+    <text x="326" y="498" fill="#2B2B2B">Postgres</text>
+    <rect x="466" y="468" width="98" height="46" rx="23" fill="#F5F4EE" stroke="#E7E6E1"/>
+    <text x="500" y="498" fill="#2B2B2B">S3</text>
+    <rect x="584" y="468" width="197" height="46" rx="23" fill="#F5F4EE" stroke="#E7E6E1"/>
+    <text x="618" y="498" fill="#2B2B2B">Cloudflare</text>
+  </g>
+</svg>

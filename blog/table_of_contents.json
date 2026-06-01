@@ -1,5 +1,10 @@
 [
   {
+    "path": "./006-v0-6-release/index.md",
+    "slug": "lix-v0-6-release",
+    "authors": ["samuelstroschein"]
+  },
+  {
     "path": "./005-april-2026-update/index.md",
     "slug": "april-2026-update",
     "authors": ["samuelstroschein"]
