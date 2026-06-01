@@ -15,12 +15,7 @@ fn bench_render_changes(c: &mut Criterion) {
     for scenario in scenarios {
         group.bench_function(scenario.name, |b| {
             b.iter_batched(
-                || {
-                    (
-                        file_from_bytes("f1", "/yarn.lock", &scenario.base),
-                        scenario.changes.clone(),
-                    )
-                },
+                || (file_from_bytes(&scenario.base), scenario.changes.clone()),
                 |(base, changes)| {
                     let reconstructed = render_changes(base, changes)
                         .expect("render_changes benchmark should succeed");

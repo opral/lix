@@ -16,8 +16,8 @@ fn bench_roundtrip_projection(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        common::file_from_bytes("f1", "/x.json", &before),
-                        common::file_from_bytes("f1", "/x.json", &after),
+                        common::file_from_bytes(&before),
+                        common::file_from_bytes(&after),
                     )
                 },
                 |(before_file, after_file)| {
@@ -26,7 +26,7 @@ fn bench_roundtrip_projection(c: &mut Criterion) {
                     let delta = detect_changes(Some(before_file), after_file)
                         .expect("delta detect_changes should succeed");
                     let projection = common::merge_latest_state_rows(vec![baseline, delta]);
-                    let seed = common::file_from_bytes("f1", "/x.json", br#"{"stale":"cache"}"#);
+                    let seed = common::file_from_bytes(br#"{"stale":"cache"}"#);
                     render_changes(seed, projection).expect("render_changes should succeed")
                 },
                 BatchSize::SmallInput,

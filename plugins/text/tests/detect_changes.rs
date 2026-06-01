@@ -5,7 +5,7 @@ use text_plugin::{DOCUMENT_ENTITY_PK, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, dete
 
 #[test]
 fn creation_returns_full_projection() {
-    let after = file_from_bytes("f1", "/doc.txt", b"a\nb\n");
+    let after = file_from_bytes(b"a\nb\n");
 
     let changes = detect_changes(None, after).expect("detect_changes should succeed");
 
@@ -24,15 +24,15 @@ fn creation_returns_full_projection() {
         .iter()
         .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
         .expect("document snapshot should exist");
-    assert_eq!(document_change.entity_pk, DOCUMENT_ENTITY_PK);
+    assert_eq!(document_change.entity_pk, [DOCUMENT_ENTITY_PK]);
     let doc = parse_document_snapshot(document_change);
     assert_eq!(doc.line_ids.len(), 2);
 }
 
 #[test]
 fn insertion_in_middle_emits_inserted_line_and_document_change() {
-    let before = file_from_bytes("f1", "/doc.txt", b"a\nb\n");
-    let after = file_from_bytes("f1", "/doc.txt", b"a\nx\nb\n");
+    let before = file_from_bytes(b"a\nb\n");
+    let after = file_from_bytes(b"a\nx\nb\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -58,8 +58,8 @@ fn insertion_in_middle_emits_inserted_line_and_document_change() {
 
 #[test]
 fn deletion_emits_line_tombstone_and_document_change() {
-    let before = file_from_bytes("f1", "/doc.txt", b"a\nb\n");
-    let after = file_from_bytes("f1", "/doc.txt", b"a\n");
+    let before = file_from_bytes(b"a\nb\n");
+    let after = file_from_bytes(b"a\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -79,8 +79,8 @@ fn deletion_emits_line_tombstone_and_document_change() {
 
 #[test]
 fn unchanged_file_returns_no_changes() {
-    let before = file_from_bytes("f1", "/doc.txt", b"unchanged\n");
-    let after = file_from_bytes("f1", "/doc.txt", b"unchanged\n");
+    let before = file_from_bytes(b"unchanged\n");
+    let after = file_from_bytes(b"unchanged\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -89,8 +89,8 @@ fn unchanged_file_returns_no_changes() {
 
 #[test]
 fn line_reorder_emits_delete_and_insert() {
-    let before = file_from_bytes("f1", "/doc.txt", b"a\nb\n");
-    let after = file_from_bytes("f1", "/doc.txt", b"b\na\n");
+    let before = file_from_bytes(b"a\nb\n");
+    let after = file_from_bytes(b"b\na\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 

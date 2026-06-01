@@ -3,10 +3,10 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::file_from_json;
-use plugin_json_v2::{PluginEntityChange, SCHEMA_KEY, detect_changes, render_changes};
+use plugin_json_v2::{DetectedChange, SCHEMA_KEY, detect_changes, render_changes};
 use serde_json::Value;
 
-fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<PluginEntityChange> {
+fn merge_latest_state_rows(changesets: Vec<Vec<DetectedChange>>) -> Vec<DetectedChange> {
     let mut latest = BTreeMap::new();
     for changes in changesets {
         for change in changes {
@@ -22,22 +22,19 @@ fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<Plug
     latest.into_values().collect()
 }
 
-fn projected_changes_for_transition(
-    before_json: &str,
-    after_json: &str,
-) -> Vec<PluginEntityChange> {
-    let baseline = detect_changes(None, file_from_json("f1", "/x.json", before_json))
+fn projected_changes_for_transition(before_json: &str, after_json: &str) -> Vec<DetectedChange> {
+    let baseline = detect_changes(None, file_from_json(before_json))
         .expect("baseline detect_changes should succeed");
     let delta = detect_changes(
-        Some(file_from_json("f1", "/x.json", before_json)),
-        file_from_json("f1", "/x.json", after_json),
+        Some(file_from_json(before_json)),
+        file_from_json(after_json),
     )
     .expect("delta detect_changes should succeed");
     merge_latest_state_rows(vec![baseline, delta])
 }
 
-fn render_projection(changes: Vec<PluginEntityChange>) -> Value {
-    let seed = file_from_json("f1", "/x.json", r#"{"stale":"cache"}"#);
+fn render_projection(changes: Vec<DetectedChange>) -> Value {
+    let seed = file_from_json(r#"{"stale":"cache"}"#);
     let reconstructed = render_changes(seed, changes).expect("render_changes should succeed");
     serde_json::from_slice(&reconstructed).expect("reconstructed bytes should parse")
 }

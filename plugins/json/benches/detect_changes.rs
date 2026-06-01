@@ -16,8 +16,8 @@ fn bench_detect_changes(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        common::file_from_bytes("f1", "/x.json", &before),
-                        common::file_from_bytes("f1", "/x.json", &after),
+                        common::file_from_bytes(&before),
+                        common::file_from_bytes(&after),
                     )
                 },
                 |(before_file, after_file)| {

@@ -13,7 +13,7 @@ fn bench_render_changes(c: &mut Criterion) {
         ("large", common::dataset_large()),
     ] {
         let projection = common::projection_for_transition(&before, &after);
-        let seed = common::file_from_bytes("f1", "/x.json", br#"{"stale":"cache"}"#);
+        let seed = common::file_from_bytes(br#"{"stale":"cache"}"#);
 
         group.bench_function(name, |b| {
             b.iter_batched(

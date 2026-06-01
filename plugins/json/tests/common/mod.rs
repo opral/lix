@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use plugin_json_v2::{PluginEntityChange, PluginFile};
+use plugin_json_v2::{DetectedChange, File};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -10,22 +10,20 @@ struct SnapshotContent {
     value: Value,
 }
 
-pub fn file_from_json(id: &str, path: &str, json: &str) -> PluginFile {
-    PluginFile {
-        id: id.to_string(),
-        path: path.to_string(),
+pub fn file_from_json(json: &str) -> File {
+    File {
         data: json.as_bytes().to_vec(),
     }
 }
 
-pub fn parse_snapshot_value_from_change(change: &PluginEntityChange) -> Value {
+pub fn parse_snapshot_value_from_change(change: &DetectedChange) -> Value {
     let Some(snapshot_content) = change.snapshot_content.as_ref() else {
         panic!("change should have snapshot_content");
     };
 
     let parsed: SnapshotContent =
         serde_json::from_str(snapshot_content).expect("snapshot content should parse");
-    assert_eq!(parsed.path, change.entity_pk);
+    assert_eq!(change.entity_pk, [parsed.path]);
     parsed.value
 }
 

@@ -1,29 +1,10 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use plugin_md_v2::{
-    PluginActiveStateRow, PluginDetectStateContext, PluginEntityChange, detect_changes,
-    detect_changes_with_state_context,
-};
+use plugin_md_v2::{DetectedChange, detect_changes, detect_changes_with_state_context};
 
-fn to_state_context(rows: &[PluginEntityChange]) -> PluginDetectStateContext {
-    PluginDetectStateContext {
-        active_state: rows
-            .iter()
-            .map(|row| PluginActiveStateRow {
-                entity_pk: row.entity_pk.clone(),
-                schema_key: row.schema_key.clone(),
-                snapshot_content: row.snapshot_content.clone(),
-                file_id: None,
-                plugin_key: None,
-                branch_id: None,
-                change_id: None,
-                metadata: None,
-                created_at: None,
-                updated_at: None,
-            })
-            .collect::<Vec<_>>(),
-    }
+fn to_state_context(rows: &[DetectedChange]) -> Vec<DetectedChange> {
+    rows.to_vec()
 }
 
 fn bench_detect_changes(c: &mut Criterion) {
@@ -39,8 +20,8 @@ fn bench_detect_changes(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        common::file_from_markdown("f1", "/doc.mdx", &before),
-                        common::file_from_markdown("f1", "/doc.mdx", &after),
+                        common::file_from_markdown(&before),
+                        common::file_from_markdown(&after),
                     )
                 },
                 |(before_file, after_file)| {
@@ -63,8 +44,8 @@ fn bench_detect_changes_with_state_context(c: &mut Criterion) {
         ("medium", common::dataset_medium()),
         ("large", common::dataset_large()),
     ] {
-        let before_file = common::file_from_markdown("f1", "/doc.mdx", &before);
-        let after_file = common::file_from_markdown("f1", "/doc.mdx", &after);
+        let before_file = common::file_from_markdown(&before);
+        let after_file = common::file_from_markdown(&after);
         let bootstrap = detect_changes(None, before_file.clone())
             .expect("bootstrap detect_changes benchmark should succeed");
         let state_context = to_state_context(&bootstrap);

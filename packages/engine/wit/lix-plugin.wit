@@ -9,14 +9,10 @@ interface api {
     data: bytes,
   }
 
-  /// Represents the latest visible row for an entity.
+  /// Represents an upsert or tombstone emitted by `detect-changes`.
   ///
-  /// `render` receives an unordered set of these rows for a single file through
-  /// `detect-state-context.active-state`. Implementations must be
-  /// order-independent and produce the same output for any row ordering.
-  ///
-  /// Uniqueness: callers provide at most one row per
-  /// (`schema-key`, `entity-pk`) for the same (`file.id`, branch).
+  /// Uniqueness: implementations should emit at most one change per
+  /// (`schema-key`, `entity-pk`) for the same file.
   record detected-change {
     entity-pk: list<string>,
     schema-key: string,
@@ -26,8 +22,11 @@ interface api {
     metadata: option<json-text>,
   }
 
-  /// Active-state row payload passed to plugin calls when requested by the
-  /// plugin manifest. Omitted row fields are represented as `none`.
+  /// Represents the latest visible row for an entity.
+  ///
+  /// `detect-changes` and `render` receive an unordered set of these rows for a
+  /// single file. Implementations must be order-independent and produce the same
+  /// output for any row ordering.
   ///
   /// Scope is implicit and engine-defined: same plugin + same file + active rows.
   record entity-state {

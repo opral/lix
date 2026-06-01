@@ -5,33 +5,33 @@ use common::{
     parse_document_order,
 };
 use plugin_md_v2::{
-    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, PluginDetectStateContext, detect_changes,
+    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, File, detect_changes,
     detect_changes_with_state_context,
 };
 use std::collections::BTreeSet;
 
-fn count_tombstones(changes: &[plugin_md_v2::PluginEntityChange]) -> usize {
+fn count_tombstones(changes: &[DetectedChange]) -> usize {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none())
         .count()
 }
 
-fn count_upserts(changes: &[plugin_md_v2::PluginEntityChange]) -> usize {
+fn count_upserts(changes: &[DetectedChange]) -> usize {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some())
         .count()
 }
 
-fn count_document_rows(changes: &[plugin_md_v2::PluginEntityChange]) -> usize {
+fn count_document_rows(changes: &[DetectedChange]) -> usize {
     changes
         .iter()
         .filter(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
         .count()
 }
 
-fn upsert_types(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
+fn upsert_types(changes: &[DetectedChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
@@ -48,7 +48,7 @@ fn upsert_types(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
         .collect()
 }
 
-fn upsert_markdowns(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
+fn upsert_markdowns(changes: &[DetectedChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
@@ -66,7 +66,7 @@ fn upsert_markdowns(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String>
 }
 
 fn bootstrap_order(markdown: &str) -> Vec<String> {
-    let bootstrap = detect_changes(None, file_from_markdown("bootstrap", "/notes.md", markdown))
+    let bootstrap = detect_changes(None, file_from_markdown(markdown))
         .expect("bootstrap detect_changes should succeed");
     let document = bootstrap
         .iter()
@@ -75,59 +75,35 @@ fn bootstrap_order(markdown: &str) -> Vec<String> {
     parse_document_order(document)
 }
 
-fn document_order_from_changes(
-    changes: &[plugin_md_v2::PluginEntityChange],
-) -> Option<Vec<String>> {
+fn document_order_from_changes(changes: &[DetectedChange]) -> Option<Vec<String>> {
     changes
         .iter()
         .find(|change| is_document_change(change))
         .map(parse_document_order)
 }
 
-fn tombstone_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
+fn tombstone_ids(changes: &[DetectedChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none())
-        .map(|change| change.entity_pk.clone())
+        .map(|change| change.entity_pk[0].clone())
         .collect()
 }
 
-fn upsert_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
+fn upsert_ids(changes: &[DetectedChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some())
-        .map(|change| change.entity_pk.clone())
+        .map(|change| change.entity_pk[0].clone())
         .collect()
 }
 
-fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginDetectStateContext {
-    PluginDetectStateContext {
-        active_state: rows
-            .iter()
-            .map(|row| plugin_md_v2::PluginActiveStateRow {
-                entity_pk: row.entity_pk.clone(),
-                schema_key: row.schema_key.clone(),
-                snapshot_content: row.snapshot_content.clone(),
-                file_id: None,
-                plugin_key: None,
-                branch_id: None,
-                change_id: None,
-                metadata: None,
-                created_at: None,
-                updated_at: None,
-            })
-            .collect::<Vec<_>>(),
-    }
+fn state_context_from_rows(rows: &[DetectedChange]) -> Vec<DetectedChange> {
+    rows.to_vec()
 }
 
-fn bootstrap_state(
-    markdown: &str,
-) -> (
-    plugin_md_v2::PluginFile,
-    Vec<String>,
-    PluginDetectStateContext,
-) {
-    let before = file_from_markdown("f1", "/notes.md", markdown);
+fn bootstrap_state(markdown: &str) -> (File, Vec<String>, Vec<DetectedChange>) {
+    let before = file_from_markdown(markdown);
     let bootstrap =
         detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
     let before_order =
@@ -142,8 +118,8 @@ fn make_large_markdown_paragraphs(count: usize) -> Vec<String> {
 
 #[test]
 fn no_changes_when_documents_are_equal() {
-    let before = file_from_markdown("f1", "/notes.md", "# Title\n\nSame paragraph.\n");
-    let after = file_from_markdown("f1", "/notes.md", "# Title\n\nSame paragraph.\n");
+    let before = file_from_markdown("# Title\n\nSame paragraph.\n");
+    let after = file_from_markdown("# Title\n\nSame paragraph.\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -152,7 +128,7 @@ fn no_changes_when_documents_are_equal() {
 
 #[test]
 fn emits_document_and_block_rows_for_new_file() {
-    let after = file_from_markdown("f1", "/notes.md", "# Title\n\nParagraph.\n");
+    let after = file_from_markdown("# Title\n\nParagraph.\n");
 
     let changes = detect_changes(None, after).expect("detect_changes should succeed");
 
@@ -176,8 +152,8 @@ fn emits_document_and_block_rows_for_new_file() {
 
 #[test]
 fn handles_empty_documents() {
-    let before = file_from_markdown("f1", "/notes.md", "");
-    let after = file_from_markdown("f1", "/notes.md", "");
+    let before = file_from_markdown("");
+    let after = file_from_markdown("");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -186,9 +162,7 @@ fn handles_empty_documents() {
 
 #[test]
 fn rejects_non_utf8_input() {
-    let after = plugin_md_v2::PluginFile {
-        id: "f1".to_string(),
-        path: "/notes.md".to_string(),
+    let after = File {
         data: vec![0xFF, 0xFE, 0xFD],
     };
 
@@ -200,8 +174,6 @@ fn rejects_non_utf8_input() {
 #[test]
 fn inline_html_br_does_not_drop_changes() {
     let after = file_from_markdown(
-        "f1",
-        "/notes.md",
         "SSH auth: `git clone git@github.com:microsoft/vscode-docs.git`<br>HTTPS auth: `git clone https://github.com/microsoft/vscode-docs.git`\n",
     );
 
@@ -217,8 +189,8 @@ fn inline_html_br_does_not_drop_changes() {
 
 #[test]
 fn move_only_emits_document_row() {
-    let before = file_from_markdown("f1", "/notes.md", "First paragraph.\n\nSecond paragraph.\n");
-    let after = file_from_markdown("f1", "/notes.md", "Second paragraph.\n\nFirst paragraph.\n");
+    let before = file_from_markdown("First paragraph.\n\nSecond paragraph.\n");
+    let after = file_from_markdown("Second paragraph.\n\nFirst paragraph.\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -228,8 +200,8 @@ fn move_only_emits_document_row() {
 
 #[test]
 fn move_section_emits_document_row_only() {
-    let before = file_from_markdown("f1", "/notes.md", "# A\n\npara a\n\n# B\n\npara b\n");
-    let after = file_from_markdown("f1", "/notes.md", "# B\n\npara b\n\n# A\n\npara a\n");
+    let before = file_from_markdown("# A\n\npara a\n\n# B\n\npara b\n");
+    let after = file_from_markdown("# B\n\npara b\n\n# A\n\npara a\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -239,8 +211,8 @@ fn move_section_emits_document_row_only() {
 
 #[test]
 fn cross_type_paragraph_to_heading_emits_delete_add_and_document_update() {
-    let before = file_from_markdown("f1", "/notes.md", "Hello\n");
-    let after = file_from_markdown("f1", "/notes.md", "# Hello\n");
+    let before = file_from_markdown("Hello\n");
+    let after = file_from_markdown("# Hello\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -264,8 +236,8 @@ fn cross_type_paragraph_to_heading_emits_delete_add_and_document_update() {
 
 #[test]
 fn cross_type_code_to_paragraph_emits_delete_add_and_document_update() {
-    let before = file_from_markdown("f1", "/notes.md", "```js\nconsole.log(1)\n```\n");
-    let after = file_from_markdown("f1", "/notes.md", "console.log(1)\n");
+    let before = file_from_markdown("```js\nconsole.log(1)\n```\n");
+    let after = file_from_markdown("console.log(1)\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -289,8 +261,8 @@ fn cross_type_code_to_paragraph_emits_delete_add_and_document_update() {
 
 #[test]
 fn duplicate_paragraphs_with_no_text_change_emit_no_changes() {
-    let before = file_from_markdown("f1", "/notes.md", "Same\n\nSame\n");
-    let after = file_from_markdown("f1", "/notes.md", "Same\n\nSame\n");
+    let before = file_from_markdown("Same\n\nSame\n");
+    let after = file_from_markdown("Same\n\nSame\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -299,8 +271,8 @@ fn duplicate_paragraphs_with_no_text_change_emit_no_changes() {
 
 #[test]
 fn insert_duplicate_paragraph_emits_new_block_and_document_update() {
-    let before = file_from_markdown("f1", "/notes.md", "Same\n\nOther\n");
-    let after = file_from_markdown("f1", "/notes.md", "Same\n\nSame\n\nOther\n");
+    let before = file_from_markdown("Same\n\nOther\n");
+    let after = file_from_markdown("Same\n\nSame\n\nOther\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -324,8 +296,8 @@ fn insert_duplicate_paragraph_emits_new_block_and_document_update() {
 
 #[test]
 fn crlf_vs_lf_normalization_emits_no_changes() {
-    let before = file_from_markdown("f1", "/notes.md", "Line A\r\n\r\nLine B\r\n");
-    let after = file_from_markdown("f1", "/notes.md", "Line A\n\nLine B\n");
+    let before = file_from_markdown("Line A\r\n\r\nLine B\r\n");
+    let after = file_from_markdown("Line A\n\nLine B\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -334,8 +306,8 @@ fn crlf_vs_lf_normalization_emits_no_changes() {
 
 #[test]
 fn unicode_nfc_vs_nfd_emits_no_changes() {
-    let before = file_from_markdown("f1", "/notes.md", "caf\u{00E9}\n");
-    let after = file_from_markdown("f1", "/notes.md", "caf\u{0065}\u{0301}\n");
+    let before = file_from_markdown("caf\u{00E9}\n");
+    let after = file_from_markdown("caf\u{0065}\u{0301}\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -352,8 +324,8 @@ fn large_doc_pure_shuffle_emits_document_row_only() {
     let after_markdown = after.join("\n\n") + "\n";
 
     let changes = detect_changes(
-        Some(file_from_markdown("f1", "/notes.md", &before_markdown)),
-        file_from_markdown("f1", "/notes.md", &after_markdown),
+        Some(file_from_markdown(&before_markdown)),
+        file_from_markdown(&after_markdown),
     )
     .expect("detect_changes should succeed");
 
@@ -363,8 +335,8 @@ fn large_doc_pure_shuffle_emits_document_row_only() {
 
 #[test]
 fn paragraph_to_blockquote_emits_delete_add_and_document_update() {
-    let before = file_from_markdown("f1", "/notes.md", "Hello\n");
-    let after = file_from_markdown("f1", "/notes.md", "> Hello\n");
+    let before = file_from_markdown("Hello\n");
+    let after = file_from_markdown("> Hello\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -376,8 +348,8 @@ fn paragraph_to_blockquote_emits_delete_add_and_document_update() {
 
 #[test]
 fn hard_break_variant_does_not_introduce_extra_blocks() {
-    let before = file_from_markdown("f1", "/notes.md", "line  \r\nbreak\r\n");
-    let after = file_from_markdown("f1", "/notes.md", "line\\\r\nbreak\r\n");
+    let before = file_from_markdown("line  \r\nbreak\r\n");
+    let after = file_from_markdown("line\\\r\nbreak\r\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -393,8 +365,8 @@ fn hard_break_variant_does_not_introduce_extra_blocks() {
 
 #[test]
 fn code_fence_length_variation_does_not_introduce_new_id() {
-    let before = file_from_markdown("f1", "/notes.md", "```js\nconsole.log(1)\n```\n");
-    let after = file_from_markdown("f1", "/notes.md", "````js\nconsole.log(1)\n````\n");
+    let before = file_from_markdown("```js\nconsole.log(1)\n```\n");
+    let after = file_from_markdown("````js\nconsole.log(1)\n````\n");
 
     let changes = detect_changes(Some(before), after).expect("detect_changes should succeed");
 
@@ -415,8 +387,8 @@ fn id_stability_pure_reorder_preserves_existing_ids() {
     assert_eq!(before_order.len(), 2);
 
     let changes = detect_changes(
-        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
-        file_from_markdown("f1", "/notes.md", "Second\n\nFirst\n"),
+        Some(file_from_markdown(before_markdown)),
+        file_from_markdown("Second\n\nFirst\n"),
     )
     .expect("detect_changes should succeed");
 
@@ -439,8 +411,8 @@ fn id_stability_insert_between_keeps_neighbors_and_mints_new_id() {
     assert_eq!(before_order.len(), 2);
 
     let changes = detect_changes(
-        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
-        file_from_markdown("f1", "/notes.md", "A\n\nB\n\nC\n"),
+        Some(file_from_markdown(before_markdown)),
+        file_from_markdown("A\n\nB\n\nC\n"),
     )
     .expect("detect_changes should succeed");
 
@@ -464,8 +436,8 @@ fn id_stability_delete_keeps_survivor_id_and_tombstones_deleted() {
     assert_eq!(before_order.len(), 2);
 
     let changes = detect_changes(
-        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
-        file_from_markdown("f1", "/notes.md", "Keep me\n"),
+        Some(file_from_markdown(before_markdown)),
+        file_from_markdown("Keep me\n"),
     )
     .expect("detect_changes should succeed");
 
@@ -486,8 +458,8 @@ fn id_stability_cross_type_does_not_reuse_old_id() {
     assert_eq!(before_order.len(), 1);
 
     let changes = detect_changes(
-        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
-        file_from_markdown("f1", "/notes.md", "# Hello\n"),
+        Some(file_from_markdown(before_markdown)),
+        file_from_markdown("# Hello\n"),
     )
     .expect("detect_changes should succeed");
 
@@ -516,8 +488,8 @@ fn id_stability_large_pure_shuffle_preserves_id_set() {
     let after_markdown = after.join("\n\n") + "\n";
 
     let changes = detect_changes(
-        Some(file_from_markdown("f1", "/notes.md", &before_markdown)),
-        file_from_markdown("f1", "/notes.md", &after_markdown),
+        Some(file_from_markdown(&before_markdown)),
+        file_from_markdown(&after_markdown),
     )
     .expect("detect_changes should succeed");
 
@@ -533,7 +505,7 @@ fn id_stability_large_pure_shuffle_preserves_id_set() {
 
 #[test]
 fn with_state_context_paragraph_edit_reuses_existing_id_without_tombstone() {
-    let before = file_from_markdown("f1", "/notes.md", "Hello\n\nWorld\n");
+    let before = file_from_markdown("Hello\n\nWorld\n");
     let bootstrap =
         detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
     let before_order = bootstrap_order("Hello\n\nWorld\n");
@@ -541,7 +513,7 @@ fn with_state_context_paragraph_edit_reuses_existing_id_without_tombstone() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "Hello updated\n\nWorld\n"),
+        file_from_markdown("Hello updated\n\nWorld\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -555,7 +527,7 @@ fn with_state_context_paragraph_edit_reuses_existing_id_without_tombstone() {
 #[test]
 fn with_state_context_move_and_edit_reuses_existing_id_and_updates_order() {
     let before_markdown = "Alpha\n\nBeta\n";
-    let before = file_from_markdown("f1", "/notes.md", before_markdown);
+    let before = file_from_markdown(before_markdown);
     let bootstrap =
         detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
     let before_order = bootstrap_order(before_markdown);
@@ -563,7 +535,7 @@ fn with_state_context_move_and_edit_reuses_existing_id_and_updates_order() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "Beta plus\n\nAlpha\n"),
+        file_from_markdown("Beta plus\n\nAlpha\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -581,7 +553,7 @@ fn with_state_context_move_and_edit_reuses_existing_id_and_updates_order() {
 #[test]
 fn with_state_context_insert_between_preserves_neighbor_ids_and_mints_new_id() {
     let before_markdown = "A\n\nC\n";
-    let before = file_from_markdown("f1", "/notes.md", before_markdown);
+    let before = file_from_markdown(before_markdown);
     let bootstrap =
         detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
     let before_order = bootstrap_order(before_markdown);
@@ -589,7 +561,7 @@ fn with_state_context_insert_between_preserves_neighbor_ids_and_mints_new_id() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "A\n\nB\n\nC\n"),
+        file_from_markdown("A\n\nB\n\nC\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -613,7 +585,7 @@ fn with_state_context_pure_reorder_emits_only_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "Second\n\nFirst\n"),
+        file_from_markdown("Second\n\nFirst\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -634,7 +606,7 @@ fn with_state_context_move_section_emits_only_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "# B\n\nPara B\n\n# A\n\nPara A\n"),
+        file_from_markdown("# B\n\nPara B\n\n# A\n\nPara A\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -666,7 +638,7 @@ fn with_state_context_large_shuffle_500_emits_only_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", &after_markdown),
+        file_from_markdown(&after_markdown),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -689,7 +661,7 @@ fn with_state_context_duplicate_edit_second_preserves_first_id_without_document_
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "Same\n\nSame updated\n"),
+        file_from_markdown("Same\n\nSame updated\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -707,7 +679,7 @@ fn with_state_context_duplicate_middle_edit_targets_only_middle_entity() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "Same\n\nSame updated\n\nSame\n"),
+        file_from_markdown("Same\n\nSame updated\n\nSame\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -725,7 +697,7 @@ fn with_state_context_list_reorder_emits_single_list_upsert_without_document_row
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "- three\n- one\n- two\n"),
+        file_from_markdown("- three\n- one\n- two\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -744,7 +716,7 @@ fn with_state_context_list_add_item_emits_single_list_upsert_without_document_ro
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "- one\n- two\n- three\n"),
+        file_from_markdown("- one\n- two\n- three\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -763,7 +735,7 @@ fn with_state_context_list_remove_item_emits_single_list_upsert_without_document
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "- one\n- three\n"),
+        file_from_markdown("- one\n- three\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -783,11 +755,7 @@ fn with_state_context_table_reorder_rows_emits_single_table_upsert_without_docum
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown(
-            "f1",
-            "/notes.md",
-            "| a | b |\n| - | - |\n| 3 | 4 |\n| 5 | 6 |\n| 1 | 2 |\n",
-        ),
+        file_from_markdown("| a | b |\n| - | - |\n| 3 | 4 |\n| 5 | 6 |\n| 1 | 2 |\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -807,11 +775,7 @@ fn with_state_context_table_add_row_emits_single_table_upsert_without_document_r
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown(
-            "f1",
-            "/notes.md",
-            "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n",
-        ),
+        file_from_markdown("| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -831,7 +795,7 @@ fn with_state_context_table_remove_row_emits_single_table_upsert_without_documen
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "| a | b |\n| - | - |\n| 1 | 2 |\n"),
+        file_from_markdown("| a | b |\n| - | - |\n| 1 | 2 |\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -850,7 +814,7 @@ fn with_state_context_heading_edit_reuses_existing_id_without_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "# Hello World\n\nBody\n"),
+        file_from_markdown("# Hello World\n\nBody\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -869,7 +833,7 @@ fn with_state_context_code_edit_reuses_existing_id_without_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "```js\nconsole.log(2)\n```\n"),
+        file_from_markdown("```js\nconsole.log(2)\n```\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -888,7 +852,7 @@ fn with_state_context_link_text_edit_reuses_existing_id_without_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "[new](https://example.com)\n"),
+        file_from_markdown("[new](https://example.com)\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -907,7 +871,7 @@ fn with_state_context_link_url_edit_reuses_existing_id_without_document_row() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "[text](https://example.org)\n"),
+        file_from_markdown("[text](https://example.org)\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -926,7 +890,7 @@ fn with_state_context_paragraph_split_reuses_first_id_and_mints_one_new() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "A\n\nB\n"),
+        file_from_markdown("A\n\nB\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -955,7 +919,7 @@ fn with_state_context_paragraph_merge_reuses_first_id_and_tombstones_second() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", "AB\n"),
+        file_from_markdown("AB\n"),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -987,7 +951,7 @@ fn with_state_context_large_500_tiny_edits_emit_only_targeted_upserts() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", &after_markdown),
+        file_from_markdown(&after_markdown),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -1030,7 +994,7 @@ fn with_state_context_large_500_delete_insert_move_emits_minimal_noise() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", &after_markdown),
+        file_from_markdown(&after_markdown),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");
@@ -1090,7 +1054,7 @@ fn with_state_context_large_duplicates_edit_350_targets_only_matching_id() {
 
     let changes = detect_changes_with_state_context(
         Some(before),
-        file_from_markdown("f1", "/notes.md", &after_markdown),
+        file_from_markdown(&after_markdown),
         Some(state_context),
     )
     .expect("detect_changes_with_state_context should succeed");

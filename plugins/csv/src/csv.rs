@@ -1,7 +1,8 @@
-use crate::exports::lix::plugin::api::{EntityChange, File, PluginError};
+use crate::exports::lix::plugin::api::PluginError;
+use crate::{DetectedChange, File};
 use crate::{Projection, ROOT_ENTITY_PK, TABLE_SCHEMA_KEY, reject_unknown_fields};
-use ::csv::{ByteRecord, QuoteStyle, ReaderBuilder, Terminator, WriterBuilder};
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
+use csv::{ByteRecord, QuoteStyle, ReaderBuilder, Terminator, WriterBuilder};
 use csv_nose::{Quote, Sniffer};
 use encoding_rs::{CoderResult, Encoding};
 use serde_json::Value;
@@ -96,17 +97,18 @@ pub(crate) struct TableSnapshot {
     pub(crate) dialect: CsvDialect,
 }
 
-pub(crate) fn table_upsert_change(dialect: CsvDialect) -> Result<EntityChange, PluginError> {
+pub(crate) fn table_upsert_change(dialect: CsvDialect) -> Result<DetectedChange, PluginError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": ROOT_ENTITY_PK,
         "dialect": dialect_snapshot_content(dialect),
     }))
     .map_err(|error| PluginError::Internal(format!("failed to serialize CSV table: {error}")))?;
 
-    Ok(EntityChange {
-        entity_pk: ROOT_ENTITY_PK.to_string(),
+    Ok(DetectedChange {
+        entity_pk: vec![ROOT_ENTITY_PK.to_string()],
         schema_key: TABLE_SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
+        metadata: None,
     })
 }
 
@@ -219,7 +221,7 @@ fn parse_dialect_byte_string(value: Option<&Value>, field: &str) -> Result<u8, P
 
 pub(crate) fn parse_file(file: &File) -> Result<(Vec<Vec<String>>, CsvDialect), PluginError> {
     let decoded = decode(&file.data)?;
-    let dialect = dialect_for_filename(Some(file.path.as_str()), &decoded);
+    let dialect = dialect_for_filename(None, &decoded);
     let rows = parse_rows(&decoded, dialect)?;
     Ok((rows, dialect))
 }

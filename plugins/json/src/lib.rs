@@ -7,9 +7,8 @@ mod bindings {
 }
 pub use bindings::*;
 
-use crate::exports::lix::plugin::api::{
-    ActiveStateRow, DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
-};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
@@ -19,10 +18,6 @@ const MAX_ARRAY_INDEX: usize = 100_000;
 const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../schema/json_pointer.json");
 
 static JSON_POINTER_SCHEMA: OnceLock<Value> = OnceLock::new();
-
-pub use crate::exports::lix::plugin::api::{
-    EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
-};
 
 struct JsonPlugin;
 
@@ -88,22 +83,24 @@ struct ProjectionTreeNode {
 
 impl Plugin for JsonPlugin {
     fn detect_changes(
-        state: DetectStateContext,
+        state: Vec<EntityState>,
         file: File,
-    ) -> Result<Vec<EntityChange>, PluginError> {
-        let before = file_from_state_context(state, &file)?;
+    ) -> Result<Vec<DetectedChange>, PluginError> {
+        let state = detected_changes_from_state(state)?;
+        let before = file_from_state_context(state)?;
         detect_changes_from_files(before, file)
     }
 
-    fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-        render_state_context(state)
+    fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+        let state = detected_changes_from_state(state)?;
+        render_entity_changes(empty_file(), state)
     }
 }
 
 fn detect_changes_from_files(
     before: Option<File>,
     after: File,
-) -> Result<Vec<EntityChange>, PluginError> {
+) -> Result<Vec<DetectedChange>, PluginError> {
     let before_json = before
         .as_ref()
         .map(|file| parse_json_bytes(&file.data))
@@ -121,7 +118,10 @@ fn detect_changes_from_files(
     Ok(changes)
 }
 
-fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+fn render_entity_changes(
+    _file: File,
+    changes: Vec<DetectedChange>,
+) -> Result<Vec<u8>, PluginError> {
     let mut seen_entity_pks = BTreeSet::new();
     let mut upserts = Vec::new();
     let mut tombstones = Vec::new();
@@ -131,7 +131,7 @@ fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<
             continue;
         }
 
-        let pointer = change.entity_pk;
+        let pointer = single_entity_pk(change.entity_pk)?;
         if !seen_entity_pks.insert(pointer.clone()) {
             return Err(PluginError::InvalidInput(format!(
                 "duplicate entity_pk '{pointer}' for schema_key '{SCHEMA_KEY}'"
@@ -355,7 +355,7 @@ fn diff_json(
     before: Option<&Value>,
     after: Option<&Value>,
     path: &mut Vec<String>,
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
 ) -> Result<(), PluginError> {
     if before.is_none() && after.is_none() {
         return Ok(());
@@ -458,7 +458,7 @@ fn diff_json(
 fn collect_deletions(
     value: &Value,
     path: &mut Vec<String>,
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
     include_current: bool,
 ) {
     match value {
@@ -493,7 +493,7 @@ fn collect_deletions(
 fn collect_leaves(
     value: &Value,
     path: &mut Vec<String>,
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
 ) -> Result<(), PluginError> {
     match value {
         Value::Array(items) => {
@@ -526,16 +526,17 @@ fn collect_leaves(
     }
 }
 
-fn push_deletion(changes: &mut Vec<EntityChange>, pointer: String) {
-    changes.push(EntityChange {
-        entity_pk: pointer,
+fn push_deletion(changes: &mut Vec<DetectedChange>, pointer: String) {
+    changes.push(DetectedChange {
+        entity_pk: vec![pointer],
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: None,
+        metadata: None,
     });
 }
 
 fn push_upsert(
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
     pointer: String,
     value: Value,
 ) -> Result<(), PluginError> {
@@ -549,10 +550,11 @@ fn push_upsert(
         ))
     })?;
 
-    changes.push(EntityChange {
-        entity_pk: pointer,
+    changes.push(DetectedChange {
+        entity_pk: vec![pointer],
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
+        metadata: None,
     });
 
     Ok(())
@@ -842,69 +844,78 @@ fn materialize_projection_node(
     Ok(value)
 }
 
-fn file_from_state_context(
-    state: DetectStateContext,
-    template: &File,
-) -> Result<Option<File>, PluginError> {
-    let active_state = state.active_state;
-    if active_state.is_empty() {
+fn file_from_state_context(state: Vec<DetectedChange>) -> Result<Option<File>, PluginError> {
+    if state.is_empty() {
         return Ok(None);
     }
 
-    let data = render_active_state_rows(active_state)?;
     Ok(Some(File {
-        id: template.id.clone(),
-        path: template.path.clone(),
-        data,
+        data: render_entity_changes(empty_file(), state)?,
     }))
 }
 
-fn render_state_context(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-    render_active_state_rows(state.active_state)
-}
-
-fn render_active_state_rows(rows: Vec<ActiveStateRow>) -> Result<Vec<u8>, PluginError> {
-    render_entity_changes(empty_file(), entity_changes_from_active_state(rows))
-}
-
-fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
-    rows.into_iter()
-        .map(|row| EntityChange {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            snapshot_content: row.snapshot_content,
+fn detected_changes_from_state(
+    state: Vec<EntityState>,
+) -> Result<Vec<DetectedChange>, PluginError> {
+    state
+        .into_iter()
+        .map(|row| {
+            validate_single_entity_pk(&row.entity_pk)?;
+            Ok(DetectedChange {
+                entity_pk: row.entity_pk,
+                schema_key: row.schema_key,
+                snapshot_content: Some(row.snapshot_content),
+                metadata: row.metadata,
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
+    validate_single_entity_pk(&entity_pk)?;
+    Ok(entity_pk.remove(0))
+}
+
+fn validate_single_entity_pk(entity_pk: &[String]) -> Result<(), PluginError> {
+    if entity_pk.len() != 1 {
+        return Err(PluginError::InvalidInput(format!(
+            "expected single-component entity_pk, got {} components",
+            entity_pk.len()
+        )));
+    }
+    Ok(())
 }
 
 fn empty_file() -> File {
-    File {
-        id: String::new(),
-        path: String::new(),
-        data: Vec::new(),
-    }
+    File { data: Vec::new() }
 }
 
-pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
+pub fn detect_changes(
+    before: Option<File>,
+    after: File,
+) -> Result<Vec<DetectedChange>, PluginError> {
     detect_changes_from_files(before, after)
 }
 
 pub fn detect_changes_with_state_context(
     before: Option<File>,
     after: File,
-    state_context: Option<DetectStateContext>,
-) -> Result<Vec<EntityChange>, PluginError> {
+    state_context: Option<Vec<DetectedChange>>,
+) -> Result<Vec<DetectedChange>, PluginError> {
     match state_context {
-        Some(state) => <JsonPlugin as Plugin>::detect_changes(state, after),
+        Some(state) => {
+            let before = file_from_state_context(state)?;
+            detect_changes_from_files(before, after)
+        }
         None => detect_changes_from_files(before, after),
     }
 }
 
-pub fn render(state_context: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-    <JsonPlugin as Plugin>::render(state_context)
+pub fn render(state_context: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> {
+    render_entity_changes(empty_file(), state_context)
 }
 
-pub fn render_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+pub fn render_changes(file: File, changes: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> {
     render_entity_changes(file, changes)
 }
 

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use plugin_json_v2::{PluginEntityChange, PluginFile, SCHEMA_KEY, detect_changes};
+use plugin_json_v2::{DetectedChange, File, SCHEMA_KEY, detect_changes};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -87,17 +87,13 @@ pub fn dataset_large() -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-pub fn file_from_bytes(id: &str, path: &str, data: &[u8]) -> PluginFile {
-    PluginFile {
-        id: id.to_string(),
-        path: path.to_string(),
+pub fn file_from_bytes(data: &[u8]) -> File {
+    File {
         data: data.to_vec(),
     }
 }
 
-pub fn merge_latest_state_rows(
-    changesets: Vec<Vec<PluginEntityChange>>,
-) -> Vec<PluginEntityChange> {
+pub fn merge_latest_state_rows(changesets: Vec<Vec<DetectedChange>>) -> Vec<DetectedChange> {
     let mut latest = BTreeMap::new();
     for changes in changesets {
         for change in changes {
@@ -113,9 +109,9 @@ pub fn merge_latest_state_rows(
     latest.into_values().collect()
 }
 
-pub fn projection_for_transition(before: &[u8], after: &[u8]) -> Vec<PluginEntityChange> {
-    let before_file = file_from_bytes("f1", "/x.json", before);
-    let after_file = file_from_bytes("f1", "/x.json", after);
+pub fn projection_for_transition(before: &[u8], after: &[u8]) -> Vec<DetectedChange> {
+    let before_file = file_from_bytes(before);
+    let after_file = file_from_bytes(after);
     let baseline =
         detect_changes(None, before_file.clone()).expect("baseline detect_changes should work");
     let delta =

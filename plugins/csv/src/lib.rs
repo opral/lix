@@ -1,5 +1,5 @@
-#[expect(clippy::same_length_and_capacity)]
 mod bindings {
+    #![expect(clippy::same_length_and_capacity)]
     wit_bindgen::generate!({
         path: "../../packages/engine/wit",
         world: "plugin",
@@ -16,14 +16,14 @@ use crate::csv::{
     CsvDialect, parse_file, parse_table_snapshot, render_projection, table_upsert_change,
 };
 use crate::diff::{Op, imara_diff_runs};
-use crate::exports::lix::plugin::api::{
-    DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
-};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use crate::order_key::OrderKey;
 use itertools::Itertools;
 use rand::Rng;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::str;
 
 pub const ROOT_ENTITY_PK: &str = "root";
@@ -31,11 +31,6 @@ pub const TABLE_SCHEMA_KEY: &str = schemas::TABLE_SCHEMA_KEY;
 pub const ROW_SCHEMA_KEY: &str = schemas::ROW_SCHEMA_KEY;
 
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
-
-pub use crate::exports::lix::plugin::api::{
-    ActiveStateRow as PluginActiveStateRow, DetectStateContext as PluginDetectStateContext,
-    EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
-};
 
 #[derive(Clone, Copy, Debug)]
 pub struct CsvPlugin;
@@ -64,26 +59,16 @@ struct RowSnapshot {
 
 impl Plugin for CsvPlugin {
     fn detect_changes(
-        state: DetectStateContext,
+        state: Vec<EntityState>,
         file: File,
-    ) -> Result<Vec<EntityChange>, PluginError> {
-        let entity_changes = state.active_state.into_iter().map(|row| EntityChange {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            snapshot_content: row.snapshot_content,
-        });
-        let before = projection_from_entity_changes(entity_changes)?;
+    ) -> Result<Vec<DetectedChange>, PluginError> {
+        let before = Projection::from_entity_state(state.into_iter())?;
         let (file_rows, after_dialect) = parse_file(&file)?;
         detect_changes_for_rows(&before, &file_rows, after_dialect)
     }
 
-    fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-        let entity_changes = state.active_state.into_iter().map(|row| EntityChange {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            snapshot_content: row.snapshot_content,
-        });
-        let projection = projection_from_entity_changes(entity_changes)?;
+    fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+        let projection = Projection::from_entity_state(state.into_iter())?;
         render_projection(&projection)
     }
 }
@@ -92,7 +77,7 @@ fn detect_changes_for_rows(
     before: &Projection,
     file_rows: &[Vec<String>],
     after_dialect: CsvDialect,
-) -> Result<Vec<EntityChange>, PluginError> {
+) -> Result<Vec<DetectedChange>, PluginError> {
     let base = before.to_rows();
     let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut changes = Vec::new();
@@ -125,10 +110,11 @@ fn detect_changes_for_rows(
             }
             Op::Delete => {
                 for _ in 0..run.len {
-                    changes.push(EntityChange {
-                        entity_pk: base[base_index].id.clone(),
+                    changes.push(DetectedChange {
+                        entity_pk: vec![base[base_index].id.clone()],
                         schema_key: ROW_SCHEMA_KEY.to_string(),
                         snapshot_content: None,
+                        metadata: None,
                     });
                     base_index += 1;
                 }
@@ -157,64 +143,63 @@ fn detect_changes_for_rows(
     Ok(changes)
 }
 
-fn projection_from_entity_changes(
-    changes: impl Iterator<Item = EntityChange>,
-) -> Result<Projection, PluginError> {
-    let mut projection = Projection {
-        rows_by_id: BTreeMap::new(),
-        dialect: CsvDialect::default(),
-        table_present: false,
-    };
-    let mut table_seen = false;
-    let mut seen_row_change_ids = BTreeSet::<String>::new();
-
-    for change in changes {
-        match change.schema_key.as_str() {
-            TABLE_SCHEMA_KEY => {
-                if change.entity_pk != ROOT_ENTITY_PK {
-                    return Err(PluginError::InvalidInput(format!(
-                        "unsupported entity_pk '{}' for schema_key '{}', expected '{}'",
-                        change.entity_pk, TABLE_SCHEMA_KEY, ROOT_ENTITY_PK
-                    )));
-                }
-                if table_seen {
-                    return Err(PluginError::InvalidInput(format!(
-                        "duplicate entity_pk '{ROOT_ENTITY_PK}' for schema_key '{TABLE_SCHEMA_KEY}'"
-                    )));
-                }
-                table_seen = true;
-                projection.table_present = change.snapshot_content.is_some();
-                projection.dialect = match change.snapshot_content {
-                    Some(raw) => parse_table_snapshot(&raw)?.dialect,
-                    None => CsvDialect::default(),
-                };
-            }
-            ROW_SCHEMA_KEY => {
-                if !seen_row_change_ids.insert(change.entity_pk.clone()) {
-                    return Err(PluginError::InvalidInput(format!(
-                        "duplicate entity_pk '{}' for schema_key '{}'",
-                        change.entity_pk, ROW_SCHEMA_KEY
-                    )));
-                }
-
-                match change.snapshot_content {
-                    Some(raw) => {
-                        let row = parse_row_snapshot(&raw, &change.entity_pk)?;
-                        projection.rows_by_id.insert(change.entity_pk, row);
-                    }
-                    None => {
-                        projection.rows_by_id.remove(&change.entity_pk);
-                    }
-                }
-            }
-            _ => {}
-        }
+fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
+    if entity_pk.len() != 1 {
+        return Err(PluginError::InvalidInput(format!(
+            "expected single-component entity_pk, got {} components",
+            entity_pk.len()
+        )));
     }
-
-    Ok(projection)
+    Ok(entity_pk.remove(0))
 }
 
 impl Projection {
+    fn from_entity_state(changes: impl Iterator<Item = EntityState>) -> Result<Self, PluginError> {
+        let mut rows_by_id = BTreeMap::new();
+        let mut dialect = None;
+
+        for change in changes {
+            match change.schema_key.as_str() {
+                TABLE_SCHEMA_KEY => {
+                    let entity_pk = single_entity_pk(change.entity_pk)?;
+                    if entity_pk != ROOT_ENTITY_PK {
+                        return Err(PluginError::InvalidInput(format!(
+                            "unsupported entity_pk '{entity_pk}' for schema_key '{TABLE_SCHEMA_KEY}', expected '{ROOT_ENTITY_PK}'"
+                        )));
+                    }
+                    if dialect.is_some() {
+                        return Err(PluginError::InvalidInput(format!(
+                            "duplicate entity_pk '{ROOT_ENTITY_PK}' for schema_key '{TABLE_SCHEMA_KEY}'"
+                        )));
+                    }
+                    dialect = Some(parse_table_snapshot(&change.snapshot_content)?.dialect);
+                }
+                ROW_SCHEMA_KEY => {
+                    let entity_pk = single_entity_pk(change.entity_pk)?;
+                    match rows_by_id.entry(entity_pk) {
+                        Entry::Occupied(entry) => {
+                            return Err(PluginError::InvalidInput(format!(
+                                "duplicate entity_pk '{}' for schema_key '{ROW_SCHEMA_KEY}'",
+                                entry.key()
+                            )));
+                        }
+                        Entry::Vacant(entry) => {
+                            let row = parse_row_snapshot(&change.snapshot_content, entry.key())?;
+                            entry.insert(row);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            rows_by_id,
+            dialect: dialect.unwrap_or_default(),
+            table_present: dialect.is_some(),
+        })
+    }
+
     fn to_rows(&self) -> Vec<Row> {
         let mut rows = self
             .rows_by_id
@@ -234,7 +219,7 @@ fn row_upsert_change(
     id: &str,
     order_key: OrderKey,
     cells: &[String],
-) -> Result<EntityChange, PluginError> {
+) -> Result<DetectedChange, PluginError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": id,
         "order_key": order_key.to_snapshot_string(),
@@ -242,10 +227,11 @@ fn row_upsert_change(
     }))
     .map_err(|error| PluginError::Internal(format!("failed to serialize CSV row: {error}")))?;
 
-    Ok(EntityChange {
-        entity_pk: id.to_string(),
+    Ok(DetectedChange {
+        entity_pk: vec![id.to_string()],
         schema_key: ROW_SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
+        metadata: None,
     })
 }
 
@@ -443,7 +429,7 @@ mod tests {
 
     fn apply_entity_change(
         projection: &mut Projection,
-        change: EntityChange,
+        change: DetectedChange,
     ) -> Result<(), PluginError> {
         match change.schema_key.as_str() {
             TABLE_SCHEMA_KEY => {
@@ -456,11 +442,12 @@ mod tests {
                 }
             }
             ROW_SCHEMA_KEY => {
+                let entity_pk = single_entity_pk(change.entity_pk)?;
                 if let Some(raw) = change.snapshot_content {
-                    let row = parse_row_snapshot(&raw, &change.entity_pk)?;
-                    projection.rows_by_id.insert(change.entity_pk, row);
+                    let row = parse_row_snapshot(&raw, &entity_pk)?;
+                    projection.rows_by_id.insert(entity_pk, row);
                 } else {
-                    projection.rows_by_id.remove(&change.entity_pk);
+                    projection.rows_by_id.remove(&entity_pk);
                 }
             }
             _ => {}
