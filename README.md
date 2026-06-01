@@ -39,14 +39,20 @@ const lix = await openLix({
   backend: new SqliteBackend({ path: "app.lix" }),
 });
 
-await lix.execute(
-  "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-  ["status", "draft"],
-);
+await lix.fs.writeFile("/notes/status.txt", new TextEncoder().encode("draft"));
 
 const main = await lix.activeBranchId();
+
 const draft = await lix.createBranch({ name: "Explore" });
+
 await lix.switchBranch({ branchId: draft.id });
+
+await lix.fs.writeFile(
+  "/notes/status.txt",
+  new TextEncoder().encode("ready for review"),
+);
+
+await lix.switchBranch({ branchId: main });
 
 const changes = await lix.execute(
   "SELECT schema_key, count(*) AS count FROM lix_change GROUP BY schema_key",
@@ -87,14 +93,8 @@ Write files, blobs, and history in one transaction.
 const tx = await lix.beginTransaction();
 
 try {
-  await tx.execute(
-    "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-    ["/spec.docx", body],
-  );
-  await tx.execute(
-    "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-    ["/spec.png", image],
-  );
+  await tx.fs.writeFile("/spec.docx", body);
+  await tx.fs.writeFile("/spec.png", image);
   await tx.commit();
 } catch (error) {
   await tx.rollback();
@@ -114,22 +114,13 @@ const pricing = await lix.createBranch({ name: "Pricing draft" });
 const qa = await lix.createBranch({ name: "QA draft" });
 
 await lix.switchBranch({ branchId: copy.id });
-await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-  ["/landing.md", copyDraft],
-);
+await lix.fs.writeFile("/landing.md", copyDraft);
 
 await lix.switchBranch({ branchId: pricing.id });
-await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-  ["/plans.json", priceModel],
-);
+await lix.fs.writeFile("/plans.json", priceModel);
 
 await lix.switchBranch({ branchId: qa.id });
-await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-  ["/checks/report.json", testRun],
-);
+await lix.fs.writeFile("/checks/report.json", testRun);
 
 await lix.switchBranch({ branchId: main });
 ```

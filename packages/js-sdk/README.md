@@ -14,20 +14,14 @@ npm install @lix-js/sdk
 import { openLix, SqliteBackend } from "@lix-js/sdk";
 
 const lix = await openLix({
-	backend: new SqliteBackend({ path: "app.lix" }),
+  backend: new SqliteBackend({ path: "app.lix" }),
 });
 
-await lix.execute(
-	"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-	["hello", "world"],
-);
+await lix.fs.writeFile("/hello.txt", new TextEncoder().encode("world"));
 
-const result = await lix.execute(
-	"SELECT value FROM lix_key_value WHERE key = $1",
-	["hello"],
-);
+const bytes = await lix.fs.readFile("/hello.txt");
 
-console.log(result.rows[0]?.get("value"));
+console.log(bytes && new TextDecoder().decode(bytes));
 
 await lix.close();
 ```
@@ -39,10 +33,7 @@ const main = await lix.activeBranchId();
 const draft = await lix.createBranch({ name: "Draft" });
 
 await lix.switchBranch({ branchId: draft.id });
-await lix.execute(
-	"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-	["status", "draft"],
-);
+await lix.fs.writeFile("/status.txt", new TextEncoder().encode("draft"));
 
 await lix.switchBranch({ branchId: main });
 const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
@@ -55,18 +46,12 @@ const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 const tx = await lix.beginTransaction();
 
 try {
-	await tx.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-		["a", "1"],
-	);
-	await tx.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-		["b", "2"],
-	);
-	await tx.commit();
+  await tx.fs.writeFile("/a.txt", new TextEncoder().encode("1"));
+  await tx.fs.writeFile("/b.txt", new TextEncoder().encode("2"));
+  await tx.commit();
 } catch (error) {
-	await tx.rollback();
-	throw error;
+  await tx.rollback();
+  throw error;
 }
 ```
 

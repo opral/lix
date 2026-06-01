@@ -16,18 +16,14 @@ const lix = await openLix({
 
 const main = await lix.activeBranchId();
 
-await lix.execute(
-  "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-  ["/orders.xlsx", bytes],
-);
+await lix.fs.writeFile("/orders.xlsx", bytes);
+
+const original = await lix.fs.readFile("/orders.xlsx");
 
 const draft = await lix.createBranch({ name: "Explore" });
 await lix.switchBranch({ branchId: draft.id });
 
-await lix.execute(
-  "UPDATE lix_file SET data = ? WHERE path = ?",
-  [draftBytes, "/orders.xlsx"],
-);
+await lix.fs.writeFile("/orders.xlsx", draftBytes);
 
 await lix.switchBranch({ branchId: main });
 
@@ -43,7 +39,7 @@ const rustHeroSample = `use lix_sdk::{openLix, sqlite};
 
 let lix = openLix(Some(sqlite("app.lix"))).await?;
 
-lix.file().write("/orders.xlsx", &bytes).await?;
+lix.fs().write_file("/orders.xlsx", bytes).await?;
 
 let draft = lix.branch("explore").await?;
 
@@ -93,8 +89,8 @@ const lix = await openLix({
     title: "ACID transactions.",
     body: "One transaction covers your data, the blobs it references, and the change row that records the edit. No two-phase commit between three systems.",
     code: `await lix.transaction(async (tx) => {
-  await tx.file.write("/spec.docx", body);
-  await tx.file.write("/spec.png", img);
+  await tx.fs.writeFile("/spec.docx", body);
+  await tx.fs.writeFile("/spec.png", img);
 });`,
   },
   {
@@ -105,9 +101,9 @@ const lix = await openLix({
 const agent2 = await lix.create_session("pricing");
 const agent3 = await lix.create_session("qa");
 
-await agent1.file.write("/landing.md", copyDraft);
-await agent2.file.write("/plans.json", priceModel);
-await agent3.file.write("/checks/report.json", testRun);
+await agent1.fs.writeFile("/landing.md", copyDraft);
+await agent2.fs.writeFile("/plans.json", priceModel);
+await agent3.fs.writeFile("/checks/report.json", testRun);
 
 await agent1.commit();
 await agent2.commit();
@@ -179,7 +175,7 @@ function cn(...classes: Array<string | false | undefined>) {
 
 function highlightCode(code: string) {
   const pattern =
-    /(`[^`]*`|"[^"]*"|'[^']*'|\bORDER BY\b|\bGROUP BY\b|\b(?:import|from|const|let|await|async|return|use|SELECT|FROM|JOIN|WHERE|AND|AS|DESC|INSERT|INTO|VALUES|UPDATE|SET)\b|\b(?:openLix|createBackend|SqliteBackend|sqlite|execute|transaction|create_session|createBranch|switchBranch|mergeBranchPreview|mergeBranch|activeBranchId|branch|diff|history|entity|write|commit|file|lix_json_get_text)\b|\b(?:lix_change|lix_file|xlsx_row)\b)/g;
+    /(`[^`]*`|"[^"]*"|'[^']*'|\bORDER BY\b|\bGROUP BY\b|\b(?:import|from|const|let|await|async|return|use|SELECT|FROM|JOIN|WHERE|AND|AS|DESC|INSERT|INTO|VALUES|UPDATE|SET)\b|\b(?:openLix|createBackend|SqliteBackend|sqlite|execute|transaction|create_session|createBranch|switchBranch|mergeBranchPreview|mergeBranch|activeBranchId|branch|diff|history|entity|write|writeFile|readFile|commit|file|fs|lix_json_get_text)\b|\b(?:lix_change|lix_file|xlsx_row)\b)/g;
 
   return code.split(pattern).map((part, index) => {
     if (!part) return null;
@@ -194,7 +190,7 @@ function highlightCode(code: string) {
     ) {
       className = "text-[#6d28d9]";
     } else if (
-      /^(openLix|createBackend|SqliteBackend|sqlite|execute|transaction|create_session|createBranch|switchBranch|mergeBranchPreview|mergeBranch|activeBranchId|branch|diff|history|entity|write|commit|file|lix_json_get_text)$/.test(
+      /^(openLix|createBackend|SqliteBackend|sqlite|execute|transaction|create_session|createBranch|switchBranch|mergeBranchPreview|mergeBranch|activeBranchId|branch|diff|history|entity|write|writeFile|readFile|commit|file|fs|lix_json_get_text)$/.test(
         part,
       )
     ) {
@@ -954,9 +950,9 @@ function GetStarted() {
             <span className="text-[#6b6b66]"># 3 · write & commit</span>
             {"\n"}
             <span className="text-[#b65aff]">await</span> lix.
-            <span className="text-[#066f86]">file</span>.
-            <span className="text-[#066f86]">write</span>(
-            <span className="text-[#058a3e]">"hello.json"</span>, payload);
+            <span className="text-[#066f86]">fs</span>.
+            <span className="text-[#066f86]">writeFile</span>(
+            <span className="text-[#058a3e]">"/hello.json"</span>, payload);
             {"\n\n"}
             <span className="text-[#6b6b66]"># 4 · branch & ask</span>
             {"\n"}
