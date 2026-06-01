@@ -346,8 +346,8 @@ pub(crate) enum FilesystemEntry {
 impl FilesystemEntry {
     fn untracked(&self) -> bool {
         match self {
-            FilesystemEntry::Directory(entry) => entry.scope.untracked,
-            FilesystemEntry::File(entry) => entry.scope.untracked,
+            Self::Directory(entry) => entry.scope.untracked,
+            Self::File(entry) => entry.scope.untracked,
         }
     }
 }
@@ -509,23 +509,22 @@ fn insert_entry(
             entry_label(&entry)
         )));
     }
-    if let Some(namespace_conflict_path) = namespace_conflict_path(&path, &entry) {
-        if let Some(existing) = entries.get(&namespace_conflict_path) {
-            return Err(filesystem_conflict_error(format!(
-                "filesystem namespace conflict at {path:?}: {} conflicts with existing {} at {namespace_conflict_path:?}",
-                entry_label(&entry),
-                entry_label(existing)
-            )));
-        }
+    let namespace_conflict_path = namespace_conflict_path(&path, &entry);
+    if let Some(existing) = entries.get(&namespace_conflict_path) {
+        return Err(filesystem_conflict_error(format!(
+            "filesystem namespace conflict at {path:?}: {} conflicts with existing {} at {namespace_conflict_path:?}",
+            entry_label(&entry),
+            entry_label(existing)
+        )));
     }
     entries.insert(path, entry);
     Ok(())
 }
 
-fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> Option<String> {
+fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> String {
     match entry {
-        FilesystemEntry::Directory(_) => Some(path.trim_end_matches('/').to_string()),
-        FilesystemEntry::File(_) => Some(format!("{path}/")),
+        FilesystemEntry::Directory(_) => path.trim_end_matches('/').to_string(),
+        FilesystemEntry::File(_) => format!("{path}/"),
     }
 }
 

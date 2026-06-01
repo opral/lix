@@ -1422,7 +1422,7 @@ mod tests {
                 id: Some("file-readme".to_string()),
                 path: "/docs/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                context: context.clone(),
+                context,
             },
             &mut test_id_generator(&["dir-docs"]),
         )

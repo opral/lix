@@ -20,19 +20,19 @@ use crate::transaction::types::{
 
 use super::context::SessionContext;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsWriteOptions {
     pub metadata: Option<JsonValue>,
     pub untracked: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsMkdirOptions {
     pub metadata: Option<JsonValue>,
     pub untracked: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsRmOptions {
     pub recursive: bool,
     pub metadata: Option<JsonValue>,
@@ -95,16 +95,16 @@ where
                 if let Some(existing) = filesystem.entry(&path) {
                     match existing {
                         FilesystemEntry::Directory(_) => {
-                            return Err(wrong_kind_error(&path, "file", "directory"));
+                            Err(wrong_kind_error(&path, "file", "directory"))
                         }
                         FilesystemEntry::File(file)
                             if file.scope.untracked != options.untracked =>
                         {
-                            return Err(filesystem_conflict_error(format!(
+                            Err(filesystem_conflict_error(format!(
                                 "fs.write_file cannot write {} path {path:?} over existing {} file",
                                 lane_name(options.untracked),
                                 lane_name(file.scope.untracked)
-                            )));
+                            )))
                         }
                         FilesystemEntry::File(file) => {
                             let mut rows = Vec::new();
@@ -330,10 +330,7 @@ where
                         if has_children && !options.recursive {
                             return Err(LixError::new(
                                 LixError::CODE_CONSTRAINT_VIOLATION,
-                                format!(
-                                    "fs.rm cannot remove non-empty directory {:?} without recursive=true",
-                                    normalized_path
-                                ),
+                                format!("fs.rm cannot remove non-empty directory {normalized_path:?} without recursive=true"),
                             ));
                         }
                         let mut context = directory.context();
