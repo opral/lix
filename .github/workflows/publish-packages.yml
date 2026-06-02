@@ -33,6 +33,7 @@ jobs:
       - name: Validate release version
         id: version
         run: |
+          set -o pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             tag="$(node scripts/release-tag.mjs "${{ inputs.version }}" | tail -n 1)"
           else
