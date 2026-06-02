@@ -61,11 +61,11 @@ const changes = await lix.execute(
 
 ## Why Lix?
 
-### Non-code files need semantic change tracking.
+### Git is great for code. Non-code files need semantic change tracking.
 
 AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, versions, reviewable changes, and rollback.
 
-Agents are increasingly operating on files where the useful diff is a spreadsheet cell, document clause, generated JSON property, CSV row, PDF section, or agent action.
+Git works well for source code, but it cannot meaningfully track many non-code files by default. Agents increasingly operate on files where the useful diff is a spreadsheet cell, document clause, generated JSON property, CSV row, PDF section, or agent action.
 
 Lix is built to make those domain-level changes queryable, reviewable, and mergeable.
 
