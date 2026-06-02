@@ -11,7 +11,7 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Git is great for source code. Lix brings Git-like branches, history, review, rollback, and merging to **non-code files** like PDF, DOCX, XLSX, CSV, JSON, and agent-generated work, where the useful diff is often a cell, clause, property, row, record, or other structured entity instead of a line of text.
+Lix gives AI agents versions, branches, checkpoints, reviewable changes, rollback, merging, immutable history, and SQL-queryable context for **non-code files** like PDF, DOCX, XLSX, CSV, JSON, and agent-generated work.
 
 - **Runs in process.** Import it as a library and run it inside your worker, service, CLI, or app. No daemon, no protocol.
 - **Works for any file format.** Track changes as entities across files, structured data, and custom formats.
@@ -61,13 +61,13 @@ const changes = await lix.execute(
 
 ## Why Lix?
 
-### Git is great for code. Non-code files need semantic change tracking.
+### Non-code files need semantic change tracking.
 
 AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, versions, reviewable changes, and rollback.
 
-Teams reach for Git because agents need branches, history, rollback, and review. That works well for source code, but becomes awkward when the thing being reviewed is a spreadsheet cell, document clause, generated JSON property, CSV row, PDF section, or agent action.
+Agents are increasingly operating on files where the useful diff is a spreadsheet cell, document clause, generated JSON property, CSV row, PDF section, or agent action.
 
-Git can store those files. Lix is built to make their domain-level changes queryable, reviewable, and mergeable.
+Lix is built to make those domain-level changes queryable, reviewable, and mergeable.
 
 [How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
