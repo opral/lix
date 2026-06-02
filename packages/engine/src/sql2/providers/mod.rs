@@ -84,6 +84,7 @@ where
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
+                    ctx.plugin_host(),
                     ctx.functions(),
                 )
                 .await?;
@@ -95,6 +96,7 @@ where
                     ctx.live_state(),
                     Arc::clone(&branch_ref),
                     ctx.blob_reader(),
+                    ctx.plugin_host(),
                     ctx.functions(),
                 )
                 .await?;

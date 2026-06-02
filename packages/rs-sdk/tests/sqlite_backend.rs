@@ -1,9 +1,13 @@
 #![cfg(feature = "sqlite")]
 use lix_engine::run_backend_conformance;
 use lix_sdk::{
-    SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory, Value, open_lix_with_backend,
+    FsWriteOptions, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory,
+    Value, WasmComponentInstance, WasmLimits, WasmRuntime, open_lix, open_lix_with_backend,
 };
 use rusqlite::Connection;
+use std::io::{Cursor, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn sqlite_backend_passes_backend_conformance() {
@@ -96,8 +100,150 @@ async fn sqlite_backend_persists_lix_data_across_reopen() {
     lix.close().await.expect("lix closes");
 }
 
+#[tokio::test]
+async fn sqlite_backend_open_lix_options_supplies_plugin_wasm_runtime() {
+    let tempdir = tempfile::tempdir().expect("tempdir should create");
+    let path = tempdir.path().join("workspace.lix");
+    let runtime = Arc::new(RecordingWasmRuntime::default());
+    let wasm_runtime: Arc<dyn WasmRuntime> = runtime.clone();
+
+    let lix = open_lix(OpenLixOptions {
+        backend: SqliteBackend::open(&path).expect("sqlite backend opens"),
+        wasm_runtime: Some(wasm_runtime),
+    })
+    .await
+    .expect("lix opens on sqlite backend with wasm runtime");
+
+    lix.install_plugin_archive(&build_runtime_test_plugin_archive())
+        .await
+        .expect("plugin archive installs");
+    lix.write_file(
+        "/custom.runtime",
+        b"source bytes".to_vec(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .expect("matching plugin file write uses the supplied wasm runtime");
+
+    assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.detect_calls.load(Ordering::SeqCst), 1);
+
+    let rendered = lix
+        .read_file("/custom.runtime")
+        .await
+        .expect("plugin file reads");
+    assert_eq!(
+        rendered.as_deref(),
+        Some(b"rendered by custom runtime".as_slice())
+    );
+    assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 1);
+
+    lix.close().await.expect("lix closes");
+}
+
 fn sqlite_journal_mode(path: &std::path::Path) -> String {
     let conn = Connection::open(path).expect("sqlite file should open");
     conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
         .expect("journal_mode should read")
 }
+
+#[derive(Default)]
+struct RecordingWasmRuntime {
+    init_calls: Arc<AtomicUsize>,
+    detect_calls: Arc<AtomicUsize>,
+    render_calls: Arc<AtomicUsize>,
+}
+
+struct RecordingWasmComponent {
+    detect_calls: Arc<AtomicUsize>,
+    render_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl WasmRuntime for RecordingWasmRuntime {
+    async fn init_component(
+        &self,
+        bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, lix_sdk::LixError> {
+        assert!(bytes.starts_with(b"\0asm"));
+        self.init_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(RecordingWasmComponent {
+            detect_calls: self.detect_calls.clone(),
+            render_calls: self.render_calls.clone(),
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl WasmComponentInstance for RecordingWasmComponent {
+    async fn call(&self, export: &str, _input: &[u8]) -> Result<Vec<u8>, lix_sdk::LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => {
+                self.detect_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(br#"[{"entity-pk":["doc"],"schema-key":"test_plugin_doc","snapshot-content":"{\"id\":\"doc\",\"content\":\"from runtime\"}","metadata":null}]"#.to_vec())
+            }
+            "render" | "api#render" => {
+                self.render_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(b"rendered by custom runtime".to_vec())
+            }
+            other => Err(lix_sdk::LixError::new(
+                lix_sdk::LixError::CODE_INTERNAL_ERROR,
+                format!("unexpected plugin export {other}"),
+            )),
+        }
+    }
+}
+
+fn build_runtime_test_plugin_archive() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        ("manifest.json", RUNTIME_TEST_PLUGIN_MANIFEST.as_bytes()),
+        (
+            "schema/test_plugin_doc.json",
+            RUNTIME_TEST_PLUGIN_SCHEMA.as_bytes(),
+        ),
+        ("plugin.wasm", b"\0asm\x01\0\0\0".as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+const RUNTIME_TEST_PLUGIN_MANIFEST: &str = r#"{
+  "key": "plugin_runtime_test",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {
+    "path_glob": "*.runtime",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/test_plugin_doc.json"
+  ]
+}"#;
+
+const RUNTIME_TEST_PLUGIN_SCHEMA: &str = r#"{
+  "x-lix-key": "test_plugin_doc",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "required": [
+    "id",
+    "content"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}"#;

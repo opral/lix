@@ -1,6 +1,8 @@
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
+use crate::NullableKeyFilter;
+use crate::binary_cas::BlobDataReader;
 use crate::common::{ParsedFilePath, directory_ancestor_paths, normalize_directory_path};
 use crate::filesystem::{
     BlobRefRowInput, DirectoryDeleteInput, DirectoryPathResolver, FileDeleteInput,
@@ -11,7 +13,14 @@ use crate::filesystem::{
     plan_directory_delete, plan_file_delete, plan_file_path_write, plan_recursive_directory_delete,
     wrong_kind_error,
 };
-use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+};
+use crate::plugin::{
+    InstalledPlugin, is_plugin_storage_path, load_installed_plugins_from_filesystem,
+    plugin_state_rows, reject_normal_plugin_storage_mutation, render_materialized_plugin_file,
+    select_plugin_for_path,
+};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
 use crate::transaction::types::{
@@ -85,6 +94,7 @@ where
         let path = ParsedFilePath::try_from_path(path)?
             .normalized_path
             .to_string();
+        reject_normal_plugin_storage_mutation(&path, "fs.write_file")?;
         self.session.with_write_transaction(|transaction| {
             Box::pin(async move {
                 let branch_id = transaction.active_branch_id().to_string();
@@ -127,13 +137,15 @@ where
                                         ..context.clone()
                                     },
                                 })?);
-                                file_data.push(TransactionFileData {
-                                    file_id: file.id.clone(),
-                                    branch_id: context.branch_id.clone(),
-                                    untracked: context.untracked,
-                                    data,
-                                });
                             }
+                            file_data.push(TransactionFileData {
+                                file_id: file.id.clone(),
+                                path: path.clone(),
+                                branch_id: context.branch_id.clone(),
+                                global: context.global,
+                                untracked: context.untracked,
+                                data,
+                            });
                             if context.metadata.is_some() {
                                 rows.push(file_descriptor_row(FileDescriptorRowInput {
                                     id: file.id.clone(),
@@ -215,8 +227,30 @@ where
         );
         let active_branch_id = self.session.active_branch_id_from_reader(&read).await?;
         let live_state = self.session.live_state.reader(&read);
-        let index = load_filesystem_index(&live_state, &active_branch_id).await?;
-        let blob_reader = self.session.binary_cas.reader(read);
+        let filesystem_rows = live_state
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: filesystem_schema_keys(),
+                    branch_ids: vec![active_branch_id.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
+        let index = FilesystemIndex::from_live_rows(filesystem_rows)?;
+        let blob_reader = self.session.binary_cas.reader(read.clone());
+        if let Some(bytes) = read_plugin_file_bytes(
+            &self.session,
+            &path,
+            &active_branch_id,
+            &index,
+            &live_state,
+            &blob_reader,
+        )
+        .await?
+        {
+            return Ok(Some(bytes));
+        }
         index.read_file_bytes(&path, &blob_reader).await
     }
 
@@ -330,6 +364,7 @@ where
                 let Some((normalized_path, entry)) = resolve_rm_entry(&filesystem, &rm_path)? else {
                     return Ok(());
                 };
+                reject_plugin_storage_rm(&normalized_path, entry, &filesystem, options.recursive)?;
                 let metadata = transaction_metadata(options.metadata, "fs.rm metadata")?;
                 let plan = match entry {
                     FilesystemEntry::File(file) => {
@@ -368,10 +403,35 @@ where
     }
 }
 
-async fn scan_filesystem_rows<B>(
+fn reject_plugin_storage_rm(
+    normalized_path: &str,
+    entry: &FilesystemEntry,
+    filesystem: &FilesystemIndex,
+    recursive: bool,
+) -> Result<(), LixError> {
+    reject_normal_plugin_storage_mutation(normalized_path, "fs.rm")?;
+    if !recursive || !matches!(entry, FilesystemEntry::Directory(_)) {
+        return Ok(());
+    }
+    if filesystem.file_entries().any(|(path, _)| {
+        is_plugin_storage_path(path) && path_is_inside_directory(path, normalized_path)
+    }) {
+        return reject_normal_plugin_storage_mutation(
+            "/.lix/plugins/",
+            "fs.rm recursive directory delete",
+        );
+    }
+    Ok(())
+}
+
+fn path_is_inside_directory(path: &str, directory_path: &str) -> bool {
+    directory_path == "/" || path.starts_with(directory_path)
+}
+
+pub(crate) async fn scan_filesystem_rows<B>(
     transaction: &mut crate::transaction::Transaction<B>,
     branch_id: &str,
-) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError>
+) -> Result<Vec<MaterializedLiveStateRow>, LixError>
 where
     B: StorageBackend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -387,6 +447,59 @@ where
             ..Default::default()
         })
         .await
+}
+
+async fn scan_plugin_state_rows_from_reader(
+    live_state: &dyn LiveStateReader,
+    branch_id: &str,
+    file_id: &str,
+    plugin: &InstalledPlugin,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    let rows = live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: plugin_state_filter(branch_id, file_id, plugin),
+            ..Default::default()
+        })
+        .await?;
+    Ok(plugin_state_rows(plugin, rows.iter()))
+}
+
+fn plugin_state_filter(
+    branch_id: &str,
+    file_id: &str,
+    plugin: &InstalledPlugin,
+) -> LiveStateFilter {
+    LiveStateFilter {
+        schema_keys: plugin.schema_keys.clone(),
+        branch_ids: vec![branch_id.to_string()],
+        file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
+        ..Default::default()
+    }
+}
+
+async fn read_plugin_file_bytes(
+    host: &impl crate::plugin::PluginComponentHost,
+    path: &str,
+    branch_id: &str,
+    index: &FilesystemIndex,
+    live_state: &dyn LiveStateReader,
+    blob_reader: &dyn BlobDataReader,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let Some(FilesystemEntry::File(file)) = index.entry(path) else {
+        return Ok(None);
+    };
+    if file.blob_hash.is_some() {
+        return Ok(None);
+    }
+
+    let installed_plugins = load_installed_plugins_from_filesystem(index, blob_reader).await?;
+    let Some(plugin) = select_plugin_for_path(&installed_plugins, path, None) else {
+        return Ok(None);
+    };
+
+    let active_state =
+        scan_plugin_state_rows_from_reader(live_state, branch_id, &file.id, plugin).await?;
+    render_materialized_plugin_file(host, plugin, &active_state).await
 }
 
 async fn stage_delete_plan<B>(

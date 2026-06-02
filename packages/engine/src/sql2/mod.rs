@@ -19,7 +19,6 @@ mod record_batch;
 mod result_metadata;
 mod runtime;
 mod session;
-pub(crate) mod storage;
 #[cfg(test)]
 mod test_support;
 mod udfs;

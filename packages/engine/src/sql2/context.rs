@@ -16,8 +16,10 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateRow,
 };
+use crate::plugin::PluginRuntimeHost;
 use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
+use crate::wasm::UnsupportedWasmRuntime;
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
@@ -55,6 +57,10 @@ pub(crate) trait SqlExecutionContext {
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+
+    fn plugin_host(&self) -> PluginRuntimeHost {
+        PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
+    }
 }
 
 /// Write-capable SQL runtime boundary.
@@ -68,6 +74,9 @@ pub(crate) trait SqlWriteExecutionContext {
     fn active_branch_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+    fn plugin_host(&self) -> PluginRuntimeHost {
+        PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
+    }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
 
@@ -127,6 +136,10 @@ impl SqlWriteContext {
 
     pub(crate) fn active_branch_id(&self) -> String {
         unsafe { self.ptr.0.as_ref().active_branch_id().to_string() }
+    }
+
+    pub(crate) fn plugin_host(&self) -> PluginRuntimeHost {
+        unsafe { self.ptr.0.as_ref().plugin_host() }
     }
 
     pub(crate) async fn scan_live_state(

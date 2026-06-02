@@ -6,27 +6,43 @@
 
 mod archive;
 pub(crate) mod component;
+mod install;
 mod manifest;
 mod materializer;
 mod storage;
 
 pub(crate) use archive::{
-    load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install, ParsedPluginArchive,
+    ParsedPluginArchive, load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install,
 };
+pub(crate) use component::{CachedPluginComponent, PluginComponentHost, PluginRuntimeHost};
+pub(crate) use install::install_plugin_archive_with_transaction;
 #[allow(unused_imports)]
 pub(crate) use manifest::{
-    glob_matches_path, parse_plugin_manifest_json, select_best_glob_match, PluginContentType,
-    PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,
+    PluginContentType, PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,
+    glob_matches_path, parse_plugin_manifest_json, select_best_glob_match,
 };
 #[allow(unused_imports)]
 pub(crate) use materializer::{
-    installed_plugin_manifest_key_exists, invalidate_installed_plugins_cache,
-    list_installed_plugin_manifest_keys, load_installed_plugins_from_backend_state,
-    load_installed_plugins_with_runtime_cache, FilesystemPluginMaterializer, InstalledPlugin,
-    PluginMaterializationHost,
+    PluginDetectedChange, detect_changes_with_plugin, file_content_type,
+    load_installed_plugins_from_filesystem, plugin_state_rows, render_materialized_plugin_file,
+    render_plugin_state, select_plugin_for_path,
 };
 #[allow(unused_imports)]
 pub(crate) use storage::{
+    PLUGIN_ARCHIVE_FILE_EXTENSION, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, is_plugin_storage_path,
     plugin_key_from_archive_path, plugin_storage_archive_file_id, plugin_storage_archive_path,
-    PLUGIN_ARCHIVE_FILE_EXTENSION, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
+    reject_normal_plugin_storage_mutation,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledPlugin {
+    pub key: String,
+    pub runtime: PluginRuntime,
+    pub api_version: String,
+    pub path_glob: String,
+    pub content_type: Option<PluginContentType>,
+    pub entry: String,
+    pub schema_keys: Vec<String>,
+    pub manifest_json: String,
+    pub wasm: Vec<u8>,
+}

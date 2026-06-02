@@ -80,6 +80,7 @@ where
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.deterministic_runtime_gate),
+            self.plugin_host.clone(),
             self.transaction_manager(),
         );
         Ok((

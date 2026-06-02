@@ -2,7 +2,15 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use lix_engine::{FsDirEntryKind, FsMkdirOptions, FsRmOptions, FsWriteOptions, LixError};
+use std::io::{Cursor, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::{
+    Engine, FsDirEntryKind, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, LixError,
+};
 
 simulation_test!(fs_write_read_and_readdir_roundtrip, |sim| async move {
     let engine = sim.boot_engine().await;
@@ -169,6 +177,213 @@ simulation_test!(
         assert_eq!(blob_ref_result.len(), 0);
     }
 );
+
+simulation_test!(
+    fs_write_file_rejects_plugin_storage_paths,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        for path in ["/.lix/plugins", "/.lix/plugins/plugin_sentinel.lixplugin"] {
+            let error = session
+                .fs
+                .write_file(path, b"bad".to_vec(), FsWriteOptions::default())
+                .await
+                .expect_err("normal fs write should reject plugin storage path");
+
+            assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+            assert!(error.message.contains("reserved plugin storage path"));
+        }
+    }
+);
+
+#[tokio::test]
+async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .fs()
+        .write_file("/raw.sentinel", Vec::new(), FsWriteOptions::default())
+        .await
+        .expect("empty file write should succeed");
+    session
+        .install_plugin_archive(&sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+
+    assert_eq!(
+        session
+            .fs()
+            .read_file("/raw.sentinel")
+            .await
+            .expect("read_file should succeed"),
+        Some(Vec::new())
+    );
+
+    let files = session
+        .execute(
+            "SELECT data FROM lix_file WHERE path = '/raw.sentinel'",
+            &[],
+        )
+        .await
+        .expect("lix_file data read should succeed");
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files.rows()[0].values(),
+        &[lix_engine::Value::Blob(Vec::new())]
+    );
+    assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 0);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn sql_update_rejects_installed_plugin_storage_archive_data_write() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .install_plugin_archive(&sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+
+    let error = session
+        .execute(
+            "UPDATE lix_file \
+             SET data = X'626164' \
+             WHERE path = '/.lix/plugins/plugin_sentinel.lixplugin'",
+            &[],
+        )
+        .await
+        .expect_err("SQL update should reject installed plugin archive data writes");
+
+    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    assert!(error.message.contains("reserved plugin storage path"));
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn fs_rm_rejects_installed_plugin_storage_deletes() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .install_plugin_archive(&sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+
+    for (path, options) in [
+        (
+            "/.lix/plugins/plugin_sentinel.lixplugin",
+            FsRmOptions::default(),
+        ),
+        (
+            "/.lix/plugins/",
+            FsRmOptions {
+                recursive: true,
+                ..FsRmOptions::default()
+            },
+        ),
+        (
+            "/.lix/",
+            FsRmOptions {
+                recursive: true,
+                ..FsRmOptions::default()
+            },
+        ),
+    ] {
+        let error = session
+            .fs()
+            .rm(path, options)
+            .await
+            .expect_err("fs.rm should reject plugin storage deletes");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(error.message.contains("reserved plugin storage path"));
+    }
+
+    assert_eq!(
+        session
+            .list_installed_plugins()
+            .await
+            .expect("plugin should still be installed")
+            .len(),
+        1
+    );
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn sql_delete_rejects_installed_plugin_storage_archive_tombstone() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .install_plugin_archive(&sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+
+    let error = session
+        .execute(
+            "DELETE FROM lix_file \
+             WHERE id = 'lix_plugin_archive::plugin_sentinel'",
+            &[],
+        )
+        .await
+        .expect_err("SQL delete should reject installed plugin archive tombstones");
+
+    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    assert!(error.message.contains("reserved plugin storage path"));
+    assert_eq!(
+        session
+            .list_installed_plugins()
+            .await
+            .expect("plugin should still be installed")
+            .len(),
+        1
+    );
+
+    session.close().await.expect("session should close");
+}
 
 simulation_test!(
     fs_mkdir_is_idempotent_and_readdir_distinguishes_missing,
@@ -667,3 +882,78 @@ simulation_test!(
             .expect_err("tracked mkdir should not create directory under untracked file");
     }
 );
+
+#[derive(Default)]
+struct SentinelPluginRuntime {
+    render_calls: Arc<AtomicUsize>,
+}
+
+struct SentinelPluginComponent {
+    render_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl WasmRuntime for SentinelPluginRuntime {
+    async fn init_component(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+        Ok(Arc::new(SentinelPluginComponent {
+            render_calls: Arc::clone(&self.render_calls),
+        }))
+    }
+}
+
+#[async_trait]
+impl WasmComponentInstance for SentinelPluginComponent {
+    async fn call(&self, export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "render" | "api#render" => {
+                self.render_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(b"plugin-rendered".to_vec())
+            }
+            "detect-changes" | "api#detect-changes" => Ok(b"[]".to_vec()),
+            other => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("unexpected plugin export {other}"),
+            )),
+        }
+    }
+}
+
+fn sentinel_plugin_archive() -> Vec<u8> {
+    const MANIFEST_JSON: &[u8] = br#"{
+        "key": "plugin_sentinel",
+        "runtime": "wasm-component-v1",
+        "api_version": "0.1.0",
+        "match": { "path_glob": "*.sentinel" },
+        "entry": "plugin.wasm",
+        "schemas": ["schema/plugin_note.json"]
+    }"#;
+    const SCHEMA_JSON: &[u8] = br#"{
+        "x-lix-key": "plugin_note",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "value": { "type": "string" }
+        },
+        "required": ["id", "value"],
+        "additionalProperties": false
+    }"#;
+    const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        ("manifest.json", MANIFEST_JSON),
+        ("schema/plugin_note.json", SCHEMA_JSON),
+        ("plugin.wasm", WASM_HEADER),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}

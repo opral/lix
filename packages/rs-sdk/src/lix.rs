@@ -1,14 +1,40 @@
+use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InMemoryBackend,
-    LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsWriteOptions,
+    InMemoryBackend, InstalledPluginInfo, LixError, MergeBranchOptions, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, SessionContext, SwitchBranchOptions,
+    SwitchBranchReceipt, Value,
 };
+use std::sync::Arc;
 
 /// Options for opening a Lix workspace session.
-#[derive(Default)]
 #[expect(missing_debug_implementations)]
 pub struct OpenLixOptions<B = InMemoryBackend> {
-    pub backend: Option<B>,
+    pub backend: B,
+    pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+}
+
+impl Default for OpenLixOptions<InMemoryBackend> {
+    fn default() -> Self {
+        Self {
+            backend: InMemoryBackend::new(),
+            wasm_runtime: None,
+        }
+    }
+}
+
+impl<B> OpenLixOptions<B> {
+    pub fn new(backend: B) -> Self {
+        Self {
+            backend,
+            wasm_runtime: None,
+        }
+    }
+
+    pub fn with_wasm_runtime(mut self, wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
+        self.wasm_runtime = Some(wasm_runtime);
+        self
+    }
 }
 
 /// Workspace-session handle for a Lix repository.
@@ -25,11 +51,21 @@ where
 
 /// Opens a Lix workspace session.
 ///
-/// If `options.backend` is omitted, a fresh in-memory backend is used. If a
-/// backend is supplied, it is opened when already initialized and initialized
-/// first when empty.
-pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
-    open_lix_with_backend(options.backend.unwrap_or_else(InMemoryBackend::new)).await
+/// `OpenLixOptions::default()` opens a fresh in-memory backend. Pass a
+/// concrete backend in `OpenLixOptions<B>` to open SQLite or custom backends
+/// with the same runtime configuration path.
+pub async fn open_lix<B>(options: OpenLixOptions<B>) -> Result<Lix<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let engine = open_or_initialize_engine(options.backend, options.wasm_runtime).await?;
+    let session = engine.open_workspace_session().await?;
+    Ok(Lix {
+        _engine: engine,
+        session,
+    })
 }
 
 pub async fn open_lix_with_backend<B>(backend: B) -> Result<Lix<B>, LixError>
@@ -38,12 +74,7 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    let engine = open_or_initialize_engine(backend).await?;
-    let session = engine.open_workspace_session().await?;
-    Ok(Lix {
-        _engine: engine,
-        session,
-    })
+    open_lix(OpenLixOptions::new(backend)).await
 }
 
 impl<B> Lix<B>
@@ -104,6 +135,27 @@ where
         self.session.merge_branch_preview(options).await
     }
 
+    pub async fn install_plugin_archive(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
+        self.session.install_plugin_archive(archive_bytes).await
+    }
+
+    pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {
+        self.session.list_installed_plugins().await
+    }
+
+    pub async fn write_file(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        options: FsWriteOptions,
+    ) -> Result<(), LixError> {
+        self.session.fs().write_file(path, data, options).await
+    }
+
+    pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+        self.session.fs().read_file(path).await
+    }
+
     pub async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
     }
@@ -146,18 +198,36 @@ where
     }
 }
 
-async fn open_or_initialize_engine<B>(backend: B) -> Result<Engine<B>, LixError>
+async fn open_or_initialize_engine<B>(
+    backend: B,
+    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    match Engine::new(backend.clone()).await {
+    match new_engine(backend.clone(), wasm_runtime.clone()).await {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
             Engine::initialize(backend.clone()).await?;
-            Engine::new(backend).await
+            new_engine(backend, wasm_runtime).await
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn new_engine<B>(
+    backend: B,
+    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+) -> Result<Engine<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    match wasm_runtime {
+        Some(wasm_runtime) => Engine::new_with_wasm_runtime(backend, wasm_runtime).await,
+        None => Engine::new(backend).await,
     }
 }

@@ -7,7 +7,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::common::{
     ParsedFilePath, directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
-    parent_directory_path, stable_content_fingerprint_hex,
+    normalize_path_segment, parent_directory_path, stable_content_fingerprint_hex,
 };
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
@@ -275,6 +275,29 @@ impl DirectoryPathResolver {
             .directory_ids_by_path
             .get(&normalize_directory_path(path)?)
             .map(String::as_str))
+    }
+
+    pub(crate) fn file_path(
+        &self,
+        directory_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<String>, LixError> {
+        let name = normalize_path_segment(name)?;
+        let Some(directory_id) = directory_id else {
+            return Ok(Some(format!("/{name}")));
+        };
+        let Some((directory_path, _)) = self
+            .directory_ids_by_path
+            .iter()
+            .find(|(_, id)| id.as_str() == directory_id)
+        else {
+            return Ok(None);
+        };
+        if directory_path == "/" {
+            Ok(Some(format!("/{name}")))
+        } else {
+            Ok(Some(format!("{directory_path}{name}")))
+        }
     }
 
     /// Stages only the missing descriptors needed for `directory_path`.
@@ -578,19 +601,23 @@ pub(crate) fn plan_file_path_write(
     }));
 
     let mut file_data = Vec::new();
-    if let Some(data) = input.data.filter(|data| !data.is_empty()) {
-        rows.push(blob_ref_row(BlobRefRowInput {
-            file_id: file_id.clone(),
-            data: data.clone(),
-            context: FilesystemRowContext {
-                file_id: None,
-                metadata: None,
-                ..input.context.clone()
-            },
-        })?);
+    if let Some(data) = input.data {
+        if !data.is_empty() {
+            rows.push(blob_ref_row(BlobRefRowInput {
+                file_id: file_id.clone(),
+                data: data.clone(),
+                context: FilesystemRowContext {
+                    file_id: None,
+                    metadata: None,
+                    ..input.context.clone()
+                },
+            })?);
+        }
         file_data.push(TransactionFileData {
             file_id,
+            path: parsed.normalized_path.to_string(),
             branch_id: input.context.branch_id,
+            global: input.context.global,
             untracked: input.context.untracked,
             data,
         });
@@ -1547,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn file_path_write_omits_blob_ref_for_empty_data() {
+    fn file_path_write_carries_empty_payload_without_blob_ref() {
         let mut resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
         let plan = plan_file_path_write(
@@ -1563,7 +1590,9 @@ mod tests {
         .expect("empty file path write should plan");
 
         assert_eq!(plan.count, 1);
-        assert!(plan.file_data.is_empty());
+        assert_eq!(plan.file_data.len(), 1);
+        assert_eq!(plan.file_data[0].file_id, "file-empty");
+        assert!(plan.file_data[0].data.is_empty());
         assert!(
             plan.rows
                 .iter()

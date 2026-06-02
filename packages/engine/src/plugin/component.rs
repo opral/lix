@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::common::LixError;
 use crate::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
@@ -12,11 +13,35 @@ pub(crate) struct CachedPluginComponent {
 }
 
 const RENDER_EXPORTS: &[&str] = &["render", "api#render"];
+const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
+
+#[derive(Clone)]
+pub(crate) struct PluginRuntimeHost {
+    wasm_runtime: Arc<dyn WasmRuntime>,
+    plugin_component_cache: Arc<Mutex<BTreeMap<String, CachedPluginComponent>>>,
+}
+
+impl PluginRuntimeHost {
+    pub(crate) fn new(wasm_runtime: Arc<dyn WasmRuntime>) -> Self {
+        Self {
+            wasm_runtime,
+            plugin_component_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+}
+
+impl PluginComponentHost for PluginRuntimeHost {
+    fn plugin_component_cache(&self) -> &Mutex<BTreeMap<String, CachedPluginComponent>> {
+        &self.plugin_component_cache
+    }
+
+    fn wasm_runtime(&self) -> &Arc<dyn WasmRuntime> {
+        &self.wasm_runtime
+    }
+}
 
 pub(crate) trait PluginComponentHost {
-    fn plugin_component_cache(
-        &self,
-    ) -> &std::sync::Mutex<std::collections::BTreeMap<String, CachedPluginComponent>>;
+    fn plugin_component_cache(&self) -> &Mutex<BTreeMap<String, CachedPluginComponent>>;
 
     fn wasm_runtime(&self) -> &Arc<dyn WasmRuntime>;
 }
@@ -47,7 +72,7 @@ pub(crate) async fn load_or_init_plugin_component(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: "plugin component cache lock poisoned".to_string(),
         hint: None,
-            details: None,
+        details: None,
     })?;
     if let Some(cached) = guard.get(&plugin.key) {
         if cached.wasm == plugin.wasm {
@@ -70,15 +95,25 @@ pub(crate) async fn render_with_plugin(
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let instance = load_or_init_plugin_component(host, plugin).await?;
-    invoke_render_export(instance.as_ref(), payload).await
+    invoke_plugin_export(instance.as_ref(), RENDER_EXPORTS, payload).await
 }
 
-async fn invoke_render_export(
+pub(crate) async fn detect_changes_with_plugin(
+    host: &impl PluginComponentHost,
+    plugin: &InstalledPlugin,
+    payload: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let instance = load_or_init_plugin_component(host, plugin).await?;
+    invoke_plugin_export(instance.as_ref(), DETECT_CHANGES_EXPORTS, payload).await
+}
+
+async fn invoke_plugin_export(
     instance: &dyn WasmComponentInstance,
+    exports: &[&str],
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let mut errors = Vec::new();
-    for export in RENDER_EXPORTS {
+    for export in exports {
         match instance.call(export, payload).await {
             Ok(output) => return Ok(output),
             Err(error) => errors.push(format!("{export}: {}", error.message)),
@@ -88,11 +123,11 @@ async fn invoke_render_export(
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!(
-            "plugin materialization: failed to call render export ({})",
+            "plugin materialization: failed to call component export ({})",
             errors.join("; ")
         ),
         hint: None,
-            details: None,
+        details: None,
     })
 }
 
@@ -102,18 +137,17 @@ mod tests {
     use crate::plugin::{InstalledPlugin, PluginRuntime};
     use crate::wasm::WasmRuntime;
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestHost {
         wasm_runtime: Arc<dyn WasmRuntime>,
-        plugin_component_cache:
-            std::sync::Mutex<std::collections::BTreeMap<String, CachedPluginComponent>>,
+        plugin_component_cache: Mutex<BTreeMap<String, CachedPluginComponent>>,
     }
 
     impl PluginComponentHost for TestHost {
-        fn plugin_component_cache(
-            &self,
-        ) -> &std::sync::Mutex<std::collections::BTreeMap<String, CachedPluginComponent>> {
+        fn plugin_component_cache(&self) -> &Mutex<BTreeMap<String, CachedPluginComponent>> {
             &self.plugin_component_cache
         }
 
@@ -129,7 +163,7 @@ mod tests {
 
     struct NoopComponent;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl WasmRuntime for CountingRuntime {
         async fn init_component(
             &self,
@@ -141,7 +175,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl WasmComponentInstance for NoopComponent {
         async fn call(&self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
             Ok(Vec::new())
@@ -153,7 +187,7 @@ mod tests {
         let runtime = Arc::new(CountingRuntime::default());
         let host = TestHost {
             wasm_runtime: runtime.clone(),
-            plugin_component_cache: std::sync::Mutex::new(Default::default()),
+            plugin_component_cache: std::sync::Mutex::new(BTreeMap::default()),
         };
         let mut plugin = InstalledPlugin {
             key: "k".to_string(),
@@ -162,6 +196,7 @@ mod tests {
             path_glob: "*.json".to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),
+            schema_keys: Vec::new(),
             manifest_json: "{}".to_string(),
             wasm: vec![1],
         };

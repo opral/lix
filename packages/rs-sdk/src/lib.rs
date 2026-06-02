@@ -9,19 +9,20 @@ mod lix;
 mod sqlite_backend;
 
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
+pub use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
 pub use lix_engine::{
     Backend, BackendConformanceReport, BackendConformanceResult, BackendConformanceStatus,
     BackendConformanceTest, BackendError, BackendFactory, BackendFixture, BackendRangeScan,
     BackendRead, BackendTestConfig, BackendWrite, CommitResult, CoreProjection,
     CreateBranchOptions, CreateBranchReceipt, CreateBranchReceipt as CreateBranchResult,
-    ExecuteResult, GetOptions, InMemoryBackend, InMemoryRangeScan, InMemoryRead, InMemoryWrite,
-    Key, KeyRange, LixError, LixNotice, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult,
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, Row, ScanOptions, ScanResult,
-    ScanVisitor, SqlQueryResult, StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
-    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, Value, WriteOptions, WriteStats,
-    run_backend_conformance,
+    ExecuteResult, FsWriteOptions, GetOptions, InMemoryBackend, InMemoryRangeScan, InMemoryRead,
+    InMemoryWrite, Key, KeyRange, LixError, LixNotice, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    MergeBranchReceipt as MergeBranchResult, MergeChangeStats, MergeConflict,
+    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, PointVisitor, ProjectedValueRef,
+    PutBatch, ReadOptions, Row, ScanOptions, ScanResult, ScanVisitor, SqlQueryResult, StoredValue,
+    SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
+    TryFromValue, Value, WriteOptions, WriteStats, run_backend_conformance,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite_backend::{

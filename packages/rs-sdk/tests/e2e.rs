@@ -1,7 +1,1024 @@
 use lix_sdk::{
-    CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions, MergeBranchOutcome,
-    OpenLixOptions, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, FsWriteOptions, InMemoryBackend, LixError, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::io::{Cursor, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use wasmtime::component::types::ComponentItem;
+use wasmtime::component::{Component, ComponentExportIndex, Instance, Linker, Val};
+use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+#[tokio::test]
+async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
+    let archive = build_csv_plugin_archive();
+    let lix = open_lix(OpenLixOptions {
+        backend: InMemoryBackend::new(),
+        wasm_runtime: Some(Arc::new(
+            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
+        )),
+    })
+    .await
+    .unwrap();
+
+    lix.install_plugin_archive(&archive).await.unwrap();
+    let plugins = lix.list_installed_plugins().await.unwrap();
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].key, "plugin_csv");
+    assert_eq!(
+        plugins[0].schema_keys,
+        vec!["csv_table".to_string(), "csv_row".to_string()]
+    );
+
+    let stored_archive = lix
+        .read_file("/.lix/plugins/plugin_csv.lixplugin")
+        .await
+        .unwrap();
+    assert_eq!(stored_archive.as_deref(), Some(archive.as_slice()));
+
+    let schemas = lix
+        .execute(
+            "SELECT table_name \
+             FROM information_schema.tables \
+             WHERE table_name IN ('csv_row', 'csv_table') \
+             ORDER BY table_name",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        schemas
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("table_name").unwrap())
+            .collect::<Vec<_>>(),
+        vec!["csv_row".to_string(), "csv_table".to_string()]
+    );
+
+    let original_csv = b"name,age\nAda,37\n".to_vec();
+    lix.write_file(
+        "/people.csv",
+        original_csv.clone(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        Some(original_csv.as_slice())
+    );
+
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/people.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(file_id.len(), 1);
+    let file_id = file_id.rows()[0].get::<String>("id").unwrap();
+    let file_changes_before_update = file_changes(&lix, &file_id).await;
+
+    let updated_csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
+    lix.write_file(
+        "/people.csv",
+        updated_csv.clone(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        Some(updated_csv.as_slice())
+    );
+
+    let file_changes_after_update = file_changes(&lix, &file_id).await;
+    let resulting_diff_changes = file_changes_after_update
+        .into_iter()
+        .skip(file_changes_before_update.len())
+        .collect::<Vec<_>>();
+    assert_eq!(resulting_diff_changes.len(), 1);
+    let change = &resulting_diff_changes[0];
+    assert_eq!(change.schema_key, "csv_row");
+    let snapshot = change
+        .snapshot_content
+        .as_ref()
+        .expect("updated file write should produce a csv row snapshot");
+    assert_eq!(
+        snapshot
+            .get("cells")
+            .and_then(serde_json::Value::as_array)
+            .unwrap(),
+        &vec![
+            serde_json::Value::String("Grace".to_string()),
+            serde_json::Value::String("85".to_string())
+        ]
+    );
+
+    let files = lix
+        .execute(
+            "SELECT path, data FROM lix_file WHERE path = $1",
+            &[Value::Text("/people.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files.rows()[0].values(),
+        &[
+            Value::Text("/people.csv".to_string()),
+            Value::Blob(updated_csv.clone())
+        ]
+    );
+
+    let files_by_id = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_by_id.len(), 1);
+    assert_eq!(
+        files_by_id.rows()[0].values(),
+        &[Value::Blob(updated_csv.clone())]
+    );
+
+    let file_changes_before_empty = file_changes(&lix, &file_id).await;
+    let empty_csv = Vec::new();
+    lix.write_file("/people.csv", empty_csv.clone(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        Some(empty_csv.as_slice())
+    );
+    let files_empty_by_id = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_empty_by_id.len(), 1);
+    assert_eq!(
+        files_empty_by_id.rows()[0].values(),
+        &[Value::Blob(empty_csv)]
+    );
+    let empty_changes = file_changes(&lix, &file_id)
+        .await
+        .into_iter()
+        .skip(file_changes_before_empty.len())
+        .collect::<Vec<_>>();
+    assert!(
+        empty_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
+    );
+
+    let sql_csv = b"name,age\nLin,44\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql-people.csv".to_string()),
+            Value::Blob(sql_csv.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        Some(sql_csv.as_slice())
+    );
+
+    let sql_file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-people.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql_file_id.len(), 1);
+    let sql_file_id = sql_file_id.rows()[0].get::<String>("id").unwrap();
+    let sql_insert_changes = file_changes(&lix, &sql_file_id).await;
+    assert!(
+        sql_insert_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_table")
+    );
+    assert!(
+        sql_insert_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_row")
+    );
+    assert!(
+        !sql_insert_changes
+            .iter()
+            .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
+    let sql_changes_before_update = sql_insert_changes.len();
+    let sql_updated_csv = b"name,age\nLin,44\nMina,29\n".to_vec();
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2",
+        &[
+            Value::Blob(sql_updated_csv.clone()),
+            Value::Text("/sql-people.csv".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        Some(sql_updated_csv.as_slice())
+    );
+    let sql_update_changes = file_changes(&lix, &sql_file_id)
+        .await
+        .into_iter()
+        .skip(sql_changes_before_update)
+        .collect::<Vec<_>>();
+    assert!(sql_update_changes.iter().any(|change| {
+        change.schema_key == "csv_row"
+            && change
+                .snapshot_content
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("cells"))
+                .and_then(serde_json::Value::as_array)
+                == Some(&vec![
+                    serde_json::Value::String("Mina".to_string()),
+                    serde_json::Value::String("29".to_string()),
+                ])
+    }));
+    assert!(
+        !sql_update_changes
+            .iter()
+            .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
+    let sql_changes_before_predicate_update = sql_changes_before_update + sql_update_changes.len();
+    let sql_predicate_updated_csv = b"name,age\nLin,44\nMina,29\nKatherine,101\n".to_vec();
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
+        &[
+            Value::Blob(sql_predicate_updated_csv.clone()),
+            Value::Text("/sql-people.csv".to_string()),
+            Value::Blob(sql_updated_csv.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        Some(sql_predicate_updated_csv.as_slice())
+    );
+    let sql_predicate_update_changes = file_changes(&lix, &sql_file_id)
+        .await
+        .into_iter()
+        .skip(sql_changes_before_predicate_update)
+        .collect::<Vec<_>>();
+    assert!(sql_predicate_update_changes.iter().any(|change| {
+        change.schema_key == "csv_row"
+            && change
+                .snapshot_content
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("cells"))
+                .and_then(serde_json::Value::as_array)
+                == Some(&vec![
+                    serde_json::Value::String("Katherine".to_string()),
+                    serde_json::Value::String("101".to_string()),
+                ])
+    }));
+    assert!(
+        !sql_predicate_update_changes
+            .iter()
+            .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
+    let sql_empty_target = b"name,age\nNoor,10\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql-empty.csv".to_string()),
+            Value::Blob(sql_empty_target),
+        ],
+    )
+    .await
+    .unwrap();
+    let sql_empty_file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-empty.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql_empty_file_id.len(), 1);
+    let sql_empty_file_id = sql_empty_file_id.rows()[0].get::<String>("id").unwrap();
+    let sql_empty_changes_before_update = file_changes(&lix, &sql_empty_file_id).await;
+    let sql_empty_bytes = Vec::new();
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2",
+        &[
+            Value::Blob(sql_empty_bytes.clone()),
+            Value::Text("/sql-empty.csv".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-empty.csv").await.unwrap().as_deref(),
+        Some(sql_empty_bytes.as_slice())
+    );
+    let sql_empty_update_changes = file_changes(&lix, &sql_empty_file_id)
+        .await
+        .into_iter()
+        .skip(sql_empty_changes_before_update.len())
+        .collect::<Vec<_>>();
+    assert!(
+        sql_empty_update_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
+    );
+
+    let sql_rename_csv = b"name,age\nRuth,99\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql-rename.csv".to_string()),
+            Value::Blob(sql_rename_csv.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    let sql_rename_file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-rename.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql_rename_file_id.len(), 1);
+    let sql_rename_file_id = sql_rename_file_id.rows()[0].get::<String>("id").unwrap();
+    let rename = lix
+        .execute(
+            "UPDATE lix_file SET path = $1 WHERE path = $2",
+            &[
+                Value::Text("/sql-rename.txt".to_string()),
+                Value::Text("/sql-rename.csv".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename.rows_affected(), 1);
+    assert_eq!(lix.read_file("/sql-rename.csv").await.unwrap(), None);
+    assert_eq!(
+        lix.read_file("/sql-rename.txt").await.unwrap().as_deref(),
+        Some(sql_rename_csv.as_slice())
+    );
+    let renamed_files = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-rename.txt".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed_files.len(), 1);
+    assert_eq!(
+        renamed_files.rows()[0].values(),
+        &[Value::Blob(sql_rename_csv.clone())]
+    );
+    let active_plugin_rows_after_rename = lix
+        .execute(
+            "SELECT schema_key FROM lix_state \
+             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
+            &[Value::Text(sql_rename_file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_plugin_rows_after_rename.len(), 0);
+    let active_blob_rows_after_rename = lix
+        .execute(
+            "SELECT schema_key FROM lix_state \
+             WHERE file_id = $1 AND schema_key = 'lix_binary_blob_ref'",
+            &[Value::Text(sql_rename_file_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_blob_rows_after_rename.len(), 1);
+
+    let sql_changes_before_delete =
+        sql_changes_before_predicate_update + sql_predicate_update_changes.len();
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1 AND data = $2",
+        &[
+            Value::Text("/sql-people.csv".to_string()),
+            Value::Blob(sql_predicate_updated_csv),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(lix.read_file("/sql-people.csv").await.unwrap(), None);
+    let sql_delete_changes = file_changes(&lix, &sql_file_id)
+        .await
+        .into_iter()
+        .skip(sql_changes_before_delete)
+        .collect::<Vec<_>>();
+    assert!(
+        sql_delete_changes.iter().any(|change| {
+            change.schema_key == "csv_table" && change.snapshot_content.is_none()
+        })
+    );
+    assert!(
+        sql_delete_changes
+            .iter()
+            .filter(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
+            .count()
+            >= 2
+    );
+    let active_plugin_rows_after_delete = lix
+        .execute(
+            "SELECT schema_key FROM lix_state \
+             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
+            &[Value::Text(sql_file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_plugin_rows_after_delete.len(), 0);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_lix_file_data_uses_session_plugin_runtime() {
+    let archive = build_csv_plugin_archive();
+    let lix = open_lix(OpenLixOptions {
+        backend: InMemoryBackend::new(),
+        wasm_runtime: Some(Arc::new(
+            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
+        )),
+    })
+    .await
+    .unwrap();
+
+    lix.install_plugin_archive(&archive).await.unwrap();
+    let csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
+    lix.write_file("/tx-plugin.csv", csv.clone(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/tx-plugin.csv".to_string())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    let files = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files.rows()[0].values(), &[Value::Blob(csv)]);
+
+    tx.rollback().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+struct WasmtimePluginRuntime {
+    engine: Engine,
+}
+
+impl WasmtimePluginRuntime {
+    fn new() -> Result<Self, LixError> {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        let engine = Engine::new(&config)
+            .map_err(|error| wasm_runtime_error("failed to create Wasmtime engine", error))?;
+        Ok(Self { engine })
+    }
+}
+
+struct WasmtimePluginComponent {
+    store: Mutex<Store<WasiHostState>>,
+    instance: Instance,
+    exports: WasmtimePluginExports,
+}
+
+#[derive(Clone, Copy)]
+struct WasmtimePluginExports {
+    detect_changes: ComponentExportIndex,
+    render: ComponentExportIndex,
+}
+
+struct WasiHostState {
+    ctx: WasiCtx,
+    table: ResourceTable,
+}
+
+impl WasiHostState {
+    fn new() -> Self {
+        Self {
+            ctx: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+        }
+    }
+}
+
+impl IoView for WasiHostState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+impl WasiView for WasiHostState {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.ctx
+    }
+}
+
+#[async_trait::async_trait]
+impl lix_sdk::WasmRuntime for WasmtimePluginRuntime {
+    async fn init_component(
+        &self,
+        bytes: Vec<u8>,
+        _limits: lix_sdk::WasmLimits,
+    ) -> Result<Arc<dyn lix_sdk::WasmComponentInstance>, LixError> {
+        let component = Component::new(&self.engine, bytes)
+            .map_err(|error| wasm_runtime_error("failed to compile plugin component", error))?;
+        let exports = WasmtimePluginExports::from_component(&self.engine, &component)?;
+        let mut linker = Linker::<WasiHostState>::new(&self.engine);
+        wasmtime_wasi::add_to_linker_sync(&mut linker)
+            .map_err(|error| wasm_runtime_error("failed to configure WASI linker", error))?;
+        let mut store = Store::new(&self.engine, WasiHostState::new());
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .map_err(|error| wasm_runtime_error("failed to instantiate plugin component", error))?;
+        Ok(Arc::new(WasmtimePluginComponent {
+            store: Mutex::new(store),
+            instance,
+            exports,
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl lix_sdk::WasmComponentInstance for WasmtimePluginComponent {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => self.detect_changes(input),
+            "render" | "api#render" => self.render(input),
+            other => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("Wasmtime test runtime does not implement export '{other}'"),
+            )),
+        }
+    }
+}
+
+impl WasmtimePluginExports {
+    fn from_component(engine: &Engine, component: &Component) -> Result<Self, LixError> {
+        Ok(Self {
+            detect_changes: find_plugin_func_export(engine, component, "detect-changes")?,
+            render: find_plugin_func_export(engine, component, "render")?,
+        })
+    }
+}
+
+impl WasmtimePluginComponent {
+    fn detect_changes(&self, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        let payload: PluginDetectChangesPayload =
+            serde_json::from_slice(input).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("plugin detect-changes payload is invalid JSON: {error}"),
+                )
+            })?;
+        let params = [
+            entity_state_list_to_val(payload.state),
+            Val::Record(vec![("data".to_string(), bytes_to_val(payload.file.data))]),
+        ];
+        let result =
+            self.call_component_func(self.exports.detect_changes, &params, "detect-changes")?;
+        let changes = expect_detected_changes_result(result, "detect-changes")?;
+        serde_json::to_vec(&changes).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to encode plugin detect-changes output: {error}"),
+            )
+        })
+    }
+
+    fn render(&self, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        let payload: PluginRenderPayload = serde_json::from_slice(input).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("plugin render payload is invalid JSON: {error}"),
+            )
+        })?;
+        let params = [entity_state_list_to_val(payload.state)];
+        let result = self.call_component_func(self.exports.render, &params, "render")?;
+        expect_render_result(result, "render")
+    }
+
+    fn call_component_func(
+        &self,
+        export: ComponentExportIndex,
+        params: &[Val],
+        export_name: &str,
+    ) -> Result<Val, LixError> {
+        let mut store = self.store.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "Wasmtime store lock poisoned",
+            )
+        })?;
+        let func = self.instance.get_func(&mut *store, export).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("plugin component export '{export_name}' is not a function"),
+            )
+        })?;
+        let mut results = [Val::Result(Ok(None))];
+        func.call(&mut *store, params, &mut results)
+            .map_err(|error| wasm_runtime_error(format!("failed to call {export_name}"), error))?;
+        func.post_return(&mut *store).map_err(|error| {
+            wasm_runtime_error(format!("failed to finish {export_name} call"), error)
+        })?;
+        Ok(results.into_iter().next().unwrap())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginDetectChangesPayload {
+    state: Vec<PluginEntityStatePayload>,
+    file: PluginFilePayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginRenderPayload {
+    state: Vec<PluginEntityStatePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginFilePayload {
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginEntityStatePayload {
+    entity_pk: Vec<String>,
+    schema_key: String,
+    snapshot_content: String,
+    metadata: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginDetectedChangePayload {
+    entity_pk: Vec<String>,
+    schema_key: String,
+    snapshot_content: Option<String>,
+    metadata: Option<String>,
+}
+
+fn find_plugin_func_export(
+    engine: &Engine,
+    component: &Component,
+    func_name: &str,
+) -> Result<ComponentExportIndex, LixError> {
+    if let Some((ComponentItem::ComponentFunc(_), export)) = component.export_index(None, func_name)
+    {
+        return Ok(export);
+    }
+
+    let component_type = component.component_type();
+    for (instance_name, item) in component_type.exports(engine) {
+        if !matches!(item, ComponentItem::ComponentInstance(_)) {
+            continue;
+        }
+        let Some((ComponentItem::ComponentInstance(_), instance_export)) =
+            component.export_index(None, instance_name)
+        else {
+            continue;
+        };
+        if let Some((ComponentItem::ComponentFunc(_), export)) =
+            component.export_index(Some(&instance_export), func_name)
+        {
+            return Ok(export);
+        }
+    }
+
+    Err(LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!(
+            "plugin component is missing export '{func_name}'. Available exports: {}",
+            component_exports_summary(engine, component)
+        ),
+    ))
+}
+
+fn component_exports_summary(engine: &Engine, component: &Component) -> String {
+    let component_type = component.component_type();
+    let mut exports = Vec::new();
+    for (name, item) in component_type.exports(engine) {
+        match item {
+            ComponentItem::ComponentInstance(instance) => {
+                let nested = instance
+                    .exports(engine)
+                    .map(|(nested_name, _)| nested_name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                exports.push(format!("{name}({nested})"));
+            }
+            _ => exports.push(name.to_string()),
+        }
+    }
+    exports.join(", ")
+}
+
+fn entity_state_list_to_val(state: Vec<PluginEntityStatePayload>) -> Val {
+    Val::List(state.into_iter().map(entity_state_to_val).collect())
+}
+
+fn entity_state_to_val(state: PluginEntityStatePayload) -> Val {
+    Val::Record(vec![
+        ("entity-pk".to_string(), string_list_to_val(state.entity_pk)),
+        ("schema-key".to_string(), Val::String(state.schema_key)),
+        (
+            "snapshot-content".to_string(),
+            Val::String(state.snapshot_content),
+        ),
+        (
+            "metadata".to_string(),
+            optional_string_to_val(state.metadata),
+        ),
+    ])
+}
+
+fn string_list_to_val(values: Vec<String>) -> Val {
+    Val::List(values.into_iter().map(Val::String).collect())
+}
+
+fn bytes_to_val(bytes: Vec<u8>) -> Val {
+    Val::List(bytes.into_iter().map(Val::U8).collect())
+}
+
+fn optional_string_to_val(value: Option<String>) -> Val {
+    Val::Option(value.map(|value| Box::new(Val::String(value))))
+}
+
+fn expect_detected_changes_result(
+    result: Val,
+    export_name: &str,
+) -> Result<Vec<PluginDetectedChangePayload>, LixError> {
+    let output = expect_plugin_ok_result(result, export_name)?;
+    let Val::List(values) = output else {
+        return Err(plugin_abi_error(format!(
+            "{export_name} returned {}, expected list",
+            val_type_name(&output)
+        )));
+    };
+    values.into_iter().map(detected_change_from_val).collect()
+}
+
+fn expect_render_result(result: Val, export_name: &str) -> Result<Vec<u8>, LixError> {
+    let output = expect_plugin_ok_result(result, export_name)?;
+    expect_u8_list(output, export_name)
+}
+
+fn expect_plugin_ok_result(result: Val, export_name: &str) -> Result<Val, LixError> {
+    match result {
+        Val::Result(Ok(Some(output))) => Ok(*output),
+        Val::Result(Ok(None)) => Err(plugin_abi_error(format!(
+            "{export_name} returned ok without a payload"
+        ))),
+        Val::Result(Err(error)) => Err(plugin_error_from_val(export_name, error.map(|v| *v))),
+        other => Err(plugin_abi_error(format!(
+            "{export_name} returned {}, expected result",
+            val_type_name(&other)
+        ))),
+    }
+}
+
+fn detected_change_from_val(value: Val) -> Result<PluginDetectedChangePayload, LixError> {
+    let Val::Record(fields) = value else {
+        return Err(plugin_abi_error(format!(
+            "detect-changes item was {}, expected record",
+            val_type_name(&value)
+        )));
+    };
+    let mut fields = fields.into_iter();
+    let entity_pk = expect_string_list(
+        expect_next_field(&mut fields, "entity-pk", "detected-change")?,
+        "detected-change.entity-pk",
+    )?;
+    let schema_key = expect_string(
+        expect_next_field(&mut fields, "schema-key", "detected-change")?,
+        "detected-change.schema-key",
+    )?;
+    let snapshot_content = expect_optional_string(
+        expect_next_field(&mut fields, "snapshot-content", "detected-change")?,
+        "detected-change.snapshot-content",
+    )?;
+    let metadata = expect_optional_string(
+        expect_next_field(&mut fields, "metadata", "detected-change")?,
+        "detected-change.metadata",
+    )?;
+    if let Some((field, _)) = fields.next() {
+        return Err(plugin_abi_error(format!(
+            "detected-change returned unexpected field '{field}'"
+        )));
+    }
+    Ok(PluginDetectedChangePayload {
+        entity_pk,
+        schema_key,
+        snapshot_content,
+        metadata,
+    })
+}
+
+fn expect_next_field(
+    fields: &mut impl Iterator<Item = (String, Val)>,
+    expected: &str,
+    label: &str,
+) -> Result<Val, LixError> {
+    let Some((field, value)) = fields.next() else {
+        return Err(plugin_abi_error(format!(
+            "{label} is missing field '{expected}'"
+        )));
+    };
+    if field != expected {
+        return Err(plugin_abi_error(format!(
+            "{label} returned field '{field}', expected '{expected}'"
+        )));
+    }
+    Ok(value)
+}
+
+fn expect_string_list(value: Val, label: &str) -> Result<Vec<String>, LixError> {
+    let Val::List(values) = value else {
+        return Err(plugin_abi_error(format!(
+            "{label} was {}, expected list<string>",
+            val_type_name(&value)
+        )));
+    };
+    values
+        .into_iter()
+        .map(|value| expect_string(value, label))
+        .collect()
+}
+
+fn expect_u8_list(value: Val, label: &str) -> Result<Vec<u8>, LixError> {
+    let Val::List(values) = value else {
+        return Err(plugin_abi_error(format!(
+            "{label} was {}, expected list<u8>",
+            val_type_name(&value)
+        )));
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            Val::U8(value) => Ok(value),
+            other => Err(plugin_abi_error(format!(
+                "{label} list item was {}, expected u8",
+                val_type_name(&other)
+            ))),
+        })
+        .collect()
+}
+
+fn expect_string(value: Val, label: &str) -> Result<String, LixError> {
+    match value {
+        Val::String(value) => Ok(value),
+        other => Err(plugin_abi_error(format!(
+            "{label} was {}, expected string",
+            val_type_name(&other)
+        ))),
+    }
+}
+
+fn expect_optional_string(value: Val, label: &str) -> Result<Option<String>, LixError> {
+    match value {
+        Val::Option(None) => Ok(None),
+        Val::Option(Some(value)) => expect_string(*value, label).map(Some),
+        other => Err(plugin_abi_error(format!(
+            "{label} was {}, expected option<string>",
+            val_type_name(&other)
+        ))),
+    }
+}
+
+fn plugin_error_from_val(export_name: &str, value: Option<Val>) -> LixError {
+    let message = match value {
+        Some(Val::Variant(kind, Some(payload))) => match *payload {
+            Val::String(message) => {
+                format!("{export_name} returned plugin error {kind}: {message}")
+            }
+            other => format!(
+                "{export_name} returned plugin error {kind} with {} payload",
+                val_type_name(&other)
+            ),
+        },
+        Some(Val::Variant(kind, None)) => {
+            format!("{export_name} returned plugin error {kind} without payload")
+        }
+        Some(other) => format!(
+            "{export_name} returned malformed plugin error {}",
+            val_type_name(&other)
+        ),
+        None => format!("{export_name} returned plugin error without payload"),
+    };
+    LixError::new(LixError::CODE_INTERNAL_ERROR, message)
+}
+
+fn val_type_name(value: &Val) -> &'static str {
+    match value {
+        Val::Bool(_) => "bool",
+        Val::S8(_) => "s8",
+        Val::U8(_) => "u8",
+        Val::S16(_) => "s16",
+        Val::U16(_) => "u16",
+        Val::S32(_) => "s32",
+        Val::U32(_) => "u32",
+        Val::S64(_) => "s64",
+        Val::U64(_) => "u64",
+        Val::Float32(_) => "float32",
+        Val::Float64(_) => "float64",
+        Val::Char(_) => "char",
+        Val::String(_) => "string",
+        Val::List(_) => "list",
+        Val::Record(_) => "record",
+        Val::Tuple(_) => "tuple",
+        Val::Variant(_, _) => "variant",
+        Val::Enum(_) => "enum",
+        Val::Option(_) => "option",
+        Val::Result(_) => "result",
+        Val::Flags(_) => "flags",
+        Val::Resource(_) => "resource",
+    }
+}
+
+fn plugin_abi_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
+}
+
+fn wasm_runtime_error(context: impl Into<String>, error: impl fmt::Display) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("{}: {error}", context.into()),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FileChange {
+    schema_key: String,
+    entity_pk: serde_json::Value,
+    snapshot_content: Option<serde_json::Value>,
+}
+
+async fn file_changes(lix: &lix_sdk::Lix, file_id: &str) -> Vec<FileChange> {
+    let changes = lix
+        .execute(
+            "SELECT schema_key, entity_pk, snapshot_content \
+             FROM lix_change \
+             WHERE file_id = $1 \
+             ORDER BY created_at, id",
+            &[Value::Text(file_id.to_string())],
+        )
+        .await
+        .unwrap();
+
+    changes
+        .rows()
+        .iter()
+        .map(|row| {
+            let snapshot_content = match row.value("snapshot_content").unwrap() {
+                Value::Json(value) => Some(value.clone()),
+                Value::Null => None,
+                other => panic!("expected JSON or null snapshot_content, got {other:?}"),
+            };
+            FileChange {
+                schema_key: row.get::<String>("schema_key").unwrap(),
+                entity_pk: row.get::<serde_json::Value>("entity_pk").unwrap(),
+                snapshot_content,
+            }
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
@@ -88,7 +1105,8 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 #[tokio::test]
 async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     let lix = open_lix(OpenLixOptions {
-        backend: Some(InMemoryBackend::new()),
+        backend: InMemoryBackend::new(),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -113,7 +1131,8 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
 async fn rs_sdk_close_does_not_destroy_committed_data() {
     let backend = InMemoryBackend::new();
     let first = open_lix(OpenLixOptions {
-        backend: Some(backend.clone()),
+        backend: backend.clone(),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -137,7 +1156,8 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     assert_closed(error);
 
     let second = open_lix(OpenLixOptions {
-        backend: Some(backend),
+        backend,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -159,7 +1179,8 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 #[tokio::test]
 async fn failed_write_validation_does_not_poison_backend_transaction() {
     let lix = open_lix(OpenLixOptions {
-        backend: Some(InMemoryBackend::new()),
+        backend: InMemoryBackend::new(),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -250,6 +1271,82 @@ async fn transaction_commits_multiple_statements_together() {
         .await
         .unwrap();
     assert_eq!(committed.len(), 2);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_lix_file_data_reads_staged_file_bytes() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let mut tx = lix.begin_transaction().await.unwrap();
+    let path = "/tx-file-data.bin".to_string();
+    let original = b"staged bytes before commit".to_vec();
+
+    tx.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[Value::Text(path.clone()), Value::Blob(original.clone())],
+    )
+    .await
+    .unwrap();
+
+    let selected = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
+            &[Value::Text(path.clone()), Value::Blob(original.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected.rows()[0].values(),
+        &[Value::Blob(original.clone())]
+    );
+
+    let updated = b"updated bytes before commit".to_vec();
+    let update = tx
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
+            &[
+                Value::Blob(updated.clone()),
+                Value::Text(path.clone()),
+                Value::Blob(original),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.rows_affected(), 1);
+
+    let after_update = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
+            &[Value::Text(path.clone()), Value::Blob(updated.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_update.len(), 1);
+    assert_eq!(
+        after_update.rows()[0].values(),
+        &[Value::Blob(updated.clone())]
+    );
+
+    let delete = tx
+        .execute(
+            "DELETE FROM lix_file WHERE path = $1 AND data = $2",
+            &[Value::Text(path.clone()), Value::Blob(updated)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.rows_affected(), 1);
+
+    let after_delete = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_delete.len(), 0);
+
+    tx.rollback().await.unwrap();
     lix.close().await.unwrap();
 }
 
@@ -345,6 +1442,38 @@ async fn transaction_blocks_session_execute_on_same_handle() {
         &[Value::Text("tx-only-task".to_string())]
     );
     lix.close().await.unwrap();
+}
+
+fn build_csv_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_WASM_plugin_csv"));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built CSV plugin wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/csv_table.json",
+            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
+        ),
+        (
+            "schema/csv_row.json",
+            include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 async fn register_crm_task_schema(lix: &lix_sdk::Lix) {

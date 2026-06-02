@@ -32,6 +32,8 @@ pub(crate) mod init;
 #[allow(dead_code)]
 pub(crate) mod json_store;
 pub(crate) mod live_state;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
@@ -84,10 +86,10 @@ pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, FsDirEntry, FsDirEntryKind, FsMkdirOptions,
-    FsRmOptions, FsWriteOptions, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext, SessionFs,
-    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    FsRmOptions, FsWriteOptions, InstalledPluginInfo, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
+    MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
+    SessionFs, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 

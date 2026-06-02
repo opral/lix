@@ -372,6 +372,7 @@ where
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     visible_schemas,
                     functions: functions.clone(),
+                    plugin_host: self.plugin_host.clone(),
                 };
 
                 let result =

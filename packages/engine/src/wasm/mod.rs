@@ -21,7 +21,7 @@ impl Default for WasmLimits {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait WasmRuntime: Send + Sync {
     async fn init_component(
         &self,
@@ -30,11 +30,28 @@ pub trait WasmRuntime: Send + Sync {
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError>;
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait WasmComponentInstance: Send + Sync {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError>;
 
     async fn close(&self) -> Result<(), LixError> {
         Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnsupportedWasmRuntime;
+
+#[async_trait]
+impl WasmRuntime for UnsupportedWasmRuntime {
+    async fn init_component(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "plugin execution requires a configured WASM component runtime",
+        ))
     }
 }
