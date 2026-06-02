@@ -77,12 +77,12 @@ describe("SEO route smoke tests", () => {
       "https://lix.dev/docs/comparison-to-git",
     );
     expect(findMetaContent(head.meta, "og:title")).toBe(
-      "Comparison to Git | Lix Documentation",
+      "How Lix compares to Git | Lix Documentation",
     );
     expect(findMetaContent(head.meta, "twitter:description")).toBe(
-      "Git versions text files line-by-line. Lix versions any file format (DOCX, XLSX, CAD, etc.) semantically per entity.",
+      "Git is great for source code. Lix brings Git-like workflows to non-code files like PDF, DOCX, XLSX, CSV, JSON, and agent-generated work.",
     );
-    expect(rendered.title).toBe("Comparison to Git");
+    expect(rendered.title).toBe("How Lix compares to Git");
     expect(rendered.body).not.toContain("<h1");
   });
 

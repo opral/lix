@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">An embeddable version control system for AI agents</h3>
+<h3 align="center">Git-like workflows for non-code files and AI agent workspaces</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,13 +11,13 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is an **embeddable version control system** you import as a library. Give agents versions, checkpoints, semantic change history, rollback, immutable history, and SQL-queryable context without wrapping Git or managing repo internals.
+Git is great for source code. Lix brings Git-like branches, history, review, rollback, and merging to **non-code files** like PDF, DOCX, XLSX, CSV, JSON, and agent-generated work, where the useful diff is often a cell, clause, property, row, record, or other structured entity instead of a line of text.
 
-- **Runs in-process.** Import it as a library and run it inside your app. No daemon, no protocol.
-- **ACID transactions.** One transaction can cover state, blobs, and history.
-- **Semantic changes.** Track XLSX rows, DOCX clauses, JSON properties, and more as entities.
-- **SQL interface.** Agents can query history and changes without rereading whole files.
+- **Runs in process.** Import it as a library and run it inside your worker, service, CLI, or app. No daemon, no protocol.
+- **Works for any file format.** Track changes as entities across files, structured data, and custom formats.
+- **Real-time multiplayer.** Give agents and tools shared versions, branches, and live change history.
 - **Bring your own backend.** Start in memory, then plug into SQLite, Postgres, S3, Cloudflare, or your own adapter.
+- **SQL interface.** Agents can query history and changes without rereading whole files.
 
 ## Getting started
 
@@ -61,13 +61,13 @@ const changes = await lix.execute(
 
 ## Why Lix?
 
-### Git was not designed to be embedded
+### Git is great for code. Non-code files need semantic change tracking.
 
 AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, versions, reviewable changes, and rollback.
 
-Teams reach for Git, but wrapping it means managing repository directories, worktrees, locks, packfiles, garbage collection, LFS, process calls, protocol servers, and transaction coordination around a tool that expects to live outside the app.
+Teams reach for Git because agents need branches, history, rollback, and review. That works well for source code, but becomes awkward when the thing being reviewed is a spreadsheet cell, document clause, generated JSON property, CSV row, PDF section, or agent action.
 
-Lix is built the other way around: version control runs in-process inside your app.
+Git can store those files. Lix is built to make their domain-level changes queryable, reviewable, and mergeable.
 
 [How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
@@ -75,7 +75,7 @@ Lix is built the other way around: version control runs in-process inside your a
 
 #### Import as a library
 
-Import Lix and open it inside your app. No daemon, no protocol.
+Import Lix and open it inside your worker, service, CLI, or app. No daemon, no protocol.
 
 ```ts
 import { openLix, SqliteBackend } from "@lix-js/sdk";
