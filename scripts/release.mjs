@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export const CHANGE_TYPES = ["major", "minor", "patch"];
-export const CHANGE_SCOPES = ["engine", "lix-sdk", "js-sdk", "cli"];
 export const JS_SDK_NATIVE_PACKAGES = [
 	"@lix-js/sdk-darwin-arm64",
 	"@lix-js/sdk-linux-arm64",
@@ -78,22 +77,9 @@ export function parseChange(root, path) {
 			}),
 	);
 	const type = metadata.type;
-	const scope = metadata.scope;
-	const scopes = scope
-		?.split(",")
-		.map((value) => value.trim())
-		.filter(Boolean);
 	const bodyParagraphs = changeBodyParagraphs(match[2]);
 	if (!CHANGE_TYPES.includes(type)) {
 		throw new Error(`${path}: type must be one of ${CHANGE_TYPES.join(", ")}`);
-	}
-	if (!scopes?.length) {
-		throw new Error(`${path}: scope must include at least one of ${CHANGE_SCOPES.join(", ")}`);
-	}
-	for (const value of scopes) {
-		if (!CHANGE_SCOPES.includes(value)) {
-			throw new Error(`${path}: scope must only include ${CHANGE_SCOPES.join(", ")}`);
-		}
 	}
 	if (bodyParagraphs.length === 0) {
 		throw new Error(`${path}: changelog body must not be empty`);
@@ -101,8 +87,6 @@ export function parseChange(root, path) {
 	return {
 		path,
 		type,
-		scope: scopes.join(", "),
-		scopes,
 		body: bodyParagraphs.join("\n\n"),
 		summary: bodyParagraphs[0],
 		details: bodyParagraphs.slice(1),
@@ -135,22 +119,53 @@ export function changelogEntry(version, date, changes) {
 }
 
 function changeBodyParagraphs(body) {
-	return body
-		.trim()
-		.replace(/\r\n/g, "\n")
-		.split(/\n{2,}/)
-		.map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim())
-		.filter(Boolean);
+	const paragraphs = [];
+	let lines = [];
+	let inFence = false;
+	for (const line of body.trim().replace(/\r\n/g, "\n").split("\n")) {
+		if (line.trimStart().startsWith("```")) {
+			inFence = !inFence;
+			lines.push(line);
+			continue;
+		}
+		if (!inFence && line.trim() === "") {
+			pushBodyParagraph(paragraphs, lines);
+			lines = [];
+			continue;
+		}
+		lines.push(line);
+	}
+	pushBodyParagraph(paragraphs, lines);
+	return paragraphs;
+}
+
+function pushBodyParagraph(paragraphs, lines) {
+	if (lines.length === 0) return;
+	const hasFence = lines.some((line) => line.trimStart().startsWith("```"));
+	const paragraph = hasFence
+		? lines.join("\n").trim()
+		: lines
+				.map((line) => line.trim())
+				.filter(Boolean)
+				.join(" ");
+	if (paragraph) paragraphs.push(paragraph);
 }
 
 function changelogListItem(change) {
 	const paragraphs = change.summary ? [change.summary, ...(change.details ?? [])] : changeBodyParagraphs(change.body);
 	const [summary, ...details] = paragraphs;
-	let item = `- ${change.scope}: ${summary}\n`;
+	let item = `- ${summary}\n`;
 	for (const detail of details) {
-		item += `\n  ${detail}\n`;
+		item += `\n${indentChangelogDetail(detail)}\n`;
 	}
 	return item;
+}
+
+function indentChangelogDetail(detail) {
+	return detail
+		.split("\n")
+		.map((line) => `  ${line}`)
+		.join("\n");
 }
 
 export function updateCargoToml(root, version) {

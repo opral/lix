@@ -13,7 +13,6 @@ Use this format:
 ```md
 ---
 type: patch
-scope: lix-sdk, engine
 ---
 
 Improved SQLite backend read performance and native backend snapshot support.
@@ -24,8 +23,6 @@ The SQLite backend now avoids loading values for key-only point reads and uses n
 ## Fields
 
 - `type` must be exactly one of `major`, `minor`, or `patch`.
-- `scope` must be one or more of `engine`, `lix-sdk`, `js-sdk`, or `cli`.
-- Use comma-separated scopes for changes affecting multiple packages, for example `scope: lix-sdk, engine`.
 - The body should be changelog-ready prose. Start with one clear summary sentence, then optionally add a short explainer paragraph.
 - Write for the generated `CHANGELOG.md`: clear, intuitive, user-facing, and free of implementation noise unless it helps users understand the impact.
 

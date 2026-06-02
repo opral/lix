@@ -1,6 +1,5 @@
 ---
 type: patch
-scope: engine, js-sdk
 ---
 
 Added a typed file API for storing, reading, querying, and versioning file bytes in Lix:
