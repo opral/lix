@@ -578,16 +578,18 @@ pub(crate) fn plan_file_path_write(
     }));
 
     let mut file_data = Vec::new();
-    if let Some(data) = input.data.filter(|data| !data.is_empty()) {
-        rows.push(blob_ref_row(BlobRefRowInput {
-            file_id: file_id.clone(),
-            data: data.clone(),
-            context: FilesystemRowContext {
-                file_id: None,
-                metadata: None,
-                ..input.context.clone()
-            },
-        })?);
+    if let Some(data) = input.data {
+        if !data.is_empty() {
+            rows.push(blob_ref_row(BlobRefRowInput {
+                file_id: file_id.clone(),
+                data: data.clone(),
+                context: FilesystemRowContext {
+                    file_id: None,
+                    metadata: None,
+                    ..input.context.clone()
+                },
+            })?);
+        }
         file_data.push(TransactionFileData {
             file_id,
             path: parsed.normalized_path.to_string(),
@@ -1549,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn file_path_write_omits_blob_ref_for_empty_data() {
+    fn file_path_write_carries_empty_payload_without_blob_ref() {
         let mut resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
         let plan = plan_file_path_write(
@@ -1565,7 +1567,9 @@ mod tests {
         .expect("empty file path write should plan");
 
         assert_eq!(plan.count, 1);
-        assert!(plan.file_data.is_empty());
+        assert_eq!(plan.file_data.len(), 1);
+        assert_eq!(plan.file_data[0].file_id, "file-empty");
+        assert!(plan.file_data[0].data.is_empty());
         assert!(
             plan.rows
                 .iter()

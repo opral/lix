@@ -134,6 +134,51 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         ]
     );
 
+    let files_by_id = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_by_id.len(), 1);
+    assert_eq!(
+        files_by_id.rows()[0].values(),
+        &[Value::Blob(updated_csv.clone())]
+    );
+
+    let file_changes_before_empty = file_changes(&lix, &file_id).await;
+    let empty_csv = Vec::new();
+    lix.write_file("/people.csv", empty_csv.clone(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        Some(empty_csv.as_slice())
+    );
+    let files_empty_by_id = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(files_empty_by_id.len(), 1);
+    assert_eq!(
+        files_empty_by_id.rows()[0].values(),
+        &[Value::Blob(empty_csv)]
+    );
+    let empty_changes = file_changes(&lix, &file_id)
+        .await
+        .into_iter()
+        .skip(file_changes_before_empty.len())
+        .collect::<Vec<_>>();
+    assert!(
+        empty_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
+    );
+
     let sql_csv = b"name,age\nLin,44\n".to_vec();
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
@@ -211,6 +256,51 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         !sql_update_changes
             .iter()
             .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
+    let sql_empty_target = b"name,age\nNoor,10\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql-empty.csv".to_string()),
+            Value::Blob(sql_empty_target),
+        ],
+    )
+    .await
+    .unwrap();
+    let sql_empty_file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-empty.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql_empty_file_id.len(), 1);
+    let sql_empty_file_id = sql_empty_file_id.rows()[0].get::<String>("id").unwrap();
+    let sql_empty_changes_before_update = file_changes(&lix, &sql_empty_file_id).await;
+    let sql_empty_bytes = Vec::new();
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2",
+        &[
+            Value::Blob(sql_empty_bytes.clone()),
+            Value::Text("/sql-empty.csv".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-empty.csv").await.unwrap().as_deref(),
+        Some(sql_empty_bytes.as_slice())
+    );
+    let sql_empty_update_changes = file_changes(&lix, &sql_empty_file_id)
+        .await
+        .into_iter()
+        .skip(sql_empty_changes_before_update.len())
+        .collect::<Vec<_>>();
+    assert!(
+        sql_empty_update_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
     );
 
     let sql_changes_before_delete = sql_changes_before_update + sql_update_changes.len();

@@ -443,7 +443,10 @@ where
                 rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
                 let file_data = file_data
                     .into_iter()
-                    .filter(|write| !file_keys.contains(&PluginFileWriteKey::from(write)))
+                    .filter(|write| {
+                        !file_keys.contains(&PluginFileWriteKey::from(write))
+                            && !write.data.is_empty()
+                    })
                     .collect();
                 Ok(TransactionWrite::RowsWithFileData {
                     mode,

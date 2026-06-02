@@ -135,15 +135,15 @@ where
                                         ..context.clone()
                                     },
                                 })?);
-                                file_data.push(TransactionFileData {
-                                    file_id: file.id.clone(),
-                                    path: path.clone(),
-                                    branch_id: context.branch_id.clone(),
-                                    global: context.global,
-                                    untracked: context.untracked,
-                                    data,
-                                });
                             }
+                            file_data.push(TransactionFileData {
+                                file_id: file.id.clone(),
+                                path: path.clone(),
+                                branch_id: context.branch_id.clone(),
+                                global: context.global,
+                                untracked: context.untracked,
+                                data,
+                            });
                             if context.metadata.is_some() {
                                 rows.push(file_descriptor_row(FileDescriptorRowInput {
                                     id: file.id.clone(),

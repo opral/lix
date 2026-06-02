@@ -48,7 +48,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::plugin::{
-    PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
+    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
     render_plugin_state, select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
@@ -1066,9 +1066,25 @@ impl ExecutionPlan for LixFileScanExec {
                 .map_err(|error| {
                     DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                 })?;
+            let installed_plugins = if needs_data {
+                load_installed_plugins_for_lix_file_scan(
+                    Arc::clone(&live_state),
+                    &blob_reader,
+                    &request,
+                )
+                .await
+            } else {
+                Ok(Vec::new())
+            }
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "sql2 lix_file plugin discovery failed: {error}"
+                ))
+            })?;
             let plugin_render = PluginRenderContext {
                 live_state: Arc::clone(&live_state),
                 host: plugin_host,
+                installed_plugins,
             };
             let batch = lix_file_record_batch(
                 &batch_schema,
@@ -1112,6 +1128,7 @@ struct FileDescriptorRecord {
 struct PluginRenderContext {
     live_state: Arc<dyn LiveStateReader>,
     host: PluginRuntimeHost,
+    installed_plugins: Vec<InstalledPlugin>,
 }
 
 #[derive(Debug, Clone)]
@@ -1617,10 +1634,17 @@ fn stage_lix_file_data_insert_write(
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
-    if data.is_empty() {
-        return Ok(());
+    if !data.is_empty() {
+        stage_lix_file_data_blob_ref_write(
+            staged,
+            file_id.clone(),
+            data.clone(),
+            &context,
+            origin,
+        )?;
     }
-    stage_lix_file_data_blob_write(staged, file_id, path, data, context, origin)
+    stage_lix_file_data_payload_write(staged, file_id, path, data, context);
+    Ok(())
 }
 
 fn stage_lix_file_data_update_write(
@@ -1634,26 +1658,28 @@ fn stage_lix_file_data_update_write(
 ) -> Result<()> {
     if data.is_empty() {
         if has_blob_ref {
-            let mut row = blob_ref_tombstone_row(file_id, context);
+            let mut row = blob_ref_tombstone_row(file_id.clone(), context.clone());
             row.origin = origin;
             staged.state_rows.push(row);
         }
+        stage_lix_file_data_payload_write(staged, file_id, path, data, context);
         return Ok(());
     }
-    stage_lix_file_data_blob_write(staged, file_id, path, data, context, origin)
+    stage_lix_file_data_blob_ref_write(staged, file_id.clone(), data.clone(), &context, origin)?;
+    stage_lix_file_data_payload_write(staged, file_id, path, data, context);
+    Ok(())
 }
 
-fn stage_lix_file_data_blob_write(
+fn stage_lix_file_data_blob_ref_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
-    path: Option<String>,
     data: Vec<u8>,
-    context: FilesystemRowContext,
+    context: &FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let mut row = blob_ref_row(BlobRefRowInput {
-        file_id: file_id.clone(),
-        data: data.clone(),
+        file_id,
+        data,
         context: FilesystemRowContext {
             file_id: None,
             metadata: None,
@@ -1663,6 +1689,16 @@ fn stage_lix_file_data_blob_write(
     .map_err(lix_error_to_datafusion_error)?;
     row.origin = origin;
     staged.state_rows.push(row);
+    Ok(())
+}
+
+fn stage_lix_file_data_payload_write(
+    staged: &mut LixFileStagedBatch,
+    file_id: String,
+    path: Option<String>,
+    data: Vec<u8>,
+    context: FilesystemRowContext,
+) {
     staged.file_data_writes.push(TransactionFileData {
         file_id,
         path: path.unwrap_or_default(),
@@ -1671,7 +1707,6 @@ fn stage_lix_file_data_blob_write(
         untracked: context.untracked,
         data,
     });
-    Ok(())
 }
 
 fn attach_lix_file_insert_origin(
@@ -1803,16 +1838,6 @@ async fn lix_file_record_batch(
         .collect::<Vec<_>>();
     let needs_data = load_data && projected_columns.contains(&"data");
 
-    let filesystem_index = if needs_data && plugin_render.is_some() {
-        Some(FilesystemIndex::from_live_rows(rows.clone())?)
-    } else {
-        None
-    };
-    let installed_plugins = match filesystem_index.as_ref() {
-        Some(index) => load_installed_plugins_from_filesystem(index, blob_reader.as_ref()).await?,
-        None => Vec::new(),
-    };
-
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
@@ -1931,17 +1956,11 @@ async fn lix_file_record_batch(
             match blob_rows.get(&FilesystemBlobRefKey::from_context(&context, &file.id)) {
                 Some(blob_ref) => load_single_blob_bytes(blob_reader, &blob_ref.blob_hash).await?,
                 None => {
-                    let rendered = match (&plugin_render, filesystem_index.as_ref()) {
-                        (Some(plugin_render), Some(_)) => {
-                            render_plugin_file_for_sql(
-                                plugin_render,
-                                &installed_plugins,
-                                &file,
-                                &path,
-                            )
-                            .await?
+                    let rendered = match &plugin_render {
+                        Some(plugin_render) => {
+                            render_plugin_file_for_sql(plugin_render, &file, &path).await?
                         }
-                        _ => None,
+                        None => None,
                     };
                     Some(rendered.unwrap_or_default())
                 }
@@ -2013,11 +2032,10 @@ async fn lix_file_record_batch(
 
 async fn render_plugin_file_for_sql(
     plugin_render: &PluginRenderContext,
-    installed_plugins: &[crate::plugin::InstalledPlugin],
     file: &FileDescriptorRecord,
     path: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let Some(plugin) = select_plugin_for_path(installed_plugins, path, None) else {
+    let Some(plugin) = select_plugin_for_path(&plugin_render.installed_plugins, path, None) else {
         return Ok(None);
     };
     let rows = plugin_render
@@ -2036,6 +2054,27 @@ async fn render_plugin_file_for_sql(
     Ok(Some(
         render_plugin_state(&plugin_render.host, plugin, &active_state).await?,
     ))
+}
+
+async fn load_installed_plugins_for_lix_file_scan(
+    live_state: Arc<dyn LiveStateReader>,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    request: &LiveStateScanRequest,
+) -> Result<Vec<InstalledPlugin>, LixError> {
+    let mut plugin_request = request.clone();
+    plugin_request.filter.schema_keys = vec![
+        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+        BLOB_REF_SCHEMA_KEY.to_string(),
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+    ];
+    plugin_request.filter.entity_pks.clear();
+    plugin_request.filter.file_ids.clear();
+    plugin_request.projection = LiveStateProjection::default();
+    plugin_request.limit = None;
+
+    let rows = live_state.scan_rows(&plugin_request).await?;
+    let filesystem = FilesystemIndex::from_live_rows(rows)?;
+    load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await
 }
 
 async fn load_single_blob_bytes(
