@@ -1,11 +1,10 @@
-mod bindings {
-    #![expect(clippy::same_length_and_capacity)]
-    wit_bindgen::generate!({
-        path: "../../packages/engine/wit",
-        world: "plugin",
-    });
-}
-pub use bindings::*;
+// TODO: workaround wit_bindgen
+#![expect(clippy::same_length_and_capacity)]
+
+wit_bindgen::generate!({
+    path: "../../packages/engine/wit",
+    world: "plugin",
+});
 
 mod csv;
 mod diff;

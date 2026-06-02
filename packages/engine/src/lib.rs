@@ -32,6 +32,8 @@ pub(crate) mod init;
 #[allow(dead_code)]
 pub(crate) mod json_store;
 pub(crate) mod live_state;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;

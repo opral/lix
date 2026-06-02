@@ -1,7 +1,164 @@
 use lix_sdk::{
-    CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions, MergeBranchOutcome,
-    OpenLixOptions, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, FsWriteOptions, InMemoryBackend, LixError, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
+use std::io::{Cursor, Write};
+use std::path::Path;
+
+#[tokio::test]
+async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
+    let archive = build_csv_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+
+    lix.install_plugin_archive(&archive).await.unwrap();
+
+    let stored_archive = lix
+        .read_file("/.lix/plugins/plugin_csv.lixplugin")
+        .await
+        .unwrap();
+    assert_eq!(stored_archive.as_deref(), Some(archive.as_slice()));
+
+    let schemas = lix
+        .execute(
+            "SELECT table_name \
+             FROM information_schema.tables \
+             WHERE table_name IN ('csv_row', 'csv_table') \
+             ORDER BY table_name",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        schemas
+            .rows()
+            .iter()
+            .map(|row| row.get::<String>("table_name").unwrap())
+            .collect::<Vec<_>>(),
+        vec!["csv_row".to_string(), "csv_table".to_string()]
+    );
+
+    let original_csv = b"name,age\nAda,37\n".to_vec();
+    lix.write_file(
+        "/people.csv",
+        original_csv.clone(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        Some(original_csv.as_slice())
+    );
+
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/people.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(file_id.len(), 1);
+    let file_id = file_id.rows()[0].get::<String>("id").unwrap();
+    let file_changes_before_update = file_changes(&lix, &file_id).await;
+
+    let updated_csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
+    lix.write_file(
+        "/people.csv",
+        updated_csv.clone(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/people.csv").await.unwrap().as_deref(),
+        Some(updated_csv.as_slice())
+    );
+
+    let file_changes_after_update = file_changes(&lix, &file_id).await;
+    let resulting_diff_changes = file_changes_after_update
+        .into_iter()
+        .skip(file_changes_before_update.len())
+        .collect::<Vec<_>>();
+    assert_eq!(resulting_diff_changes.len(), 1);
+    let change = &resulting_diff_changes[0];
+    assert_eq!(change.schema_key, "lix_binary_blob_ref");
+    assert_eq!(change.entity_pk, serde_json::json!([file_id.as_str()]));
+    let snapshot = change
+        .snapshot_content
+        .as_ref()
+        .expect("updated file write should produce a blob ref snapshot");
+    assert_eq!(
+        snapshot.get("id").and_then(|value| value.as_str()),
+        Some(file_id.as_str())
+    );
+    assert_eq!(
+        snapshot
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_u64),
+        Some(updated_csv.len() as u64)
+    );
+    assert!(
+        snapshot
+            .get("blob_hash")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let files = lix
+        .execute(
+            "SELECT path, data FROM lix_file WHERE path = $1",
+            &[Value::Text("/people.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files.rows()[0].values(),
+        &[
+            Value::Text("/people.csv".to_string()),
+            Value::Blob(updated_csv.clone())
+        ]
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FileChange {
+    schema_key: String,
+    entity_pk: serde_json::Value,
+    snapshot_content: Option<serde_json::Value>,
+}
+
+async fn file_changes(lix: &lix_sdk::Lix, file_id: &str) -> Vec<FileChange> {
+    let changes = lix
+        .execute(
+            "SELECT schema_key, entity_pk, snapshot_content \
+             FROM lix_change \
+             WHERE file_id = $1 \
+             ORDER BY created_at, id",
+            &[Value::Text(file_id.to_string())],
+        )
+        .await
+        .unwrap();
+
+    changes
+        .rows()
+        .iter()
+        .map(|row| {
+            let snapshot_content = match row.value("snapshot_content").unwrap() {
+                Value::Json(value) => Some(value.clone()),
+                Value::Null => None,
+                other => panic!("expected JSON or null snapshot_content, got {other:?}"),
+            };
+            FileChange {
+                schema_key: row.get::<String>("schema_key").unwrap(),
+                entity_pk: row.get::<serde_json::Value>("entity_pk").unwrap(),
+                snapshot_content,
+            }
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
@@ -345,6 +502,38 @@ async fn transaction_blocks_session_execute_on_same_handle() {
         &[Value::Text("tx-only-task".to_string())]
     );
     lix.close().await.unwrap();
+}
+
+fn build_csv_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_WASM_plugin_csv"));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built CSV plugin wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/csv_table.json",
+            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
+        ),
+        (
+            "schema/csv_row.json",
+            include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
+        ),
+        ("plugin.wasm", &wasm),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 async fn register_crm_task_schema(lix: &lix_sdk::Lix) {

@@ -5,10 +5,10 @@ use std::path::{Component, Path};
 use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
 
-use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::LixError;
+use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 
-use super::{parse_plugin_manifest_json, InstalledPlugin, PluginManifest};
+use super::{InstalledPlugin, PluginManifest, parse_plugin_manifest_json};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedPluginArchive {
@@ -25,13 +25,13 @@ pub(crate) fn parse_plugin_archive_for_install(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: "Plugin archive must contain manifest.json".to_string(),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Plugin archive manifest.json must be UTF-8: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
 
@@ -51,7 +51,7 @@ pub(crate) fn parse_plugin_archive_for_install(
     ensure_valid_plugin_wasm_for_install(&wasm_bytes)?;
 
     let mut schemas = Vec::with_capacity(validated_manifest.manifest.schemas.len());
-    let mut seen_schema_keys = BTreeSet::<(String, String)>::new();
+    let mut seen_schema_keys = BTreeSet::<String>::new();
     for schema_path in &validated_manifest.manifest.schemas {
         let normalized_schema_path = normalize_archive_path_for_install(schema_path)?;
         let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
@@ -63,11 +63,9 @@ pub(crate) fn parse_plugin_archive_for_install(
         let schema_json: JsonValue =
             serde_json::from_slice(schema_bytes).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                message: format!(
-                    "Plugin archive schema '{schema_path}' is invalid JSON: {error}"
-                ),
+                message: format!("Plugin archive schema '{schema_path}' is invalid JSON: {error}"),
                 hint: None,
-            details: None,
+                details: None,
             })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?;
@@ -79,7 +77,7 @@ pub(crate) fn parse_plugin_archive_for_install(
                     schema_key.schema_key
                 ),
                 hint: None,
-            details: None,
+                details: None,
             });
         }
         schemas.push(schema_json);
@@ -100,20 +98,18 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!(
-            "plugin materialization: archive '{}' is missing manifest.json",
-            archive_path
+            "plugin materialization: archive '{archive_path}' is missing manifest.json"
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!(
-            "plugin materialization: archive '{}' manifest.json must be UTF-8: {error}",
-            archive_path
+            "plugin materialization: archive '{archive_path}' manifest.json must be UTF-8: {error}"
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
     if validated_manifest.manifest.key != plugin_key {
@@ -137,7 +133,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path, validated_manifest.manifest.entry
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     ensure_valid_plugin_wasm_for_materialization(wasm)?;
 
@@ -172,7 +168,7 @@ fn read_archive_files_for_install(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Plugin archive is not a valid zip file: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
@@ -193,7 +189,7 @@ fn read_archive_files_for_install(
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 message: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
                 hint: None,
-            details: None,
+                details: None,
             });
         }
 
@@ -210,7 +206,7 @@ fn read_archive_files_for_install(
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 message: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
                 hint: None,
-            details: None,
+                details: None,
             });
         }
     }
@@ -225,10 +221,7 @@ fn read_plugin_archive_files(
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!(
-                "plugin materialization: archive '{}' is empty",
-                archive_path
-            ),
+            message: format!("plugin materialization: archive '{archive_path}' is empty"),
             hint: None,
             details: None,
         });
@@ -237,11 +230,10 @@ fn read_plugin_archive_files(
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!(
-            "plugin materialization: archive '{}' is not a valid zip file: {error}",
-            archive_path
+            "plugin materialization: archive '{archive_path}' is not a valid zip file: {error}"
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
@@ -249,8 +241,7 @@ fn read_plugin_archive_files(
         let mut entry = archive.by_index(index).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             message: format!(
-                "plugin materialization: failed to read archive '{}' entry index {}: {error}",
-                archive_path, index
+                "plugin materialization: failed to read archive '{archive_path}' entry index {index}: {error}"
             ),
             hint: None,
             details: None,
@@ -266,8 +257,7 @@ fn read_plugin_archive_files(
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             message: format!(
-                "plugin materialization: failed to read archive '{}' entry '{}': {error}",
-                archive_path, entry_name
+                "plugin materialization: failed to read archive '{archive_path}' entry '{entry_name}': {error}"
             ),
             hint: None,
             details: None,
@@ -310,31 +300,32 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             Component::Normal(value) => {
                 let segment = value.to_str().ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    message: format!(
-                        "Plugin archive path '{path}' contains non-UTF-8 components"
-                    ),
+                    message: format!("Plugin archive path '{path}' contains non-UTF-8 components"),
                     hint: None,
-            details: None,
+                    details: None,
                 })?;
                 if segment.is_empty() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         message: format!("Plugin archive path '{path}' is invalid"),
                         hint: None,
-            details: None,
+                        details: None,
                     });
                 }
                 segments.push(segment.to_string());
             }
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     message: format!(
                         "Plugin archive path '{path}' must not contain traversal or absolute components"
                     ),
                     hint: None,
-            details: None,
-                })
+                    details: None,
+                });
             }
         }
     }
@@ -356,10 +347,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
     if raw_path.is_absolute() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!(
-                "plugin materialization: archive path '{}' must be relative",
-                path
-            ),
+            message: format!("plugin materialization: archive path '{path}' must be relative"),
             hint: None,
             details: None,
         });
@@ -374,11 +362,10 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     message: format!(
-                        "plugin materialization: archive path '{}' must not escape the archive root",
-                        path
+                        "plugin materialization: archive path '{path}' must not escape the archive root"
                     ),
                     hint: None,
-            details: None,
+                    details: None,
                 });
             }
         }
@@ -432,7 +419,7 @@ fn ensure_valid_plugin_wasm_for_materialization(bytes: &[u8]) -> Result<(), LixE
 }
 
 fn is_symlink_mode(mode: Option<u32>) -> bool {
-    const MODE_FILE_TYPE_MASK: u32 = 0o170000;
-    const MODE_SYMLINK: u32 = 0o120000;
+    const MODE_FILE_TYPE_MASK: u32 = 0o170_000;
+    const MODE_SYMLINK: u32 = 0o120_000;
     mode.is_some_and(|value| (value & MODE_FILE_TYPE_MASK) == MODE_SYMLINK)
 }

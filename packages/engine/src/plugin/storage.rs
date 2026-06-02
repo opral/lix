@@ -37,10 +37,7 @@ fn validate_plugin_key_segment(plugin_key: &str) -> Result<(), LixError> {
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!(
-                "plugin key '{}' must be a single relative path segment",
-                plugin_key
-            ),
+            message: format!("plugin key '{plugin_key}' must be a single relative path segment"),
             hint: None,
             details: None,
         });

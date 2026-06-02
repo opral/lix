@@ -368,7 +368,7 @@ where
     }
 }
 
-async fn scan_filesystem_rows<B>(
+pub(crate) async fn scan_filesystem_rows<B>(
     transaction: &mut crate::transaction::Transaction<B>,
     branch_id: &str,
 ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError>

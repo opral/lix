@@ -1,6 +1,6 @@
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, InMemoryBackend,
-    LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
+    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsWriteOptions,
+    InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 
@@ -102,6 +102,23 @@ where
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
         self.session.merge_branch_preview(options).await
+    }
+
+    pub async fn install_plugin_archive(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
+        self.session.install_plugin_archive(archive_bytes).await
+    }
+
+    pub async fn write_file(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        options: FsWriteOptions,
+    ) -> Result<(), LixError> {
+        self.session.fs().write_file(path, data, options).await
+    }
+
+    pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+        self.session.fs().read_file(path).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

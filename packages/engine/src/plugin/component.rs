@@ -47,7 +47,7 @@ pub(crate) async fn load_or_init_plugin_component(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: "plugin component cache lock poisoned".to_string(),
         hint: None,
-            details: None,
+        details: None,
     })?;
     if let Some(cached) = guard.get(&plugin.key) {
         if cached.wasm == plugin.wasm {
@@ -92,7 +92,7 @@ async fn invoke_render_export(
             errors.join("; ")
         ),
         hint: None,
-            details: None,
+        details: None,
     })
 }
 
@@ -102,18 +102,18 @@ mod tests {
     use crate::plugin::{InstalledPlugin, PluginRuntime};
     use crate::wasm::WasmRuntime;
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestHost {
         wasm_runtime: Arc<dyn WasmRuntime>,
-        plugin_component_cache:
-            std::sync::Mutex<std::collections::BTreeMap<String, CachedPluginComponent>>,
+        plugin_component_cache: std::sync::Mutex<BTreeMap<String, CachedPluginComponent>>,
     }
 
     impl PluginComponentHost for TestHost {
         fn plugin_component_cache(
             &self,
-        ) -> &std::sync::Mutex<std::collections::BTreeMap<String, CachedPluginComponent>> {
+        ) -> &std::sync::Mutex<BTreeMap<String, CachedPluginComponent>> {
             &self.plugin_component_cache
         }
 
@@ -153,7 +153,7 @@ mod tests {
         let runtime = Arc::new(CountingRuntime::default());
         let host = TestHost {
             wasm_runtime: runtime.clone(),
-            plugin_component_cache: std::sync::Mutex::new(Default::default()),
+            plugin_component_cache: std::sync::Mutex::new(BTreeMap::default()),
         };
         let mut plugin = InstalledPlugin {
             key: "k".to_string(),
