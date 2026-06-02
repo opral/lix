@@ -1,7 +1,8 @@
 use lix_engine::{
     Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsWriteOptions,
-    InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    InMemoryBackend, InstalledPluginInfo, LixError, MergeBranchOptions, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, SessionContext, SwitchBranchOptions,
+    SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use std::sync::Arc;
 #[expect(missing_debug_implementations)]
 pub struct OpenLixOptions<B = InMemoryBackend> {
     pub backend: Option<B>,
+    pub wasm_runtime: Option<Arc<dyn lix_engine::wasm::WasmRuntime>>,
 }
 
 /// Workspace-session handle for a Lix repository.
@@ -30,7 +32,16 @@ where
 /// backend is supplied, it is opened when already initialized and initialized
 /// first when empty.
 pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
-    open_lix_with_backend(options.backend.unwrap_or_else(InMemoryBackend::new)).await
+    let engine = open_or_initialize_engine(
+        options.backend.unwrap_or_else(InMemoryBackend::new),
+        options.wasm_runtime,
+    )
+    .await?;
+    let session = engine.open_workspace_session().await?;
+    Ok(Lix {
+        _engine: engine,
+        session,
+    })
 }
 
 pub async fn open_lix_with_backend<B>(backend: B) -> Result<Lix<B>, LixError>
@@ -40,17 +51,6 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     let engine = open_or_initialize_engine(backend, None).await?;
-    let session = engine.open_workspace_session().await?;
-    Ok(Lix {
-        _engine: engine,
-        session,
-    })
-}
-
-pub async fn open_lix_with_wasm_runtime(
-    wasm_runtime: Arc<dyn lix_engine::wasm::WasmRuntime>,
-) -> Result<Lix, LixError> {
-    let engine = open_or_initialize_engine(InMemoryBackend::new(), Some(wasm_runtime)).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
@@ -118,6 +118,10 @@ where
 
     pub async fn install_plugin_archive(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
         self.session.install_plugin_archive(archive_bytes).await
+    }
+
+    pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {
+        self.session.list_installed_plugins().await
     }
 
     pub async fn write_file(

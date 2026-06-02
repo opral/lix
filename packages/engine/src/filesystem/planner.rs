@@ -590,7 +590,9 @@ pub(crate) fn plan_file_path_write(
         })?);
         file_data.push(TransactionFileData {
             file_id,
+            path: parsed.normalized_path.to_string(),
             branch_id: input.context.branch_id,
+            global: input.context.global,
             untracked: input.context.untracked,
             data,
         });

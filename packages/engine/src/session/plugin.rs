@@ -1,8 +1,24 @@
 use crate::LixError;
-use crate::plugin::install_plugin_archive_with_transaction;
-use crate::storage::StorageBackend;
+use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
+use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
+use crate::plugin::{
+    PluginContentType, install_plugin_archive_with_transaction,
+    load_installed_plugins_from_filesystem,
+};
+use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
 
 use super::SessionContext;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPluginInfo {
+    pub key: String,
+    pub api_version: String,
+    pub path_glob: String,
+    pub content_type: Option<String>,
+    pub entry: String,
+    pub schema_keys: Vec<String>,
+    pub manifest_json: String,
+}
 
 impl<B> SessionContext<B>
 where
@@ -18,5 +34,44 @@ where
             })
         })
         .await
+    }
+
+    pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {
+        let _operation_guard = self.begin_session_operation()?;
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let active_branch_id = self.active_branch_id_from_reader(&read).await?;
+        let live_state = self.live_state.reader(&read);
+        let filesystem_rows = live_state
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: filesystem_schema_keys(),
+                    branch_ids: vec![active_branch_id],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
+        let index = FilesystemIndex::from_live_rows(filesystem_rows)?;
+        let blob_reader = self.binary_cas.reader(read);
+        let plugins = load_installed_plugins_from_filesystem(&index, &blob_reader).await?;
+        Ok(plugins
+            .into_iter()
+            .map(|plugin| InstalledPluginInfo {
+                key: plugin.key,
+                api_version: plugin.api_version,
+                path_glob: plugin.path_glob,
+                content_type: plugin.content_type.map(plugin_content_type_name),
+                entry: plugin.entry,
+                schema_keys: plugin.schema_keys,
+                manifest_json: plugin.manifest_json,
+            })
+            .collect())
+    }
+}
+
+fn plugin_content_type_name(content_type: PluginContentType) -> String {
+    match content_type {
+        PluginContentType::Text => "text".to_string(),
+        PluginContentType::Binary => "binary".to_string(),
     }
 }

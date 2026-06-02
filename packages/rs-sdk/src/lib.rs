@@ -8,10 +8,7 @@ mod lix;
 #[cfg(feature = "sqlite")]
 mod sqlite_backend;
 
-pub use lix::{
-    Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend,
-    open_lix_with_wasm_runtime,
-};
+pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
 pub use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
 pub use lix_engine::{
     Backend, BackendConformanceReport, BackendConformanceResult, BackendConformanceStatus,

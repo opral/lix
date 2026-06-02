@@ -30,5 +30,6 @@ pub use merge::{
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
     MergeConflictKind, MergeConflictSide,
 };
+pub use plugin::InstalledPluginInfo;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;

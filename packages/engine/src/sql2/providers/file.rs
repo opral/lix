@@ -1311,11 +1311,13 @@ fn lix_file_existing_update_stage_from_batch(
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
+            let path = optional_string_value(batch, row_index, "path")?;
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
             stage_lix_file_data_update_write(
                 &mut staged,
                 id.clone(),
+                path,
                 data,
                 context,
                 has_blob_ref,
@@ -1440,7 +1442,7 @@ fn lix_file_path_update_stage_from_batch(
         let plan = plan_file_path_update(
             resolver,
             id.clone(),
-            path,
+            path.clone(),
             context.clone(),
             generate_directory_id,
         )
@@ -1453,6 +1455,7 @@ fn lix_file_path_update_stage_from_batch(
             stage_lix_file_data_update_write(
                 &mut staged,
                 id.clone(),
+                Some(path),
                 data,
                 context,
                 has_blob_ref,
@@ -1594,7 +1597,8 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         if let (Some(id), Some(data)) = (id, data) {
             let origin = Some(lix_file_insert_origin(surface_name, &id));
-            stage_lix_file_data_insert_write(&mut staged, id, data, context, origin)?;
+            let path = directory_id.is_none().then(|| format!("/{name}"));
+            stage_lix_file_data_insert_write(&mut staged, id, path, data, context, origin)?;
         }
         staged.count = staged
             .count
@@ -1608,6 +1612,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 fn stage_lix_file_data_insert_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
+    path: Option<String>,
     data: Vec<u8>,
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
@@ -1615,12 +1620,13 @@ fn stage_lix_file_data_insert_write(
     if data.is_empty() {
         return Ok(());
     }
-    stage_lix_file_data_blob_write(staged, file_id, data, context, origin)
+    stage_lix_file_data_blob_write(staged, file_id, path, data, context, origin)
 }
 
 fn stage_lix_file_data_update_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
+    path: Option<String>,
     data: Vec<u8>,
     context: FilesystemRowContext,
     has_blob_ref: bool,
@@ -1634,12 +1640,13 @@ fn stage_lix_file_data_update_write(
         }
         return Ok(());
     }
-    stage_lix_file_data_blob_write(staged, file_id, data, context, origin)
+    stage_lix_file_data_blob_write(staged, file_id, path, data, context, origin)
 }
 
 fn stage_lix_file_data_blob_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
+    path: Option<String>,
     data: Vec<u8>,
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
@@ -1658,7 +1665,9 @@ fn stage_lix_file_data_blob_write(
     staged.state_rows.push(row);
     staged.file_data_writes.push(TransactionFileData {
         file_id,
+        path: path.unwrap_or_default(),
         branch_id: context.branch_id,
+        global: context.global,
         untracked: context.untracked,
         data,
     });

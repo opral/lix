@@ -374,6 +374,7 @@ where
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
+            self.plugin_host.clone(),
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
         )

@@ -17,15 +17,13 @@ use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    InstalledPlugin, PluginDetectedChange, detect_changes_with_plugin, file_content_type,
-    load_installed_plugins_from_filesystem, plugin_state_rows, render_plugin_state,
-    select_plugin_for_path,
+    InstalledPlugin, load_installed_plugins_from_filesystem, plugin_state_rows,
+    render_plugin_state, select_plugin_for_path,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
 use crate::transaction::types::{
     TransactionFileData, TransactionJson, TransactionWrite, TransactionWriteMode,
-    TransactionWriteRow,
 };
 
 use super::context::SessionContext;
@@ -95,25 +93,11 @@ where
         let path = ParsedFilePath::try_from_path(path)?
             .normalized_path
             .to_string();
-        let session = self.session.clone();
         self.session.with_write_transaction(|transaction| {
             Box::pin(async move {
                 let branch_id = transaction.active_branch_id().to_string();
                 let rows = scan_filesystem_rows(transaction, &branch_id).await?;
                 let filesystem = FilesystemIndex::from_live_rows(rows.clone())?;
-                let read = SharedStorageRead::new(
-                    session
-                        .storage
-                        .begin_read(StorageReadOptions::default())?,
-                );
-                let blob_reader = session.binary_cas.reader(read);
-                let installed_plugins =
-                    load_installed_plugins_from_filesystem(&filesystem, &blob_reader).await?;
-                let matched_plugin = select_plugin_for_path(
-                    &installed_plugins,
-                    &path,
-                    Some(file_content_type(&data)),
-                );
                 let metadata = transaction_metadata(options.metadata, "fs.write_file metadata")?;
 
                 if let Some(existing) = filesystem.entry(&path) {
@@ -131,49 +115,6 @@ where
                             )))
                         }
                         FilesystemEntry::File(file) => {
-                            if let Some(plugin) = matched_plugin {
-                                let context = file.context_with_metadata(metadata.clone());
-                                let active_state =
-                                    scan_plugin_state_rows(transaction, &branch_id, &file.id, plugin)
-                                        .await?;
-                                let changes = detect_changes_with_plugin(
-                                    &session,
-                                    plugin,
-                                    &active_state,
-                                    data.clone(),
-                                )
-                                .await?;
-                                let mut rows = Vec::new();
-                                if file.blob_hash.is_some() {
-                                    rows.push(blob_ref_tombstone_row(
-                                        file.id.clone(),
-                                        context.clone(),
-                                    ));
-                                }
-                                rows.extend(plugin_change_rows(
-                                    changes,
-                                    &file.id,
-                                    &context,
-                                    "fs.write_file plugin change",
-                                )?);
-                                if context.metadata.is_some() {
-                                    rows.push(file_descriptor_row(FileDescriptorRowInput {
-                                        id: file.id.clone(),
-                                        directory_id: file.directory_id.clone(),
-                                        name: file.name.clone(),
-                                        context,
-                                    }));
-                                }
-                                if !rows.is_empty() {
-                                    transaction
-                                        .stage_write(TransactionWrite::Rows {
-                                            mode: TransactionWriteMode::Replace,
-                                            rows,
-                                        })
-                                        .await?;
-                                }
-                                return Ok(());
-                            }
                             let mut rows = Vec::new();
                             let context = file.context_with_metadata(metadata);
                             let mut file_data = Vec::new();
@@ -196,7 +137,9 @@ where
                                 })?);
                                 file_data.push(TransactionFileData {
                                     file_id: file.id.clone(),
+                                    path: path.clone(),
                                     branch_id: context.branch_id.clone(),
+                                    global: context.global,
                                     untracked: context.untracked,
                                     data,
                                 });
@@ -245,47 +188,6 @@ where
                     let resolver = resolvers
                         .entry(key)
                         .or_insert_with(DirectoryPathResolver::default);
-                    if let Some(plugin) = matched_plugin {
-                        let changes =
-                            detect_changes_with_plugin(&session, plugin, &[], data.clone()).await?;
-                        let plan = plan_file_path_write(
-                            resolver,
-                            FilePathWriteInput {
-                                id: None,
-                                path,
-                                data: None,
-                                context: context.clone(),
-                            },
-                            &mut || transaction.functions().call_uuid_v7().to_string(),
-                        )?;
-                        let file_id = plan
-                            .rows
-                            .iter()
-                            .find(|row| row.schema_key == "lix_file_descriptor")
-                            .and_then(|row| row.entity_pk.as_ref())
-                            .and_then(|entity_pk| entity_pk.as_single_string().ok())
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_INTERNAL_ERROR,
-                                    "plugin file write did not create a file descriptor",
-                                )
-                            })?
-                            .to_string();
-                        let mut rows = plan.rows;
-                        rows.extend(plugin_change_rows(
-                            changes,
-                            &file_id,
-                            &context,
-                            "fs.write_file plugin change",
-                        )?);
-                        transaction
-                            .stage_write(TransactionWrite::Rows {
-                                mode: TransactionWriteMode::Replace,
-                                rows,
-                            })
-                            .await?;
-                        return Ok(());
-                    }
                     let plan = plan_file_path_write(
                         resolver,
                         FilePathWriteInput {
@@ -519,26 +421,6 @@ where
         .await
 }
 
-async fn scan_plugin_state_rows<B>(
-    transaction: &mut crate::transaction::Transaction<B>,
-    branch_id: &str,
-    file_id: &str,
-    plugin: &InstalledPlugin,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError>
-where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let rows = transaction
-        .scan_live_state(&LiveStateScanRequest {
-            filter: plugin_state_filter(branch_id, file_id, plugin),
-            ..Default::default()
-        })
-        .await?;
-    Ok(plugin_state_rows(plugin, rows.iter()))
-}
-
 async fn scan_plugin_state_rows_from_reader(
     live_state: &dyn LiveStateReader,
     branch_id: &str,
@@ -592,50 +474,6 @@ async fn read_plugin_file_bytes(
     Ok(Some(
         render_plugin_state(host, plugin, &active_state).await?,
     ))
-}
-
-fn plugin_change_rows(
-    changes: Vec<PluginDetectedChange>,
-    file_id: &str,
-    context: &FilesystemRowContext,
-    json_context: &str,
-) -> Result<Vec<TransactionWriteRow>, LixError> {
-    changes
-        .into_iter()
-        .map(|change| {
-            Ok(TransactionWriteRow {
-                entity_pk: Some(change.entity_pk),
-                schema_key: change.schema_key,
-                file_id: Some(file_id.to_string()),
-                snapshot: change
-                    .snapshot_content
-                    .map(|raw| plugin_transaction_json(&raw, json_context))
-                    .transpose()?,
-                metadata: change
-                    .metadata
-                    .map(|raw| plugin_transaction_json(&raw, json_context))
-                    .transpose()?,
-                origin: None,
-                created_at: None,
-                updated_at: None,
-                global: context.global,
-                change_id: None,
-                commit_id: None,
-                untracked: context.untracked,
-                branch_id: context.branch_id.clone(),
-            })
-        })
-        .collect()
-}
-
-fn plugin_transaction_json(raw: &str, context: &str) -> Result<TransactionJson, LixError> {
-    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!("{context} emitted invalid JSON: {error}"),
-        )
-    })?;
-    TransactionJson::from_value(value, context)
 }
 
 async fn stage_delete_plan<B>(

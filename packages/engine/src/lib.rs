@@ -86,10 +86,10 @@ pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, FsDirEntry, FsDirEntryKind, FsMkdirOptions,
-    FsRmOptions, FsWriteOptions, MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext, SessionFs,
-    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
+    FsRmOptions, FsWriteOptions, InstalledPluginInfo, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
+    MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, SessionContext,
+    SessionFs, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 

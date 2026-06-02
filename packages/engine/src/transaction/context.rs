@@ -22,10 +22,19 @@ use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::LixTimestamp;
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
+use crate::filesystem::{
+    FilesystemIndex, FilesystemRowContext, blob_ref_tombstone_row, filesystem_schema_keys,
+};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::overlay_scan_rows;
 use crate::live_state::{
-    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateContext, LiveStateFilter, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
+};
+use crate::plugin::{
+    InstalledPlugin, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, PluginDetectedChange, PluginRuntimeHost,
+    detect_changes_with_plugin, file_content_type, load_installed_plugins_from_filesystem,
+    plugin_state_rows, select_plugin_for_path,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::SqlWriteExecutionContext;
@@ -78,6 +87,7 @@ pub(crate) struct Transaction<B: StorageBackend = InMemoryStorageBackend> {
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
+    plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     schema_resolver: TransactionSchemaResolver,
@@ -247,6 +257,7 @@ where
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
+        plugin_host: PluginRuntimeHost,
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
     ) -> Result<OpenTransaction<B>, LixError> {
@@ -291,6 +302,7 @@ where
                 live_state,
                 tracked_state,
                 binary_cas,
+                plugin_host,
                 branch_ctx,
                 catalog_context,
                 schema_resolver,
@@ -390,8 +402,223 @@ where
         }
         self.require_existing_transaction_write_branch_ids(&write)
             .await?;
+        let write = self.reconcile_plugin_write(write).await?;
+        require_valid_transaction_write_storage_scopes(&write)?;
         let write = self.prepare_transaction_write(write).await?;
         self.staged_writes.stage_write(write)
+    }
+
+    async fn scan_visible_live_state(
+        &mut self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let staged = self.staged_writes.staging_overlay()?;
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let base = self.live_state.reader(read);
+        overlay_scan_rows(&base, &staged, request).await
+    }
+
+    async fn reconcile_plugin_write(
+        &mut self,
+        write: TransactionWrite,
+    ) -> Result<TransactionWrite, LixError> {
+        match write {
+            TransactionWrite::Rows { mode, mut rows } => {
+                rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
+                Ok(TransactionWrite::Rows { mode, rows })
+            }
+            TransactionWrite::RowsWithFileData {
+                mode,
+                rows,
+                file_data,
+                count,
+            } => {
+                let mut rows = rows;
+                let PluginFileDataReconciliation {
+                    file_keys,
+                    rows: plugin_rows,
+                } = self.plugin_file_data_reconciliation(&file_data).await?;
+                rows.retain(|row| !file_keys.iter().any(|key| key.matches_blob_ref_row(row)));
+                rows.extend(plugin_rows);
+                rows.extend(self.plugin_delete_tombstone_rows(&rows).await?);
+                let file_data = file_data
+                    .into_iter()
+                    .filter(|write| !file_keys.contains(&PluginFileWriteKey::from(write)))
+                    .collect();
+                Ok(TransactionWrite::RowsWithFileData {
+                    mode,
+                    rows,
+                    file_data,
+                    count,
+                })
+            }
+        }
+    }
+
+    async fn plugin_file_data_reconciliation(
+        &mut self,
+        file_data: &[TransactionFileData],
+    ) -> Result<PluginFileDataReconciliation, LixError> {
+        let mut reconciliation = PluginFileDataReconciliation::default();
+        for write in file_data {
+            if !is_plugin_reconciliation_candidate_path(&write.path) {
+                continue;
+            }
+            let filesystem = self.filesystem_index_for_branch(&write.branch_id).await?;
+            let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
+            let Some(plugin) = select_plugin_for_path(
+                &installed_plugins,
+                &write.path,
+                Some(file_content_type(&write.data)),
+            ) else {
+                continue;
+            };
+            let active_state = self
+                .active_plugin_state_rows(&write.branch_id, &write.file_id, plugin)
+                .await?;
+            let changes = detect_changes_with_plugin(
+                &self.plugin_host,
+                plugin,
+                &active_state,
+                write.data.clone(),
+            )
+            .await?;
+            let context = FilesystemRowContext {
+                branch_id: write.branch_id.clone(),
+                global: write.global,
+                untracked: write.untracked,
+                file_id: None,
+                metadata: None,
+            };
+            if filesystem.file_entries().any(|(_, file)| {
+                file.id == write.file_id
+                    && file.scope.global == write.global
+                    && file.scope.untracked == write.untracked
+                    && file.blob_hash.is_some()
+            }) {
+                reconciliation.rows.push(blob_ref_tombstone_row(
+                    write.file_id.clone(),
+                    context.clone(),
+                ));
+            }
+            reconciliation.rows.extend(plugin_change_rows(
+                plugin,
+                changes,
+                &write.file_id,
+                &context,
+                "plugin detect-changes",
+            )?);
+            reconciliation
+                .file_keys
+                .insert(PluginFileWriteKey::from(write));
+        }
+        Ok(reconciliation)
+    }
+
+    async fn plugin_delete_tombstone_rows(
+        &mut self,
+        rows: &[TransactionWriteRow],
+    ) -> Result<Vec<TransactionWriteRow>, LixError> {
+        let mut tombstones = Vec::new();
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.snapshot.is_some() {
+                continue;
+            }
+            let Some(file_id) = row
+                .entity_pk
+                .as_ref()
+                .and_then(|entity_pk| entity_pk.as_single_string().ok())
+            else {
+                continue;
+            };
+            let key = PluginFileWriteKey {
+                branch_id: row.branch_id.clone(),
+                global: row.global,
+                untracked: row.untracked,
+                file_id: file_id.to_string(),
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            let filesystem = self.filesystem_index_for_branch(&row.branch_id).await?;
+            let Some((path, _file)) = filesystem.file_entries().find(|(_, file)| {
+                file.id == file_id
+                    && file.scope.global == row.global
+                    && file.scope.untracked == row.untracked
+            }) else {
+                continue;
+            };
+            if !is_plugin_reconciliation_candidate_path(path) {
+                continue;
+            }
+            let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
+            let Some(plugin) = select_plugin_for_path(&installed_plugins, path, None) else {
+                continue;
+            };
+            let active_state = self
+                .active_plugin_state_rows(&row.branch_id, file_id, plugin)
+                .await?;
+            let context = FilesystemRowContext {
+                branch_id: row.branch_id.clone(),
+                global: row.global,
+                untracked: row.untracked,
+                file_id: None,
+                metadata: row.metadata.clone(),
+            };
+            tombstones.extend(plugin_state_tombstone_rows(
+                &active_state,
+                file_id,
+                &context,
+            ));
+        }
+        Ok(tombstones)
+    }
+
+    async fn filesystem_index_for_branch(
+        &mut self,
+        branch_id: &str,
+    ) -> Result<FilesystemIndex, LixError> {
+        let rows = self
+            .scan_visible_live_state(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: filesystem_schema_keys(),
+                    branch_ids: vec![branch_id.to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
+        FilesystemIndex::from_live_rows(rows)
+    }
+
+    async fn installed_plugins_for_filesystem(
+        &self,
+        filesystem: &FilesystemIndex,
+    ) -> Result<Vec<InstalledPlugin>, LixError> {
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let blob_reader = self.binary_cas.reader(read);
+        load_installed_plugins_from_filesystem(filesystem, &blob_reader).await
+    }
+
+    async fn active_plugin_state_rows(
+        &mut self,
+        branch_id: &str,
+        file_id: &str,
+        plugin: &InstalledPlugin,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let rows = self
+            .scan_visible_live_state(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: plugin.schema_keys.clone(),
+                    branch_ids: vec![branch_id.to_string()],
+                    file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
+        Ok(plugin_state_rows(plugin, rows.iter()))
     }
 
     async fn prepare_transaction_write(
@@ -752,7 +979,7 @@ where
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         Ok(self
             .scan_rows(&LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+                filter: LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
                     branch_ids: vec![request.branch_id.clone()],
@@ -900,6 +1127,7 @@ pub(crate) async fn open_transaction<B>(
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
+    plugin_host: PluginRuntimeHost,
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
 ) -> Result<OpenTransaction<B>, LixError>
@@ -914,6 +1142,7 @@ where
         live_state,
         tracked_state,
         binary_cas,
+        plugin_host,
         branch_ctx,
         catalog_context,
     )
@@ -948,10 +1177,7 @@ where
         &mut self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let staged = self.staged_writes.staging_overlay()?;
-        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
-        let base = self.live_state.reader(read);
-        overlay_scan_rows(&base, &staged, request).await
+        self.scan_visible_live_state(request).await
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
@@ -969,6 +1195,131 @@ where
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
     }
+}
+
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginFileWriteKey {
+    branch_id: String,
+    global: bool,
+    untracked: bool,
+    file_id: String,
+}
+
+impl PluginFileWriteKey {
+    fn matches_blob_ref_row(&self, row: &TransactionWriteRow) -> bool {
+        row.schema_key == BLOB_REF_SCHEMA_KEY
+            && row.branch_id == self.branch_id
+            && row.global == self.global
+            && row.untracked == self.untracked
+            && row.file_id.as_deref() == Some(self.file_id.as_str())
+    }
+}
+
+impl From<&TransactionFileData> for PluginFileWriteKey {
+    fn from(write: &TransactionFileData) -> Self {
+        Self {
+            branch_id: write.branch_id.clone(),
+            global: write.global,
+            untracked: write.untracked,
+            file_id: write.file_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PluginFileDataReconciliation {
+    file_keys: BTreeSet<PluginFileWriteKey>,
+    rows: Vec<TransactionWriteRow>,
+}
+
+fn is_plugin_reconciliation_candidate_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    !path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)
+}
+
+fn plugin_change_rows(
+    plugin: &InstalledPlugin,
+    changes: Vec<PluginDetectedChange>,
+    file_id: &str,
+    context: &FilesystemRowContext,
+    json_context: &str,
+) -> Result<Vec<TransactionWriteRow>, LixError> {
+    let schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
+    changes
+        .into_iter()
+        .map(|change| {
+            if !schema_keys.contains(&change.schema_key) {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "plugin '{}' emitted schema key '{}' that is not declared in its manifest",
+                        plugin.key, change.schema_key
+                    ),
+                ));
+            }
+            Ok(TransactionWriteRow {
+                entity_pk: Some(change.entity_pk),
+                schema_key: change.schema_key,
+                file_id: Some(file_id.to_string()),
+                snapshot: change
+                    .snapshot_content
+                    .map(|raw| plugin_transaction_json(&raw, json_context))
+                    .transpose()?,
+                metadata: change
+                    .metadata
+                    .map(|raw| plugin_transaction_json(&raw, json_context))
+                    .transpose()?,
+                origin: None,
+                created_at: None,
+                updated_at: None,
+                global: context.global,
+                change_id: None,
+                commit_id: None,
+                untracked: context.untracked,
+                branch_id: context.branch_id.clone(),
+            })
+        })
+        .collect()
+}
+
+fn plugin_state_tombstone_rows(
+    active_state: &[MaterializedLiveStateRow],
+    file_id: &str,
+    context: &FilesystemRowContext,
+) -> Vec<TransactionWriteRow> {
+    active_state
+        .iter()
+        .map(|row| TransactionWriteRow {
+            entity_pk: Some(row.entity_pk.clone()),
+            schema_key: row.schema_key.clone(),
+            file_id: Some(file_id.to_string()),
+            snapshot: None,
+            metadata: context.metadata.clone(),
+            origin: None,
+            created_at: None,
+            updated_at: None,
+            global: context.global,
+            change_id: None,
+            commit_id: None,
+            untracked: context.untracked,
+            branch_id: context.branch_id.clone(),
+        })
+        .collect()
+}
+
+fn plugin_transaction_json(raw: &str, context: &str) -> Result<TransactionJson, LixError> {
+    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{context} emitted invalid JSON: {error}"),
+        )
+    })?;
+    TransactionJson::from_value(value, context)
 }
 
 fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
@@ -1159,6 +1510,7 @@ mod tests {
             Arc::clone(&live_state),
             Arc::clone(&tracked_state),
             Arc::clone(&binary_cas),
+            PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
         )
@@ -1334,7 +1686,7 @@ mod tests {
 
         let rows = transaction
             .scan_live_state(&LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
+                filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![EntityPk::single("lossy-timestamp")],
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
@@ -1370,6 +1722,7 @@ mod tests {
             Arc::clone(&live_state),
             Arc::new(TrackedStateContext::new()),
             Arc::clone(&binary_cas),
+            PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             Arc::clone(&catalog_context),
         )
@@ -1650,6 +2003,7 @@ mod tests {
             Arc::clone(&live_state),
             Arc::new(TrackedStateContext::new()),
             Arc::clone(&binary_cas),
+            PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             Arc::clone(&branch_ctx),
             catalog_context,
         )

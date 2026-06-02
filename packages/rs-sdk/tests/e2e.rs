@@ -1,7 +1,6 @@
 use lix_sdk::{
     CreateBranchOptions, FsWriteOptions, InMemoryBackend, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
-    open_lix_with_wasm_runtime,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -16,13 +15,23 @@ use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 #[tokio::test]
 async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     let archive = build_csv_plugin_archive();
-    let lix = open_lix_with_wasm_runtime(Arc::new(
-        WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
-    ))
+    let lix = open_lix(OpenLixOptions {
+        backend: None,
+        wasm_runtime: Some(Arc::new(
+            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
+        )),
+    })
     .await
     .unwrap();
 
     lix.install_plugin_archive(&archive).await.unwrap();
+    let plugins = lix.list_installed_plugins().await.unwrap();
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].key, "plugin_csv");
+    assert_eq!(
+        plugins[0].schema_keys,
+        vec!["csv_table".to_string(), "csv_row".to_string()]
+    );
 
     let stored_archive = lix
         .read_file("/.lix/plugins/plugin_csv.lixplugin")
@@ -124,6 +133,120 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
             Value::Blob(updated_csv.clone())
         ]
     );
+
+    let sql_csv = b"name,age\nLin,44\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql-people.csv".to_string()),
+            Value::Blob(sql_csv.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        Some(sql_csv.as_slice())
+    );
+
+    let sql_file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-people.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql_file_id.len(), 1);
+    let sql_file_id = sql_file_id.rows()[0].get::<String>("id").unwrap();
+    let sql_insert_changes = file_changes(&lix, &sql_file_id).await;
+    assert!(
+        sql_insert_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_table")
+    );
+    assert!(
+        sql_insert_changes
+            .iter()
+            .any(|change| change.schema_key == "csv_row")
+    );
+    assert!(
+        !sql_insert_changes
+            .iter()
+            .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
+    let sql_changes_before_update = sql_insert_changes.len();
+    let sql_updated_csv = b"name,age\nLin,44\nMina,29\n".to_vec();
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2",
+        &[
+            Value::Blob(sql_updated_csv.clone()),
+            Value::Text("/sql-people.csv".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        Some(sql_updated_csv.as_slice())
+    );
+    let sql_update_changes = file_changes(&lix, &sql_file_id)
+        .await
+        .into_iter()
+        .skip(sql_changes_before_update)
+        .collect::<Vec<_>>();
+    assert!(sql_update_changes.iter().any(|change| {
+        change.schema_key == "csv_row"
+            && change
+                .snapshot_content
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("cells"))
+                .and_then(serde_json::Value::as_array)
+                == Some(&vec![
+                    serde_json::Value::String("Mina".to_string()),
+                    serde_json::Value::String("29".to_string()),
+                ])
+    }));
+    assert!(
+        !sql_update_changes
+            .iter()
+            .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
+    let sql_changes_before_delete = sql_changes_before_update + sql_update_changes.len();
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/sql-people.csv".to_string())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(lix.read_file("/sql-people.csv").await.unwrap(), None);
+    let sql_delete_changes = file_changes(&lix, &sql_file_id)
+        .await
+        .into_iter()
+        .skip(sql_changes_before_delete)
+        .collect::<Vec<_>>();
+    assert!(
+        sql_delete_changes.iter().any(|change| {
+            change.schema_key == "csv_table" && change.snapshot_content.is_none()
+        })
+    );
+    assert!(
+        sql_delete_changes
+            .iter()
+            .filter(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
+            .count()
+            >= 2
+    );
+    let active_plugin_rows_after_delete = lix
+        .execute(
+            "SELECT schema_key FROM lix_state \
+             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
+            &[Value::Text(sql_file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_plugin_rows_after_delete.len(), 0);
 
     lix.close().await.unwrap();
 }
@@ -740,6 +863,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     let lix = open_lix(OpenLixOptions {
         backend: Some(InMemoryBackend::new()),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -765,6 +889,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     let backend = InMemoryBackend::new();
     let first = open_lix(OpenLixOptions {
         backend: Some(backend.clone()),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -789,6 +914,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 
     let second = open_lix(OpenLixOptions {
         backend: Some(backend),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -811,6 +937,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 async fn failed_write_validation_does_not_poison_backend_transaction() {
     let lix = open_lix(OpenLixOptions {
         backend: Some(InMemoryBackend::new()),
+        ..Default::default()
     })
     .await
     .unwrap();
