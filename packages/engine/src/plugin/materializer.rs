@@ -154,6 +154,20 @@ pub(crate) async fn render_plugin_state(
     render_with_component(host, plugin, &payload).await
 }
 
+pub(crate) async fn render_materialized_plugin_file(
+    host: &impl PluginComponentHost,
+    plugin: &InstalledPlugin,
+    active_state: &[MaterializedLiveStateRow],
+) -> Result<Option<Vec<u8>>, LixError> {
+    // A matching plugin is not enough: raw empty files also have no blob ref.
+    // Durable plugin-owned state is the signal that the file was materialized.
+    if active_state.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(render_plugin_state(host, plugin, active_state).await?))
+}
+
 pub(crate) fn plugin_state_rows<'a>(
     plugin: &InstalledPlugin,
     rows: impl IntoIterator<Item = &'a MaterializedLiveStateRow>,

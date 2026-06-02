@@ -16,7 +16,7 @@ use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions {
-        backend: None,
+        backend: InMemoryBackend::new(),
         wasm_runtime: Some(Arc::new(
             WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
         )),
@@ -381,6 +381,50 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         .unwrap();
     assert_eq!(active_plugin_rows_after_delete.len(), 0);
 
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_lix_file_data_uses_session_plugin_runtime() {
+    let archive = build_csv_plugin_archive();
+    let lix = open_lix(OpenLixOptions {
+        backend: InMemoryBackend::new(),
+        wasm_runtime: Some(Arc::new(
+            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
+        )),
+    })
+    .await
+    .unwrap();
+
+    lix.install_plugin_archive(&archive).await.unwrap();
+    let csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
+    lix.write_file("/tx-plugin.csv", csv.clone(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/tx-plugin.csv".to_string())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    let files = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files.rows()[0].values(), &[Value::Blob(csv)]);
+
+    tx.rollback().await.unwrap();
     lix.close().await.unwrap();
 }
 
@@ -995,7 +1039,7 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 #[tokio::test]
 async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     let lix = open_lix(OpenLixOptions {
-        backend: Some(InMemoryBackend::new()),
+        backend: InMemoryBackend::new(),
         ..Default::default()
     })
     .await
@@ -1021,7 +1065,7 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
 async fn rs_sdk_close_does_not_destroy_committed_data() {
     let backend = InMemoryBackend::new();
     let first = open_lix(OpenLixOptions {
-        backend: Some(backend.clone()),
+        backend: backend.clone(),
         ..Default::default()
     })
     .await
@@ -1046,7 +1090,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     assert_closed(error);
 
     let second = open_lix(OpenLixOptions {
-        backend: Some(backend),
+        backend,
         ..Default::default()
     })
     .await
@@ -1069,7 +1113,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 #[tokio::test]
 async fn failed_write_validation_does_not_poison_backend_transaction() {
     let lix = open_lix(OpenLixOptions {
-        backend: Some(InMemoryBackend::new()),
+        backend: InMemoryBackend::new(),
         ..Default::default()
     })
     .await
@@ -1161,6 +1205,82 @@ async fn transaction_commits_multiple_statements_together() {
         .await
         .unwrap();
     assert_eq!(committed.len(), 2);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_lix_file_data_reads_staged_file_bytes() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let mut tx = lix.begin_transaction().await.unwrap();
+    let path = "/tx-file-data.bin".to_string();
+    let original = b"staged bytes before commit".to_vec();
+
+    tx.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[Value::Text(path.clone()), Value::Blob(original.clone())],
+    )
+    .await
+    .unwrap();
+
+    let selected = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
+            &[Value::Text(path.clone()), Value::Blob(original.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected.rows()[0].values(),
+        &[Value::Blob(original.clone())]
+    );
+
+    let updated = b"updated bytes before commit".to_vec();
+    let update = tx
+        .execute(
+            "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
+            &[
+                Value::Blob(updated.clone()),
+                Value::Text(path.clone()),
+                Value::Blob(original),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.rows_affected(), 1);
+
+    let after_update = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1 AND data = $2",
+            &[Value::Text(path.clone()), Value::Blob(updated.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_update.len(), 1);
+    assert_eq!(
+        after_update.rows()[0].values(),
+        &[Value::Blob(updated.clone())]
+    );
+
+    let delete = tx
+        .execute(
+            "DELETE FROM lix_file WHERE path = $1 AND data = $2",
+            &[Value::Text(path.clone()), Value::Blob(updated)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.rows_affected(), 1);
+
+    let after_delete = tx
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text(path)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_delete.len(), 0);
+
+    tx.rollback().await.unwrap();
     lix.close().await.unwrap();
 }
 

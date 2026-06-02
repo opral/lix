@@ -40,6 +40,7 @@ use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
+use crate::common::ParsedFilePath;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemIndex;
 use crate::functions::FunctionProviderHandle;
@@ -49,7 +50,7 @@ use crate::live_state::{
 };
 use crate::plugin::{
     InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
-    render_plugin_state, select_plugin_for_path,
+    reject_normal_plugin_storage_mutation, render_materialized_plugin_file, select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -1167,7 +1168,16 @@ struct FileDescriptorRecord {
 struct PluginRenderContext {
     live_state: Arc<dyn LiveStateReader>,
     host: PluginRuntimeHost,
-    installed_plugins: Vec<InstalledPlugin>,
+    installed_plugins_by_branch: BTreeMap<String, Vec<InstalledPlugin>>,
+}
+
+impl PluginRenderContext {
+    fn installed_plugins_for_branch(&self, branch_id: &str) -> &[InstalledPlugin] {
+        self.installed_plugins_by_branch
+            .get(branch_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1243,6 +1253,9 @@ fn lix_file_delete_stage_from_batch(
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
     for row_index in 0..batch.num_rows() {
+        if let Some(path) = optional_string_value(batch, row_index, "path")? {
+            normalize_normal_write_file_path(&path, TransactionWriteOperation::Delete)?;
+        }
         let file_id = required_string_value(batch, row_index, "id")?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
         staged.extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
@@ -1342,6 +1355,7 @@ fn lix_file_existing_update_stage_from_batch(
         let id = required_string_value(batch, row_index, "id")?;
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
+        let mut data_path = None;
 
         if include_descriptor_writes {
             let directory_id =
@@ -1353,6 +1367,9 @@ fn lix_file_existing_update_stage_from_batch(
                     .or_insert_with(DirectoryPathResolver::default);
                 resolver
                     .reserve_file(directory_id.clone(), name.clone(), id.clone())
+                    .map_err(lix_error_to_datafusion_error)?;
+                data_path = resolver
+                    .file_path(directory_id.as_deref(), &name)
                     .map_err(lix_error_to_datafusion_error)?;
             }
             staged
@@ -1367,7 +1384,11 @@ fn lix_file_existing_update_stage_from_batch(
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
-            let path = optional_string_value(batch, row_index, "path")?;
+            let path = if include_descriptor_writes {
+                data_path
+            } else {
+                optional_string_value(batch, row_index, "path")?
+            };
             let has_blob_ref =
                 blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
             stage_lix_file_data_update_write(
@@ -1416,6 +1437,24 @@ impl LixFileUpdateColumns {
     }
 }
 
+fn reject_lix_file_update_plugin_storage_paths(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    update_columns: LixFileUpdateColumns,
+) -> Result<()> {
+    for row_index in 0..batch.num_rows() {
+        if let Some(existing_path) = optional_string_value(batch, row_index, "path")? {
+            normalize_normal_write_file_path(&existing_path, TransactionWriteOperation::Update)?;
+        }
+        if update_columns.path {
+            let assigned_path =
+                update_required_string_value(batch, assignment_values, row_index, "path")?;
+            normalize_normal_write_file_path(&assigned_path, TransactionWriteOperation::Update)?;
+        }
+    }
+    Ok(())
+}
+
 fn lix_file_update_stage_from_batch(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -1425,6 +1464,8 @@ fn lix_file_update_stage_from_batch(
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
+    reject_lix_file_update_plugin_storage_paths(batch, assignment_values, update_columns)?;
+
     if update_columns.path || update_columns.descriptor {
         let Some(path_resolvers) = path_resolvers else {
             return Err(DataFusionError::Execution(
@@ -1479,6 +1520,7 @@ fn lix_file_path_update_stage_from_batch(
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
         let path = update_required_string_value(batch, assignment_values, row_index, "path")?;
+        let path = normalize_normal_write_file_path(&path, TransactionWriteOperation::Update)?;
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
         let assigned_data = if update_columns.data {
@@ -1576,6 +1618,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         };
 
         if let Some(path) = path {
+            let path = normalize_normal_write_file_path(&path, TransactionWriteOperation::Insert)?;
             reject_read_only_lix_file_insert_field(batch, row_index, "directory_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "name")?;
 
@@ -1611,6 +1654,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
+        let mut data_path = None;
 
         let id = if data.is_some() {
             match id {
@@ -1637,6 +1681,9 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     resolver
                         .reserve_file(directory_id.clone(), name.clone(), file_id.clone())
                         .map_err(lix_error_to_datafusion_error)?;
+                    data_path = resolver
+                        .file_path(directory_id.as_deref(), &name)
+                        .map_err(lix_error_to_datafusion_error)?;
                 }
             }
             let mut row = file_descriptor_write_row(FileDescriptorWriteIntent {
@@ -1653,7 +1700,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         if let (Some(id), Some(data)) = (id, data) {
             let origin = Some(lix_file_insert_origin(surface_name, &id));
-            let path = directory_id.is_none().then(|| format!("/{name}"));
+            let path = data_path.or_else(|| directory_id.is_none().then(|| format!("/{name}")));
             stage_lix_file_data_insert_write(&mut staged, id, path, data, context, origin)?;
         }
         staged.count = staged
@@ -2074,7 +2121,8 @@ async fn render_plugin_file_for_sql(
     file: &FileDescriptorRecord,
     path: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let Some(plugin) = select_plugin_for_path(&plugin_render.installed_plugins, path, None) else {
+    let installed_plugins = plugin_render.installed_plugins_for_branch(&file.live.branch_id);
+    let Some(plugin) = select_plugin_for_path(installed_plugins, path, None) else {
         return Ok(None);
     };
     let rows = plugin_render
@@ -2090,16 +2138,14 @@ async fn render_plugin_file_for_sql(
         })
         .await?;
     let active_state = plugin_state_rows(plugin, rows.iter());
-    Ok(Some(
-        render_plugin_state(&plugin_render.host, plugin, &active_state).await?,
-    ))
+    render_materialized_plugin_file(&plugin_render.host, plugin, &active_state).await
 }
 
 async fn load_installed_plugins_for_lix_file_scan(
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: &Arc<dyn BlobDataReader>,
     request: &LiveStateScanRequest,
-) -> Result<Vec<InstalledPlugin>, LixError> {
+) -> Result<BTreeMap<String, Vec<InstalledPlugin>>, LixError> {
     let mut plugin_request = request.clone();
     plugin_request.filter.schema_keys = vec![
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -2112,8 +2158,22 @@ async fn load_installed_plugins_for_lix_file_scan(
     plugin_request.limit = None;
 
     let rows = live_state.scan_rows(&plugin_request).await?;
-    let filesystem = FilesystemIndex::from_live_rows(rows)?;
-    load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await
+    let mut rows_by_branch = BTreeMap::<String, Vec<MaterializedLiveStateRow>>::new();
+    for row in rows {
+        rows_by_branch
+            .entry(row.branch_id.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let mut installed_plugins_by_branch = BTreeMap::new();
+    for (branch_id, rows) in rows_by_branch {
+        let filesystem = FilesystemIndex::from_live_rows(rows)?;
+        let installed_plugins =
+            load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await?;
+        installed_plugins_by_branch.insert(branch_id, installed_plugins);
+    }
+    Ok(installed_plugins_by_branch)
 }
 
 async fn plugin_render_context_for_lix_file_scan(
@@ -2127,13 +2187,13 @@ async fn plugin_render_context_for_lix_file_scan(
         return Ok(None);
     }
 
-    let installed_plugins =
+    let installed_plugins_by_branch =
         load_installed_plugins_for_lix_file_scan(Arc::clone(&live_state), blob_reader, request)
             .await?;
     Ok(Some(PluginRenderContext {
         live_state,
         host,
-        installed_plugins,
+        installed_plugins_by_branch,
     }))
 }
 
@@ -2484,29 +2544,29 @@ fn string_expr_literal(expr: &Expr) -> Option<String> {
 }
 
 fn contains_column(expr: &Expr, column_name: &str) -> bool {
-    match expr {
-        Expr::Column(column) => column.name == column_name,
-        Expr::BinaryExpr(binary_expr) => {
-            contains_column(&binary_expr.left, column_name)
-                || contains_column(&binary_expr.right, column_name)
-        }
-        Expr::InList(in_list) => {
-            contains_column(&in_list.expr, column_name)
-                || in_list
-                    .list
-                    .iter()
-                    .any(|expr| contains_column(expr, column_name))
-        }
-        Expr::Between(between) => {
-            contains_column(&between.expr, column_name)
-                || contains_column(&between.low, column_name)
-                || contains_column(&between.high, column_name)
-        }
-        Expr::Not(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
-            contains_column(expr, column_name)
-        }
-        Expr::Negative(expr) => contains_column(expr, column_name),
-        _ => false,
+    expr.column_refs()
+        .iter()
+        .any(|column| column.name.as_str() == column_name)
+}
+
+fn normalize_normal_write_file_path(
+    path: &str,
+    operation: TransactionWriteOperation,
+) -> Result<String> {
+    let parsed = ParsedFilePath::try_from_path(path).map_err(lix_error_to_datafusion_error)?;
+    reject_normal_plugin_storage_mutation(
+        parsed.normalized_path.as_str(),
+        lix_file_write_operation_label(operation),
+    )
+    .map_err(lix_error_to_datafusion_error)?;
+    Ok(parsed.normalized_path.to_string())
+}
+
+fn lix_file_write_operation_label(operation: TransactionWriteOperation) -> &'static str {
+    match operation {
+        TransactionWriteOperation::Insert => "INSERT into lix_file",
+        TransactionWriteOperation::Update => "UPDATE lix_file",
+        TransactionWriteOperation::Delete => "DELETE FROM lix_file",
     }
 }
 
@@ -2885,6 +2945,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 #[expect(trivial_casts)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::{Cursor, Write};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -2893,17 +2954,19 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::execution::TaskContext;
-    use datafusion::logical_expr::expr::InList;
+    use datafusion::logical_expr::expr::{Cast, InList, ScalarFunction};
     use datafusion::logical_expr::lit;
-    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use datafusion::logical_expr::{
+        BinaryExpr, ColumnarValue, Expr, Operator, Volatility, create_udf,
+    };
     use serde_json::Value as JsonValue;
 
     use crate::LixError;
-    use crate::binary_cas::BlobDataReader;
+    use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
     use crate::changelog::{ChangeId, CommitId};
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
     use crate::functions::FunctionProviderHandle;
-    use crate::live_state::MaterializedLiveStateRow;
+    use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
@@ -3040,6 +3103,44 @@ mod tests {
         ))));
     }
 
+    #[test]
+    fn contains_column_finds_nested_cast_and_function_references() {
+        let cast_data = Expr::Cast(Cast::new(Box::new(column("data")), DataType::Utf8));
+        let function_data = scalar_function_expr("some_fn", vec![cast_data.clone()]);
+
+        assert!(super::contains_column(&cast_data, "data"));
+        assert!(super::contains_column(&function_data, "data"));
+        assert!(!super::contains_column(&function_data, "path"));
+    }
+
+    #[test]
+    fn scan_needs_data_finds_data_inside_filter_functions() {
+        let schema = super::lix_file_schema();
+        let projection = vec![schema.index_of("id").expect("id column")];
+        let filter = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(scalar_function_expr("octet_length", vec![column("data")])),
+            Operator::Gt,
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(0)), None)),
+        ));
+
+        assert!(super::scan_needs_data(
+            &schema,
+            Some(&projection),
+            &[filter]
+        ));
+    }
+
+    fn scalar_function_expr(name: &str, args: Vec<Expr>) -> Expr {
+        let udf = create_udf(
+            name,
+            vec![DataType::Binary],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|_: &[ColumnarValue]| Ok(ColumnarValue::Scalar(ScalarValue::Null))),
+        );
+        Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(udf), args))
+    }
+
     fn lix_file_update_stage_from_batch_for_test(
         batch: &RecordBatch,
         branch_binding: Option<&str>,
@@ -3111,16 +3212,37 @@ mod tests {
         writes: Vec<TransactionWrite>,
     }
 
+    struct StaticBlobReader {
+        bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
+    }
+
+    impl StaticBlobReader {
+        fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                bytes_by_hash: blobs
+                    .into_iter()
+                    .map(|bytes| (BlobHash::from_content(&bytes), bytes))
+                    .collect(),
+            }
+        }
+    }
+
     #[async_trait]
     impl BlobDataReader for CapturingWriteContext {
-        async fn load_bytes_many(
-            &self,
-            hashes: &[crate::binary_cas::BlobHash],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
-                None;
-                hashes.len()
-            ]))
+        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(vec![None; hashes.len()]))
+        }
+    }
+
+    #[async_trait]
+    impl BlobDataReader for StaticBlobReader {
+        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+            Ok(BlobBytesBatch::new(
+                hashes
+                    .iter()
+                    .map(|hash| self.bytes_by_hash.get(hash).cloned())
+                    .collect(),
+            ))
         }
     }
 
@@ -3140,8 +3262,8 @@ mod tests {
 
         async fn load_bytes_many(
             &mut self,
-            hashes: &[crate::binary_cas::BlobHash],
-        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            hashes: &[BlobHash],
+        ) -> Result<BlobBytesBatch, LixError> {
             BlobDataReader::load_bytes_many(self, hashes).await
         }
 
@@ -3239,6 +3361,92 @@ mod tests {
         }
     }
 
+    fn live_blob_ref_row(
+        entity_pk: &str,
+        branch_id: &str,
+        file_id: &str,
+        blob_hash: &str,
+        size_bytes: usize,
+    ) -> MaterializedLiveStateRow {
+        let mut row = live_file_row(
+            entity_pk,
+            branch_id,
+            &format!(r#"{{"id":"{file_id}","blob_hash":"{blob_hash}","size_bytes":{size_bytes}}}"#),
+        );
+        row.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
+        row.file_id = Some(file_id.to_string());
+        row
+    }
+
+    fn plugin_archive(path_glob: &str, schema_key: &str) -> Vec<u8> {
+        const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
+        let manifest_json = format!(
+            r#"{{
+                "key": "plugin_sentinel",
+                "runtime": "wasm-component-v1",
+                "api_version": "0.1.0",
+                "match": {{ "path_glob": "{path_glob}" }},
+                "entry": "plugin.wasm",
+                "schemas": ["schema/plugin_note.json"]
+            }}"#
+        );
+        let schema_json = format!(
+            r#"{{
+                "x-lix-key": "{schema_key}",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {{
+                    "id": {{ "type": "string" }},
+                    "value": {{ "type": "string" }}
+                }},
+                "required": ["id", "value"],
+                "additionalProperties": false
+            }}"#
+        );
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (path, bytes) in [
+            ("manifest.json", manifest_json.as_bytes()),
+            ("schema/plugin_note.json", schema_json.as_bytes()),
+            ("plugin.wasm", WASM_HEADER),
+        ] {
+            writer.start_file(path, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn plugin_install_rows(branch_id: &str, archive_bytes: &[u8]) -> Vec<MaterializedLiveStateRow> {
+        let archive_file_id = "lix_plugin_archive::plugin_sentinel";
+        let blob_hash = BlobHash::from_content(archive_bytes).to_hex();
+        vec![
+            live_directory_row(
+                "dir-lix",
+                branch_id,
+                r#"{"id":"dir-lix","parent_id":null,"name":".lix"}"#,
+            ),
+            live_directory_row(
+                "dir-lix-plugins",
+                branch_id,
+                r#"{"id":"dir-lix-plugins","parent_id":"dir-lix","name":"plugins"}"#,
+            ),
+            live_file_row(
+                archive_file_id,
+                branch_id,
+                r#"{"id":"lix_plugin_archive::plugin_sentinel","directory_id":"dir-lix-plugins","name":"plugin_sentinel.lixplugin"}"#,
+            ),
+            live_blob_ref_row(
+                archive_file_id,
+                branch_id,
+                archive_file_id,
+                &blob_hash,
+                archive_bytes.len(),
+            ),
+        ]
+    }
+
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values)) as ArrayRef
     }
@@ -3286,6 +3494,10 @@ mod tests {
     }
 
     fn path_data_insert_batch() -> RecordBatch {
+        path_data_insert_batch_with_path("/docs/guides/readme.md")
+    }
+
+    fn path_data_insert_batch_with_path(path: &str) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -3295,7 +3507,7 @@ mod tests {
             ])),
             vec![
                 string_column(vec![Some("file-readme")]),
-                string_column(vec![Some("/docs/guides/readme.md")]),
+                string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
@@ -3304,6 +3516,10 @@ mod tests {
     }
 
     fn path_update_batch() -> RecordBatch {
+        path_update_batch_with_path("/docs/renamed.md")
+    }
+
+    fn path_update_batch_with_path(path: &str) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -3313,12 +3529,52 @@ mod tests {
             ])),
             vec![
                 string_column(vec![Some("file-readme")]),
-                string_column(vec![Some("/docs/renamed.md")]),
+                string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("branch-b")]),
             ],
         )
         .expect("file path update batch")
+    }
+
+    fn data_update_batch_with_path(path: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some(path)]),
+                Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
+                string_column(vec![Some("branch-b")]),
+            ],
+        )
+        .expect("file data update batch")
+    }
+
+    fn descriptor_data_update_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, false),
+                Field::new("directory_id", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_branch_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("/old.raw")]),
+                string_column(vec![Some("dir-docs")]),
+                string_column(vec![Some("readme.md")]),
+                Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
+                string_column(vec![Some("branch-b")]),
+            ],
+        )
+        .expect("file descriptor data update batch")
     }
 
     fn empty_data_update_batch() -> RecordBatch {
@@ -3338,17 +3594,20 @@ mod tests {
     }
 
     fn file_delete_batch() -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("lixcol_branch_id", DataType::Utf8, false),
-            ])),
-            vec![
-                string_column(vec![Some("file-readme")]),
-                string_column(vec![Some("branch-b")]),
-            ],
-        )
-        .expect("file delete batch")
+        file_delete_batch_with_path(None)
+    }
+
+    fn file_delete_batch_with_path(path: Option<&str>) -> RecordBatch {
+        let mut fields = vec![Field::new("id", DataType::Utf8, false)];
+        let mut columns = vec![string_column(vec![Some("file-readme")])];
+        if let Some(path) = path {
+            fields.push(Field::new("path", DataType::Utf8, false));
+            columns.push(string_column(vec![Some(path)]));
+        }
+        fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
+        columns.push(string_column(vec![Some("branch-b")]));
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file delete batch")
     }
 
     #[test]
@@ -3442,6 +3701,45 @@ mod tests {
         assert!(values.contains(&Some("owner-file".to_string())));
     }
 
+    #[tokio::test]
+    async fn plugin_discovery_keeps_duplicate_archive_paths_branch_scoped() {
+        let archive_a = plugin_archive("*.branch-a", "plugin_note_a");
+        let archive_b = plugin_archive("*.branch-b", "plugin_note_b");
+        let mut rows = plugin_install_rows("branch-a", &archive_a);
+        rows.extend(plugin_install_rows("branch-b", &archive_b));
+        let blob_reader = Arc::new(StaticBlobReader::from_blobs(vec![
+            archive_a.clone(),
+            archive_b.clone(),
+        ])) as Arc<dyn BlobDataReader>;
+
+        let installed_plugins = super::load_installed_plugins_for_lix_file_scan(
+            Arc::new(RowsLiveStateReader { rows }) as Arc<dyn LiveStateReader>,
+            &blob_reader,
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    branch_ids: vec!["branch-a".to_string(), "branch-b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("duplicate plugin paths in different branches should not collide");
+
+        let branch_a_plugins = installed_plugins
+            .get("branch-a")
+            .expect("branch-a plugins should load");
+        let branch_b_plugins = installed_plugins
+            .get("branch-b")
+            .expect("branch-b plugins should load");
+        assert_eq!(branch_a_plugins.len(), 1);
+        assert_eq!(branch_b_plugins.len(), 1);
+        assert_eq!(branch_a_plugins[0].path_glob, "*.branch-a");
+        assert_eq!(branch_b_plugins[0].path_glob, "*.branch-b");
+        assert_eq!(branch_a_plugins[0].schema_keys, vec!["plugin_note_a"]);
+        assert_eq!(branch_b_plugins[0].schema_keys, vec!["plugin_note_b"]);
+    }
+
     #[test]
     fn decodes_file_insert_into_lix_state_write_row() {
         let batch = file_insert_batch(true, false);
@@ -3511,6 +3809,85 @@ mod tests {
             &[("path".to_string(), lit("/docs/renamed.md"))],
         )
         .expect("path should be writable for update");
+    }
+
+    #[test]
+    fn file_path_insert_rejects_plugin_storage_path() {
+        let mut resolvers = BTreeMap::new();
+
+        let error = lix_file_insert_stage_from_batch_with_path_resolvers(
+            &path_data_insert_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
+            None,
+            "lix_file",
+            &mut resolvers,
+            &mut test_id_generator(&["should-not-be-used"]),
+            true,
+        )
+        .expect_err("normal file insert should reject plugin storage path");
+
+        assert!(
+            error.to_string().contains("reserved plugin storage path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn file_path_update_rejects_plugin_storage_path() {
+        let mut resolvers = BTreeMap::new();
+
+        let error = lix_file_update_stage_from_batch_for_test(
+            &path_update_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect_err("normal file update should reject plugin storage path");
+
+        assert!(
+            error.to_string().contains("reserved plugin storage path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn file_data_update_rejects_existing_plugin_storage_path() {
+        let error = lix_file_update_stage_from_batch_for_test(
+            &data_update_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
+            None,
+            super::LixFileUpdateColumns {
+                path: false,
+                data: true,
+                descriptor: false,
+            },
+            None,
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect_err("normal file data update should reject installed archive path");
+
+        assert!(
+            error.to_string().contains("reserved plugin storage path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn file_delete_rejects_plugin_storage_path() {
+        let error = lix_file_delete_stage_from_batch(
+            &file_delete_batch_with_path(Some("/.lix/plugins/plugin_sentinel.lixplugin")),
+            None,
+            &BTreeSet::new(),
+        )
+        .expect_err("normal file delete should reject installed archive path");
+
+        assert!(
+            error.to_string().contains("reserved plugin storage path"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3730,6 +4107,38 @@ mod tests {
                 .iter()
                 .any(|row| row.schema_key == "lix_binary_blob_ref")
         );
+    }
+
+    #[test]
+    fn file_descriptor_update_with_data_stages_payload_at_assigned_path() {
+        let mut resolvers = BTreeMap::new();
+        resolvers.insert(
+            super::filesystem_storage_scope_key("branch-b", false, false, None),
+            super::DirectoryPathResolver::from_existing([(
+                "/docs/".to_string(),
+                "dir-docs".to_string(),
+            )])
+            .expect("directory resolver should seed"),
+        );
+
+        let staged = lix_file_update_stage_from_batch_for_test(
+            &descriptor_data_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: false,
+                data: true,
+                descriptor: true,
+            },
+            Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect("decode file descriptor and data update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(staged.file_data_writes[0].path, "/docs/readme.md");
+        assert_eq!(staged.file_data_writes[0].data, b"hello");
     }
 
     #[test]
@@ -3981,7 +4390,14 @@ mod tests {
     #[tokio::test]
     async fn file_insert_sink_stages_file_data_writes() {
         let batch = data_insert_batch();
-        let mut write_context = CapturingWriteContext::default();
+        let mut write_context = CapturingWriteContext {
+            rows: vec![live_directory_row(
+                "dir-docs",
+                "branch-b",
+                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            )],
+            writes: Vec::new(),
+        };
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink =
             LixFileInsertSink::new(write_ctx, test_functions(), BranchBinding::explicit(), true);
@@ -4015,6 +4431,7 @@ mod tests {
                 );
                 assert_eq!(file_data.len(), 1);
                 assert_eq!(file_data[0].file_id, "file-readme");
+                assert_eq!(file_data[0].path, "/docs/readme.md");
                 assert_eq!(file_data[0].data, b"hello");
             }
             other => panic!("expected insert with file data staged write, got {other:?}"),

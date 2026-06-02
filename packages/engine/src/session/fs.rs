@@ -17,8 +17,9 @@ use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    InstalledPlugin, load_installed_plugins_from_filesystem, plugin_state_rows,
-    render_plugin_state, select_plugin_for_path,
+    InstalledPlugin, is_plugin_storage_path, load_installed_plugins_from_filesystem,
+    plugin_state_rows, reject_normal_plugin_storage_mutation, render_materialized_plugin_file,
+    select_plugin_for_path,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
@@ -93,6 +94,7 @@ where
         let path = ParsedFilePath::try_from_path(path)?
             .normalized_path
             .to_string();
+        reject_normal_plugin_storage_mutation(&path, "fs.write_file")?;
         self.session.with_write_transaction(|transaction| {
             Box::pin(async move {
                 let branch_id = transaction.active_branch_id().to_string();
@@ -362,6 +364,7 @@ where
                 let Some((normalized_path, entry)) = resolve_rm_entry(&filesystem, &rm_path)? else {
                     return Ok(());
                 };
+                reject_plugin_storage_rm(&normalized_path, entry, &filesystem, options.recursive)?;
                 let metadata = transaction_metadata(options.metadata, "fs.rm metadata")?;
                 let plan = match entry {
                     FilesystemEntry::File(file) => {
@@ -398,6 +401,31 @@ where
         })
         .await
     }
+}
+
+fn reject_plugin_storage_rm(
+    normalized_path: &str,
+    entry: &FilesystemEntry,
+    filesystem: &FilesystemIndex,
+    recursive: bool,
+) -> Result<(), LixError> {
+    reject_normal_plugin_storage_mutation(normalized_path, "fs.rm")?;
+    if !recursive || !matches!(entry, FilesystemEntry::Directory(_)) {
+        return Ok(());
+    }
+    if filesystem.file_entries().any(|(path, _)| {
+        is_plugin_storage_path(path) && path_is_inside_directory(path, normalized_path)
+    }) {
+        return reject_normal_plugin_storage_mutation(
+            "/.lix/plugins/",
+            "fs.rm recursive directory delete",
+        );
+    }
+    Ok(())
+}
+
+fn path_is_inside_directory(path: &str, directory_path: &str) -> bool {
+    directory_path == "/" || path.starts_with(directory_path)
 }
 
 pub(crate) async fn scan_filesystem_rows<B>(
@@ -471,9 +499,7 @@ async fn read_plugin_file_bytes(
 
     let active_state =
         scan_plugin_state_rows_from_reader(live_state, branch_id, &file.id, plugin).await?;
-    Ok(Some(
-        render_plugin_state(host, plugin, &active_state).await?,
-    ))
+    render_materialized_plugin_file(host, plugin, &active_state).await
 }
 
 async fn stage_delete_plan<B>(

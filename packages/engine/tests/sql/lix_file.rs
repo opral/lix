@@ -126,6 +126,60 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_writes_reject_plugin_storage_paths,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let insert_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('plugin-poison', '/.lix/plugins/plugin_sentinel.lixplugin', X'626164')",
+                &[],
+            )
+            .await
+            .expect_err("SQL insert should reject plugin storage paths");
+        assert_eq!(insert_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            insert_error
+                .message
+                .contains("reserved plugin storage path")
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('safe-file', '/safe.bin', X'6F6B')",
+                &[],
+            )
+            .await
+            .expect("safe file insert should succeed");
+
+        let update_error = session
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/.lix/plugins/plugin_sentinel.lixplugin' \
+                 WHERE id = 'safe-file'",
+                &[],
+            )
+            .await
+            .expect_err("SQL update should reject plugin storage paths");
+        assert_eq!(update_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert!(
+            update_error
+                .message
+                .contains("reserved plugin storage path")
+        );
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_percent_encoded_forbidden_code_points,
     |sim| async move {
         let engine = sim.boot_engine().await;

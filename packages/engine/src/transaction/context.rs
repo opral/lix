@@ -14,7 +14,7 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::Value as JsonValue;
 
 use crate::GLOBAL_BRANCH_ID;
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
+use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::CatalogContext;
 use crate::changelog::{ChangeId, CommitId};
@@ -796,6 +796,8 @@ where
         let visible_schemas = self.cached_visible_schemas()?.to_vec();
         let functions = self.functions.clone();
         let staged = self.staged_writes.staging_overlay()?;
+        let staged_writes = Arc::clone(&self.staged_writes);
+        let plugin_host = self.plugin_host.clone();
 
         with_static_transaction_sql_read::<B, _, _>(read, |read_store| async move {
             let read_ctx = TransactionSqlReadExecutionContext {
@@ -807,6 +809,8 @@ where
                 visible_schemas,
                 functions,
                 staged,
+                staged_writes,
+                plugin_host,
             };
             let result = crate::sql2::execute_transaction_read_statement_from_parsed(
                 &read_ctx, self, sql, statement, params,
@@ -906,6 +910,8 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage::StorageB
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
     staged: crate::transaction::staging::PreparedStateRowOverlay,
+    staged_writes: Arc<TransactionWriteBuffer>,
+    plugin_host: PluginRuntimeHost,
 }
 
 impl<R> SqlExecutionContext for TransactionSqlReadExecutionContext<R>
@@ -950,13 +956,69 @@ where
         Arc::new(self.branch_ctx.ref_reader(self.read_store.clone()))
     }
 
-    fn blob_reader(&self) -> Arc<dyn crate::binary_cas::BlobDataReader> {
-        Arc::new(self.binary_cas.reader(self.read_store.clone()))
+    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+        Arc::new(TransactionBlobDataReader {
+            base: Arc::new(self.binary_cas.reader(self.read_store.clone())),
+            staged_writes: Arc::clone(&self.staged_writes),
+        })
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.visible_schemas.clone())
     }
+
+    fn plugin_host(&self) -> PluginRuntimeHost {
+        self.plugin_host.clone()
+    }
+}
+
+struct TransactionBlobDataReader {
+    base: Arc<dyn BlobDataReader>,
+    staged_writes: Arc<TransactionWriteBuffer>,
+}
+
+#[async_trait]
+impl BlobDataReader for TransactionBlobDataReader {
+    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        load_transaction_blob_bytes(self.base.as_ref(), &self.staged_writes, hashes).await
+    }
+}
+
+async fn load_transaction_blob_bytes(
+    base: &dyn BlobDataReader,
+    staged_writes: &TransactionWriteBuffer,
+    hashes: &[BlobHash],
+) -> Result<BlobBytesBatch, LixError> {
+    let mut entries = staged_writes
+        .load_staged_file_bytes_many(hashes)?
+        .into_vec();
+    let mut missing_indices = Vec::new();
+    let mut missing_hashes = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_none() {
+            missing_indices.push(index);
+            missing_hashes.push(hashes[index]);
+        }
+    }
+    if missing_hashes.is_empty() {
+        return Ok(BlobBytesBatch::new(entries));
+    }
+
+    let base_entries = base.load_bytes_many(&missing_hashes).await?.into_vec();
+    if base_entries.len() != missing_indices.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "transaction blob read expected {} fallback rows, got {}",
+                missing_indices.len(),
+                base_entries.len()
+            ),
+        ));
+    }
+    for (index, entry) in missing_indices.into_iter().zip(base_entries) {
+        entries[index] = entry;
+    }
+    Ok(BlobBytesBatch::new(entries))
 }
 
 struct TransactionReadLiveStateReader<R: crate::storage::StorageBackendRead> {
@@ -1177,7 +1239,8 @@ where
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
-        self.binary_cas.reader(read).load_bytes_many(hashes).await
+        let base = self.binary_cas.reader(read);
+        load_transaction_blob_bytes(&base, &self.staged_writes, hashes).await
     }
 
     async fn scan_live_state(

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::GLOBAL_BRANCH_ID;
+use crate::binary_cas::{BlobBytesBatch, BlobHash};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::domain::{Domain, DomainRowIdentity};
@@ -400,6 +401,39 @@ impl TransactionWriteBuffer {
         Ok(PreparedStateRowOverlay {
             staged_writes: Arc::clone(self),
         })
+    }
+
+    /// Returns transaction-local file bytes addressed by their eventual CAS hash.
+    ///
+    /// File data is flushed into the binary CAS only during commit, while SQL reads
+    /// can observe the staged `lix_binary_blob_ref` rows immediately. This lookup
+    /// lets transaction-scoped blob readers satisfy those hashes from the same
+    /// staged file payloads that commit will later write.
+    pub(crate) fn load_staged_file_bytes_many(
+        &self,
+        hashes: &[BlobHash],
+    ) -> Result<BlobBytesBatch, LixError> {
+        if hashes.is_empty() {
+            return Ok(BlobBytesBatch::new(Vec::new()));
+        }
+        let file_data_guard = self.file_data_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        let mut bytes_by_hash = BTreeMap::<BlobHash, Vec<u8>>::new();
+        for write in file_data_guard.iter() {
+            bytes_by_hash
+                .entry(BlobHash::from_content(&write.data))
+                .or_insert_with(|| write.data.clone());
+        }
+        Ok(BlobBytesBatch::new(
+            hashes
+                .iter()
+                .map(|hash| bytes_by_hash.get(hash).cloned())
+                .collect(),
+        ))
     }
 
     /// Stages one prepared write batch into this transaction.
