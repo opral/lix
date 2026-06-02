@@ -1,5 +1,3 @@
-mod normalize;
-
 use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
