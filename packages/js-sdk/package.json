@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.6.1",
+	"version": "0.6.2",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"repository": {
@@ -26,10 +26,10 @@
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},
 	"optionalDependencies": {
-		"@lix-js/sdk-darwin-arm64": "0.6.1",
-		"@lix-js/sdk-linux-arm64": "0.6.1",
-		"@lix-js/sdk-linux-x64": "0.6.1",
-		"@lix-js/sdk-win32-x64": "0.6.1"
+		"@lix-js/sdk-darwin-arm64": "0.6.2",
+		"@lix-js/sdk-linux-arm64": "0.6.2",
+		"@lix-js/sdk-linux-x64": "0.6.2",
+		"@lix-js/sdk-win32-x64": "0.6.2"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.2",

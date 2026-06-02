@@ -2561,7 +2561,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "lix_cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "lix_engine"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "ahash",
  "async-trait",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "lix_js_sdk"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "lix_sdk",
  "napi",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "lix_sdk"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3114,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_csv"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bytecount",
  "chardetng 1.0.0",
@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json_v2"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "criterion",
  "serde",
@@ -3140,7 +3140,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_md_v2"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "criterion",
  "markdown",
@@ -3773,7 +3773,7 @@ dependencies = [
 
 [[package]]
 name = "text_plugin"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "criterion",
