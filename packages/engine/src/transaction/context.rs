@@ -469,11 +469,41 @@ where
             }
             let filesystem = self.filesystem_index_for_branch(&write.branch_id).await?;
             let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
-            let Some(plugin) = select_plugin_for_path(
+            let existing_file = filesystem.file_entries().find(|(_, file)| {
+                file.id == write.file_id
+                    && file.scope.global == write.global
+                    && file.scope.untracked == write.untracked
+            });
+            let content_type = file_content_type(&write.data);
+            let existing_plugin = existing_file.and_then(|(path, _)| {
+                select_plugin_for_path(&installed_plugins, path, Some(content_type))
+            });
+            let selected_plugin = select_plugin_for_path(
                 &installed_plugins,
                 &write.path,
-                Some(file_content_type(&write.data)),
-            ) else {
+                Some(content_type),
+            );
+            let context = FilesystemRowContext {
+                branch_id: write.branch_id.clone(),
+                global: write.global,
+                untracked: write.untracked,
+                file_id: None,
+                metadata: None,
+            };
+            if let Some(existing_plugin) = existing_plugin
+                && selected_plugin
+                    .is_none_or(|plugin| plugin.key != existing_plugin.key)
+            {
+                let existing_state = self
+                    .active_plugin_state_rows(&write.branch_id, &write.file_id, existing_plugin)
+                    .await?;
+                reconciliation.rows.extend(plugin_state_tombstone_rows(
+                    &existing_state,
+                    &write.file_id,
+                    &context,
+                ));
+            }
+            let Some(plugin) = selected_plugin else {
                 continue;
             };
             let active_state = self
@@ -486,19 +516,7 @@ where
                 write.data.clone(),
             )
             .await?;
-            let context = FilesystemRowContext {
-                branch_id: write.branch_id.clone(),
-                global: write.global,
-                untracked: write.untracked,
-                file_id: None,
-                metadata: None,
-            };
-            if filesystem.file_entries().any(|(_, file)| {
-                file.id == write.file_id
-                    && file.scope.global == write.global
-                    && file.scope.untracked == write.untracked
-                    && file.blob_hash.is_some()
-            }) {
+            if existing_file.is_some_and(|(_, file)| file.blob_hash.is_some()) {
                 reconciliation.rows.push(blob_ref_tombstone_row(
                     write.file_id.clone(),
                     context.clone(),

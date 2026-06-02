@@ -342,6 +342,72 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
             .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
     );
 
+    let sql_rename_csv = b"name,age\nRuth,99\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql-rename.csv".to_string()),
+            Value::Blob(sql_rename_csv.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    let sql_rename_file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-rename.csv".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(sql_rename_file_id.len(), 1);
+    let sql_rename_file_id = sql_rename_file_id.rows()[0].get::<String>("id").unwrap();
+    let rename = lix
+        .execute(
+            "UPDATE lix_file SET path = $1 WHERE path = $2",
+            &[
+                Value::Text("/sql-rename.txt".to_string()),
+                Value::Text("/sql-rename.csv".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename.rows_affected(), 1);
+    assert_eq!(lix.read_file("/sql-rename.csv").await.unwrap(), None);
+    assert_eq!(
+        lix.read_file("/sql-rename.txt").await.unwrap().as_deref(),
+        Some(sql_rename_csv.as_slice())
+    );
+    let renamed_files = lix
+        .execute(
+            "SELECT data FROM lix_file WHERE path = $1",
+            &[Value::Text("/sql-rename.txt".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed_files.len(), 1);
+    assert_eq!(
+        renamed_files.rows()[0].values(),
+        &[Value::Blob(sql_rename_csv.clone())]
+    );
+    let active_plugin_rows_after_rename = lix
+        .execute(
+            "SELECT schema_key FROM lix_state \
+             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
+            &[Value::Text(sql_rename_file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_plugin_rows_after_rename.len(), 0);
+    let active_blob_rows_after_rename = lix
+        .execute(
+            "SELECT schema_key FROM lix_state \
+             WHERE file_id = $1 AND schema_key = 'lix_binary_blob_ref'",
+            &[Value::Text(sql_rename_file_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_blob_rows_after_rename.len(), 1);
+
     let sql_changes_before_delete =
         sql_changes_before_predicate_update + sql_predicate_update_changes.len();
     lix.execute(

@@ -49,8 +49,9 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::plugin::{
-    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
-    reject_normal_plugin_storage_mutation, render_materialized_plugin_file, select_plugin_for_path,
+    InstalledPlugin, PluginRuntimeHost, file_content_type, load_installed_plugins_from_filesystem,
+    plugin_state_rows, reject_normal_plugin_storage_mutation, render_materialized_plugin_file,
+    select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -441,7 +442,7 @@ impl TableProvider for LixFileProvider {
         let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
             || assignments
                 .iter()
-                .any(|(_, expr)| contains_column(expr, "data"));
+                .any(|(column_name, expr)| column_name == "path" || contains_column(expr, "data"));
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
@@ -928,13 +929,28 @@ impl ExecutionPlan for LixFileUpdateExec {
                     "sql2 lix_file plugin discovery failed: {error}"
                 ))
             })?;
-            let source_batch =
-                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
+            let source_batch = lix_file_record_batch(
+                &table_schema,
+                &blob_reader,
+                plugin_render.clone(),
+                needs_data,
+                rows,
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
             let assignment_values = UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
             let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
+            let plugin_rewrite_file_ids = if update_columns.path && !update_columns.data {
+                path_update_plugin_rewrite_file_ids(
+                    plugin_render.as_ref(),
+                    &matched_batch,
+                    &assignment_values,
+                    branch_binding.active_branch_id(),
+                )?
+            } else {
+                BTreeSet::new()
+            };
             let mut path_resolvers = None;
             if update_columns.path || update_columns.descriptor {
                 path_resolvers = Some(
@@ -952,6 +968,7 @@ impl ExecutionPlan for LixFileUpdateExec {
                 branch_binding.active_branch_id(),
                 update_columns,
                 &blob_ref_keys,
+                &plugin_rewrite_file_ids,
                 path_resolvers.as_mut(),
                 &mut || functions.call_uuid_v7().to_string(),
             )?;
@@ -1461,6 +1478,7 @@ fn lix_file_update_stage_from_batch(
     branch_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
+    plugin_rewrite_file_ids: &BTreeSet<String>,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
@@ -1479,6 +1497,7 @@ fn lix_file_update_stage_from_batch(
                 branch_binding,
                 update_columns,
                 blob_ref_keys,
+                plugin_rewrite_file_ids,
                 path_resolvers,
                 generate_directory_id,
             )
@@ -1512,6 +1531,7 @@ fn lix_file_path_update_stage_from_batch(
     branch_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
     blob_ref_keys: &BTreeSet<FilesystemBlobRefKey>,
+    plugin_rewrite_file_ids: &BTreeSet<String>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
@@ -1559,10 +1579,63 @@ fn lix_file_path_update_stage_from_batch(
                 has_blob_ref,
                 None,
             )?;
+        } else if plugin_rewrite_file_ids.contains(&id) {
+            let data = required_binary_value(batch, row_index, "data")?;
+            let has_blob_ref =
+                blob_ref_keys.contains(&FilesystemBlobRefKey::from_context(&context, &id));
+            stage_lix_file_data_update_write(
+                &mut staged,
+                id.clone(),
+                Some(path),
+                data,
+                context,
+                has_blob_ref,
+                None,
+            )?;
         }
     }
 
     Ok(staged)
+}
+
+fn path_update_plugin_rewrite_file_ids(
+    plugin_render: Option<&PluginRenderContext>,
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    branch_binding: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let Some(plugin_render) = plugin_render else {
+        return Ok(BTreeSet::new());
+    };
+    let mut file_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        let file_id = required_string_value(batch, row_index, "id")?;
+        let existing_path = required_string_value(batch, row_index, "path")?;
+        let assigned_path =
+            update_required_string_value(batch, assignment_values, row_index, "path")?;
+        let assigned_path =
+            normalize_normal_write_file_path(&assigned_path, TransactionWriteOperation::Update)?;
+        if existing_path == assigned_path {
+            continue;
+        }
+
+        let context =
+            file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
+        let plugins = plugin_render.installed_plugins_for_branch(&context.branch_id);
+        if plugins.is_empty() {
+            continue;
+        }
+        let data = required_binary_value(batch, row_index, "data")?;
+        let content_type = Some(file_content_type(&data));
+        let existing_plugin = select_plugin_for_path(plugins, &existing_path, content_type);
+        let assigned_plugin = select_plugin_for_path(plugins, &assigned_path, content_type);
+        let existing_plugin_key = existing_plugin.map(|plugin| plugin.key.as_str());
+        let assigned_plugin_key = assigned_plugin.map(|plugin| plugin.key.as_str());
+        if existing_plugin_key != assigned_plugin_key {
+            file_ids.insert(file_id);
+        }
+    }
+    Ok(file_ids)
 }
 
 #[cfg(test)]
@@ -2794,6 +2867,22 @@ fn update_required_binary_value(
     }
 }
 
+fn required_binary_value(batch: &RecordBatch, row_index: usize, column_name: &str) -> Result<Vec<u8>> {
+    match optional_scalar_value(batch, row_index, column_name)? {
+        Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => Ok(value),
+        Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(value),
+        Some(other) => Err(lix_file_data_type_error_with_value(
+            "UPDATE lix_file",
+            column_name,
+            &other,
+            "expected materialized binary file contents",
+        )),
+        None => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_file requires materialized column '{column_name}'"
+        ))),
+    }
+}
+
 fn optional_string_value(
     batch: &RecordBatch,
     row_index: usize,
@@ -3183,6 +3272,7 @@ mod tests {
             branch_binding,
             update_columns,
             blob_ref_keys,
+            &BTreeSet::new(),
             path_resolvers,
             generate_directory_id,
         )
