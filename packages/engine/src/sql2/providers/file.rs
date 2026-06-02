@@ -325,6 +325,10 @@ impl TableProvider for LixFileProvider {
             Some(projected_schema.as_ref()),
             scan_limit,
         );
+        let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::File)?;
+        if matches!(self.branch_binding, BranchBinding::Explicit) {
+            request.filter.branch_ids = explicit_branch_ids_from_dml_filters(&filters);
+        }
         request.filter.branch_ids = resolve_provider_branch_ids(
             self.branch_ref.as_ref(),
             &self.branch_binding,
@@ -332,7 +336,7 @@ impl TableProvider for LixFileProvider {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::File)?;
+        let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
@@ -350,6 +354,7 @@ impl TableProvider for LixFileProvider {
             request,
             target_file_ids,
             physical_filters,
+            needs_data,
             limit,
         )))
     }
@@ -707,7 +712,7 @@ impl ExecutionPlan for LixFileDeleteExec {
             .map_err(lix_error_to_datafusion_error)?;
             let blob_ref_keys =
                 blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, rows)
+            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, true, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
@@ -874,7 +879,7 @@ impl ExecutionPlan for LixFileUpdateExec {
             .map_err(lix_error_to_datafusion_error)?;
             let blob_ref_keys =
                 blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, rows)
+            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, true, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
@@ -945,6 +950,7 @@ struct LixFileScanExec {
     request: LiveStateScanRequest,
     target_file_ids: FileIdConstraint,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    needs_data: bool,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
@@ -966,6 +972,7 @@ impl LixFileScanExec {
         request: LiveStateScanRequest,
         target_file_ids: FileIdConstraint,
         filters: Vec<Arc<dyn PhysicalExpr>>,
+        needs_data: bool,
         limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -984,6 +991,7 @@ impl LixFileScanExec {
             request,
             target_file_ids,
             filters,
+            needs_data,
             limit,
             properties: Arc::new(properties),
         }
@@ -1047,6 +1055,7 @@ impl ExecutionPlan for LixFileScanExec {
         let request = self.request.clone();
         let target_file_ids = self.target_file_ids.clone();
         let filters = self.filters.clone();
+        let needs_data = self.needs_data;
         let limit = self.limit;
         let output_schema = Arc::clone(&self.output_schema);
         let batch_schema = Arc::clone(&self.batch_schema);
@@ -1061,14 +1070,17 @@ impl ExecutionPlan for LixFileScanExec {
                 live_state: Arc::clone(&live_state),
                 host: plugin_host,
             };
-            let batch =
-                lix_file_record_batch(&batch_schema, &blob_reader, Some(plugin_render), rows)
-                    .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file batch build failed: {error}"
-                        ))
-                    })?;
+            let batch = lix_file_record_batch(
+                &batch_schema,
+                &blob_reader,
+                Some(plugin_render),
+                needs_data,
+                rows,
+            )
+            .await
+            .map_err(|error| {
+                DataFusionError::Execution(format!("sql2 lix_file batch build failed: {error}"))
+            })?;
             let filtered = filter_lix_file_batch(batch, &filters)?;
             let projected = match projection {
                 Some(indices) => filtered.project(&indices).map_err(DataFusionError::from),
@@ -1772,6 +1784,7 @@ async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
     plugin_render: Option<PluginRenderContext>,
+    load_data: bool,
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
@@ -1779,7 +1792,7 @@ async fn lix_file_record_batch(
         .iter()
         .map(|field| field.name().as_str())
         .collect::<Vec<_>>();
-    let needs_data = projected_columns.contains(&"data");
+    let needs_data = load_data && projected_columns.contains(&"data");
 
     let filesystem_index = if needs_data && plugin_render.is_some() {
         Some(FilesystemIndex::from_live_rows(rows.clone())?)
@@ -1925,7 +1938,7 @@ async fn lix_file_record_batch(
                 }
             }
         } else {
-            None
+            Some(Vec::new())
         };
 
         ids.push(Some(file.id));
@@ -2101,6 +2114,20 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
             .collect::<Vec<_>>(),
     };
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn scan_needs_data(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projected_needs_data = match projection {
+        Some(indices) => indices
+            .iter()
+            .any(|index| base_schema.field(*index).name() == "data"),
+        None => true,
+    };
+    projected_needs_data || filters.iter().any(|filter| contains_column(filter, "data"))
 }
 
 fn lix_file_scan_request(
@@ -3248,6 +3275,7 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            true,
             vec![live_file_row(
                 "file-readme",
                 "branch-b",
@@ -3274,6 +3302,7 @@ mod tests {
             &super::lix_file_schema(),
             &blob_reader,
             None,
+            true,
             vec![
                 live_file_row(
                     "file-readme",
