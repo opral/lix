@@ -17,6 +17,7 @@ use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
+use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
     SqlHistoryQuerySource,
@@ -55,6 +56,7 @@ pub struct SessionContext<B: StorageBackend = InMemoryStorageBackend> {
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(super) plugin_host: PluginRuntimeHost,
     transaction_manager: SessionTransactionManager,
 }
 
@@ -72,6 +74,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        plugin_host: PluginRuntimeHost,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -82,6 +85,7 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            plugin_host,
         );
         session.active_branch_id().await?;
         Ok(session)
@@ -96,6 +100,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        plugin_host: PluginRuntimeHost,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -108,6 +113,7 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            plugin_host,
         ))
     }
 
@@ -120,6 +126,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        plugin_host: PluginRuntimeHost,
     ) -> Self {
         Self::new_with_transaction_manager(
             mode,
@@ -130,6 +137,7 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            plugin_host,
             SessionTransactionManager::new(),
         )
     }
@@ -143,6 +151,7 @@ where
         branch_ctx: Arc<BranchContext>,
         catalog_context: Arc<CatalogContext>,
         deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+        plugin_host: PluginRuntimeHost,
         transaction_manager: SessionTransactionManager,
     ) -> Self {
         Self {
@@ -154,6 +163,7 @@ where
             branch_ctx,
             catalog_context,
             deterministic_runtime_gate,
+            plugin_host,
             transaction_manager,
         }
     }
@@ -395,6 +405,22 @@ where
     }
 }
 
+impl<B> PluginComponentHost for SessionContext<B>
+where
+    B: StorageBackend,
+{
+    fn plugin_component_cache(
+        &self,
+    ) -> &std::sync::Mutex<std::collections::BTreeMap<String, crate::plugin::CachedPluginComponent>>
+    {
+        self.plugin_host.plugin_component_cache()
+    }
+
+    fn wasm_runtime(&self) -> &Arc<dyn crate::wasm::WasmRuntime> {
+        self.plugin_host.wasm_runtime()
+    }
+}
+
 pub(super) struct SessionWriteAccess {
     _write_lease: SessionWriteLease,
 }
@@ -416,6 +442,7 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage::StorageBacke
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
+    pub(super) plugin_host: PluginRuntimeHost,
 }
 
 impl<R> SqlExecutionContext for SessionSqlExecutionContext<'_, R>
@@ -465,6 +492,10 @@ where
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.visible_schemas.clone())
+    }
+
+    fn plugin_host(&self) -> PluginRuntimeHost {
+        self.plugin_host.clone()
     }
 }
 

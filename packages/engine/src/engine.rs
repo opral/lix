@@ -9,11 +9,13 @@ use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
+use crate::plugin::PluginRuntimeHost;
 use crate::session::SessionContext;
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions, StorageWriteOptions};
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
+use crate::wasm::{UnsupportedWasmRuntime, WasmRuntime};
 use crate::{LixError, NullableKeyFilter};
 
 #[derive(Clone)]
@@ -26,6 +28,7 @@ pub struct Engine<B: StorageBackend = crate::storage::InMemoryStorageBackend> {
     binary_cas: Arc<BinaryCasContext>,
     catalog_context: Arc<CatalogContext>,
     deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
+    plugin_host: PluginRuntimeHost,
 }
 
 impl<B> Engine<B>
@@ -59,6 +62,14 @@ where
     /// context. Independently constructing multiple Engine values over the same
     /// cloned backend is outside that MVP runtime-sharing boundary.
     pub async fn new(backend: B) -> Result<Self, LixError> {
+        Self::new_with_wasm_runtime(backend, Arc::new(UnsupportedWasmRuntime)).await
+    }
+
+    /// Creates an engine with a WASM component runtime for installed plugins.
+    pub async fn new_with_wasm_runtime(
+        backend: B,
+        wasm_runtime: Arc<dyn WasmRuntime>,
+    ) -> Result<Self, LixError> {
         let storage = StorageContext::new(backend);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
@@ -84,6 +95,7 @@ where
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             deterministic_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
+            plugin_host: PluginRuntimeHost::new(wasm_runtime),
         })
     }
 
@@ -123,6 +135,7 @@ where
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.deterministic_runtime_gate),
+            self.plugin_host.clone(),
         )
         .await
     }
@@ -136,6 +149,7 @@ where
             Arc::clone(&self.branch_ctx),
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.deterministic_runtime_gate),
+            self.plugin_host.clone(),
         )
         .await
     }

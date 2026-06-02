@@ -139,6 +139,32 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
 
     let manifest = validated_manifest.manifest;
     let content_type = manifest.file_match.content_type;
+    let mut schema_keys = Vec::with_capacity(manifest.schemas.len());
+    for schema_path in &manifest.schemas {
+        let normalized_schema_path =
+            normalize_plugin_archive_path_for_materialization(schema_path)?;
+        let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            message: format!(
+                "plugin materialization: archive '{archive_path}' is missing schema file '{schema_path}'"
+            ),
+            hint: None,
+            details: None,
+        })?;
+        let schema_json: JsonValue = serde_json::from_slice(schema_bytes).map_err(|error| {
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                message: format!(
+                    "plugin materialization: archive '{archive_path}' schema '{schema_path}' is invalid JSON: {error}"
+                ),
+                hint: None,
+                details: None,
+            }
+        })?;
+        validate_lix_schema_definition(&schema_json)?;
+        let schema_key = schema_key_from_definition(&schema_json)?;
+        schema_keys.push(schema_key.schema_key);
+    }
 
     Ok(InstalledPlugin {
         key: manifest.key,
@@ -147,6 +173,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
         path_glob: manifest.file_match.path_glob,
         content_type,
         entry: manifest.entry,
+        schema_keys,
         manifest_json: validated_manifest.normalized_json,
         wasm: wasm.clone(),
     })

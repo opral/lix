@@ -41,10 +41,15 @@ use serde::Deserialize;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::branch::BranchRefReader;
 use crate::entity_pk::EntityPk;
+use crate::filesystem::FilesystemIndex;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+};
+use crate::plugin::{
+    PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
+    render_plugin_state, select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -93,6 +98,7 @@ pub(super) async fn register_lix_file_active_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     session
@@ -103,6 +109,7 @@ pub(super) async fn register_lix_file_active_provider(
                 live_state,
                 branch_ref,
                 blob_reader,
+                plugin_host,
                 functions,
             )),
         )
@@ -116,6 +123,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     session
@@ -125,6 +133,7 @@ pub(super) async fn register_lix_file_by_branch_provider(
                 live_state,
                 branch_ref,
                 blob_reader,
+                plugin_host,
                 functions,
             )),
         )
@@ -169,6 +178,7 @@ pub(crate) struct LixFileProvider {
     live_state: Arc<dyn LiveStateReader>,
     branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     write_access: WriteAccess,
     functions: FunctionProviderHandle,
     branch_binding: BranchBinding,
@@ -187,6 +197,7 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -194,6 +205,7 @@ impl LixFileProvider {
             live_state,
             branch_ref,
             blob_reader,
+            plugin_host,
             write_access: WriteAccess::read_only(),
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -215,6 +227,7 @@ impl LixFileProvider {
             live_state,
             branch_ref,
             blob_reader,
+            plugin_host: PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -226,6 +239,7 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        plugin_host: PluginRuntimeHost,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -233,6 +247,7 @@ impl LixFileProvider {
             live_state,
             branch_ref,
             blob_reader,
+            plugin_host,
             write_access: WriteAccess::read_only(),
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -253,6 +268,7 @@ impl LixFileProvider {
             live_state,
             branch_ref,
             blob_reader,
+            plugin_host: PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
             write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -327,6 +343,7 @@ impl TableProvider for LixFileProvider {
         Ok(Arc::new(LixFileScanExec::new(
             Arc::clone(&self.live_state),
             Arc::clone(&self.blob_reader),
+            self.plugin_host.clone(),
             Arc::clone(&self.schema),
             projected_schema,
             projection.cloned(),
@@ -690,7 +707,7 @@ impl ExecutionPlan for LixFileDeleteExec {
             .map_err(lix_error_to_datafusion_error)?;
             let blob_ref_keys =
                 blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
+            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
@@ -857,7 +874,7 @@ impl ExecutionPlan for LixFileUpdateExec {
             .map_err(lix_error_to_datafusion_error)?;
             let blob_ref_keys =
                 blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
+            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
@@ -921,6 +938,7 @@ impl ExecutionPlan for LixFileUpdateExec {
 struct LixFileScanExec {
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     batch_schema: SchemaRef,
     output_schema: SchemaRef,
     projection: Option<Vec<usize>>,
@@ -941,6 +959,7 @@ impl LixFileScanExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
         blob_reader: Arc<dyn BlobDataReader>,
+        plugin_host: PluginRuntimeHost,
         batch_schema: SchemaRef,
         output_schema: SchemaRef,
         projection: Option<Vec<usize>>,
@@ -958,6 +977,7 @@ impl LixFileScanExec {
         Self {
             live_state,
             blob_reader,
+            plugin_host,
             batch_schema,
             output_schema,
             projection,
@@ -1023,6 +1043,7 @@ impl ExecutionPlan for LixFileScanExec {
 
         let live_state = Arc::clone(&self.live_state);
         let blob_reader = Arc::clone(&self.blob_reader);
+        let plugin_host = self.plugin_host.clone();
         let request = self.request.clone();
         let target_file_ids = self.target_file_ids.clone();
         let filters = self.filters.clone();
@@ -1031,16 +1052,23 @@ impl ExecutionPlan for LixFileScanExec {
         let batch_schema = Arc::clone(&self.batch_schema);
         let projection = self.projection.clone();
         let fut = async move {
-            let rows = scan_lix_file_live_rows(live_state, &request, &target_file_ids)
+            let rows = scan_lix_file_live_rows(Arc::clone(&live_state), &request, &target_file_ids)
                 .await
                 .map_err(|error| {
                     DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                 })?;
-            let batch = lix_file_record_batch(&batch_schema, &blob_reader, rows)
-                .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!("sql2 lix_file batch build failed: {error}"))
-                })?;
+            let plugin_render = PluginRenderContext {
+                live_state: Arc::clone(&live_state),
+                host: plugin_host,
+            };
+            let batch =
+                lix_file_record_batch(&batch_schema, &blob_reader, Some(plugin_render), rows)
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file batch build failed: {error}"
+                        ))
+                    })?;
             let filtered = filter_lix_file_batch(batch, &filters)?;
             let projected = match projection {
                 Some(indices) => filtered.project(&indices).map_err(DataFusionError::from),
@@ -1066,6 +1094,12 @@ struct FileDescriptorRecord {
     name: String,
     key: FilesystemDescriptorKey,
     live: MaterializedLiveStateRow,
+}
+
+#[derive(Clone)]
+struct PluginRenderContext {
+    live_state: Arc<dyn LiveStateReader>,
+    host: PluginRuntimeHost,
 }
 
 #[derive(Debug, Clone)]
@@ -1737,6 +1771,7 @@ async fn file_path_resolvers_from_live_state(
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_render: Option<PluginRenderContext>,
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
@@ -1745,6 +1780,16 @@ async fn lix_file_record_batch(
         .map(|field| field.name().as_str())
         .collect::<Vec<_>>();
     let needs_data = projected_columns.contains(&"data");
+
+    let filesystem_index = if needs_data && plugin_render.is_some() {
+        Some(FilesystemIndex::from_live_rows(rows.clone())?)
+    } else {
+        None
+    };
+    let installed_plugins = match filesystem_index.as_ref() {
+        Some(index) => load_installed_plugins_from_filesystem(index, blob_reader.as_ref()).await?,
+        None => Vec::new(),
+    };
 
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
     let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
@@ -1863,7 +1908,21 @@ async fn lix_file_record_batch(
             };
             match blob_rows.get(&FilesystemBlobRefKey::from_context(&context, &file.id)) {
                 Some(blob_ref) => load_single_blob_bytes(blob_reader, &blob_ref.blob_hash).await?,
-                None => Some(Vec::new()),
+                None => {
+                    let rendered = match (&plugin_render, filesystem_index.as_ref()) {
+                        (Some(plugin_render), Some(_)) => {
+                            render_plugin_file_for_sql(
+                                plugin_render,
+                                &installed_plugins,
+                                &file,
+                                &path,
+                            )
+                            .await?
+                        }
+                        _ => None,
+                    };
+                    Some(rendered.unwrap_or_default())
+                }
             }
         } else {
             None
@@ -1928,6 +1987,33 @@ async fn lix_file_record_batch(
             format!("sql2 failed to build lix_file record batch: {error}"),
         )
     })
+}
+
+async fn render_plugin_file_for_sql(
+    plugin_render: &PluginRenderContext,
+    installed_plugins: &[crate::plugin::InstalledPlugin],
+    file: &FileDescriptorRecord,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let Some(plugin) = select_plugin_for_path(installed_plugins, path, None) else {
+        return Ok(None);
+    };
+    let rows = plugin_render
+        .live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: plugin.schema_keys.clone(),
+                branch_ids: vec![file.live.branch_id.clone()],
+                file_ids: vec![crate::NullableKeyFilter::Value(file.id.clone())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let active_state = plugin_state_rows(plugin, rows.iter());
+    Ok(Some(
+        render_plugin_state(&plugin_render.host, plugin, &active_state).await?,
+    ))
 }
 
 async fn load_single_blob_bytes(
@@ -3161,6 +3247,7 @@ mod tests {
         let error = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
+            None,
             vec![live_file_row(
                 "file-readme",
                 "branch-b",
@@ -3186,6 +3273,7 @@ mod tests {
         let batch = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
+            None,
             vec![
                 live_file_row(
                     "file-readme",

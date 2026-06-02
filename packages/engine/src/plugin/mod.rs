@@ -8,16 +8,24 @@ mod archive;
 pub(crate) mod component;
 mod install;
 mod manifest;
+mod materializer;
 mod storage;
 
 pub(crate) use archive::{
     ParsedPluginArchive, load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install,
 };
+pub(crate) use component::{CachedPluginComponent, PluginComponentHost, PluginRuntimeHost};
 pub(crate) use install::install_plugin_archive_with_transaction;
 #[allow(unused_imports)]
 pub(crate) use manifest::{
     PluginContentType, PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,
     glob_matches_path, parse_plugin_manifest_json, select_best_glob_match,
+};
+#[allow(unused_imports)]
+pub(crate) use materializer::{
+    PluginDetectedChange, detect_changes_with_plugin, file_content_type,
+    load_installed_plugins_from_filesystem, plugin_state_rows, render_plugin_state,
+    select_plugin_for_path,
 };
 #[allow(unused_imports)]
 pub(crate) use storage::{
@@ -33,6 +41,7 @@ pub(crate) struct InstalledPlugin {
     pub path_glob: String,
     pub content_type: Option<PluginContentType>,
     pub entry: String,
+    pub schema_keys: Vec<String>,
     pub manifest_json: String,
     pub wasm: Vec<u8>,
 }

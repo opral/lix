@@ -1,202 +1,211 @@
 use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
 
-use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
-use crate::common::LixError;
-use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
-use crate::Backend;
+use crate::LixError;
+use crate::binary_cas::{BlobDataReader, BlobHash};
+use crate::entity_pk::EntityPk;
+use crate::filesystem::FilesystemIndex;
+use crate::live_state::MaterializedLiveStateRow;
 
-use super::component::{render_with_plugin, PluginComponentHost};
+use super::component::{
+    PluginComponentHost, detect_changes_with_plugin as detect_changes_with_component,
+    render_with_plugin as render_with_component,
+};
 use super::{
-    load_installed_plugin_from_archive_bytes, plugin_key_from_archive_path, PluginContentType,
-    PluginRuntime,
+    InstalledPlugin, PluginContentType, load_installed_plugin_from_archive_bytes,
+    plugin_key_from_archive_path, select_best_glob_match,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledPlugin {
-    pub key: String,
-    pub runtime: PluginRuntime,
-    pub api_version: String,
-    pub path_glob: String,
-    pub content_type: Option<PluginContentType>,
-    pub entry: String,
-    pub manifest_json: String,
-    pub wasm: Vec<u8>,
+pub(crate) struct PluginDetectedChange {
+    pub(crate) entity_pk: EntityPk,
+    pub(crate) schema_key: String,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
 }
 
-#[async_trait(?Send)]
-pub trait FilesystemPluginMaterializer {
-    async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError>;
-
-    async fn render_plugin_state(
-        &self,
-        plugin: &InstalledPlugin,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, LixError>;
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginDetectChangesRequest {
+    state: Vec<PluginEntityState>,
+    file: PluginFile,
 }
 
-pub(crate) trait PluginMaterializationHost: PluginComponentHost {
-    fn plugin_backend(&self) -> &Arc<dyn Backend + Send + Sync>;
-
-    fn installed_plugins_cache(&self) -> &RwLock<Option<Vec<InstalledPlugin>>>;
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginRenderRequest {
+    state: Vec<PluginEntityState>,
 }
 
-pub(crate) async fn load_installed_plugins_with_runtime_cache(
-    host: &impl PluginMaterializationHost,
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginFile {
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginEntityState {
+    entity_pk: Vec<String>,
+    schema_key: String,
+    snapshot_content: String,
+    metadata: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PluginDetectedChangeWire {
+    entity_pk: Vec<String>,
+    schema_key: String,
+    snapshot_content: Option<String>,
+    metadata: Option<String>,
+}
+
+pub(crate) async fn load_installed_plugins_from_filesystem(
+    filesystem: &FilesystemIndex,
+    blob_reader: &dyn BlobDataReader,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
-    if let Some(cached) = host
-        .installed_plugins_cache()
-        .read()
-        .map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "installed plugin cache lock poisoned".to_string(),
-            hint: None,
-            details: None,
-        })?
-        .clone()
-    {
-        return Ok(cached);
-    }
-
-    let plugins = load_installed_plugins_from_backend(host).await?;
-    let mut guard = host
-        .installed_plugins_cache()
-        .write()
-        .map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "installed plugin cache lock poisoned".to_string(),
-            hint: None,
-            details: None,
-        })?;
-    *guard = Some(plugins.clone());
-    Ok(plugins)
-}
-
-pub(crate) async fn load_installed_plugins_from_backend(
-    host: &impl PluginMaterializationHost,
-) -> Result<Vec<InstalledPlugin>, LixError> {
-    load_installed_plugins_from_backend_state(host.plugin_backend().as_ref()).await
-}
-
-pub(crate) async fn load_installed_plugins_from_backend_state(
-    backend: &dyn Backend,
-) -> Result<Vec<InstalledPlugin>, LixError> {
-    let archive_refs = list_installed_plugin_archive_refs(backend).await?;
-    let mut plugins = Vec::with_capacity(archive_refs.len());
-    for archive_ref in archive_refs {
-        plugins.push(
-            load_installed_plugin_from_archive_ref_with_backend(backend, &archive_ref).await?,
-        );
+    let mut plugins = Vec::new();
+    for (path, file) in filesystem.file_entries() {
+        let Some(plugin_key) = plugin_key_from_archive_path(path) else {
+            continue;
+        };
+        let Some(blob_hash) = file.blob_hash.as_deref() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("installed plugin archive '{path}' is missing binary blob data"),
+            ));
+        };
+        let hash = BlobHash::from_hex(blob_hash)?;
+        let mut batch = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
+        let Some(archive_bytes) = batch.pop().flatten() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("installed plugin archive '{path}' blob '{blob_hash}' is missing"),
+            ));
+        };
+        plugins.push(load_installed_plugin_from_archive_bytes(
+            &plugin_key,
+            path,
+            &archive_bytes,
+        )?);
     }
     Ok(plugins)
 }
 
-pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
-    backend: &dyn Backend,
-    archive_ref: &PluginArchiveRef,
-) -> Result<InstalledPlugin, LixError> {
-    let Some(plugin_key) = plugin_key_from_archive_path(&archive_ref.path) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!(
-                "plugin materialization: unsupported plugin archive path '{}'",
-                archive_ref.path
-            ),
-            hint: None,
-            details: None,
-        });
+pub(crate) fn select_plugin_for_path<'a>(
+    plugins: &'a [InstalledPlugin],
+    path: &str,
+    content_type: Option<PluginContentType>,
+) -> Option<&'a InstalledPlugin> {
+    select_best_glob_match(
+        path,
+        content_type,
+        plugins,
+        |plugin| plugin.path_glob.as_str(),
+        |plugin| plugin.content_type,
+    )
+}
+
+pub(crate) async fn detect_changes_with_plugin(
+    host: &impl PluginComponentHost,
+    plugin: &InstalledPlugin,
+    active_state: &[MaterializedLiveStateRow],
+    file_data: Vec<u8>,
+) -> Result<Vec<PluginDetectedChange>, LixError> {
+    let request = PluginDetectChangesRequest {
+        state: plugin_entity_state_from_live_rows(active_state)?,
+        file: PluginFile { data: file_data },
     };
-    let binary_cas = crate::binary_cas::BinaryCasContext::new();
-    let mut reader = binary_cas.reader(backend);
-    let archive_hash = crate::binary_cas::BlobHash::from_hex(&archive_ref.blob_hash)?;
-    let archive_bytes = reader
-        .load_bytes_many(&[archive_hash])
-        .await?
-        .into_vec()
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!(
-                "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
-                archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
-            ),
-            hint: None,
-            details: None,
+    let payload = serialize_plugin_payload(&request, "detect-changes")?;
+    let output = detect_changes_with_component(host, plugin, &payload).await?;
+    let changes: Vec<PluginDetectedChangeWire> =
+        serde_json::from_slice(&output).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("plugin detect-changes returned invalid JSON: {error}"),
+            )
         })?;
-    if archive_bytes.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!(
-                "plugin materialization: archive '{}' is empty",
-                archive_ref.path
-            ),
-            hint: None,
-            details: None,
-        });
-    }
-    load_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
-}
-
-pub(crate) async fn list_installed_plugin_manifest_keys(
-    backend: &dyn Backend,
-) -> Result<BTreeSet<String>, LixError> {
-    Ok(load_installed_plugins_from_backend_state(backend)
-        .await?
+    changes
         .into_iter()
-        .map(|plugin| plugin.key)
-        .collect())
+        .map(|change| {
+            Ok(PluginDetectedChange {
+                entity_pk: EntityPk::from_parts(change.entity_pk).map_err(|error| {
+                    LixError::unknown(format!("plugin emitted invalid entity_pk: {error}"))
+                })?,
+                schema_key: change.schema_key,
+                snapshot_content: change.snapshot_content,
+                metadata: change.metadata,
+            })
+        })
+        .collect()
 }
 
-#[allow(dead_code)]
-pub(crate) async fn installed_plugin_manifest_key_exists(
-    backend: &dyn Backend,
-    plugin_key: &str,
-) -> Result<bool, LixError> {
-    Ok(list_installed_plugin_manifest_keys(backend)
-        .await?
-        .contains(plugin_key))
+pub(crate) async fn render_plugin_state(
+    host: &impl PluginComponentHost,
+    plugin: &InstalledPlugin,
+    active_state: &[MaterializedLiveStateRow],
+) -> Result<Vec<u8>, LixError> {
+    let request = PluginRenderRequest {
+        state: plugin_entity_state_from_live_rows(active_state)?,
+    };
+    let payload = serialize_plugin_payload(&request, "render")?;
+    render_with_component(host, plugin, &payload).await
 }
 
-pub(crate) fn invalidate_installed_plugins_cache(
-    host: &impl PluginMaterializationHost,
-) -> Result<(), LixError> {
-    let mut guard = host
-        .installed_plugins_cache()
-        .write()
-        .map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "installed plugin cache lock poisoned".to_string(),
-            hint: None,
-            details: None,
-        })?;
-    *guard = None;
-    let mut component_guard = host.plugin_component_cache().lock().map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        message: "plugin component cache lock poisoned".to_string(),
-        hint: None,
-            details: None,
-    })?;
-    component_guard.clear();
-    Ok(())
+pub(crate) fn plugin_state_rows<'a>(
+    plugin: &InstalledPlugin,
+    rows: impl IntoIterator<Item = &'a MaterializedLiveStateRow>,
+) -> Vec<MaterializedLiveStateRow> {
+    let schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
+    rows.into_iter()
+        .filter(|row| schema_keys.contains(&row.schema_key) && row.snapshot_content.is_some())
+        .cloned()
+        .collect()
 }
 
-#[async_trait(?Send)]
-impl<T> FilesystemPluginMaterializer for T
-where
-    T: PluginMaterializationHost,
-{
-    async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError> {
-        load_installed_plugins_with_runtime_cache(self).await
+fn plugin_entity_state_from_live_rows(
+    rows: &[MaterializedLiveStateRow],
+) -> Result<Vec<PluginEntityState>, LixError> {
+    rows.iter()
+        .map(|row| {
+            let snapshot_content = row.snapshot_content.clone().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "plugin state row '{}' '{}' is missing snapshot_content",
+                        row.schema_key,
+                        row.entity_pk.as_json_array_text().unwrap_or_default()
+                    ),
+                )
+            })?;
+            Ok(PluginEntityState {
+                entity_pk: row.entity_pk.parts.clone(),
+                schema_key: row.schema_key.clone(),
+                snapshot_content,
+                metadata: row.metadata.clone(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn file_content_type(data: &[u8]) -> PluginContentType {
+    if std::str::from_utf8(data).is_ok() {
+        PluginContentType::Text
+    } else {
+        PluginContentType::Binary
     }
+}
 
-    async fn render_plugin_state(
-        &self,
-        plugin: &InstalledPlugin,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, LixError> {
-        render_with_plugin(self, plugin, payload).await
-    }
+fn serialize_plugin_payload<T: Serialize>(
+    value: &T,
+    export_name: &str,
+) -> Result<Vec<u8>, LixError> {
+    serde_json::to_vec(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode plugin {export_name} payload: {error}"),
+        )
+    })
 }

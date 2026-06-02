@@ -3,6 +3,7 @@ use lix_engine::{
     InMemoryBackend, LixError, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
+use std::sync::Arc;
 
 /// Options for opening a Lix workspace session.
 #[derive(Default)]
@@ -38,7 +39,18 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    let engine = open_or_initialize_engine(backend).await?;
+    let engine = open_or_initialize_engine(backend, None).await?;
+    let session = engine.open_workspace_session().await?;
+    Ok(Lix {
+        _engine: engine,
+        session,
+    })
+}
+
+pub async fn open_lix_with_wasm_runtime(
+    wasm_runtime: Arc<dyn lix_engine::wasm::WasmRuntime>,
+) -> Result<Lix, LixError> {
+    let engine = open_or_initialize_engine(InMemoryBackend::new(), Some(wasm_runtime)).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
@@ -163,18 +175,36 @@ where
     }
 }
 
-async fn open_or_initialize_engine<B>(backend: B) -> Result<Engine<B>, LixError>
+async fn open_or_initialize_engine<B>(
+    backend: B,
+    wasm_runtime: Option<Arc<dyn lix_engine::wasm::WasmRuntime>>,
+) -> Result<Engine<B>, LixError>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    match Engine::new(backend.clone()).await {
+    match new_engine(backend.clone(), wasm_runtime.clone()).await {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
             Engine::initialize(backend.clone()).await?;
-            Engine::new(backend).await
+            new_engine(backend, wasm_runtime).await
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn new_engine<B>(
+    backend: B,
+    wasm_runtime: Option<Arc<dyn lix_engine::wasm::WasmRuntime>>,
+) -> Result<Engine<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    match wasm_runtime {
+        Some(wasm_runtime) => Engine::new_with_wasm_runtime(backend, wasm_runtime).await,
+        None => Engine::new(backend).await,
     }
 }

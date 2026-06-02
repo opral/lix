@@ -166,6 +166,15 @@ impl FilesystemIndex {
         self.entries_by_path.get(path)
     }
 
+    pub(crate) fn file_entries(&self) -> impl Iterator<Item = (&str, &FilesystemFileEntry)> {
+        self.entries_by_path
+            .iter()
+            .filter_map(|(path, entry)| match entry {
+                FilesystemEntry::File(file) => Some((path.as_str(), file)),
+                FilesystemEntry::Directory(_) => None,
+            })
+    }
+
     pub(crate) async fn read_file_bytes(
         &self,
         path: &str,

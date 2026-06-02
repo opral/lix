@@ -16,8 +16,10 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateRow,
 };
+use crate::plugin::PluginRuntimeHost;
 use crate::storage::StorageRead;
 use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
+use crate::wasm::UnsupportedWasmRuntime;
 
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
@@ -55,6 +57,10 @@ pub(crate) trait SqlExecutionContext {
     fn branch_ref(&self) -> Arc<dyn BranchRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+
+    fn plugin_host(&self) -> PluginRuntimeHost {
+        PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
+    }
 }
 
 /// Write-capable SQL runtime boundary.

@@ -1,14 +1,18 @@
 use lix_sdk::{
     CreateBranchOptions, FsWriteOptions, InMemoryBackend, LixError, MergeBranchOptions,
     MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
+    open_lix_with_wasm_runtime,
 };
 use std::io::{Cursor, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     let archive = build_csv_plugin_archive();
-    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    let lix = open_lix_with_wasm_runtime(Arc::new(CsvTestRuntime))
+        .await
+        .unwrap();
 
     lix.install_plugin_archive(&archive).await.unwrap();
 
@@ -81,27 +85,20 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
         .collect::<Vec<_>>();
     assert_eq!(resulting_diff_changes.len(), 1);
     let change = &resulting_diff_changes[0];
-    assert_eq!(change.schema_key, "lix_binary_blob_ref");
-    assert_eq!(change.entity_pk, serde_json::json!([file_id.as_str()]));
+    assert_eq!(change.schema_key, "csv_row");
     let snapshot = change
         .snapshot_content
         .as_ref()
-        .expect("updated file write should produce a blob ref snapshot");
-    assert_eq!(
-        snapshot.get("id").and_then(|value| value.as_str()),
-        Some(file_id.as_str())
-    );
+        .expect("updated file write should produce a csv row snapshot");
     assert_eq!(
         snapshot
-            .get("size_bytes")
-            .and_then(serde_json::Value::as_u64),
-        Some(updated_csv.len() as u64)
-    );
-    assert!(
-        snapshot
-            .get("blob_hash")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| !value.is_empty())
+            .get("cells")
+            .and_then(serde_json::Value::as_array)
+            .unwrap(),
+        &vec![
+            serde_json::Value::String("Grace".to_string()),
+            serde_json::Value::String("85".to_string())
+        ]
     );
 
     let files = lix
@@ -121,6 +118,192 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     );
 
     lix.close().await.unwrap();
+}
+
+#[derive(Debug)]
+struct CsvTestRuntime;
+
+struct CsvTestComponent;
+
+#[async_trait::async_trait]
+impl lix_sdk::WasmRuntime for CsvTestRuntime {
+    async fn init_component(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: lix_sdk::WasmLimits,
+    ) -> Result<Arc<dyn lix_sdk::WasmComponentInstance>, LixError> {
+        Ok(Arc::new(CsvTestComponent))
+    }
+}
+
+#[async_trait::async_trait]
+impl lix_sdk::WasmComponentInstance for CsvTestComponent {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => csv_test_detect_changes(input),
+            "render" | "api#render" => csv_test_render(input),
+            other => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("CSV test runtime does not implement export '{other}'"),
+            )),
+        }
+    }
+}
+
+fn csv_test_detect_changes(input: &[u8]) -> Result<Vec<u8>, LixError> {
+    let payload = parse_plugin_payload(input, "detect-changes")?;
+    let state = payload
+        .get("state")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| plugin_payload_error("detect-changes state must be an array"))?;
+    let file_data = payload
+        .get("file")
+        .and_then(|file| file.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| plugin_payload_error("detect-changes file.data must be an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| plugin_payload_error("detect-changes file.data must contain bytes"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let existing_cells = state
+        .iter()
+        .filter(|row| row.get("schema-key").and_then(serde_json::Value::as_str) == Some("csv_row"))
+        .map(|row| {
+            row.get("snapshot-content")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|snapshot| csv_cells_from_snapshot(&snapshot))
+                .ok_or_else(|| plugin_payload_error("csv_row state has invalid snapshot-content"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let table_present = state
+        .iter()
+        .any(|row| row.get("schema-key").and_then(serde_json::Value::as_str) == Some("csv_table"));
+
+    let records = parse_simple_csv(&file_data)?;
+    let mut changes = Vec::new();
+    for (index, cells) in records.iter().enumerate() {
+        if existing_cells.iter().any(|existing| existing == cells) {
+            continue;
+        }
+        let id = csv_test_row_id(index, cells);
+        changes.push(serde_json::json!({
+            "entity-pk": [id],
+            "schema-key": "csv_row",
+            "snapshot-content": serde_json::to_string(&serde_json::json!({
+                "id": csv_test_row_id(index, cells),
+                "order_key": format!("{:032x}", index + 1),
+                "cells": cells,
+            })).unwrap(),
+            "metadata": null,
+        }));
+    }
+    if !table_present && !records.is_empty() {
+        changes.push(serde_json::json!({
+            "entity-pk": ["root"],
+            "schema-key": "csv_table",
+            "snapshot-content": serde_json::to_string(&serde_json::json!({
+                "id": "root",
+                "dialect": {
+                    "delimiter": ",",
+                    "quote": "\"",
+                    "terminator": "\n",
+                }
+            })).unwrap(),
+            "metadata": null,
+        }));
+    }
+    serde_json::to_vec(&changes).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode CSV test changes: {error}"),
+        )
+    })
+}
+
+fn csv_test_render(input: &[u8]) -> Result<Vec<u8>, LixError> {
+    let payload = parse_plugin_payload(input, "render")?;
+    let mut rows = payload
+        .get("state")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| plugin_payload_error("render state must be an array"))?
+        .iter()
+        .filter(|row| row.get("schema-key").and_then(serde_json::Value::as_str) == Some("csv_row"))
+        .map(|row| {
+            let snapshot = row
+                .get("snapshot-content")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .ok_or_else(|| plugin_payload_error("csv_row render state has invalid snapshot"))?;
+            let order_key = snapshot
+                .get("order_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| plugin_payload_error("csv_row render state is missing order_key"))?
+                .to_string();
+            let cells = csv_cells_from_snapshot(&snapshot)
+                .ok_or_else(|| plugin_payload_error("csv_row render state is missing cells"))?;
+            Ok((order_key, cells))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut output = String::new();
+    for (_, cells) in rows {
+        output.push_str(&cells.join(","));
+        output.push('\n');
+    }
+    Ok(output.into_bytes())
+}
+
+fn parse_plugin_payload(input: &[u8], export_name: &str) -> Result<serde_json::Value, LixError> {
+    serde_json::from_slice(input).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("CSV test runtime received invalid {export_name} payload: {error}"),
+        )
+    })
+}
+
+fn parse_simple_csv(data: &[u8]) -> Result<Vec<Vec<String>>, LixError> {
+    let text = std::str::from_utf8(data).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("CSV test runtime expected UTF-8 input: {error}"),
+        )
+    })?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split(',').map(str::to_string).collect())
+        .collect())
+}
+
+fn csv_cells_from_snapshot(snapshot: &serde_json::Value) -> Option<Vec<String>> {
+    snapshot
+        .get("cells")?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect()
+}
+
+fn csv_test_row_id(index: usize, cells: &[String]) -> String {
+    let mut id = format!("row-{index}");
+    for cell in cells {
+        id.push('-');
+        for ch in cell.chars() {
+            id.push(if ch.is_ascii_alphanumeric() { ch } else { '_' });
+        }
+    }
+    id
+}
+
+fn plugin_payload_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -528,7 +711,7 @@ fn build_csv_plugin_archive() -> Vec<u8> {
             "schema/csv_row.json",
             include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
         ),
-        ("plugin.wasm", &wasm),
+        ("plugin.wasm", wasm.as_slice()),
     ] {
         writer.start_file(path, options).unwrap();
         writer.write_all(bytes).unwrap();
