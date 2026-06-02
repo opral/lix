@@ -1,5 +1,5 @@
-#[expect(clippy::same_length_and_capacity)]
 mod bindings {
+    #![expect(clippy::same_length_and_capacity)]
     wit_bindgen::generate!({
         path: "../../packages/engine/wit",
         world: "plugin",
@@ -7,9 +7,8 @@ mod bindings {
 }
 pub use bindings::*;
 
-use crate::exports::lix::plugin::api::{
-    ActiveStateRow, DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
-};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 
 mod common;
 mod detect_changes;
@@ -19,112 +18,41 @@ pub mod schemas;
 pub const ROOT_ENTITY_PK: &str = "root";
 pub const DOCUMENT_SCHEMA_KEY: &str = schemas::DOCUMENT_SCHEMA_KEY;
 pub const BLOCK_SCHEMA_KEY: &str = schemas::BLOCK_SCHEMA_KEY;
+pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
 
-pub use crate::exports::lix::plugin::api::{
-    ActiveStateRow as PluginActiveStateRow, DetectStateContext as PluginDetectStateContext,
-    EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
-};
-
-struct MarkdownPlugin;
+#[derive(Clone, Copy, Debug)]
+pub struct MarkdownPlugin;
+#[cfg(target_family = "wasm")]
+export!(MarkdownPlugin);
 
 impl Plugin for MarkdownPlugin {
     fn detect_changes(
-        state: DetectStateContext,
+        state: Vec<EntityState>,
         file: File,
-    ) -> Result<Vec<EntityChange>, PluginError> {
+    ) -> Result<Vec<DetectedChange>, PluginError> {
         detect_changes::detect_changes(None, file, Some(state))
     }
 
-    fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-        render_state_context(state)
+    fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+        render_changes::render_state(empty_file(), state)
     }
 }
 
-pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    let state_context = project_state_context_from_before(before)?;
-    <MarkdownPlugin as Plugin>::detect_changes(state_context, after)
+pub(crate) fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
+    validate_single_entity_pk(&entity_pk)?;
+    Ok(entity_pk.remove(0))
 }
 
-pub fn detect_changes_with_state_context(
-    before: Option<File>,
-    after: File,
-    state_context: Option<PluginDetectStateContext>,
-) -> Result<Vec<EntityChange>, PluginError> {
-    let state_context = match state_context {
-        Some(state_context) => state_context,
-        None => project_state_context_from_before(before)?,
-    };
-    <MarkdownPlugin as Plugin>::detect_changes(state_context, after)
-}
-
-pub fn render(state_context: PluginDetectStateContext) -> Result<Vec<u8>, PluginError> {
-    <MarkdownPlugin as Plugin>::render(state_context)
-}
-
-pub fn render_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-    render_changes::render_changes(file, changes)
-}
-
-fn empty_state_context() -> PluginDetectStateContext {
-    PluginDetectStateContext {
-        active_state: Vec::new(),
+fn validate_single_entity_pk(entity_pk: &[String]) -> Result<(), PluginError> {
+    if entity_pk.len() != 1 {
+        return Err(PluginError::InvalidInput(format!(
+            "expected single-component entity_pk, got {} components",
+            entity_pk.len()
+        )));
     }
-}
-
-fn project_state_context_from_before(
-    before: Option<File>,
-) -> Result<PluginDetectStateContext, PluginError> {
-    let Some(before_file) = before else {
-        return Ok(empty_state_context());
-    };
-
-    // Compatibility helper for tests/callers using detect_changes(before, after):
-    // bootstrap a projected active-state from `before`.
-    let bootstrap = <MarkdownPlugin as Plugin>::detect_changes(empty_state_context(), before_file)?;
-
-    Ok(PluginDetectStateContext {
-        active_state: bootstrap
-            .into_iter()
-            .map(|row| PluginActiveStateRow {
-                entity_pk: row.entity_pk,
-                schema_key: row.schema_key,
-                snapshot_content: row.snapshot_content,
-                file_id: None,
-                plugin_key: None,
-                branch_id: None,
-                change_id: None,
-                metadata: None,
-                created_at: None,
-                updated_at: None,
-            })
-            .collect(),
-    })
-}
-
-fn render_state_context(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-    render_changes::render_changes(
-        empty_file(),
-        entity_changes_from_active_state(state.active_state),
-    )
-}
-
-fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
-    rows.into_iter()
-        .map(|row| EntityChange {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            snapshot_content: row.snapshot_content,
-        })
-        .collect()
+    Ok(())
 }
 
 fn empty_file() -> File {
-    File {
-        id: String::new(),
-        path: String::new(),
-        data: Vec::new(),
-    }
+    File { data: Vec::new() }
 }
-
-#[cfg(target_family = "wasm")]
-export!(MarkdownPlugin);

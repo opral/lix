@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use text_plugin::{PluginEntityChange, PluginFile, detect_changes};
+use text_plugin::{DetectedChange, File, detect_changes};
 
 pub struct DetectScenario {
     pub name: &'static str,
@@ -11,13 +11,11 @@ pub struct DetectScenario {
 pub struct RenderScenario {
     pub name: &'static str,
     pub base: Vec<u8>,
-    pub changes: Vec<PluginEntityChange>,
+    pub changes: Vec<DetectedChange>,
 }
 
-pub fn file_from_bytes(id: &str, path: &str, data: &[u8]) -> PluginFile {
-    PluginFile {
-        id: id.to_string(),
-        path: path.to_string(),
+pub fn file_from_bytes(data: &[u8]) -> File {
+    File {
         data: data.to_vec(),
     }
 }
@@ -59,33 +57,30 @@ pub fn render_scenarios() -> Vec<RenderScenario> {
         RenderScenario {
             name: "small_projection_from_empty",
             base: Vec::new(),
-            changes: detect_changes(None, file_from_bytes("f1", "/doc.txt", &small_after))
+            changes: detect_changes(None, file_from_bytes(&small_after))
                 .expect("small projection should be constructible for render bench"),
         },
         RenderScenario {
             name: "small_delta_on_base",
             base: small_before.clone(),
             changes: detect_changes(
-                Some(file_from_bytes("f1", "/doc.txt", &small_before)),
-                file_from_bytes("f1", "/doc.txt", &small_after),
+                Some(file_from_bytes(&small_before)),
+                file_from_bytes(&small_after),
             )
             .expect("small delta should be constructible for render bench"),
         },
         RenderScenario {
             name: "lockfile_projection_from_empty",
             base: Vec::new(),
-            changes: detect_changes(
-                None,
-                file_from_bytes("f1", "/yarn.lock", &lockfile_patch_1800),
-            )
-            .expect("lockfile projection should be constructible for render bench"),
+            changes: detect_changes(None, file_from_bytes(&lockfile_patch_1800))
+                .expect("lockfile projection should be constructible for render bench"),
         },
         RenderScenario {
             name: "lockfile_delta_patch_on_base",
             base: lockfile_base_1800.clone(),
             changes: detect_changes(
-                Some(file_from_bytes("f1", "/yarn.lock", &lockfile_base_1800)),
-                file_from_bytes("f1", "/yarn.lock", &lockfile_patch_1800),
+                Some(file_from_bytes(&lockfile_base_1800)),
+                file_from_bytes(&lockfile_patch_1800),
             )
             .expect("lockfile delta should be constructible for render bench"),
         },
@@ -93,8 +88,8 @@ pub fn render_scenarios() -> Vec<RenderScenario> {
             name: "lockfile_delta_move_patch_on_base",
             base: lockfile_base_2200.clone(),
             changes: detect_changes(
-                Some(file_from_bytes("f1", "/yarn.lock", &lockfile_base_2200)),
-                file_from_bytes("f1", "/yarn.lock", &lockfile_move_patch_2200),
+                Some(file_from_bytes(&lockfile_base_2200)),
+                file_from_bytes(&lockfile_move_patch_2200),
             )
             .expect("lockfile move+patch delta should be constructible for render bench"),
         },

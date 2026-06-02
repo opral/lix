@@ -1,7 +1,8 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use plugin_json_v2::{detect_changes, render_changes};
+use plugin_json_v2::JsonPlugin;
+use plugin_json_v2::exports::lix::plugin::api::Guest;
 
 fn bench_roundtrip_projection(c: &mut Criterion) {
     let mut group = c.benchmark_group("roundtrip_projection");
@@ -16,18 +17,18 @@ fn bench_roundtrip_projection(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        common::file_from_bytes("f1", "/x.json", &before),
-                        common::file_from_bytes("f1", "/x.json", &after),
+                        common::file_from_bytes(&before),
+                        common::file_from_bytes(&after),
                     )
                 },
                 |(before_file, after_file)| {
-                    let baseline = detect_changes(None, before_file.clone())
+                    let baseline = JsonPlugin::detect_changes(Vec::new(), before_file)
                         .expect("baseline detect_changes should succeed");
-                    let delta = detect_changes(Some(before_file), after_file)
+                    let before_state = common::active_state_from_changes(baseline);
+                    let delta = JsonPlugin::detect_changes(before_state.clone(), after_file)
                         .expect("delta detect_changes should succeed");
-                    let projection = common::merge_latest_state_rows(vec![baseline, delta]);
-                    let seed = common::file_from_bytes("f1", "/x.json", br#"{"stale":"cache"}"#);
-                    render_changes(seed, projection).expect("render_changes should succeed")
+                    let after_state = common::apply_changes_to_active_state(before_state, delta);
+                    JsonPlugin::render(after_state).expect("render should succeed")
                 },
                 BatchSize::SmallInput,
             );

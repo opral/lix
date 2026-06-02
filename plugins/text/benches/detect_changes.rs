@@ -16,11 +16,8 @@ fn bench_detect_changes(c: &mut Criterion) {
         group.bench_function(scenario.name, |b| {
             b.iter_batched(
                 || {
-                    let before = scenario
-                        .before
-                        .as_ref()
-                        .map(|bytes| file_from_bytes("f1", "/yarn.lock", bytes));
-                    let after = file_from_bytes("f1", "/yarn.lock", &scenario.after);
+                    let before = scenario.before.as_ref().map(|bytes| file_from_bytes(bytes));
+                    let after = file_from_bytes(&scenario.after);
                     (before, after)
                 },
                 |(before, after)| {

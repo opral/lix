@@ -1,7 +1,8 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use plugin_json_v2::detect_changes;
+use plugin_json_v2::JsonPlugin;
+use plugin_json_v2::exports::lix::plugin::api::Guest;
 
 fn bench_detect_changes(c: &mut Criterion) {
     let mut group = c.benchmark_group("detect_changes");
@@ -16,12 +17,16 @@ fn bench_detect_changes(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        common::file_from_bytes("f1", "/x.json", &before),
-                        common::file_from_bytes("f1", "/x.json", &after),
+                        common::file_from_bytes(&before),
+                        common::file_from_bytes(&after),
                     )
                 },
                 |(before_file, after_file)| {
-                    detect_changes(Some(before_file), after_file)
+                    let before_state = common::active_state_from_changes(
+                        JsonPlugin::detect_changes(Vec::new(), before_file)
+                            .expect("baseline detect_changes benchmark should succeed"),
+                    );
+                    JsonPlugin::detect_changes(before_state, after_file)
                         .expect("detect_changes benchmark should succeed")
                 },
                 BatchSize::SmallInput,

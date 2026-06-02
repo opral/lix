@@ -1,7 +1,8 @@
 use crate::ROOT_ENTITY_PK;
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
-use crate::exports::lix::plugin::api::{DetectStateContext, EntityChange, File, PluginError};
+use crate::exports::lix::plugin::api::{EntityState, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
+use crate::{DetectedChange, File, single_entity_pk};
 use markdown::mdast::{Node, Root};
 use markdown::{ParseOptions, to_mdast};
 use serde_json::Value;
@@ -36,12 +37,8 @@ struct BeforeProjection {
 pub(crate) fn detect_changes(
     _before: Option<File>,
     after: File,
-    state_context: Option<DetectStateContext>,
-) -> Result<Vec<EntityChange>, PluginError> {
-    if !is_markdown_path(&after.path) {
-        return Ok(Vec::new());
-    }
-
+    state_context: Option<Vec<EntityState>>,
+) -> Result<Vec<DetectedChange>, PluginError> {
     let after_markdown = decode_markdown_bytes(&after.data)?;
     let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
 
@@ -67,10 +64,11 @@ pub(crate) fn detect_changes(
             let before_block = before_by_id
                 .get(id)
                 .expect("key came from before_by_id.keys() iterator");
-            changes.push(EntityChange {
-                entity_pk: id.clone(),
+            changes.push(DetectedChange {
+                entity_pk: vec![id.clone()],
                 schema_key: before_block.schema_key.clone(),
                 snapshot_content: None,
+                metadata: None,
             });
         }
     }
@@ -94,10 +92,11 @@ pub(crate) fn detect_changes(
             ))
         })?;
 
-        changes.push(EntityChange {
-            entity_pk: ROOT_ENTITY_PK.to_string(),
+        changes.push(DetectedChange {
+            entity_pk: vec![ROOT_ENTITY_PK.to_string()],
             schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content),
+            metadata: None,
         });
     }
 
@@ -105,7 +104,7 @@ pub(crate) fn detect_changes(
 }
 
 fn parse_state_context_projection(
-    state_context: Option<&DetectStateContext>,
+    state_context: Option<&Vec<EntityState>>,
 ) -> Result<BeforeProjection, PluginError> {
     let Some(state_context) = state_context else {
         return Ok(BeforeProjection {
@@ -113,16 +112,12 @@ fn parse_state_context_projection(
             blocks_by_id: BTreeMap::new(),
         });
     };
-    let rows = &state_context.active_state;
-
     let mut document_order = None::<Vec<String>>;
     let mut blocks_by_id = BTreeMap::<String, ParsedBlock>::new();
 
-    for row in rows {
+    for row in state_context {
         let schema_key = row.schema_key.as_str();
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-            continue;
-        };
+        let snapshot_content = row.snapshot_content.as_str();
 
         if schema_key == DOCUMENT_SCHEMA_KEY {
             let snapshot: DocumentSnapshotContent = serde_json::from_str(snapshot_content)
@@ -147,7 +142,7 @@ fn parse_state_context_projection(
             })?;
         let fingerprint = normalize_text_for_fingerprint(&snapshot.markdown);
         let block = ParsedBlock {
-            id: row.entity_pk.clone(),
+            id: single_entity_pk(row.entity_pk.clone())?,
             schema_key: BLOCK_SCHEMA_KEY.to_string(),
             node_type: snapshot.node_type,
             node_json: snapshot.node,
@@ -445,7 +440,7 @@ fn assign_missing_ids(
         .collect()
 }
 
-fn block_upsert_change(block: &ParsedBlock) -> Result<EntityChange, PluginError> {
+fn block_upsert_change(block: &ParsedBlock) -> Result<DetectedChange, PluginError> {
     let snapshot_content = serde_json::to_string(&BlockSnapshotContent {
         id: block.id.clone(),
         node_type: block.node_type.clone(),
@@ -458,10 +453,11 @@ fn block_upsert_change(block: &ParsedBlock) -> Result<EntityChange, PluginError>
         ))
     })?;
 
-    Ok(EntityChange {
-        entity_pk: block.id.clone(),
+    Ok(DetectedChange {
+        entity_pk: vec![block.id.clone()],
         schema_key: block.schema_key.clone(),
         snapshot_content: Some(snapshot_content),
+        metadata: None,
     })
 }
 
@@ -653,12 +649,6 @@ fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, PluginError> {
                 "file.data must be valid UTF-8 markdown bytes: {error}"
             ))
         })
-}
-
-fn is_markdown_path(path: &str) -> bool {
-    std::path::Path::new(path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("mdx"))
 }
 
 fn parse_options_all_extensions() -> ParseOptions {

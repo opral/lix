@@ -1,11 +1,9 @@
 use std::fmt::Write as _;
 
-use plugin_md_v2::PluginFile;
+use plugin_md_v2::File;
 
-pub fn file_from_markdown(id: &str, path: &str, markdown: &str) -> PluginFile {
-    PluginFile {
-        id: id.to_string(),
-        path: path.to_string(),
+pub fn file_from_markdown(markdown: &str) -> File {
+    File {
         data: markdown.as_bytes().to_vec(),
     }
 }

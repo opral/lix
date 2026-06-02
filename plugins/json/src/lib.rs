@@ -1,5 +1,5 @@
-#[expect(clippy::same_length_and_capacity)]
 mod bindings {
+    #![expect(clippy::same_length_and_capacity)]
     wit_bindgen::generate!({
         path: "../../packages/engine/wit",
         world: "plugin",
@@ -7,24 +7,24 @@ mod bindings {
 }
 pub use bindings::*;
 
-use crate::exports::lix::plugin::api::{
-    ActiveStateRow, DetectStateContext, EntityChange, File, Guest as Plugin, PluginError,
-};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 pub const SCHEMA_KEY: &str = "json_pointer";
+pub const SCHEMA_PATH: &str = "schema/json_pointer.json";
+pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
 const MAX_ARRAY_INDEX: usize = 100_000;
 const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../schema/json_pointer.json");
 
 static JSON_POINTER_SCHEMA: OnceLock<Value> = OnceLock::new();
 
-pub use crate::exports::lix::plugin::api::{
-    EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
-};
-
-struct JsonPlugin;
+#[derive(Clone, Copy, Debug)]
+pub struct JsonPlugin;
+#[cfg(target_family = "wasm")]
+export!(JsonPlugin);
 
 #[derive(Debug, serde::Serialize)]
 struct SnapshotContentRef<'a> {
@@ -47,10 +47,10 @@ struct ProjectionUpsert {
     value: Value,
 }
 
-#[derive(Debug, Clone)]
-struct ProjectionTombstone {
-    pointer: String,
-    tokens: Vec<String>,
+#[derive(Debug)]
+struct ProjectionRow {
+    entity_pk: Vec<String>,
+    snapshot_content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,22 +88,22 @@ struct ProjectionTreeNode {
 
 impl Plugin for JsonPlugin {
     fn detect_changes(
-        state: DetectStateContext,
+        state: Vec<EntityState>,
         file: File,
-    ) -> Result<Vec<EntityChange>, PluginError> {
-        let before = file_from_state_context(state, &file)?;
+    ) -> Result<Vec<DetectedChange>, PluginError> {
+        let before = file_from_entity_state(state)?;
         detect_changes_from_files(before, file)
     }
 
-    fn render(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-        render_state_context(state)
+    fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+        render_entity_state(empty_file(), state)
     }
 }
 
 fn detect_changes_from_files(
     before: Option<File>,
     after: File,
-) -> Result<Vec<EntityChange>, PluginError> {
+) -> Result<Vec<DetectedChange>, PluginError> {
     let before_json = before
         .as_ref()
         .map(|file| parse_json_bytes(&file.data))
@@ -121,17 +121,27 @@ fn detect_changes_from_files(
     Ok(changes)
 }
 
-fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+fn render_entity_state(_file: File, state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+    render_projection_rows(state.into_iter().filter_map(|row| {
+        if row.schema_key == SCHEMA_KEY {
+            Some(ProjectionRow {
+                entity_pk: row.entity_pk,
+                snapshot_content: row.snapshot_content,
+            })
+        } else {
+            None
+        }
+    }))
+}
+
+fn render_projection_rows(
+    rows: impl IntoIterator<Item = ProjectionRow>,
+) -> Result<Vec<u8>, PluginError> {
     let mut seen_entity_pks = BTreeSet::new();
     let mut upserts = Vec::new();
-    let mut tombstones = Vec::new();
 
-    for change in changes {
-        if change.schema_key != SCHEMA_KEY {
-            continue;
-        }
-
-        let pointer = change.entity_pk;
+    for row in rows {
+        let pointer = single_entity_pk(row.entity_pk)?;
         if !seen_entity_pks.insert(pointer.clone()) {
             return Err(PluginError::InvalidInput(format!(
                 "duplicate entity_pk '{pointer}' for schema_key '{SCHEMA_KEY}'"
@@ -139,34 +149,17 @@ fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<
         }
 
         let tokens = pointer_tokens(&pointer)?;
-        match change.snapshot_content {
-            Some(snapshot_content) => {
-                let value = parse_snapshot_value(&snapshot_content, &pointer)?;
-                upserts.push(ProjectionUpsert {
-                    pointer,
-                    tokens,
-                    terminal_token: None,
-                    value,
-                });
-            }
-            None => {
-                tombstones.push(ProjectionTombstone { pointer, tokens });
-            }
-        }
+        let value = parse_snapshot_value(&row.snapshot_content, &pointer)?;
+        upserts.push(ProjectionUpsert {
+            pointer,
+            tokens,
+            terminal_token: None,
+            value,
+        });
     }
 
-    let has_root_tombstone = tombstones.iter().any(|entry| entry.tokens.is_empty());
-    if has_root_tombstone
-        && (upserts.iter().any(|entry| !entry.tokens.is_empty())
-            || tombstones.iter().any(|entry| !entry.tokens.is_empty()))
-    {
-        return Err(PluginError::InvalidInput(
-            "root tombstone cannot coexist with non-root projection rows".to_string(),
-        ));
-    }
     let has_root_upsert = upserts.iter().any(|entry| entry.pointer.is_empty());
-    let has_non_root_rows = upserts.iter().any(|entry| !entry.pointer.is_empty())
-        || tombstones.iter().any(|entry| !entry.tokens.is_empty());
+    let has_non_root_rows = upserts.iter().any(|entry| !entry.pointer.is_empty());
     if has_non_root_rows && !has_root_upsert {
         return Err(PluginError::InvalidInput(
             "non-root projection rows require a root row with entity_pk ''".to_string(),
@@ -174,10 +167,6 @@ fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<
     }
 
     let upsert_pointers = upserts
-        .iter()
-        .map(|entry| entry.pointer.clone())
-        .collect::<BTreeSet<_>>();
-    let tombstone_pointers = tombstones
         .iter()
         .map(|entry| entry.pointer.clone())
         .collect::<BTreeSet<_>>();
@@ -199,12 +188,6 @@ fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<
         let raw_tokens = std::mem::take(&mut upsert.tokens);
         let mut terminal_token = None;
         for token in raw_tokens {
-            if tombstone_pointers.contains(&ancestor) {
-                return Err(PluginError::InvalidInput(format!(
-                    "entity_pk '{}' conflicts with tombstoned ancestor '{ancestor}'",
-                    upsert.pointer
-                )));
-            }
             if !upsert_pointers.contains(&ancestor) {
                 return Err(PluginError::InvalidInput(format!(
                     "missing ancestor container row '{ancestor}' for entity_pk '{}'",
@@ -243,40 +226,8 @@ fn render_entity_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<
             )));
         }
     }
-    let mut canonical_tombstone_pointers = BTreeSet::new();
-    for tombstone in &tombstones {
-        let mut ancestor = String::new();
-        let mut canonical_pointer = String::new();
-        for token in &tombstone.tokens {
-            if array_child_indices.contains_key(&ancestor) {
-                if token == "-"
-                    || (!token.is_empty() && token.chars().all(|ch| ch.is_ascii_digit()))
-                {
-                    let index = parse_projection_array_index(token, &ancestor, &tombstone.pointer)?;
-                    push_pointer_segment(&mut canonical_pointer, &index.to_string());
-                } else {
-                    push_pointer_segment(&mut canonical_pointer, token);
-                }
-            } else {
-                push_pointer_segment(&mut canonical_pointer, token);
-            }
-            push_pointer_segment(&mut ancestor, token);
-        }
-
-        if canonical_upsert_pointers.contains(&canonical_pointer) {
-            return Err(PluginError::InvalidInput(format!(
-                "tombstone '{}' conflicts with live projection row '{}'",
-                tombstone.pointer, canonical_pointer
-            )));
-        }
-        if !canonical_tombstone_pointers.insert(canonical_pointer.clone()) {
-            return Err(PluginError::InvalidInput(format!(
-                "logical duplicate tombstone pointer '{canonical_pointer}' in projection rows"
-            )));
-        }
-    }
     validate_sparse_array_children(&array_child_indices)?;
-    let document = build_document_from_projection(upserts, has_root_tombstone)?;
+    let document = build_document_from_projection(upserts)?;
 
     serde_json::to_vec(&document).map_err(|error| {
         PluginError::Internal(format!("failed to serialize reconstructed JSON: {error}"))
@@ -355,7 +306,7 @@ fn diff_json(
     before: Option<&Value>,
     after: Option<&Value>,
     path: &mut Vec<String>,
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
 ) -> Result<(), PluginError> {
     if before.is_none() && after.is_none() {
         return Ok(());
@@ -458,7 +409,7 @@ fn diff_json(
 fn collect_deletions(
     value: &Value,
     path: &mut Vec<String>,
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
     include_current: bool,
 ) {
     match value {
@@ -493,7 +444,7 @@ fn collect_deletions(
 fn collect_leaves(
     value: &Value,
     path: &mut Vec<String>,
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
 ) -> Result<(), PluginError> {
     match value {
         Value::Array(items) => {
@@ -526,16 +477,17 @@ fn collect_leaves(
     }
 }
 
-fn push_deletion(changes: &mut Vec<EntityChange>, pointer: String) {
-    changes.push(EntityChange {
-        entity_pk: pointer,
+fn push_deletion(changes: &mut Vec<DetectedChange>, pointer: String) {
+    changes.push(DetectedChange {
+        entity_pk: vec![pointer],
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: None,
+        metadata: None,
     });
 }
 
 fn push_upsert(
-    changes: &mut Vec<EntityChange>,
+    changes: &mut Vec<DetectedChange>,
     pointer: String,
     value: Value,
 ) -> Result<(), PluginError> {
@@ -549,10 +501,11 @@ fn push_upsert(
         ))
     })?;
 
-    changes.push(EntityChange {
-        entity_pk: pointer,
+    changes.push(DetectedChange {
+        entity_pk: vec![pointer],
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
+        metadata: None,
     });
 
     Ok(())
@@ -714,16 +667,9 @@ fn parse_projection_array_index(
     Ok(index)
 }
 
-fn build_document_from_projection(
-    upserts: Vec<ProjectionUpsert>,
-    has_root_tombstone: bool,
-) -> Result<Value, PluginError> {
+fn build_document_from_projection(upserts: Vec<ProjectionUpsert>) -> Result<Value, PluginError> {
     if upserts.is_empty() {
-        return Ok(if has_root_tombstone {
-            Value::Null
-        } else {
-            Value::Object(Map::new())
-        });
+        return Ok(Value::Object(Map::new()));
     }
 
     let mut index_by_pointer = HashMap::with_capacity(upserts.len());
@@ -842,70 +788,33 @@ fn materialize_projection_node(
     Ok(value)
 }
 
-fn file_from_state_context(
-    state: DetectStateContext,
-    template: &File,
-) -> Result<Option<File>, PluginError> {
-    let active_state = state.active_state;
-    if active_state.is_empty() {
+fn file_from_entity_state(state: Vec<EntityState>) -> Result<Option<File>, PluginError> {
+    if state.is_empty() {
         return Ok(None);
     }
 
-    let data = render_active_state_rows(active_state)?;
     Ok(Some(File {
-        id: template.id.clone(),
-        path: template.path.clone(),
-        data,
+        data: render_entity_state(empty_file(), state)?,
     }))
 }
 
-fn render_state_context(state: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-    render_active_state_rows(state.active_state)
+fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
+    validate_single_entity_pk(&entity_pk)?;
+    Ok(entity_pk.remove(0))
 }
 
-fn render_active_state_rows(rows: Vec<ActiveStateRow>) -> Result<Vec<u8>, PluginError> {
-    render_entity_changes(empty_file(), entity_changes_from_active_state(rows))
-}
-
-fn entity_changes_from_active_state(rows: Vec<ActiveStateRow>) -> Vec<EntityChange> {
-    rows.into_iter()
-        .map(|row| EntityChange {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            snapshot_content: row.snapshot_content,
-        })
-        .collect()
+fn validate_single_entity_pk(entity_pk: &[String]) -> Result<(), PluginError> {
+    if entity_pk.len() != 1 {
+        return Err(PluginError::InvalidInput(format!(
+            "expected single-component entity_pk, got {} components",
+            entity_pk.len()
+        )));
+    }
+    Ok(())
 }
 
 fn empty_file() -> File {
-    File {
-        id: String::new(),
-        path: String::new(),
-        data: Vec::new(),
-    }
-}
-
-pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    detect_changes_from_files(before, after)
-}
-
-pub fn detect_changes_with_state_context(
-    before: Option<File>,
-    after: File,
-    state_context: Option<DetectStateContext>,
-) -> Result<Vec<EntityChange>, PluginError> {
-    match state_context {
-        Some(state) => <JsonPlugin as Plugin>::detect_changes(state, after),
-        None => detect_changes_from_files(before, after),
-    }
-}
-
-pub fn render(state_context: DetectStateContext) -> Result<Vec<u8>, PluginError> {
-    <JsonPlugin as Plugin>::render(state_context)
-}
-
-pub fn render_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
-    render_entity_changes(file, changes)
+    File { data: Vec::new() }
 }
 
 pub fn schema_json() -> &'static str {
@@ -917,6 +826,3 @@ pub fn schema_definition() -> &'static Value {
         serde_json::from_str(JSON_POINTER_SCHEMA_JSON).expect("json pointer schema must be valid")
     })
 }
-
-#[cfg(target_family = "wasm")]
-export!(JsonPlugin);

@@ -2,11 +2,15 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::file_from_json;
-use plugin_json_v2::{PluginEntityChange, SCHEMA_KEY, detect_changes, render_changes};
+use common::{
+    active_state_from_changes, apply_changes_to_active_state, detect_changes_from_files,
+    file_from_json,
+};
+use plugin_json_v2::exports::lix::plugin::api::Guest;
+use plugin_json_v2::{DetectedChange, JsonPlugin, SCHEMA_KEY};
 use serde_json::Value;
 
-fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<PluginEntityChange> {
+fn merge_latest_state_rows(changesets: Vec<Vec<DetectedChange>>) -> Vec<DetectedChange> {
     let mut latest = BTreeMap::new();
     for changes in changesets {
         for change in changes {
@@ -22,23 +26,19 @@ fn merge_latest_state_rows(changesets: Vec<Vec<PluginEntityChange>>) -> Vec<Plug
     latest.into_values().collect()
 }
 
-fn projected_changes_for_transition(
-    before_json: &str,
-    after_json: &str,
-) -> Vec<PluginEntityChange> {
-    let baseline = detect_changes(None, file_from_json("f1", "/x.json", before_json))
+fn projected_changes_for_transition(before_json: &str, after_json: &str) -> Vec<DetectedChange> {
+    let baseline = detect_changes_from_files(None, file_from_json(before_json))
         .expect("baseline detect_changes should succeed");
-    let delta = detect_changes(
-        Some(file_from_json("f1", "/x.json", before_json)),
-        file_from_json("f1", "/x.json", after_json),
+    let delta = detect_changes_from_files(
+        Some(file_from_json(before_json)),
+        file_from_json(after_json),
     )
     .expect("delta detect_changes should succeed");
     merge_latest_state_rows(vec![baseline, delta])
 }
 
-fn render_projection(changes: Vec<PluginEntityChange>) -> Value {
-    let seed = file_from_json("f1", "/x.json", r#"{"stale":"cache"}"#);
-    let reconstructed = render_changes(seed, changes).expect("render_changes should succeed");
+fn render_projection(changes: Vec<DetectedChange>) -> Value {
+    let reconstructed = common::render_projection(changes).expect("render should succeed");
     serde_json::from_slice(&reconstructed).expect("reconstructed bytes should parse")
 }
 
@@ -290,4 +290,29 @@ fn roundtrip_reconstructs_with_lexicographic_entity_pk_order() {
     let reconstructed = render_projection(projected);
     let expected: Value = serde_json::from_str(after_json).expect("expected JSON should parse");
     assert_eq!(reconstructed, expected);
+}
+
+#[test]
+fn guest_interface_applies_delta_to_active_state_and_renders_json() {
+    let before_json = r#"{"keep":1,"drop":{"nested":true},"list":["a","b"]}"#;
+    let after_json = r#"{"keep":2,"list":["a"],"add":{"x":1}}"#;
+
+    let before_state = active_state_from_changes(
+        JsonPlugin::detect_changes(Vec::new(), file_from_json(before_json))
+            .expect("initial detect_changes should succeed"),
+    );
+
+    let delta = JsonPlugin::detect_changes(before_state.clone(), file_from_json(after_json))
+        .expect("delta detect_changes should succeed");
+    assert!(
+        delta.iter().any(|change| change.snapshot_content.is_none()),
+        "delta should include tombstones for removed JSON projection rows"
+    );
+
+    let after_state = apply_changes_to_active_state(before_state, delta);
+    let output = JsonPlugin::render(after_state).expect("render should succeed");
+
+    let actual: Value = serde_json::from_slice(&output).expect("rendered JSON should parse");
+    let expected: Value = serde_json::from_str(after_json).expect("expected JSON should parse");
+    assert_eq!(actual, expected);
 }

@@ -1,5 +1,8 @@
+use plugin_md_v2::MANIFEST_JSON;
 use plugin_md_v2::schemas::{
-    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, schema_definitions, schema_jsons,
+    BLOCK_SCHEMA_KEY, BLOCK_SCHEMA_PATH, DOCUMENT_SCHEMA_KEY, DOCUMENT_SCHEMA_PATH,
+    block_schema_definition, block_schema_json, document_schema_definition, document_schema_json,
+    schema_definitions, schema_jsons,
 };
 use std::collections::BTreeSet;
 
@@ -35,4 +38,54 @@ fn schema_json_accessors_return_expected_text() {
     let raw = schema_jsons().join("\n");
     assert!(raw.contains("\"x-lix-key\": \"markdown_v2_document\""));
     assert!(raw.contains("\"x-lix-key\": \"markdown_v2_block\""));
+    assert_eq!(
+        document_schema_definition()
+            .get("x-lix-key")
+            .and_then(serde_json::Value::as_str),
+        Some(DOCUMENT_SCHEMA_KEY)
+    );
+    assert_eq!(
+        block_schema_definition()
+            .get("x-lix-key")
+            .and_then(serde_json::Value::as_str),
+        Some(BLOCK_SCHEMA_KEY)
+    );
+    assert!(document_schema_json().contains("\"order\""));
+    assert!(block_schema_json().contains("\"markdown\""));
+}
+
+#[test]
+fn manifest_json_has_expected_plugin_identity() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(MANIFEST_JSON).expect("manifest must be valid JSON");
+    assert_eq!(
+        manifest
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .expect("manifest.key must be string"),
+        "plugin_md_v2"
+    );
+    assert_eq!(
+        manifest
+            .get("runtime")
+            .and_then(serde_json::Value::as_str)
+            .expect("manifest.runtime must be string"),
+        "wasm-component-v1"
+    );
+    assert_eq!(
+        manifest
+            .get("match")
+            .and_then(|value| value.get("path_glob"))
+            .and_then(serde_json::Value::as_str)
+            .expect("manifest.match.path_glob must be string"),
+        "*.{md,mdx}"
+    );
+    let schemas = manifest
+        .get("schemas")
+        .and_then(serde_json::Value::as_array)
+        .expect("manifest.schemas must be an array")
+        .iter()
+        .map(|value| value.as_str().expect("schema paths must be strings"))
+        .collect::<Vec<_>>();
+    assert_eq!(schemas, [DOCUMENT_SCHEMA_PATH, BLOCK_SCHEMA_PATH]);
 }
