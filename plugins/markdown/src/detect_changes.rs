@@ -1,6 +1,6 @@
 use crate::ROOT_ENTITY_PK;
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
-use crate::exports::lix::plugin::api::PluginError;
+use crate::exports::lix::plugin::api::{EntityState, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 use crate::{DetectedChange, File, single_entity_pk};
 use markdown::mdast::{Node, Root};
@@ -37,7 +37,7 @@ struct BeforeProjection {
 pub(crate) fn detect_changes(
     _before: Option<File>,
     after: File,
-    state_context: Option<Vec<DetectedChange>>,
+    state_context: Option<Vec<EntityState>>,
 ) -> Result<Vec<DetectedChange>, PluginError> {
     let after_markdown = decode_markdown_bytes(&after.data)?;
     let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
@@ -104,7 +104,7 @@ pub(crate) fn detect_changes(
 }
 
 fn parse_state_context_projection(
-    state_context: Option<&Vec<DetectedChange>>,
+    state_context: Option<&Vec<EntityState>>,
 ) -> Result<BeforeProjection, PluginError> {
     let Some(state_context) = state_context else {
         return Ok(BeforeProjection {
@@ -117,9 +117,7 @@ fn parse_state_context_projection(
 
     for row in state_context {
         let schema_key = row.schema_key.as_str();
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-            continue;
-        };
+        let snapshot_content = row.snapshot_content.as_str();
 
         if schema_key == DOCUMENT_SCHEMA_KEY {
             let snapshot: DocumentSnapshotContent = serde_json::from_str(snapshot_content)

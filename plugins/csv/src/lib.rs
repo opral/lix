@@ -22,8 +22,8 @@ use crate::order_key::OrderKey;
 use itertools::Itertools;
 use rand::Rng;
 use serde_json::Value;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::str;
 
 pub const ROOT_ENTITY_PK: &str = "root";

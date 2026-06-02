@@ -1,7 +1,8 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use plugin_json_v2::render_changes;
+use plugin_json_v2::JsonPlugin;
+use plugin_json_v2::exports::lix::plugin::api::Guest;
 
 fn bench_render_changes(c: &mut Criterion) {
     let mut group = c.benchmark_group("render_changes");
@@ -12,16 +13,12 @@ fn bench_render_changes(c: &mut Criterion) {
         ("medium", common::dataset_medium()),
         ("large", common::dataset_large()),
     ] {
-        let projection = common::projection_for_transition(&before, &after);
-        let seed = common::file_from_bytes(br#"{"stale":"cache"}"#);
+        let active_state = common::active_state_for_transition(&before, &after);
 
         group.bench_function(name, |b| {
             b.iter_batched(
-                || (seed.clone(), projection.clone()),
-                |(seed_file, rows)| {
-                    render_changes(seed_file, rows)
-                        .expect("render_changes benchmark should succeed")
-                },
+                || active_state.clone(),
+                |rows| JsonPlugin::render(rows).expect("render benchmark should succeed"),
                 BatchSize::SmallInput,
             );
         });

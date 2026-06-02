@@ -1,27 +1,25 @@
 mod common;
 
 use common::{
-    StateRows, collect_state_rows, decode_utf8, empty_file, file_from_markdown, is_document_change,
-    merge_delta,
+    StateRows, active_state_from_changes, apply_changes_to_active_state, collect_state_rows,
+    decode_utf8, detect_changes_from_files, file_from_markdown, is_document_change, merge_delta,
 };
-use plugin_md_v2::{
-    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, detect_changes,
-    detect_changes_with_state_context, render_changes,
-};
-
-fn to_state_context(rows: &[DetectedChange]) -> Vec<DetectedChange> {
-    rows.to_vec()
-}
+use plugin_md_v2::exports::lix::plugin::api::Guest;
+use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, MarkdownPlugin};
 
 fn detect_with_state_context(
     state: &StateRows,
-    before: plugin_md_v2::File,
+    _before: plugin_md_v2::File,
     after: plugin_md_v2::File,
 ) -> Vec<DetectedChange> {
-    let rows = collect_state_rows(state);
-    let ctx = to_state_context(&rows);
-    detect_changes_with_state_context(Some(before), after, Some(ctx))
-        .expect("detect_changes_with_state_context should succeed")
+    let active_state = active_state_from_changes(collect_state_rows(state));
+    MarkdownPlugin::detect_changes(active_state, after)
+        .expect("MarkdownPlugin::detect_changes should succeed")
+}
+
+fn render_state(state: &StateRows) -> Vec<u8> {
+    MarkdownPlugin::render(active_state_from_changes(collect_state_rows(state)))
+        .expect("MarkdownPlugin::render should succeed")
 }
 
 fn count_tombstones(changes: &[DetectedChange]) -> usize {
@@ -70,13 +68,13 @@ fn roundtrip_file_detect_state_render_markdown() {
     let markdown = "# Title\n\nParagraph one.\n\nParagraph two.\n";
     let file = file_from_markdown(markdown);
 
-    let delta = detect_changes(None, file).expect("detect_changes should succeed");
+    let delta =
+        MarkdownPlugin::detect_changes(Vec::new(), file).expect("detect_changes should succeed");
 
     let mut state = StateRows::new();
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
 
     assert_eq!(decode_utf8(materialized), markdown);
 }
@@ -89,12 +87,11 @@ fn roundtrip_edit_move_delete_across_block_rows() {
     let before_file = file_from_markdown(before_markdown);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
-    let delta = detect_changes(Some(before_file), file_from_markdown(after_markdown))
-        .expect("delta detect should succeed");
+    let delta = detect_with_state_context(&state, before_file, file_from_markdown(after_markdown));
 
     assert!(
         delta
@@ -110,8 +107,7 @@ fn roundtrip_edit_move_delete_across_block_rows() {
 
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
 
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
@@ -121,7 +117,7 @@ fn roundtrip_move_only_updates_document_order() {
     let before_markdown = "First block.\n\nSecond block.\n";
     let after_markdown = "Second block.\n\nFirst block.\n";
 
-    let delta = detect_changes(
+    let delta = detect_changes_from_files(
         Some(file_from_markdown(before_markdown)),
         file_from_markdown(after_markdown),
     )
@@ -143,7 +139,8 @@ fn roundtrip_multi_step_evolution() {
 
     let mut state = StateRows::new();
 
-    let delta_a = detect_changes(None, a_file.clone()).expect("detect_changes should succeed");
+    let delta_a = MarkdownPlugin::detect_changes(Vec::new(), a_file.clone())
+        .expect("detect_changes should succeed");
     merge_delta(&mut state, delta_a);
 
     let delta_b = detect_with_state_context(&state, a_file, b_file.clone());
@@ -152,8 +149,7 @@ fn roundtrip_multi_step_evolution() {
     let delta_c = detect_with_state_context(&state, b_file, c_file);
     merge_delta(&mut state, delta_c);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
 
     assert_eq!(decode_utf8(materialized), c);
 }
@@ -164,16 +160,14 @@ fn roundtrip_delete_all_blocks_to_empty_document() {
     let before_file = file_from_markdown(before);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
-    let delta = detect_changes(Some(before_file), file_from_markdown(""))
-        .expect("detect_changes should succeed");
+    let delta = detect_with_state_context(&state, before_file, file_from_markdown(""));
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
 
     assert_eq!(decode_utf8(materialized), "");
 }
@@ -185,8 +179,8 @@ fn roundtrip_list_internal_edit_keeps_top_level_block_model() {
     let before_file = file_from_markdown(before);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
     let delta = detect_with_state_context(&state, before_file, file_from_markdown(after));
@@ -198,8 +192,7 @@ fn roundtrip_list_internal_edit_keeps_top_level_block_model() {
 
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
     assert_eq!(decode_utf8(materialized), after);
 }
 
@@ -212,8 +205,8 @@ fn roundtrip_table_row_add_remove_reorder() {
 
     let mut state = StateRows::new();
     let initial_file = file_from_markdown(initial);
-    let bootstrap =
-        detect_changes(None, initial_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), initial_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
     let delta_add = detect_with_state_context(&state, initial_file, file_from_markdown(add));
@@ -245,8 +238,7 @@ fn roundtrip_table_row_add_remove_reorder() {
     assert_eq!(upsert_block_types(&delta_remove), vec!["table".to_string()]);
     merge_delta(&mut state, delta_remove);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
     assert_eq!(decode_utf8(materialized), remove);
 }
 
@@ -257,8 +249,8 @@ fn roundtrip_large_shuffle_500_with_state_context_low_noise() {
     let before_file = file_from_markdown(&before_markdown);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
     let mut after = paragraphs;
@@ -271,8 +263,7 @@ fn roundtrip_large_shuffle_500_with_state_context_low_noise() {
     assert_eq!(count_document_rows(&delta), 1);
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
 
@@ -283,8 +274,8 @@ fn roundtrip_large_tiny_edits_500_with_state_context_low_noise() {
     let before_file = file_from_markdown(&before_markdown);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
     let mut after = paragraphs;
@@ -299,8 +290,7 @@ fn roundtrip_large_tiny_edits_500_with_state_context_low_noise() {
     assert_eq!(count_document_rows(&delta), 0);
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
 
@@ -311,8 +301,8 @@ fn roundtrip_large_duplicate_edit_with_state_context_low_noise() {
     let before_file = file_from_markdown(&before_markdown);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
     let mut after = before_paragraphs;
@@ -325,8 +315,7 @@ fn roundtrip_large_duplicate_edit_with_state_context_low_noise() {
     assert!(count_document_rows(&delta) <= 1);
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
     assert_eq!(decode_utf8(materialized), after_markdown);
 }
 
@@ -337,8 +326,8 @@ fn roundtrip_move_insert_delete_large_with_state_context_low_noise() {
     let before_file = file_from_markdown(&before_markdown);
 
     let mut state = StateRows::new();
-    let bootstrap =
-        detect_changes(None, before_file.clone()).expect("bootstrap detect should succeed");
+    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
+        .expect("bootstrap detect should succeed");
     merge_delta(&mut state, bootstrap);
 
     let moved = paragraphs[450..460].to_vec();
@@ -366,7 +355,28 @@ fn roundtrip_move_insert_delete_large_with_state_context_low_noise() {
     assert!(tombstones + upserts <= 2);
     merge_delta(&mut state, delta);
 
-    let materialized = render_changes(empty_file(), collect_state_rows(&state))
-        .expect("render_changes should succeed");
+    let materialized = render_state(&state);
     assert_eq!(decode_utf8(materialized), after_markdown);
+}
+
+#[test]
+fn guest_interface_uses_active_state_for_low_noise_edit_and_render() {
+    let before = "Hello\n\nWorld\n";
+    let after = "Hello updated\n\nWorld\n";
+
+    let before_state = active_state_from_changes(
+        MarkdownPlugin::detect_changes(Vec::new(), file_from_markdown(before))
+            .expect("initial detect_changes should succeed"),
+    );
+
+    let delta = MarkdownPlugin::detect_changes(before_state.clone(), file_from_markdown(after))
+        .expect("delta detect_changes should succeed");
+    assert_eq!(count_tombstones(&delta), 0);
+    assert_eq!(count_upserts(&delta), 1);
+    assert_eq!(count_document_rows(&delta), 0);
+
+    let after_state = apply_changes_to_active_state(before_state, delta);
+    let materialized = MarkdownPlugin::render(after_state).expect("render should succeed");
+
+    assert_eq!(decode_utf8(materialized), after);
 }

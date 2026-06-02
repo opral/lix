@@ -1,29 +1,45 @@
 use crate::ROOT_ENTITY_PK;
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
-use crate::exports::lix::plugin::api::PluginError;
+use crate::exports::lix::plugin::api::{EntityState, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
-use crate::{DetectedChange, File, single_entity_pk};
+use crate::{File, single_entity_pk};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn render_changes(
+struct RenderRow {
+    entity_pk: Vec<String>,
+    schema_key: String,
+    snapshot_content: String,
+}
+
+pub(crate) fn render_state(file: File, state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+    render_rows(
+        file,
+        state.into_iter().map(|row| RenderRow {
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            snapshot_content: row.snapshot_content,
+        }),
+    )
+}
+
+fn render_rows(
     file: File,
-    changes: Vec<DetectedChange>,
+    rows: impl IntoIterator<Item = RenderRow>,
 ) -> Result<Vec<u8>, PluginError> {
     let mut document: Option<DocumentSnapshotContent> = None;
     let mut blocks_by_id: BTreeMap<String, BlockSnapshotContent> = BTreeMap::new();
     let mut seen_block_ids = BTreeSet::new();
 
-    for change in changes {
-        if change.schema_key != DOCUMENT_SCHEMA_KEY && change.schema_key != BLOCK_SCHEMA_KEY {
+    for row in rows {
+        if row.schema_key != DOCUMENT_SCHEMA_KEY && row.schema_key != BLOCK_SCHEMA_KEY {
             continue;
         }
 
-        if change.schema_key == DOCUMENT_SCHEMA_KEY {
-            let entity_pk = single_entity_pk(change.entity_pk)?;
+        if row.schema_key == DOCUMENT_SCHEMA_KEY {
+            let entity_pk = single_entity_pk(row.entity_pk)?;
             if entity_pk != ROOT_ENTITY_PK {
                 return Err(PluginError::InvalidInput(format!(
-                    "unsupported entity_pk '{}' for schema_key '{}', expected '{}'",
-                    entity_pk, DOCUMENT_SCHEMA_KEY, ROOT_ENTITY_PK
+                    "unsupported entity_pk '{entity_pk}' for schema_key '{DOCUMENT_SCHEMA_KEY}', expected '{ROOT_ENTITY_PK}'"
                 )));
             }
             if document.is_some() {
@@ -32,50 +48,35 @@ pub(crate) fn render_changes(
                 )));
             }
 
-            let snapshot = match change.snapshot_content {
-                Some(raw) => {
-                    let parsed: DocumentSnapshotContent =
-                        serde_json::from_str(&raw).map_err(|error| {
-                            PluginError::InvalidInput(format!(
-                                "invalid snapshot_content for entity_pk '{ROOT_ENTITY_PK}': {error}"
-                            ))
-                        })?;
-                    if parsed.id != ROOT_ENTITY_PK {
-                        return Err(PluginError::InvalidInput(format!(
-                            "document snapshot id '{}' does not match expected '{}'",
-                            parsed.id, ROOT_ENTITY_PK
-                        )));
-                    }
-                    parsed
-                }
-                None => DocumentSnapshotContent {
-                    id: ROOT_ENTITY_PK.to_string(),
-                    order: Vec::new(),
-                },
-            };
+            let snapshot: DocumentSnapshotContent = serde_json::from_str(&row.snapshot_content)
+                .map_err(|error| {
+                    PluginError::InvalidInput(format!(
+                        "invalid snapshot_content for entity_pk '{ROOT_ENTITY_PK}': {error}"
+                    ))
+                })?;
+            if snapshot.id != ROOT_ENTITY_PK {
+                return Err(PluginError::InvalidInput(format!(
+                    "document snapshot id '{}' does not match expected '{}'",
+                    snapshot.id, ROOT_ENTITY_PK
+                )));
+            }
 
             document = Some(snapshot);
             continue;
         }
 
         // BLOCK_SCHEMA_KEY
-        let entity_pk = single_entity_pk(change.entity_pk)?;
+        let entity_pk = single_entity_pk(row.entity_pk)?;
         if !seen_block_ids.insert(entity_pk.clone()) {
             return Err(PluginError::InvalidInput(format!(
-                "duplicate entity_pk '{}' for schema_key '{}'",
-                entity_pk, BLOCK_SCHEMA_KEY
+                "duplicate entity_pk '{entity_pk}' for schema_key '{BLOCK_SCHEMA_KEY}'"
             )));
         }
 
-        let Some(snapshot_content) = change.snapshot_content else {
-            continue;
-        };
-
         let snapshot: BlockSnapshotContent =
-            serde_json::from_str(&snapshot_content).map_err(|error| {
+            serde_json::from_str(&row.snapshot_content).map_err(|error| {
                 PluginError::InvalidInput(format!(
-                    "invalid snapshot_content for entity_pk '{}': {error}",
-                    entity_pk
+                    "invalid snapshot_content for entity_pk '{entity_pk}': {error}"
                 ))
             })?;
 

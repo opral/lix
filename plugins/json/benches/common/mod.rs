@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-use plugin_json_v2::{DetectedChange, File, SCHEMA_KEY, detect_changes};
+use plugin_json_v2::exports::lix::plugin::api::{EntityState, Guest};
+use plugin_json_v2::{DetectedChange, File, JsonPlugin, SCHEMA_KEY};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -109,12 +110,49 @@ pub fn merge_latest_state_rows(changesets: Vec<Vec<DetectedChange>>) -> Vec<Dete
     latest.into_values().collect()
 }
 
-pub fn projection_for_transition(before: &[u8], after: &[u8]) -> Vec<DetectedChange> {
+pub fn active_state_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {
+    apply_changes_to_active_state(Vec::new(), changes)
+}
+
+pub fn apply_changes_to_active_state(
+    active_state: Vec<EntityState>,
+    changes: Vec<DetectedChange>,
+) -> Vec<EntityState> {
+    let mut rows = active_state
+        .into_iter()
+        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
+        .collect::<BTreeMap<_, _>>();
+
+    for change in changes {
+        let key = (change.schema_key.clone(), change.entity_pk.clone());
+        match change.snapshot_content {
+            Some(snapshot_content) => {
+                rows.insert(
+                    key,
+                    EntityState {
+                        entity_pk: change.entity_pk,
+                        schema_key: change.schema_key,
+                        snapshot_content,
+                        metadata: change.metadata,
+                    },
+                );
+            }
+            None => {
+                rows.remove(&key);
+            }
+        }
+    }
+
+    rows.into_values().collect()
+}
+
+pub fn active_state_for_transition(before: &[u8], after: &[u8]) -> Vec<EntityState> {
     let before_file = file_from_bytes(before);
     let after_file = file_from_bytes(after);
-    let baseline =
-        detect_changes(None, before_file.clone()).expect("baseline detect_changes should work");
-    let delta =
-        detect_changes(Some(before_file), after_file).expect("delta detect_changes should work");
-    merge_latest_state_rows(vec![baseline, delta])
+    let baseline = JsonPlugin::detect_changes(Vec::new(), before_file)
+        .expect("baseline detect_changes should work");
+    let before_state = active_state_from_changes(baseline);
+    let delta = JsonPlugin::detect_changes(before_state.clone(), after_file)
+        .expect("delta detect_changes should work");
+    apply_changes_to_active_state(before_state, delta)
 }

@@ -1,7 +1,7 @@
 mod common;
 
-use common::{file_from_json, snapshot_content};
-use plugin_json_v2::{DetectedChange, PluginError, SCHEMA_KEY, render_changes};
+use common::snapshot_content;
+use plugin_json_v2::{DetectedChange, PluginError, SCHEMA_KEY};
 use serde_json::Value;
 
 fn with_root_object(mut changes: Vec<DetectedChange>) -> Vec<DetectedChange> {
@@ -20,8 +20,7 @@ fn with_root_object(mut changes: Vec<DetectedChange>) -> Vec<DetectedChange> {
 }
 
 #[test]
-fn applies_insert_update_delete() {
-    let file = file_from_json(r#"{"stale":"cache"}"#);
+fn applies_insert_update() {
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/Name".to_string()],
@@ -38,16 +37,10 @@ fn applies_insert_update_delete() {
             snapshot_content: Some(snapshot_content("/Age", Value::Number(20.into()))),
             metadata: None,
         },
-        DetectedChange {
-            entity_pk: vec!["/City".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
     ];
 
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
+    let output = common::render_projection(with_root_object(changes))
+        .expect("render_changes should succeed");
 
     let parsed: Value = serde_json::from_slice(&output).expect("output should be valid JSON");
     assert_eq!(parsed, serde_json::json!({"Name":"Samuel","Age":20}));
@@ -55,7 +48,6 @@ fn applies_insert_update_delete() {
 
 #[test]
 fn applies_array_changes_with_indexes() {
-    let file = file_from_json(r#"{"stale":"cache"}"#);
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/list".to_string()],
@@ -89,8 +81,8 @@ fn applies_array_changes_with_indexes() {
         },
     ];
 
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
+    let output = common::render_projection(with_root_object(changes))
+        .expect("render_changes should succeed");
 
     let parsed: Value = serde_json::from_slice(&output).expect("output should be valid JSON");
     assert_eq!(parsed, serde_json::json!({"list":["a","x","c","d"]}));
@@ -98,7 +90,6 @@ fn applies_array_changes_with_indexes() {
 
 #[test]
 fn rejects_snapshot_missing_path() {
-    let file = file_from_json(r#"{"foo":1}"#);
     let changes = vec![DetectedChange {
         entity_pk: vec!["/foo".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
@@ -106,8 +97,8 @@ fn rejects_snapshot_missing_path() {
         metadata: None,
     }];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("must contain 'path'"));
@@ -120,7 +111,6 @@ fn rejects_snapshot_missing_path() {
 
 #[test]
 fn infers_array_parent_for_numeric_pointer_segment() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/team".to_string()],
@@ -148,31 +138,14 @@ fn infers_array_parent_for_numeric_pointer_segment() {
         },
     ];
 
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
+    let output = common::render_projection(with_root_object(changes))
+        .expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"team":[{"name":"Ada"}]}));
 }
 
 #[test]
-fn removing_root_sets_null() {
-    let file = file_from_json(r#"{"foo":1}"#);
-    let changes = vec![DetectedChange {
-        entity_pk: vec!["".to_string()],
-        schema_key: SCHEMA_KEY.to_string(),
-        snapshot_content: None,
-        metadata: None,
-    }];
-
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
-    let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
-    assert_eq!(parsed, Value::Null);
-}
-
-#[test]
 fn rejects_duplicate_entity_pks_in_projection_set() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/foo".to_string()],
@@ -188,8 +161,8 @@ fn rejects_duplicate_entity_pks_in_projection_set() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("duplicate entity_pk"));
@@ -202,7 +175,6 @@ fn rejects_duplicate_entity_pks_in_projection_set() {
 
 #[test]
 fn rejects_mismatched_snapshot_path() {
-    let file = file_from_json(r#"{"foo":1}"#);
     let changes = vec![DetectedChange {
         entity_pk: vec!["/foo".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
@@ -210,8 +182,8 @@ fn rejects_mismatched_snapshot_path() {
         metadata: None,
     }];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("snapshot path '/bar'"));
@@ -224,7 +196,6 @@ fn rejects_mismatched_snapshot_path() {
 
 #[test]
 fn rejects_invalid_json_pointer_escape() {
-    let file = file_from_json(r#"{"foo":1}"#);
     let changes = vec![DetectedChange {
         entity_pk: vec!["/foo/~2bar".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
@@ -232,8 +203,8 @@ fn rejects_invalid_json_pointer_escape() {
         metadata: None,
     }];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("invalid JSON pointer escape"));
@@ -246,7 +217,6 @@ fn rejects_invalid_json_pointer_escape() {
 
 #[test]
 fn rejects_invalid_dash_placement() {
-    let file = file_from_json(r#"{"list":[{"x":"a"}]}"#);
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/list".to_string()],
@@ -265,8 +235,8 @@ fn rejects_invalid_dash_placement() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("non-canonical '-' array token"));
@@ -279,7 +249,6 @@ fn rejects_invalid_dash_placement() {
 
 #[test]
 fn allows_proto_like_keys_when_projection_rows_are_consistent() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/__proto__".to_string()],
@@ -301,75 +270,14 @@ fn allows_proto_like_keys_when_projection_rows_are_consistent() {
         },
     ];
 
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
+    let output = common::render_projection(with_root_object(changes))
+        .expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"__proto__":{"x":"pwn"}}));
 }
 
 #[test]
-fn rejects_descendant_upsert_under_tombstoned_ancestor() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/a".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/a/b".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/a/b", Value::Number(1.into()))),
-            metadata: None,
-        },
-    ];
-
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
-    match error {
-        PluginError::InvalidInput(message) => {
-            assert!(message.contains("conflicts with tombstoned ancestor"));
-        }
-        PluginError::Internal(message) => {
-            panic!("expected InvalidInput, got Internal({message})");
-        }
-    }
-}
-
-#[test]
-fn rejects_root_tombstone_with_non_root_rows() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/a".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/a", Value::Number(1.into()))),
-            metadata: None,
-        },
-    ];
-
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
-    match error {
-        PluginError::InvalidInput(message) => {
-            assert!(message.contains("root tombstone cannot coexist"));
-        }
-        PluginError::Internal(message) => {
-            panic!("expected InvalidInput, got Internal({message})");
-        }
-    }
-}
-
-#[test]
 fn rejects_snapshot_path_non_string() {
-    let file = file_from_json(r"{}");
     let changes = vec![DetectedChange {
         entity_pk: vec!["/safe".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
@@ -377,8 +285,8 @@ fn rejects_snapshot_path_non_string() {
         metadata: None,
     }];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("must be a string"));
@@ -391,15 +299,13 @@ fn rejects_snapshot_path_non_string() {
 
 #[test]
 fn rejects_snapshot_with_additional_properties_or_missing_value() {
-    let file = file_from_json(r"{}");
-
     let with_extra = vec![DetectedChange {
         entity_pk: vec!["/safe".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
         snapshot_content: Some(r#"{"path":"/safe","value":1,"extra":true}"#.to_string()),
         metadata: None,
     }];
-    let error = render_changes(file.clone(), with_root_object(with_extra))
+    let error = common::render_projection(with_root_object(with_extra))
         .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
@@ -416,7 +322,7 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
         snapshot_content: Some(r#"{"path":"/safe"}"#.to_string()),
         metadata: None,
     }];
-    let error = render_changes(file, with_root_object(missing_value))
+    let error = common::render_projection(with_root_object(missing_value))
         .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
@@ -430,7 +336,6 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
 
 #[test]
 fn rejects_numeric_child_without_parent_container_row() {
-    let file = file_from_json(r"{}");
     let changes = vec![DetectedChange {
         entity_pk: vec!["/foo/0".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
@@ -438,8 +343,8 @@ fn rejects_numeric_child_without_parent_container_row() {
         metadata: None,
     }];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("missing ancestor container row"));
@@ -452,7 +357,6 @@ fn rejects_numeric_child_without_parent_container_row() {
 
 #[test]
 fn rejects_huge_array_index_growth() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/arr".to_string()],
@@ -471,8 +375,8 @@ fn rejects_huge_array_index_growth() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("exceeds max supported index"));
@@ -485,7 +389,6 @@ fn rejects_huge_array_index_growth() {
 
 #[test]
 fn rejects_leading_zero_array_indices_under_array_ancestor() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/arr".to_string()],
@@ -501,8 +404,8 @@ fn rejects_leading_zero_array_indices_under_array_ancestor() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("non-canonical array index token"));
@@ -515,7 +418,6 @@ fn rejects_leading_zero_array_indices_under_array_ancestor() {
 
 #[test]
 fn accepts_canonical_zero_array_index() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/arr".to_string()],
@@ -531,15 +433,14 @@ fn accepts_canonical_zero_array_index() {
         },
     ];
 
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
+    let output = common::render_projection(with_root_object(changes))
+        .expect("render_changes should succeed");
     let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
     assert_eq!(parsed, serde_json::json!({"arr":["A"]}));
 }
 
 #[test]
 fn rejects_sparse_array_projection_rows() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/arr".to_string()],
@@ -555,8 +456,8 @@ fn rejects_sparse_array_projection_rows() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("sparse array projection"));
@@ -569,7 +470,6 @@ fn rejects_sparse_array_projection_rows() {
 
 #[test]
 fn rejects_aliasing_array_indices_via_non_canonical_form() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/arr".to_string()],
@@ -591,8 +491,8 @@ fn rejects_aliasing_array_indices_via_non_canonical_form() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("non-canonical array index token"));
@@ -601,203 +501,10 @@ fn rejects_aliasing_array_indices_via_non_canonical_form() {
             panic!("expected InvalidInput, got Internal({message})");
         }
     }
-}
-
-#[test]
-fn rejects_tombstone_with_leading_zero_token_under_live_array_context() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/arr".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/0".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr/0", Value::String("A".to_string()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/01".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-    ];
-
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
-    match error {
-        PluginError::InvalidInput(message) => {
-            assert!(message.contains("non-canonical array index token"));
-        }
-        PluginError::Internal(message) => {
-            panic!("expected InvalidInput, got Internal({message})");
-        }
-    }
-}
-
-#[test]
-fn rejects_tombstone_with_dash_token_under_live_array_context() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/arr".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/0".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr/0", Value::String("A".to_string()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/-".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-    ];
-
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
-    match error {
-        PluginError::InvalidInput(message) => {
-            assert!(message.contains("non-canonical '-' array token"));
-        }
-        PluginError::Internal(message) => {
-            panic!("expected InvalidInput, got Internal({message})");
-        }
-    }
-}
-
-#[test]
-fn allows_tombstone_with_leading_zero_token_with_only_live_array_container() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/arr".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/00".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-    ];
-
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
-    let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
-    assert_eq!(parsed, serde_json::json!({"arr":[]}));
-}
-
-#[test]
-fn allows_tombstone_with_dash_token_with_only_live_array_container() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/arr".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/-".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-    ];
-
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
-    let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
-    assert_eq!(parsed, serde_json::json!({"arr":[]}));
-}
-
-#[test]
-fn rejects_live_array_row_with_non_canonical_tombstone_alias() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/arr".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/0".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr/0", Value::Null)),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/1".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr/1", Value::String("B".to_string()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/01".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-    ];
-
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
-    match error {
-        PluginError::InvalidInput(message) => {
-            assert!(message.contains("non-canonical array index token"));
-        }
-        PluginError::Internal(message) => {
-            panic!("expected InvalidInput, got Internal({message})");
-        }
-    }
-}
-
-#[test]
-fn allows_tombstone_non_numeric_token_under_live_array_context() {
-    let file = file_from_json(r"{}");
-    let changes = vec![
-        DetectedChange {
-            entity_pk: vec!["/arr".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr", Value::Array(Vec::new()))),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/0".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot_content("/arr/0", Value::Null)),
-            metadata: None,
-        },
-        DetectedChange {
-            entity_pk: vec!["/arr/foo".to_string()],
-            schema_key: SCHEMA_KEY.to_string(),
-            snapshot_content: None,
-            metadata: None,
-        },
-    ];
-
-    let output =
-        render_changes(file, with_root_object(changes)).expect("render_changes should succeed");
-    let parsed: Value = serde_json::from_slice(&output).expect("output should parse");
-    assert_eq!(parsed, serde_json::json!({"arr":[null]}));
 }
 
 #[test]
 fn rejects_root_scalar_with_non_root_descendants() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["".to_string()],
@@ -813,8 +520,8 @@ fn rejects_root_scalar_with_non_root_descendants() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("is not a container"));
@@ -827,7 +534,6 @@ fn rejects_root_scalar_with_non_root_descendants() {
 
 #[test]
 fn rejects_scalar_ancestor_with_descendant_row() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/a".to_string()],
@@ -843,8 +549,8 @@ fn rejects_scalar_ancestor_with_descendant_row() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("is not a container"));
@@ -857,7 +563,6 @@ fn rejects_scalar_ancestor_with_descendant_row() {
 
 #[test]
 fn rejects_final_dash_token_in_projection_rows() {
-    let file = file_from_json(r"{}");
     let changes = vec![
         DetectedChange {
             entity_pk: vec!["/arr".to_string()],
@@ -873,8 +578,8 @@ fn rejects_final_dash_token_in_projection_rows() {
         },
     ];
 
-    let error =
-        render_changes(file, with_root_object(changes)).expect_err("render_changes should fail");
+    let error = common::render_projection(with_root_object(changes))
+        .expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("non-canonical '-' array token"));
@@ -887,7 +592,6 @@ fn rejects_final_dash_token_in_projection_rows() {
 
 #[test]
 fn rejects_non_root_rows_when_root_row_is_missing() {
-    let file = file_from_json(r"{}");
     let changes = vec![DetectedChange {
         entity_pk: vec!["/0".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
@@ -895,7 +599,7 @@ fn rejects_non_root_rows_when_root_row_is_missing() {
         metadata: None,
     }];
 
-    let error = render_changes(file, changes).expect_err("render_changes should fail");
+    let error = common::render_projection(changes).expect_err("render_changes should fail");
     match error {
         PluginError::InvalidInput(message) => {
             assert!(message.contains("non-root projection rows require a root row"));

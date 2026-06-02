@@ -1,5 +1,5 @@
-#[expect(clippy::same_length_and_capacity)]
 mod bindings {
+    #![expect(clippy::same_length_and_capacity)]
     wit_bindgen::generate!({
         path: "../../packages/engine/wit",
         world: "plugin",
@@ -28,7 +28,10 @@ const DOCUMENT_SCHEMA_JSON: &str = include_str!("../schema/text_document.json");
 static LINE_SCHEMA: OnceLock<Value> = OnceLock::new();
 static DOCUMENT_SCHEMA: OnceLock<Value> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug)]
 struct TextLinesPlugin;
+#[cfg(target_family = "wasm")]
+export!(TextLinesPlugin);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LineEnding {
@@ -73,19 +76,24 @@ struct DocumentSnapshotOwned {
     line_ids: Vec<String>,
 }
 
+#[derive(Debug)]
+struct RenderRow {
+    entity_pk: Vec<String>,
+    schema_key: String,
+    snapshot_content: Option<String>,
+}
+
 impl Plugin for TextLinesPlugin {
     fn detect_changes(
         state: Vec<EntityState>,
         file: File,
     ) -> Result<Vec<DetectedChange>, PluginError> {
-        let state = detected_changes_from_state(state)?;
-        let before = file_from_state_context(state)?;
+        let before = file_from_entity_state(state)?;
         detect_changes_from_files(before, file)
     }
 
     fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
-        let state = detected_changes_from_state(state)?;
-        render_entity_changes(empty_file(), state)
+        render_entity_state(empty_file(), state)
     }
 }
 
@@ -170,9 +178,35 @@ fn detect_changes_from_files(
 }
 
 fn render_entity_changes(file: File, changes: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> {
-    let expected_line_changes = changes
+    render_rows(
+        file,
+        changes.into_iter().map(|change| RenderRow {
+            entity_pk: change.entity_pk,
+            schema_key: change.schema_key,
+            snapshot_content: change.snapshot_content,
+        }),
+    )
+}
+
+fn render_entity_state(file: File, state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+    render_rows(
+        file,
+        state.into_iter().map(|row| RenderRow {
+            entity_pk: row.entity_pk,
+            schema_key: row.schema_key,
+            snapshot_content: Some(row.snapshot_content),
+        }),
+    )
+}
+
+fn render_rows(
+    file: File,
+    rows: impl IntoIterator<Item = RenderRow>,
+) -> Result<Vec<u8>, PluginError> {
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    let expected_line_changes = rows
         .iter()
-        .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
+        .filter(|row| row.schema_key == LINE_SCHEMA_KEY)
         .count();
     let mut document_snapshot: Option<DocumentSnapshotOwned> = None;
     let mut document_tombstoned = false;
@@ -183,16 +217,16 @@ fn render_entity_changes(file: File, changes: Vec<DetectedChange>) -> Result<Vec
     line_by_id.reserve(expected_line_changes);
     let mut seen_line_change_ids = HashSet::<String>::with_capacity(expected_line_changes);
 
-    for change in changes {
-        if change.schema_key == LINE_SCHEMA_KEY {
-            let entity_pk = single_entity_pk(change.entity_pk)?;
+    for row in rows {
+        if row.schema_key == LINE_SCHEMA_KEY {
+            let entity_pk = single_entity_pk(row.entity_pk)?;
             if !seen_line_change_ids.insert(entity_pk.clone()) {
                 return Err(PluginError::InvalidInput(
                     "duplicate text_line snapshot in render_changes input".to_string(),
                 ));
             }
 
-            match change.snapshot_content {
+            match row.snapshot_content {
                 Some(snapshot_raw) => {
                     let snapshot = parse_line_snapshot(&snapshot_raw, &entity_pk)?;
                     line_by_id.insert(
@@ -211,16 +245,15 @@ fn render_entity_changes(file: File, changes: Vec<DetectedChange>) -> Result<Vec
             continue;
         }
 
-        if change.schema_key == DOCUMENT_SCHEMA_KEY {
-            let entity_pk = single_entity_pk(change.entity_pk)?;
+        if row.schema_key == DOCUMENT_SCHEMA_KEY {
+            let entity_pk = single_entity_pk(row.entity_pk)?;
             if entity_pk != DOCUMENT_ENTITY_PK {
                 return Err(PluginError::InvalidInput(format!(
-                    "document snapshot entity_pk must be '{DOCUMENT_ENTITY_PK}', got '{}'",
-                    entity_pk
+                    "document snapshot entity_pk must be '{DOCUMENT_ENTITY_PK}', got '{entity_pk}'"
                 )));
             }
 
-            match change.snapshot_content {
+            match row.snapshot_content {
                 Some(snapshot_raw) => {
                     if document_snapshot.is_some() || document_tombstoned {
                         return Err(PluginError::InvalidInput(
@@ -543,7 +576,7 @@ fn hex_char(value: u8) -> char {
     match value {
         0..=9 => (b'0' + value) as char,
         10..=15 => (b'a' + (value - 10)) as char,
-        _ => '?',
+        _ => unreachable!(),
     }
 }
 
@@ -567,21 +600,14 @@ fn file_from_state_context(state: Vec<DetectedChange>) -> Result<Option<File>, P
     }))
 }
 
-fn detected_changes_from_state(
-    state: Vec<EntityState>,
-) -> Result<Vec<DetectedChange>, PluginError> {
-    state
-        .into_iter()
-        .map(|row| {
-            validate_single_entity_pk(&row.entity_pk)?;
-            Ok(DetectedChange {
-                entity_pk: row.entity_pk,
-                schema_key: row.schema_key,
-                snapshot_content: Some(row.snapshot_content),
-                metadata: row.metadata,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
+fn file_from_entity_state(state: Vec<EntityState>) -> Result<Option<File>, PluginError> {
+    if state.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(File {
+        data: render_entity_state(empty_file(), state)?,
+    }))
 }
 
 fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
@@ -655,6 +681,3 @@ pub fn document_schema_definition() -> &'static Value {
         serde_json::from_str(DOCUMENT_SCHEMA_JSON).expect("text document schema must parse")
     })
 }
-
-#[cfg(target_family = "wasm")]
-export!(TextLinesPlugin);
