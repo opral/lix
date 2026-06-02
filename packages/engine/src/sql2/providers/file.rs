@@ -222,12 +222,13 @@ impl LixFileProvider {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
+        let plugin_host = write_ctx.plugin_host();
         Self {
             schema: lix_file_schema(),
             live_state,
             branch_ref,
             blob_reader,
-            plugin_host: PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
+            plugin_host,
             write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::active(active_branch_id),
@@ -263,12 +264,13 @@ impl LixFileProvider {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
         let branch_ref = Arc::new(WriteContextBranchRefReader::new(write_ctx.clone()));
         let blob_reader = write_ctx.blob_reader();
+        let plugin_host = write_ctx.plugin_host();
         Self {
             schema: lix_file_by_branch_schema(),
             live_state,
             branch_ref,
             blob_reader,
-            plugin_host: PluginRuntimeHost::new(Arc::new(crate::wasm::UnsupportedWasmRuntime)),
+            plugin_host,
             write_access: WriteAccess::write(write_ctx),
             functions,
             branch_binding: BranchBinding::explicit(),
@@ -395,6 +397,7 @@ impl TableProvider for LixFileProvider {
         let write_ctx = self.write_access.require_write("DELETE FROM lix_file")?;
         let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
         let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"));
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
@@ -413,12 +416,14 @@ impl TableProvider for LixFileProvider {
         .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixFileDeleteExec::new(
             Arc::clone(&self.blob_reader),
+            self.plugin_host.clone(),
             write_ctx,
             Arc::clone(&self.schema),
             self.branch_binding.clone(),
             request,
             target_file_ids,
             physical_filters,
+            needs_data,
         )))
     }
 
@@ -432,6 +437,10 @@ impl TableProvider for LixFileProvider {
         validate_lix_file_update_assignments(&self.schema, &assignments)?;
         let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
         let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
+        let needs_data = filters.iter().any(|filter| contains_column(filter, "data"))
+            || assignments
+                .iter()
+                .any(|(_, expr)| contains_column(expr, "data"));
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
@@ -459,6 +468,7 @@ impl TableProvider for LixFileProvider {
         .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixFileUpdateExec::new(
             Arc::clone(&self.blob_reader),
+            self.plugin_host.clone(),
             write_ctx,
             Arc::clone(&self.schema),
             self.branch_binding.clone(),
@@ -467,6 +477,7 @@ impl TableProvider for LixFileProvider {
             target_file_ids,
             physical_assignments,
             physical_filters,
+            needs_data,
         )))
     }
 }
@@ -594,12 +605,14 @@ fn lix_file_surface_name(branch_binding: &BranchBinding) -> &'static str {
 
 struct LixFileDeleteExec {
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
     branch_binding: BranchBinding,
     request: LiveStateScanRequest,
     target_file_ids: FileIdConstraint,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    needs_data: bool,
     result_schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -613,12 +626,14 @@ impl std::fmt::Debug for LixFileDeleteExec {
 impl LixFileDeleteExec {
     fn new(
         blob_reader: Arc<dyn BlobDataReader>,
+        plugin_host: PluginRuntimeHost,
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
         branch_binding: BranchBinding,
         request: LiveStateScanRequest,
         target_file_ids: FileIdConstraint,
         filters: Vec<Arc<dyn PhysicalExpr>>,
+        needs_data: bool,
     ) -> Self {
         let result_schema = dml_count_schema();
         let properties = PlanProperties::new(
@@ -629,12 +644,14 @@ impl LixFileDeleteExec {
         );
         Self {
             blob_reader,
+            plugin_host,
             write_ctx,
             table_schema,
             branch_binding,
             request,
             target_file_ids,
             filters,
+            needs_data,
             result_schema,
             properties: Arc::new(properties),
         }
@@ -693,28 +710,41 @@ impl ExecutionPlan for LixFileDeleteExec {
         }
 
         let blob_reader = Arc::clone(&self.blob_reader);
+        let plugin_host = self.plugin_host.clone();
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
         let branch_binding = self.branch_binding.clone();
         let request = self.request.clone();
         let target_file_ids = self.target_file_ids.clone();
         let filters = self.filters.clone();
+        let needs_data = self.needs_data;
         let result_schema = Arc::clone(&self.result_schema);
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = scan_lix_file_live_rows(
-                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                &request,
-                &target_file_ids,
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-            let blob_ref_keys =
-                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, true, rows)
+            let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+            let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
+            let blob_ref_keys =
+                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+            let plugin_render = plugin_render_context_for_lix_file_scan(
+                live_state,
+                &blob_reader,
+                &request,
+                plugin_host,
+                needs_data,
+            )
+            .await
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "sql2 lix_file plugin discovery failed: {error}"
+                ))
+            })?;
+            let source_batch =
+                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
             let staged = lix_file_delete_stage_from_batch(
                 &matched_batch,
@@ -748,6 +778,7 @@ impl ExecutionPlan for LixFileDeleteExec {
 
 struct LixFileUpdateExec {
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
     branch_binding: BranchBinding,
@@ -756,6 +787,7 @@ struct LixFileUpdateExec {
     target_file_ids: FileIdConstraint,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    needs_data: bool,
     result_schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -769,6 +801,7 @@ impl std::fmt::Debug for LixFileUpdateExec {
 impl LixFileUpdateExec {
     fn new(
         blob_reader: Arc<dyn BlobDataReader>,
+        plugin_host: PluginRuntimeHost,
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
         branch_binding: BranchBinding,
@@ -777,6 +810,7 @@ impl LixFileUpdateExec {
         target_file_ids: FileIdConstraint,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
+        needs_data: bool,
     ) -> Self {
         let result_schema = dml_count_schema();
         let properties = PlanProperties::new(
@@ -787,6 +821,7 @@ impl LixFileUpdateExec {
         );
         Self {
             blob_reader,
+            plugin_host,
             write_ctx,
             table_schema,
             branch_binding,
@@ -795,6 +830,7 @@ impl LixFileUpdateExec {
             target_file_ids,
             assignments,
             filters,
+            needs_data,
             result_schema,
             properties: Arc::new(properties),
         }
@@ -858,6 +894,7 @@ impl ExecutionPlan for LixFileUpdateExec {
         }
 
         let blob_reader = Arc::clone(&self.blob_reader);
+        let plugin_host = self.plugin_host.clone();
         let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
         let branch_binding = self.branch_binding.clone();
@@ -866,22 +903,34 @@ impl ExecutionPlan for LixFileUpdateExec {
         let target_file_ids = self.target_file_ids.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
+        let needs_data = self.needs_data;
         let result_schema = Arc::clone(&self.result_schema);
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = scan_lix_file_live_rows(
-                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
-                &request,
-                &target_file_ids,
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-            let blob_ref_keys =
-                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
-            let source_batch = lix_file_record_batch(&table_schema, &blob_reader, None, true, rows)
+            let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+            let rows = scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
+            let blob_ref_keys =
+                blob_ref_keys_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
+            let plugin_render = plugin_render_context_for_lix_file_scan(
+                live_state,
+                &blob_reader,
+                &request,
+                plugin_host,
+                needs_data,
+            )
+            .await
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "sql2 lix_file plugin discovery failed: {error}"
+                ))
+            })?;
+            let source_batch =
+                lix_file_record_batch(&table_schema, &blob_reader, plugin_render, needs_data, rows)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
             let assignment_values = UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
             let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
@@ -1066,37 +1115,27 @@ impl ExecutionPlan for LixFileScanExec {
                 .map_err(|error| {
                     DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
                 })?;
-            let installed_plugins = if needs_data {
-                load_installed_plugins_for_lix_file_scan(
-                    Arc::clone(&live_state),
-                    &blob_reader,
-                    &request,
-                )
-                .await
-            } else {
-                Ok(Vec::new())
-            }
+            let plugin_render = plugin_render_context_for_lix_file_scan(
+                Arc::clone(&live_state),
+                &blob_reader,
+                &request,
+                plugin_host,
+                needs_data,
+            )
+            .await
             .map_err(|error| {
                 DataFusionError::Execution(format!(
                     "sql2 lix_file plugin discovery failed: {error}"
                 ))
             })?;
-            let plugin_render = PluginRenderContext {
-                live_state: Arc::clone(&live_state),
-                host: plugin_host,
-                installed_plugins,
-            };
-            let batch = lix_file_record_batch(
-                &batch_schema,
-                &blob_reader,
-                Some(plugin_render),
-                needs_data,
-                rows,
-            )
-            .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!("sql2 lix_file batch build failed: {error}"))
-            })?;
+            let batch =
+                lix_file_record_batch(&batch_schema, &blob_reader, plugin_render, needs_data, rows)
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "sql2 lix_file batch build failed: {error}"
+                        ))
+                    })?;
             let filtered = filter_lix_file_batch(batch, &filters)?;
             let projected = match projection {
                 Some(indices) => filtered.project(&indices).map_err(DataFusionError::from),
@@ -2075,6 +2114,27 @@ async fn load_installed_plugins_for_lix_file_scan(
     let rows = live_state.scan_rows(&plugin_request).await?;
     let filesystem = FilesystemIndex::from_live_rows(rows)?;
     load_installed_plugins_from_filesystem(&filesystem, blob_reader.as_ref()).await
+}
+
+async fn plugin_render_context_for_lix_file_scan(
+    live_state: Arc<dyn LiveStateReader>,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    request: &LiveStateScanRequest,
+    host: PluginRuntimeHost,
+    needs_data: bool,
+) -> Result<Option<PluginRenderContext>, LixError> {
+    if !needs_data {
+        return Ok(None);
+    }
+
+    let installed_plugins =
+        load_installed_plugins_for_lix_file_scan(Arc::clone(&live_state), blob_reader, request)
+            .await?;
+    Ok(Some(PluginRenderContext {
+        live_state,
+        host,
+        installed_plugins,
+    }))
 }
 
 async fn load_single_blob_bytes(

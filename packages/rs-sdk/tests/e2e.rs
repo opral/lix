@@ -258,6 +258,45 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
             .any(|change| change.schema_key == "lix_binary_blob_ref")
     );
 
+    let sql_changes_before_predicate_update = sql_changes_before_update + sql_update_changes.len();
+    let sql_predicate_updated_csv = b"name,age\nLin,44\nMina,29\nKatherine,101\n".to_vec();
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
+        &[
+            Value::Blob(sql_predicate_updated_csv.clone()),
+            Value::Text("/sql-people.csv".to_string()),
+            Value::Blob(sql_updated_csv.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lix.read_file("/sql-people.csv").await.unwrap().as_deref(),
+        Some(sql_predicate_updated_csv.as_slice())
+    );
+    let sql_predicate_update_changes = file_changes(&lix, &sql_file_id)
+        .await
+        .into_iter()
+        .skip(sql_changes_before_predicate_update)
+        .collect::<Vec<_>>();
+    assert!(sql_predicate_update_changes.iter().any(|change| {
+        change.schema_key == "csv_row"
+            && change
+                .snapshot_content
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("cells"))
+                .and_then(serde_json::Value::as_array)
+                == Some(&vec![
+                    serde_json::Value::String("Katherine".to_string()),
+                    serde_json::Value::String("101".to_string()),
+                ])
+    }));
+    assert!(
+        !sql_predicate_update_changes
+            .iter()
+            .any(|change| change.schema_key == "lix_binary_blob_ref")
+    );
+
     let sql_empty_target = b"name,age\nNoor,10\n".to_vec();
     lix.execute(
         "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
@@ -303,10 +342,14 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
             .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
     );
 
-    let sql_changes_before_delete = sql_changes_before_update + sql_update_changes.len();
+    let sql_changes_before_delete =
+        sql_changes_before_predicate_update + sql_predicate_update_changes.len();
     lix.execute(
-        "DELETE FROM lix_file WHERE path = $1",
-        &[Value::Text("/sql-people.csv".to_string())],
+        "DELETE FROM lix_file WHERE path = $1 AND data = $2",
+        &[
+            Value::Text("/sql-people.csv".to_string()),
+            Value::Blob(sql_predicate_updated_csv),
+        ],
     )
     .await
     .unwrap();

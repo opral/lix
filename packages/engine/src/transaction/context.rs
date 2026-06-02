@@ -1171,6 +1171,10 @@ where
         Ok(self.cached_visible_schemas()?.to_vec())
     }
 
+    fn plugin_host(&self) -> PluginRuntimeHost {
+        self.plugin_host.clone()
+    }
+
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
         self.binary_cas.reader(read).load_bytes_many(hashes).await
