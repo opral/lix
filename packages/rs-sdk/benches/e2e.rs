@@ -1,4 +1,4 @@
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lix_sdk::{FsWriteOptions, InMemoryBackend, LixError, OpenLixOptions, Value, open_lix};
 use plugin_csv::exports::lix::plugin::api::EntityState as CsvEntityState;
 use plugin_csv::exports::lix::plugin::api::Guest as _;
@@ -8,6 +8,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Write as _;
+use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -20,13 +21,15 @@ use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 const INITIAL_ROW_COUNT: usize = 10_000;
 const NEW_ROW_COUNT: usize = 10_000;
 const CSV_PATH: &str = "/large-merge.csv";
+const CSV_PLUGIN_WARMUP_PATH: &str = "/.csv-plugin-warmup.csv";
 
 fn bench_e2e(c: &mut Criterion) {
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to create Tokio runtime for e2e bench");
-    let archive = build_csv_plugin_archive();
+    let plugin = build_csv_plugin();
+    let plugin_wasm = csv_plugin_wasm_from_archive(&plugin);
     let initial_rows = random_csv_rows("initial", INITIAL_ROW_COUNT, 0x8ae7_b4b1_9f4c_d215);
     let new_rows = random_csv_rows("new", NEW_ROW_COUNT, 0xf3bb_91d4_6a8c_2e73);
     let initial_csv = csv_bytes_from_rows(&initial_rows);
@@ -35,14 +38,20 @@ fn bench_e2e(c: &mut Criterion) {
         &new_rows,
         0x6449_2c6f_179d_31b5,
     ));
-    let initial_wasm_changes = runtime.block_on(wasm_plugin_file_changes(
-        WasmPluginDiffFixture::new(&archive, Vec::new(), &initial_csv),
-    ));
+    let initial_wasm_changes = runtime.block_on(async {
+        wasm_plugin_file_changes(
+            wasm_plugin_diff_fixture(&plugin_wasm, Vec::new(), &initial_csv).await,
+        )
+        .await
+    });
     assert_detected_csv_changes(&initial_wasm_changes, INITIAL_ROW_COUNT, 1);
     let initial_wasm_state = plugin_entity_state_from_file_changes(&initial_wasm_changes);
-    let merge_wasm_changes = runtime.block_on(wasm_plugin_file_changes(
-        WasmPluginDiffFixture::new(&archive, initial_wasm_state.clone(), &updated_csv),
-    ));
+    let merge_wasm_changes = runtime.block_on(async {
+        wasm_plugin_file_changes(
+            wasm_plugin_diff_fixture(&plugin_wasm, initial_wasm_state.clone(), &updated_csv).await,
+        )
+        .await
+    });
     assert_detected_csv_changes(&merge_wasm_changes, NEW_ROW_COUNT, 0);
 
     let initial_native_changes =
@@ -55,39 +64,114 @@ fn bench_e2e(c: &mut Criterion) {
     ));
     assert_file_changes_equivalent(&merge_wasm_changes, &merge_native_changes);
 
+    runtime.block_on(async {
+        validate_overwrite_large_csv(
+            large_csv_fixture(open_lix_with_plugin(&plugin).await, &initial_csv).await,
+            &updated_csv,
+        )
+        .await;
+        validate_manual_bulk_insert_schema_changes(
+            csv_schema_changes_insert_fixture(
+                open_lix_with_plugin(&plugin).await,
+                &[],
+                &initial_wasm_changes,
+                INITIAL_ROW_COUNT,
+            )
+            .await,
+        )
+        .await;
+        validate_manual_bulk_insert_file_changes(
+            csv_changes_insert_fixture(
+                open_lix_with_plugin(&plugin).await,
+                &[],
+                &initial_wasm_changes,
+                INITIAL_ROW_COUNT,
+            )
+            .await,
+        )
+        .await;
+        validate_manual_bulk_insert_schema_changes(
+            csv_schema_changes_insert_fixture(
+                open_lix_with_plugin(&plugin).await,
+                &initial_wasm_changes,
+                &merge_wasm_changes,
+                INITIAL_ROW_COUNT + NEW_ROW_COUNT,
+            )
+            .await,
+        )
+        .await;
+        validate_manual_bulk_insert_file_changes(
+            csv_changes_insert_fixture(
+                open_lix_with_plugin(&plugin).await,
+                &initial_wasm_changes,
+                &merge_wasm_changes,
+                INITIAL_ROW_COUNT + NEW_ROW_COUNT,
+            )
+            .await,
+        )
+        .await;
+    });
+
     let mut group = c.benchmark_group("e2e/csv_plugin");
     group.sample_size(10);
     group.throughput(Throughput::Elements(NEW_ROW_COUNT as u64));
+    group.bench_function("setup", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let lix = open_lix_with_warmed_csv_plugin(&plugin).await;
+                black_box(lix).close().await.unwrap();
+            });
+        });
+    });
+    group.bench_function("setup_wasm", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let fixture =
+                    wasm_plugin_diff_fixture(&plugin_wasm, Vec::new(), &initial_csv).await;
+                black_box(fixture);
+            });
+        });
+    });
     group.bench_function("insert_10k", |b| {
         b.iter_batched(
-            || runtime.block_on(csv_plugin_fixture(&archive)),
-            |fixture| runtime.block_on(insert_large_csv(fixture, &initial_csv)),
+            || runtime.block_on(open_lix_with_warmed_csv_plugin(&plugin)),
+            |lix| runtime.block_on(insert_large_csv(lix, &initial_csv)),
             BatchSize::SmallInput,
         );
     });
     group.bench_function("insert_10k_plugin", |b| {
         b.iter_batched(
-            || WasmPluginDiffFixture::new(&archive, Vec::new(), &initial_csv),
-            |fixture| runtime.block_on(bench_wasm_plugin_diff(fixture, INITIAL_ROW_COUNT, 1)),
+            || {
+                runtime.block_on(wasm_plugin_diff_fixture(
+                    &plugin_wasm,
+                    Vec::new(),
+                    &initial_csv,
+                ))
+            },
+            |fixture| runtime.block_on(bench_wasm_plugin_diff(fixture)),
             BatchSize::SmallInput,
         );
     });
     group.bench_function("insert_10k_plugin_diff", |b| {
         b.iter_batched(
             || NativeCsvDiffFixture::new(Vec::new(), initial_csv.clone()),
-            |fixture| bench_native_csv_diff(fixture, INITIAL_ROW_COUNT, 1),
+            |fixture| bench_native_csv_diff(fixture),
             BatchSize::SmallInput,
         );
     });
     group.bench_function("insert_10k_insert", |b| {
         b.iter_batched(
             || {
-                runtime.block_on(csv_schema_changes_insert_fixture(
-                    &archive,
-                    &[],
-                    &initial_wasm_changes,
-                    INITIAL_ROW_COUNT,
-                ))
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin(&plugin).await;
+                    csv_schema_changes_insert_fixture(
+                        lix,
+                        &[],
+                        &initial_wasm_changes,
+                        INITIAL_ROW_COUNT,
+                    )
+                    .await
+                })
             },
             |fixture| runtime.block_on(manual_bulk_insert_schema_changes(fixture)),
             BatchSize::SmallInput,
@@ -96,12 +180,11 @@ fn bench_e2e(c: &mut Criterion) {
     group.bench_function("insert_10k_insert_state", |b| {
         b.iter_batched(
             || {
-                runtime.block_on(csv_changes_insert_fixture(
-                    &archive,
-                    &[],
-                    &initial_wasm_changes,
-                    INITIAL_ROW_COUNT,
-                ))
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin(&plugin).await;
+                    csv_changes_insert_fixture(lix, &[], &initial_wasm_changes, INITIAL_ROW_COUNT)
+                        .await
+                })
             },
             |fixture| runtime.block_on(manual_bulk_insert_file_changes(fixture)),
             BatchSize::SmallInput,
@@ -109,34 +192,49 @@ fn bench_e2e(c: &mut Criterion) {
     });
     group.bench_function("merge_10k", |b| {
         b.iter_batched(
-            || runtime.block_on(large_csv_fixture(&archive, &initial_csv)),
+            || {
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin(&plugin).await;
+                    large_csv_fixture(lix, &initial_csv).await
+                })
+            },
             |fixture| runtime.block_on(overwrite_large_csv(fixture, &updated_csv)),
             BatchSize::SmallInput,
         );
     });
     group.bench_function("merge_10k_plugin", |b| {
         b.iter_batched(
-            || WasmPluginDiffFixture::new(&archive, initial_wasm_state.clone(), &updated_csv),
-            |fixture| runtime.block_on(bench_wasm_plugin_diff(fixture, NEW_ROW_COUNT, 0)),
+            || {
+                runtime.block_on(wasm_plugin_diff_fixture(
+                    &plugin_wasm,
+                    initial_wasm_state.clone(),
+                    &updated_csv,
+                ))
+            },
+            |fixture| runtime.block_on(bench_wasm_plugin_diff(fixture)),
             BatchSize::SmallInput,
         );
     });
     group.bench_function("merge_10k_plugin_diff", |b| {
         b.iter_batched(
             || NativeCsvDiffFixture::new(initial_native_state.clone(), updated_csv.clone()),
-            |fixture| bench_native_csv_diff(fixture, NEW_ROW_COUNT, 0),
+            |fixture| bench_native_csv_diff(fixture),
             BatchSize::SmallInput,
         );
     });
     group.bench_function("merge_10k_insert", |b| {
         b.iter_batched(
             || {
-                runtime.block_on(csv_schema_changes_insert_fixture(
-                    &archive,
-                    &initial_wasm_changes,
-                    &merge_wasm_changes,
-                    INITIAL_ROW_COUNT + NEW_ROW_COUNT,
-                ))
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin(&plugin).await;
+                    csv_schema_changes_insert_fixture(
+                        lix,
+                        &initial_wasm_changes,
+                        &merge_wasm_changes,
+                        INITIAL_ROW_COUNT + NEW_ROW_COUNT,
+                    )
+                    .await
+                })
             },
             |fixture| runtime.block_on(manual_bulk_insert_schema_changes(fixture)),
             BatchSize::SmallInput,
@@ -145,12 +243,16 @@ fn bench_e2e(c: &mut Criterion) {
     group.bench_function("merge_10k_insert_state", |b| {
         b.iter_batched(
             || {
-                runtime.block_on(csv_changes_insert_fixture(
-                    &archive,
-                    &initial_wasm_changes,
-                    &merge_wasm_changes,
-                    INITIAL_ROW_COUNT + NEW_ROW_COUNT,
-                ))
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin(&plugin).await;
+                    csv_changes_insert_fixture(
+                        lix,
+                        &initial_wasm_changes,
+                        &merge_wasm_changes,
+                        INITIAL_ROW_COUNT + NEW_ROW_COUNT,
+                    )
+                    .await
+                })
             },
             |fixture| runtime.block_on(manual_bulk_insert_file_changes(fixture)),
             BatchSize::SmallInput,
@@ -162,10 +264,6 @@ fn bench_e2e(c: &mut Criterion) {
 struct LargeCsvFixture {
     lix: lix_sdk::Lix,
     file_id: String,
-}
-
-struct CsvPluginFixture {
-    lix: lix_sdk::Lix,
 }
 
 struct ExtractedCsvChangesFixture {
@@ -189,22 +287,44 @@ struct ExtractedCsvSchemaChangesFixture {
 }
 
 struct WasmPluginDiffFixture {
-    runtime: WasmtimePluginRuntime,
-    archive: Vec<u8>,
-    state: Vec<PluginEntityStatePayload>,
-    file_data: Vec<u8>,
+    component: Arc<dyn lix_sdk::WasmComponentInstance>,
+    detect_changes_input: Vec<u8>,
 }
 
 impl WasmPluginDiffFixture {
-    fn new(archive: &[u8], state: Vec<PluginEntityStatePayload>, file_data: &[u8]) -> Self {
-        Self {
-            runtime: WasmtimePluginRuntime::new()
-                .expect("failed to create Wasmtime plugin runtime"),
-            archive: archive.to_vec(),
+    fn new(
+        component: Arc<dyn lix_sdk::WasmComponentInstance>,
+        state: Vec<PluginEntityStatePayload>,
+        file_data: &[u8],
+    ) -> Self {
+        let payload = PluginDetectChangesPayload {
             state,
-            file_data: file_data.to_vec(),
+            file: PluginFilePayload {
+                data: file_data.to_vec(),
+            },
+        };
+        Self {
+            component,
+            detect_changes_input: serde_json::to_vec(&payload).unwrap(),
         }
     }
+}
+
+async fn wasm_plugin_diff_fixture(
+    wasm: &[u8],
+    state: Vec<PluginEntityStatePayload>,
+    file_data: &[u8],
+) -> WasmPluginDiffFixture {
+    let runtime = WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime");
+    let component = <WasmtimePluginRuntime as lix_sdk::WasmRuntime>::init_component(
+        &runtime,
+        wasm.to_vec(),
+        lix_sdk::WasmLimits::default(),
+    )
+    .await
+    .unwrap();
+    warm_wasm_csv_plugin_component(&component).await;
+    WasmPluginDiffFixture::new(component, state, file_data)
 }
 
 struct NativeCsvDiffFixture {
@@ -218,7 +338,7 @@ impl NativeCsvDiffFixture {
     }
 }
 
-async fn csv_plugin_fixture(archive: &[u8]) -> CsvPluginFixture {
+async fn open_lix_with_plugin(plugin: &[u8]) -> lix_sdk::Lix {
     let lix = open_lix(OpenLixOptions {
         backend: InMemoryBackend::new(),
         wasm_runtime: Some(Arc::new(
@@ -228,21 +348,48 @@ async fn csv_plugin_fixture(archive: &[u8]) -> CsvPluginFixture {
     .await
     .unwrap();
 
-    lix.install_plugin_archive(archive).await.unwrap();
+    lix.install_plugin_archive(plugin).await.unwrap();
 
-    CsvPluginFixture { lix }
+    lix
 }
 
-async fn large_csv_fixture(archive: &[u8], initial_csv: &[u8]) -> LargeCsvFixture {
-    let fixture = csv_plugin_fixture(archive).await;
-    fixture
-        .lix
-        .write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
+async fn open_lix_with_warmed_csv_plugin(plugin: &[u8]) -> lix_sdk::Lix {
+    let lix = open_lix_with_plugin(plugin).await;
+    warm_lix_csv_plugin(&lix).await;
+    lix
+}
+
+async fn warm_lix_csv_plugin(lix: &lix_sdk::Lix) {
+    lix.write_file(
+        CSV_PLUGIN_WARMUP_PATH,
+        Vec::new(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    let removed = lix
+        .execute(
+            "DELETE FROM lix_file WHERE path = $1",
+            &[Value::Text(CSV_PLUGIN_WARMUP_PATH.to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed.rows_affected(), 1);
+}
+
+async fn warm_wasm_csv_plugin_component(component: &Arc<dyn lix_sdk::WasmComponentInstance>) {
+    let fixture = WasmPluginDiffFixture::new(component.clone(), Vec::new(), &[]);
+    let output = wasm_plugin_detect_changes_output(fixture).await;
+    let changes = serde_json::from_slice::<Vec<PluginDetectedChangePayload>>(&output).unwrap();
+    assert!(changes.is_empty());
+}
+
+async fn large_csv_fixture(lix: lix_sdk::Lix, initial_csv: &[u8]) -> LargeCsvFixture {
+    lix.write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
         .await
         .unwrap();
 
-    let file_id = fixture
-        .lix
+    let file_id = lix
         .execute(
             "SELECT id FROM lix_file WHERE path = $1",
             &[Value::Text(CSV_PATH.to_string())],
@@ -252,41 +399,31 @@ async fn large_csv_fixture(archive: &[u8], initial_csv: &[u8]) -> LargeCsvFixtur
     assert_eq!(file_id.len(), 1);
     let file_id = file_id.rows()[0].get::<String>("id").unwrap();
 
-    LargeCsvFixture {
-        lix: fixture.lix,
-        file_id,
-    }
+    LargeCsvFixture { lix, file_id }
 }
 
 async fn csv_changes_insert_fixture(
-    archive: &[u8],
+    lix: lix_sdk::Lix,
     existing_changes: &[FileChange],
     insert_changes: &[FileChange],
     expected_active_row_count: usize,
 ) -> ExtractedCsvChangesFixture {
-    let fixture = csv_plugin_fixture(archive).await;
     let file_id = "bench-csv-file".to_string();
-    fixture
-        .lix
-        .execute(
-            "INSERT INTO lix_file (id, path) VALUES ($1, $2)",
-            &[
-                Value::Text(file_id.clone()),
-                Value::Text(CSV_PATH.to_string()),
-            ],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture.lix.read_file(CSV_PATH).await.unwrap(),
-        Some(Vec::new())
-    );
+    lix.execute(
+        "INSERT INTO lix_file (id, path) VALUES ($1, $2)",
+        &[
+            Value::Text(file_id.clone()),
+            Value::Text(CSV_PATH.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(lix.read_file(CSV_PATH).await.unwrap(), Some(Vec::new()));
 
     if !existing_changes.is_empty() {
         let existing_insert_sql = bulk_insert_file_changes_sql(existing_changes.len());
         let existing_params = bulk_insert_file_changes_params(&file_id, existing_changes);
-        let result = fixture
-            .lix
+        let result = lix
             .execute(&existing_insert_sql, &existing_params)
             .await
             .unwrap();
@@ -298,14 +435,14 @@ async fn csv_changes_insert_fixture(
         .filter(|change| change.schema_key == "csv_row" && change.snapshot_content.is_some())
         .count();
     assert_eq!(
-        active_csv_row_count(&fixture.lix, &file_id).await,
+        active_csv_row_count(&lix, &file_id).await,
         existing_row_count
     );
 
     let state_insert_sql = bulk_insert_file_changes_sql(insert_changes.len());
     let state_params = bulk_insert_file_changes_params(&file_id, insert_changes);
     ExtractedCsvChangesFixture {
-        lix: fixture.lix,
+        lix,
         file_id,
         change_count: insert_changes.len(),
         state_insert_sql,
@@ -315,24 +452,20 @@ async fn csv_changes_insert_fixture(
 }
 
 async fn csv_schema_changes_insert_fixture(
-    archive: &[u8],
+    lix: lix_sdk::Lix,
     existing_changes: &[FileChange],
     insert_changes: &[FileChange],
     expected_active_row_count: usize,
 ) -> ExtractedCsvSchemaChangesFixture {
-    let fixture = csv_plugin_fixture(archive).await;
     if !existing_changes.is_empty() {
-        bulk_insert_schema_changes(&fixture.lix, existing_changes).await;
+        bulk_insert_schema_changes(&lix, existing_changes).await;
     }
 
     let existing_row_count = existing_changes
         .iter()
         .filter(|change| change.schema_key == "csv_row" && change.snapshot_content.is_some())
         .count();
-    assert_eq!(
-        active_csv_schema_row_count(&fixture.lix).await,
-        existing_row_count
-    );
+    assert_eq!(active_csv_schema_row_count(&lix).await, existing_row_count);
 
     let table_changes = insert_changes
         .iter()
@@ -345,7 +478,7 @@ async fn csv_schema_changes_insert_fixture(
     assert!(!row_changes.is_empty());
 
     ExtractedCsvSchemaChangesFixture {
-        lix: fixture.lix,
+        lix,
         table_insert_sql: (!table_changes.is_empty())
             .then(|| bulk_insert_csv_table_sql(table_changes.len())),
         table_params: bulk_insert_csv_table_params(&table_changes),
@@ -357,22 +490,35 @@ async fn csv_schema_changes_insert_fixture(
     }
 }
 
-async fn insert_large_csv(fixture: CsvPluginFixture, initial_csv: &[u8]) {
-    fixture
-        .lix
-        .write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
+async fn insert_large_csv(lix: lix_sdk::Lix, initial_csv: &[u8]) {
+    lix.write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
         .await
         .unwrap();
     black_box(initial_csv);
-    fixture.lix.close().await.unwrap();
+    lix.close().await.unwrap();
 }
 
 async fn overwrite_large_csv(fixture: LargeCsvFixture, updated_csv: &[u8]) {
+    write_updated_csv(&fixture, updated_csv).await;
+    black_box(updated_csv);
+    fixture.lix.close().await.unwrap();
+}
+
+async fn validate_overwrite_large_csv(fixture: LargeCsvFixture, updated_csv: &[u8]) {
+    write_updated_csv(&fixture, updated_csv).await;
+    assert_large_csv_overwrite_result(&fixture, updated_csv).await;
+    fixture.lix.close().await.unwrap();
+}
+
+async fn write_updated_csv(fixture: &LargeCsvFixture, updated_csv: &[u8]) {
     fixture
         .lix
         .write_file(CSV_PATH, updated_csv.to_vec(), FsWriteOptions::default())
         .await
         .unwrap();
+}
+
+async fn assert_large_csv_overwrite_result(fixture: &LargeCsvFixture, updated_csv: &[u8]) {
     assert_eq!(
         fixture.lix.read_file(CSV_PATH).await.unwrap().as_deref(),
         Some(updated_csv)
@@ -432,7 +578,7 @@ async fn overwrite_large_csv(fixture: LargeCsvFixture, updated_csv: &[u8]) {
             "SELECT COUNT(*) AS row_count \
              FROM lix_state \
              WHERE file_id = $1 AND schema_key = 'csv_row'",
-            &[Value::Text(fixture.file_id)],
+            &[Value::Text(fixture.file_id.clone())],
         )
         .await
         .unwrap();
@@ -440,9 +586,6 @@ async fn overwrite_large_csv(fixture: LargeCsvFixture, updated_csv: &[u8]) {
         active_rows.rows()[0].get::<i64>("row_count").unwrap(),
         20_000
     );
-
-    black_box(changes);
-    fixture.lix.close().await.unwrap();
 }
 
 async fn active_csv_row_count(lix: &lix_sdk::Lix, file_id: &str) -> usize {
@@ -467,49 +610,85 @@ async fn active_csv_schema_row_count(lix: &lix_sdk::Lix) -> usize {
 }
 
 async fn manual_bulk_insert_file_changes(fixture: ExtractedCsvChangesFixture) {
-    let result = fixture
-        .lix
-        .execute(&fixture.state_insert_sql, &fixture.state_params)
-        .await
-        .unwrap();
-    assert_eq!(result.rows_affected(), fixture.change_count as u64);
+    let rows_affected = execute_bulk_insert_file_changes(&fixture).await;
+    black_box(rows_affected);
+    black_box(fixture.state_insert_sql);
+    black_box(fixture.state_params);
+    fixture.lix.close().await.unwrap();
+}
+
+async fn validate_manual_bulk_insert_file_changes(fixture: ExtractedCsvChangesFixture) {
+    let rows_affected = execute_bulk_insert_file_changes(&fixture).await;
+    assert_eq!(rows_affected, fixture.change_count as u64);
 
     assert_eq!(
         active_csv_row_count(&fixture.lix, &fixture.file_id).await,
         fixture.expected_active_row_count
     );
 
-    black_box(fixture.state_insert_sql);
-    black_box(fixture.state_params);
     fixture.lix.close().await.unwrap();
 }
 
+async fn execute_bulk_insert_file_changes(fixture: &ExtractedCsvChangesFixture) -> u64 {
+    let result = fixture
+        .lix
+        .execute(&fixture.state_insert_sql, &fixture.state_params)
+        .await
+        .unwrap();
+    result.rows_affected()
+}
+
 async fn manual_bulk_insert_schema_changes(fixture: ExtractedCsvSchemaChangesFixture) {
-    if let Some(table_insert_sql) = fixture.table_insert_sql.as_ref() {
+    let (table_rows_affected, row_rows_affected) =
+        execute_bulk_insert_schema_changes(&fixture).await;
+    black_box(table_rows_affected);
+    black_box(row_rows_affected);
+    black_box(fixture.table_insert_sql);
+    black_box(fixture.table_params);
+    black_box(fixture.row_insert_sql);
+    black_box(fixture.row_params);
+    fixture.lix.close().await.unwrap();
+}
+
+async fn validate_manual_bulk_insert_schema_changes(fixture: ExtractedCsvSchemaChangesFixture) {
+    let (table_rows_affected, row_rows_affected) =
+        execute_bulk_insert_schema_changes(&fixture).await;
+    assert_eq!(
+        table_rows_affected,
+        fixture
+            .table_insert_sql
+            .as_ref()
+            .map(|_| fixture.table_count as u64)
+    );
+    assert_eq!(row_rows_affected, fixture.row_count as u64);
+    assert_eq!(
+        active_csv_schema_row_count(&fixture.lix).await,
+        fixture.expected_active_row_count
+    );
+
+    fixture.lix.close().await.unwrap();
+}
+
+async fn execute_bulk_insert_schema_changes(
+    fixture: &ExtractedCsvSchemaChangesFixture,
+) -> (Option<u64>, u64) {
+    let table_rows_affected = if let Some(table_insert_sql) = fixture.table_insert_sql.as_ref() {
         let table_result = fixture
             .lix
             .execute(table_insert_sql, &fixture.table_params)
             .await
             .unwrap();
-        assert_eq!(table_result.rows_affected(), fixture.table_count as u64);
-    }
+        Some(table_result.rows_affected())
+    } else {
+        None
+    };
 
     let row_result = fixture
         .lix
         .execute(&fixture.row_insert_sql, &fixture.row_params)
         .await
         .unwrap();
-    assert_eq!(row_result.rows_affected(), fixture.row_count as u64);
-    assert_eq!(
-        active_csv_schema_row_count(&fixture.lix).await,
-        fixture.expected_active_row_count
-    );
-
-    black_box(fixture.table_insert_sql);
-    black_box(fixture.table_params);
-    black_box(fixture.row_insert_sql);
-    black_box(fixture.row_params);
-    fixture.lix.close().await.unwrap();
+    (table_rows_affected, row_result.rows_affected())
 }
 
 fn bulk_insert_file_changes_sql(change_count: usize) -> String {
@@ -658,57 +837,42 @@ fn bulk_insert_csv_row_params(changes: &[&FileChange]) -> Vec<Value> {
     params
 }
 
-async fn bench_wasm_plugin_diff(
-    fixture: WasmPluginDiffFixture,
-    expected_row_upserts: usize,
-    expected_table_upserts: usize,
-) {
-    let changes = wasm_plugin_file_changes(fixture).await;
-    assert_detected_csv_changes(&changes, expected_row_upserts, expected_table_upserts);
-    black_box(changes);
+async fn bench_wasm_plugin_diff(fixture: WasmPluginDiffFixture) {
+    let output = wasm_plugin_detect_changes_output(fixture).await;
+    black_box(output);
 }
 
 async fn wasm_plugin_file_changes(fixture: WasmPluginDiffFixture) -> Vec<FileChange> {
-    let component = <WasmtimePluginRuntime as lix_sdk::WasmRuntime>::init_component(
-        &fixture.runtime,
-        csv_plugin_wasm_from_archive(&fixture.archive),
-        lix_sdk::WasmLimits::default(),
-    )
-    .await
-    .unwrap();
-    let payload = PluginDetectChangesPayload {
-        state: fixture.state,
-        file: PluginFilePayload {
-            data: fixture.file_data,
-        },
-    };
-    let output = component
-        .call("detect-changes", &serde_json::to_vec(&payload).unwrap())
-        .await
-        .unwrap();
+    let output = wasm_plugin_detect_changes_output(fixture).await;
     let changes = serde_json::from_slice::<Vec<PluginDetectedChangePayload>>(&output).unwrap();
     plugin_detected_changes_to_file_changes(changes)
 }
 
-fn bench_native_csv_diff(
-    fixture: NativeCsvDiffFixture,
-    expected_row_upserts: usize,
-    expected_table_upserts: usize,
-) {
-    let changes = native_csv_file_changes(fixture);
-    assert_detected_csv_changes(&changes, expected_row_upserts, expected_table_upserts);
+async fn wasm_plugin_detect_changes_output(fixture: WasmPluginDiffFixture) -> Vec<u8> {
+    fixture
+        .component
+        .call("detect-changes", &fixture.detect_changes_input)
+        .await
+        .unwrap()
+}
+
+fn bench_native_csv_diff(fixture: NativeCsvDiffFixture) {
+    let changes = native_csv_detected_changes(fixture);
     black_box(changes);
 }
 
 fn native_csv_file_changes(fixture: NativeCsvDiffFixture) -> Vec<FileChange> {
-    let changes = CsvPlugin::detect_changes(
+    csv_detected_changes_to_file_changes(native_csv_detected_changes(fixture))
+}
+
+fn native_csv_detected_changes(fixture: NativeCsvDiffFixture) -> Vec<plugin_csv::DetectedChange> {
+    CsvPlugin::detect_changes(
         fixture.state,
         CsvFile {
             data: fixture.file_data,
         },
     )
-    .unwrap();
-    csv_detected_changes_to_file_changes(changes)
+    .unwrap()
 }
 
 fn plugin_detected_changes_to_file_changes(
@@ -1482,7 +1646,7 @@ fn wasm_runtime_error(context: impl Into<String>, error: impl fmt::Display) -> L
     )
 }
 
-fn build_csv_plugin_archive() -> Vec<u8> {
+fn build_csv_plugin() -> Vec<u8> {
     let wasm = csv_plugin_wasm();
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
@@ -1519,8 +1683,8 @@ fn csv_plugin_wasm() -> Vec<u8> {
 }
 
 fn csv_plugin_wasm_from_archive(archive_bytes: &[u8]) -> Vec<u8> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(archive_bytes)).unwrap();
-    let mut entry = archive.by_name("plugin.wasm").unwrap();
+    let mut plugin = zip::ZipArchive::new(Cursor::new(archive_bytes)).unwrap();
+    let mut entry = plugin.by_name("plugin.wasm").unwrap();
     let mut wasm = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
     entry.read_to_end(&mut wasm).unwrap();
     wasm
