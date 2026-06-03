@@ -228,6 +228,26 @@ where
 {
     match wasm_runtime {
         Some(wasm_runtime) => Engine::new_with_wasm_runtime(backend, wasm_runtime).await,
-        None => Engine::new(backend).await,
+        None => new_engine_with_default_runtime(backend).await,
     }
+}
+
+#[cfg(feature = "default_wasm_runtime")]
+async fn new_engine_with_default_runtime<B>(backend: B) -> Result<Engine<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    Engine::new_with_wasm_runtime(backend, crate::default_wasm_runtime::runtime()?).await
+}
+
+#[cfg(not(feature = "default_wasm_runtime"))]
+async fn new_engine_with_default_runtime<B>(backend: B) -> Result<Engine<B>, LixError>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    Engine::new(backend).await
 }

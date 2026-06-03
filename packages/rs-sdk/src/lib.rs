@@ -4,6 +4,8 @@
 //! session, and the returned [`Lix`] handle owns the small application-facing
 //! surface.
 
+#[cfg(feature = "default_wasm_runtime")]
+mod default_wasm_runtime;
 mod lix;
 #[cfg(feature = "sqlite")]
 mod sqlite_backend;
