@@ -29,7 +29,7 @@ wasmtime = { version = "30.0.2", default-features = false, features = ["componen
 wasmtime-wasi = { version = "30.0.2", default-features = false, optional = true }
 
 [dev-dependencies]
-plugin_csv_wasm = { package = "plugin_csv", path = "../../plugins/csv", artifact = "cdylib", target = "wasm32-wasip2", lib = false }
+plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 rand = { version = "0.9", features = ["small_rng"] }
