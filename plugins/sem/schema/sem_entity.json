@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-lix-key": "sem_entity",
+  "x-lix-primary-key": ["/id"],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique entity identifier"
+    },
+    "entity_type": {
+      "type": "string",
+      "description": "Type of semantic entity: function, class, method, interface, gap, etc."
+    },
+    "entity_name": {
+      "type": "string",
+      "description": "Name of the entity"
+    },
+    "file_path": {
+      "type": "string",
+      "description": "Synthetic file path used by sem for language selection and entity IDs"
+    },
+    "line": {
+      "type": "integer",
+      "description": "Start line of the entity (1-indexed)"
+    },
+    "end_line": {
+      "type": "integer",
+      "description": "End line of the entity (1-indexed, inclusive)"
+    },
+    "content": {
+      "type": ["string", "null"],
+      "description": "Source content of the entity"
+    }
+  },
+  "required": ["id", "entity_type", "entity_name", "file_path", "line"],
+  "additionalProperties": false
+}

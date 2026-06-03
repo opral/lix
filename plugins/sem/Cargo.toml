@@ -1,0 +1,32 @@
+[package]
+name = "plugin_sem"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sem-core = { path = "../../artifact/sem/crates/sem-core", default-features = false, features = ["wasm", "grammar-all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.57"
+
+[dev-dependencies]
+jsonschema = "0.30"
+lix_sdk = { path = "../../packages/rs-sdk" }
+tokio = { version = "1", features = ["rt", "macros"] }
+zip = { version = "8", default-features = false }
