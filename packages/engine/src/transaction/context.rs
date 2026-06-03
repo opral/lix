@@ -33,8 +33,8 @@ use crate::live_state::{
 };
 use crate::plugin::{
     InstalledPlugin, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, PluginDetectedChange, PluginRuntimeHost,
-    detect_changes_with_plugin, file_content_type, load_installed_plugins_from_filesystem,
-    plugin_state_rows, select_plugin_for_path,
+    detect_changes_with_plugin, load_installed_plugins_from_filesystem, plugin_state_rows,
+    select_plugin_for_path,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::SqlWriteExecutionContext;
@@ -474,15 +474,9 @@ where
                     && file.scope.global == write.global
                     && file.scope.untracked == write.untracked
             });
-            let content_type = file_content_type(&write.data);
-            let existing_plugin = existing_file.and_then(|(path, _)| {
-                select_plugin_for_path(&installed_plugins, path, Some(content_type))
-            });
-            let selected_plugin = select_plugin_for_path(
-                &installed_plugins,
-                &write.path,
-                Some(content_type),
-            );
+            let existing_plugin = existing_file
+                .and_then(|(path, _)| select_plugin_for_path(&installed_plugins, path));
+            let selected_plugin = select_plugin_for_path(&installed_plugins, &write.path);
             let context = FilesystemRowContext {
                 branch_id: write.branch_id.clone(),
                 global: write.global,
@@ -491,8 +485,7 @@ where
                 metadata: None,
             };
             if let Some(existing_plugin) = existing_plugin
-                && selected_plugin
-                    .is_none_or(|plugin| plugin.key != existing_plugin.key)
+                && selected_plugin.is_none_or(|plugin| plugin.key != existing_plugin.key)
             {
                 let existing_state = self
                     .active_plugin_state_rows(&write.branch_id, &write.file_id, existing_plugin)
@@ -574,7 +567,7 @@ where
                 continue;
             }
             let installed_plugins = self.installed_plugins_for_filesystem(&filesystem).await?;
-            let Some(plugin) = select_plugin_for_path(&installed_plugins, path, None) else {
+            let Some(plugin) = select_plugin_for_path(&installed_plugins, path) else {
                 continue;
             };
             let active_state = self

@@ -13,8 +13,8 @@ use super::component::{
     render_with_plugin as render_with_component,
 };
 use super::{
-    InstalledPlugin, PluginContentType, load_installed_plugin_from_archive_bytes,
-    plugin_key_from_archive_path, select_best_glob_match,
+    InstalledPlugin, load_installed_plugin_from_archive_bytes, plugin_key_from_archive_path,
+    select_best_glob_match,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,14 +97,15 @@ pub(crate) async fn load_installed_plugins_from_filesystem(
 pub(crate) fn select_plugin_for_path<'a>(
     plugins: &'a [InstalledPlugin],
     path: &str,
-    content_type: Option<PluginContentType>,
 ) -> Option<&'a InstalledPlugin> {
+    // Plugin ownership is path-based. File bytes, especially empty bytes, are
+    // not reliable for deciding which plugin is active for a path.
     select_best_glob_match(
         path,
-        content_type,
+        None::<()>,
         plugins,
         |plugin| plugin.path_glob.as_str(),
-        |plugin| plugin.content_type,
+        |_plugin| None::<()>,
     )
 }
 
@@ -202,14 +203,6 @@ fn plugin_entity_state_from_live_rows(
             })
         })
         .collect()
-}
-
-pub(crate) fn file_content_type(data: &[u8]) -> PluginContentType {
-    if std::str::from_utf8(data).is_ok() {
-        PluginContentType::Text
-    } else {
-        PluginContentType::Binary
-    }
 }
 
 fn serialize_plugin_payload<T: Serialize>(

@@ -493,7 +493,7 @@ async fn read_plugin_file_bytes(
     }
 
     let installed_plugins = load_installed_plugins_from_filesystem(index, blob_reader).await?;
-    let Some(plugin) = select_plugin_for_path(&installed_plugins, path, None) else {
+    let Some(plugin) = select_plugin_for_path(&installed_plugins, path) else {
         return Ok(None);
     };
 

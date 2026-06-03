@@ -49,9 +49,8 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::plugin::{
-    InstalledPlugin, PluginRuntimeHost, file_content_type, load_installed_plugins_from_filesystem,
-    plugin_state_rows, reject_normal_plugin_storage_mutation, render_materialized_plugin_file,
-    select_plugin_for_path,
+    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
+    reject_normal_plugin_storage_mutation, render_materialized_plugin_file, select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -1625,10 +1624,8 @@ fn path_update_plugin_rewrite_file_ids(
         if plugins.is_empty() {
             continue;
         }
-        let data = required_binary_value(batch, row_index, "data")?;
-        let content_type = Some(file_content_type(&data));
-        let existing_plugin = select_plugin_for_path(plugins, &existing_path, content_type);
-        let assigned_plugin = select_plugin_for_path(plugins, &assigned_path, content_type);
+        let existing_plugin = select_plugin_for_path(plugins, &existing_path);
+        let assigned_plugin = select_plugin_for_path(plugins, &assigned_path);
         let existing_plugin_key = existing_plugin.map(|plugin| plugin.key.as_str());
         let assigned_plugin_key = assigned_plugin.map(|plugin| plugin.key.as_str());
         if existing_plugin_key != assigned_plugin_key {
@@ -2195,7 +2192,7 @@ async fn render_plugin_file_for_sql(
     path: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
     let installed_plugins = plugin_render.installed_plugins_for_branch(&file.live.branch_id);
-    let Some(plugin) = select_plugin_for_path(installed_plugins, path, None) else {
+    let Some(plugin) = select_plugin_for_path(installed_plugins, path) else {
         return Ok(None);
     };
     let rows = plugin_render
@@ -2867,7 +2864,11 @@ fn update_required_binary_value(
     }
 }
 
-fn required_binary_value(batch: &RecordBatch, row_index: usize, column_name: &str) -> Result<Vec<u8>> {
+fn required_binary_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Vec<u8>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         Some(ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value))) => Ok(value),
         Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(value),
