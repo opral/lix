@@ -68,3 +68,4 @@ required-features = ["sqlite"]
 name = "e2e"
 path = "benches/e2e.rs"
 harness = false
+required-features = ["sqlite"]

@@ -1,5 +1,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use lix_sdk::{FsWriteOptions, InMemoryBackend, LixError, OpenLixOptions, Value, open_lix};
+use lix_sdk::{
+    FsWriteOptions, InMemoryBackend, LixError, OpenLixOptions, SqliteBackend, Value, open_lix,
+};
 use plugin_csv::exports::lix::plugin::api::EntityState as CsvEntityState;
 use plugin_csv::exports::lix::plugin::api::Guest as _;
 use plugin_csv::{CsvPlugin, File as CsvFile};
@@ -12,6 +14,7 @@ use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tempfile::TempDir;
 use tokio::runtime::Builder;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, ComponentExportIndex, Instance, Linker, Val};
@@ -123,6 +126,14 @@ fn bench_e2e(c: &mut Criterion) {
             });
         });
     });
+    group.bench_function("setup_inmemory", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let lix = open_lix_with_warmed_csv_plugin_inmemory(&plugin).await;
+                black_box(lix).close().await.unwrap();
+            });
+        });
+    });
     group.bench_function("setup_wasm", |b| {
         b.iter(|| {
             runtime.block_on(async {
@@ -135,6 +146,13 @@ fn bench_e2e(c: &mut Criterion) {
     group.bench_function("insert_10k", |b| {
         b.iter_batched(
             || runtime.block_on(open_lix_with_warmed_csv_plugin(&plugin)),
+            |lix| runtime.block_on(insert_large_csv(lix, &initial_csv)),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("insert_10k_inmemory", |b| {
+        b.iter_batched(
+            || runtime.block_on(open_lix_with_warmed_csv_plugin_inmemory(&plugin)),
             |lix| runtime.block_on(insert_large_csv(lix, &initial_csv)),
             BatchSize::SmallInput,
         );
@@ -155,7 +173,7 @@ fn bench_e2e(c: &mut Criterion) {
     group.bench_function("insert_10k_plugin_diff", |b| {
         b.iter_batched(
             || NativeCsvDiffFixture::new(Vec::new(), initial_csv.clone()),
-            |fixture| bench_native_csv_diff(fixture),
+            bench_native_csv_diff,
             BatchSize::SmallInput,
         );
     });
@@ -164,6 +182,24 @@ fn bench_e2e(c: &mut Criterion) {
             || {
                 runtime.block_on(async {
                     let lix = open_lix_with_plugin(&plugin).await;
+                    csv_schema_changes_insert_fixture(
+                        lix,
+                        &[],
+                        &initial_wasm_changes,
+                        INITIAL_ROW_COUNT,
+                    )
+                    .await
+                })
+            },
+            |fixture| runtime.block_on(manual_bulk_insert_schema_changes(fixture)),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("insert_10k_insert_inmemory", |b| {
+        b.iter_batched(
+            || {
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin_inmemory(&plugin).await;
                     csv_schema_changes_insert_fixture(
                         lix,
                         &[],
@@ -190,11 +226,36 @@ fn bench_e2e(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.bench_function("insert_10k_insert_state_inmemory", |b| {
+        b.iter_batched(
+            || {
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin_inmemory(&plugin).await;
+                    csv_changes_insert_fixture(lix, &[], &initial_wasm_changes, INITIAL_ROW_COUNT)
+                        .await
+                })
+            },
+            |fixture| runtime.block_on(manual_bulk_insert_file_changes(fixture)),
+            BatchSize::SmallInput,
+        );
+    });
     group.bench_function("merge_10k", |b| {
         b.iter_batched(
             || {
                 runtime.block_on(async {
                     let lix = open_lix_with_plugin(&plugin).await;
+                    large_csv_fixture(lix, &initial_csv).await
+                })
+            },
+            |fixture| runtime.block_on(overwrite_large_csv(fixture, &updated_csv)),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("merge_10k_inmemory", |b| {
+        b.iter_batched(
+            || {
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin_inmemory(&plugin).await;
                     large_csv_fixture(lix, &initial_csv).await
                 })
             },
@@ -218,7 +279,7 @@ fn bench_e2e(c: &mut Criterion) {
     group.bench_function("merge_10k_plugin_diff", |b| {
         b.iter_batched(
             || NativeCsvDiffFixture::new(initial_native_state.clone(), updated_csv.clone()),
-            |fixture| bench_native_csv_diff(fixture),
+            bench_native_csv_diff,
             BatchSize::SmallInput,
         );
     });
@@ -227,6 +288,24 @@ fn bench_e2e(c: &mut Criterion) {
             || {
                 runtime.block_on(async {
                     let lix = open_lix_with_plugin(&plugin).await;
+                    csv_schema_changes_insert_fixture(
+                        lix,
+                        &initial_wasm_changes,
+                        &merge_wasm_changes,
+                        INITIAL_ROW_COUNT + NEW_ROW_COUNT,
+                    )
+                    .await
+                })
+            },
+            |fixture| runtime.block_on(manual_bulk_insert_schema_changes(fixture)),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("merge_10k_insert_inmemory", |b| {
+        b.iter_batched(
+            || {
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin_inmemory(&plugin).await;
                     csv_schema_changes_insert_fixture(
                         lix,
                         &initial_wasm_changes,
@@ -258,16 +337,83 @@ fn bench_e2e(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.bench_function("merge_10k_insert_state_inmemory", |b| {
+        b.iter_batched(
+            || {
+                runtime.block_on(async {
+                    let lix = open_lix_with_plugin_inmemory(&plugin).await;
+                    csv_changes_insert_fixture(
+                        lix,
+                        &initial_wasm_changes,
+                        &merge_wasm_changes,
+                        INITIAL_ROW_COUNT + NEW_ROW_COUNT,
+                    )
+                    .await
+                })
+            },
+            |fixture| runtime.block_on(manual_bulk_insert_file_changes(fixture)),
+            BatchSize::SmallInput,
+        );
+    });
     group.finish();
 }
 
+enum BenchLix {
+    Sqlite {
+        lix: lix_sdk::Lix<SqliteBackend>,
+        _temp_dir: TempDir,
+    },
+    InMemory {
+        lix: lix_sdk::Lix<InMemoryBackend>,
+    },
+}
+
+impl BenchLix {
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<lix_sdk::ExecuteResult, LixError> {
+        match self {
+            Self::Sqlite { lix, .. } => lix.execute(sql, params).await,
+            Self::InMemory { lix } => lix.execute(sql, params).await,
+        }
+    }
+
+    async fn write_file(
+        &self,
+        path: &str,
+        data: Vec<u8>,
+        options: FsWriteOptions,
+    ) -> Result<(), LixError> {
+        match self {
+            Self::Sqlite { lix, .. } => lix.write_file(path, data, options).await,
+            Self::InMemory { lix } => lix.write_file(path, data, options).await,
+        }
+    }
+
+    async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
+        match self {
+            Self::Sqlite { lix, .. } => lix.read_file(path).await,
+            Self::InMemory { lix } => lix.read_file(path).await,
+        }
+    }
+
+    async fn close(&self) -> Result<(), LixError> {
+        match self {
+            Self::Sqlite { lix, .. } => lix.close().await,
+            Self::InMemory { lix } => lix.close().await,
+        }
+    }
+}
+
 struct LargeCsvFixture {
-    lix: lix_sdk::Lix,
+    lix: BenchLix,
     file_id: String,
 }
 
 struct ExtractedCsvChangesFixture {
-    lix: lix_sdk::Lix,
+    lix: BenchLix,
     file_id: String,
     change_count: usize,
     state_insert_sql: String,
@@ -276,7 +422,7 @@ struct ExtractedCsvChangesFixture {
 }
 
 struct ExtractedCsvSchemaChangesFixture {
-    lix: lix_sdk::Lix,
+    lix: BenchLix,
     table_insert_sql: Option<String>,
     table_params: Vec<Value>,
     table_count: usize,
@@ -338,7 +484,27 @@ impl NativeCsvDiffFixture {
     }
 }
 
-async fn open_lix_with_plugin(plugin: &[u8]) -> lix_sdk::Lix {
+async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
+    let temp_dir = tempfile::tempdir().expect("failed to create sqlite bench tempdir");
+    let path = temp_dir.path().join("bench.lix");
+    let lix = open_lix(OpenLixOptions {
+        backend: SqliteBackend::open(path).expect("failed to open sqlite bench backend"),
+        wasm_runtime: Some(Arc::new(
+            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
+        )),
+    })
+    .await
+    .unwrap();
+
+    lix.install_plugin_archive(plugin).await.unwrap();
+
+    BenchLix::Sqlite {
+        lix,
+        _temp_dir: temp_dir,
+    }
+}
+
+async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
     let lix = open_lix(OpenLixOptions {
         backend: InMemoryBackend::new(),
         wasm_runtime: Some(Arc::new(
@@ -350,16 +516,22 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> lix_sdk::Lix {
 
     lix.install_plugin_archive(plugin).await.unwrap();
 
-    lix
+    BenchLix::InMemory { lix }
 }
 
-async fn open_lix_with_warmed_csv_plugin(plugin: &[u8]) -> lix_sdk::Lix {
+async fn open_lix_with_warmed_csv_plugin(plugin: &[u8]) -> BenchLix {
     let lix = open_lix_with_plugin(plugin).await;
     warm_lix_csv_plugin(&lix).await;
     lix
 }
 
-async fn warm_lix_csv_plugin(lix: &lix_sdk::Lix) {
+async fn open_lix_with_warmed_csv_plugin_inmemory(plugin: &[u8]) -> BenchLix {
+    let lix = open_lix_with_plugin_inmemory(plugin).await;
+    warm_lix_csv_plugin(&lix).await;
+    lix
+}
+
+async fn warm_lix_csv_plugin(lix: &BenchLix) {
     lix.write_file(
         CSV_PLUGIN_WARMUP_PATH,
         Vec::new(),
@@ -384,7 +556,7 @@ async fn warm_wasm_csv_plugin_component(component: &Arc<dyn lix_sdk::WasmCompone
     assert!(changes.is_empty());
 }
 
-async fn large_csv_fixture(lix: lix_sdk::Lix, initial_csv: &[u8]) -> LargeCsvFixture {
+async fn large_csv_fixture(lix: BenchLix, initial_csv: &[u8]) -> LargeCsvFixture {
     lix.write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
         .await
         .unwrap();
@@ -403,7 +575,7 @@ async fn large_csv_fixture(lix: lix_sdk::Lix, initial_csv: &[u8]) -> LargeCsvFix
 }
 
 async fn csv_changes_insert_fixture(
-    lix: lix_sdk::Lix,
+    lix: BenchLix,
     existing_changes: &[FileChange],
     insert_changes: &[FileChange],
     expected_active_row_count: usize,
@@ -452,7 +624,7 @@ async fn csv_changes_insert_fixture(
 }
 
 async fn csv_schema_changes_insert_fixture(
-    lix: lix_sdk::Lix,
+    lix: BenchLix,
     existing_changes: &[FileChange],
     insert_changes: &[FileChange],
     expected_active_row_count: usize,
@@ -490,7 +662,7 @@ async fn csv_schema_changes_insert_fixture(
     }
 }
 
-async fn insert_large_csv(lix: lix_sdk::Lix, initial_csv: &[u8]) {
+async fn insert_large_csv(lix: BenchLix, initial_csv: &[u8]) {
     lix.write_file(CSV_PATH, initial_csv.to_vec(), FsWriteOptions::default())
         .await
         .unwrap();
@@ -588,7 +760,7 @@ async fn assert_large_csv_overwrite_result(fixture: &LargeCsvFixture, updated_cs
     );
 }
 
-async fn active_csv_row_count(lix: &lix_sdk::Lix, file_id: &str) -> usize {
+async fn active_csv_row_count(lix: &BenchLix, file_id: &str) -> usize {
     let active_rows = lix
         .execute(
             "SELECT COUNT(*) AS row_count \
@@ -601,7 +773,7 @@ async fn active_csv_row_count(lix: &lix_sdk::Lix, file_id: &str) -> usize {
     usize::try_from(active_rows.rows()[0].get::<i64>("row_count").unwrap()).unwrap()
 }
 
-async fn active_csv_schema_row_count(lix: &lix_sdk::Lix) -> usize {
+async fn active_csv_schema_row_count(lix: &BenchLix) -> usize {
     let active_rows = lix
         .execute("SELECT COUNT(*) AS row_count FROM csv_row", &[])
         .await
@@ -727,7 +899,7 @@ fn bulk_insert_file_changes_params(file_id: &str, changes: &[FileChange]) -> Vec
     params
 }
 
-async fn bulk_insert_schema_changes(lix: &lix_sdk::Lix, changes: &[FileChange]) {
+async fn bulk_insert_schema_changes(lix: &BenchLix, changes: &[FileChange]) {
     let table_changes = changes
         .iter()
         .filter(|change| change.schema_key == "csv_table")
@@ -1066,7 +1238,7 @@ struct FileChange {
     snapshot_content: Option<serde_json::Value>,
 }
 
-async fn file_changes(lix: &lix_sdk::Lix, file_id: &str) -> Vec<FileChange> {
+async fn file_changes(lix: &BenchLix, file_id: &str) -> Vec<FileChange> {
     let changes = lix
         .execute(
             "SELECT schema_key, entity_pk, snapshot_content \
