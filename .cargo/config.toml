@@ -33,6 +33,25 @@ debug = false
 inherits = "dev"
 debug = true
 
+[profile.test]
+inherits = "release"
+debug = false
+debug-assertions = true
+
+[profile.test.build-override]
+inherits = "dev"
+debug = false
+opt-level = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.package."*"]
+debug = false
+debug-assertions = false
+overflow-checks = false
+[profile.test.package."log"]
+debug-assertions = true
+
 [profile.release]
 trim-paths = true
 

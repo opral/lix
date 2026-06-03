@@ -2958,6 +2958,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "lix_engine",
  "plugin_csv",
+ "rand 0.9.2",
  "rusqlite",
  "serde",
  "serde_json",

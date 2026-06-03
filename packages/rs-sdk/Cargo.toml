@@ -28,6 +28,7 @@ tempfile = { version = "3", optional = true }
 plugin_csv_wasm = { package = "plugin_csv", path = "../../plugins/csv", artifact = "cdylib", target = "wasm32-wasip2", lib = false }
 
 criterion = { package = "codspeed-criterion-compat", version = "4" }
+rand = { version = "0.9", features = ["small_rng"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
@@ -59,3 +60,8 @@ name = "sqlite_backend"
 path = "benches/sqlite_backend.rs"
 harness = false
 required-features = ["sqlite"]
+
+[[bench]]
+name = "e2e"
+path = "benches/e2e.rs"
+harness = false
