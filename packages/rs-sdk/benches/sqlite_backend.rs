@@ -1,12 +1,11 @@
+use std::hint::black_box;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lix_engine::backend::{KeyRef, PutEntry};
 use lix_sdk::{
     Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,

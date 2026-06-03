@@ -944,7 +944,7 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 
 #[cfg(feature = "default_wasm_runtime")]
 fn build_csv_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_WASM_plugin_csv"));
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
         panic!(
             "failed to read bindep-built CSV plugin wasm at {}: {error}",
