@@ -255,6 +255,109 @@ async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
 }
 
 #[tokio::test]
+async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(backend, runtime)
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .install_plugin_archive(&binary_sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+
+    session
+        .fs()
+        .write_file(
+            "/owned.binary-sentinel",
+            vec![0xff],
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("binary plugin write should succeed");
+
+    assert_eq!(
+        session
+            .fs()
+            .read_file("/owned.binary-sentinel")
+            .await
+            .expect("read_file should render plugin state"),
+        Some(b"plugin-rendered".to_vec())
+    );
+
+    let file_id_rows = session
+        .execute(
+            "SELECT id FROM lix_file WHERE path = '/owned.binary-sentinel'",
+            &[],
+        )
+        .await
+        .expect("file id read should succeed");
+    let [lix_engine::Value::Text(file_id)] = file_id_rows.rows()[0].values() else {
+        panic!(
+            "expected file id row, got {:?}",
+            file_id_rows.rows()[0].values()
+        );
+    };
+
+    let plugin_rows = session
+        .execute(
+            &format!(
+                "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'plugin_note' \
+                   AND file_id = '{file_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin state read should succeed");
+    assert_eq!(plugin_rows.len(), 1);
+
+    session
+        .fs()
+        .write_file(
+            "/owned.binary-sentinel",
+            Vec::new(),
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("empty plugin write should succeed");
+
+    assert_eq!(
+        session
+            .fs()
+            .read_file("/owned.binary-sentinel")
+            .await
+            .expect("read_file should succeed"),
+        Some(Vec::new())
+    );
+
+    let plugin_rows = session
+        .execute(
+            &format!(
+                "SELECT entity_pk \
+                 FROM lix_state \
+                 WHERE schema_key = 'plugin_note' \
+                   AND file_id = '{file_id}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("plugin state read should succeed");
+    assert_eq!(plugin_rows.len(), 0);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
 async fn sql_update_rejects_installed_plugin_storage_archive_data_write() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
@@ -907,13 +1010,36 @@ impl WasmRuntime for SentinelPluginRuntime {
 
 #[async_trait]
 impl WasmComponentInstance for SentinelPluginComponent {
-    async fn call(&self, export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         match export {
             "render" | "api#render" => {
                 self.render_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(b"plugin-rendered".to_vec())
             }
-            "detect-changes" | "api#detect-changes" => Ok(b"[]".to_vec()),
+            "detect-changes" | "api#detect-changes" => {
+                let payload: serde_json::Value =
+                    serde_json::from_slice(input).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("test plugin received invalid detect payload: {error}"),
+                        )
+                    })?;
+                let data = payload
+                    .get("file")
+                    .and_then(|file| file.get("data"))
+                    .and_then(|data| data.as_array())
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "test plugin detect payload is missing file data",
+                        )
+                    })?;
+                if data.is_empty() {
+                    Ok(br#"[{"entity-pk":["note"],"schema-key":"plugin_note","snapshot-content":null,"metadata":null}]"#.to_vec())
+                } else {
+                    Ok(br#"[{"entity-pk":["note"],"schema-key":"plugin_note","snapshot-content":"{\"id\":\"note\",\"value\":\"detected\"}","metadata":null}]"#.to_vec())
+                }
+            }
             other => Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("unexpected plugin export {other}"),
@@ -931,6 +1057,22 @@ fn sentinel_plugin_archive() -> Vec<u8> {
         "entry": "plugin.wasm",
         "schemas": ["schema/plugin_note.json"]
     }"#;
+    plugin_archive(MANIFEST_JSON)
+}
+
+fn binary_sentinel_plugin_archive() -> Vec<u8> {
+    const MANIFEST_JSON: &[u8] = br#"{
+        "key": "plugin_binary_sentinel",
+        "runtime": "wasm-component-v1",
+        "api_version": "0.1.0",
+        "match": { "path_glob": "*.binary-sentinel", "content_type": "binary" },
+        "entry": "plugin.wasm",
+        "schemas": ["schema/plugin_note.json"]
+    }"#;
+    plugin_archive(MANIFEST_JSON)
+}
+
+fn plugin_archive(manifest_json: &[u8]) -> Vec<u8> {
     const SCHEMA_JSON: &[u8] = br#"{
         "x-lix-key": "plugin_note",
         "x-lix-primary-key": ["/id"],
@@ -948,7 +1090,7 @@ fn sentinel_plugin_archive() -> Vec<u8> {
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (path, bytes) in [
-        ("manifest.json", MANIFEST_JSON),
+        ("manifest.json", manifest_json),
         ("schema/plugin_note.json", SCHEMA_JSON),
         ("plugin.wasm", WASM_HEADER),
     ] {
