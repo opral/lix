@@ -2,6 +2,7 @@ use lix_sdk::{OpenLixOptions, Value, open_lix};
 use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub const ORIGINAL_RUST_SOURCE: &[u8] = b"use std::fmt;\n\nfn hello(name: &str) -> String {\n    format!(\"Hello, {}!\", name)\n}\n\nstruct Greeter;\n";
 pub const UPDATED_RUST_SOURCE: &[u8] = b"use std::fmt;\n\nfn hello(name: &str) -> String {\n    format!(\"Hi, {}!\", name)\n}\n\nstruct Greeter;\n";
@@ -14,15 +15,20 @@ pub struct FileChange {
 }
 
 pub async fn open_lix_with_sem_plugin() -> lix_sdk::Lix {
-    let archive = build_sem_plugin_archive();
+    let archive = sem_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin_archive(&archive).await.unwrap();
+    lix.install_plugin_archive(archive).await.unwrap();
     let plugins = lix.list_installed_plugins().await.unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].key, "plugin_sem");
     assert_eq!(plugins[0].schema_keys, vec!["sem_entity".to_string()]);
     lix
+}
+
+fn sem_plugin_archive() -> &'static [u8] {
+    static ARCHIVE: OnceLock<Vec<u8>> = OnceLock::new();
+    ARCHIVE.get_or_init(build_sem_plugin_archive).as_slice()
 }
 
 pub async fn file_id_for_path(lix: &lix_sdk::Lix, path: &str) -> String {

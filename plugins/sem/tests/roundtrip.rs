@@ -45,9 +45,13 @@ async fn roundtrips_update_fixtures_byte_for_byte() {
     let lix = common::open_lix_with_sem_plugin().await;
 
     for pair in load_update_fixture_pairs() {
-        lix.write_file(&pair.before.path, pair.before.bytes, FsWriteOptions::default())
-            .await
-            .unwrap_or_else(|error| panic!("initial write failed for {}: {error:?}", pair.label));
+        lix.write_file(
+            &pair.before.path,
+            pair.before.bytes,
+            FsWriteOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("initial write failed for {}: {error:?}", pair.label));
         lix.write_file(
             &pair.after.path,
             pair.after.bytes.clone(),

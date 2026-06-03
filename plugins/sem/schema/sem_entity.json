@@ -6,7 +6,11 @@
   "properties": {
     "id": {
       "type": "string",
-      "description": "Unique entity identifier"
+      "description": "Stable Lix entity primary key"
+    },
+    "sem_id": {
+      "type": "string",
+      "description": "Current sem-core entity identifier"
     },
     "entity_type": {
       "type": "string",
@@ -31,8 +35,16 @@
     "content": {
       "type": ["string", "null"],
       "description": "Source content of the entity"
+    },
+    "content_hash": {
+      "type": ["string", "null"],
+      "description": "sem-core content hash used for identity matching"
+    },
+    "structural_hash": {
+      "type": ["string", "null"],
+      "description": "sem-core structural hash used for identity matching"
     }
   },
-  "required": ["id", "entity_type", "entity_name", "file_path", "line"],
+  "required": ["id", "sem_id", "entity_type", "entity_name", "file_path", "line"],
   "additionalProperties": false
 }
