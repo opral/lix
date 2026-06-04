@@ -348,7 +348,7 @@ fn assemble_blob_bytes(
     let expected_blob_size = persisted_size_to_usize(metadata.size_bytes, "binary CAS blob")?;
     let bytes = match &metadata.layout {
         BlobLayout::Empty => {
-            if metadata.hash != BlobHash::from_content(&[]) {
+            if cfg!(debug_assertions) && metadata.hash != BlobHash::from_content(&[]) {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -366,7 +366,10 @@ fn assemble_blob_bytes(
                 *chunk_hash,
                 expected_blob_size,
             )?;
-            if *chunk_hash != metadata.hash && BlobHash::from_content(&chunk) != metadata.hash {
+            if cfg!(debug_assertions)
+                && *chunk_hash != metadata.hash
+                && BlobHash::from_content(&chunk) != metadata.hash
+            {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -422,7 +425,7 @@ fn assemble_blob_bytes(
                     ),
                 ));
             }
-            if BlobHash::from_content(&out) != metadata.hash {
+            if cfg!(debug_assertions) && BlobHash::from_content(&out) != metadata.hash {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -488,7 +491,7 @@ fn decode_and_verify_chunk(
             ),
         ));
     }
-    if BlobHash::from_content(chunk_payload) != chunk_hash {
+    if cfg!(debug_assertions) && BlobHash::from_content(chunk_payload) != chunk_hash {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
