@@ -44,13 +44,14 @@ use crate::common::ParsedFilePath;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemIndex;
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
-    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
+    LiveStateFileScanRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
+    LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::{
-    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem, plugin_state_rows,
-    reject_normal_plugin_storage_mutation, render_materialized_plugin_file, select_plugin_for_path,
+    InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem,
+    plugin_state_live_state_projection, reject_normal_plugin_storage_mutation,
+    render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -2197,17 +2198,15 @@ async fn render_plugin_file_for_sql(
     };
     let rows = plugin_render
         .live_state
-        .scan_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: plugin.schema_keys.clone(),
-                branch_ids: vec![file.live.branch_id.clone()],
-                file_ids: vec![crate::NullableKeyFilter::Value(file.id.clone())],
-                ..Default::default()
-            },
+        .scan_file_rows(&LiveStateFileScanRequest {
+            branch_ids: vec![file.live.branch_id.clone()],
+            file_id: file.id.clone(),
+            schema_keys: plugin.schema_keys.clone(),
+            projection: plugin_state_live_state_projection(),
             ..Default::default()
         })
         .await?;
-    let active_state = plugin_state_rows(plugin, rows.iter());
+    let active_state = retain_plugin_state_rows(plugin, rows);
     render_materialized_plugin_file(&plugin_render.host, plugin, &active_state).await
 }
 

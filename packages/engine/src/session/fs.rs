@@ -1,7 +1,6 @@
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::NullableKeyFilter;
 use crate::binary_cas::BlobDataReader;
 use crate::common::{ParsedFilePath, directory_ancestor_paths, normalize_directory_path};
 use crate::filesystem::{
@@ -14,12 +13,13 @@ use crate::filesystem::{
     wrong_kind_error,
 };
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateFileScanRequest, LiveStateFilter, LiveStateReader, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::plugin::{
     InstalledPlugin, is_plugin_storage_path, load_installed_plugins_from_filesystem,
-    plugin_state_rows, reject_normal_plugin_storage_mutation, render_materialized_plugin_file,
-    select_plugin_for_path,
+    plugin_state_live_state_projection, reject_normal_plugin_storage_mutation,
+    render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
@@ -456,25 +456,15 @@ async fn scan_plugin_state_rows_from_reader(
     plugin: &InstalledPlugin,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
     let rows = live_state
-        .scan_rows(&LiveStateScanRequest {
-            filter: plugin_state_filter(branch_id, file_id, plugin),
+        .scan_file_rows(&LiveStateFileScanRequest {
+            branch_ids: vec![branch_id.to_string()],
+            file_id: file_id.to_string(),
+            schema_keys: plugin.schema_keys.clone(),
+            projection: plugin_state_live_state_projection(),
             ..Default::default()
         })
         .await?;
-    Ok(plugin_state_rows(plugin, rows.iter()))
-}
-
-fn plugin_state_filter(
-    branch_id: &str,
-    file_id: &str,
-    plugin: &InstalledPlugin,
-) -> LiveStateFilter {
-    LiveStateFilter {
-        schema_keys: plugin.schema_keys.clone(),
-        branch_ids: vec![branch_id.to_string()],
-        file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
-        ..Default::default()
-    }
+    Ok(retain_plugin_state_rows(plugin, rows))
 }
 
 async fn read_plugin_file_bytes(

@@ -24,8 +24,8 @@ pub(crate) use manifest::{
 #[allow(unused_imports)]
 pub(crate) use materializer::{
     PluginDetectedChange, detect_changes_with_plugin, load_installed_plugins_from_filesystem,
-    plugin_state_rows, render_materialized_plugin_file, render_plugin_state,
-    select_plugin_for_path,
+    plugin_state_live_state_projection, plugin_state_rows, render_materialized_plugin_file,
+    render_plugin_state, retain_plugin_state_rows, select_plugin_for_path,
 };
 #[allow(unused_imports)]
 pub(crate) use storage::{

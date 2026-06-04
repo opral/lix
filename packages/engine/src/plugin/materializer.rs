@@ -6,7 +6,7 @@ use crate::LixError;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemIndex;
-use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::{LiveStateProjection, MaterializedLiveStateRow};
 
 use super::component::{
     PluginComponentHost, detect_changes_with_plugin as detect_changes_with_component,
@@ -27,15 +27,15 @@ pub(crate) struct PluginDetectedChange {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
-struct PluginDetectChangesRequest {
-    state: Vec<PluginEntityState>,
+struct PluginDetectChangesRequest<'a> {
+    state: Vec<PluginEntityState<'a>>,
     file: PluginFile,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
-struct PluginRenderRequest {
-    state: Vec<PluginEntityState>,
+struct PluginRenderRequest<'a> {
+    state: Vec<PluginEntityState<'a>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,11 +46,11 @@ struct PluginFile {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
-struct PluginEntityState {
-    entity_pk: Vec<String>,
-    schema_key: String,
-    snapshot_content: String,
-    metadata: Option<String>,
+struct PluginEntityState<'a> {
+    entity_pk: &'a [String],
+    schema_key: &'a str,
+    snapshot_content: &'a str,
+    metadata: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,12 +180,27 @@ pub(crate) fn plugin_state_rows<'a>(
         .collect()
 }
 
-fn plugin_entity_state_from_live_rows(
-    rows: &[MaterializedLiveStateRow],
-) -> Result<Vec<PluginEntityState>, LixError> {
+pub(crate) fn retain_plugin_state_rows(
+    plugin: &InstalledPlugin,
+    mut rows: Vec<MaterializedLiveStateRow>,
+) -> Vec<MaterializedLiveStateRow> {
+    let schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
+    rows.retain(|row| schema_keys.contains(&row.schema_key) && row.snapshot_content.is_some());
+    rows
+}
+
+pub(crate) fn plugin_state_live_state_projection() -> LiveStateProjection {
+    LiveStateProjection {
+        columns: vec!["snapshot_content".to_string(), "metadata".to_string()],
+    }
+}
+
+fn plugin_entity_state_from_live_rows<'a>(
+    rows: &'a [MaterializedLiveStateRow],
+) -> Result<Vec<PluginEntityState<'a>>, LixError> {
     rows.iter()
         .map(|row| {
-            let snapshot_content = row.snapshot_content.clone().ok_or_else(|| {
+            let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
@@ -196,10 +211,10 @@ fn plugin_entity_state_from_live_rows(
                 )
             })?;
             Ok(PluginEntityState {
-                entity_pk: row.entity_pk.parts.clone(),
-                schema_key: row.schema_key.clone(),
+                entity_pk: &row.entity_pk.parts,
+                schema_key: &row.schema_key,
                 snapshot_content,
-                metadata: row.metadata.clone(),
+                metadata: row.metadata.as_deref(),
             })
         })
         .collect()
