@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::wasm::{
+    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
+    WasmPluginFile, WasmRuntime,
+};
 use lix_engine::{
     Engine, FsDirEntryKind, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, LixError,
 };
@@ -1010,41 +1013,31 @@ impl WasmRuntime for SentinelPluginRuntime {
 
 #[async_trait]
 impl WasmComponentInstance for SentinelPluginComponent {
-    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
-        match export {
-            "render" | "api#render" => {
-                self.render_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(b"plugin-rendered".to_vec())
-            }
-            "detect-changes" | "api#detect-changes" => {
-                let payload: serde_json::Value =
-                    serde_json::from_slice(input).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("test plugin received invalid detect payload: {error}"),
-                        )
-                    })?;
-                let data = payload
-                    .get("file")
-                    .and_then(|file| file.get("data"))
-                    .and_then(|data| data.as_array())
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "test plugin detect payload is missing file data",
-                        )
-                    })?;
-                if data.is_empty() {
-                    Ok(br#"[{"entity-pk":["note"],"schema-key":"plugin_note","snapshot-content":null,"metadata":null}]"#.to_vec())
-                } else {
-                    Ok(br#"[{"entity-pk":["note"],"schema-key":"plugin_note","snapshot-content":"{\"id\":\"note\",\"value\":\"detected\"}","metadata":null}]"#.to_vec())
-                }
-            }
-            other => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("unexpected plugin export {other}"),
-            )),
+    async fn detect_changes(
+        &self,
+        _state: Vec<WasmPluginEntityState>,
+        file: WasmPluginFile,
+    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+        if file.data.is_empty() {
+            Ok(vec![WasmPluginDetectedChange {
+                entity_pk: vec!["note".to_string()],
+                schema_key: "plugin_note".to_string(),
+                snapshot_content: None,
+                metadata: None,
+            }])
+        } else {
+            Ok(vec![WasmPluginDetectedChange {
+                entity_pk: vec!["note".to_string()],
+                schema_key: "plugin_note".to_string(),
+                snapshot_content: Some("{\"id\":\"note\",\"value\":\"detected\"}".to_string()),
+                metadata: None,
+            }])
         }
+    }
+
+    async fn render(&self, _state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
+        self.render_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(b"plugin-rendered".to_vec())
     }
 }
 

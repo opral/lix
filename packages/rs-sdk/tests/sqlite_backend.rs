@@ -2,7 +2,8 @@
 use lix_engine::run_backend_conformance;
 use lix_sdk::{
     FsWriteOptions, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory,
-    Value, WasmComponentInstance, WasmLimits, WasmRuntime, open_lix, open_lix_with_backend,
+    Value, WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
+    WasmPluginFile, WasmRuntime, open_lix, open_lix_with_backend,
 };
 use rusqlite::Connection;
 use std::io::{Cursor, Write};
@@ -177,21 +178,26 @@ impl WasmRuntime for RecordingWasmRuntime {
 
 #[async_trait::async_trait]
 impl WasmComponentInstance for RecordingWasmComponent {
-    async fn call(&self, export: &str, _input: &[u8]) -> Result<Vec<u8>, lix_sdk::LixError> {
-        match export {
-            "detect-changes" | "api#detect-changes" => {
-                self.detect_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(br#"[{"entity-pk":["doc"],"schema-key":"test_plugin_doc","snapshot-content":"{\"id\":\"doc\",\"content\":\"from runtime\"}","metadata":null}]"#.to_vec())
-            }
-            "render" | "api#render" => {
-                self.render_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(b"rendered by custom runtime".to_vec())
-            }
-            other => Err(lix_sdk::LixError::new(
-                lix_sdk::LixError::CODE_INTERNAL_ERROR,
-                format!("unexpected plugin export {other}"),
-            )),
-        }
+    async fn detect_changes(
+        &self,
+        _state: Vec<WasmPluginEntityState>,
+        _file: WasmPluginFile,
+    ) -> Result<Vec<WasmPluginDetectedChange>, lix_sdk::LixError> {
+        self.detect_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![WasmPluginDetectedChange {
+            entity_pk: vec!["doc".to_string()],
+            schema_key: "test_plugin_doc".to_string(),
+            snapshot_content: Some("{\"id\":\"doc\",\"content\":\"from runtime\"}".to_string()),
+            metadata: None,
+        }])
+    }
+
+    async fn render(
+        &self,
+        _state: Vec<WasmPluginEntityState>,
+    ) -> Result<Vec<u8>, lix_sdk::LixError> {
+        self.render_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(b"rendered by custom runtime".to_vec())
     }
 }
 

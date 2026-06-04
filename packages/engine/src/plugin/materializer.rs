@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
-
 use crate::LixError;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemIndex;
 use crate::live_state::{LiveStateProjection, MaterializedLiveStateRow};
+use crate::wasm::{WasmPluginEntityState, WasmPluginFile};
 
 use super::component::{
     PluginComponentHost, detect_changes_with_plugin as detect_changes_with_component,
@@ -23,43 +22,6 @@ pub(crate) struct PluginDetectedChange {
     pub(crate) schema_key: String,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginDetectChangesRequest<'a> {
-    state: Vec<PluginEntityState<'a>>,
-    file: PluginFile,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginRenderRequest<'a> {
-    state: Vec<PluginEntityState<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginFile {
-    data: Vec<u8>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginEntityState<'a> {
-    entity_pk: &'a [String],
-    schema_key: &'a str,
-    snapshot_content: &'a str,
-    metadata: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginDetectedChangeWire {
-    entity_pk: Vec<String>,
-    schema_key: String,
-    snapshot_content: Option<String>,
-    metadata: Option<String>,
 }
 
 pub(crate) async fn load_installed_plugins_from_filesystem(
@@ -115,19 +77,13 @@ pub(crate) async fn detect_changes_with_plugin(
     active_state: &[MaterializedLiveStateRow],
     file_data: Vec<u8>,
 ) -> Result<Vec<PluginDetectedChange>, LixError> {
-    let request = PluginDetectChangesRequest {
-        state: plugin_entity_state_from_live_rows(active_state)?,
-        file: PluginFile { data: file_data },
-    };
-    let payload = serialize_plugin_payload(&request, "detect-changes")?;
-    let output = detect_changes_with_component(host, plugin, &payload).await?;
-    let changes: Vec<PluginDetectedChangeWire> =
-        serde_json::from_slice(&output).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("plugin detect-changes returned invalid JSON: {error}"),
-            )
-        })?;
+    let changes = detect_changes_with_component(
+        host,
+        plugin,
+        plugin_entity_state_from_live_rows(active_state)?,
+        WasmPluginFile { data: file_data },
+    )
+    .await?;
     changes
         .into_iter()
         .map(|change| {
@@ -148,11 +104,12 @@ pub(crate) async fn render_plugin_state(
     plugin: &InstalledPlugin,
     active_state: &[MaterializedLiveStateRow],
 ) -> Result<Vec<u8>, LixError> {
-    let request = PluginRenderRequest {
-        state: plugin_entity_state_from_live_rows(active_state)?,
-    };
-    let payload = serialize_plugin_payload(&request, "render")?;
-    render_with_component(host, plugin, &payload).await
+    render_with_component(
+        host,
+        plugin,
+        plugin_entity_state_from_live_rows(active_state)?,
+    )
+    .await
 }
 
 pub(crate) async fn render_materialized_plugin_file(
@@ -195,9 +152,9 @@ pub(crate) fn plugin_state_live_state_projection() -> LiveStateProjection {
     }
 }
 
-fn plugin_entity_state_from_live_rows<'a>(
-    rows: &'a [MaterializedLiveStateRow],
-) -> Result<Vec<PluginEntityState<'a>>, LixError> {
+fn plugin_entity_state_from_live_rows(
+    rows: &[MaterializedLiveStateRow],
+) -> Result<Vec<WasmPluginEntityState>, LixError> {
     rows.iter()
         .map(|row| {
             let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
@@ -210,24 +167,12 @@ fn plugin_entity_state_from_live_rows<'a>(
                     ),
                 )
             })?;
-            Ok(PluginEntityState {
-                entity_pk: &row.entity_pk.parts,
-                schema_key: &row.schema_key,
-                snapshot_content,
-                metadata: row.metadata.as_deref(),
+            Ok(WasmPluginEntityState {
+                entity_pk: row.entity_pk.parts.clone(),
+                schema_key: row.schema_key.clone(),
+                snapshot_content: snapshot_content.to_string(),
+                metadata: row.metadata.clone(),
             })
         })
         .collect()
-}
-
-fn serialize_plugin_payload<T: Serialize>(
-    value: &T,
-    export_name: &str,
-) -> Result<Vec<u8>, LixError> {
-    serde_json::to_vec(value).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode plugin {export_name} payload: {error}"),
-        )
-    })
 }

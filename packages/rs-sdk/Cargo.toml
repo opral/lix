@@ -22,8 +22,6 @@ lix_engine = { workspace = true }
 async-trait = "0.1"
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
 tempfile = { version = "3", optional = true }
 wasmtime = { version = "30.0.2", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
 wasmtime-wasi = { version = "30.0.2", default-features = false, optional = true }
@@ -40,7 +38,7 @@ zip = { version = "8", default-features = false }
 
 [features]
 default = ["default_wasm_runtime"]
-default_wasm_runtime = ["dep:serde", "dep:serde_json", "dep:wasmtime", "dep:wasmtime-wasi"]
+default_wasm_runtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
 sqlite = ["dep:rusqlite", "dep:tempfile"]
 
 [[example]]

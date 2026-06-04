@@ -4,6 +4,27 @@ use async_trait::async_trait;
 
 use crate::LixError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmPluginFile {
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmPluginEntityState {
+    pub entity_pk: Vec<String>,
+    pub schema_key: String,
+    pub snapshot_content: String,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmPluginDetectedChange {
+    pub entity_pk: Vec<String>,
+    pub schema_key: String,
+    pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmLimits {
     pub max_memory_bytes: u64,
@@ -32,7 +53,13 @@ pub trait WasmRuntime: Send + Sync {
 
 #[async_trait]
 pub trait WasmComponentInstance: Send + Sync {
-    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError>;
+    async fn detect_changes(
+        &self,
+        state: Vec<WasmPluginEntityState>,
+        file: WasmPluginFile,
+    ) -> Result<Vec<WasmPluginDetectedChange>, LixError>;
+
+    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError>;
 
     async fn close(&self) -> Result<(), LixError> {
         Ok(())
