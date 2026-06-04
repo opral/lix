@@ -4,6 +4,14 @@ interface api {
   type json-text = string;
   type bytes = list<u8>;
 
+  variant scalar {
+    nil,
+    boolean(bool),
+    number(f64),
+    text(string),
+    json(json-text),
+  }
+
   /// Current materialized file payload supplied to `detect-changes`.
   record file {
     data: bytes,
@@ -17,7 +25,7 @@ interface api {
     entity-pk: list<string>,
     schema-key: string,
     /// Deterministically encoded JSON text.
-    snapshot-content: option<json-text>,
+    snapshot-content: option<map<string, scalar>>,
     /// Deterministically encoded JSON text.
     metadata: option<json-text>,
   }
@@ -33,7 +41,7 @@ interface api {
     entity-pk: list<string>,
     schema-key: string,
     /// Deterministically encoded JSON text.
-    snapshot-content: json-text,
+    snapshot-content: map<string, scalar>,
     /// Deterministically encoded JSON text.
     metadata: option<json-text>,
   }
