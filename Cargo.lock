@@ -3523,6 +3523,7 @@ dependencies = [
  "itertools 0.14.0",
  "rand 0.9.2",
  "serde_json",
+ "uuid",
  "wit-bindgen 0.57.1",
 ]
 

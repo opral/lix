@@ -9,7 +9,7 @@
     "id": {
       "type": "string",
       "minLength": 1,
-      "description": "Stable row entity pk. Must match the row entity_pk."
+      "description": "Stable row entity pk. New rows are generated as UUIDv7 strings. Must match the row entity_pk."
     },
     "order_key": {
       "type": "string",
