@@ -84,16 +84,17 @@ fn active_state_snapshot_value(row: &EntityState) -> Value {
     serde_json::from_str(&row.snapshot_content).expect("snapshot_content should parse")
 }
 
-fn snapshot_order_key_from_value(value: &Value) -> u128 {
+fn snapshot_order_key_from_value(value: &Value) -> String {
     let raw = value
         .get("order_key")
         .and_then(Value::as_str)
         .expect("line order_key should exist")
         .to_string();
-    u128::from_str_radix(&raw, 16).expect("line order_key should parse")
+    assert_order_key_is_valid(&raw);
+    raw
 }
 
-fn snapshot_order_key(change: &DetectedChange) -> u128 {
+fn snapshot_order_key(change: &DetectedChange) -> String {
     snapshot_order_key_from_value(&snapshot_value(change))
 }
 
@@ -118,7 +119,7 @@ fn assert_generated_line_id_is_uuid_v7(change: &DetectedChange) {
     assert_eq!(uuid.get_version_num(), 7);
 }
 
-fn line_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String, u128> {
+fn line_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String, String> {
     active_state
         .iter()
         .filter(|row| row.schema_key == LINE_SCHEMA_KEY)
@@ -132,6 +133,49 @@ fn line_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String, 
             (line, snapshot_order_key_from_value(&value))
         })
         .collect()
+}
+
+fn text_active_state_with_line_order_keys(lines: &[(&str, &str, &str)]) -> Vec<EntityState> {
+    let mut state = vec![EntityState {
+        entity_pk: vec![ROOT_ENTITY_PK.to_string()],
+        schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
+        snapshot_content: serde_json::json!({
+            "id": ROOT_ENTITY_PK,
+            "line_endings": "\n",
+        })
+        .to_string(),
+        metadata: None,
+    }];
+
+    state.extend(lines.iter().map(|(id, order_key, line)| {
+        EntityState {
+            entity_pk: vec![(*id).to_string()],
+            schema_key: LINE_SCHEMA_KEY.to_string(),
+            snapshot_content: serde_json::json!({
+                "id": id,
+                "order_key": order_key,
+                "line": line,
+            })
+            .to_string(),
+            metadata: None,
+        }
+    }));
+
+    state
+}
+
+fn assert_order_key_is_valid(raw: &str) {
+    assert!(!raw.is_empty(), "order_key should not be empty");
+    assert!(
+        raw.bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "order_key should contain only lowercase hexadecimal digits: {raw}"
+    );
+    assert_eq!(raw.len() % 2, 0, "order_key should have even length: {raw}");
+    assert!(
+        !raw.ends_with("00"),
+        "order_key should not end with the minimum byte: {raw}"
+    );
 }
 
 #[test]
@@ -171,13 +215,11 @@ fn detects_initial_projection_and_renders_text() {
         .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
     {
         assert_generated_line_id_is_uuid_v7(line);
-        assert_eq!(
+        assert_order_key_is_valid(
             snapshot_value(line)
                 .get("order_key")
                 .and_then(Value::as_str)
-                .expect("line order_key should exist")
-                .len(),
-            32
+                .expect("line order_key should exist"),
         );
     }
 
@@ -218,7 +260,7 @@ fn detects_empty_initial_text_file_as_document() {
 }
 
 #[test]
-fn detects_initial_text_larger_than_fractional_halving_limit() {
+fn detects_initial_text_larger_than_fixed_width_order_key_limit() {
     let expected = text_lines("line", 200);
     let after = file_from_bytes(&expected);
 
@@ -254,7 +296,7 @@ fn applies_delta_to_existing_text() {
 }
 
 #[test]
-fn appends_text_lines_larger_than_fractional_halving_limit() {
+fn appends_text_lines_larger_than_fixed_width_order_key_limit() {
     let before_bytes = text_lines("line", 1);
     let after_bytes = text_lines("line", 201);
     let before = file_from_bytes(&before_bytes);
@@ -381,7 +423,7 @@ fn silently_decodes_malformed_text() {
 }
 
 #[test]
-fn inserted_lines_get_fractional_index_between_neighbors() {
+fn inserted_lines_get_order_key_between_neighbors() {
     let before_bytes = b"a\nc\n";
     let after_bytes = b"a\nb\nc\n";
     let before = file_from_bytes(before_bytes);
@@ -400,18 +442,66 @@ fn inserted_lines_get_fractional_index_between_neighbors() {
         assert_eq!(line_changes.len(), 1);
         snapshot_order_key(line_changes[0])
     };
-    let lower = *order_keys_by_line
+    let lower = order_keys_by_line
         .get("a")
         .expect("before state should contain line a");
-    let upper = *order_keys_by_line
+    let upper = order_keys_by_line
         .get("c")
         .expect("before state should contain line c");
-    assert!(inserted_order_key > lower);
-    assert!(inserted_order_key < upper);
+    assert!(inserted_order_key.as_str() > lower.as_str());
+    assert!(inserted_order_key.as_str() < upper.as_str());
 
     let output = render_active_state(apply_changes_to_active_state(before_state, changes))
         .expect("render should succeed");
 
+    assert_eq!(output, after_bytes);
+}
+
+#[test]
+fn inserts_many_lines_inside_narrow_order_key_gap() {
+    let before_state =
+        text_active_state_with_line_order_keys(&[("line:a", "80", "a"), ("line:z", "8001", "z")]);
+    let mut after_text = String::from("a\n");
+    for offset in 0..256 {
+        writeln!(&mut after_text, "mid{offset}").unwrap();
+    }
+    after_text.push('z');
+
+    let changes =
+        TextPlugin::detect_changes(before_state.clone(), file_from_bytes(after_text.as_bytes()))
+            .expect("detect_changes should succeed");
+
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
+            .count(),
+        256
+    );
+
+    let output = render_active_state(apply_changes_to_active_state(before_state, changes))
+        .expect("render should succeed");
+    assert_eq!(output, after_text.as_bytes());
+}
+
+#[test]
+fn repairs_duplicate_line_order_keys_when_inserting_between_them() {
+    let before_state =
+        text_active_state_with_line_order_keys(&[("line:a", "80", "a"), ("line:c", "80", "c")]);
+    let after_bytes = b"a\nb\nc";
+
+    let changes = TextPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
+        .expect("detect_changes should succeed");
+    let active_state = apply_changes_to_active_state(before_state, changes);
+    let order_keys_by_line = line_order_keys_by_content(&active_state);
+    let unique_order_keys = order_keys_by_line
+        .values()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(order_keys_by_line.len(), 3);
+    assert_eq!(unique_order_keys.len(), 3);
+
+    let output = render_active_state(active_state).expect("render should succeed");
     assert_eq!(output, after_bytes);
 }
 
@@ -433,28 +523,19 @@ fn render_uses_line_endings_from_document_snapshot() {
         DetectedChange {
             entity_pk: vec!["line:0".to_string()],
             schema_key: LINE_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r#"{"id":"line:0","order_key":"80000000000000000000000000000000","line":"a"}"#
-                    .to_string(),
-            ),
+            snapshot_content: Some(r#"{"id":"line:0","order_key":"80","line":"a"}"#.to_string()),
             metadata: None,
         },
         DetectedChange {
             entity_pk: vec!["line:1".to_string()],
             schema_key: LINE_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r#"{"id":"line:1","order_key":"c0000000000000000000000000000000","line":"b"}"#
-                    .to_string(),
-            ),
+            snapshot_content: Some(r#"{"id":"line:1","order_key":"c0","line":"b"}"#.to_string()),
             metadata: None,
         },
         DetectedChange {
             entity_pk: vec!["line:2".to_string()],
             schema_key: LINE_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r#"{"id":"line:2","order_key":"e0000000000000000000000000000000","line":""}"#
-                    .to_string(),
-            ),
+            snapshot_content: Some(r#"{"id":"line:2","order_key":"e0","line":""}"#.to_string()),
             metadata: None,
         },
         DetectedChange {
@@ -475,7 +556,7 @@ fn rejects_line_snapshot_with_invalid_order_key() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["line:0".to_string()],
         schema_key: LINE_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"id":"line:0","order_key":"bad","line":"a"}"#.to_string()),
+        snapshot_content: Some(r#"{"id":"line:0","order_key":"ba00","line":"a"}"#.to_string()),
         metadata: None,
     }];
 

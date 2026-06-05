@@ -8,7 +8,6 @@ wit_bindgen::generate!({
 
 mod csv;
 mod diff;
-mod order_key;
 pub mod schemas;
 
 use crate::csv::{
@@ -17,8 +16,8 @@ use crate::csv::{
 use crate::diff::{Op, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
-use crate::order_key::OrderKey;
 use itertools::Itertools;
+use lix_order_key::OrderKey;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -78,17 +77,26 @@ fn detect_changes_for_rows(
     after_dialect: CsvDialect,
 ) -> Result<Vec<DetectedChange>, PluginError> {
     let base = before.to_rows();
+    if has_duplicate_order_keys(&base) {
+        return detect_changes_for_rows_with_reindexed_order(
+            before,
+            file_rows,
+            after_dialect,
+            &base,
+        );
+    }
+
     let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut changes = Vec::new();
     let mut base_index = 0;
     let mut file_index = 0;
-    let mut previous_order_key = None;
+    let mut previous_order_key = None::<OrderKey>;
 
     for run in op_runs {
         match run.op {
             Op::Equal => {
                 for _ in 0..run.len {
-                    previous_order_key = Some(base[base_index].order_key);
+                    previous_order_key = Some(base[base_index].order_key.clone());
                     base_index += 1;
                     file_index += 1;
                 }
@@ -98,10 +106,10 @@ fn detect_changes_for_rows(
                     let row = &base[base_index];
                     changes.push(row_upsert_change(
                         &row.id,
-                        row.order_key,
+                        &row.order_key,
                         &file_rows[file_index],
                     )?);
-                    previous_order_key = Some(row.order_key);
+                    previous_order_key = Some(row.order_key.clone());
                     base_index += 1;
                     file_index += 1;
                 }
@@ -118,13 +126,14 @@ fn detect_changes_for_rows(
                 }
             }
             Op::Insert => {
-                let next_order_key = base.get(base_index).map(|row| row.order_key);
+                let next_order_key = base.get(base_index).map(|row| &row.order_key);
+                let ids = new_ids(run.len);
                 let order_keys =
-                    OrderKey::evenly_between(previous_order_key, next_order_key, run.len);
-                for order_key in order_keys {
-                    let id = Uuid::now_v7().to_string();
-                    changes.push(row_upsert_change(&id, order_key, &file_rows[file_index])?);
-                    previous_order_key = Some(order_key);
+                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
+                        .map_err(PluginError::Internal)?;
+                for (id, order_key) in ids.into_iter().zip(order_keys) {
+                    changes.push(row_upsert_change(&id, &order_key, &file_rows[file_index])?);
+                    previous_order_key = Some(order_key.clone());
                     file_index += 1;
                 }
             }
@@ -139,6 +148,100 @@ fn detect_changes_for_rows(
     }
 
     Ok(changes)
+}
+
+#[derive(Debug)]
+struct PlannedRow {
+    id: String,
+    cells: Vec<String>,
+}
+
+fn detect_changes_for_rows_with_reindexed_order(
+    before: &Projection,
+    file_rows: &[Vec<String>],
+    after_dialect: CsvDialect,
+    base: &[Row],
+) -> Result<Vec<DetectedChange>, PluginError> {
+    let planned_rows = plan_rows(base, file_rows);
+    let planned_ids = planned_rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<Vec<_>>();
+    let order_keys =
+        OrderKey::evenly_between(None, None, &planned_ids).map_err(PluginError::Internal)?;
+    let planned_id_set = planned_ids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut changes = Vec::new();
+
+    for id in before.rows_by_id.keys() {
+        if !planned_id_set.contains(id) {
+            changes.push(DetectedChange {
+                entity_pk: vec![id.clone()],
+                schema_key: ROW_SCHEMA_KEY.to_string(),
+                snapshot_content: None,
+                metadata: None,
+            });
+        }
+    }
+
+    for (row, order_key) in planned_rows.iter().zip(order_keys.iter()) {
+        changes.push(row_upsert_change(&row.id, order_key, &row.cells)?);
+    }
+
+    if before.dialect != after_dialect
+        || (!before.table_present
+            && (!file_rows.is_empty() || after_dialect != CsvDialect::default()))
+    {
+        changes.push(table_upsert_change(after_dialect)?);
+    }
+
+    Ok(changes)
+}
+
+fn plan_rows(base: &[Row], file_rows: &[Vec<String>]) -> Vec<PlannedRow> {
+    let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
+    let mut planned_rows = Vec::with_capacity(file_rows.len());
+    let mut base_index = 0;
+    let mut file_index = 0;
+
+    for run in op_runs {
+        match run.op {
+            Op::Equal | Op::Replace => {
+                for _ in 0..run.len {
+                    planned_rows.push(PlannedRow {
+                        id: base[base_index].id.clone(),
+                        cells: file_rows[file_index].clone(),
+                    });
+                    base_index += 1;
+                    file_index += 1;
+                }
+            }
+            Op::Delete => {
+                base_index += run.len;
+            }
+            Op::Insert => {
+                for id in new_ids(run.len) {
+                    planned_rows.push(PlannedRow {
+                        id,
+                        cells: file_rows[file_index].clone(),
+                    });
+                    file_index += 1;
+                }
+            }
+        }
+    }
+
+    planned_rows
+}
+
+fn has_duplicate_order_keys(rows: &[Row]) -> bool {
+    rows.windows(2)
+        .any(|pair| pair[0].order_key == pair[1].order_key)
+}
+
+fn new_ids(count: usize) -> Vec<String> {
+    (0..count).map(|_| Uuid::now_v7().to_string()).collect()
 }
 
 fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
@@ -204,7 +307,7 @@ impl Projection {
             .iter()
             .map(|(id, row)| Row {
                 id: id.clone(),
-                order_key: row.order_key,
+                order_key: row.order_key.clone(),
                 cells: row.cells.clone(),
             })
             .collect_vec();
@@ -215,7 +318,7 @@ impl Projection {
 
 fn row_upsert_change(
     id: &str,
-    order_key: OrderKey,
+    order_key: &OrderKey,
     cells: &[String],
 ) -> Result<DetectedChange, PluginError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
@@ -376,14 +479,14 @@ mod tests {
     }
 
     fn projection_from_rows(rows: Vec<Vec<String>>) -> Projection {
-        let order_keys = OrderKey::evenly_between(None, None, rows.len());
+        let ids = (0..rows.len())
+            .map(|offset| format!("row:{offset}"))
+            .collect::<Vec<_>>();
+        let order_keys = OrderKey::evenly_between(None, None, &ids).unwrap();
         let rows_by_id = rows
             .into_iter()
-            .zip(order_keys)
-            .enumerate()
-            .map(|(offset, (cells, order_key))| {
-                (format!("row:{offset}"), RowSnapshot { order_key, cells })
-            })
+            .zip(ids.into_iter().zip(order_keys))
+            .map(|(cells, (id, order_key))| (id, RowSnapshot { order_key, cells }))
             .collect::<BTreeMap<_, _>>();
 
         Projection {

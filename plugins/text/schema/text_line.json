@@ -13,8 +13,8 @@
     },
     "order_key": {
       "type": "string",
-      "pattern": "^[0-9a-f]{32}$",
-      "description": "Opaque U128 fractional line ordering key encoded as 32 lowercase hexadecimal digits."
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "Opaque variable-length byte order key encoded as lowercase hex. Lexicographic string order matches line order."
     },
     "line": {
       "type": "string",
