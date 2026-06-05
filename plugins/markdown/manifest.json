@@ -1,0 +1,14 @@
+{
+  "key": "plugin_md_v2",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {
+    "path_glob": "*.{md,markdown,mdx}",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/markdown_document.json",
+    "schema/markdown_block.json"
+  ]
+}
