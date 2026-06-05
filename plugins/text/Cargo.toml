@@ -20,20 +20,12 @@ workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64 = "0.22"
+chardetng = "1"
+encoding_rs = "0.8"
 imara-diff = "0.2"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
+uuid = { version = "1", features = ["v7", "std", "js", "fast-rng"] }
 wit-bindgen = "0.57"
 
 [dev-dependencies]
-criterion = "0.5"
-
-[[bench]]
-name = "detect_changes"
-harness = false
-
-[[bench]]
-name = "render_changes"
-harness = false
+rand = { version = "0.9", features = ["small_rng"] }

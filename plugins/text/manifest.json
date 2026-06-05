@@ -1,10 +1,14 @@
 {
-  "key": "text_plugin",
+  "key": "plugin_text",
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
   "match": {
-    "path_glob": "*",
+    "path_glob": "*.txt",
     "content_type": "text"
   },
-  "entry": "plugin.wasm"
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/text_document.json",
+    "schema/text_line.json"
+  ]
 }
