@@ -7,18 +7,17 @@ wit_bindgen::generate!({
 });
 
 mod diff;
-mod order_key;
 pub mod schemas;
 mod text;
 
 use crate::diff::{Op, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
-use crate::order_key::OrderKey;
 use crate::text::{
     ParsedText, TextDocumentSnapshot, document_upsert_change, parse_document_snapshot, parse_file,
     render_projection,
 };
+use lix_order_key::OrderKey;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -77,17 +76,21 @@ fn detect_changes_for_text(
     after: &ParsedText,
 ) -> Result<Vec<DetectedChange>, PluginError> {
     let base = before.to_lines();
+    if has_duplicate_order_keys(&base) {
+        return detect_changes_for_text_with_reindexed_order(before, after, &base);
+    }
+
     let op_runs = imara_diff_runs(base.iter().map(|line| &line.line), after.lines.iter());
     let mut changes = Vec::new();
     let mut base_index = 0;
     let mut file_index = 0;
-    let mut previous_order_key = None;
+    let mut previous_order_key = None::<OrderKey>;
 
     for run in op_runs {
         match run.op {
             Op::Equal => {
                 for _ in 0..run.len {
-                    previous_order_key = Some(base[base_index].order_key);
+                    previous_order_key = Some(base[base_index].order_key.clone());
                     base_index += 1;
                     file_index += 1;
                 }
@@ -97,10 +100,10 @@ fn detect_changes_for_text(
                     let line = &base[base_index];
                     changes.push(line_upsert_change(
                         &line.id,
-                        line.order_key,
+                        &line.order_key,
                         &after.lines[file_index],
                     )?);
-                    previous_order_key = Some(line.order_key);
+                    previous_order_key = Some(line.order_key.clone());
                     base_index += 1;
                     file_index += 1;
                 }
@@ -117,17 +120,18 @@ fn detect_changes_for_text(
                 }
             }
             Op::Insert => {
-                let next_order_key = base.get(base_index).map(|line| line.order_key);
+                let next_order_key = base.get(base_index).map(|line| &line.order_key);
+                let ids = new_ids(run.len);
                 let order_keys =
-                    OrderKey::evenly_between(previous_order_key, next_order_key, run.len);
-                for order_key in order_keys {
-                    let id = Uuid::now_v7().to_string();
+                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
+                        .map_err(PluginError::Internal)?;
+                for (id, order_key) in ids.into_iter().zip(order_keys) {
                     changes.push(line_upsert_change(
                         &id,
-                        order_key,
+                        &order_key,
                         &after.lines[file_index],
                     )?);
-                    previous_order_key = Some(order_key);
+                    previous_order_key = Some(order_key.clone());
                     file_index += 1;
                 }
             }
@@ -139,6 +143,97 @@ fn detect_changes_for_text(
     }
 
     Ok(changes)
+}
+
+#[derive(Debug)]
+struct PlannedLine {
+    id: String,
+    line: String,
+}
+
+fn detect_changes_for_text_with_reindexed_order(
+    before: &Projection,
+    after: &ParsedText,
+    base: &[Line],
+) -> Result<Vec<DetectedChange>, PluginError> {
+    let planned_lines = plan_text_lines(base, after);
+    let planned_ids = planned_lines
+        .iter()
+        .map(|line| line.id.clone())
+        .collect::<Vec<_>>();
+    let order_keys =
+        OrderKey::evenly_between(None, None, &planned_ids).map_err(PluginError::Internal)?;
+    let planned_id_set = planned_ids
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut changes = Vec::new();
+
+    for id in before.lines_by_id.keys() {
+        if !planned_id_set.contains(id) {
+            changes.push(DetectedChange {
+                entity_pk: vec![id.clone()],
+                schema_key: LINE_SCHEMA_KEY.to_string(),
+                snapshot_content: None,
+                metadata: None,
+            });
+        }
+    }
+
+    for (line, order_key) in planned_lines.iter().zip(order_keys.iter()) {
+        changes.push(line_upsert_change(&line.id, order_key, &line.line)?);
+    }
+
+    if !before.document_present || before.document != after.document {
+        changes.push(document_upsert_change(after.document)?);
+    }
+
+    Ok(changes)
+}
+
+fn plan_text_lines(base: &[Line], after: &ParsedText) -> Vec<PlannedLine> {
+    let op_runs = imara_diff_runs(base.iter().map(|line| &line.line), after.lines.iter());
+    let mut planned_lines = Vec::with_capacity(after.lines.len());
+    let mut base_index = 0;
+    let mut file_index = 0;
+
+    for run in op_runs {
+        match run.op {
+            Op::Equal | Op::Replace => {
+                for _ in 0..run.len {
+                    planned_lines.push(PlannedLine {
+                        id: base[base_index].id.clone(),
+                        line: after.lines[file_index].clone(),
+                    });
+                    base_index += 1;
+                    file_index += 1;
+                }
+            }
+            Op::Delete => {
+                base_index += run.len;
+            }
+            Op::Insert => {
+                for id in new_ids(run.len) {
+                    planned_lines.push(PlannedLine {
+                        id,
+                        line: after.lines[file_index].clone(),
+                    });
+                    file_index += 1;
+                }
+            }
+        }
+    }
+
+    planned_lines
+}
+
+fn has_duplicate_order_keys(lines: &[Line]) -> bool {
+    lines
+        .windows(2)
+        .any(|pair| pair[0].order_key == pair[1].order_key)
+}
+
+fn new_ids(count: usize) -> Vec<String> {
+    (0..count).map(|_| Uuid::now_v7().to_string()).collect()
 }
 
 fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
@@ -204,7 +299,7 @@ impl Projection {
             .iter()
             .map(|(id, line)| Line {
                 id: id.clone(),
-                order_key: line.order_key,
+                order_key: line.order_key.clone(),
                 line: line.line.clone(),
             })
             .collect::<Vec<_>>();
@@ -215,7 +310,7 @@ impl Projection {
 
 fn line_upsert_change(
     id: &str,
-    order_key: OrderKey,
+    order_key: &OrderKey,
     line: &str,
 ) -> Result<DetectedChange, PluginError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
@@ -378,15 +473,15 @@ mod tests {
     fn projection_from_text(text: ParsedText) -> Projection {
         let document_present =
             text.document != TextDocumentSnapshot::default() || !text.lines.is_empty();
-        let order_keys = OrderKey::evenly_between(None, None, text.lines.len());
+        let ids = (0..text.lines.len())
+            .map(|offset| format!("line:{offset}"))
+            .collect::<Vec<_>>();
+        let order_keys = OrderKey::evenly_between(None, None, &ids).unwrap();
         let lines_by_id = text
             .lines
             .into_iter()
-            .zip(order_keys)
-            .enumerate()
-            .map(|(offset, (line, order_key))| {
-                (format!("line:{offset}"), LineSnapshot { order_key, line })
-            })
+            .zip(ids.into_iter().zip(order_keys))
+            .map(|(line, (id, order_key))| (id, LineSnapshot { order_key, line }))
             .collect::<BTreeMap<_, _>>();
 
         Projection {

@@ -23,6 +23,7 @@ rust-version = "1.93"
 lix_cli = { path = "packages/cli", version = "0.6.0" }
 lix_engine = { path = "packages/engine", version = "0.6.2" }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.6.0" }
+lix_order_key = { path = "plugins/order-key", version = "0.6.2" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.6.2" }
 plugin_csv = { path = "plugins/csv", version = "0.6.0" }
 plugin_json_v2 = { path = "plugins/json", version = "0.6.0" }
@@ -79,6 +80,7 @@ multiple_bound_locations = "allow"
 must_use_candidate = "allow" # instead, enforce unused_results everywhere (TODO)
 needless_bitwise_bool = "allow"
 needless_pass_by_value = "allow"
+or_fun_call = "allow"
 redundant_pub_crate = "allow"
 result_unit_err = "allow"
 return_self_not_must_use = "allow"

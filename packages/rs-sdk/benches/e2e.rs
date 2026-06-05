@@ -1178,9 +1178,9 @@ fn assert_file_changes_equivalent(direct: &[FileChange], extracted: &[FileChange
         "direct plugin csv_table dialect should match extracted dialect"
     );
     assert_eq!(
-        normalized_csv_rows(direct),
-        normalized_csv_rows(extracted),
-        "direct plugin csv_row order/cells should match extracted rows"
+        ordered_csv_row_cells(direct),
+        ordered_csv_row_cells(extracted),
+        "direct plugin csv_row cells should match extracted rows in order"
     );
 }
 
@@ -1201,8 +1201,8 @@ fn csv_table_dialect(changes: &[FileChange]) -> Option<serde_json::Value> {
     })
 }
 
-fn normalized_csv_rows(changes: &[FileChange]) -> Vec<(String, String)> {
-    let mut normalized = changes
+fn ordered_csv_row_cells(changes: &[FileChange]) -> Vec<String> {
+    let mut ordered = changes
         .iter()
         .filter(|change| change.schema_key == "csv_row")
         .map(|change| {
@@ -1223,8 +1223,8 @@ fn normalized_csv_rows(changes: &[FileChange]) -> Vec<(String, String)> {
             )
         })
         .collect::<Vec<_>>();
-    normalized.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    normalized
+    ordered.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    ordered.into_iter().map(|(_, cells)| cells).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
