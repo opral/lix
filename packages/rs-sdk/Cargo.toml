@@ -23,8 +23,8 @@ async-trait = "0.1"
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 tempfile = { version = "3", optional = true }
-wasmtime = { version = "30.0.2", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
-wasmtime-wasi = { version = "30.0.2", default-features = false, optional = true }
+wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
+wasmtime-wasi = { version = "45", default-features = false, features = ["p2"], optional = true }
 
 [dev-dependencies]
 plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
