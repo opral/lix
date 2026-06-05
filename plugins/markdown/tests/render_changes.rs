@@ -1,7 +1,12 @@
 mod common;
 
-use common::{assert_invalid_input, block_change, decode_utf8, document_change};
-use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange};
+use common::{assert_invalid_input, block_change, decode_utf8, document_change, snapshot_content};
+use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, Scalar};
+use std::collections::BTreeMap;
+
+fn invalid_json_scalar_snapshot() -> BTreeMap<String, Scalar> {
+    BTreeMap::from([("bad".to_string(), Scalar::Json("{".to_string()))])
+}
 
 #[test]
 fn materializes_markdown_from_document_order_and_blocks() {
@@ -52,13 +57,10 @@ fn rejects_unknown_document_entity_pk() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["other".to_string()],
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(
-            serde_json::json!({
-                "id": "other",
-                "order": ["b1"],
-            })
-            .to_string(),
-        ),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "id": "other",
+            "order": ["b1"],
+        }))),
         metadata: None,
     }];
 
@@ -72,7 +74,7 @@ fn rejects_invalid_block_snapshot_json() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["b1".to_string()],
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        snapshot_content: Some("{".to_string()),
+        snapshot_content: Some(invalid_json_scalar_snapshot()),
         metadata: None,
     }];
 
@@ -86,7 +88,7 @@ fn rejects_invalid_document_snapshot_json() {
     let changes = vec![DetectedChange {
         entity_pk: vec![plugin_md_v2::ROOT_ENTITY_PK.to_string()],
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        snapshot_content: Some("{".to_string()),
+        snapshot_content: Some(invalid_json_scalar_snapshot()),
         metadata: None,
     }];
 
@@ -100,15 +102,12 @@ fn rejects_block_snapshot_id_mismatch_with_entity_pk() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["b1".to_string()],
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(
-            serde_json::json!({
-                "id": "b2",
-                "type": "paragraph",
-                "node": {},
-                "markdown": "hello",
-            })
-            .to_string(),
-        ),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "id": "b2",
+            "type": "paragraph",
+            "node": {},
+            "markdown": "hello",
+        }))),
         metadata: None,
     }];
 
@@ -122,13 +121,10 @@ fn rejects_document_snapshot_id_mismatch_with_root() {
     let changes = vec![DetectedChange {
         entity_pk: vec![plugin_md_v2::ROOT_ENTITY_PK.to_string()],
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(
-            serde_json::json!({
-                "id": "other",
-                "order": ["b1"],
-            })
-            .to_string(),
-        ),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "id": "other",
+            "order": ["b1"],
+        }))),
         metadata: None,
     }];
 
@@ -142,7 +138,7 @@ fn ignores_unknown_schema_rows() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["unknown1".to_string()],
         schema_key: "other_schema".to_string(),
-        snapshot_content: Some("{\"x\":1}".to_string()),
+        snapshot_content: Some(snapshot_content(serde_json::json!({"x": 1}))),
         metadata: None,
     }];
 

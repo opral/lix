@@ -1,6 +1,9 @@
 use crate::exports::lix::plugin::api::PluginError;
 use crate::{DetectedChange, File};
-use crate::{Projection, ROOT_ENTITY_PK, TABLE_SCHEMA_KEY, reject_unknown_fields};
+use crate::{
+    Projection, ROOT_ENTITY_PK, SnapshotContent, TABLE_SCHEMA_KEY, reject_unknown_fields,
+    snapshot_content_from_value, snapshot_content_to_value,
+};
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use csv::{ByteRecord, QuoteStyle, ReaderBuilder, Terminator, WriterBuilder};
 use csv_nose::{Quote, Sniffer};
@@ -98,11 +101,13 @@ pub(crate) struct TableSnapshot {
 }
 
 pub(crate) fn table_upsert_change(dialect: CsvDialect) -> Result<DetectedChange, PluginError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": ROOT_ENTITY_PK,
-        "dialect": dialect_snapshot_content(dialect),
-    }))
-    .map_err(|error| PluginError::Internal(format!("failed to serialize CSV table: {error}")))?;
+    let snapshot_content = snapshot_content_from_value(
+        serde_json::json!({
+            "id": ROOT_ENTITY_PK,
+            "dialect": dialect_snapshot_content(dialect),
+        }),
+        "CSV table",
+    )?;
 
     Ok(DetectedChange {
         entity_pk: vec![ROOT_ENTITY_PK.to_string()],
@@ -123,10 +128,10 @@ fn dialect_snapshot_content(dialect: CsvDialect) -> Value {
     })
 }
 
-pub(crate) fn parse_table_snapshot(raw: &str) -> Result<TableSnapshot, PluginError> {
-    let value: Value = serde_json::from_str(raw).map_err(|error| {
-        PluginError::InvalidInput(format!("invalid csv table snapshot_content: {error}"))
-    })?;
+pub(crate) fn parse_table_snapshot(
+    snapshot_content: &SnapshotContent,
+) -> Result<TableSnapshot, PluginError> {
+    let value = snapshot_content_to_value(snapshot_content, "CSV table")?;
     let object = value.as_object().ok_or_else(|| {
         PluginError::InvalidInput("csv table snapshot_content must be an object".to_string())
     })?;

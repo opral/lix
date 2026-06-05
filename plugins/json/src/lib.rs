@@ -6,7 +6,7 @@ wit_bindgen::generate!({
     world: "plugin",
 });
 
-pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError, Scalar};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -49,8 +49,10 @@ struct ProjectionUpsert {
 #[derive(Debug)]
 struct ProjectionRow {
     entity_pk: Vec<String>,
-    snapshot_content: String,
+    snapshot_content: SnapshotContent,
 }
+
+type SnapshotContent = BTreeMap<String, Scalar>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectionNodeKind {
@@ -243,8 +245,12 @@ fn parse_json_bytes(data: &[u8]) -> Result<Value, PluginError> {
     })
 }
 
-fn parse_snapshot_value(raw: &str, pointer: &str) -> Result<Value, PluginError> {
-    if let Ok(parsed) = serde_json::from_str::<SnapshotContentWithPath>(raw) {
+fn parse_snapshot_value(
+    snapshot_content: &SnapshotContent,
+    pointer: &str,
+) -> Result<Value, PluginError> {
+    let raw = snapshot_content_to_json(snapshot_content, "JSON pointer snapshot")?;
+    if let Ok(parsed) = serde_json::from_str::<SnapshotContentWithPath>(&raw) {
         if parsed.path != pointer {
             return Err(PluginError::InvalidInput(format!(
                 "snapshot path '{}' does not match entity_pk '{}'",
@@ -254,7 +260,7 @@ fn parse_snapshot_value(raw: &str, pointer: &str) -> Result<Value, PluginError> 
         return Ok(parsed.value);
     }
 
-    parse_snapshot_value_slow(raw, pointer)
+    parse_snapshot_value_slow(&raw, pointer)
 }
 
 fn parse_snapshot_value_slow(raw: &str, pointer: &str) -> Result<Value, PluginError> {
@@ -490,7 +496,7 @@ fn push_upsert(
     pointer: String,
     value: Value,
 ) -> Result<(), PluginError> {
-    let snapshot_content = serde_json::to_string(&SnapshotContentRef {
+    let snapshot_value = serde_json::to_value(&SnapshotContentRef {
         path: &pointer,
         value: &value,
     })
@@ -499,6 +505,7 @@ fn push_upsert(
             "failed to serialize snapshot content for '{pointer}': {error}"
         ))
     })?;
+    let snapshot_content = snapshot_content_from_value(snapshot_value, "JSON pointer snapshot")?;
 
     changes.push(DetectedChange {
         entity_pk: vec![pointer],
@@ -508,6 +515,60 @@ fn push_upsert(
     });
 
     Ok(())
+}
+
+fn snapshot_content_from_value(value: Value, label: &str) -> Result<SnapshotContent, PluginError> {
+    let Value::Object(object) = value else {
+        return Err(PluginError::Internal(format!(
+            "{label} must serialize to a JSON object"
+        )));
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| Ok((key, scalar_from_json_value(value)?)))
+        .collect()
+}
+
+fn snapshot_content_to_json(
+    snapshot_content: &SnapshotContent,
+    label: &str,
+) -> Result<String, PluginError> {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json_value_from_scalar(value, label)?)))
+        .collect::<Result<Map<_, _>, _>>()?;
+    serde_json::to_string(&Value::Object(object))
+        .map_err(|error| PluginError::Internal(format!("failed to encode {label} JSON: {error}")))
+}
+
+fn scalar_from_json_value(value: Value) -> Result<Scalar, PluginError> {
+    match value {
+        Value::Null => Ok(Scalar::Nil),
+        Value::Bool(value) => Ok(Scalar::Boolean(value)),
+        Value::String(value) => Ok(Scalar::Text(value)),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => serde_json::to_string(&value)
+            .map(Scalar::Json)
+            .map_err(|error| {
+                PluginError::Internal(format!("failed to encode snapshot scalar JSON: {error}"))
+            }),
+    }
+}
+
+fn json_value_from_scalar(value: &Scalar, label: &str) -> Result<Value, PluginError> {
+    match value {
+        Scalar::Nil => Ok(Value::Null),
+        Scalar::Boolean(value) => Ok(Value::Bool(*value)),
+        Scalar::Number(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                PluginError::InvalidInput(format!("{label} contains NaN or infinite number"))
+            }),
+        Scalar::Text(value) => Ok(Value::String(value.clone())),
+        Scalar::Json(value) => serde_json::from_str(value).map_err(|error| {
+            PluginError::InvalidInput(format!("{label} contains invalid JSON scalar: {error}"))
+        }),
+    }
 }
 
 fn is_container(value: &Value) -> bool {

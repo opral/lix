@@ -1,6 +1,6 @@
 mod common;
 
-use common::{file_from_bytes, parse_document_snapshot};
+use common::{file_from_bytes, parse_document_snapshot, snapshot_content};
 use text_plugin::{
     DOCUMENT_SCHEMA_KEY, DetectedChange, LINE_SCHEMA_KEY, PluginError, detect_changes,
     render_changes,
@@ -35,7 +35,10 @@ fn rejects_missing_document_snapshot() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["line:abc:0".to_string()],
         schema_key: LINE_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"content_base64":"YQ==","ending":"\n"}"#.to_string()),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "content_base64": "YQ==",
+            "ending": "\n",
+        }))),
         metadata: None,
     }];
 
@@ -63,12 +66,9 @@ fn document_order_drives_output_order() {
         .expect("document row should exist");
     let mut doc = parse_document_snapshot(&changes[document_index]);
     doc.line_ids.reverse();
-    changes[document_index].snapshot_content = Some(
-        serde_json::json!({
-            "line_ids": doc.line_ids,
-        })
-        .to_string(),
-    );
+    changes[document_index].snapshot_content = Some(snapshot_content(serde_json::json!({
+        "line_ids": doc.line_ids,
+    })));
 
     let output =
         render_changes(file_from_bytes(b""), changes).expect("render_changes should succeed");

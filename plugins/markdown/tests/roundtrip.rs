@@ -3,6 +3,7 @@ mod common;
 use common::{
     StateRows, active_state_from_changes, apply_changes_to_active_state, collect_state_rows,
     decode_utf8, detect_changes_from_files, file_from_markdown, is_document_change, merge_delta,
+    snapshot_value,
 };
 use plugin_md_v2::exports::lix::plugin::api::Guest;
 use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, MarkdownPlugin};
@@ -48,12 +49,7 @@ fn upsert_block_types(changes: &[DetectedChange]) -> Vec<String> {
         .iter()
         .filter(|c| c.schema_key == BLOCK_SCHEMA_KEY && c.snapshot_content.is_some())
         .map(|c| {
-            let raw = c
-                .snapshot_content
-                .as_ref()
-                .expect("upsert should have snapshot");
-            let parsed: serde_json::Value =
-                serde_json::from_str(raw).expect("block snapshot should be valid JSON");
+            let parsed = snapshot_value(c);
             parsed
                 .get("type")
                 .and_then(serde_json::Value::as_str)

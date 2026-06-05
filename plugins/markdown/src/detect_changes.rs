@@ -1,5 +1,8 @@
 use crate::ROOT_ENTITY_PK;
-use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
+use crate::common::{
+    BlockSnapshotContent, DocumentSnapshotContent, snapshot_content_from_value,
+    snapshot_content_to_json,
+};
 use crate::exports::lix::plugin::api::{EntityState, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 use crate::{DetectedChange, File, single_entity_pk};
@@ -82,7 +85,7 @@ pub(crate) fn detect_changes(
     }
 
     if before_order != after_order {
-        let snapshot_content = serde_json::to_string(&DocumentSnapshotContent {
+        let snapshot_value = serde_json::to_value(&DocumentSnapshotContent {
             id: ROOT_ENTITY_PK.to_string(),
             order: after_order,
         })
@@ -91,6 +94,7 @@ pub(crate) fn detect_changes(
                 "failed to serialize markdown document snapshot: {error}"
             ))
         })?;
+        let snapshot_content = snapshot_content_from_value(snapshot_value, "markdown document")?;
 
         changes.push(DetectedChange {
             entity_pk: vec![ROOT_ENTITY_PK.to_string()],
@@ -117,10 +121,11 @@ fn parse_state_context_projection(
 
     for row in state_context {
         let schema_key = row.schema_key.as_str();
-        let snapshot_content = row.snapshot_content.as_str();
 
         if schema_key == DOCUMENT_SCHEMA_KEY {
-            let snapshot: DocumentSnapshotContent = serde_json::from_str(snapshot_content)
+            let snapshot_content =
+                snapshot_content_to_json(&row.snapshot_content, "markdown document")?;
+            let snapshot: DocumentSnapshotContent = serde_json::from_str(&snapshot_content)
                 .map_err(|error| {
                     PluginError::Internal(format!(
                         "invalid markdown document row in detect state context: {error}"
@@ -134,8 +139,9 @@ fn parse_state_context_projection(
             continue;
         }
 
+        let snapshot_content = snapshot_content_to_json(&row.snapshot_content, "markdown block")?;
         let snapshot: BlockSnapshotContent =
-            serde_json::from_str(snapshot_content).map_err(|error| {
+            serde_json::from_str(&snapshot_content).map_err(|error| {
                 PluginError::Internal(format!(
                     "invalid markdown block row in detect state context: {error}"
                 ))
@@ -441,7 +447,7 @@ fn assign_missing_ids(
 }
 
 fn block_upsert_change(block: &ParsedBlock) -> Result<DetectedChange, PluginError> {
-    let snapshot_content = serde_json::to_string(&BlockSnapshotContent {
+    let snapshot_value = serde_json::to_value(&BlockSnapshotContent {
         id: block.id.clone(),
         node_type: block.node_type.clone(),
         node: block.node_json.clone(),
@@ -452,6 +458,7 @@ fn block_upsert_change(block: &ParsedBlock) -> Result<DetectedChange, PluginErro
             "failed to serialize markdown block snapshot: {error}"
         ))
     })?;
+    let snapshot_content = snapshot_content_from_value(snapshot_value, "markdown block")?;
 
     Ok(DetectedChange {
         entity_pk: vec![block.id.clone()],

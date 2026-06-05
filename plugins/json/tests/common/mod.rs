@@ -1,16 +1,18 @@
 #![allow(dead_code)]
 
 use plugin_json_v2::exports::lix::plugin::api::{EntityState, Guest};
-use plugin_json_v2::{DetectedChange, File, JsonPlugin, PluginError};
+use plugin_json_v2::{DetectedChange, File, JsonPlugin, PluginError, Scalar};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
-struct SnapshotContent {
+struct SnapshotContentJson {
     path: String,
     value: Value,
 }
+
+pub type SnapshotContent = BTreeMap<String, Scalar>;
 
 pub fn file_from_json(json: &str) -> File {
     File {
@@ -19,22 +21,64 @@ pub fn file_from_json(json: &str) -> File {
 }
 
 pub fn parse_snapshot_value_from_change(change: &DetectedChange) -> Value {
-    let Some(snapshot_content) = change.snapshot_content.as_ref() else {
-        panic!("change should have snapshot_content");
-    };
-
-    let parsed: SnapshotContent =
-        serde_json::from_str(snapshot_content).expect("snapshot content should parse");
+    let parsed: SnapshotContentJson = serde_json::from_value(snapshot_content_value(
+        change
+            .snapshot_content
+            .as_ref()
+            .expect("change should have snapshot_content"),
+    ))
+    .expect("snapshot content should parse");
     assert_eq!(change.entity_pk, [parsed.path]);
     parsed.value
 }
 
-pub fn snapshot_content(path: &str, value: Value) -> String {
-    serde_json::json!({
+pub fn snapshot_content(path: &str, value: Value) -> SnapshotContent {
+    snapshot_content_from_value(serde_json::json!({
         "path": path,
         "value": value,
-    })
-    .to_string()
+    }))
+}
+
+pub fn snapshot_content_from_value(value: Value) -> SnapshotContent {
+    let Value::Object(object) = value else {
+        panic!("snapshot_content must be a JSON object");
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| (key, scalar_from_value(value)))
+        .collect()
+}
+
+fn snapshot_content_value(snapshot_content: &SnapshotContent) -> Value {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| (key.clone(), value_from_scalar(value)))
+        .collect::<Map<_, _>>();
+    Value::Object(object)
+}
+
+fn scalar_from_value(value: Value) -> Scalar {
+    match value {
+        Value::Null => Scalar::Nil,
+        Value::Bool(value) => Scalar::Boolean(value),
+        Value::String(value) => Scalar::Text(value),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            Scalar::Json(serde_json::to_string(&value).expect("snapshot scalar should encode"))
+        }
+    }
+}
+
+fn value_from_scalar(value: &Scalar) -> Value {
+    match value {
+        Scalar::Nil => Value::Null,
+        Scalar::Boolean(value) => Value::Bool(*value),
+        Scalar::Number(value) => {
+            Value::Number(serde_json::Number::from_f64(*value).expect("finite JSON number"))
+        }
+        Scalar::Text(value) => Value::String(value.clone()),
+        Scalar::Json(value) => serde_json::from_str(value).expect("JSON scalar should parse"),
+    }
 }
 
 pub fn active_state_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {

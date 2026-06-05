@@ -47,7 +47,7 @@ fn detects_nested_array_updates_and_deletions() {
         Value::String("x".to_string())
     );
     assert_eq!(changes[1].entity_pk, ["/list/2"]);
-    assert_eq!(changes[1].snapshot_content, None);
+    assert!(changes[1].snapshot_content.is_none());
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn detects_container_replacement() {
 
     assert_eq!(changes.len(), 2);
     assert_eq!(changes[0].entity_pk, ["/a/x"]);
-    assert_eq!(changes[0].snapshot_content, None);
+    assert!(changes[0].snapshot_content.is_none());
     assert_eq!(changes[1].entity_pk, ["/a"]);
     assert_eq!(
         parse_snapshot_value_from_change(&changes[1]),
@@ -97,11 +97,11 @@ fn detects_multi_delete_array_in_descending_order() {
 
     assert_eq!(changes.len(), 3);
     assert_eq!(changes[0].entity_pk, ["/list/3"]);
-    assert_eq!(changes[0].snapshot_content, None);
+    assert!(changes[0].snapshot_content.is_none());
     assert_eq!(changes[1].entity_pk, ["/list/2"]);
-    assert_eq!(changes[1].snapshot_content, None);
+    assert!(changes[1].snapshot_content.is_none());
     assert_eq!(changes[2].entity_pk, ["/list/1"]);
-    assert_eq!(changes[2].snapshot_content, None);
+    assert!(changes[2].snapshot_content.is_none());
 }
 
 #[test]
@@ -114,9 +114,9 @@ fn deleting_non_empty_container_emits_subtree_tombstones() {
 
     assert_eq!(changes.len(), 2);
     assert_eq!(changes[0].entity_pk, ["/a"]);
-    assert_eq!(changes[0].snapshot_content, None);
+    assert!(changes[0].snapshot_content.is_none());
     assert_eq!(changes[1].entity_pk, ["/a/b"]);
-    assert_eq!(changes[1].snapshot_content, None);
+    assert!(changes[1].snapshot_content.is_none());
 }
 
 #[test]
@@ -129,9 +129,9 @@ fn replacing_non_empty_container_with_scalar_tombstones_subtree() {
 
     assert_eq!(changes.len(), 3);
     assert_eq!(changes[0].entity_pk, ["/a"]);
-    assert_eq!(changes[0].snapshot_content, None);
+    assert!(changes[0].snapshot_content.is_none());
     assert_eq!(changes[1].entity_pk, ["/a/b"]);
-    assert_eq!(changes[1].snapshot_content, None);
+    assert!(changes[1].snapshot_content.is_none());
     assert_eq!(changes[2].entity_pk, [""]);
     assert_eq!(
         parse_snapshot_value_from_change(&changes[2]),

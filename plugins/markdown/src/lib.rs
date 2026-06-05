@@ -6,7 +6,7 @@ wit_bindgen::generate!({
     world: "plugin",
 });
 
-pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError, Scalar};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 
 mod common;

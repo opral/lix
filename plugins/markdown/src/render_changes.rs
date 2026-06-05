@@ -1,5 +1,7 @@
 use crate::ROOT_ENTITY_PK;
-use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
+use crate::common::{
+    BlockSnapshotContent, DocumentSnapshotContent, SnapshotContent, snapshot_content_to_json,
+};
 use crate::exports::lix::plugin::api::{EntityState, PluginError};
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 use crate::{File, single_entity_pk};
@@ -8,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 struct RenderRow {
     entity_pk: Vec<String>,
     schema_key: String,
-    snapshot_content: String,
+    snapshot_content: SnapshotContent,
 }
 
 pub(crate) fn render_state(file: File, state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
@@ -48,7 +50,9 @@ fn render_rows(
                 )));
             }
 
-            let snapshot: DocumentSnapshotContent = serde_json::from_str(&row.snapshot_content)
+            let snapshot_content =
+                snapshot_content_to_json(&row.snapshot_content, "markdown document")?;
+            let snapshot: DocumentSnapshotContent = serde_json::from_str(&snapshot_content)
                 .map_err(|error| {
                     PluginError::InvalidInput(format!(
                         "invalid snapshot_content for entity_pk '{ROOT_ENTITY_PK}': {error}"
@@ -73,8 +77,9 @@ fn render_rows(
             )));
         }
 
+        let snapshot_content = snapshot_content_to_json(&row.snapshot_content, "markdown block")?;
         let snapshot: BlockSnapshotContent =
-            serde_json::from_str(&row.snapshot_content).map_err(|error| {
+            serde_json::from_str(&snapshot_content).map_err(|error| {
                 PluginError::InvalidInput(format!(
                     "invalid snapshot_content for entity_pk '{entity_pk}': {error}"
                 ))

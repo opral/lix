@@ -1,6 +1,6 @@
 mod common;
 
-use common::snapshot_content;
+use common::{snapshot_content, snapshot_content_from_value};
 use plugin_json_v2::{DetectedChange, PluginError, SCHEMA_KEY};
 use serde_json::Value;
 
@@ -93,7 +93,9 @@ fn rejects_snapshot_missing_path() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["/foo".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"value":2}"#.to_string()),
+        snapshot_content: Some(snapshot_content_from_value(serde_json::json!({
+            "value": 2,
+        }))),
         metadata: None,
     }];
 
@@ -178,7 +180,10 @@ fn rejects_mismatched_snapshot_path() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["/foo".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"path":"/bar","value":2}"#.to_string()),
+        snapshot_content: Some(snapshot_content_from_value(serde_json::json!({
+            "path": "/bar",
+            "value": 2,
+        }))),
         metadata: None,
     }];
 
@@ -281,7 +286,10 @@ fn rejects_snapshot_path_non_string() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["/safe".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"path":123,"value":1}"#.to_string()),
+        snapshot_content: Some(snapshot_content_from_value(serde_json::json!({
+            "path": 123,
+            "value": 1,
+        }))),
         metadata: None,
     }];
 
@@ -302,7 +310,11 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
     let with_extra = vec![DetectedChange {
         entity_pk: vec!["/safe".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"path":"/safe","value":1,"extra":true}"#.to_string()),
+        snapshot_content: Some(snapshot_content_from_value(serde_json::json!({
+            "path": "/safe",
+            "value": 1,
+            "extra": true,
+        }))),
         metadata: None,
     }];
     let error = common::render_projection(with_root_object(with_extra))
@@ -319,7 +331,9 @@ fn rejects_snapshot_with_additional_properties_or_missing_value() {
     let missing_value = vec![DetectedChange {
         entity_pk: vec!["/safe".to_string()],
         schema_key: SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"path":"/safe"}"#.to_string()),
+        snapshot_content: Some(snapshot_content_from_value(serde_json::json!({
+            "path": "/safe",
+        }))),
         metadata: None,
     }];
     let error = common::render_projection(with_root_object(missing_value))

@@ -2,7 +2,7 @@ mod common;
 
 use common::{
     active_state_from_changes, assert_invalid_input, detect_changes_from_files, file_from_markdown,
-    is_block_change, is_document_change, parse_document_order,
+    is_block_change, is_document_change, parse_document_order, snapshot_value,
 };
 use plugin_md_v2::exports::lix::plugin::api::{EntityState, Guest};
 use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, File, MarkdownPlugin};
@@ -33,10 +33,9 @@ fn upsert_types(changes: &[DetectedChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-        .filter_map(|change| change.snapshot_content.as_ref())
-        .map(|raw| {
-            let parsed: serde_json::Value =
-                serde_json::from_str(raw).expect("block snapshot should be valid JSON");
+        .filter(|change| change.snapshot_content.is_some())
+        .map(|change| {
+            let parsed = snapshot_value(change);
             parsed
                 .get("type")
                 .and_then(serde_json::Value::as_str)
@@ -50,10 +49,9 @@ fn upsert_markdowns(changes: &[DetectedChange]) -> Vec<String> {
     changes
         .iter()
         .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
-        .filter_map(|change| change.snapshot_content.as_ref())
-        .map(|raw| {
-            let parsed: serde_json::Value =
-                serde_json::from_str(raw).expect("block snapshot should be valid JSON");
+        .filter(|change| change.snapshot_content.is_some())
+        .map(|change| {
+            let parsed = snapshot_value(change);
             parsed
                 .get("markdown")
                 .and_then(serde_json::Value::as_str)

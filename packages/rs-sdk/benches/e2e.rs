@@ -8,6 +8,7 @@ use plugin_csv::exports::lix::plugin::api::Guest as _;
 use plugin_csv::{CsvPlugin, File as CsvFile};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -18,7 +19,7 @@ use tempfile::TempDir;
 use tokio::runtime::Builder;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod plugin_bindings {
     wasmtime::component::bindgen!({
@@ -26,6 +27,8 @@ mod plugin_bindings {
         world: "plugin",
     });
 }
+
+type BindingSnapshotContent = HashMap<String, plugin_bindings::exports::lix::plugin::api::Scalar>;
 
 const INITIAL_ROW_COUNT: usize = 10_000;
 const NEW_ROW_COUNT: usize = 10_000;
@@ -1083,7 +1086,7 @@ fn csv_detected_changes_to_file_changes(
                 ),
                 snapshot_content: change
                     .snapshot_content
-                    .map(|snapshot| serde_json::from_str(&snapshot).unwrap()),
+                    .map(|snapshot| csv_snapshot_content_value(&snapshot)),
             }
         })
         .collect()
@@ -1116,11 +1119,61 @@ fn csv_entity_state_from_file_changes(changes: &[FileChange]) -> Vec<CsvEntitySt
                 .map(|snapshot_content| CsvEntityState {
                     entity_pk: entity_pk_parts(change),
                     schema_key: change.schema_key.clone(),
-                    snapshot_content: snapshot_content.to_string(),
+                    snapshot_content: csv_snapshot_content_from_value(snapshot_content),
                     metadata: None,
                 })
         })
         .collect()
+}
+
+fn csv_snapshot_content_value(
+    snapshot_content: &BTreeMap<String, plugin_csv::Scalar>,
+) -> serde_json::Value {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| (key.clone(), value_from_csv_scalar(value)))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(object)
+}
+
+fn csv_snapshot_content_from_value(
+    value: &serde_json::Value,
+) -> BTreeMap<String, plugin_csv::Scalar> {
+    let serde_json::Value::Object(object) = value else {
+        panic!("CSV snapshot_content should be a JSON object");
+    };
+
+    object
+        .iter()
+        .map(|(key, value)| (key.clone(), csv_scalar_from_value(value.clone())))
+        .collect()
+}
+
+fn csv_scalar_from_value(value: serde_json::Value) -> plugin_csv::Scalar {
+    match value {
+        serde_json::Value::Null => plugin_csv::Scalar::Nil,
+        serde_json::Value::Bool(value) => plugin_csv::Scalar::Boolean(value),
+        serde_json::Value::String(value) => plugin_csv::Scalar::Text(value),
+        serde_json::Value::Number(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => plugin_csv::Scalar::Json(
+            serde_json::to_string(&value).expect("CSV snapshot scalar should encode"),
+        ),
+    }
+}
+
+fn value_from_csv_scalar(value: &plugin_csv::Scalar) -> serde_json::Value {
+    match value {
+        plugin_csv::Scalar::Nil => serde_json::Value::Null,
+        plugin_csv::Scalar::Boolean(value) => serde_json::Value::Bool(*value),
+        plugin_csv::Scalar::Number(value) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*value).expect("finite CSV snapshot number"),
+        ),
+        plugin_csv::Scalar::Text(value) => serde_json::Value::String(value.clone()),
+        plugin_csv::Scalar::Json(value) => {
+            serde_json::from_str(value).expect("CSV snapshot JSON scalar should parse")
+        }
+    }
 }
 
 fn entity_pk_parts(change: &FileChange) -> Vec<String> {
@@ -1331,6 +1384,7 @@ impl WasmtimePluginRuntime {
     fn new() -> Result<Self, LixError> {
         let mut config = Config::new();
         config.wasm_component_model(true);
+        config.wasm_component_model_map(true);
         let engine = Engine::new(&config)
             .map_err(|error| wasm_runtime_error("failed to create Wasmtime engine", error))?;
         Ok(Self { engine })
@@ -1356,15 +1410,12 @@ impl WasiHostState {
     }
 }
 
-impl IoView for WasiHostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
 impl WasiView for WasiHostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -1378,7 +1429,7 @@ impl lix_sdk::WasmRuntime for WasmtimePluginRuntime {
         let component = Component::new(&self.engine, bytes)
             .map_err(|error| wasm_runtime_error("failed to compile plugin component", error))?;
         let mut linker = Linker::<WasiHostState>::new(&self.engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|error| wasm_runtime_error("failed to configure WASI linker", error))?;
         let mut store = Store::new(&self.engine, WasiHostState::new());
         let bindings = plugin_bindings::Plugin::instantiate(&mut store, &component, &linker)
@@ -1398,7 +1449,10 @@ impl lix_sdk::WasmComponentInstance for WasmtimePluginComponent {
         file: WasmPluginFile,
     ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
         let mut store = self.store("detect-changes")?;
-        let state = state.into_iter().map(Into::into).collect::<Vec<_>>();
+        let state = state
+            .into_iter()
+            .map(binding_entity_state_from_wasm)
+            .collect::<Result<Vec<_>, _>>()?;
         let file = file.into();
         match self
             .bindings
@@ -1406,14 +1460,20 @@ impl lix_sdk::WasmComponentInstance for WasmtimePluginComponent {
             .call_detect_changes(&mut *store, &state, &file)
             .map_err(|error| wasm_runtime_error("failed to call detect-changes", error))?
         {
-            Ok(changes) => Ok(changes.into_iter().map(Into::into).collect()),
+            Ok(changes) => changes
+                .into_iter()
+                .map(wasm_detected_change_from_binding)
+                .collect(),
             Err(error) => Err(plugin_error_from_binding("detect-changes", error)),
         }
     }
 
     async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
         let mut store = self.store("render")?;
-        let state = state.into_iter().map(Into::into).collect::<Vec<_>>();
+        let state = state
+            .into_iter()
+            .map(binding_entity_state_from_wasm)
+            .collect::<Result<Vec<_>, _>>()?;
         match self
             .bindings
             .lix_plugin_api()
@@ -1446,24 +1506,126 @@ impl From<WasmPluginFile> for plugin_bindings::exports::lix::plugin::api::File {
     }
 }
 
-impl From<WasmPluginEntityState> for plugin_bindings::exports::lix::plugin::api::EntityState {
-    fn from(state: WasmPluginEntityState) -> Self {
-        Self {
-            entity_pk: state.entity_pk,
-            schema_key: state.schema_key,
-            snapshot_content: state.snapshot_content,
-            metadata: state.metadata,
-        }
+fn binding_entity_state_from_wasm(
+    state: WasmPluginEntityState,
+) -> Result<plugin_bindings::exports::lix::plugin::api::EntityState, LixError> {
+    Ok(plugin_bindings::exports::lix::plugin::api::EntityState {
+        entity_pk: state.entity_pk,
+        schema_key: state.schema_key,
+        snapshot_content: snapshot_content_from_json(
+            &state.snapshot_content,
+            "plugin state snapshot_content",
+        )?,
+        metadata: state.metadata,
+    })
+}
+
+fn wasm_detected_change_from_binding(
+    change: plugin_bindings::exports::lix::plugin::api::DetectedChange,
+) -> Result<WasmPluginDetectedChange, LixError> {
+    Ok(WasmPluginDetectedChange {
+        entity_pk: change.entity_pk,
+        schema_key: change.schema_key,
+        snapshot_content: change
+            .snapshot_content
+            .as_ref()
+            .map(|snapshot_content| {
+                snapshot_content_to_json(snapshot_content, "plugin emitted snapshot_content")
+            })
+            .transpose()?,
+        metadata: change.metadata,
+    })
+}
+
+fn snapshot_content_from_json(raw: &str, label: &str) -> Result<BindingSnapshotContent, LixError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("{label} is invalid JSON: {error}"),
+        )
+    })?;
+    let serde_json::Value::Object(object) = value else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("{label} must be a JSON object"),
+        ));
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| Ok((key, scalar_from_json_value(value)?)))
+        .collect()
+}
+
+fn snapshot_content_to_json(
+    snapshot_content: &BindingSnapshotContent,
+    label: &str,
+) -> Result<String, LixError> {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json_value_from_scalar(value, label)?)))
+        .collect::<Result<serde_json::Map<_, _>, LixError>>()?;
+    serde_json::to_string(&serde_json::Value::Object(object)).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode {label} JSON: {error}"),
+        )
+    })
+}
+
+fn scalar_from_json_value(
+    value: serde_json::Value,
+) -> Result<plugin_bindings::exports::lix::plugin::api::Scalar, LixError> {
+    match value {
+        serde_json::Value::Null => Ok(plugin_bindings::exports::lix::plugin::api::Scalar::Nil),
+        serde_json::Value::Bool(value) => Ok(
+            plugin_bindings::exports::lix::plugin::api::Scalar::Boolean(value),
+        ),
+        serde_json::Value::String(value) => Ok(
+            plugin_bindings::exports::lix::plugin::api::Scalar::Text(value),
+        ),
+        serde_json::Value::Number(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => serde_json::to_string(&value)
+            .map(plugin_bindings::exports::lix::plugin::api::Scalar::Json)
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("failed to encode snapshot scalar JSON: {error}"),
+                )
+            }),
     }
 }
 
-impl From<plugin_bindings::exports::lix::plugin::api::DetectedChange> for WasmPluginDetectedChange {
-    fn from(change: plugin_bindings::exports::lix::plugin::api::DetectedChange) -> Self {
-        Self {
-            entity_pk: change.entity_pk,
-            schema_key: change.schema_key,
-            snapshot_content: change.snapshot_content,
-            metadata: change.metadata,
+fn json_value_from_scalar(
+    value: &plugin_bindings::exports::lix::plugin::api::Scalar,
+    label: &str,
+) -> Result<serde_json::Value, LixError> {
+    match value {
+        plugin_bindings::exports::lix::plugin::api::Scalar::Nil => Ok(serde_json::Value::Null),
+        plugin_bindings::exports::lix::plugin::api::Scalar::Boolean(value) => {
+            Ok(serde_json::Value::Bool(*value))
+        }
+        plugin_bindings::exports::lix::plugin::api::Scalar::Number(value) => {
+            serde_json::Number::from_f64(*value)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("{label} contains NaN or infinite number"),
+                    )
+                })
+        }
+        plugin_bindings::exports::lix::plugin::api::Scalar::Text(value) => {
+            Ok(serde_json::Value::String(value.clone()))
+        }
+        plugin_bindings::exports::lix::plugin::api::Scalar::Json(value) => {
+            serde_json::from_str(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("{label} contains invalid JSON scalar: {error}"),
+                )
+            })
         }
     }
 }

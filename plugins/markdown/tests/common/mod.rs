@@ -3,8 +3,9 @@
 use plugin_md_v2::exports::lix::plugin::api::{EntityState, Guest};
 use plugin_md_v2::{
     BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, File, MarkdownPlugin, PluginError,
-    ROOT_ENTITY_PK,
+    ROOT_ENTITY_PK, Scalar,
 };
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 pub type StateKey = (String, Vec<String>);
@@ -34,19 +35,14 @@ pub fn is_block_change(change: &DetectedChange) -> bool {
 
 pub fn parse_document_order(change: &DetectedChange) -> Vec<String> {
     assert!(is_document_change(change));
-    let raw = change
-        .snapshot_content
-        .as_ref()
-        .expect("document snapshot should be present");
-    let parsed: serde_json::Value =
-        serde_json::from_str(raw).expect("document snapshot should be valid JSON");
+    let parsed = snapshot_value(change);
     assert_eq!(
-        parsed.get("id").and_then(serde_json::Value::as_str),
+        parsed.get("id").and_then(Value::as_str),
         Some(ROOT_ENTITY_PK)
     );
     parsed
         .get("order")
-        .and_then(serde_json::Value::as_array)
+        .and_then(Value::as_array)
         .expect("document snapshot should contain order array")
         .iter()
         .map(|entry| {
@@ -60,17 +56,24 @@ pub fn parse_document_order(change: &DetectedChange) -> Vec<String> {
 
 pub fn parse_block_markdown(change: &DetectedChange) -> String {
     assert!(is_block_change(change));
-    let raw = change
-        .snapshot_content
-        .as_ref()
-        .expect("block snapshot should be present");
-    let parsed: serde_json::Value =
-        serde_json::from_str(raw).expect("block snapshot should be valid JSON");
+    let parsed = snapshot_value(change);
     parsed
         .get("markdown")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .expect("block snapshot should contain markdown")
         .to_string()
+}
+
+pub fn snapshot_value(change: &DetectedChange) -> Value {
+    let snapshot_content = change
+        .snapshot_content
+        .as_ref()
+        .expect("snapshot should be present");
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| (key.clone(), value_from_scalar(value)))
+        .collect::<Map<_, _>>();
+    Value::Object(object)
 }
 
 pub fn assert_invalid_input(error: PluginError) {
@@ -168,13 +171,10 @@ pub fn document_change(order: Vec<String>) -> DetectedChange {
     DetectedChange {
         entity_pk: vec![ROOT_ENTITY_PK.to_string()],
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(
-            serde_json::json!({
-                "id": ROOT_ENTITY_PK,
-                "order": order,
-            })
-            .to_string(),
-        ),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "id": ROOT_ENTITY_PK,
+            "order": order,
+        }))),
         metadata: None,
     }
 }
@@ -183,15 +183,46 @@ pub fn block_change(id: &str, node_type: &str, markdown: &str) -> DetectedChange
     DetectedChange {
         entity_pk: vec![id.to_string()],
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(
-            serde_json::json!({
-                "id": id,
-                "type": node_type,
-                "node": {},
-                "markdown": markdown,
-            })
-            .to_string(),
-        ),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "id": id,
+            "type": node_type,
+            "node": {},
+            "markdown": markdown,
+        }))),
         metadata: None,
+    }
+}
+
+pub fn snapshot_content(value: Value) -> BTreeMap<String, Scalar> {
+    let Value::Object(object) = value else {
+        panic!("snapshot_content must be a JSON object");
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| (key, scalar_from_value(value)))
+        .collect()
+}
+
+fn scalar_from_value(value: Value) -> Scalar {
+    match value {
+        Value::Null => Scalar::Nil,
+        Value::Bool(value) => Scalar::Boolean(value),
+        Value::String(value) => Scalar::Text(value),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            Scalar::Json(serde_json::to_string(&value).expect("snapshot scalar should encode"))
+        }
+    }
+}
+
+fn value_from_scalar(value: &Scalar) -> Value {
+    match value {
+        Scalar::Nil => Value::Null,
+        Scalar::Boolean(value) => Value::Bool(*value),
+        Scalar::Number(value) => {
+            Value::Number(serde_json::Number::from_f64(*value).expect("finite JSON number"))
+        }
+        Scalar::Text(value) => Value::String(value.clone()),
+        Scalar::Json(value) => serde_json::from_str(value).expect("JSON scalar should parse"),
     }
 }

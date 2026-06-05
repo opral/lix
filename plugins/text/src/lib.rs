@@ -6,15 +6,15 @@ wit_bindgen::generate!({
     world: "plugin",
 });
 
-pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError, Scalar};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 pub const LINE_SCHEMA_KEY: &str = "text_line";
@@ -79,8 +79,10 @@ struct DocumentSnapshotOwned {
 struct RenderRow {
     entity_pk: Vec<String>,
     schema_key: String,
-    snapshot_content: Option<String>,
+    snapshot_content: Option<SnapshotContent>,
 }
+
+type SnapshotContent = BTreeMap<String, Scalar>;
 
 impl Plugin for TextLinesPlugin {
     fn detect_changes(
@@ -153,7 +155,10 @@ fn detect_changes_from_files(
         changes.push(DetectedChange {
             entity_pk: vec![line.id.clone()],
             schema_key: LINE_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(serialize_line_snapshot(line)?),
+            snapshot_content: Some(snapshot_content_from_json(
+                &serialize_line_snapshot(line)?,
+                "text line",
+            )?),
             metadata: None,
         });
     }
@@ -168,7 +173,7 @@ fn detect_changes_from_files(
         changes.push(DetectedChange {
             entity_pk: vec![DOCUMENT_ENTITY_PK.to_string()],
             schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(snapshot),
+            snapshot_content: Some(snapshot_content_from_json(&snapshot, "text document")?),
             metadata: None,
         });
     }
@@ -226,7 +231,8 @@ fn render_rows(
             }
 
             match row.snapshot_content {
-                Some(snapshot_raw) => {
+                Some(snapshot_content) => {
+                    let snapshot_raw = snapshot_content_to_json(&snapshot_content, "text line")?;
                     let snapshot = parse_line_snapshot(&snapshot_raw, &entity_pk)?;
                     line_by_id.insert(
                         entity_pk.clone(),
@@ -253,12 +259,14 @@ fn render_rows(
             }
 
             match row.snapshot_content {
-                Some(snapshot_raw) => {
+                Some(snapshot_content) => {
                     if document_snapshot.is_some() || document_tombstoned {
                         return Err(PluginError::InvalidInput(
                             "duplicate text_document snapshot in render_changes input".to_string(),
                         ));
                     }
+                    let snapshot_raw =
+                        snapshot_content_to_json(&snapshot_content, "text document")?;
                     let parsed = parse_document_snapshot(&snapshot_raw)?;
                     document_snapshot = Some(parsed);
                 }
@@ -587,6 +595,72 @@ fn base64_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
     BASE64_STANDARD
         .decode(raw)
         .map_err(|error| format!("invalid base64: {error}"))
+}
+
+fn snapshot_content_from_json(raw: &str, label: &str) -> Result<SnapshotContent, PluginError> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        PluginError::Internal(format!("failed to parse {label} snapshot JSON: {error}"))
+    })?;
+    snapshot_content_from_value(value, label)
+}
+
+fn snapshot_content_from_value(value: Value, label: &str) -> Result<SnapshotContent, PluginError> {
+    let Value::Object(object) = value else {
+        return Err(PluginError::Internal(format!(
+            "{label} snapshot must serialize to a JSON object"
+        )));
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| Ok((key, scalar_from_json_value(value)?)))
+        .collect()
+}
+
+fn snapshot_content_to_json(
+    snapshot_content: &SnapshotContent,
+    label: &str,
+) -> Result<String, PluginError> {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json_value_from_scalar(value, label)?)))
+        .collect::<Result<Map<_, _>, _>>()?;
+    serde_json::to_string(&Value::Object(object)).map_err(|error| {
+        PluginError::Internal(format!("failed to encode {label} snapshot JSON: {error}"))
+    })
+}
+
+fn scalar_from_json_value(value: Value) -> Result<Scalar, PluginError> {
+    match value {
+        Value::Null => Ok(Scalar::Nil),
+        Value::Bool(value) => Ok(Scalar::Boolean(value)),
+        Value::String(value) => Ok(Scalar::Text(value)),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => serde_json::to_string(&value)
+            .map(Scalar::Json)
+            .map_err(|error| {
+                PluginError::Internal(format!("failed to encode snapshot scalar JSON: {error}"))
+            }),
+    }
+}
+
+fn json_value_from_scalar(value: &Scalar, label: &str) -> Result<Value, PluginError> {
+    match value {
+        Scalar::Nil => Ok(Value::Null),
+        Scalar::Boolean(value) => Ok(Value::Bool(*value)),
+        Scalar::Number(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                PluginError::InvalidInput(format!(
+                    "{label} snapshot contains NaN or infinite number"
+                ))
+            }),
+        Scalar::Text(value) => Ok(Value::String(value.clone())),
+        Scalar::Json(value) => serde_json::from_str(value).map_err(|error| {
+            PluginError::InvalidInput(format!(
+                "{label} snapshot contains invalid JSON scalar: {error}"
+            ))
+        }),
+    }
 }
 
 fn file_from_state_context(state: Vec<DetectedChange>) -> Result<Option<File>, PluginError> {

@@ -15,11 +15,11 @@ use crate::csv::{
     CsvDialect, parse_file, parse_table_snapshot, render_projection, table_upsert_change,
 };
 use crate::diff::{Op, imara_diff_runs};
-pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
+pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError, Scalar};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use crate::order_key::OrderKey;
 use itertools::Itertools;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::str;
@@ -30,6 +30,7 @@ pub const TABLE_SCHEMA_KEY: &str = schemas::TABLE_SCHEMA_KEY;
 pub const ROW_SCHEMA_KEY: &str = schemas::ROW_SCHEMA_KEY;
 
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
+pub(crate) type SnapshotContent = BTreeMap<String, Scalar>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CsvPlugin;
@@ -218,12 +219,14 @@ fn row_upsert_change(
     order_key: OrderKey,
     cells: &[String],
 ) -> Result<DetectedChange, PluginError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": id,
-        "order_key": order_key.to_snapshot_string(),
-        "cells": cells,
-    }))
-    .map_err(|error| PluginError::Internal(format!("failed to serialize CSV row: {error}")))?;
+    let snapshot_content = snapshot_content_from_value(
+        serde_json::json!({
+            "id": id,
+            "order_key": order_key.to_snapshot_string(),
+            "cells": cells,
+        }),
+        "CSV row",
+    )?;
 
     Ok(DetectedChange {
         entity_pk: vec![id.to_string()],
@@ -233,12 +236,11 @@ fn row_upsert_change(
     })
 }
 
-fn parse_row_snapshot(raw: &str, entity_pk: &str) -> Result<RowSnapshot, PluginError> {
-    let value: Value = serde_json::from_str(raw).map_err(|error| {
-        PluginError::InvalidInput(format!(
-            "invalid csv row snapshot_content for entity_pk '{entity_pk}': {error}"
-        ))
-    })?;
+fn parse_row_snapshot(
+    snapshot_content: &SnapshotContent,
+    entity_pk: &str,
+) -> Result<RowSnapshot, PluginError> {
+    let value = snapshot_content_to_value(snapshot_content, "CSV row")?;
     let object = value.as_object().ok_or_else(|| {
         PluginError::InvalidInput(format!(
             "csv row snapshot_content for entity_pk '{entity_pk}' must be an object"
@@ -284,6 +286,66 @@ fn parse_row_snapshot(raw: &str, entity_pk: &str) -> Result<RowSnapshot, PluginE
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RowSnapshot { order_key, cells })
+}
+
+pub(crate) fn snapshot_content_from_value(
+    value: Value,
+    label: &str,
+) -> Result<SnapshotContent, PluginError> {
+    let Value::Object(object) = value else {
+        return Err(PluginError::Internal(format!(
+            "{label} snapshot must serialize to a JSON object"
+        )));
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| Ok((key, scalar_from_json_value(value)?)))
+        .collect()
+}
+
+pub(crate) fn snapshot_content_to_value(
+    snapshot_content: &SnapshotContent,
+    label: &str,
+) -> Result<Value, PluginError> {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json_value_from_scalar(value, label)?)))
+        .collect::<Result<Map<_, _>, _>>()?;
+    Ok(Value::Object(object))
+}
+
+fn scalar_from_json_value(value: Value) -> Result<Scalar, PluginError> {
+    match value {
+        Value::Null => Ok(Scalar::Nil),
+        Value::Bool(value) => Ok(Scalar::Boolean(value)),
+        Value::String(value) => Ok(Scalar::Text(value)),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => serde_json::to_string(&value)
+            .map(Scalar::Json)
+            .map_err(|error| {
+                PluginError::Internal(format!("failed to encode snapshot scalar JSON: {error}"))
+            }),
+    }
+}
+
+fn json_value_from_scalar(value: &Scalar, label: &str) -> Result<Value, PluginError> {
+    match value {
+        Scalar::Nil => Ok(Value::Null),
+        Scalar::Boolean(value) => Ok(Value::Bool(*value)),
+        Scalar::Number(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                PluginError::InvalidInput(format!(
+                    "{label} snapshot contains NaN or infinite number"
+                ))
+            }),
+        Scalar::Text(value) => Ok(Value::String(value.clone())),
+        Scalar::Json(value) => serde_json::from_str(value).map_err(|error| {
+            PluginError::InvalidInput(format!(
+                "{label} snapshot contains invalid JSON scalar: {error}"
+            ))
+        }),
+    }
 }
 
 fn reject_unknown_fields<'a>(

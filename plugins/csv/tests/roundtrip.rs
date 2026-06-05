@@ -1,8 +1,9 @@
 use plugin_csv::exports::lix::plugin::api::{EntityState, Guest};
 use plugin_csv::{
-    CsvPlugin, DetectedChange, File, PluginError, ROOT_ENTITY_PK, ROW_SCHEMA_KEY, TABLE_SCHEMA_KEY,
+    CsvPlugin, DetectedChange, File, PluginError, ROOT_ENTITY_PK, ROW_SCHEMA_KEY, Scalar,
+    TABLE_SCHEMA_KEY,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use uuid::Uuid;
@@ -72,15 +73,57 @@ fn render_changes(changes: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> 
 }
 
 fn snapshot_value(change: &DetectedChange) -> Value {
-    let raw = change
+    let snapshot_content = change
         .snapshot_content
         .as_ref()
         .expect("snapshot_content should exist");
-    serde_json::from_str(raw).expect("snapshot_content should parse")
+    snapshot_content_value(snapshot_content)
 }
 
 fn active_state_snapshot_value(row: &EntityState) -> Value {
-    serde_json::from_str(&row.snapshot_content).expect("snapshot_content should parse")
+    snapshot_content_value(&row.snapshot_content)
+}
+
+fn snapshot_content(value: Value) -> BTreeMap<String, Scalar> {
+    let Value::Object(object) = value else {
+        panic!("snapshot_content must be a JSON object");
+    };
+
+    object
+        .into_iter()
+        .map(|(key, value)| (key, scalar_from_value(value)))
+        .collect()
+}
+
+fn snapshot_content_value(snapshot_content: &BTreeMap<String, Scalar>) -> Value {
+    let object = snapshot_content
+        .iter()
+        .map(|(key, value)| (key.clone(), value_from_scalar(value)))
+        .collect::<Map<_, _>>();
+    Value::Object(object)
+}
+
+fn scalar_from_value(value: Value) -> Scalar {
+    match value {
+        Value::Null => Scalar::Nil,
+        Value::Bool(value) => Scalar::Boolean(value),
+        Value::String(value) => Scalar::Text(value),
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            Scalar::Json(serde_json::to_string(&value).expect("snapshot scalar should encode"))
+        }
+    }
+}
+
+fn value_from_scalar(value: &Scalar) -> Value {
+    match value {
+        Scalar::Nil => Value::Null,
+        Scalar::Boolean(value) => Value::Bool(*value),
+        Scalar::Number(value) => {
+            Value::Number(serde_json::Number::from_f64(*value).expect("finite JSON number"))
+        }
+        Scalar::Text(value) => Value::String(value.clone()),
+        Scalar::Json(value) => serde_json::from_str(value).expect("JSON scalar should parse"),
+    }
 }
 
 fn snapshot_order_key_from_value(value: &Value) -> u128 {
@@ -311,19 +354,20 @@ fn render_uses_quote_byte_from_table_dialect() {
         DetectedChange {
             entity_pk: vec!["row:0".to_string()],
             schema_key: ROW_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r#"{"id":"row:0","order_key":"80000000000000000000000000000000","cells":["a;b","plain"]}"#
-                    .to_string(),
-            ),
+            snapshot_content: Some(snapshot_content(serde_json::json!({
+                "id": "row:0",
+                "order_key": "80000000000000000000000000000000",
+                "cells": ["a;b", "plain"],
+            }))),
             metadata: None,
         },
         DetectedChange {
             entity_pk: vec![ROOT_ENTITY_PK.to_string()],
             schema_key: TABLE_SCHEMA_KEY.to_string(),
-            snapshot_content: Some(
-                r#"{"id":"root","dialect":{"delimiter":";","quote":"'","terminator":"\n"}}"#
-                    .to_string(),
-            ),
+            snapshot_content: Some(snapshot_content(serde_json::json!({
+                "id": "root",
+                "dialect": {"delimiter": ";", "quote": "'", "terminator": "\n"},
+            }))),
             metadata: None,
         },
     ];
@@ -363,7 +407,11 @@ fn rejects_row_snapshot_with_invalid_order_key() {
     let changes = vec![DetectedChange {
         entity_pk: vec!["row:0".to_string()],
         schema_key: ROW_SCHEMA_KEY.to_string(),
-        snapshot_content: Some(r#"{"id":"row:0","order_key":"bad","cells":["a"]}"#.to_string()),
+        snapshot_content: Some(snapshot_content(serde_json::json!({
+            "id": "row:0",
+            "order_key": "bad",
+            "cells": ["a"],
+        }))),
         metadata: None,
     }];
 
