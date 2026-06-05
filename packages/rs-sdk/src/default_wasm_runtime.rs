@@ -12,7 +12,9 @@ use lix_engine::wasm::{
 };
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{
+    ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
+};
 
 mod plugin_bindings {
     wasmtime::component::bindgen!({
@@ -82,15 +84,12 @@ impl WasiHostState {
     }
 }
 
-impl IoView for WasiHostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
 impl WasiView for WasiHostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -110,7 +109,7 @@ impl WasmRuntime for WasmtimePluginRuntime {
         let component = Component::new(engine, bytes)
             .map_err(|error| wasm_runtime_error("failed to compile plugin component", error))?;
         let mut linker = Linker::<WasiHostState>::new(engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)
+        add_to_linker_sync(&mut linker)
             .map_err(|error| wasm_runtime_error("failed to configure WASI linker", error))?;
         let mut store = Store::new(engine, WasiHostState::new());
         if let Some(max_fuel) = limits.max_fuel {
