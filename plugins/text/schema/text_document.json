@@ -1,0 +1,29 @@
+{
+  "x-lix-key": "text_document",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "description": "Projection root for a plain text file. Document-level line ending metadata is stored here; line content and order are stored in text_line snapshots. A terminal line ending is represented by an empty final text_line.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "const": "root",
+      "description": "Stable root document id."
+    },
+    "line_endings": {
+      "type": "string",
+      "enum": [
+        "\n",
+        "\r\n",
+        "\r"
+      ],
+      "description": "Line ending sequence used to render text_line entries."
+    }
+  },
+  "required": [
+    "id",
+    "line_endings"
+  ],
+  "additionalProperties": false
+}
