@@ -1,13 +1,13 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lix_sdk::{
-    FsWriteOptions, InMemoryBackend, LixError, OpenLixOptions, SqliteBackend, Value, open_lix,
+    FsWriteOptions, InMemoryBackend, LixError, OpenLixOptions, SqliteBackend, Value,
+    WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, open_lix,
 };
 use plugin_csv::exports::lix::plugin::api::EntityState as CsvEntityState;
 use plugin_csv::exports::lix::plugin::api::Guest as _;
 use plugin_csv::{CsvPlugin, File as CsvFile};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -16,10 +16,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::runtime::Builder;
-use wasmtime::component::types::ComponentItem;
-use wasmtime::component::{Component, ComponentExportIndex, Instance, Linker, Val};
+use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+mod plugin_bindings {
+    wasmtime::component::bindgen!({
+        path: "../engine/wit",
+        world: "plugin",
+    });
+}
 
 const INITIAL_ROW_COUNT: usize = 10_000;
 const NEW_ROW_COUNT: usize = 10_000;
@@ -434,31 +440,29 @@ struct ExtractedCsvSchemaChangesFixture {
 
 struct WasmPluginDiffFixture {
     component: Arc<dyn lix_sdk::WasmComponentInstance>,
-    detect_changes_input: Vec<u8>,
+    state: Vec<WasmPluginEntityState>,
+    file: WasmPluginFile,
 }
 
 impl WasmPluginDiffFixture {
     fn new(
         component: Arc<dyn lix_sdk::WasmComponentInstance>,
-        state: Vec<PluginEntityStatePayload>,
+        state: Vec<WasmPluginEntityState>,
         file_data: &[u8],
     ) -> Self {
-        let payload = PluginDetectChangesPayload {
-            state,
-            file: PluginFilePayload {
-                data: file_data.to_vec(),
-            },
-        };
         Self {
             component,
-            detect_changes_input: serde_json::to_vec(&payload).unwrap(),
+            state,
+            file: WasmPluginFile {
+                data: file_data.to_vec(),
+            },
         }
     }
 }
 
 async fn wasm_plugin_diff_fixture(
     wasm: &[u8],
-    state: Vec<PluginEntityStatePayload>,
+    state: Vec<WasmPluginEntityState>,
     file_data: &[u8],
 ) -> WasmPluginDiffFixture {
     let runtime = WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime");
@@ -487,12 +491,9 @@ impl NativeCsvDiffFixture {
 async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
     let temp_dir = tempfile::tempdir().expect("failed to create sqlite bench tempdir");
     let path = temp_dir.path().join("bench.lix");
-    let lix = open_lix(OpenLixOptions {
-        backend: SqliteBackend::open(path).expect("failed to open sqlite bench backend"),
-        wasm_runtime: Some(Arc::new(
-            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
-        )),
-    })
+    let lix = open_lix(OpenLixOptions::new(
+        SqliteBackend::open(path).expect("failed to open sqlite bench backend"),
+    ))
     .await
     .unwrap();
 
@@ -505,14 +506,7 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
 }
 
 async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
-    let lix = open_lix(OpenLixOptions {
-        backend: InMemoryBackend::new(),
-        wasm_runtime: Some(Arc::new(
-            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
-        )),
-    })
-    .await
-    .unwrap();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
     lix.install_plugin_archive(plugin).await.unwrap();
 
@@ -551,8 +545,7 @@ async fn warm_lix_csv_plugin(lix: &BenchLix) {
 
 async fn warm_wasm_csv_plugin_component(component: &Arc<dyn lix_sdk::WasmComponentInstance>) {
     let fixture = WasmPluginDiffFixture::new(component.clone(), Vec::new(), &[]);
-    let output = wasm_plugin_detect_changes_output(fixture).await;
-    let changes = serde_json::from_slice::<Vec<PluginDetectedChangePayload>>(&output).unwrap();
+    let changes = wasm_plugin_detect_changes_output(fixture).await;
     assert!(changes.is_empty());
 }
 
@@ -1015,15 +1008,16 @@ async fn bench_wasm_plugin_diff(fixture: WasmPluginDiffFixture) {
 }
 
 async fn wasm_plugin_file_changes(fixture: WasmPluginDiffFixture) -> Vec<FileChange> {
-    let output = wasm_plugin_detect_changes_output(fixture).await;
-    let changes = serde_json::from_slice::<Vec<PluginDetectedChangePayload>>(&output).unwrap();
+    let changes = wasm_plugin_detect_changes_output(fixture).await;
     plugin_detected_changes_to_file_changes(changes)
 }
 
-async fn wasm_plugin_detect_changes_output(fixture: WasmPluginDiffFixture) -> Vec<u8> {
+async fn wasm_plugin_detect_changes_output(
+    fixture: WasmPluginDiffFixture,
+) -> Vec<WasmPluginDetectedChange> {
     fixture
         .component
-        .call("detect-changes", &fixture.detect_changes_input)
+        .detect_changes(fixture.state, fixture.file)
         .await
         .unwrap()
 }
@@ -1048,7 +1042,7 @@ fn native_csv_detected_changes(fixture: NativeCsvDiffFixture) -> Vec<plugin_csv:
 }
 
 fn plugin_detected_changes_to_file_changes(
-    changes: Vec<PluginDetectedChangePayload>,
+    changes: Vec<WasmPluginDetectedChange>,
 ) -> Vec<FileChange> {
     changes
         .into_iter()
@@ -1095,14 +1089,14 @@ fn csv_detected_changes_to_file_changes(
         .collect()
 }
 
-fn plugin_entity_state_from_file_changes(changes: &[FileChange]) -> Vec<PluginEntityStatePayload> {
+fn plugin_entity_state_from_file_changes(changes: &[FileChange]) -> Vec<WasmPluginEntityState> {
     changes
         .iter()
         .filter_map(|change| {
             change
                 .snapshot_content
                 .as_ref()
-                .map(|snapshot_content| PluginEntityStatePayload {
+                .map(|snapshot_content| WasmPluginEntityState {
                     entity_pk: entity_pk_parts(change),
                     schema_key: change.schema_key.clone(),
                     snapshot_content: snapshot_content.to_string(),
@@ -1345,14 +1339,7 @@ impl WasmtimePluginRuntime {
 
 struct WasmtimePluginComponent {
     store: Mutex<Store<WasiHostState>>,
-    instance: Instance,
-    exports: WasmtimePluginExports,
-}
-
-#[derive(Clone, Copy)]
-struct WasmtimePluginExports {
-    detect_changes: ComponentExportIndex,
-    render: ComponentExportIndex,
+    bindings: plugin_bindings::Plugin,
 }
 
 struct WasiHostState {
@@ -1390,425 +1377,113 @@ impl lix_sdk::WasmRuntime for WasmtimePluginRuntime {
     ) -> Result<Arc<dyn lix_sdk::WasmComponentInstance>, LixError> {
         let component = Component::new(&self.engine, bytes)
             .map_err(|error| wasm_runtime_error("failed to compile plugin component", error))?;
-        let exports = WasmtimePluginExports::from_component(&self.engine, &component)?;
         let mut linker = Linker::<WasiHostState>::new(&self.engine);
         wasmtime_wasi::add_to_linker_sync(&mut linker)
             .map_err(|error| wasm_runtime_error("failed to configure WASI linker", error))?;
         let mut store = Store::new(&self.engine, WasiHostState::new());
-        let instance = linker
-            .instantiate(&mut store, &component)
+        let bindings = plugin_bindings::Plugin::instantiate(&mut store, &component, &linker)
             .map_err(|error| wasm_runtime_error("failed to instantiate plugin component", error))?;
         Ok(Arc::new(WasmtimePluginComponent {
             store: Mutex::new(store),
-            instance,
-            exports,
+            bindings,
         }))
     }
 }
 
 #[async_trait::async_trait]
 impl lix_sdk::WasmComponentInstance for WasmtimePluginComponent {
-    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
-        match export {
-            "detect-changes" | "api#detect-changes" => self.detect_changes(input),
-            "render" | "api#render" => self.render(input),
-            other => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("Wasmtime test runtime does not implement export '{other}'"),
-            )),
+    async fn detect_changes(
+        &self,
+        state: Vec<WasmPluginEntityState>,
+        file: WasmPluginFile,
+    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+        let mut store = self.store("detect-changes")?;
+        let state = state.into_iter().map(Into::into).collect::<Vec<_>>();
+        let file = file.into();
+        match self
+            .bindings
+            .lix_plugin_api()
+            .call_detect_changes(&mut *store, &state, &file)
+            .map_err(|error| wasm_runtime_error("failed to call detect-changes", error))?
+        {
+            Ok(changes) => Ok(changes.into_iter().map(Into::into).collect()),
+            Err(error) => Err(plugin_error_from_binding("detect-changes", error)),
         }
     }
-}
 
-impl WasmtimePluginExports {
-    fn from_component(engine: &Engine, component: &Component) -> Result<Self, LixError> {
-        Ok(Self {
-            detect_changes: find_plugin_func_export(engine, component, "detect-changes")?,
-            render: find_plugin_func_export(engine, component, "render")?,
-        })
+    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
+        let mut store = self.store("render")?;
+        let state = state.into_iter().map(Into::into).collect::<Vec<_>>();
+        match self
+            .bindings
+            .lix_plugin_api()
+            .call_render(&mut *store, &state)
+            .map_err(|error| wasm_runtime_error("failed to call render", error))?
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => Err(plugin_error_from_binding("render", error)),
+        }
     }
 }
 
 impl WasmtimePluginComponent {
-    fn detect_changes(&self, input: &[u8]) -> Result<Vec<u8>, LixError> {
-        let payload: PluginDetectChangesPayload =
-            serde_json::from_slice(input).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("plugin detect-changes payload is invalid JSON: {error}"),
-                )
-            })?;
-        let params = [
-            entity_state_list_to_val(payload.state),
-            Val::Record(vec![("data".to_string(), bytes_to_val(payload.file.data))]),
-        ];
-        let result =
-            self.call_component_func(self.exports.detect_changes, &params, "detect-changes")?;
-        let changes = expect_detected_changes_result(result, "detect-changes")?;
-        serde_json::to_vec(&changes).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to encode plugin detect-changes output: {error}"),
-            )
-        })
-    }
-
-    fn render(&self, input: &[u8]) -> Result<Vec<u8>, LixError> {
-        let payload: PluginRenderPayload = serde_json::from_slice(input).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("plugin render payload is invalid JSON: {error}"),
-            )
-        })?;
-        let params = [entity_state_list_to_val(payload.state)];
-        let result = self.call_component_func(self.exports.render, &params, "render")?;
-        expect_render_result(result, "render")
-    }
-
-    fn call_component_func(
+    fn store(
         &self,
-        export: ComponentExportIndex,
-        params: &[Val],
         export_name: &str,
-    ) -> Result<Val, LixError> {
-        let mut store = self.store.lock().map_err(|_| {
+    ) -> Result<std::sync::MutexGuard<'_, Store<WasiHostState>>, LixError> {
+        self.store.lock().map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "Wasmtime store lock poisoned",
+                format!("Wasmtime store lock poisoned before calling {export_name}"),
             )
-        })?;
-        let func = self.instance.get_func(&mut *store, export).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("plugin component export '{export_name}' is not a function"),
-            )
-        })?;
-        let mut results = [Val::Result(Ok(None))];
-        func.call(&mut *store, params, &mut results)
-            .map_err(|error| wasm_runtime_error(format!("failed to call {export_name}"), error))?;
-        func.post_return(&mut *store).map_err(|error| {
-            wasm_runtime_error(format!("failed to finish {export_name} call"), error)
-        })?;
-        Ok(results.into_iter().next().unwrap())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginDetectChangesPayload {
-    state: Vec<PluginEntityStatePayload>,
-    file: PluginFilePayload,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginRenderPayload {
-    state: Vec<PluginEntityStatePayload>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginFilePayload {
-    data: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginEntityStatePayload {
-    entity_pk: Vec<String>,
-    schema_key: String,
-    snapshot_content: String,
-    metadata: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PluginDetectedChangePayload {
-    entity_pk: Vec<String>,
-    schema_key: String,
-    snapshot_content: Option<String>,
-    metadata: Option<String>,
-}
-
-fn find_plugin_func_export(
-    engine: &Engine,
-    component: &Component,
-    func_name: &str,
-) -> Result<ComponentExportIndex, LixError> {
-    if let Some((ComponentItem::ComponentFunc(_), export)) = component.export_index(None, func_name)
-    {
-        return Ok(export);
-    }
-
-    let component_type = component.component_type();
-    for (instance_name, item) in component_type.exports(engine) {
-        if !matches!(item, ComponentItem::ComponentInstance(_)) {
-            continue;
-        }
-        let Some((ComponentItem::ComponentInstance(_), instance_export)) =
-            component.export_index(None, instance_name)
-        else {
-            continue;
-        };
-        if let Some((ComponentItem::ComponentFunc(_), export)) =
-            component.export_index(Some(&instance_export), func_name)
-        {
-            return Ok(export);
-        }
-    }
-
-    Err(LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!(
-            "plugin component is missing export '{func_name}'. Available exports: {}",
-            component_exports_summary(engine, component)
-        ),
-    ))
-}
-
-fn component_exports_summary(engine: &Engine, component: &Component) -> String {
-    let component_type = component.component_type();
-    let mut exports = Vec::new();
-    for (name, item) in component_type.exports(engine) {
-        match item {
-            ComponentItem::ComponentInstance(instance) => {
-                let nested = instance
-                    .exports(engine)
-                    .map(|(nested_name, _)| nested_name.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                exports.push(format!("{name}({nested})"));
-            }
-            _ => exports.push(name.to_string()),
-        }
-    }
-    exports.join(", ")
-}
-
-fn entity_state_list_to_val(state: Vec<PluginEntityStatePayload>) -> Val {
-    Val::List(state.into_iter().map(entity_state_to_val).collect())
-}
-
-fn entity_state_to_val(state: PluginEntityStatePayload) -> Val {
-    Val::Record(vec![
-        ("entity-pk".to_string(), string_list_to_val(state.entity_pk)),
-        ("schema-key".to_string(), Val::String(state.schema_key)),
-        (
-            "snapshot-content".to_string(),
-            Val::String(state.snapshot_content),
-        ),
-        (
-            "metadata".to_string(),
-            optional_string_to_val(state.metadata),
-        ),
-    ])
-}
-
-fn string_list_to_val(values: Vec<String>) -> Val {
-    Val::List(values.into_iter().map(Val::String).collect())
-}
-
-fn bytes_to_val(bytes: Vec<u8>) -> Val {
-    Val::List(bytes.into_iter().map(Val::U8).collect())
-}
-
-fn optional_string_to_val(value: Option<String>) -> Val {
-    Val::Option(value.map(|value| Box::new(Val::String(value))))
-}
-
-fn expect_detected_changes_result(
-    result: Val,
-    export_name: &str,
-) -> Result<Vec<PluginDetectedChangePayload>, LixError> {
-    let output = expect_plugin_ok_result(result, export_name)?;
-    let Val::List(values) = output else {
-        return Err(plugin_abi_error(format!(
-            "{export_name} returned {}, expected list",
-            val_type_name(&output)
-        )));
-    };
-    values.into_iter().map(detected_change_from_val).collect()
-}
-
-fn expect_render_result(result: Val, export_name: &str) -> Result<Vec<u8>, LixError> {
-    let output = expect_plugin_ok_result(result, export_name)?;
-    expect_u8_list(output, export_name)
-}
-
-fn expect_plugin_ok_result(result: Val, export_name: &str) -> Result<Val, LixError> {
-    match result {
-        Val::Result(Ok(Some(output))) => Ok(*output),
-        Val::Result(Ok(None)) => Err(plugin_abi_error(format!(
-            "{export_name} returned ok without a payload"
-        ))),
-        Val::Result(Err(error)) => Err(plugin_error_from_val(export_name, error.map(|v| *v))),
-        other => Err(plugin_abi_error(format!(
-            "{export_name} returned {}, expected result",
-            val_type_name(&other)
-        ))),
-    }
-}
-
-fn detected_change_from_val(value: Val) -> Result<PluginDetectedChangePayload, LixError> {
-    let Val::Record(fields) = value else {
-        return Err(plugin_abi_error(format!(
-            "detect-changes item was {}, expected record",
-            val_type_name(&value)
-        )));
-    };
-    let mut fields = fields.into_iter();
-    let entity_pk = expect_string_list(
-        expect_next_field(&mut fields, "entity-pk", "detected-change")?,
-        "detected-change.entity-pk",
-    )?;
-    let schema_key = expect_string(
-        expect_next_field(&mut fields, "schema-key", "detected-change")?,
-        "detected-change.schema-key",
-    )?;
-    let snapshot_content = expect_optional_string(
-        expect_next_field(&mut fields, "snapshot-content", "detected-change")?,
-        "detected-change.snapshot-content",
-    )?;
-    let metadata = expect_optional_string(
-        expect_next_field(&mut fields, "metadata", "detected-change")?,
-        "detected-change.metadata",
-    )?;
-    if let Some((field, _)) = fields.next() {
-        return Err(plugin_abi_error(format!(
-            "detected-change returned unexpected field '{field}'"
-        )));
-    }
-    Ok(PluginDetectedChangePayload {
-        entity_pk,
-        schema_key,
-        snapshot_content,
-        metadata,
-    })
-}
-
-fn expect_next_field(
-    fields: &mut impl Iterator<Item = (String, Val)>,
-    expected: &str,
-    label: &str,
-) -> Result<Val, LixError> {
-    let Some((field, value)) = fields.next() else {
-        return Err(plugin_abi_error(format!(
-            "{label} is missing field '{expected}'"
-        )));
-    };
-    if field != expected {
-        return Err(plugin_abi_error(format!(
-            "{label} returned field '{field}', expected '{expected}'"
-        )));
-    }
-    Ok(value)
-}
-
-fn expect_string_list(value: Val, label: &str) -> Result<Vec<String>, LixError> {
-    let Val::List(values) = value else {
-        return Err(plugin_abi_error(format!(
-            "{label} was {}, expected list<string>",
-            val_type_name(&value)
-        )));
-    };
-    values
-        .into_iter()
-        .map(|value| expect_string(value, label))
-        .collect()
-}
-
-fn expect_u8_list(value: Val, label: &str) -> Result<Vec<u8>, LixError> {
-    let Val::List(values) = value else {
-        return Err(plugin_abi_error(format!(
-            "{label} was {}, expected list<u8>",
-            val_type_name(&value)
-        )));
-    };
-    values
-        .into_iter()
-        .map(|value| match value {
-            Val::U8(value) => Ok(value),
-            other => Err(plugin_abi_error(format!(
-                "{label} list item was {}, expected u8",
-                val_type_name(&other)
-            ))),
         })
-        .collect()
-}
-
-fn expect_string(value: Val, label: &str) -> Result<String, LixError> {
-    match value {
-        Val::String(value) => Ok(value),
-        other => Err(plugin_abi_error(format!(
-            "{label} was {}, expected string",
-            val_type_name(&other)
-        ))),
     }
 }
 
-fn expect_optional_string(value: Val, label: &str) -> Result<Option<String>, LixError> {
-    match value {
-        Val::Option(None) => Ok(None),
-        Val::Option(Some(value)) => expect_string(*value, label).map(Some),
-        other => Err(plugin_abi_error(format!(
-            "{label} was {}, expected option<string>",
-            val_type_name(&other)
-        ))),
+impl From<WasmPluginFile> for plugin_bindings::exports::lix::plugin::api::File {
+    fn from(file: WasmPluginFile) -> Self {
+        Self { data: file.data }
     }
 }
 
-fn plugin_error_from_val(export_name: &str, value: Option<Val>) -> LixError {
-    let message = match value {
-        Some(Val::Variant(kind, Some(payload))) => match *payload {
-            Val::String(message) => {
-                format!("{export_name} returned plugin error {kind}: {message}")
-            }
-            other => format!(
-                "{export_name} returned plugin error {kind} with {} payload",
-                val_type_name(&other)
-            ),
-        },
-        Some(Val::Variant(kind, None)) => {
-            format!("{export_name} returned plugin error {kind} without payload")
+impl From<WasmPluginEntityState> for plugin_bindings::exports::lix::plugin::api::EntityState {
+    fn from(state: WasmPluginEntityState) -> Self {
+        Self {
+            entity_pk: state.entity_pk,
+            schema_key: state.schema_key,
+            snapshot_content: state.snapshot_content,
+            metadata: state.metadata,
         }
-        Some(other) => format!(
-            "{export_name} returned malformed plugin error {}",
-            val_type_name(&other)
-        ),
-        None => format!("{export_name} returned plugin error without payload"),
-    };
-    LixError::new(LixError::CODE_INTERNAL_ERROR, message)
-}
-
-fn val_type_name(value: &Val) -> &'static str {
-    match value {
-        Val::Bool(_) => "bool",
-        Val::S8(_) => "s8",
-        Val::U8(_) => "u8",
-        Val::S16(_) => "s16",
-        Val::U16(_) => "u16",
-        Val::S32(_) => "s32",
-        Val::U32(_) => "u32",
-        Val::S64(_) => "s64",
-        Val::U64(_) => "u64",
-        Val::Float32(_) => "float32",
-        Val::Float64(_) => "float64",
-        Val::Char(_) => "char",
-        Val::String(_) => "string",
-        Val::List(_) => "list",
-        Val::Record(_) => "record",
-        Val::Tuple(_) => "tuple",
-        Val::Variant(_, _) => "variant",
-        Val::Enum(_) => "enum",
-        Val::Option(_) => "option",
-        Val::Result(_) => "result",
-        Val::Flags(_) => "flags",
-        Val::Resource(_) => "resource",
     }
 }
 
-fn plugin_abi_error(message: impl Into<String>) -> LixError {
-    LixError::new(LixError::CODE_INTERNAL_ERROR, message.into())
+impl From<plugin_bindings::exports::lix::plugin::api::DetectedChange> for WasmPluginDetectedChange {
+    fn from(change: plugin_bindings::exports::lix::plugin::api::DetectedChange) -> Self {
+        Self {
+            entity_pk: change.entity_pk,
+            schema_key: change.schema_key,
+            snapshot_content: change.snapshot_content,
+            metadata: change.metadata,
+        }
+    }
+}
+
+fn plugin_error_from_binding(
+    export_name: &str,
+    error: plugin_bindings::exports::lix::plugin::api::PluginError,
+) -> LixError {
+    let (kind, message) = match error {
+        plugin_bindings::exports::lix::plugin::api::PluginError::InvalidInput(message) => {
+            ("invalid-input", message)
+        }
+        plugin_bindings::exports::lix::plugin::api::PluginError::Internal(message) => {
+            ("internal", message)
+        }
+    };
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("{export_name} returned plugin error {kind}: {message}"),
+    )
 }
 
 fn wasm_runtime_error(context: impl Into<String>, error: impl fmt::Display) -> LixError {

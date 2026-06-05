@@ -11,7 +11,10 @@ mod lix;
 mod sqlite_backend;
 
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
-pub use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+pub use lix_engine::wasm::{
+    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
+    WasmPluginFile, WasmRuntime,
+};
 pub use lix_engine::{
     Backend, BackendConformanceReport, BackendConformanceResult, BackendConformanceStatus,
     BackendConformanceTest, BackendError, BackendFactory, BackendFixture, BackendRangeScan,

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::LixError;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{LiveStateRowRequest, LiveStateScanRequest};
+use crate::live_state::{LiveStateFileScanRequest, LiveStateRowRequest, LiveStateScanRequest};
 
 /// Minimal engine read model for transaction planning and SQL providers.
 ///
@@ -15,6 +15,13 @@ pub(crate) trait LiveStateReader: Send + Sync {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+
+    async fn scan_file_rows(
+        &self,
+        request: &LiveStateFileScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        self.scan_rows(&request.to_scan_request()).await
+    }
 
     async fn load_row(
         &self,

@@ -161,6 +161,9 @@ pub(crate) async fn validate_prepared_writes(
     let pending_schema_domains = PendingSchemaDomains::from_staged_rows(&staged_rows)?;
     validate_registered_schema_identity_is_canonical(&input, &staged_rows).await?;
     let mut pending_constraints = PendingConstraintIndexes::default();
+    let mut validated_constraint_rows =
+        BTreeMap::<DomainRowIdentity, ValidatedRowContent<'_>>::new();
+    let mut file_owner_validator = FileOwnerReferenceValidator::default();
     let mut staged_snapshots = Vec::new();
     for row in &constraint_rows {
         let row = *row;
@@ -168,20 +171,27 @@ pub(crate) async fn validate_prepared_writes(
             pending_constraints.remember_tombstone(row);
             continue;
         };
-        let schema_plan = schema_plan_for_row(input.schema_catalog, &pending_schema_domains, row)?;
-        validate_schema_matches_row(row, schema_plan)?;
-        validate_snapshot_content(row, schema_plan)?;
-        pending_constraints.remember_row(row, schema_plan, snapshot)?;
+        let validated = validate_row_content(input.schema_catalog, &pending_schema_domains, row)?;
+        pending_constraints.remember_row(row, validated.schema_plan, snapshot)?;
+        validated_constraint_rows.insert(row.domain_row_identity(), validated);
     }
     for row in &staged_rows {
         let row = *row;
         validate_staged_row_shape(row)?;
         validate_staged_row_metadata(row)?;
-        let schema_plan = schema_plan_for_row(input.schema_catalog, &pending_schema_domains, row)?;
-        validate_schema_matches_row(row, schema_plan)?;
-        let snapshot = validate_snapshot_content(row, schema_plan)?;
+        let validated = validated_constraint_rows
+            .get(&row.domain_row_identity())
+            .copied()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                validate_row_content(input.schema_catalog, &pending_schema_domains, row)
+            })?;
+        let schema_plan = validated.schema_plan;
+        let snapshot = validated.snapshot;
         if let Some(snapshot) = snapshot {
-            validate_file_owner_reference(&input, &pending_file_descriptors, row).await?;
+            file_owner_validator
+                .validate(&input, &pending_file_descriptors, row)
+                .await?;
             validate_primary_key_identity(row, schema_plan, snapshot)?;
             pending_constraints.remember_foreign_key_references(row, schema_plan, snapshot)?;
             staged_snapshots.push((row, schema_plan, snapshot));
@@ -979,50 +989,88 @@ impl PendingFileDescriptorIndex {
     }
 }
 
-async fn validate_file_owner_reference(
-    input: &TransactionValidationInput<'_>,
-    pending_file_descriptors: &PendingFileDescriptorIndex,
-    row: PreparedValidationRow<'_>,
-) -> Result<(), LixError> {
-    let Some(file_id) = row.file_id().as_deref() else {
-        return Ok(());
-    };
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FileOwnerDescriptorKey {
+    domain: Domain,
+    file_id: String,
+}
 
-    let row_domain = row.domain();
-    let target_domains = row_domain
-        .with_untracked(row.untracked())
-        .file_owner_domains();
+#[derive(Default)]
+struct FileOwnerReferenceValidator {
+    committed_descriptor_exists: BTreeMap<FileOwnerDescriptorKey, bool>,
+}
 
-    for domain in &target_domains {
-        if pending_file_descriptors.state_in_domain(domain, file_id)
-            == Some(PendingFileDescriptorState::Present)
-        {
+impl FileOwnerReferenceValidator {
+    async fn validate(
+        &mut self,
+        input: &TransactionValidationInput<'_>,
+        pending_file_descriptors: &PendingFileDescriptorIndex,
+        row: PreparedValidationRow<'_>,
+    ) -> Result<(), LixError> {
+        let Some(file_id) = row.file_id().as_deref() else {
             return Ok(());
+        };
+
+        let row_domain = row.domain();
+        let target_domains = row_domain
+            .with_untracked(row.untracked())
+            .file_owner_domains();
+
+        for domain in &target_domains {
+            if pending_file_descriptors.state_in_domain(domain, file_id)
+                == Some(PendingFileDescriptorState::Present)
+            {
+                return Ok(());
+            }
         }
+
+        for domain in &target_domains {
+            if pending_file_descriptors.state_in_domain(domain, file_id)
+                == Some(PendingFileDescriptorState::Tombstone)
+            {
+                continue;
+            }
+            if self
+                .committed_file_descriptor_exists_in_domain(input.live_state, domain, file_id)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+
+        Err(missing_file_owner_reference_error(row, file_id)?)
     }
 
-    for domain in &target_domains {
-        if pending_file_descriptors.state_in_domain(domain, file_id)
-            == Some(PendingFileDescriptorState::Tombstone)
-        {
-            continue;
+    async fn committed_file_descriptor_exists_in_domain(
+        &mut self,
+        live_state: &dyn LiveStateReader,
+        domain: &Domain,
+        file_id: &str,
+    ) -> Result<bool, LixError> {
+        let descriptor_domain = domain.with_exact_file_scope(None);
+        let key = FileOwnerDescriptorKey {
+            domain: descriptor_domain.clone(),
+            file_id: file_id.to_string(),
+        };
+        if let Some(exists) = self.committed_descriptor_exists.get(&key) {
+            return Ok(*exists);
         }
-        if committed_file_descriptor_exists_in_domain(input.live_state, domain, file_id).await? {
-            return Ok(());
-        }
+        let exists =
+            committed_file_descriptor_exists_in_domain(live_state, &descriptor_domain, file_id)
+                .await?;
+        self.committed_descriptor_exists.insert(key, exists);
+        Ok(exists)
     }
-
-    Err(missing_file_owner_reference_error(row, file_id)?)
 }
 
 async fn committed_file_descriptor_exists_in_domain(
     live_state: &dyn LiveStateReader,
-    domain: &Domain,
+    descriptor_domain: &Domain,
     file_id: &str,
 ) -> Result<bool, LixError> {
     let Some(row) = load_committed_constraint_row(
         live_state,
-        &domain.with_exact_file_scope(None),
+        descriptor_domain,
         FILE_DESCRIPTOR_SCHEMA_KEY,
         EntityPk::single(file_id),
         false,
@@ -1125,6 +1173,26 @@ impl PendingSchemaDomains {
             ),
         ))
     }
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedRowContent<'a> {
+    schema_plan: &'a SchemaPlan,
+    snapshot: Option<&'a JsonValue>,
+}
+
+fn validate_row_content<'a>(
+    schema_catalog: &'a CatalogSnapshot,
+    pending_schema_domains: &PendingSchemaDomains,
+    row: PreparedValidationRow<'a>,
+) -> Result<ValidatedRowContent<'a>, LixError> {
+    let schema_plan = schema_plan_for_row(schema_catalog, pending_schema_domains, row)?;
+    validate_schema_matches_row(row, schema_plan)?;
+    let snapshot = validate_snapshot_content(row, schema_plan)?;
+    Ok(ValidatedRowContent {
+        schema_plan,
+        snapshot,
+    })
 }
 
 fn schema_plan_for_row<'a>(
@@ -3499,6 +3567,32 @@ mod tests {
         ))
         .await
         .expect("committed file descriptor should satisfy file ownership");
+    }
+
+    #[tokio::test]
+    async fn validation_caches_committed_file_owner_reference_by_domain() {
+        let visible_schemas = vec![unique_schema()];
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![
+                unique_row("post-1", "hello-world", "first"),
+                unique_row("post-2", "second-slug", "second"),
+            ],
+            ..empty_staged_write_set()
+        };
+        let live_state = CountingStaticLiveStateReader {
+            rows: Vec::new(),
+            scan_count: AtomicUsize::new(0),
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect("shared committed file descriptor should satisfy file ownership");
+
+        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

@@ -19,11 +19,11 @@ pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use crate::order_key::OrderKey;
 use itertools::Itertools;
-use rand::Rng;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::str;
+use uuid::Uuid;
 
 pub const ROOT_ENTITY_PK: &str = "root";
 pub const TABLE_SCHEMA_KEY: &str = schemas::TABLE_SCHEMA_KEY;
@@ -80,7 +80,6 @@ fn detect_changes_for_rows(
     let base = before.to_rows();
     let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut changes = Vec::new();
-    let mut rng = rand::rng();
     let mut base_index = 0;
     let mut file_index = 0;
     let mut previous_order_key = None;
@@ -123,7 +122,7 @@ fn detect_changes_for_rows(
                 let order_keys =
                     OrderKey::evenly_between(previous_order_key, next_order_key, run.len);
                 for order_key in order_keys {
-                    let id = RowId::random(&mut rng).to_entity_pk();
+                    let id = Uuid::now_v7().to_string();
                     changes.push(row_upsert_change(&id, order_key, &file_rows[file_index])?);
                     previous_order_key = Some(order_key);
                     file_index += 1;
@@ -317,38 +316,6 @@ fn parse_order_key_snapshot(
             "invalid csv row order_key for entity_pk '{entity_pk}': {message}"
         ))
     })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct RowId([u8; 8]);
-
-impl RowId {
-    fn random(rng: &mut impl Rng) -> Self {
-        let mut bytes = [0_u8; 8];
-        rng.fill(&mut bytes);
-        Self(bytes)
-    }
-
-    fn to_entity_pk(self) -> String {
-        format!("row:{}", bytes_to_hex(&self.0))
-    }
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(hex_char(byte >> 4));
-        output.push(hex_char(byte & 0x0f));
-    }
-    output
-}
-
-fn hex_char(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'a' + (value - 10)) as char,
-        _ => unreachable!(),
-    }
 }
 
 #[cfg(test)]

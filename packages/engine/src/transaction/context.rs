@@ -26,15 +26,15 @@ use crate::filesystem::{
     FilesystemIndex, FilesystemRowContext, blob_ref_tombstone_row, filesystem_schema_keys,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::live_state::overlay_scan_rows;
 use crate::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateRow,
+    LiveStateContext, LiveStateFileScanRequest, LiveStateFilter, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow,
 };
+use crate::live_state::{overlay_scan_file_rows, overlay_scan_rows};
 use crate::plugin::{
     InstalledPlugin, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, PluginDetectedChange, PluginRuntimeHost,
-    detect_changes_with_plugin, load_installed_plugins_from_filesystem, plugin_state_rows,
-    select_plugin_for_path,
+    detect_changes_with_plugin, load_installed_plugins_from_filesystem,
+    plugin_state_live_state_projection, retain_plugin_state_rows, select_plugin_for_path,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::SqlWriteExecutionContext;
@@ -418,6 +418,16 @@ where
         overlay_scan_rows(&base, &staged, request).await
     }
 
+    async fn scan_visible_live_state_file(
+        &mut self,
+        request: &LiveStateFileScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let staged = self.staged_writes.staging_overlay()?;
+        let read = SharedStorageRead::new(self.storage.begin_read(StorageReadOptions::default())?);
+        let base = self.live_state.reader(read);
+        overlay_scan_file_rows(&base, &staged, request).await
+    }
+
     async fn reconcile_plugin_write(
         &mut self,
         write: TransactionWrite,
@@ -622,17 +632,15 @@ where
         plugin: &InstalledPlugin,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let rows = self
-            .scan_visible_live_state(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: plugin.schema_keys.clone(),
-                    branch_ids: vec![branch_id.to_string()],
-                    file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
-                    ..Default::default()
-                },
+            .scan_visible_live_state_file(&LiveStateFileScanRequest {
+                branch_ids: vec![branch_id.to_string()],
+                file_id: file_id.to_string(),
+                schema_keys: plugin.schema_keys.clone(),
+                projection: plugin_state_live_state_projection(),
                 ..Default::default()
             })
             .await?;
-        Ok(plugin_state_rows(plugin, rows.iter()))
+        Ok(retain_plugin_state_rows(plugin, rows))
     }
 
     async fn prepare_transaction_write(
@@ -1047,6 +1055,13 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         overlay_scan_rows(&self.base, &self.staged, request).await
+    }
+
+    async fn scan_file_rows(
+        &self,
+        request: &LiveStateFileScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        overlay_scan_file_rows(&self.base, &self.staged, request).await
     }
 
     async fn load_row(

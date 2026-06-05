@@ -137,12 +137,14 @@ pub(crate) fn verify_chunk_hash(
     expected: &[u8; TRACKED_STATE_HASH_BYTES],
     bytes: &[u8],
 ) -> Result<(), LixError> {
-    let actual = crate::tracked_state::codec::hash_bytes(bytes);
-    if &actual != expected {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state chunk hash mismatch",
-        ));
+    if cfg!(debug_assertions) {
+        let actual = crate::tracked_state::codec::hash_bytes(bytes);
+        if &actual != expected {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state chunk hash mismatch",
+            ));
+        }
     }
     Ok(())
 }

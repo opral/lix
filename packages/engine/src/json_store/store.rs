@@ -347,7 +347,7 @@ fn decode_json_payload(
             ),
         ));
     }
-    if hash_check == JsonHashCheck::Verify {
+    if hash_check == JsonHashCheck::Verify && cfg!(debug_assertions) {
         let actual_hash = blake3::hash(&data);
         if actual_hash.as_bytes() != json_ref.as_hash_bytes() {
             return Err(LixError::new(

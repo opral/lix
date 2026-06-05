@@ -5,6 +5,7 @@ use plugin_csv::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use uuid::Uuid;
 
 fn file_from_bytes(data: &[u8]) -> File {
     File {
@@ -95,6 +96,19 @@ fn snapshot_order_key(change: &DetectedChange) -> u128 {
     snapshot_order_key_from_value(&snapshot_value(change))
 }
 
+fn assert_generated_row_id_is_uuid_v7(change: &DetectedChange) {
+    let [entity_pk] = change.entity_pk.as_slice() else {
+        panic!("row entity_pk should have one component");
+    };
+    let value = snapshot_value(change);
+    assert_eq!(
+        value.get("id").and_then(Value::as_str),
+        Some(entity_pk.as_str())
+    );
+    let uuid = Uuid::parse_str(entity_pk).expect("row entity_pk should parse as UUID");
+    assert_eq!(uuid.get_version_num(), 7);
+}
+
 fn row_order_keys_by_first_cell(active_state: &[EntityState]) -> BTreeMap<String, u128> {
     active_state
         .iter()
@@ -152,6 +166,7 @@ fn detects_initial_projection_and_renders_csv() {
         .iter()
         .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
     {
+        assert_generated_row_id_is_uuid_v7(row);
         assert_eq!(
             snapshot_value(row)
                 .get("order_key")

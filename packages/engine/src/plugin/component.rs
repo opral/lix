@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::common::LixError;
-use crate::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use crate::wasm::{
+    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
+    WasmPluginFile, WasmRuntime,
+};
 
 use super::InstalledPlugin;
 
@@ -11,9 +14,6 @@ pub(crate) struct CachedPluginComponent {
     pub(crate) wasm: Vec<u8>,
     pub(crate) instance: Arc<dyn WasmComponentInstance>,
 }
-
-const RENDER_EXPORTS: &[&str] = &["render", "api#render"];
-const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
 
 #[derive(Clone)]
 pub(crate) struct PluginRuntimeHost {
@@ -92,43 +92,20 @@ pub(crate) async fn load_or_init_plugin_component(
 pub(crate) async fn render_with_plugin(
     host: &impl PluginComponentHost,
     plugin: &InstalledPlugin,
-    payload: &[u8],
+    state: Vec<WasmPluginEntityState>,
 ) -> Result<Vec<u8>, LixError> {
     let instance = load_or_init_plugin_component(host, plugin).await?;
-    invoke_plugin_export(instance.as_ref(), RENDER_EXPORTS, payload).await
+    instance.render(state).await
 }
 
 pub(crate) async fn detect_changes_with_plugin(
     host: &impl PluginComponentHost,
     plugin: &InstalledPlugin,
-    payload: &[u8],
-) -> Result<Vec<u8>, LixError> {
+    state: Vec<WasmPluginEntityState>,
+    file: WasmPluginFile,
+) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
     let instance = load_or_init_plugin_component(host, plugin).await?;
-    invoke_plugin_export(instance.as_ref(), DETECT_CHANGES_EXPORTS, payload).await
-}
-
-async fn invoke_plugin_export(
-    instance: &dyn WasmComponentInstance,
-    exports: &[&str],
-    payload: &[u8],
-) -> Result<Vec<u8>, LixError> {
-    let mut errors = Vec::new();
-    for export in exports {
-        match instance.call(export, payload).await {
-            Ok(output) => return Ok(output),
-            Err(error) => errors.push(format!("{export}: {}", error.message)),
-        }
-    }
-
-    Err(LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        message: format!(
-            "plugin materialization: failed to call component export ({})",
-            errors.join("; ")
-        ),
-        hint: None,
-        details: None,
-    })
+    instance.detect_changes(state, file).await
 }
 
 #[cfg(test)]
@@ -177,7 +154,15 @@ mod tests {
 
     #[async_trait]
     impl WasmComponentInstance for NoopComponent {
-        async fn call(&self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
+        async fn detect_changes(
+            &self,
+            _state: Vec<WasmPluginEntityState>,
+            _file: WasmPluginFile,
+        ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn render(&self, _state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
             Ok(Vec::new())
         }
     }
