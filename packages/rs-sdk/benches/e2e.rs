@@ -491,12 +491,9 @@ impl NativeCsvDiffFixture {
 async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
     let temp_dir = tempfile::tempdir().expect("failed to create sqlite bench tempdir");
     let path = temp_dir.path().join("bench.lix");
-    let lix = open_lix(OpenLixOptions {
-        backend: SqliteBackend::open(path).expect("failed to open sqlite bench backend"),
-        wasm_runtime: Some(Arc::new(
-            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
-        )),
-    })
+    let lix = open_lix(OpenLixOptions::new(
+        SqliteBackend::open(path).expect("failed to open sqlite bench backend"),
+    ))
     .await
     .unwrap();
 
@@ -509,14 +506,7 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
 }
 
 async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
-    let lix = open_lix(OpenLixOptions {
-        backend: InMemoryBackend::new(),
-        wasm_runtime: Some(Arc::new(
-            WasmtimePluginRuntime::new().expect("failed to create Wasmtime plugin runtime"),
-        )),
-    })
-    .await
-    .unwrap();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
     lix.install_plugin_archive(plugin).await.unwrap();
 
