@@ -3027,7 +3027,6 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5cab8f2cadc416a82d2e783a1946388b31654d391d1c7d92cc1f03e295b1deb"
 dependencies = [
- "serde",
  "unicode-id",
 ]
 
@@ -3528,12 +3527,14 @@ dependencies = [
 name = "plugin_md_v2"
 version = "0.6.2"
 dependencies = [
- "criterion",
+ "chardetng 1.0.0",
+ "encoding_rs",
+ "imara-diff",
+ "lix_order_key",
  "markdown",
- "serde",
+ "rand 0.9.2",
  "serde_json",
- "strsim",
- "unicode-normalization",
+ "uuid",
  "wit-bindgen 0.57.1",
 ]
 

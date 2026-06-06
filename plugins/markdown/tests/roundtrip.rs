@@ -1,382 +1,568 @@
-mod common;
-
-use common::{
-    StateRows, active_state_from_changes, apply_changes_to_active_state, collect_state_rows,
-    decode_utf8, detect_changes_from_files, file_from_markdown, is_document_change, merge_delta,
+use plugin_md_v2::exports::lix::plugin::api::{EntityState, Guest};
+use plugin_md_v2::{
+    BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, File, MarkdownPlugin, PluginError,
+    ROOT_ENTITY_PK,
 };
-use plugin_md_v2::exports::lix::plugin::api::Guest;
-use plugin_md_v2::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, DetectedChange, MarkdownPlugin};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use uuid::Uuid;
 
-fn detect_with_state_context(
-    state: &StateRows,
-    _before: plugin_md_v2::File,
-    after: plugin_md_v2::File,
-) -> Vec<DetectedChange> {
-    let active_state = active_state_from_changes(collect_state_rows(state));
-    MarkdownPlugin::detect_changes(active_state, after)
-        .expect("MarkdownPlugin::detect_changes should succeed")
+fn file_from_bytes(data: &[u8]) -> File {
+    File {
+        data: data.to_vec(),
+    }
 }
 
-fn render_state(state: &StateRows) -> Vec<u8> {
-    MarkdownPlugin::render(active_state_from_changes(collect_state_rows(state)))
-        .expect("MarkdownPlugin::render should succeed")
+fn active_state_from_file(file: File) -> Vec<EntityState> {
+    active_state_from_changes(
+        MarkdownPlugin::detect_changes(Vec::new(), file).expect("detect_changes should succeed"),
+    )
 }
 
-fn count_tombstones(changes: &[DetectedChange]) -> usize {
-    changes
+fn apply_changes_to_active_state(
+    active_state: Vec<EntityState>,
+    changes: Vec<DetectedChange>,
+) -> Vec<EntityState> {
+    let mut rows = active_state
+        .into_iter()
+        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
+        .collect::<BTreeMap<_, _>>();
+
+    for change in changes {
+        let key = (change.schema_key.clone(), change.entity_pk.clone());
+        match change.snapshot_content {
+            Some(snapshot_content) => {
+                rows.insert(
+                    key,
+                    EntityState {
+                        entity_pk: change.entity_pk,
+                        schema_key: change.schema_key,
+                        snapshot_content,
+                        metadata: change.metadata,
+                    },
+                );
+            }
+            None => {
+                rows.remove(&key);
+            }
+        }
+    }
+
+    rows.into_values().collect()
+}
+
+fn active_state_from_changes(changes: Vec<DetectedChange>) -> Vec<EntityState> {
+    apply_changes_to_active_state(Vec::new(), changes)
+}
+
+fn render_active_state(active_state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
+    MarkdownPlugin::render(active_state)
+}
+
+fn render_changes(changes: Vec<DetectedChange>) -> Result<Vec<u8>, PluginError> {
+    render_active_state(active_state_from_changes(changes))
+}
+
+fn snapshot_value(change: &DetectedChange) -> Value {
+    let raw = change
+        .snapshot_content
+        .as_ref()
+        .expect("snapshot_content should exist");
+    serde_json::from_str(raw).expect("snapshot_content should parse")
+}
+
+fn active_state_snapshot_value(row: &EntityState) -> Value {
+    serde_json::from_str(&row.snapshot_content).expect("snapshot_content should parse")
+}
+
+fn snapshot_order_key_from_value(value: &Value) -> String {
+    let raw = value
+        .get("order_key")
+        .and_then(Value::as_str)
+        .expect("block order_key should exist")
+        .to_string();
+    assert_order_key_is_valid(&raw);
+    raw
+}
+
+fn snapshot_order_key(change: &DetectedChange) -> String {
+    snapshot_order_key_from_value(&snapshot_value(change))
+}
+
+fn snapshot_block(change: &DetectedChange) -> String {
+    snapshot_value(change)
+        .get("block")
+        .and_then(Value::as_str)
+        .expect("block content should exist")
+        .to_string()
+}
+
+fn assert_generated_block_id_is_uuid_v7(change: &DetectedChange) {
+    let [entity_pk] = change.entity_pk.as_slice() else {
+        panic!("block entity_pk should have one component");
+    };
+    let value = snapshot_value(change);
+    assert_eq!(
+        value.get("id").and_then(Value::as_str),
+        Some(entity_pk.as_str())
+    );
+    let uuid = Uuid::parse_str(entity_pk).expect("block entity_pk should parse as UUID");
+    assert_eq!(uuid.get_version_num(), 7);
+}
+
+fn block_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String, String> {
+    active_state
         .iter()
-        .filter(|c| c.schema_key == BLOCK_SCHEMA_KEY && c.snapshot_content.is_none())
-        .count()
-}
-
-fn count_upserts(changes: &[DetectedChange]) -> usize {
-    changes
-        .iter()
-        .filter(|c| c.schema_key == BLOCK_SCHEMA_KEY && c.snapshot_content.is_some())
-        .count()
-}
-
-fn count_document_rows(changes: &[DetectedChange]) -> usize {
-    changes
-        .iter()
-        .filter(|c| c.schema_key == DOCUMENT_SCHEMA_KEY)
-        .count()
-}
-
-fn upsert_block_types(changes: &[DetectedChange]) -> Vec<String> {
-    changes
-        .iter()
-        .filter(|c| c.schema_key == BLOCK_SCHEMA_KEY && c.snapshot_content.is_some())
-        .map(|c| {
-            let raw = c
-                .snapshot_content
-                .as_ref()
-                .expect("upsert should have snapshot");
-            let parsed: serde_json::Value =
-                serde_json::from_str(raw).expect("block snapshot should be valid JSON");
-            parsed
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .expect("block snapshot should contain type")
-                .to_string()
+        .filter(|row| row.schema_key == BLOCK_SCHEMA_KEY)
+        .map(|row| {
+            let value = active_state_snapshot_value(row);
+            let block = value
+                .get("block")
+                .and_then(Value::as_str)
+                .expect("block content should exist")
+                .to_string();
+            (block, snapshot_order_key_from_value(&value))
         })
         .collect()
+}
+
+fn markdown_active_state_with_block_order_keys(blocks: &[(&str, &str, &str)]) -> Vec<EntityState> {
+    let mut state = vec![EntityState {
+        entity_pk: vec![ROOT_ENTITY_PK.to_string()],
+        schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
+        snapshot_content: serde_json::json!({
+            "id": ROOT_ENTITY_PK,
+        })
+        .to_string(),
+        metadata: None,
+    }];
+
+    state.extend(blocks.iter().map(|(id, order_key, block)| {
+        EntityState {
+            entity_pk: vec![(*id).to_string()],
+            schema_key: BLOCK_SCHEMA_KEY.to_string(),
+            snapshot_content: serde_json::json!({
+                "id": id,
+                "order_key": order_key,
+                "block": block,
+            })
+            .to_string(),
+            metadata: None,
+        }
+    }));
+
+    state
+}
+
+fn assert_order_key_is_valid(raw: &str) {
+    assert!(!raw.is_empty(), "order_key should not be empty");
+    assert!(
+        raw.bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "order_key should contain only lowercase hexadecimal digits: {raw}"
+    );
+    assert_eq!(raw.len() % 2, 0, "order_key should have even length: {raw}");
+    assert!(
+        !raw.ends_with("00"),
+        "order_key should not end with the minimum byte: {raw}"
+    );
+}
+
+#[test]
+fn detects_initial_projection_and_renders_normalized_markdown() {
+    let after = file_from_bytes(b"# Title\r\n\r\nHello **Ada**\r\n\r\n- one\r\n- two\r\n");
+
+    let changes =
+        MarkdownPlugin::detect_changes(Vec::new(), after).expect("detect_changes should succeed");
+
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
+            .count(),
+        3
+    );
+    let document = changes
+        .iter()
+        .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
+        .expect("document snapshot should exist");
+    assert_eq!(document.entity_pk, [ROOT_ENTITY_PK]);
+    assert_eq!(snapshot_value(document), serde_json::json!({"id": "root"}));
+
+    let blocks = changes
+        .iter()
+        .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
+        .map(snapshot_block)
+        .collect::<Vec<_>>();
+    assert_eq!(blocks, ["# Title", "Hello **Ada**", "- one\n- two"]);
+    for block in changes
+        .iter()
+        .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
+    {
+        assert_generated_block_id_is_uuid_v7(block);
+        assert_order_key_is_valid(
+            snapshot_value(block)
+                .get("order_key")
+                .and_then(Value::as_str)
+                .expect("block order_key should exist"),
+        );
+    }
+
+    let output = render_changes(changes).expect("render should succeed");
+    assert_eq!(output, b"# Title\n\nHello **Ada**\n\n- one\n- two\n");
+}
+
+#[test]
+fn detects_empty_initial_markdown_file_as_document() {
+    let changes = MarkdownPlugin::detect_changes(Vec::new(), file_from_bytes(b""))
+        .expect("detect_changes should succeed");
+
+    assert_eq!(changes.len(), 1);
+    let document = changes
+        .iter()
+        .find(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
+        .expect("document snapshot should exist");
+    assert_eq!(document.entity_pk, [ROOT_ENTITY_PK]);
+    assert_eq!(snapshot_value(document), serde_json::json!({"id": "root"}));
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
+            .count(),
+        0
+    );
+
+    let output = render_changes(changes).expect("render should succeed");
+    assert_eq!(output, b"\n");
+}
+
+#[test]
+fn applies_delta_to_existing_markdown() {
+    let before_bytes = b"# Title\n\nHello\n";
+    let after_bytes = b"# Title\n\nHello **Ada**\n\n- one\n";
+    let before_state = active_state_from_file(file_from_bytes(before_bytes));
+
+    let changes =
+        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
+            .expect("detect_changes should succeed");
+    let output = render_active_state(apply_changes_to_active_state(before_state, changes))
+        .expect("render should succeed");
+
+    assert_eq!(output, b"# Title\n\nHello **Ada**\n\n- one\n");
+}
+
+#[test]
+fn normalizes_adjacent_blocks_to_blank_line_separators() {
+    let output = render_changes(vec![
+        DetectedChange {
+            entity_pk: vec![ROOT_ENTITY_PK.to_string()],
+            schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(r#"{"id":"root"}"#.to_string()),
+            metadata: None,
+        },
+        DetectedChange {
+            entity_pk: vec!["block:0".to_string()],
+            schema_key: BLOCK_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(
+                r##"{"id":"block:0","order_key":"80","block":"# Title"}"##.to_string(),
+            ),
+            metadata: None,
+        },
+        DetectedChange {
+            entity_pk: vec!["block:1".to_string()],
+            schema_key: BLOCK_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(
+                r#"{"id":"block:1","order_key":"c0","block":"paragraph"}"#.to_string(),
+            ),
+            metadata: None,
+        },
+    ])
+    .expect("render should succeed");
+
+    assert_eq!(output, b"# Title\n\nparagraph\n");
+}
+
+#[test]
+fn inserted_blocks_get_order_key_between_neighbors() {
+    let before_state = active_state_from_file(file_from_bytes(b"# A\n\n# C"));
+    let order_keys_by_block = block_order_keys_by_content(&before_state);
+
+    let changes =
+        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(b"# A\n\n# B\n\n# C"))
+            .expect("detect_changes should succeed");
+    let inserted_order_key = {
+        let block_changes = changes
+            .iter()
+            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
+            .collect::<Vec<_>>();
+
+        assert_eq!(block_changes.len(), 1);
+        snapshot_order_key(block_changes[0])
+    };
+    let lower = order_keys_by_block
+        .get("# A")
+        .expect("before state should contain block A");
+    let upper = order_keys_by_block
+        .get("# C")
+        .expect("before state should contain block C");
+    assert!(inserted_order_key.as_str() > lower.as_str());
+    assert!(inserted_order_key.as_str() < upper.as_str());
+
+    let output = render_active_state(apply_changes_to_active_state(before_state, changes))
+        .expect("render should succeed");
+
+    assert_eq!(output, b"# A\n\n# B\n\n# C\n");
+}
+
+#[test]
+fn repairs_duplicate_block_order_keys_when_inserting_between_them() {
+    let before_state = markdown_active_state_with_block_order_keys(&[
+        ("block:a", "80", "# A"),
+        ("block:c", "80", "# C"),
+    ]);
+
+    let changes =
+        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(b"# A\n\n# B\n\n# C"))
+            .expect("detect_changes should succeed");
+    let active_state = apply_changes_to_active_state(before_state, changes);
+    let order_keys_by_block = block_order_keys_by_content(&active_state);
+    let unique_order_keys = order_keys_by_block
+        .values()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(order_keys_by_block.len(), 3);
+    assert_eq!(unique_order_keys.len(), 3);
+
+    let output = render_active_state(active_state).expect("render should succeed");
+    assert_eq!(output, b"# A\n\n# B\n\n# C\n");
+}
+
+#[test]
+fn render_rebuilds_from_unordered_active_state() {
+    let mut active_state = active_state_from_file(file_from_bytes(b"# A\n\n# B\n\n# C"));
+    active_state.reverse();
+
+    let output = MarkdownPlugin::render(active_state).expect("render should succeed");
+
+    assert_eq!(output, b"# A\n\n# B\n\n# C\n");
+}
+
+#[test]
+fn rejects_block_snapshot_with_invalid_order_key() {
+    let changes = vec![DetectedChange {
+        entity_pk: vec!["block:0".to_string()],
+        schema_key: BLOCK_SCHEMA_KEY.to_string(),
+        snapshot_content: Some(
+            r##"{"id":"block:0","order_key":"ba00","block":"# A"}"##.to_string(),
+        ),
+        metadata: None,
+    }];
+
+    let error = render_changes(changes).expect_err("render should reject invalid projection");
+
+    match error {
+        PluginError::InvalidInput(message) => {
+            assert!(message.contains("invalid markdown block order_key"));
+        }
+        PluginError::Internal(message) => {
+            panic!("expected InvalidInput, got Internal({message})");
+        }
+    }
 }
 
 #[test]
 fn roundtrip_file_detect_state_render_markdown() {
     let markdown = "# Title\n\nParagraph one.\n\nParagraph two.\n";
-    let file = file_from_markdown(markdown);
+    let state = active_state_from_file(file_from_bytes(markdown.as_bytes()));
 
-    let delta =
-        MarkdownPlugin::detect_changes(Vec::new(), file).expect("detect_changes should succeed");
+    let output = render_active_state(state).expect("render should succeed");
 
-    let mut state = StateRows::new();
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-
-    assert_eq!(decode_utf8(materialized), markdown);
+    assert_eq!(output, b"# Title\n\nParagraph one.\n\nParagraph two.\n");
 }
 
 #[test]
 fn roundtrip_edit_move_delete_across_block_rows() {
-    let before_markdown = "Alpha.\n\nBravo.\n\nCharlie.\n";
-    let after_markdown = "Charlie.\n\nAlpha updated.\n";
+    let before = b"Alpha.\n\nBravo.\n\nCharlie.\n";
+    let after = b"Charlie.\n\nAlpha updated.\n";
+    let before_state = active_state_from_file(file_from_bytes(before));
 
-    let before_file = file_from_markdown(before_markdown);
+    let delta = MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(after))
+        .expect("detect_changes should succeed");
+    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
+        .expect("render should succeed");
 
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
-
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(after_markdown));
-
-    assert!(
-        delta
-            .iter()
-            .any(|change| change.schema_key == DOCUMENT_SCHEMA_KEY)
-    );
-    assert!(delta.iter().any(|change| {
-        change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none()
-    }));
-    assert!(delta.iter().any(|change| {
-        change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
-    }));
-
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-
-    assert_eq!(decode_utf8(materialized), after_markdown);
-}
-
-#[test]
-fn roundtrip_move_only_updates_document_order() {
-    let before_markdown = "First block.\n\nSecond block.\n";
-    let after_markdown = "Second block.\n\nFirst block.\n";
-
-    let delta = detect_changes_from_files(
-        Some(file_from_markdown(before_markdown)),
-        file_from_markdown(after_markdown),
-    )
-    .expect("detect_changes should succeed");
-
-    assert_eq!(delta.len(), 1);
-    assert!(delta.iter().all(is_document_change));
+    assert_eq!(output, b"Charlie.\n\nAlpha updated.\n");
 }
 
 #[test]
 fn roundtrip_multi_step_evolution() {
-    let a = "# Title\n\nOne.\n";
-    let b = "# Title v2\n\nOne.\n\nTwo.\n";
-    let c = "Two.\n\n# Title v3\n";
+    let a = b"# Title\n\nOne.\n";
+    let b = b"# Title v2\n\nOne.\n\nTwo.\n";
+    let c = b"Two.\n\n# Title v3\n";
+    let mut state = active_state_from_file(file_from_bytes(a));
 
-    let a_file = file_from_markdown(a);
-    let b_file = file_from_markdown(b);
-    let c_file = file_from_markdown(c);
-
-    let mut state = StateRows::new();
-
-    let delta_a = MarkdownPlugin::detect_changes(Vec::new(), a_file.clone())
+    let delta_b = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(b))
         .expect("detect_changes should succeed");
-    merge_delta(&mut state, delta_a);
+    state = apply_changes_to_active_state(state, delta_b);
 
-    let delta_b = detect_with_state_context(&state, a_file, b_file.clone());
-    merge_delta(&mut state, delta_b);
+    let delta_c = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(c))
+        .expect("detect_changes should succeed");
+    state = apply_changes_to_active_state(state, delta_c);
 
-    let delta_c = detect_with_state_context(&state, b_file, c_file);
-    merge_delta(&mut state, delta_c);
-
-    let materialized = render_state(&state);
-
-    assert_eq!(decode_utf8(materialized), c);
+    let output = render_active_state(state).expect("render should succeed");
+    assert_eq!(output, b"Two.\n\n# Title v3\n");
 }
 
 #[test]
 fn roundtrip_delete_all_blocks_to_empty_document() {
-    let before = "A\n\nB\n";
-    let before_file = file_from_markdown(before);
+    let before_state = active_state_from_file(file_from_bytes(b"A\n\nB\n"));
 
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
+    let delta = MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(b""))
+        .expect("detect_changes should succeed");
+    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
+        .expect("render should succeed");
 
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(""));
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-
-    assert_eq!(decode_utf8(materialized), "");
+    assert_eq!(output, b"\n");
 }
 
 #[test]
 fn roundtrip_list_internal_edit_keeps_top_level_block_model() {
-    let before = "- one\n- two\n";
-    let after = "- one\n- two changed\n";
-    let before_file = file_from_markdown(before);
+    let before_state = active_state_from_file(file_from_bytes(b"- one\n- two\n"));
 
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
+    let delta = MarkdownPlugin::detect_changes(
+        before_state.clone(),
+        file_from_bytes(b"- one\n- two changed\n"),
+    )
+    .expect("detect_changes should succeed");
 
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(after));
+    assert_eq!(
+        delta
+            .iter()
+            .filter(
+                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none()
+            )
+            .count(),
+        0
+    );
+    assert_eq!(
+        delta
+            .iter()
+            .filter(
+                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
+            )
+            .count(),
+        1
+    );
 
-    assert_eq!(count_tombstones(&delta), 0);
-    assert_eq!(count_upserts(&delta), 1);
-    assert_eq!(count_document_rows(&delta), 0);
-    assert_eq!(upsert_block_types(&delta), vec!["list".to_string()]);
-
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-    assert_eq!(decode_utf8(materialized), after);
+    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
+        .expect("render should succeed");
+    assert_eq!(output, b"- one\n- two changed\n");
 }
 
 #[test]
 fn roundtrip_table_row_add_remove_reorder() {
-    let initial = "| a | b |\n| - | - |\n| 1 | 2 |\n";
-    let add = "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
-    let reorder = "| a | b |\n| - | - |\n| 3 | 4 |\n| 1 | 2 |\n";
-    let remove = "| a | b |\n| - | - |\n| 3 | 4 |\n";
+    let initial = b"| a | b |\n| - | - |\n| 1 | 2 |\n";
+    let add = b"| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
+    let reorder = b"| a | b |\n| - | - |\n| 3 | 4 |\n| 1 | 2 |\n";
+    let remove = b"| a | b |\n| - | - |\n| 3 | 4 |\n";
+    let mut state = active_state_from_file(file_from_bytes(initial));
 
-    let mut state = StateRows::new();
-    let initial_file = file_from_markdown(initial);
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), initial_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
-
-    let delta_add = detect_with_state_context(&state, initial_file, file_from_markdown(add));
-    assert_eq!(count_tombstones(&delta_add), 0);
-    assert_eq!(count_upserts(&delta_add), 1);
-    assert_eq!(count_document_rows(&delta_add), 0);
-    assert_eq!(upsert_block_types(&delta_add), vec!["table".to_string()]);
-    merge_delta(&mut state, delta_add);
-
-    let delta_reorder =
-        detect_with_state_context(&state, file_from_markdown(add), file_from_markdown(reorder));
-    assert_eq!(count_tombstones(&delta_reorder), 0);
-    assert_eq!(count_upserts(&delta_reorder), 1);
-    assert_eq!(count_document_rows(&delta_reorder), 0);
-    assert_eq!(
-        upsert_block_types(&delta_reorder),
-        vec!["table".to_string()]
-    );
-    merge_delta(&mut state, delta_reorder);
-
-    let delta_remove = detect_with_state_context(
-        &state,
-        file_from_markdown(reorder),
-        file_from_markdown(remove),
-    );
-    assert_eq!(count_tombstones(&delta_remove), 0);
-    assert_eq!(count_upserts(&delta_remove), 1);
-    assert_eq!(count_document_rows(&delta_remove), 0);
-    assert_eq!(upsert_block_types(&delta_remove), vec!["table".to_string()]);
-    merge_delta(&mut state, delta_remove);
-
-    let materialized = render_state(&state);
-    assert_eq!(decode_utf8(materialized), remove);
-}
-
-#[test]
-fn roundtrip_large_shuffle_500_with_state_context_low_noise() {
-    let paragraphs = (1..=500).map(|idx| format!("P{idx}")).collect::<Vec<_>>();
-    let before_markdown = paragraphs.join("\n\n") + "\n";
-    let before_file = file_from_markdown(&before_markdown);
-
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
-
-    let mut after = paragraphs;
-    after.rotate_left(123);
-    let after_markdown = after.join("\n\n") + "\n";
-
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(&after_markdown));
-    assert_eq!(count_tombstones(&delta), 0);
-    assert_eq!(count_upserts(&delta), 0);
-    assert_eq!(count_document_rows(&delta), 1);
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-    assert_eq!(decode_utf8(materialized), after_markdown);
-}
-
-#[test]
-fn roundtrip_large_tiny_edits_500_with_state_context_low_noise() {
-    let paragraphs = (1..=500).map(|idx| format!("P{idx}")).collect::<Vec<_>>();
-    let before_markdown = paragraphs.join("\n\n") + "\n";
-    let before_file = file_from_markdown(&before_markdown);
-
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
-
-    let mut after = paragraphs;
-    for idx in [10usize, 111, 222, 333, 444] {
-        after[idx] = format!("{} x", after[idx]);
+    for next in [add.as_slice(), reorder.as_slice(), remove.as_slice()] {
+        let delta = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(next))
+            .expect("detect_changes should succeed");
+        assert_eq!(
+            delta
+                .iter()
+                .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY
+                    && change.snapshot_content.is_some())
+                .count(),
+            1
+        );
+        state = apply_changes_to_active_state(state, delta);
     }
-    let after_markdown = after.join("\n\n") + "\n";
 
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(&after_markdown));
-    assert_eq!(count_tombstones(&delta), 0);
-    assert_eq!(count_upserts(&delta), 5);
-    assert_eq!(count_document_rows(&delta), 0);
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-    assert_eq!(decode_utf8(materialized), after_markdown);
+    let output = render_active_state(state).expect("render should succeed");
+    assert_eq!(output, b"| a | b |\n| - | - |\n| 3 | 4 |\n");
 }
 
 #[test]
-fn roundtrip_large_duplicate_edit_with_state_context_low_noise() {
-    let before_paragraphs = (0..500).map(|_| "Same".to_string()).collect::<Vec<_>>();
-    let before_markdown = before_paragraphs.join("\n\n") + "\n";
-    let before_file = file_from_markdown(&before_markdown);
+fn roundtrip_large_tiny_edits_500_with_state_context() {
+    let paragraphs = (1..=500)
+        .map(|index| format!("P{index}"))
+        .collect::<Vec<_>>();
+    let before = paragraphs.join("\n\n") + "\n";
+    let mut state = active_state_from_file(file_from_bytes(before.as_bytes()));
 
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
+    let mut after = paragraphs;
+    for index in [10usize, 111, 222, 333, 444] {
+        after[index] = format!("{} x", after[index]);
+    }
+    let after = after.join("\n\n") + "\n";
 
-    let mut after = before_paragraphs;
-    after[349] = "Same updated".to_string();
-    let after_markdown = after.join("\n\n") + "\n";
+    let delta = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(after.as_bytes()))
+        .expect("detect_changes should succeed");
+    assert_eq!(
+        delta
+            .iter()
+            .filter(
+                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
+            )
+            .count(),
+        5
+    );
+    state = apply_changes_to_active_state(state, delta);
 
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(&after_markdown));
-    assert_eq!(count_tombstones(&delta), 0);
-    assert_eq!(count_upserts(&delta), 1);
-    assert!(count_document_rows(&delta) <= 1);
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-    assert_eq!(decode_utf8(materialized), after_markdown);
+    let output = render_active_state(state).expect("render should succeed");
+    assert_eq!(output, after.as_bytes());
 }
 
 #[test]
-fn roundtrip_move_insert_delete_large_with_state_context_low_noise() {
-    let paragraphs = (1..=500).map(|idx| format!("P{idx}")).collect::<Vec<_>>();
-    let before_markdown = paragraphs.join("\n\n") + "\n";
-    let before_file = file_from_markdown(&before_markdown);
+fn roundtrip_large_duplicate_edit_with_state_context() {
+    let before_blocks = (0..500).map(|_| "Same").collect::<Vec<_>>();
+    let before = before_blocks.join("\n\n") + "\n";
+    let mut state = active_state_from_file(file_from_bytes(before.as_bytes()));
 
-    let mut state = StateRows::new();
-    let bootstrap = MarkdownPlugin::detect_changes(Vec::new(), before_file.clone())
-        .expect("bootstrap detect should succeed");
-    merge_delta(&mut state, bootstrap);
+    let mut after_blocks = before_blocks;
+    after_blocks[349] = "Same updated";
+    let after = after_blocks.join("\n\n") + "\n";
 
-    let moved = paragraphs[450..460].to_vec();
-    let mut remaining = paragraphs[..450].to_vec();
-    remaining.extend_from_slice(&paragraphs[460..]);
-    remaining.retain(|entry| entry != "P500");
-    let idx_p300 = remaining
-        .iter()
-        .position(|entry| entry == "P300")
-        .expect("P300 should exist");
-    let mut after = Vec::new();
-    after.extend(moved);
-    after.extend_from_slice(&remaining[..=idx_p300]);
-    after.push("PX".to_string());
-    after.extend_from_slice(&remaining[idx_p300 + 1..]);
-    let after_markdown = after.join("\n\n") + "\n";
+    let delta = MarkdownPlugin::detect_changes(state.clone(), file_from_bytes(after.as_bytes()))
+        .expect("detect_changes should succeed");
+    assert_eq!(
+        delta
+            .iter()
+            .filter(
+                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
+            )
+            .count(),
+        1
+    );
+    state = apply_changes_to_active_state(state, delta);
 
-    let delta = detect_with_state_context(&state, before_file, file_from_markdown(&after_markdown));
-    let tombstones = count_tombstones(&delta);
-    let upserts = count_upserts(&delta);
-    let docs = count_document_rows(&delta);
-    assert!(tombstones <= 1);
-    assert_eq!(upserts, 1);
-    assert_eq!(docs, 1);
-    assert!(tombstones + upserts <= 2);
-    merge_delta(&mut state, delta);
-
-    let materialized = render_state(&state);
-    assert_eq!(decode_utf8(materialized), after_markdown);
+    let output = render_active_state(state).expect("render should succeed");
+    assert_eq!(output, after.as_bytes());
 }
 
 #[test]
 fn guest_interface_uses_active_state_for_low_noise_edit_and_render() {
-    let before = "Hello\n\nWorld\n";
-    let after = "Hello updated\n\nWorld\n";
+    let before_state = active_state_from_file(file_from_bytes(b"Hello\n\nWorld\n"));
 
-    let before_state = active_state_from_changes(
-        MarkdownPlugin::detect_changes(Vec::new(), file_from_markdown(before))
-            .expect("initial detect_changes should succeed"),
+    let delta = MarkdownPlugin::detect_changes(
+        before_state.clone(),
+        file_from_bytes(b"Hello updated\n\nWorld\n"),
+    )
+    .expect("detect_changes should succeed");
+    assert_eq!(
+        delta
+            .iter()
+            .filter(
+                |change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some()
+            )
+            .count(),
+        1
     );
 
-    let delta = MarkdownPlugin::detect_changes(before_state.clone(), file_from_markdown(after))
-        .expect("delta detect_changes should succeed");
-    assert_eq!(count_tombstones(&delta), 0);
-    assert_eq!(count_upserts(&delta), 1);
-    assert_eq!(count_document_rows(&delta), 0);
-
-    let after_state = apply_changes_to_active_state(before_state, delta);
-    let materialized = MarkdownPlugin::render(after_state).expect("render should succeed");
-
-    assert_eq!(decode_utf8(materialized), after);
+    let output = render_active_state(apply_changes_to_active_state(before_state, delta))
+        .expect("render should succeed");
+    assert_eq!(output, b"Hello updated\n\nWorld\n");
 }

@@ -3,7 +3,7 @@
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
   "match": {
-    "path_glob": "*.{md,mdx}",
+    "path_glob": "*.{md,markdown,mdx}",
     "content_type": "text"
   },
   "entry": "plugin.wasm",

@@ -1,30 +1,30 @@
 {
-  "x-lix-key": "markdown_v2_block",
+  "x-lix-key": "markdown_block",
   "x-lix-primary-key": [
     "/id"
   ],
+  "description": "One normalized top-level Markdown block parsed by markdown-rs. Normalization: input bytes are decoded to text and rendered as UTF-8, CRLF and CR line endings become LF, leading and trailing line endings around each parsed top-level block are removed, inter-block blank lines are collapsed to one empty line, and documents render with a single trailing LF.",
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "description": "Stable block entity pk. New blocks are generated as UUIDv7 strings. Must match the block entity_pk."
     },
-    "type": {
+    "order_key": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "Opaque variable-length byte order key encoded as lowercase hex. Lexicographic string order matches Markdown block order."
     },
-    "node": {
-      "type": "object"
-    },
-    "markdown": {
-      "type": "string"
+    "block": {
+      "type": "string",
+      "description": "Normalized Markdown source for a single top-level markdown-rs block."
     }
   },
   "required": [
     "id",
-    "type",
-    "node",
-    "markdown"
+    "order_key",
+    "block"
   ],
   "additionalProperties": false
 }

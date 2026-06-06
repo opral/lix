@@ -1,9 +1,9 @@
-use plugin_md_v2::MANIFEST_JSON;
 use plugin_md_v2::schemas::{
-    BLOCK_SCHEMA_KEY, BLOCK_SCHEMA_PATH, DOCUMENT_SCHEMA_KEY, DOCUMENT_SCHEMA_PATH,
     block_schema_definition, block_schema_json, document_schema_definition, document_schema_json,
-    schema_definitions, schema_jsons,
+    schema_definitions, schema_jsons, BLOCK_SCHEMA_KEY, BLOCK_SCHEMA_PATH, DOCUMENT_SCHEMA_KEY,
+    DOCUMENT_SCHEMA_PATH,
 };
+use plugin_md_v2::MANIFEST_JSON;
 use std::collections::BTreeSet;
 
 #[test]
@@ -36,8 +36,8 @@ fn schema_definitions_have_expected_keys() {
 #[test]
 fn schema_json_accessors_return_expected_text() {
     let raw = schema_jsons().join("\n");
-    assert!(raw.contains("\"x-lix-key\": \"markdown_v2_document\""));
-    assert!(raw.contains("\"x-lix-key\": \"markdown_v2_block\""));
+    assert!(raw.contains("\"x-lix-key\": \"markdown_document\""));
+    assert!(raw.contains("\"x-lix-key\": \"markdown_block\""));
     assert_eq!(
         document_schema_definition()
             .get("x-lix-key")
@@ -50,8 +50,10 @@ fn schema_json_accessors_return_expected_text() {
             .and_then(serde_json::Value::as_str),
         Some(BLOCK_SCHEMA_KEY)
     );
-    assert!(document_schema_json().contains("\"order\""));
-    assert!(block_schema_json().contains("\"markdown\""));
+    assert!(!document_schema_json().contains("\"order_key\""));
+    assert!(block_schema_json().contains("\"order_key\""));
+    assert!(block_schema_json().contains("\"block\""));
+    assert!(block_schema_json().contains("inter-block blank lines"));
 }
 
 #[test]
@@ -78,7 +80,14 @@ fn manifest_json_has_expected_plugin_identity() {
             .and_then(|value| value.get("path_glob"))
             .and_then(serde_json::Value::as_str)
             .expect("manifest.match.path_glob must be string"),
-        "*.{md,mdx}"
+        "*.{md,markdown,mdx}"
+    );
+    assert_eq!(
+        manifest
+            .get("match")
+            .and_then(|value| value.get("content_type"))
+            .and_then(serde_json::Value::as_str),
+        Some("text")
     );
     let schemas = manifest
         .get("schemas")
