@@ -15,25 +15,34 @@ impl fmt::Debug for OrderKey {
 }
 
 impl OrderKey {
+    fn new(bytes: Vec<u8>) -> Self {
+        assert!(!bytes.is_empty(), "must not be empty");
+        assert!(bytes.last() != Some(&MIN_BYTE), "must not end with 00");
+        Self(bytes)
+    }
     pub fn evenly_between(
         previous: Option<&Self>,
         next: Option<&Self>,
         count: usize,
     ) -> Result<Vec<Self>, String> {
+        if let (Some(previous), Some(next)) = (previous, next) {
+            if previous == next {
+                return Err(format!(
+                    "order key bounds are equal: previous={previous:?}, next={next:?}"
+                ));
+            }
+            assert!(
+                previous < next,
+                "order key bounds are out of order: previous={previous:?}, next={next:?}"
+            );
+        }
+
         if count == 0 {
             return Ok(Vec::new());
         }
 
-        if let (Some(previous), Some(next)) = (previous, next) {
-            if previous >= next {
-                return Err(format!(
-                    "order key bounds are out of order: previous={previous:?}, next={next:?}"
-                ));
-            }
-        }
-
         let mut keys = Vec::with_capacity(count);
-        fill_evenly(previous, next, count, &mut keys)?;
+        fill_evenly(previous, next, count, &mut keys);
         Ok(keys)
     }
 
@@ -43,14 +52,18 @@ impl OrderKey {
 
     pub fn from_snapshot_string(raw: &str) -> Result<Self, String> {
         let bytes = decode_hex(raw)?;
-        validate_bytes(&bytes)?;
-        Ok(Self(bytes))
+        if bytes.is_empty() {
+            return Err("must not be empty".to_owned());
+        }
+        if bytes.last() == Some(&MIN_BYTE) {
+            return Err("must not end with 00".to_owned());
+        }
+        Ok(Self::new(bytes))
     }
 
-    fn between(previous: Option<&Self>, next: Option<&Self>) -> Result<Self, String> {
-        let bytes = midpoint(previous.map(Self::as_bytes), next.map(Self::as_bytes))?;
-        validate_bytes(&bytes)?;
-        Ok(Self(bytes))
+    fn between(previous: Option<&Self>, next: Option<&Self>) -> Self {
+        let bytes = midpoint(previous.map(Self::as_bytes), next.map(Self::as_bytes));
+        Self::new(bytes)
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -63,36 +76,25 @@ fn fill_evenly(
     next: Option<&OrderKey>,
     count: usize,
     out: &mut Vec<OrderKey>,
-) -> Result<(), String> {
+) {
     if count == 0 {
-        return Ok(());
+        return;
     }
 
     let left_count = count / 2;
     let right_count = count - left_count - 1;
-    let key = OrderKey::between(previous, next)?;
-    fill_evenly(previous, Some(&key), left_count, out)?;
+    let key = OrderKey::between(previous, next);
+    fill_evenly(previous, Some(&key), left_count, out);
     out.push(key.clone());
-    fill_evenly(Some(&key), next, right_count, out)
+    fill_evenly(Some(&key), next, right_count, out);
 }
 
-fn validate_bytes(bytes: &[u8]) -> Result<(), String> {
-    if bytes.is_empty() {
-        return Err("must not be empty".to_string());
-    }
-    if bytes.last() == Some(&MIN_BYTE) {
-        return Err("must not end with 00".to_string());
-    }
-    Ok(())
-}
-
-fn midpoint(previous: Option<&[u8]>, next: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn midpoint(previous: Option<&[u8]>, next: Option<&[u8]>) -> Vec<u8> {
     if let (Some(previous), Some(next)) = (previous, next) {
-        if previous >= next {
-            return Err(format!(
-                "order key bounds are out of order: previous={previous:?}, next={next:?}"
-            ));
-        }
+        assert!(
+            previous < next,
+            "order key bounds are out of order: previous={previous:?}, next={next:?}"
+        );
     }
 
     let previous = previous.unwrap_or_default();
@@ -113,7 +115,7 @@ fn midpoint(previous: Option<&[u8]>, next: Option<&[u8]>) -> Result<Vec<u8>, Str
         if next_digit > previous_digit + 1 {
             let mid_digit = previous_digit + (next_digit - previous_digit) / 2;
             prefix.push(u8::try_from(mid_digit).expect("midpoint byte is always in range"));
-            return Ok(prefix);
+            return prefix;
         }
 
         prefix.push(u8::try_from(previous_digit).expect("previous byte is always in range"));
@@ -215,6 +217,39 @@ mod tests {
 
         assert_eq!(left, right);
         assert_eq!(left.to_snapshot_string(), "80");
+    }
+
+    #[test]
+    fn equal_bounds_return_an_error() {
+        let key = OrderKey::from_snapshot_string("80").unwrap();
+
+        let error = OrderKey::evenly_between(Some(&key), Some(&key), 1).unwrap_err();
+
+        assert!(error.contains("order key bounds are equal"));
+    }
+
+    #[test]
+    fn equal_bounds_return_an_error_even_when_count_is_zero() {
+        let key = OrderKey::from_snapshot_string("80").unwrap();
+
+        let error = OrderKey::evenly_between(Some(&key), Some(&key), 0).unwrap_err();
+
+        assert!(error.contains("order key bounds are equal"));
+    }
+
+    #[test]
+    #[should_panic(expected = "order key bounds are out of order")]
+    fn reversed_bounds_panic() {
+        let lower = OrderKey::from_snapshot_string("80").unwrap();
+        let upper = OrderKey::from_snapshot_string("c0").unwrap();
+
+        OrderKey::evenly_between(Some(&upper), Some(&lower), 1).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "order key bounds are out of order")]
+    fn midpoint_asserts_bounds_are_ordered() {
+        midpoint(Some(&[0xc0]), Some(&[0x80]));
     }
 
     #[test]
