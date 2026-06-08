@@ -1,13 +1,12 @@
-#[cfg(feature = "default_wasm_runtime")]
-use lix_sdk::FsWriteOptions;
 use lix_sdk::{
-    CreateBranchOptions, InMemoryBackend, LixError, MergeBranchOptions, MergeBranchOutcome,
-    OpenLixOptions, SwitchBranchOptions, Value, open_lix,
+    CreateBranchOptions, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, Lix,
+    LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
+    open_lix, open_lix_with_backend, open_lix_with_backend_and_worktree,
 };
 #[cfg(feature = "default_wasm_runtime")]
 use std::io::{Cursor, Write};
-#[cfg(feature = "default_wasm_runtime")]
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[tokio::test]
 #[cfg(feature = "default_wasm_runtime")]
@@ -488,7 +487,7 @@ struct FileChange {
 }
 
 #[cfg(feature = "default_wasm_runtime")]
-async fn file_changes(lix: &lix_sdk::Lix, file_id: &str) -> Vec<FileChange> {
+async fn file_changes(lix: &Lix, file_id: &str) -> Vec<FileChange> {
     let changes = lix
         .execute(
             "SELECT schema_key, entity_pk, snapshot_content \
@@ -942,6 +941,253 @@ async fn transaction_blocks_session_execute_on_same_handle() {
     lix.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn worktree_initial_import_uses_local_files_as_source_of_truth() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
+    std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
+    std::fs::write(tempdir.path().join("docs/readme.txt"), b"local").unwrap();
+
+    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
+        Some(b"local".as_slice())
+    );
+    assert!(lix.readdir("/empty/").await.unwrap().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(tempdir.path().join("docs/readme.txt")).unwrap(),
+        b"local"
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn worktree_initial_import_deletes_lix_entries_missing_locally() {
+    let backend = InMemoryBackend::new();
+    let seed = open_lix_with_backend(backend.clone()).await.unwrap();
+    seed.write_file("/old.txt", b"old".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    seed.mkdir("/old-empty/", FsMkdirOptions::default())
+        .await
+        .unwrap();
+    seed.close().await.unwrap();
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_backend_and_worktree(backend, tempdir.path())
+        .await
+        .unwrap();
+
+    assert_eq!(lix.read_file("/old.txt").await.unwrap(), None);
+    assert_eq!(lix.readdir("/old-empty/").await.unwrap(), None);
+    assert!(!tempdir.path().join("old.txt").exists());
+    assert!(!tempdir.path().join("old-empty").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn worktree_materializes_sdk_sql_and_transaction_writes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
+        .await
+        .unwrap();
+
+    std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
+    lix.write_file("/sdk.txt", b"sdk".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sdk.txt"), Some(b"sdk"));
+    assert_eq!(
+        std::fs::read(tempdir.path().join("pending-local.txt")).unwrap(),
+        b"pending"
+    );
+    wait_for_lix_file(&lix, "/pending-local.txt", Some(b"pending")).await;
+
+    lix.mkdir("/empty-sdk/", FsMkdirOptions::default())
+        .await
+        .unwrap();
+    assert!(tempdir.path().join("empty-sdk").is_dir());
+
+    lix.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/sql.txt".to_string()),
+            Value::Blob(b"sql".to_vec()),
+        ],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"sql"));
+
+    lix.execute(
+        "UPDATE lix_file SET data = $1 WHERE path = $2",
+        &[
+            Value::Blob(b"updated".to_vec()),
+            Value::Text("/sql.txt".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sql.txt"), Some(b"updated"));
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        &[
+            Value::Text("/tx.txt".to_string()),
+            Value::Blob(b"tx".to_vec()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(!tempdir.path().join("tx.txt").exists());
+    tx.commit().await.unwrap();
+    wait_for_disk_file(&tempdir.path().join("tx.txt"), Some(b"tx"));
+
+    lix.execute(
+        "DELETE FROM lix_file WHERE path = $1",
+        &[Value::Text("/sql.txt".to_string())],
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("sql.txt"), None);
+
+    lix.rm(
+        "/empty-sdk/",
+        FsRmOptions {
+            recursive: true,
+            ..FsRmOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!tempdir.path().join("empty-sdk").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn worktree_watcher_syncs_disk_changes_to_lix() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
+        .await
+        .unwrap();
+
+    std::fs::write(tempdir.path().join("disk.txt"), b"disk").unwrap();
+    wait_for_lix_file(&lix, "/disk.txt", Some(b"disk")).await;
+
+    std::fs::write(tempdir.path().join("disk.txt"), b"changed").unwrap();
+    wait_for_lix_file(&lix, "/disk.txt", Some(b"changed")).await;
+
+    std::fs::create_dir(tempdir.path().join("empty-disk")).unwrap();
+    wait_for_lix_directory(&lix, "/empty-disk/", true).await;
+
+    std::fs::remove_file(tempdir.path().join("disk.txt")).unwrap();
+    wait_for_lix_file(&lix, "/disk.txt", None).await;
+
+    std::fs::remove_dir(tempdir.path().join("empty-disk")).unwrap();
+    wait_for_lix_directory(&lix, "/empty-disk/", false).await;
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "default_wasm_runtime")]
+async fn worktree_materializes_internal_lix_plugin_paths() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
+        .await
+        .unwrap();
+    let archive = build_csv_plugin_archive();
+
+    lix.install_plugin_archive(&archive).await.unwrap();
+
+    wait_for_disk_file(
+        &tempdir.path().join(".lix/plugins/plugin_csv.lixplugin"),
+        Some(archive.as_slice()),
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn worktree_rejects_invalid_lix_path_names() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
+
+    let Err(error) =
+        open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path()).await
+    else {
+        panic!("invalid worktree path should fail");
+    };
+
+    assert_eq!(error.code, "LIX_WORKTREE_ERROR");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn worktree_rejects_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
+    symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
+
+    let Err(error) =
+        open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path()).await
+    else {
+        panic!("symlink should fail");
+    };
+
+    assert_eq!(error.code, "LIX_WORKTREE_ERROR");
+}
+
+fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let path_display = path.display();
+    loop {
+        let actual = std::fs::read(path).ok();
+        if actual.as_deref() == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for disk file {path_display} to be {expected:?}, got {actual:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_for_lix_file(lix: &Lix<InMemoryBackend>, path: &str, expected: Option<&[u8]>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = lix.read_file(path).await.unwrap();
+        if actual.as_deref() == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Lix file {path} to be {expected:?}, got {actual:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_for_lix_directory(lix: &Lix<InMemoryBackend>, path: &str, expected: bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = lix.readdir(path).await.unwrap().is_some();
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Lix directory {path} existence to be {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(feature = "default_wasm_runtime")]
 fn build_csv_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"));
@@ -975,7 +1221,7 @@ fn build_csv_plugin_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-async fn register_crm_task_schema(lix: &lix_sdk::Lix) {
+async fn register_crm_task_schema(lix: &Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "crm_task",
@@ -1045,7 +1291,7 @@ fn assert_crm_task_projection(result: &lix_sdk::ExecuteResult) {
     assert_eq!(missing.code, "LIX_COLUMN_NOT_FOUND");
 }
 
-async fn register_poison_task_schema(lix: &lix_sdk::Lix) {
+async fn register_poison_task_schema(lix: &Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "poison_task",
@@ -1068,7 +1314,7 @@ async fn register_poison_task_schema(lix: &lix_sdk::Lix) {
     .unwrap();
 }
 
-async fn task_done(lix: &lix_sdk::Lix, task_id: &str) -> bool {
+async fn task_done(lix: &Lix, task_id: &str) -> bool {
     let result = lix
         .execute(
             "SELECT done FROM crm_task WHERE id = $1",
