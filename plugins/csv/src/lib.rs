@@ -89,7 +89,13 @@ fn detect_changes_for_rows(
         file_rows,
         imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter()),
     );
-    let inserted_ids = inserted_row_ids(&old_for_new);
+    let inserted_ids = old_for_new
+        .iter()
+        .map(|old_index| match old_index {
+            Some(_) => None,
+            None => Some(Uuid::now_v7().to_string()),
+        })
+        .collect::<Vec<_>>();
     let mut changes = Vec::new();
 
     for base_index in (0..base.len()).filter(|index| new_for_old[*index].is_none()) {
@@ -194,16 +200,6 @@ fn match_diff_rows(
     (old_for_new, new_for_old)
 }
 
-fn inserted_row_ids(old_for_new: &[Option<usize>]) -> Vec<Option<String>> {
-    old_for_new
-        .iter()
-        .map(|old_index| match old_index {
-            Some(_) => None,
-            None => Some(Uuid::now_v7().to_string()),
-        })
-        .collect()
-}
-
 fn row_id_for_new<'a>(
     base: &'a [Row],
     old_for_new: &[Option<usize>],
@@ -271,7 +267,13 @@ fn detect_row_upsert_changes(
 
 fn kept_order_key_indices(base: &[Row], old_for_new: &[Option<usize>]) -> Vec<bool> {
     let mut keep = vec![false; old_for_new.len()];
-    if order_keys_are_strictly_increasing(base, old_for_new) {
+    if old_for_new
+        .iter()
+        .copied()
+        .flatten()
+        .map(|old_index| &base[old_index].order_key)
+        .is_sorted_by(|previous, current| previous < current)
+    {
         for (new_index, old_index) in old_for_new.iter().enumerate() {
             keep[new_index] = old_index.is_some();
         }
@@ -309,20 +311,6 @@ fn kept_order_key_indices(base: &[Row], old_for_new: &[Option<usize>]) -> Vec<bo
         current = previous;
     }
     keep
-}
-
-fn order_keys_are_strictly_increasing(base: &[Row], old_for_new: &[Option<usize>]) -> bool {
-    let mut previous_order_key = None::<&OrderKey>;
-
-    for old_index in old_for_new.iter().copied().flatten() {
-        let order_key = &base[old_index].order_key;
-        if previous_order_key.is_some_and(|previous| previous >= order_key) {
-            return false;
-        }
-        previous_order_key = Some(order_key);
-    }
-
-    true
 }
 
 fn old_order_key<'a>(
