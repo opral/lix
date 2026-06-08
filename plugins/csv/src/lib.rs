@@ -13,7 +13,7 @@ pub mod schemas;
 use crate::csv::{
     CsvDialect, parse_file, parse_table_snapshot, render_projection, table_upsert_change,
 };
-use crate::diff::{Op, imara_diff_runs};
+use crate::diff::{DiffRun, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use itertools::Itertools;
@@ -86,23 +86,25 @@ fn detect_changes_for_rows(
         );
     }
 
-    let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
+    let diff_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut changes = Vec::new();
     let mut base_index = 0;
     let mut file_index = 0;
     let mut previous_order_key = None::<OrderKey>;
 
-    for run in op_runs {
-        match run.op {
-            Op::Equal => {
-                for _ in 0..run.len {
+    for run in diff_runs {
+        match run {
+            DiffRun::Equal { len } => {
+                for _ in 0..len {
                     previous_order_key = Some(base[base_index].order_key.clone());
                     base_index += 1;
                     file_index += 1;
                 }
             }
-            Op::Replace => {
-                for _ in 0..run.len {
+            DiffRun::Replace { old, new } => {
+                let update_len = old.min(new);
+
+                for _ in 0..update_len {
                     let row = &base[base_index];
                     changes.push(row_upsert_change(
                         &row.id,
@@ -113,9 +115,8 @@ fn detect_changes_for_rows(
                     base_index += 1;
                     file_index += 1;
                 }
-            }
-            Op::Delete => {
-                for _ in 0..run.len {
+
+                for _ in 0..old - update_len {
                     changes.push(DetectedChange {
                         entity_pk: vec![base[base_index].id.clone()],
                         schema_key: ROW_SCHEMA_KEY.to_string(),
@@ -124,17 +125,19 @@ fn detect_changes_for_rows(
                     });
                     base_index += 1;
                 }
-            }
-            Op::Insert => {
-                let next_order_key = base.get(base_index).map(|row| &row.order_key);
-                let ids = new_ids(run.len);
-                let order_keys =
-                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
-                        .map_err(PluginError::Internal)?;
-                for (id, order_key) in ids.into_iter().zip(order_keys) {
-                    changes.push(row_upsert_change(&id, &order_key, &file_rows[file_index])?);
-                    previous_order_key = Some(order_key.clone());
-                    file_index += 1;
+
+                let insert_len = new - update_len;
+                if insert_len != 0 {
+                    let next_order_key = base.get(base_index).map(|row| &row.order_key);
+                    let ids = new_ids(insert_len);
+                    let order_keys =
+                        OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
+                            .map_err(PluginError::Internal)?;
+                    for (id, order_key) in ids.into_iter().zip(order_keys) {
+                        changes.push(row_upsert_change(&id, &order_key, &file_rows[file_index])?);
+                        previous_order_key = Some(order_key.clone());
+                        file_index += 1;
+                    }
                 }
             }
         }
@@ -200,15 +203,15 @@ fn detect_changes_for_rows_with_reindexed_order(
 }
 
 fn plan_rows(base: &[Row], file_rows: &[Vec<String>]) -> Vec<PlannedRow> {
-    let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
+    let diff_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut planned_rows = Vec::with_capacity(file_rows.len());
     let mut base_index = 0;
     let mut file_index = 0;
 
-    for run in op_runs {
-        match run.op {
-            Op::Equal | Op::Replace => {
-                for _ in 0..run.len {
+    for run in diff_runs {
+        match run {
+            DiffRun::Equal { len } => {
+                for _ in 0..len {
                     planned_rows.push(PlannedRow {
                         id: base[base_index].id.clone(),
                         cells: file_rows[file_index].clone(),
@@ -217,11 +220,21 @@ fn plan_rows(base: &[Row], file_rows: &[Vec<String>]) -> Vec<PlannedRow> {
                     file_index += 1;
                 }
             }
-            Op::Delete => {
-                base_index += run.len;
-            }
-            Op::Insert => {
-                for id in new_ids(run.len) {
+            DiffRun::Replace { old, new } => {
+                let update_len = old.min(new);
+
+                for _ in 0..update_len {
+                    planned_rows.push(PlannedRow {
+                        id: base[base_index].id.clone(),
+                        cells: file_rows[file_index].clone(),
+                    });
+                    base_index += 1;
+                    file_index += 1;
+                }
+
+                base_index += old - update_len;
+
+                for id in new_ids(new - update_len) {
                     planned_rows.push(PlannedRow {
                         id,
                         cells: file_rows[file_index].clone(),

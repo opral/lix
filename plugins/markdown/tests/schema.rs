@@ -1,9 +1,9 @@
-use plugin_md_v2::schemas::{
-    block_schema_definition, block_schema_json, document_schema_definition, document_schema_json,
-    schema_definitions, schema_jsons, BLOCK_SCHEMA_KEY, BLOCK_SCHEMA_PATH, DOCUMENT_SCHEMA_KEY,
-    DOCUMENT_SCHEMA_PATH,
-};
 use plugin_md_v2::MANIFEST_JSON;
+use plugin_md_v2::schemas::{
+    BLOCK_SCHEMA_KEY, BLOCK_SCHEMA_PATH, DOCUMENT_SCHEMA_KEY, DOCUMENT_SCHEMA_PATH,
+    block_schema_definition, block_schema_json, document_schema_definition, document_schema_json,
+    schema_definitions, schema_jsons,
+};
 use std::collections::BTreeSet;
 
 #[test]
