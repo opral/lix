@@ -128,6 +128,27 @@ fn row_order_keys_by_first_cell(active_state: &[EntityState]) -> BTreeMap<String
         .collect()
 }
 
+fn row_ids_by_first_cell(active_state: &[EntityState]) -> BTreeMap<String, String> {
+    active_state
+        .iter()
+        .filter(|row| row.schema_key == ROW_SCHEMA_KEY)
+        .map(|row| {
+            let value = active_state_snapshot_value(row);
+            let first_cell = value
+                .get("cells")
+                .and_then(Value::as_array)
+                .and_then(|cells| cells.first())
+                .and_then(Value::as_str)
+                .expect("row first cell should exist")
+                .to_string();
+            let [entity_pk] = row.entity_pk.as_slice() else {
+                panic!("row entity_pk should have one component");
+            };
+            (first_cell, entity_pk.clone())
+        })
+        .collect()
+}
+
 fn csv_active_state_with_row_order_keys(rows: &[(&str, &str, &str)]) -> Vec<EntityState> {
     let mut state = vec![EntityState {
         entity_pk: vec![ROOT_ENTITY_PK.to_string()],
@@ -301,6 +322,32 @@ fn applies_delta_to_existing_tsv() {
     let output = render_active_state(apply_changes_to_active_state(before_state, changes))
         .expect("render should succeed");
 
+    assert_eq!(output, after_bytes);
+}
+
+#[test]
+fn detects_sorted_rows_as_order_key_changes() {
+    let before_bytes = b"a\nb\nc\n";
+    let after_bytes = b"c\nb\na\n";
+    let before_state = active_state_from_file(file_from_bytes(before_bytes));
+    let before_ids = row_ids_by_first_cell(&before_state);
+
+    let changes = CsvPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
+        .expect("detect_changes should succeed");
+
+    assert!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
+            .all(|change| change.snapshot_content.is_some()),
+        "sorting rows should not delete existing row entities"
+    );
+
+    let active_state = apply_changes_to_active_state(before_state, changes);
+    let after_ids = row_ids_by_first_cell(&active_state);
+    let output = render_active_state(active_state).expect("render should succeed");
+
+    assert_eq!(after_ids, before_ids);
     assert_eq!(output, after_bytes);
 }
 

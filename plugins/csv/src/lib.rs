@@ -13,14 +13,15 @@ pub mod schemas;
 use crate::csv::{
     CsvDialect, parse_file, parse_table_snapshot, render_projection, table_upsert_change,
 };
-use crate::diff::{Op, imara_diff_runs};
+use crate::diff::{DiffRun, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use itertools::Itertools;
 use lix_order_key::OrderKey;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::str;
 use uuid::Uuid;
 
@@ -55,6 +56,12 @@ struct RowSnapshot {
     cells: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplaceRun {
+    old: Range<usize>,
+    new: Range<usize>,
+}
+
 impl Plugin for CsvPlugin {
     fn detect_changes(
         state: Vec<EntityState>,
@@ -77,117 +84,29 @@ fn detect_changes_for_rows(
     after_dialect: CsvDialect,
 ) -> Result<Vec<DetectedChange>, PluginError> {
     let base = before.to_rows();
-    if has_duplicate_order_keys(&base) {
-        return detect_changes_for_rows_with_reindexed_order(
-            before,
-            file_rows,
-            after_dialect,
-            &base,
-        );
-    }
-
-    let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
-    let mut changes = Vec::new();
-    let mut base_index = 0;
-    let mut file_index = 0;
-    let mut previous_order_key = None::<OrderKey>;
-
-    for run in op_runs {
-        match run.op {
-            Op::Equal => {
-                for _ in 0..run.len {
-                    previous_order_key = Some(base[base_index].order_key.clone());
-                    base_index += 1;
-                    file_index += 1;
-                }
-            }
-            Op::Replace => {
-                for _ in 0..run.len {
-                    let row = &base[base_index];
-                    changes.push(row_upsert_change(
-                        &row.id,
-                        &row.order_key,
-                        &file_rows[file_index],
-                    )?);
-                    previous_order_key = Some(row.order_key.clone());
-                    base_index += 1;
-                    file_index += 1;
-                }
-            }
-            Op::Delete => {
-                for _ in 0..run.len {
-                    changes.push(DetectedChange {
-                        entity_pk: vec![base[base_index].id.clone()],
-                        schema_key: ROW_SCHEMA_KEY.to_string(),
-                        snapshot_content: None,
-                        metadata: None,
-                    });
-                    base_index += 1;
-                }
-            }
-            Op::Insert => {
-                let next_order_key = base.get(base_index).map(|row| &row.order_key);
-                let ids = new_ids(run.len);
-                let order_keys =
-                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
-                        .map_err(PluginError::Internal)?;
-                for (id, order_key) in ids.into_iter().zip(order_keys) {
-                    changes.push(row_upsert_change(&id, &order_key, &file_rows[file_index])?);
-                    previous_order_key = Some(order_key.clone());
-                    file_index += 1;
-                }
-            }
-        }
-    }
-
-    if before.dialect != after_dialect
-        || (!before.table_present
-            && (!file_rows.is_empty() || after_dialect != CsvDialect::default()))
-    {
-        changes.push(table_upsert_change(after_dialect)?);
-    }
-
-    Ok(changes)
-}
-
-#[derive(Debug)]
-struct PlannedRow {
-    id: String,
-    cells: Vec<String>,
-}
-
-fn detect_changes_for_rows_with_reindexed_order(
-    before: &Projection,
-    file_rows: &[Vec<String>],
-    after_dialect: CsvDialect,
-    base: &[Row],
-) -> Result<Vec<DetectedChange>, PluginError> {
-    let planned_rows = plan_rows(base, file_rows);
-    let planned_ids = planned_rows
+    let (old_for_new, new_for_old) = match_diff_rows(
+        &base,
+        file_rows,
+        imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter()),
+    );
+    let inserted_ids = old_for_new
         .iter()
-        .map(|row| row.id.clone())
+        .map(|old_index| match old_index {
+            Some(_) => None,
+            None => Some(Uuid::now_v7().to_string()),
+        })
         .collect::<Vec<_>>();
-    let order_keys =
-        OrderKey::evenly_between(None, None, &planned_ids).map_err(PluginError::Internal)?;
-    let planned_id_set = planned_ids
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>();
     let mut changes = Vec::new();
 
-    for id in before.rows_by_id.keys() {
-        if !planned_id_set.contains(id) {
-            changes.push(DetectedChange {
-                entity_pk: vec![id.clone()],
-                schema_key: ROW_SCHEMA_KEY.to_string(),
-                snapshot_content: None,
-                metadata: None,
-            });
-        }
+    for base_index in (0..base.len()).filter(|index| new_for_old[*index].is_none()) {
+        changes.push(DetectedChange {
+            entity_pk: vec![base[base_index].id.clone()],
+            schema_key: ROW_SCHEMA_KEY.to_string(),
+            snapshot_content: None,
+            metadata: None,
+        });
     }
-
-    for (row, order_key) in planned_rows.iter().zip(order_keys.iter()) {
-        changes.push(row_upsert_change(&row.id, order_key, &row.cells)?);
-    }
+    detect_row_upsert_changes(&base, file_rows, &old_for_new, &inserted_ids, &mut changes)?;
 
     if before.dialect != after_dialect
         || (!before.table_present
@@ -199,49 +118,238 @@ fn detect_changes_for_rows_with_reindexed_order(
     Ok(changes)
 }
 
-fn plan_rows(base: &[Row], file_rows: &[Vec<String>]) -> Vec<PlannedRow> {
-    let op_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
-    let mut planned_rows = Vec::with_capacity(file_rows.len());
-    let mut base_index = 0;
-    let mut file_index = 0;
+fn match_diff_rows(
+    base: &[Row],
+    file_rows: &[Vec<String>],
+    diff_runs: impl IntoIterator<Item = DiffRun>,
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut old_for_new = vec![None; file_rows.len()];
+    let mut new_for_old = vec![None; base.len()];
+    let mut replace_runs = Vec::new();
+    let mut base_index = 0usize;
+    let mut file_index = 0usize;
 
-    for run in op_runs {
-        match run.op {
-            Op::Equal | Op::Replace => {
-                for _ in 0..run.len {
-                    planned_rows.push(PlannedRow {
-                        id: base[base_index].id.clone(),
-                        cells: file_rows[file_index].clone(),
-                    });
-                    base_index += 1;
-                    file_index += 1;
+    for run in diff_runs {
+        match run {
+            DiffRun::Equal { len } => {
+                for (old_index, new_index) in
+                    (base_index..base_index + len).zip(file_index..file_index + len)
+                {
+                    old_for_new[new_index] = Some(old_index);
+                    new_for_old[old_index] = Some(new_index);
                 }
+                base_index += len;
+                file_index += len;
             }
-            Op::Delete => {
-                base_index += run.len;
-            }
-            Op::Insert => {
-                for id in new_ids(run.len) {
-                    planned_rows.push(PlannedRow {
-                        id,
-                        cells: file_rows[file_index].clone(),
-                    });
-                    file_index += 1;
-                }
+            DiffRun::Replace { old, new } => {
+                replace_runs.push(ReplaceRun {
+                    old: base_index..base_index + old,
+                    new: file_index..file_index + new,
+                });
+                base_index += old;
+                file_index += new;
             }
         }
     }
 
-    planned_rows
+    let old_replace_len = replace_runs.iter().map(|run| run.old.len()).sum();
+    let mut old_rows_by_cells = HashMap::<&[String], Vec<usize>>::with_capacity(old_replace_len);
+    for run in replace_runs.iter().rev() {
+        for old_index in run.old.clone().rev() {
+            old_rows_by_cells
+                .entry(base[old_index].cells.as_slice())
+                .or_default()
+                .push(old_index);
+        }
+    }
+
+    for run in &replace_runs {
+        for new_index in run.new.clone() {
+            let Some(old_indices) = old_rows_by_cells.get_mut(file_rows[new_index].as_slice())
+            else {
+                continue;
+            };
+            let Some(old_index) = old_indices.pop() else {
+                continue;
+            };
+            old_for_new[new_index] = Some(old_index);
+            new_for_old[old_index] = Some(new_index);
+        }
+    }
+
+    for run in &replace_runs {
+        let mut old_index = run.old.start;
+        let mut new_index = run.new.start;
+        loop {
+            while old_index < run.old.end && new_for_old[old_index].is_some() {
+                old_index += 1;
+            }
+            while new_index < run.new.end && old_for_new[new_index].is_some() {
+                new_index += 1;
+            }
+            if old_index == run.old.end || new_index == run.new.end {
+                break;
+            }
+            old_for_new[new_index] = Some(old_index);
+            new_for_old[old_index] = Some(new_index);
+            old_index += 1;
+            new_index += 1;
+        }
+    }
+
+    (old_for_new, new_for_old)
 }
 
-fn has_duplicate_order_keys(rows: &[Row]) -> bool {
-    rows.windows(2)
-        .any(|pair| pair[0].order_key == pair[1].order_key)
+fn row_id_for_new<'a>(
+    base: &'a [Row],
+    old_for_new: &[Option<usize>],
+    inserted_ids: &'a [Option<String>],
+    new_index: usize,
+) -> &'a str {
+    match old_for_new[new_index] {
+        Some(old_index) => &base[old_index].id,
+        None => inserted_ids[new_index]
+            .as_deref()
+            .expect("inserted row id should exist"),
+    }
 }
 
-fn new_ids(count: usize) -> Vec<String> {
-    (0..count).map(|_| Uuid::now_v7().to_string()).collect()
+fn detect_row_upsert_changes(
+    base: &[Row],
+    file_rows: &[Vec<String>],
+    old_for_new: &[Option<usize>],
+    inserted_ids: &[Option<String>],
+    changes: &mut Vec<DetectedChange>,
+) -> Result<(), PluginError> {
+    let keep_order_key = kept_order_key_indices(base, old_for_new);
+    let mut previous_order_key = None::<OrderKey>;
+    let mut pending = Vec::new();
+
+    for new_index in 0..file_rows.len() {
+        if keep_order_key[new_index] {
+            let old_index =
+                old_for_new[new_index].expect("kept order key should belong to an existing row");
+            let order_key = &base[old_index].order_key;
+            flush_generated_row_upserts(
+                &mut pending,
+                &mut previous_order_key,
+                Some(order_key),
+                base,
+                file_rows,
+                old_for_new,
+                inserted_ids,
+                changes,
+            )?;
+            if base[old_index].cells.as_slice() != file_rows[new_index].as_slice() {
+                changes.push(row_upsert_change(
+                    row_id_for_new(base, old_for_new, inserted_ids, new_index),
+                    order_key,
+                    &file_rows[new_index],
+                )?);
+            }
+            previous_order_key = Some(order_key.clone());
+        } else {
+            pending.push(new_index);
+        }
+    }
+
+    flush_generated_row_upserts(
+        &mut pending,
+        &mut previous_order_key,
+        None,
+        base,
+        file_rows,
+        old_for_new,
+        inserted_ids,
+        changes,
+    )
+}
+
+fn kept_order_key_indices(base: &[Row], old_for_new: &[Option<usize>]) -> Vec<bool> {
+    let mut keep = vec![false; old_for_new.len()];
+    if old_for_new
+        .iter()
+        .copied()
+        .flatten()
+        .map(|old_index| &base[old_index].order_key)
+        .is_sorted_by(|previous, current| previous < current)
+    {
+        for (new_index, old_index) in old_for_new.iter().enumerate() {
+            keep[new_index] = old_index.is_some();
+        }
+        return keep;
+    }
+
+    let mut pile_tops = Vec::<usize>::new();
+    let mut predecessors = vec![None; old_for_new.len()];
+
+    for (new_index, old_index) in old_for_new.iter().copied().enumerate() {
+        let Some(old_index) = old_index else {
+            continue;
+        };
+        let order_key = &base[old_index].order_key;
+        let pile = pile_tops
+            .partition_point(|top_index| old_order_key(base, old_for_new, *top_index) < order_key);
+        if pile != 0 {
+            predecessors[new_index] = Some(pile_tops[pile - 1]);
+        }
+        if pile == pile_tops.len() {
+            pile_tops.push(new_index);
+        } else if old_order_key(base, old_for_new, pile_tops[pile]) > order_key {
+            pile_tops[pile] = new_index;
+        }
+    }
+
+    let Some(mut current) = pile_tops.last().copied() else {
+        return keep;
+    };
+    loop {
+        keep[current] = true;
+        let Some(previous) = predecessors[current] else {
+            break;
+        };
+        current = previous;
+    }
+    keep
+}
+
+fn old_order_key<'a>(
+    base: &'a [Row],
+    old_for_new: &[Option<usize>],
+    new_index: usize,
+) -> &'a OrderKey {
+    let old_index = old_for_new[new_index].expect("old order key should belong to existing row");
+    &base[old_index].order_key
+}
+
+fn flush_generated_row_upserts(
+    pending: &mut Vec<usize>,
+    previous_order_key: &mut Option<OrderKey>,
+    next_order_key: Option<&OrderKey>,
+    base: &[Row],
+    file_rows: &[Vec<String>],
+    old_for_new: &[Option<usize>],
+    inserted_ids: &[Option<String>],
+    changes: &mut Vec<DetectedChange>,
+) -> Result<(), PluginError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let order_keys =
+        OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, pending.len())
+            .map_err(PluginError::Internal)?;
+
+    for (new_index, order_key) in pending.drain(..).zip(order_keys) {
+        changes.push(row_upsert_change(
+            row_id_for_new(base, old_for_new, inserted_ids, new_index),
+            &order_key,
+            &file_rows[new_index],
+        )?);
+        *previous_order_key = Some(order_key);
+    }
+
+    Ok(())
 }
 
 fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
@@ -461,6 +569,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fuzz_detect_changes_reorders_rows_without_changing_ids() {
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        for _ in 0..100_000 {
+            let base_rows = random_csv(&mut rng);
+            let before = projection_from_rows(base_rows.clone());
+            let mut reordered_rows = base_rows.clone();
+            shuffle(&mut reordered_rows, &mut rng);
+
+            let changes =
+                detect_changes_for_rows(&before, &reordered_rows, CsvDialect::default()).unwrap();
+
+            for change in &changes {
+                assert_eq!(
+                    change.schema_key, ROW_SCHEMA_KEY,
+                    "reordering rows should not change the table snapshot"
+                );
+
+                let entity_pk = single_entity_pk(change.entity_pk.clone()).unwrap();
+                let before_row = before
+                    .rows_by_id
+                    .get(&entity_pk)
+                    .expect("reordering rows should only update existing row ids");
+                let snapshot_content = change
+                    .snapshot_content
+                    .as_deref()
+                    .expect("reordering rows should not delete existing row entities");
+                let after_row = parse_row_snapshot(snapshot_content, &entity_pk).unwrap();
+
+                assert_eq!(
+                    after_row.cells, before_row.cells,
+                    "reordering rows should only update order keys"
+                );
+                assert_ne!(
+                    after_row.order_key, before_row.order_key,
+                    "reordering rows should not emit unchanged row snapshots"
+                );
+            }
+
+            let mut applied = before;
+            for change in changes {
+                apply_entity_change(&mut applied, change).unwrap();
+            }
+
+            let applied_rows = applied
+                .to_rows()
+                .into_iter()
+                .map(|row| row.cells)
+                .collect::<Vec<_>>();
+            assert_eq!(applied_rows, reordered_rows);
+        }
+    }
+
     fn random_csv(rng: &mut (impl Rng + ?Sized)) -> Vec<Vec<String>> {
         let random_cell_alphabet_len: u8 = rng.random_range(1..=6);
         let width = rng.random_range(1..=10);
@@ -478,11 +640,17 @@ mod tests {
             .collect()
     }
 
+    fn shuffle<T>(items: &mut [T], rng: &mut (impl Rng + ?Sized)) {
+        for index in (1..items.len()).rev() {
+            items.swap(index, rng.random_range(0..=index));
+        }
+    }
+
     fn projection_from_rows(rows: Vec<Vec<String>>) -> Projection {
         let ids = (0..rows.len())
             .map(|offset| format!("row:{offset}"))
             .collect::<Vec<_>>();
-        let order_keys = OrderKey::evenly_between(None, None, &ids).unwrap();
+        let order_keys = OrderKey::evenly_between(None, None, ids.len()).unwrap();
         let rows_by_id = rows
             .into_iter()
             .zip(ids.into_iter().zip(order_keys))

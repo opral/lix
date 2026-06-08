@@ -10,7 +10,7 @@ mod diff;
 mod markdown_file;
 pub mod schemas;
 
-use crate::diff::{Op, imara_diff_runs};
+use crate::diff::{DiffRun, imara_diff_runs};
 pub use crate::exports::lix::plugin::api::{DetectedChange, File, PluginError};
 use crate::exports::lix::plugin::api::{EntityState, Guest as Plugin};
 use crate::markdown_file::{
@@ -19,8 +19,9 @@ use crate::markdown_file::{
 };
 use lix_order_key::OrderKey;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::str;
 use uuid::Uuid;
 
@@ -55,6 +56,12 @@ struct BlockSnapshot {
     block: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplaceRun {
+    old: Range<usize>,
+    new: Range<usize>,
+}
+
 impl Plugin for MarkdownPlugin {
     fn detect_changes(
         state: Vec<EntityState>,
@@ -80,63 +87,29 @@ fn detect_changes_for_markdown(
         return detect_changes_for_markdown_with_reindexed_order(before, after, &base);
     }
 
-    let op_runs = imara_diff_runs(base.iter().map(|block| &block.block), after.blocks.iter());
+    let (old_for_new, new_for_old) = match_diff_blocks(
+        &base,
+        &after.blocks,
+        imara_diff_runs(base.iter().map(|block| &block.block), after.blocks.iter()),
+    );
+    let inserted_ids = inserted_block_ids(&old_for_new);
     let mut changes = Vec::new();
-    let mut base_index = 0;
-    let mut file_index = 0;
-    let mut previous_order_key = None::<OrderKey>;
 
-    for run in op_runs {
-        match run.op {
-            Op::Equal => {
-                for _ in 0..run.len {
-                    previous_order_key = Some(base[base_index].order_key.clone());
-                    base_index += 1;
-                    file_index += 1;
-                }
-            }
-            Op::Replace => {
-                for _ in 0..run.len {
-                    let block = &base[base_index];
-                    changes.push(block_upsert_change(
-                        &block.id,
-                        &block.order_key,
-                        &after.blocks[file_index],
-                    )?);
-                    previous_order_key = Some(block.order_key.clone());
-                    base_index += 1;
-                    file_index += 1;
-                }
-            }
-            Op::Delete => {
-                for _ in 0..run.len {
-                    changes.push(DetectedChange {
-                        entity_pk: vec![base[base_index].id.clone()],
-                        schema_key: BLOCK_SCHEMA_KEY.to_string(),
-                        snapshot_content: None,
-                        metadata: None,
-                    });
-                    base_index += 1;
-                }
-            }
-            Op::Insert => {
-                let next_order_key = base.get(base_index).map(|block| &block.order_key);
-                let ids = new_ids(run.len);
-                let order_keys =
-                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
-                        .map_err(PluginError::Internal)?;
-                for (id, order_key) in ids.into_iter().zip(order_keys) {
-                    changes.push(block_upsert_change(
-                        &id,
-                        &order_key,
-                        &after.blocks[file_index],
-                    )?);
-                    previous_order_key = Some(order_key.clone());
-                    file_index += 1;
-                }
-            }
-        }
+    for base_index in (0..base.len()).filter(|index| new_for_old[*index].is_none()) {
+        changes.push(DetectedChange {
+            entity_pk: vec![base[base_index].id.clone()],
+            schema_key: BLOCK_SCHEMA_KEY.to_string(),
+            snapshot_content: None,
+            metadata: None,
+        });
     }
+    detect_block_upsert_changes(
+        &base,
+        &after.blocks,
+        &old_for_new,
+        &inserted_ids,
+        &mut changes,
+    )?;
 
     if !before.document_present || before.document != after.document {
         changes.push(document_upsert_change(after.document)?);
@@ -145,30 +118,29 @@ fn detect_changes_for_markdown(
     Ok(changes)
 }
 
-#[derive(Debug)]
-struct PlannedBlock {
-    id: String,
-    block: String,
-}
-
 fn detect_changes_for_markdown_with_reindexed_order(
     before: &Projection,
     after: &ParsedMarkdown,
     base: &[Block],
 ) -> Result<Vec<DetectedChange>, PluginError> {
-    let planned_blocks = plan_markdown_blocks(base, after);
-    let planned_ids = planned_blocks
-        .iter()
-        .map(|block| block.id.clone())
+    let (old_for_new, new_for_old) = match_diff_blocks(
+        base,
+        &after.blocks,
+        imara_diff_runs(base.iter().map(|block| &block.block), after.blocks.iter()),
+    );
+    let inserted_ids = inserted_block_ids(&old_for_new);
+    let planned_ids = (0..after.blocks.len())
+        .map(|new_index| block_id_for_new(base, &old_for_new, &inserted_ids, new_index).to_string())
         .collect::<Vec<_>>();
     let order_keys =
-        OrderKey::evenly_between(None, None, &planned_ids).map_err(PluginError::Internal)?;
+        OrderKey::evenly_between(None, None, planned_ids.len()).map_err(PluginError::Internal)?;
     let planned_id_set = planned_ids
         .iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut changes = Vec::new();
 
-    for id in before.blocks_by_id.keys() {
+    for base_index in (0..base.len()).filter(|index| new_for_old[*index].is_none()) {
+        let id = &base[base_index].id;
         if !planned_id_set.contains(id) {
             changes.push(DetectedChange {
                 entity_pk: vec![id.clone()],
@@ -179,8 +151,12 @@ fn detect_changes_for_markdown_with_reindexed_order(
         }
     }
 
-    for (block, order_key) in planned_blocks.iter().zip(order_keys.iter()) {
-        changes.push(block_upsert_change(&block.id, order_key, &block.block)?);
+    for ((id, block), order_key) in planned_ids
+        .iter()
+        .zip(after.blocks.iter())
+        .zip(order_keys.iter())
+    {
+        changes.push(block_upsert_change(id, order_key, block)?);
     }
 
     if !before.document_present || before.document != after.document {
@@ -190,50 +166,254 @@ fn detect_changes_for_markdown_with_reindexed_order(
     Ok(changes)
 }
 
-fn plan_markdown_blocks(base: &[Block], after: &ParsedMarkdown) -> Vec<PlannedBlock> {
-    let op_runs = imara_diff_runs(base.iter().map(|block| &block.block), after.blocks.iter());
-    let mut planned_blocks = Vec::with_capacity(after.blocks.len());
-    let mut base_index = 0;
-    let mut file_index = 0;
+fn match_diff_blocks(
+    base: &[Block],
+    file_blocks: &[String],
+    diff_runs: impl IntoIterator<Item = DiffRun>,
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut old_for_new = vec![None; file_blocks.len()];
+    let mut new_for_old = vec![None; base.len()];
+    let mut replace_runs = Vec::new();
+    let mut base_index = 0usize;
+    let mut file_index = 0usize;
 
-    for run in op_runs {
-        match run.op {
-            Op::Equal | Op::Replace => {
-                for _ in 0..run.len {
-                    planned_blocks.push(PlannedBlock {
-                        id: base[base_index].id.clone(),
-                        block: after.blocks[file_index].clone(),
-                    });
-                    base_index += 1;
-                    file_index += 1;
+    for run in diff_runs {
+        match run {
+            DiffRun::Equal { len } => {
+                for (old_index, new_index) in
+                    (base_index..base_index + len).zip(file_index..file_index + len)
+                {
+                    old_for_new[new_index] = Some(old_index);
+                    new_for_old[old_index] = Some(new_index);
                 }
+                base_index += len;
+                file_index += len;
             }
-            Op::Delete => {
-                base_index += run.len;
-            }
-            Op::Insert => {
-                for id in new_ids(run.len) {
-                    planned_blocks.push(PlannedBlock {
-                        id,
-                        block: after.blocks[file_index].clone(),
-                    });
-                    file_index += 1;
-                }
+            DiffRun::Replace { old, new } => {
+                replace_runs.push(ReplaceRun {
+                    old: base_index..base_index + old,
+                    new: file_index..file_index + new,
+                });
+                base_index += old;
+                file_index += new;
             }
         }
     }
 
-    planned_blocks
+    let old_replace_len = replace_runs.iter().map(|run| run.old.len()).sum();
+    let mut old_blocks_by_content = HashMap::<&str, Vec<usize>>::with_capacity(old_replace_len);
+    for run in replace_runs.iter().rev() {
+        for old_index in run.old.clone().rev() {
+            old_blocks_by_content
+                .entry(base[old_index].block.as_str())
+                .or_default()
+                .push(old_index);
+        }
+    }
+
+    for run in &replace_runs {
+        for new_index in run.new.clone() {
+            let Some(old_indices) = old_blocks_by_content.get_mut(file_blocks[new_index].as_str())
+            else {
+                continue;
+            };
+            let Some(old_index) = old_indices.pop() else {
+                continue;
+            };
+            old_for_new[new_index] = Some(old_index);
+            new_for_old[old_index] = Some(new_index);
+        }
+    }
+
+    for run in &replace_runs {
+        let mut old_index = run.old.start;
+        let mut new_index = run.new.start;
+        loop {
+            while old_index < run.old.end && new_for_old[old_index].is_some() {
+                old_index += 1;
+            }
+            while new_index < run.new.end && old_for_new[new_index].is_some() {
+                new_index += 1;
+            }
+            if old_index == run.old.end || new_index == run.new.end {
+                break;
+            }
+            old_for_new[new_index] = Some(old_index);
+            new_for_old[old_index] = Some(new_index);
+            old_index += 1;
+            new_index += 1;
+        }
+    }
+
+    (old_for_new, new_for_old)
+}
+
+fn inserted_block_ids(old_for_new: &[Option<usize>]) -> Vec<Option<String>> {
+    old_for_new
+        .iter()
+        .map(|old_index| match old_index {
+            Some(_) => None,
+            None => Some(Uuid::now_v7().to_string()),
+        })
+        .collect()
+}
+
+fn block_id_for_new<'a>(
+    base: &'a [Block],
+    old_for_new: &[Option<usize>],
+    inserted_ids: &'a [Option<String>],
+    new_index: usize,
+) -> &'a str {
+    match old_for_new[new_index] {
+        Some(old_index) => &base[old_index].id,
+        None => inserted_ids[new_index]
+            .as_deref()
+            .expect("inserted block id should exist"),
+    }
+}
+
+fn detect_block_upsert_changes(
+    base: &[Block],
+    file_blocks: &[String],
+    old_for_new: &[Option<usize>],
+    inserted_ids: &[Option<String>],
+    changes: &mut Vec<DetectedChange>,
+) -> Result<(), PluginError> {
+    let keep_order_key = kept_order_key_indices(base, old_for_new);
+    let mut previous_order_key = None::<OrderKey>;
+    let mut pending = Vec::new();
+
+    for new_index in 0..file_blocks.len() {
+        if keep_order_key[new_index] {
+            let old_index =
+                old_for_new[new_index].expect("kept order key should belong to an existing block");
+            let order_key = &base[old_index].order_key;
+            flush_generated_block_upserts(
+                &mut pending,
+                &mut previous_order_key,
+                Some(order_key),
+                base,
+                file_blocks,
+                old_for_new,
+                inserted_ids,
+                changes,
+            )?;
+            if base[old_index].block != file_blocks[new_index] {
+                changes.push(block_upsert_change(
+                    block_id_for_new(base, old_for_new, inserted_ids, new_index),
+                    order_key,
+                    &file_blocks[new_index],
+                )?);
+            }
+            previous_order_key = Some(order_key.clone());
+        } else {
+            pending.push(new_index);
+        }
+    }
+
+    flush_generated_block_upserts(
+        &mut pending,
+        &mut previous_order_key,
+        None,
+        base,
+        file_blocks,
+        old_for_new,
+        inserted_ids,
+        changes,
+    )
+}
+
+fn kept_order_key_indices(base: &[Block], old_for_new: &[Option<usize>]) -> Vec<bool> {
+    let mut keep = vec![false; old_for_new.len()];
+    if old_for_new
+        .iter()
+        .copied()
+        .flatten()
+        .map(|old_index| &base[old_index].order_key)
+        .is_sorted_by(|previous, current| previous < current)
+    {
+        for (new_index, old_index) in old_for_new.iter().enumerate() {
+            keep[new_index] = old_index.is_some();
+        }
+        return keep;
+    }
+
+    let mut pile_tops = Vec::<usize>::new();
+    let mut predecessors = vec![None; old_for_new.len()];
+
+    for (new_index, old_index) in old_for_new.iter().copied().enumerate() {
+        let Some(old_index) = old_index else {
+            continue;
+        };
+        let order_key = &base[old_index].order_key;
+        let pile = pile_tops
+            .partition_point(|top_index| old_order_key(base, old_for_new, *top_index) < order_key);
+        if pile != 0 {
+            predecessors[new_index] = Some(pile_tops[pile - 1]);
+        }
+        if pile == pile_tops.len() {
+            pile_tops.push(new_index);
+        } else if old_order_key(base, old_for_new, pile_tops[pile]) > order_key {
+            pile_tops[pile] = new_index;
+        }
+    }
+
+    let Some(mut current) = pile_tops.last().copied() else {
+        return keep;
+    };
+    loop {
+        keep[current] = true;
+        let Some(previous) = predecessors[current] else {
+            break;
+        };
+        current = previous;
+    }
+    keep
+}
+
+fn old_order_key<'a>(
+    base: &'a [Block],
+    old_for_new: &[Option<usize>],
+    new_index: usize,
+) -> &'a OrderKey {
+    let old_index = old_for_new[new_index].expect("old order key should belong to existing block");
+    &base[old_index].order_key
+}
+
+fn flush_generated_block_upserts(
+    pending: &mut Vec<usize>,
+    previous_order_key: &mut Option<OrderKey>,
+    next_order_key: Option<&OrderKey>,
+    base: &[Block],
+    file_blocks: &[String],
+    old_for_new: &[Option<usize>],
+    inserted_ids: &[Option<String>],
+    changes: &mut Vec<DetectedChange>,
+) -> Result<(), PluginError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let order_keys =
+        OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, pending.len())
+            .map_err(PluginError::Internal)?;
+
+    for (new_index, order_key) in pending.drain(..).zip(order_keys) {
+        changes.push(block_upsert_change(
+            block_id_for_new(base, old_for_new, inserted_ids, new_index),
+            &order_key,
+            &file_blocks[new_index],
+        )?);
+        *previous_order_key = Some(order_key);
+    }
+
+    Ok(())
 }
 
 fn has_duplicate_order_keys(blocks: &[Block]) -> bool {
     blocks
         .windows(2)
         .any(|pair| pair[0].order_key == pair[1].order_key)
-}
-
-fn new_ids(count: usize) -> Vec<String> {
-    (0..count).map(|_| Uuid::now_v7().to_string()).collect()
 }
 
 fn single_entity_pk(mut entity_pk: Vec<String>) -> Result<String, PluginError> {
@@ -450,6 +630,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fuzz_detect_changes_reorders_blocks_without_changing_ids() {
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        for _ in 0..10_000 {
+            let before_markdown = parse_markdown_source(&random_markdown_source(&mut rng))
+                .expect("random before markdown should parse");
+            let before = projection_from_markdown(before_markdown.clone());
+            let mut reordered_blocks = before_markdown.blocks.clone();
+            shuffle(&mut reordered_blocks, &mut rng);
+            let after_markdown = ParsedMarkdown {
+                document: before_markdown.document,
+                blocks: reordered_blocks.clone(),
+            };
+
+            let changes = detect_changes_for_markdown(&before, &after_markdown).unwrap();
+
+            for change in &changes {
+                assert_eq!(
+                    change.schema_key, BLOCK_SCHEMA_KEY,
+                    "reordering blocks should not change the document snapshot"
+                );
+
+                let entity_pk = single_entity_pk(change.entity_pk.clone()).unwrap();
+                let before_block = before
+                    .blocks_by_id
+                    .get(&entity_pk)
+                    .expect("reordering blocks should only update existing block ids");
+                let snapshot_content = change
+                    .snapshot_content
+                    .as_deref()
+                    .expect("reordering blocks should not delete existing block entities");
+                let after_block = parse_block_snapshot(snapshot_content, &entity_pk).unwrap();
+
+                assert_eq!(
+                    after_block.block, before_block.block,
+                    "reordering blocks should only update order keys"
+                );
+                assert_ne!(
+                    after_block.order_key, before_block.order_key,
+                    "reordering blocks should not emit unchanged block snapshots"
+                );
+            }
+
+            let mut applied = before;
+            for change in changes {
+                apply_entity_change(&mut applied, change).unwrap();
+            }
+
+            let applied_blocks = applied
+                .to_blocks()
+                .into_iter()
+                .map(|block| block.block)
+                .collect::<Vec<_>>();
+            assert_eq!(applied_blocks, reordered_blocks);
+            assert_eq!(applied.document, after_markdown.document);
+        }
+    }
+
     fn random_markdown_source(rng: &mut (impl Rng + ?Sized)) -> String {
         let block_count = rng.random_range(0..=8);
         let mut output = String::new();
@@ -532,11 +771,17 @@ mod tests {
         alphabet[rng.random_range(0..alphabet.len())].to_string()
     }
 
+    fn shuffle<T>(items: &mut [T], rng: &mut (impl Rng + ?Sized)) {
+        for index in (1..items.len()).rev() {
+            items.swap(index, rng.random_range(0..=index));
+        }
+    }
+
     fn projection_from_markdown(markdown: ParsedMarkdown) -> Projection {
         let ids = (0..markdown.blocks.len())
             .map(|offset| format!("block:{offset}"))
             .collect::<Vec<_>>();
-        let order_keys = OrderKey::evenly_between(None, None, &ids).unwrap();
+        let order_keys = OrderKey::evenly_between(None, None, ids.len()).unwrap();
         let blocks_by_id = markdown
             .blocks
             .into_iter()

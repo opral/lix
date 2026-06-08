@@ -135,6 +135,25 @@ fn line_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String, 
         .collect()
 }
 
+fn line_ids_by_content(active_state: &[EntityState]) -> BTreeMap<String, String> {
+    active_state
+        .iter()
+        .filter(|row| row.schema_key == LINE_SCHEMA_KEY)
+        .map(|row| {
+            let value = active_state_snapshot_value(row);
+            let line = value
+                .get("line")
+                .and_then(Value::as_str)
+                .expect("line content should exist")
+                .to_string();
+            let [entity_pk] = row.entity_pk.as_slice() else {
+                panic!("line entity_pk should have one component");
+            };
+            (line, entity_pk.clone())
+        })
+        .collect()
+}
+
 fn text_active_state_with_line_order_keys(lines: &[(&str, &str, &str)]) -> Vec<EntityState> {
     let mut state = vec![EntityState {
         entity_pk: vec![ROOT_ENTITY_PK.to_string()],
@@ -420,6 +439,32 @@ fn silently_decodes_malformed_text() {
 
     let output = render_changes(changes).expect("render should succeed");
     assert_eq!(output, "aÿ\n".as_bytes());
+}
+
+#[test]
+fn detects_sorted_lines_as_order_key_changes() {
+    let before_bytes = b"a\nb\nc\n";
+    let after_bytes = b"c\nb\na\n";
+    let before_state = active_state_from_file(file_from_bytes(before_bytes));
+    let before_ids = line_ids_by_content(&before_state);
+
+    let changes = TextPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
+        .expect("detect_changes should succeed");
+
+    assert!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
+            .all(|change| change.snapshot_content.is_some()),
+        "sorting lines should not delete existing line entities"
+    );
+
+    let active_state = apply_changes_to_active_state(before_state, changes);
+    let after_ids = line_ids_by_content(&active_state);
+    let output = render_active_state(active_state).expect("render should succeed");
+
+    assert_eq!(after_ids, before_ids);
+    assert_eq!(output, after_bytes);
 }
 
 #[test]
