@@ -348,12 +348,9 @@ fn flush_generated_row_upserts(
         return Ok(());
     }
 
-    let ids = pending
-        .iter()
-        .map(|new_index| row_id_for_new(base, old_for_new, inserted_ids, *new_index).to_string())
-        .collect_vec();
-    let order_keys = OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
-        .map_err(PluginError::Internal)?;
+    let order_keys =
+        OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, pending.len())
+            .map_err(PluginError::Internal)?;
 
     for (new_index, order_key) in pending.drain(..).zip(order_keys) {
         changes.push(row_upsert_change(
@@ -605,7 +602,7 @@ mod tests {
         let ids = (0..rows.len())
             .map(|offset| format!("row:{offset}"))
             .collect::<Vec<_>>();
-        let order_keys = OrderKey::evenly_between(None, None, &ids).unwrap();
+        let order_keys = OrderKey::evenly_between(None, None, ids.len()).unwrap();
         let rows_by_id = rows
             .into_iter()
             .zip(ids.into_iter().zip(order_keys))

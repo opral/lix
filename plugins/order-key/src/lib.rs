@@ -18,9 +18,9 @@ impl OrderKey {
     pub fn evenly_between(
         previous: Option<&Self>,
         next: Option<&Self>,
-        ids: &[String],
+        count: usize,
     ) -> Result<Vec<Self>, String> {
-        if ids.is_empty() {
+        if count == 0 {
             return Ok(Vec::new());
         }
 
@@ -32,8 +32,8 @@ impl OrderKey {
             }
         }
 
-        let mut keys = Vec::with_capacity(ids.len());
-        fill_evenly(previous, next, ids, &mut keys)?;
+        let mut keys = Vec::with_capacity(count);
+        fill_evenly(previous, next, count, &mut keys)?;
         Ok(keys)
     }
 
@@ -47,10 +47,8 @@ impl OrderKey {
         Ok(Self(bytes))
     }
 
-    fn between(previous: Option<&Self>, next: Option<&Self>, id: &str) -> Result<Self, String> {
-        let mut bytes = midpoint(previous.map(Self::as_bytes), next.map(Self::as_bytes))?;
-        let suffix = suffix_from_id(id);
-        bytes.extend(suffix);
+    fn between(previous: Option<&Self>, next: Option<&Self>) -> Result<Self, String> {
+        let bytes = midpoint(previous.map(Self::as_bytes), next.map(Self::as_bytes))?;
         validate_bytes(&bytes)?;
         Ok(Self(bytes))
     }
@@ -63,18 +61,19 @@ impl OrderKey {
 fn fill_evenly(
     previous: Option<&OrderKey>,
     next: Option<&OrderKey>,
-    ids: &[String],
+    count: usize,
     out: &mut Vec<OrderKey>,
 ) -> Result<(), String> {
-    if ids.is_empty() {
+    if count == 0 {
         return Ok(());
     }
 
-    let mid = ids.len() / 2;
-    let key = OrderKey::between(previous, next, &ids[mid])?;
-    fill_evenly(previous, Some(&key), &ids[..mid], out)?;
+    let left_count = count / 2;
+    let right_count = count - left_count - 1;
+    let key = OrderKey::between(previous, next)?;
+    fill_evenly(previous, Some(&key), left_count, out)?;
     out.push(key.clone());
-    fill_evenly(Some(&key), next, &ids[mid + 1..], out)
+    fill_evenly(Some(&key), next, right_count, out)
 }
 
 fn validate_bytes(bytes: &[u8]) -> Result<(), String> {
@@ -122,12 +121,6 @@ fn midpoint(previous: Option<&[u8]>, next: Option<&[u8]>) -> Result<Vec<u8>, Str
     }
 }
 
-fn suffix_from_id(id: &str) -> Vec<u8> {
-    let mut suffix = id.as_bytes().to_vec();
-    suffix.push(1);
-    suffix
-}
-
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -172,14 +165,12 @@ mod tests {
 
     #[test]
     fn allocates_ordered_keys_between_open_bounds() {
-        let ids = ids(200);
+        let keys = OrderKey::evenly_between(None, None, 200).unwrap();
 
-        let keys = OrderKey::evenly_between(None, None, &ids).unwrap();
-
-        assert_eq!(keys.len(), ids.len());
+        assert_eq!(keys.len(), 200);
         assert_strictly_increasing(&keys);
         assert_serialized_order_matches(&keys);
-        assert!(keys.iter().all(|key| key.to_snapshot_string().len() < 192));
+        assert!(keys.iter().all(|key| key.to_snapshot_string().len() < 16));
     }
 
     #[test]
@@ -189,9 +180,8 @@ mod tests {
         let mut previous = lower;
         let mut keys = Vec::new();
 
-        for offset in 0..256 {
-            let id = vec![format!("id-{offset}")];
-            let key = OrderKey::evenly_between(Some(&previous), Some(&upper), &id)
+        for _ in 0..256 {
+            let key = OrderKey::evenly_between(Some(&previous), Some(&upper), 1)
                 .unwrap()
                 .remove(0);
             assert!(key > previous);
@@ -208,11 +198,10 @@ mod tests {
     fn allocates_multiple_keys_inside_a_narrow_gap() {
         let lower = OrderKey::from_snapshot_string("80").unwrap();
         let upper = OrderKey::from_snapshot_string("8001").unwrap();
-        let ids = ids(64);
 
-        let keys = OrderKey::evenly_between(Some(&lower), Some(&upper), &ids).unwrap();
+        let keys = OrderKey::evenly_between(Some(&lower), Some(&upper), 64).unwrap();
 
-        assert_eq!(keys.len(), ids.len());
+        assert_eq!(keys.len(), 64);
         assert!(keys.first().unwrap() > &lower);
         assert!(keys.last().unwrap() < &upper);
         assert_strictly_increasing(&keys);
@@ -220,19 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn id_suffix_disambiguates_same_bounds() {
-        let left = OrderKey::evenly_between(None, None, &["id-a".to_string()])
-            .unwrap()
-            .remove(0);
-        let right = OrderKey::evenly_between(None, None, &["id-b".to_string()])
-            .unwrap()
-            .remove(0);
+    fn repeated_single_allocation_in_same_bounds_is_deterministic() {
+        let left = OrderKey::evenly_between(None, None, 1).unwrap().remove(0);
+        let right = OrderKey::evenly_between(None, None, 1).unwrap().remove(0);
 
-        assert_ne!(left, right);
-        assert_eq!(
-            left.cmp(&right),
-            left.to_snapshot_string().cmp(&right.to_snapshot_string())
-        );
+        assert_eq!(left, right);
+        assert_eq!(left.to_snapshot_string(), "80");
     }
 
     #[test]
@@ -242,10 +224,6 @@ mod tests {
         assert!(OrderKey::from_snapshot_string("zz").is_err());
         assert!(OrderKey::from_snapshot_string("abc").is_err());
         assert!(OrderKey::from_snapshot_string("ab00").is_err());
-    }
-
-    fn ids(count: usize) -> Vec<String> {
-        (0..count).map(|offset| format!("id-{offset}")).collect()
     }
 
     fn assert_strictly_increasing(keys: &[OrderKey]) {

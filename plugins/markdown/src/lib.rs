@@ -123,7 +123,7 @@ fn detect_changes_for_markdown(
                 let next_order_key = base.get(base_index).map(|block| &block.order_key);
                 let ids = new_ids(run.len);
                 let order_keys =
-                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, &ids)
+                    OrderKey::evenly_between(previous_order_key.as_ref(), next_order_key, run.len)
                         .map_err(PluginError::Internal)?;
                 for (id, order_key) in ids.into_iter().zip(order_keys) {
                     changes.push(block_upsert_change(
@@ -162,7 +162,7 @@ fn detect_changes_for_markdown_with_reindexed_order(
         .map(|block| block.id.clone())
         .collect::<Vec<_>>();
     let order_keys =
-        OrderKey::evenly_between(None, None, &planned_ids).map_err(PluginError::Internal)?;
+        OrderKey::evenly_between(None, None, planned_ids.len()).map_err(PluginError::Internal)?;
     let planned_id_set = planned_ids
         .iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -536,7 +536,7 @@ mod tests {
         let ids = (0..markdown.blocks.len())
             .map(|offset| format!("block:{offset}"))
             .collect::<Vec<_>>();
-        let order_keys = OrderKey::evenly_between(None, None, &ids).unwrap();
+        let order_keys = OrderKey::evenly_between(None, None, ids.len()).unwrap();
         let blocks_by_id = markdown
             .blocks
             .into_iter()
