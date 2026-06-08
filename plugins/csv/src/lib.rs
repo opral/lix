@@ -77,15 +77,6 @@ fn detect_changes_for_rows(
     after_dialect: CsvDialect,
 ) -> Result<Vec<DetectedChange>, PluginError> {
     let base = before.to_rows();
-    if has_duplicate_order_keys(&base) {
-        return detect_changes_for_rows_with_reindexed_order(
-            before,
-            file_rows,
-            after_dialect,
-            &base,
-        );
-    }
-
     let diff_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
     let mut changes = Vec::new();
     let mut base_index = 0;
@@ -151,106 +142,6 @@ fn detect_changes_for_rows(
     }
 
     Ok(changes)
-}
-
-#[derive(Debug)]
-struct PlannedRow {
-    id: String,
-    cells: Vec<String>,
-}
-
-fn detect_changes_for_rows_with_reindexed_order(
-    before: &Projection,
-    file_rows: &[Vec<String>],
-    after_dialect: CsvDialect,
-    base: &[Row],
-) -> Result<Vec<DetectedChange>, PluginError> {
-    let planned_rows = plan_rows(base, file_rows);
-    let planned_ids = planned_rows
-        .iter()
-        .map(|row| row.id.clone())
-        .collect::<Vec<_>>();
-    let order_keys =
-        OrderKey::evenly_between(None, None, &planned_ids).map_err(PluginError::Internal)?;
-    let planned_id_set = planned_ids
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut changes = Vec::new();
-
-    for id in before.rows_by_id.keys() {
-        if !planned_id_set.contains(id) {
-            changes.push(DetectedChange {
-                entity_pk: vec![id.clone()],
-                schema_key: ROW_SCHEMA_KEY.to_string(),
-                snapshot_content: None,
-                metadata: None,
-            });
-        }
-    }
-
-    for (row, order_key) in planned_rows.iter().zip(order_keys.iter()) {
-        changes.push(row_upsert_change(&row.id, order_key, &row.cells)?);
-    }
-
-    if before.dialect != after_dialect
-        || (!before.table_present
-            && (!file_rows.is_empty() || after_dialect != CsvDialect::default()))
-    {
-        changes.push(table_upsert_change(after_dialect)?);
-    }
-
-    Ok(changes)
-}
-
-fn plan_rows(base: &[Row], file_rows: &[Vec<String>]) -> Vec<PlannedRow> {
-    let diff_runs = imara_diff_runs(base.iter().map(|row| &row.cells), file_rows.iter());
-    let mut planned_rows = Vec::with_capacity(file_rows.len());
-    let mut base_index = 0;
-    let mut file_index = 0;
-
-    for run in diff_runs {
-        match run {
-            DiffRun::Equal { len } => {
-                for _ in 0..len {
-                    planned_rows.push(PlannedRow {
-                        id: base[base_index].id.clone(),
-                        cells: file_rows[file_index].clone(),
-                    });
-                    base_index += 1;
-                    file_index += 1;
-                }
-            }
-            DiffRun::Replace { old, new } => {
-                let update_len = old.min(new);
-
-                for _ in 0..update_len {
-                    planned_rows.push(PlannedRow {
-                        id: base[base_index].id.clone(),
-                        cells: file_rows[file_index].clone(),
-                    });
-                    base_index += 1;
-                    file_index += 1;
-                }
-
-                base_index += old - update_len;
-
-                for id in new_ids(new - update_len) {
-                    planned_rows.push(PlannedRow {
-                        id,
-                        cells: file_rows[file_index].clone(),
-                    });
-                    file_index += 1;
-                }
-            }
-        }
-    }
-
-    planned_rows
-}
-
-fn has_duplicate_order_keys(rows: &[Row]) -> bool {
-    rows.windows(2)
-        .any(|pair| pair[0].order_key == pair[1].order_key)
 }
 
 fn new_ids(count: usize) -> Vec<String> {
