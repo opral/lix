@@ -569,6 +569,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fuzz_detect_changes_reorders_rows_without_changing_ids() {
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        for _ in 0..100_000 {
+            let base_rows = random_csv(&mut rng);
+            let before = projection_from_rows(base_rows.clone());
+            let mut reordered_rows = base_rows.clone();
+            shuffle(&mut reordered_rows, &mut rng);
+
+            let changes =
+                detect_changes_for_rows(&before, &reordered_rows, CsvDialect::default()).unwrap();
+
+            for change in &changes {
+                assert_eq!(
+                    change.schema_key, ROW_SCHEMA_KEY,
+                    "reordering rows should not change the table snapshot"
+                );
+
+                let entity_pk = single_entity_pk(change.entity_pk.clone()).unwrap();
+                let before_row = before
+                    .rows_by_id
+                    .get(&entity_pk)
+                    .expect("reordering rows should only update existing row ids");
+                let snapshot_content = change
+                    .snapshot_content
+                    .as_deref()
+                    .expect("reordering rows should not delete existing row entities");
+                let after_row = parse_row_snapshot(snapshot_content, &entity_pk).unwrap();
+
+                assert_eq!(
+                    after_row.cells, before_row.cells,
+                    "reordering rows should only update order keys"
+                );
+                assert_ne!(
+                    after_row.order_key, before_row.order_key,
+                    "reordering rows should not emit unchanged row snapshots"
+                );
+            }
+
+            let mut applied = before;
+            for change in changes {
+                apply_entity_change(&mut applied, change).unwrap();
+            }
+
+            let applied_rows = applied
+                .to_rows()
+                .into_iter()
+                .map(|row| row.cells)
+                .collect::<Vec<_>>();
+            assert_eq!(applied_rows, reordered_rows);
+        }
+    }
+
     fn random_csv(rng: &mut (impl Rng + ?Sized)) -> Vec<Vec<String>> {
         let random_cell_alphabet_len: u8 = rng.random_range(1..=6);
         let width = rng.random_range(1..=10);
@@ -584,6 +638,12 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn shuffle<T>(items: &mut [T], rng: &mut (impl Rng + ?Sized)) {
+        for index in (1..items.len()).rev() {
+            items.swap(index, rng.random_range(0..=index));
+        }
     }
 
     fn projection_from_rows(rows: Vec<Vec<String>>) -> Projection {
