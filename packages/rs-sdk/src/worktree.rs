@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, Engine, FsMkdirOptions, FsRmOptions, FsWriteOptions, LixError, SessionContext,
+    Backend, BackendError, BackendWrite, CommitResult, Engine, FsMkdirOptions, FsRmOptions,
+    FsWriteOptions, LixError, PutBatch, ReadOptions, SessionContext, WriteOptions,
 };
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
@@ -13,14 +16,37 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 type WorktreeDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 
 #[derive(Clone)]
-pub(crate) struct WorktreeSupervisor<B>
+#[expect(missing_debug_implementations)]
+pub struct WorktreeBackend<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    inner: B,
+    supervisor: WorktreeSupervisor<B>,
+}
+
+#[expect(missing_debug_implementations)]
+pub struct WorktreeWrite<'a, B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    inner: B::Write<'a>,
+    supervisor: WorktreeSupervisor<B>,
+}
+
+#[derive(Clone)]
+struct WorktreeSupervisor<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     inner: Arc<WorktreeSupervisorInner>,
-    state: Arc<WorktreeState<B>>,
+    _marker: PhantomData<fn() -> B>,
 }
 
 struct WorktreeSupervisorInner {
@@ -49,7 +75,106 @@ struct Snapshot {
 
 enum WorktreeEvent {
     DiskChanged,
+    SyncFromLix {
+        reply_tx: mpsc::SyncSender<Result<(), LixError>>,
+    },
     Shutdown,
+}
+
+impl<B> WorktreeBackend<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    pub async fn open<P>(backend: B, root: P) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        let engine = crate::lix::open_or_initialize_engine(backend.clone(), None).await?;
+        Self::open_with_engine(backend, engine, root.as_ref()).await
+    }
+
+    pub async fn open_with_wasm_runtime<P>(
+        backend: B,
+        root: P,
+        wasm_runtime: Arc<dyn WasmRuntime>,
+    ) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        let engine =
+            crate::lix::open_or_initialize_engine(backend.clone(), Some(wasm_runtime)).await?;
+        Self::open_with_engine(backend, engine, root.as_ref()).await
+    }
+
+    async fn open_with_engine(
+        backend: B,
+        engine: Engine<B>,
+        root: &Path,
+    ) -> Result<Self, LixError> {
+        Ok(Self {
+            inner: backend,
+            supervisor: WorktreeSupervisor::open(engine, root).await?,
+        })
+    }
+}
+
+impl<B> Backend for WorktreeBackend<B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    type Read<'a>
+        = B::Read<'a>
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = WorktreeWrite<'a, B>
+    where
+        Self: 'a;
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        Ok(WorktreeWrite {
+            inner: self.inner.begin_write(opts)?,
+            supervisor: self.supervisor.clone(),
+        })
+    }
+}
+
+impl<B> BackendWrite for WorktreeWrite<'_, B>
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(entries)
+    }
+
+    fn delete_many(&mut self, keys: &[lix_engine::Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(keys)
+    }
+
+    fn delete_range(&mut self, range: lix_engine::KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(range)
+    }
+
+    fn commit(self) -> Result<CommitResult, BackendError> {
+        let result = self.inner.commit()?;
+        self.supervisor.sync_from_lix_blocking()?;
+        Ok(result)
+    }
+
+    fn rollback(self) -> Result<(), BackendError> {
+        self.inner.rollback()
+    }
 }
 
 impl<B> WorktreeSupervisor<B>
@@ -58,7 +183,7 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    pub(crate) async fn open(engine: Engine<B>, root: &Path) -> Result<Self, LixError> {
+    async fn open(engine: Engine<B>, root: &Path) -> Result<Self, LixError> {
         std::fs::create_dir_all(root)
             .map_err(|error| io_error("create worktree root", root, error))?;
         let root = std::fs::canonicalize(root)
@@ -105,17 +230,27 @@ where
                 debouncer: Mutex::new(Some(debouncer)),
                 worker: Mutex::new(Some(worker)),
             }),
-            state,
+            _marker: PhantomData,
         })
     }
 
-    pub(crate) async fn sync_from_lix(&self) -> Result<(), LixError> {
-        self.state.sync_from_lix().await
-    }
-
-    pub(crate) async fn close(&self) -> Result<(), LixError> {
-        self.inner.shutdown();
-        self.state.session.close().await
+    fn sync_from_lix_blocking(&self) -> Result<(), BackendError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.inner
+            .event_tx
+            .send(WorktreeEvent::SyncFromLix { reply_tx })
+            .map_err(|error| {
+                BackendError::Io(format!(
+                    "worktree sync failed: worktree worker stopped: {error}"
+                ))
+            })?;
+        match reply_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(worktree_sync_backend_error(error)),
+            Err(error) => Err(BackendError::Io(format!(
+                "worktree sync failed: worktree worker stopped: {error}"
+            ))),
+        }
     }
 }
 
@@ -164,6 +299,10 @@ where
         self.materialize_snapshot(&lix)?;
         self.remember_materialized(lix);
         Ok(())
+    }
+
+    async fn close(&self) -> Result<(), LixError> {
+        self.session.close().await
     }
 
     async fn collect_lix_snapshot(&self) -> Result<Snapshot, LixError> {
@@ -344,17 +483,74 @@ where
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().build() else {
         return;
     };
-    while let Ok(WorktreeEvent::DiskChanged) | Err(mpsc::RecvTimeoutError::Timeout) =
-        event_rx.recv_timeout(Duration::from_secs(1))
-    {
-        loop {
-            match event_rx.try_recv() {
-                Ok(WorktreeEvent::DiskChanged) => {}
-                Err(mpsc::TryRecvError::Empty) => break,
-                Ok(WorktreeEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => return,
+    loop {
+        match event_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(WorktreeEvent::DiskChanged) => {
+                if drain_worktree_events(&runtime, &state, &event_rx, true) {
+                    return;
+                }
+            }
+            Ok(WorktreeEvent::SyncFromLix { reply_tx }) => {
+                sync_from_lix_for_replies(&runtime, &state, vec![reply_tx]);
+                if drain_worktree_events(&runtime, &state, &event_rx, false) {
+                    return;
+                }
+            }
+            Ok(WorktreeEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = runtime.block_on(state.close());
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = runtime.block_on(state.sync_disk_to_lix(true));
             }
         }
+    }
+}
+
+fn drain_worktree_events<B>(
+    runtime: &tokio::runtime::Runtime,
+    state: &Arc<WorktreeState<B>>,
+    event_rx: &mpsc::Receiver<WorktreeEvent>,
+    mut sync_disk: bool,
+) -> bool
+where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let mut sync_replies = Vec::new();
+    loop {
+        match event_rx.try_recv() {
+            Ok(WorktreeEvent::DiskChanged) => sync_disk = true,
+            Ok(WorktreeEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
+            Ok(WorktreeEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = runtime.block_on(state.close());
+                return true;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+        }
+    }
+    if sync_disk {
         let _ = runtime.block_on(state.sync_disk_to_lix(true));
+    }
+    if !sync_replies.is_empty() {
+        sync_from_lix_for_replies(runtime, state, sync_replies);
+    }
+    false
+}
+
+fn sync_from_lix_for_replies<B>(
+    runtime: &tokio::runtime::Runtime,
+    state: &Arc<WorktreeState<B>>,
+    replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
+) where
+    B: Backend + Clone + Send + Sync + 'static,
+    for<'backend> B::Read<'backend>: Send,
+    for<'backend> B::Write<'backend>: Send,
+{
+    let result = runtime.block_on(state.sync_from_lix());
+    for reply in replies {
+        let _ = reply.send(result.clone());
     }
 }
 
@@ -542,6 +738,10 @@ fn notify_error(error: notify_debouncer_full::notify::Error) -> LixError {
         "LIX_WORKTREE_NOTIFY_ERROR",
         format!("worktree watcher error: {error}"),
     )
+}
+
+fn worktree_sync_backend_error(error: LixError) -> BackendError {
+    BackendError::Io(format!("worktree sync failed: {}", error.format()))
 }
 
 fn worktree_error(message: impl Into<String>) -> LixError {

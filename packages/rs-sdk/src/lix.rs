@@ -5,12 +5,7 @@ use lix_engine::{
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
-#[cfg(not(target_family = "wasm"))]
-use std::path::Path;
 use std::sync::Arc;
-
-#[cfg(not(target_family = "wasm"))]
-use crate::worktree::WorktreeSupervisor;
 
 /// Options for opening a Lix workspace session.
 #[expect(missing_debug_implementations)]
@@ -52,8 +47,6 @@ where
 {
     _engine: Engine<B>,
     session: SessionContext<B>,
-    #[cfg(not(target_family = "wasm"))]
-    worktree: Option<WorktreeSupervisor<B>>,
 }
 
 /// Opens a Lix workspace session.
@@ -72,8 +65,6 @@ where
     Ok(Lix {
         _engine: engine,
         session,
-        #[cfg(not(target_family = "wasm"))]
-        worktree: None,
     })
 }
 
@@ -84,27 +75,6 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     open_lix(OpenLixOptions::new(backend)).await
-}
-
-#[cfg(not(target_family = "wasm"))]
-pub async fn open_lix_with_backend_and_worktree<B, P>(
-    backend: B,
-    worktree_path: P,
-) -> Result<Lix<B>, LixError>
-where
-    B: Backend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-    P: AsRef<Path>,
-{
-    let engine = open_or_initialize_engine(backend, None).await?;
-    let session = engine.open_workspace_session().await?;
-    let worktree = WorktreeSupervisor::open(engine.clone(), worktree_path.as_ref()).await?;
-    Ok(Lix {
-        _engine: engine,
-        session,
-        worktree: Some(worktree),
-    })
 }
 
 impl<B> Lix<B>
@@ -123,19 +93,12 @@ where
     /// While a transaction is active, call `execute()` on the transaction
     /// handle instead.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        let should_sync_worktree = sql_may_change_filesystem(sql);
-        let result = self.session.execute(sql, params).await?;
-        if should_sync_worktree {
-            self.sync_worktree_from_lix().await?;
-        }
-        Ok(result)
+        self.session.execute(sql, params).await
     }
 
     pub async fn begin_transaction(&self) -> Result<LixTransaction<B>, LixError> {
         Ok(LixTransaction {
             inner: self.session.begin_transaction().await?,
-            #[cfg(not(target_family = "wasm"))]
-            worktree: self.worktree.clone(),
         })
     }
 
@@ -155,7 +118,6 @@ where
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
         let (_session, receipt) = self.session.switch_branch(options).await?;
-        self.sync_worktree_from_lix().await?;
         Ok(receipt)
     }
 
@@ -163,9 +125,7 @@ where
         &self,
         options: MergeBranchOptions,
     ) -> Result<MergeBranchReceipt, LixError> {
-        let receipt = self.session.merge_branch(options).await?;
-        self.sync_worktree_from_lix().await?;
-        Ok(receipt)
+        self.session.merge_branch(options).await
     }
 
     pub async fn merge_branch_preview(
@@ -176,8 +136,7 @@ where
     }
 
     pub async fn install_plugin_archive(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.session.install_plugin_archive(archive_bytes).await?;
-        self.sync_worktree_from_lix().await
+        self.session.install_plugin_archive(archive_bytes).await
     }
 
     pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {
@@ -190,8 +149,7 @@ where
         data: Vec<u8>,
         options: FsWriteOptions,
     ) -> Result<(), LixError> {
-        self.session.fs().write_file(path, data, options).await?;
-        self.sync_worktree_from_lix().await
+        self.session.fs().write_file(path, data, options).await
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
@@ -199,8 +157,7 @@ where
     }
 
     pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
-        self.session.fs().mkdir(path, options).await?;
-        self.sync_worktree_from_lix().await
+        self.session.fs().mkdir(path, options).await
     }
 
     pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
@@ -208,29 +165,11 @@ where
     }
 
     pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
-        self.session.fs().rm(path, options).await?;
-        self.sync_worktree_from_lix().await
+        self.session.fs().rm(path, options).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(worktree) = &self.worktree {
-            worktree.close().await?;
-        }
         self.session.close().await
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    async fn sync_worktree_from_lix(&self) -> Result<(), LixError> {
-        if let Some(worktree) = &self.worktree {
-            worktree.sync_from_lix().await?;
-        }
-        Ok(())
-    }
-
-    #[cfg(target_family = "wasm")]
-    async fn sync_worktree_from_lix(&self) -> Result<(), LixError> {
-        Ok(())
     }
 }
 
@@ -242,8 +181,6 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     inner: lix_engine::SessionTransaction<B>,
-    #[cfg(not(target_family = "wasm"))]
-    worktree: Option<WorktreeSupervisor<B>>,
 }
 
 impl<B> LixTransaction<B>
@@ -265,14 +202,7 @@ where
     }
 
     pub async fn commit(self) -> Result<(), LixError> {
-        #[cfg(not(target_family = "wasm"))]
-        let worktree = self.worktree.clone();
-        self.inner.commit().await?;
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(worktree) = worktree {
-            worktree.sync_from_lix().await?;
-        }
-        Ok(())
+        self.inner.commit().await
     }
 
     pub async fn rollback(self) -> Result<(), LixError> {
@@ -280,7 +210,7 @@ where
     }
 }
 
-async fn open_or_initialize_engine<B>(
+pub(crate) async fn open_or_initialize_engine<B>(
     backend: B,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 ) -> Result<Engine<B>, LixError>
@@ -297,17 +227,6 @@ where
         }
         Err(error) => Err(error),
     }
-}
-
-fn sql_may_change_filesystem(sql: &str) -> bool {
-    let sql = sql.trim_start();
-    let Some(first_word) = sql.split_whitespace().next() else {
-        return false;
-    };
-    matches!(
-        first_word.to_ascii_lowercase().as_str(),
-        "insert" | "update" | "delete"
-    )
 }
 
 async fn new_engine<B>(

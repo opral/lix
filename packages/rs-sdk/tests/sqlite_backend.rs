@@ -3,12 +3,13 @@ use lix_engine::run_backend_conformance;
 use lix_sdk::{
     FsWriteOptions, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory,
     Value, WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
-    WasmPluginFile, WasmRuntime, open_lix, open_lix_with_backend,
+    WasmPluginFile, WasmRuntime, WorktreeBackend, open_lix, open_lix_with_backend,
 };
 use rusqlite::Connection;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 #[test]
 fn sqlite_backend_passes_backend_conformance() {
@@ -102,6 +103,79 @@ async fn sqlite_backend_persists_lix_data_across_reopen() {
 }
 
 #[tokio::test]
+async fn worktree_backend_wraps_sqlite_and_materializes_across_reopen() {
+    let tempdir = tempfile::tempdir().expect("tempdir should create");
+    let sqlite_path = tempdir.path().join("workspace.lix");
+    let worktree_path = tempdir.path().join("worktree");
+
+    {
+        let backend = WorktreeBackend::open(
+            SqliteBackend::open(&sqlite_path).expect("sqlite backend opens"),
+            &worktree_path,
+        )
+        .await
+        .expect("worktree backend opens");
+        let lix = open_lix_with_backend(backend)
+            .await
+            .expect("lix opens on worktree sqlite backend");
+        lix.write_file(
+            "/persisted.txt",
+            b"persisted".to_vec(),
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("file write succeeds");
+        wait_for_disk_file(
+            &worktree_path.join("persisted.txt"),
+            Some(b"persisted".as_slice()),
+        );
+        lix.close().await.expect("lix closes");
+    }
+
+    {
+        let plain = open_lix_with_backend(
+            SqliteBackend::open(&sqlite_path).expect("sqlite backend reopens"),
+        )
+        .await
+        .expect("plain lix opens on sqlite backend");
+        assert_eq!(
+            plain
+                .read_file("/persisted.txt")
+                .await
+                .expect("persisted file reads")
+                .as_deref(),
+            Some(b"persisted".as_slice())
+        );
+        plain.close().await.expect("plain lix closes");
+    }
+
+    let backend = WorktreeBackend::open(
+        SqliteBackend::open(&sqlite_path).expect("sqlite backend reopens"),
+        &worktree_path,
+    )
+    .await
+    .expect("worktree backend reopens");
+    let lix = open_lix_with_backend(backend)
+        .await
+        .expect("lix reopens on worktree sqlite backend");
+    assert_eq!(
+        lix.read_file("/persisted.txt")
+            .await
+            .expect("persisted file reads after reopen")
+            .as_deref(),
+        Some(b"persisted".as_slice())
+    );
+    lix.write_file("/second.txt", b"second".to_vec(), FsWriteOptions::default())
+        .await
+        .expect("second file write succeeds");
+    wait_for_disk_file(
+        &worktree_path.join("second.txt"),
+        Some(b"second".as_slice()),
+    );
+    lix.close().await.expect("lix closes");
+}
+
+#[tokio::test]
 async fn sqlite_backend_open_lix_options_supplies_plugin_wasm_runtime() {
     let tempdir = tempfile::tempdir().expect("tempdir should create");
     let path = tempdir.path().join("workspace.lix");
@@ -146,6 +220,22 @@ fn sqlite_journal_mode(path: &std::path::Path) -> String {
     let conn = Connection::open(path).expect("sqlite file should open");
     conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
         .expect("journal_mode should read")
+}
+
+fn wait_for_disk_file(path: &std::path::Path, expected: Option<&[u8]>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let path_display = path.display();
+    loop {
+        let actual = std::fs::read(path).ok();
+        if actual.as_deref() == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for disk file {path_display} to be {expected:?}, got {actual:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[derive(Default)]

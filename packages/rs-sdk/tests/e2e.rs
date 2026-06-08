@@ -1,7 +1,7 @@
 use lix_sdk::{
     CreateBranchOptions, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, Lix,
     LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
-    open_lix, open_lix_with_backend, open_lix_with_backend_and_worktree,
+    WorktreeBackend, open_lix, open_lix_with_backend,
 };
 #[cfg(feature = "default_wasm_runtime")]
 use std::io::{Cursor, Write};
@@ -948,9 +948,7 @@ async fn worktree_initial_import_uses_local_files_as_source_of_truth() {
     std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
     std::fs::write(tempdir.path().join("docs/readme.txt"), b"local").unwrap();
 
-    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
-        .await
-        .unwrap();
+    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
 
     assert_eq!(
         lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
@@ -962,6 +960,14 @@ async fn worktree_initial_import_uses_local_files_as_source_of_truth() {
         b"local"
     );
     lix.close().await.unwrap();
+}
+
+async fn open_lix_with_worktree(
+    backend: InMemoryBackend,
+    path: &Path,
+) -> Lix<WorktreeBackend<InMemoryBackend>> {
+    let backend = WorktreeBackend::open(backend, path).await.unwrap();
+    open_lix_with_backend(backend).await.unwrap()
 }
 
 #[tokio::test]
@@ -977,9 +983,7 @@ async fn worktree_initial_import_deletes_lix_entries_missing_locally() {
     seed.close().await.unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_backend_and_worktree(backend, tempdir.path())
-        .await
-        .unwrap();
+    let lix = open_lix_with_worktree(backend, tempdir.path()).await;
 
     assert_eq!(lix.read_file("/old.txt").await.unwrap(), None);
     assert_eq!(lix.readdir("/old-empty/").await.unwrap(), None);
@@ -991,9 +995,7 @@ async fn worktree_initial_import_deletes_lix_entries_missing_locally() {
 #[tokio::test]
 async fn worktree_materializes_sdk_sql_and_transaction_writes() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
-        .await
-        .unwrap();
+    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
     lix.write_file("/sdk.txt", b"sdk".to_vec(), FsWriteOptions::default())
@@ -1071,9 +1073,7 @@ async fn worktree_materializes_sdk_sql_and_transaction_writes() {
 #[tokio::test]
 async fn worktree_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
-        .await
-        .unwrap();
+    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("disk.txt"), b"disk").unwrap();
     wait_for_lix_file(&lix, "/disk.txt", Some(b"disk")).await;
@@ -1096,9 +1096,7 @@ async fn worktree_watcher_syncs_disk_changes_to_lix() {
 #[cfg(feature = "default_wasm_runtime")]
 async fn worktree_materializes_internal_lix_plugin_paths() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path())
-        .await
-        .unwrap();
+    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
     let archive = build_csv_plugin_archive();
 
     lix.install_plugin_archive(&archive).await.unwrap();
@@ -1115,9 +1113,7 @@ async fn worktree_rejects_invalid_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
 
-    let Err(error) =
-        open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path()).await
-    else {
+    let Err(error) = WorktreeBackend::open(InMemoryBackend::new(), tempdir.path()).await else {
         panic!("invalid worktree path should fail");
     };
 
@@ -1133,9 +1129,7 @@ async fn worktree_rejects_symlinks() {
     std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
     symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
 
-    let Err(error) =
-        open_lix_with_backend_and_worktree(InMemoryBackend::new(), tempdir.path()).await
-    else {
+    let Err(error) = WorktreeBackend::open(InMemoryBackend::new(), tempdir.path()).await else {
         panic!("symlink should fail");
     };
 
@@ -1158,7 +1152,11 @@ fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     }
 }
 
-async fn wait_for_lix_file(lix: &Lix<InMemoryBackend>, path: &str, expected: Option<&[u8]>) {
+async fn wait_for_lix_file(
+    lix: &Lix<WorktreeBackend<InMemoryBackend>>,
+    path: &str,
+    expected: Option<&[u8]>,
+) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let actual = lix.read_file(path).await.unwrap();
@@ -1173,7 +1171,11 @@ async fn wait_for_lix_file(lix: &Lix<InMemoryBackend>, path: &str, expected: Opt
     }
 }
 
-async fn wait_for_lix_directory(lix: &Lix<InMemoryBackend>, path: &str, expected: bool) {
+async fn wait_for_lix_directory(
+    lix: &Lix<WorktreeBackend<InMemoryBackend>>,
+    path: &str,
+    expected: bool,
+) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let actual = lix.readdir(path).await.unwrap().is_some();

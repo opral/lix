@@ -12,8 +12,6 @@ mod sqlite_backend;
 #[cfg(not(target_family = "wasm"))]
 mod worktree;
 
-#[cfg(not(target_family = "wasm"))]
-pub use lix::open_lix_with_backend_and_worktree;
 pub use lix::{Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_backend};
 pub use lix_engine::wasm::{
     WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
@@ -39,3 +37,5 @@ pub use sqlite_backend::{
     SQLITE_FORMAT_VERSION, SqliteBackend, SqliteBackendFactory, SqliteBackendFixture,
     SqliteBackendOptions,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use worktree::{WorktreeBackend, WorktreeWrite};
