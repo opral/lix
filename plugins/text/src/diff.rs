@@ -3,23 +3,15 @@ use std::hash::Hash;
 use std::iter;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Op {
-    Equal,
-    Replace,
-    Insert,
-    Delete,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct OpRun {
-    pub(crate) op: Op,
-    pub(crate) len: usize,
+pub(crate) enum DiffRun {
+    Equal { len: usize },
+    Replace { old: usize, new: usize },
 }
 
 pub(crate) fn imara_diff_runs<'a, T: Eq + Hash + ?Sized + 'a>(
     a: impl ExactSizeIterator<Item = &'a T>,
     b: impl ExactSizeIterator<Item = &'a T>,
-) -> impl Iterator<Item = OpRun> {
+) -> impl Iterator<Item = DiffRun> {
     let before_capacity = a.len();
     let after_capacity = b.len();
     let mut input = InternedInput {
@@ -41,19 +33,7 @@ pub(crate) fn imara_diff_runs<'a, T: Eq + Hash + ?Sized + 'a>(
     let after_len = u32::try_from(input.after.len()).unwrap();
     let mut before_pos = 0u32;
     let mut after_pos = 0u32;
-    let mut pending = [None; 3];
-    let mut pending_index = 0usize;
-    let mut pending_len = 0usize;
-
     iter::from_fn(move || {
-        if pending_index < pending_len {
-            let run = pending[pending_index];
-            pending_index += 1;
-            return run;
-        }
-        pending_index = 0;
-        pending_len = 0;
-
         let equal_start = before_pos;
         while before_pos < before_len
             && after_pos < after_len
@@ -65,8 +45,7 @@ pub(crate) fn imara_diff_runs<'a, T: Eq + Hash + ?Sized + 'a>(
         }
         let equal_len = before_pos - equal_start;
         if equal_len != 0 {
-            return Some(OpRun {
-                op: Op::Equal,
+            return Some(DiffRun::Equal {
                 len: usize::try_from(equal_len).unwrap(),
             });
         }
@@ -83,30 +62,11 @@ pub(crate) fn imara_diff_runs<'a, T: Eq + Hash + ?Sized + 'a>(
         }
         let after_run_len = after_pos - after_start;
 
-        let replace_len = before_run_len.min(after_run_len);
-        for run in [
-            OpRun {
-                op: Op::Replace,
-                len: usize::try_from(replace_len).unwrap(),
-            },
-            OpRun {
-                op: Op::Delete,
-                len: usize::try_from(before_run_len - replace_len).unwrap(),
-            },
-            OpRun {
-                op: Op::Insert,
-                len: usize::try_from(after_run_len - replace_len).unwrap(),
-            },
-        ] {
-            if run.len != 0 {
-                pending[pending_len] = Some(run);
-                pending_len += 1;
-            }
-        }
-
-        if pending_len != 0 {
-            pending_index = 1;
-            return pending[0].take();
+        if before_run_len != 0 || after_run_len != 0 {
+            return Some(DiffRun::Replace {
+                old: usize::try_from(before_run_len).unwrap(),
+                new: usize::try_from(after_run_len).unwrap(),
+            });
         }
 
         debug_assert_eq!(before_pos, before_len);

@@ -126,6 +126,25 @@ fn block_order_keys_by_content(active_state: &[EntityState]) -> BTreeMap<String,
         .collect()
 }
 
+fn block_ids_by_content(active_state: &[EntityState]) -> BTreeMap<String, String> {
+    active_state
+        .iter()
+        .filter(|row| row.schema_key == BLOCK_SCHEMA_KEY)
+        .map(|row| {
+            let value = active_state_snapshot_value(row);
+            let block = value
+                .get("block")
+                .and_then(Value::as_str)
+                .expect("block content should exist")
+                .to_string();
+            let [entity_pk] = row.entity_pk.as_slice() else {
+                panic!("block entity_pk should have one component");
+            };
+            (block, entity_pk.clone())
+        })
+        .collect()
+}
+
 fn markdown_active_state_with_block_order_keys(blocks: &[(&str, &str, &str)]) -> Vec<EntityState> {
     let mut state = vec![EntityState {
         entity_pk: vec![ROOT_ENTITY_PK.to_string()],
@@ -280,6 +299,33 @@ fn normalizes_adjacent_blocks_to_blank_line_separators() {
     .expect("render should succeed");
 
     assert_eq!(output, b"# Title\n\nparagraph\n");
+}
+
+#[test]
+fn detects_sorted_blocks_as_order_key_changes() {
+    let before_bytes = b"# A\n\n# B\n\n# C\n";
+    let after_bytes = b"# C\n\n# B\n\n# A\n";
+    let before_state = active_state_from_file(file_from_bytes(before_bytes));
+    let before_ids = block_ids_by_content(&before_state);
+
+    let changes =
+        MarkdownPlugin::detect_changes(before_state.clone(), file_from_bytes(after_bytes))
+            .expect("detect_changes should succeed");
+
+    assert!(
+        changes
+            .iter()
+            .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY)
+            .all(|change| change.snapshot_content.is_some()),
+        "sorting blocks should not delete existing block entities"
+    );
+
+    let active_state = apply_changes_to_active_state(before_state, changes);
+    let after_ids = block_ids_by_content(&active_state);
+    let output = render_active_state(active_state).expect("render should succeed");
+
+    assert_eq!(after_ids, before_ids);
+    assert_eq!(output, after_bytes);
 }
 
 #[test]
