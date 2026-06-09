@@ -13,11 +13,13 @@ use lix_engine::{
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 
+#[cfg(feature = "sqlite")]
+use crate::sqlite_backend::SqliteBackend;
+
 type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 
 #[derive(Clone)]
-#[expect(missing_debug_implementations)]
-pub struct FilesystemSync<B>
+pub(crate) struct FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -27,8 +29,7 @@ where
     supervisor: FilesystemSupervisor<B>,
 }
 
-#[expect(missing_debug_implementations)]
-pub struct FilesystemWrite<'a, B>
+pub(crate) struct FilesystemWrite<'a, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -36,6 +37,19 @@ where
 {
     inner: B::Write<'a>,
     supervisor: FilesystemSupervisor<B>,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Clone)]
+#[expect(missing_debug_implementations)]
+pub struct FsBackend {
+    inner: FilesystemSync<SqliteBackend>,
+}
+
+#[cfg(feature = "sqlite")]
+#[expect(missing_debug_implementations)]
+pub struct FsWrite<'a> {
+    inner: FilesystemWrite<'a, SqliteBackend>,
 }
 
 #[derive(Clone)]
@@ -79,6 +93,77 @@ enum FilesystemEvent {
         reply_tx: mpsc::SyncSender<Result<(), LixError>>,
     },
     Shutdown,
+}
+
+#[cfg(feature = "sqlite")]
+impl FsBackend {
+    pub async fn open<P>(dir: P) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        let backend = open_filesystem_sqlite_backend(dir.as_ref())?;
+        let inner = FilesystemSync::open(backend, dir.as_ref()).await?;
+        Ok(Self { inner })
+    }
+
+    pub async fn open_with_wasm_runtime<P>(
+        dir: P,
+        wasm_runtime: Arc<dyn WasmRuntime>,
+    ) -> Result<Self, LixError>
+    where
+        P: AsRef<Path>,
+    {
+        let backend = open_filesystem_sqlite_backend(dir.as_ref())?;
+        let inner =
+            FilesystemSync::open_with_wasm_runtime(backend, dir.as_ref(), wasm_runtime).await?;
+        Ok(Self { inner })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl Backend for FsBackend {
+    type Read<'a>
+        = crate::sqlite_backend::SqliteRead
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = FsWrite<'a>
+    where
+        Self: 'a;
+
+    fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+        self.inner.begin_read(opts)
+    }
+
+    fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+        Ok(FsWrite {
+            inner: self.inner.begin_write(opts)?,
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl BackendWrite for FsWrite<'_> {
+    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(entries)
+    }
+
+    fn delete_many(&mut self, keys: &[lix_engine::Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(keys)
+    }
+
+    fn delete_range(&mut self, range: lix_engine::KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(range)
+    }
+
+    fn commit(self) -> Result<CommitResult, BackendError> {
+        self.inner.commit()
+    }
+
+    fn rollback(self) -> Result<(), BackendError> {
+        self.inner.rollback()
+    }
 }
 
 impl<B> FilesystemSync<B>
@@ -335,7 +420,10 @@ where
         let lix = self.collect_lix_snapshot().await?;
 
         for path in lix.files.keys() {
-            if !local.files.contains_key(path) && !is_plugin_storage_path(path) {
+            if !local.files.contains_key(path)
+                && !is_plugin_storage_path(path)
+                && !is_filesystem_metadata_path(path)
+            {
                 self.session.fs().rm(path, FsRmOptions::default()).await?;
             }
         }
@@ -343,7 +431,11 @@ where
         let mut directories_to_remove = lix
             .directories
             .difference(&local.directories)
-            .filter(|path| path.as_str() != "/" && !is_plugin_storage_path(path))
+            .filter(|path| {
+                path.as_str() != "/"
+                    && !is_plugin_storage_path(path)
+                    && !is_filesystem_metadata_path(path)
+            })
             .cloned()
             .collect::<Vec<_>>();
         sort_directories_deepest_first(&mut directories_to_remove);
@@ -374,7 +466,11 @@ where
                 .await?;
         }
 
-        for (path, data) in &local.files {
+        for (path, data) in local
+            .files
+            .iter()
+            .filter(|(path, _)| !is_filesystem_metadata_path(path))
+        {
             if is_plugin_storage_path(path) {
                 self.session.install_plugin_archive(data).await?;
             } else if lix.files.get(path) != Some(data) {
@@ -396,6 +492,7 @@ where
 
         for path in local.files.keys().filter(|path| {
             !target.files.contains_key(*path)
+                && !is_filesystem_metadata_path(path)
                 && previous
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.files.contains_key(*path))
@@ -408,7 +505,7 @@ where
         let mut directories_to_remove = local
             .directories
             .difference(&target.directories)
-            .filter(|path| path.as_str() != "/")
+            .filter(|path| path.as_str() != "/" && !is_filesystem_metadata_path(path))
             .filter(|path| {
                 previous
                     .as_ref()
@@ -426,7 +523,7 @@ where
         let mut directories_to_create = target
             .directories
             .iter()
-            .filter(|path| path.as_str() != "/")
+            .filter(|path| path.as_str() != "/" && !is_filesystem_metadata_path(path))
             .cloned()
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
@@ -436,7 +533,11 @@ where
                 .map_err(|error| io_error("create filesystem directory", &local_path, error))?;
         }
 
-        for (path, data) in &target.files {
+        for (path, data) in target
+            .files
+            .iter()
+            .filter(|(path, _)| !is_filesystem_metadata_path(path))
+        {
             let local_path = lix_path_to_local_path(&self.root, path)?;
             if let Some(parent) = local_path.parent() {
                 std::fs::create_dir_all(parent)
@@ -586,6 +687,9 @@ fn collect_local_directory(
     for entry in entries {
         let entry =
             entry.map_err(|error| io_error("read filesystem directory entry", directory, error))?;
+        if directory == root && is_filesystem_metadata_file_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -697,7 +801,21 @@ fn validate_lix_path_segment(segment: &str, path: &Path) -> Result<(), LixError>
 }
 
 fn is_plugin_storage_path(path: &str) -> bool {
-    path == "/.lix/plugins" || path.starts_with("/.lix/plugins/")
+    path == "/.lix_system/plugins" || path.starts_with("/.lix_system/plugins/")
+}
+
+fn is_filesystem_metadata_path(path: &str) -> bool {
+    matches!(
+        path.trim_end_matches('/'),
+        "/.lix" | "/.lix-wal" | "/.lix-shm" | "/.lix-journal"
+    )
+}
+
+fn is_filesystem_metadata_file_name(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".lix" | ".lix-wal" | ".lix-shm" | ".lix-journal")
+    )
 }
 
 fn sort_directories_deepest_first(paths: &mut [String]) {
@@ -746,4 +864,18 @@ fn filesystem_sync_backend_error(error: LixError) -> BackendError {
 
 fn filesystem_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_FILESYSTEM_ERROR", message)
+}
+
+#[cfg(feature = "sqlite")]
+fn open_filesystem_sqlite_backend(dir: &Path) -> Result<SqliteBackend, LixError> {
+    std::fs::create_dir_all(dir).map_err(|error| io_error("create filesystem root", dir, error))?;
+    SqliteBackend::open(dir.join(".lix")).map_err(sqlite_backend_error)
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_backend_error(error: BackendError) -> LixError {
+    LixError::new(
+        LixError::CODE_STORAGE_ERROR,
+        format!("failed to open filesystem SQLite backend: {error}"),
+    )
 }

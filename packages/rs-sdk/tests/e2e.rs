@@ -1,11 +1,14 @@
 use lix_sdk::{
-    CreateBranchOptions, FilesystemSync, FsMkdirOptions, FsRmOptions, FsWriteOptions,
-    InMemoryBackend, Lix, LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions,
-    SwitchBranchOptions, Value, open_lix, open_lix_with_backend,
+    CreateBranchOptions, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, Lix,
+    LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
+    open_lix, open_lix_with_backend,
 };
+#[cfg(feature = "sqlite")]
+use lix_sdk::{FsBackend, SqliteBackend};
 #[cfg(feature = "default_wasm_runtime")]
 use std::io::{Cursor, Write};
 use std::path::Path;
+#[cfg(feature = "sqlite")]
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -24,7 +27,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     );
 
     let stored_archive = lix
-        .read_file("/.lix/plugins/plugin_csv.lixplugin")
+        .read_file("/.lix_system/plugins/plugin_csv.lixplugin")
         .await
         .unwrap();
     assert_eq!(stored_archive.as_deref(), Some(archive.as_slice()));
@@ -942,13 +945,14 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 }
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
     std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
     std::fs::write(tempdir.path().join("docs/readme.txt"), b"local").unwrap();
 
-    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(
         lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
@@ -962,18 +966,19 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     lix.close().await.unwrap();
 }
 
-async fn open_lix_with_filesystem(
-    backend: InMemoryBackend,
-    path: &Path,
-) -> Lix<FilesystemSync<InMemoryBackend>> {
-    let backend = FilesystemSync::open(backend, path).await.unwrap();
+#[cfg(feature = "sqlite")]
+async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
+    let backend = FsBackend::open(path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
 }
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
-    let backend = InMemoryBackend::new();
-    let seed = open_lix_with_backend(backend.clone()).await.unwrap();
+    let tempdir = tempfile::tempdir().unwrap();
+    let seed = open_lix_with_backend(SqliteBackend::open(tempdir.path().join(".lix")).unwrap())
+        .await
+        .unwrap();
     seed.write_file("/old.txt", b"old".to_vec(), FsWriteOptions::default())
         .await
         .unwrap();
@@ -982,8 +987,7 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
         .unwrap();
     seed.close().await.unwrap();
 
-    let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(backend, tempdir.path()).await;
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(lix.read_file("/old.txt").await.unwrap(), None);
     assert_eq!(lix.readdir("/old-empty/").await.unwrap(), None);
@@ -993,9 +997,10 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
 }
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
     lix.write_file("/sdk.txt", b"sdk".to_vec(), FsWriteOptions::default())
@@ -1071,9 +1076,10 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("disk.txt"), b"disk").unwrap();
     wait_for_lix_file(&lix, "/disk.txt", Some(b"disk")).await;
@@ -1093,27 +1099,30 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 }
 
 #[tokio::test]
-#[cfg(feature = "default_wasm_runtime")]
+#[cfg(all(feature = "default_wasm_runtime", feature = "sqlite"))]
 async fn filesystem_materializes_internal_lix_plugin_paths() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
     let archive = build_csv_plugin_archive();
 
     lix.install_plugin_archive(&archive).await.unwrap();
 
     wait_for_disk_file(
-        &tempdir.path().join(".lix/plugins/plugin_csv.lixplugin"),
+        &tempdir
+            .path()
+            .join(".lix_system/plugins/plugin_csv.lixplugin"),
         Some(archive.as_slice()),
     );
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_rejects_invalid_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
 
-    let Err(error) = FilesystemSync::open(InMemoryBackend::new(), tempdir.path()).await else {
+    let Err(error) = FsBackend::open(tempdir.path()).await else {
         panic!("invalid filesystem path should fail");
     };
 
@@ -1121,7 +1130,7 @@ async fn filesystem_rejects_invalid_lix_path_names() {
 }
 
 #[tokio::test]
-#[cfg(unix)]
+#[cfg(all(unix, feature = "sqlite"))]
 async fn filesystem_rejects_symlinks() {
     use std::os::unix::fs::symlink;
 
@@ -1129,13 +1138,14 @@ async fn filesystem_rejects_symlinks() {
     std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
     symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
 
-    let Err(error) = FilesystemSync::open(InMemoryBackend::new(), tempdir.path()).await else {
+    let Err(error) = FsBackend::open(tempdir.path()).await else {
         panic!("symlink should fail");
     };
 
     assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
 }
 
+#[cfg(feature = "sqlite")]
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let path_display = path.display();
@@ -1152,11 +1162,8 @@ fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     }
 }
 
-async fn wait_for_lix_file(
-    lix: &Lix<FilesystemSync<InMemoryBackend>>,
-    path: &str,
-    expected: Option<&[u8]>,
-) {
+#[cfg(feature = "sqlite")]
+async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[u8]>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let actual = lix.read_file(path).await.unwrap();
@@ -1171,11 +1178,8 @@ async fn wait_for_lix_file(
     }
 }
 
-async fn wait_for_lix_directory(
-    lix: &Lix<FilesystemSync<InMemoryBackend>>,
-    path: &str,
-    expected: bool,
-) {
+#[cfg(feature = "sqlite")]
+async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let actual = lix.readdir(path).await.unwrap().is_some();

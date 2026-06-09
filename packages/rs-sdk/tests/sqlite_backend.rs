@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlite")]
 use lix_engine::run_backend_conformance;
 use lix_sdk::{
-    FilesystemSync, FsWriteOptions, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend,
+    FsBackend, FsWriteOptions, OpenLixOptions, SQLITE_FORMAT_VERSION, SqliteBackend,
     SqliteBackendFactory, Value, WasmComponentInstance, WasmLimits, WasmPluginDetectedChange,
     WasmPluginEntityState, WasmPluginFile, WasmRuntime, open_lix, open_lix_with_backend,
 };
@@ -103,21 +103,28 @@ async fn sqlite_backend_persists_lix_data_across_reopen() {
 }
 
 #[tokio::test]
-async fn filesystem_sync_wraps_sqlite_and_materializes_across_reopen() {
+async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
     let tempdir = tempfile::tempdir().expect("tempdir should create");
-    let sqlite_path = tempdir.path().join("workspace.lix");
     let filesystem_path = tempdir.path().join("filesystem");
 
     {
-        let backend = FilesystemSync::open(
-            SqliteBackend::open(&sqlite_path).expect("sqlite backend opens"),
-            &filesystem_path,
-        )
-        .await
-        .expect("filesystem sync opens");
+        let backend = FsBackend::open(&filesystem_path)
+            .await
+            .expect("fs backend opens");
         let lix = open_lix_with_backend(backend)
             .await
-            .expect("lix opens on filesystem sqlite backend");
+            .expect("lix opens on fs backend");
+        assert!(
+            filesystem_path.join(".lix").is_file(),
+            "fs backend should store SQLite at dir/.lix"
+        );
+        assert_eq!(
+            lix.read_file("/.lix")
+                .await
+                .expect("reserved backing file path reads"),
+            None,
+            "dir/.lix should not be imported into Lix"
+        );
         lix.write_file(
             "/persisted.txt",
             b"persisted".to_vec(),
@@ -134,7 +141,7 @@ async fn filesystem_sync_wraps_sqlite_and_materializes_across_reopen() {
 
     {
         let plain = open_lix_with_backend(
-            SqliteBackend::open(&sqlite_path).expect("sqlite backend reopens"),
+            SqliteBackend::open(filesystem_path.join(".lix")).expect("sqlite backend reopens"),
         )
         .await
         .expect("plain lix opens on sqlite backend");
@@ -149,15 +156,12 @@ async fn filesystem_sync_wraps_sqlite_and_materializes_across_reopen() {
         plain.close().await.expect("plain lix closes");
     }
 
-    let backend = FilesystemSync::open(
-        SqliteBackend::open(&sqlite_path).expect("sqlite backend reopens"),
-        &filesystem_path,
-    )
-    .await
-    .expect("filesystem sync reopens");
+    let backend = FsBackend::open(&filesystem_path)
+        .await
+        .expect("fs backend reopens");
     let lix = open_lix_with_backend(backend)
         .await
-        .expect("lix reopens on filesystem sqlite backend");
+        .expect("lix reopens on fs backend");
     assert_eq!(
         lix.read_file("/persisted.txt")
             .await
@@ -172,6 +176,29 @@ async fn filesystem_sync_wraps_sqlite_and_materializes_across_reopen() {
         &filesystem_path.join("second.txt"),
         Some(b"second".as_slice()),
     );
+    lix.close().await.expect("lix closes");
+}
+
+#[tokio::test]
+async fn fs_backend_ignores_sqlite_sidecar_paths() {
+    let tempdir = tempfile::tempdir().expect("tempdir should create");
+    let filesystem_path = tempdir.path().join("filesystem");
+    let lix = open_lix_with_backend(
+        FsBackend::open(&filesystem_path)
+            .await
+            .expect("fs backend opens"),
+    )
+    .await
+    .expect("lix opens on fs backend");
+
+    for path in ["/.lix", "/.lix-wal", "/.lix-shm", "/.lix-journal"] {
+        assert_eq!(
+            lix.read_file(path).await.expect("metadata path reads"),
+            None,
+            "{path} should not be visible as a synced Lix file"
+        );
+    }
+
     lix.close().await.expect("lix closes");
 }
 

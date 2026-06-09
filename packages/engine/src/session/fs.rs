@@ -417,7 +417,7 @@ fn reject_plugin_storage_rm(
         is_plugin_storage_path(path) && path_is_inside_directory(path, normalized_path)
     }) {
         return reject_normal_plugin_storage_mutation(
-            "/.lix/plugins/",
+            "/.lix_system/plugins/",
             "fs.rm recursive directory delete",
         );
     }
