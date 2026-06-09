@@ -193,7 +193,10 @@ simulation_test!(
             &engine,
         );
 
-        for path in ["/.lix/plugins", "/.lix/plugins/plugin_sentinel.lixplugin"] {
+        for path in [
+            "/.lix_system/plugins",
+            "/.lix_system/plugins/plugin_sentinel.lixplugin",
+        ] {
             let error = session
                 .fs
                 .write_file(path, b"bad".to_vec(), FsWriteOptions::default())
@@ -381,7 +384,7 @@ async fn sql_update_rejects_installed_plugin_storage_archive_data_write() {
         .execute(
             "UPDATE lix_file \
              SET data = X'626164' \
-             WHERE path = '/.lix/plugins/plugin_sentinel.lixplugin'",
+             WHERE path = '/.lix_system/plugins/plugin_sentinel.lixplugin'",
             &[],
         )
         .await
@@ -412,18 +415,18 @@ async fn fs_rm_rejects_installed_plugin_storage_deletes() {
 
     for (path, options) in [
         (
-            "/.lix/plugins/plugin_sentinel.lixplugin",
+            "/.lix_system/plugins/plugin_sentinel.lixplugin",
             FsRmOptions::default(),
         ),
         (
-            "/.lix/plugins/",
+            "/.lix_system/plugins/",
             FsRmOptions {
                 recursive: true,
                 ..FsRmOptions::default()
             },
         ),
         (
-            "/.lix/",
+            "/.lix_system/",
             FsRmOptions {
                 recursive: true,
                 ..FsRmOptions::default()

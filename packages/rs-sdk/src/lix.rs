@@ -1,9 +1,9 @@
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
-    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsWriteOptions,
-    InMemoryBackend, InstalledPluginInfo, LixError, MergeBranchOptions, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, SessionContext, SwitchBranchOptions,
-    SwitchBranchReceipt, Value,
+    Backend, CreateBranchOptions, CreateBranchReceipt, Engine, ExecuteResult, FsDirEntry,
+    FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, InstalledPluginInfo, LixError,
+    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    SessionContext, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -156,6 +156,18 @@ where
         self.session.fs().read_file(path).await
     }
 
+    pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
+        self.session.fs().mkdir(path, options).await
+    }
+
+    pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
+        self.session.fs().readdir(path).await
+    }
+
+    pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
+        self.session.fs().rm(path, options).await
+    }
+
     pub async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
     }
@@ -198,7 +210,7 @@ where
     }
 }
 
-async fn open_or_initialize_engine<B>(
+pub(crate) async fn open_or_initialize_engine<B>(
     backend: B,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 ) -> Result<Engine<B>, LixError>

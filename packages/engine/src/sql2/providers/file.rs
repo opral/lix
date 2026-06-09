@@ -3513,19 +3513,19 @@ mod tests {
         let blob_hash = BlobHash::from_content(archive_bytes).to_hex();
         vec![
             live_directory_row(
-                "dir-lix",
+                "dir-lix-system",
                 branch_id,
-                r#"{"id":"dir-lix","parent_id":null,"name":".lix"}"#,
+                r#"{"id":"dir-lix-system","parent_id":null,"name":".lix_system"}"#,
             ),
             live_directory_row(
-                "dir-lix-plugins",
+                "dir-lix-system-plugins",
                 branch_id,
-                r#"{"id":"dir-lix-plugins","parent_id":"dir-lix","name":"plugins"}"#,
+                r#"{"id":"dir-lix-system-plugins","parent_id":"dir-lix-system","name":"plugins"}"#,
             ),
             live_file_row(
                 archive_file_id,
                 branch_id,
-                r#"{"id":"lix_plugin_archive::plugin_sentinel","directory_id":"dir-lix-plugins","name":"plugin_sentinel.lixplugin"}"#,
+                r#"{"id":"lix_plugin_archive::plugin_sentinel","directory_id":"dir-lix-system-plugins","name":"plugin_sentinel.lixplugin"}"#,
             ),
             live_blob_ref_row(
                 archive_file_id,
@@ -3906,7 +3906,7 @@ mod tests {
         let mut resolvers = BTreeMap::new();
 
         let error = lix_file_insert_stage_from_batch_with_path_resolvers(
-            &path_data_insert_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
+            &path_data_insert_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
             None,
             "lix_file",
             &mut resolvers,
@@ -3926,7 +3926,7 @@ mod tests {
         let mut resolvers = BTreeMap::new();
 
         let error = lix_file_update_stage_from_batch_for_test(
-            &path_update_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
+            &path_update_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
                 path: true,
@@ -3947,7 +3947,7 @@ mod tests {
     #[test]
     fn file_data_update_rejects_existing_plugin_storage_path() {
         let error = lix_file_update_stage_from_batch_for_test(
-            &data_update_batch_with_path("/.lix/plugins/plugin_sentinel.lixplugin"),
+            &data_update_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
                 path: false,
@@ -3968,7 +3968,7 @@ mod tests {
     #[test]
     fn file_delete_rejects_plugin_storage_path() {
         let error = lix_file_delete_stage_from_batch(
-            &file_delete_batch_with_path(Some("/.lix/plugins/plugin_sentinel.lixplugin")),
+            &file_delete_batch_with_path(Some("/.lix_system/plugins/plugin_sentinel.lixplugin")),
             None,
             &BTreeSet::new(),
         )
