@@ -13,49 +13,49 @@ use lix_engine::{
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 
-type WorktreeDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
+type FilesystemDebouncer = Debouncer<RecommendedWatcher, RecommendedCache>;
 
 #[derive(Clone)]
 #[expect(missing_debug_implementations)]
-pub struct WorktreeBackend<B>
+pub struct FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     inner: B,
-    supervisor: WorktreeSupervisor<B>,
+    supervisor: FilesystemSupervisor<B>,
 }
 
 #[expect(missing_debug_implementations)]
-pub struct WorktreeWrite<'a, B>
+pub struct FilesystemWrite<'a, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
     inner: B::Write<'a>,
-    supervisor: WorktreeSupervisor<B>,
+    supervisor: FilesystemSupervisor<B>,
 }
 
 #[derive(Clone)]
-struct WorktreeSupervisor<B>
+struct FilesystemSupervisor<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    inner: Arc<WorktreeSupervisorInner>,
+    inner: Arc<FilesystemSupervisorInner>,
     _marker: PhantomData<fn() -> B>,
 }
 
-struct WorktreeSupervisorInner {
-    event_tx: mpsc::Sender<WorktreeEvent>,
-    debouncer: Mutex<Option<WorktreeDebouncer>>,
+struct FilesystemSupervisorInner {
+    event_tx: mpsc::Sender<FilesystemEvent>,
+    debouncer: Mutex<Option<FilesystemDebouncer>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-struct WorktreeState<B>
+struct FilesystemState<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -73,7 +73,7 @@ struct Snapshot {
     files: BTreeMap<String, Vec<u8>>,
 }
 
-enum WorktreeEvent {
+enum FilesystemEvent {
     DiskChanged,
     SyncFromLix {
         reply_tx: mpsc::SyncSender<Result<(), LixError>>,
@@ -81,7 +81,7 @@ enum WorktreeEvent {
     Shutdown,
 }
 
-impl<B> WorktreeBackend<B>
+impl<B> FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -115,12 +115,12 @@ where
     ) -> Result<Self, LixError> {
         Ok(Self {
             inner: backend,
-            supervisor: WorktreeSupervisor::open(engine, root).await?,
+            supervisor: FilesystemSupervisor::open(engine, root).await?,
         })
     }
 }
 
-impl<B> Backend for WorktreeBackend<B>
+impl<B> Backend for FilesystemSync<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -132,7 +132,7 @@ where
         Self: 'a;
 
     type Write<'a>
-        = WorktreeWrite<'a, B>
+        = FilesystemWrite<'a, B>
     where
         Self: 'a;
 
@@ -141,14 +141,14 @@ where
     }
 
     fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        Ok(WorktreeWrite {
+        Ok(FilesystemWrite {
             inner: self.inner.begin_write(opts)?,
             supervisor: self.supervisor.clone(),
         })
     }
 }
 
-impl<B> BackendWrite for WorktreeWrite<'_, B>
+impl<B> BackendWrite for FilesystemWrite<'_, B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -177,7 +177,7 @@ where
     }
 }
 
-impl<B> WorktreeSupervisor<B>
+impl<B> FilesystemSupervisor<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -185,11 +185,11 @@ where
 {
     async fn open(engine: Engine<B>, root: &Path) -> Result<Self, LixError> {
         std::fs::create_dir_all(root)
-            .map_err(|error| io_error("create worktree root", root, error))?;
+            .map_err(|error| io_error("create filesystem root", root, error))?;
         let root = std::fs::canonicalize(root)
-            .map_err(|error| io_error("canonicalize worktree root", root, error))?;
+            .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
         let session = engine.open_workspace_session().await?;
-        let state = Arc::new(WorktreeState {
+        let state = Arc::new(FilesystemState {
             session,
             root,
             sync_lock: tokio::sync::Mutex::new(()),
@@ -202,12 +202,12 @@ where
         let (event_tx, event_rx) = mpsc::channel();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::Builder::new()
-            .name("lix-sdk-worktree-sync".to_string())
-            .spawn(move || worktree_worker(worker_state, event_rx))
+            .name("lix-sdk-filesystem-sync".to_string())
+            .spawn(move || filesystem_worker(worker_state, event_rx))
             .map_err(|error| {
                 LixError::new(
-                    "LIX_WORKTREE_THREAD_ERROR",
-                    format!("failed to start worktree sync worker: {error}"),
+                    "LIX_FILESYSTEM_THREAD_ERROR",
+                    format!("failed to start filesystem sync worker: {error}"),
                 )
             })?;
 
@@ -216,7 +216,7 @@ where
             Duration::from_millis(250),
             None,
             move |_result: DebounceEventResult| {
-                let _ = callback_tx.send(WorktreeEvent::DiskChanged);
+                let _ = callback_tx.send(FilesystemEvent::DiskChanged);
             },
         )
         .map_err(notify_error)?;
@@ -225,7 +225,7 @@ where
             .map_err(notify_error)?;
 
         Ok(Self {
-            inner: Arc::new(WorktreeSupervisorInner {
+            inner: Arc::new(FilesystemSupervisorInner {
                 event_tx,
                 debouncer: Mutex::new(Some(debouncer)),
                 worker: Mutex::new(Some(worker)),
@@ -238,34 +238,34 @@ where
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.inner
             .event_tx
-            .send(WorktreeEvent::SyncFromLix { reply_tx })
+            .send(FilesystemEvent::SyncFromLix { reply_tx })
             .map_err(|error| {
                 BackendError::Io(format!(
-                    "worktree sync failed: worktree worker stopped: {error}"
+                    "filesystem sync failed: filesystem worker stopped: {error}"
                 ))
             })?;
         match reply_rx.recv() {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(worktree_sync_backend_error(error)),
+            Ok(Err(error)) => Err(filesystem_sync_backend_error(error)),
             Err(error) => Err(BackendError::Io(format!(
-                "worktree sync failed: worktree worker stopped: {error}"
+                "filesystem sync failed: filesystem worker stopped: {error}"
             ))),
         }
     }
 }
 
-impl Drop for WorktreeSupervisorInner {
+impl Drop for FilesystemSupervisorInner {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-impl WorktreeSupervisorInner {
+impl FilesystemSupervisorInner {
     fn shutdown(&self) {
         if let Ok(mut debouncer) = self.debouncer.lock() {
-            let _ = debouncer.take().map(WorktreeDebouncer::stop);
+            let _ = debouncer.take().map(FilesystemDebouncer::stop);
         }
-        let _ = self.event_tx.send(WorktreeEvent::Shutdown);
+        let _ = self.event_tx.send(FilesystemEvent::Shutdown);
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(worker) = worker.take() {
                 let _ = worker.join();
@@ -274,7 +274,7 @@ impl WorktreeSupervisorInner {
     }
 }
 
-impl<B> WorktreeState<B>
+impl<B> FilesystemState<B>
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -390,7 +390,7 @@ where
 
     fn materialize_snapshot(&self, target: &Snapshot) -> Result<(), LixError> {
         std::fs::create_dir_all(&self.root)
-            .map_err(|error| io_error("create worktree root", &self.root, error))?;
+            .map_err(|error| io_error("create filesystem root", &self.root, error))?;
         let local = collect_local_snapshot(&self.root)?;
         let previous = self.last_materialized();
 
@@ -402,7 +402,7 @@ where
         }) {
             let local_path = lix_path_to_local_path(&self.root, path)?;
             std::fs::remove_file(&local_path)
-                .map_err(|error| io_error("remove worktree file", &local_path, error))?;
+                .map_err(|error| io_error("remove filesystem file", &local_path, error))?;
         }
 
         let mut directories_to_remove = local
@@ -420,7 +420,7 @@ where
         for path in directories_to_remove {
             let local_path = lix_path_to_local_path(&self.root, &path)?;
             std::fs::remove_dir(&local_path)
-                .map_err(|error| io_error("remove worktree directory", &local_path, error))?;
+                .map_err(|error| io_error("remove filesystem directory", &local_path, error))?;
         }
 
         let mut directories_to_create = target
@@ -433,18 +433,18 @@ where
         for path in directories_to_create {
             let local_path = lix_path_to_local_path(&self.root, &path)?;
             std::fs::create_dir_all(&local_path)
-                .map_err(|error| io_error("create worktree directory", &local_path, error))?;
+                .map_err(|error| io_error("create filesystem directory", &local_path, error))?;
         }
 
         for (path, data) in &target.files {
             let local_path = lix_path_to_local_path(&self.root, path)?;
             if let Some(parent) = local_path.parent() {
                 std::fs::create_dir_all(parent)
-                    .map_err(|error| io_error("create worktree file parent", parent, error))?;
+                    .map_err(|error| io_error("create filesystem file parent", parent, error))?;
             }
             if local.files.get(path) != Some(data) {
                 std::fs::write(&local_path, data)
-                    .map_err(|error| io_error("write worktree file", &local_path, error))?;
+                    .map_err(|error| io_error("write filesystem file", &local_path, error))?;
             }
         }
 
@@ -455,26 +455,26 @@ where
         *self
             .last_materialized
             .lock()
-            .expect("worktree materialized snapshot lock should not poison") = Some(snapshot);
+            .expect("filesystem materialized snapshot lock should not poison") = Some(snapshot);
     }
 
     fn last_materialized(&self) -> Option<Snapshot> {
         self.last_materialized
             .lock()
-            .expect("worktree materialized snapshot lock should not poison")
+            .expect("filesystem materialized snapshot lock should not poison")
             .clone()
     }
 
     fn is_last_materialized(&self, snapshot: &Snapshot) -> bool {
         self.last_materialized
             .lock()
-            .expect("worktree materialized snapshot lock should not poison")
+            .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
             == Some(snapshot)
     }
 }
 
-fn worktree_worker<B>(state: Arc<WorktreeState<B>>, event_rx: mpsc::Receiver<WorktreeEvent>)
+fn filesystem_worker<B>(state: Arc<FilesystemState<B>>, event_rx: mpsc::Receiver<FilesystemEvent>)
 where
     B: Backend + Clone + Send + Sync + 'static,
     for<'backend> B::Read<'backend>: Send,
@@ -485,18 +485,18 @@ where
     };
     loop {
         match event_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(WorktreeEvent::DiskChanged) => {
-                if drain_worktree_events(&runtime, &state, &event_rx, true) {
+            Ok(FilesystemEvent::DiskChanged) => {
+                if drain_filesystem_events(&runtime, &state, &event_rx, true) {
                     return;
                 }
             }
-            Ok(WorktreeEvent::SyncFromLix { reply_tx }) => {
+            Ok(FilesystemEvent::SyncFromLix { reply_tx }) => {
                 sync_from_lix_for_replies(&runtime, &state, vec![reply_tx]);
-                if drain_worktree_events(&runtime, &state, &event_rx, false) {
+                if drain_filesystem_events(&runtime, &state, &event_rx, false) {
                     return;
                 }
             }
-            Ok(WorktreeEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(FilesystemEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = runtime.block_on(state.close());
                 return;
             }
@@ -507,10 +507,10 @@ where
     }
 }
 
-fn drain_worktree_events<B>(
+fn drain_filesystem_events<B>(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<WorktreeState<B>>,
-    event_rx: &mpsc::Receiver<WorktreeEvent>,
+    state: &Arc<FilesystemState<B>>,
+    event_rx: &mpsc::Receiver<FilesystemEvent>,
     mut sync_disk: bool,
 ) -> bool
 where
@@ -521,9 +521,9 @@ where
     let mut sync_replies = Vec::new();
     loop {
         match event_rx.try_recv() {
-            Ok(WorktreeEvent::DiskChanged) => sync_disk = true,
-            Ok(WorktreeEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
-            Ok(WorktreeEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+            Ok(FilesystemEvent::DiskChanged) => sync_disk = true,
+            Ok(FilesystemEvent::SyncFromLix { reply_tx }) => sync_replies.push(reply_tx),
+            Ok(FilesystemEvent::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
                 let _ = runtime.block_on(state.close());
                 return true;
             }
@@ -541,7 +541,7 @@ where
 
 fn sync_from_lix_for_replies<B>(
     runtime: &tokio::runtime::Runtime,
-    state: &Arc<WorktreeState<B>>,
+    state: &Arc<FilesystemState<B>>,
     replies: Vec<mpsc::SyncSender<Result<(), LixError>>>,
 ) where
     B: Backend + Clone + Send + Sync + 'static,
@@ -556,17 +556,17 @@ fn sync_from_lix_for_replies<B>(
 
 fn collect_local_snapshot(root: &Path) -> Result<Snapshot, LixError> {
     let metadata = std::fs::symlink_metadata(root)
-        .map_err(|error| io_error("read worktree root metadata", root, error))?;
+        .map_err(|error| io_error("read filesystem root metadata", root, error))?;
     if metadata.file_type().is_symlink() {
         let root = root.display();
-        return Err(worktree_error(format!(
-            "worktree root {root} must not be a symlink"
+        return Err(filesystem_error(format!(
+            "filesystem root {root} must not be a symlink"
         )));
     }
     if !metadata.is_dir() {
         let root = root.display();
-        return Err(worktree_error(format!(
-            "worktree root {root} must be a directory"
+        return Err(filesystem_error(format!(
+            "filesystem root {root} must be a directory"
         )));
     }
 
@@ -582,18 +582,18 @@ fn collect_local_directory(
     snapshot: &mut Snapshot,
 ) -> Result<(), LixError> {
     let entries = std::fs::read_dir(directory)
-        .map_err(|error| io_error("read worktree directory", directory, error))?;
+        .map_err(|error| io_error("read filesystem directory", directory, error))?;
     for entry in entries {
         let entry =
-            entry.map_err(|error| io_error("read worktree directory entry", directory, error))?;
+            entry.map_err(|error| io_error("read filesystem directory entry", directory, error))?;
         let path = entry.path();
         let file_type = entry
             .file_type()
-            .map_err(|error| io_error("read worktree entry type", &path, error))?;
+            .map_err(|error| io_error("read filesystem entry type", &path, error))?;
         if file_type.is_symlink() {
             let path = path.display();
-            return Err(worktree_error(format!(
-                "worktree path {path} must not be a symlink"
+            return Err(filesystem_error(format!(
+                "filesystem path {path} must not be a symlink"
             )));
         }
         if file_type.is_dir() {
@@ -603,14 +603,14 @@ fn collect_local_directory(
             collect_local_directory(root, &path, snapshot)?;
         } else if file_type.is_file() {
             let data = std::fs::read(&path)
-                .map_err(|error| io_error("read worktree file", &path, error))?;
+                .map_err(|error| io_error("read filesystem file", &path, error))?;
             snapshot
                 .files
                 .insert(local_path_to_lix_path(root, &path, false)?, data);
         } else {
             let path = path.display();
-            return Err(worktree_error(format!(
-                "worktree path {path} is not a regular file or directory"
+            return Err(filesystem_error(format!(
+                "filesystem path {path} is not a regular file or directory"
             )));
         }
     }
@@ -625,21 +625,21 @@ fn local_path_to_lix_path(
     let relative = path.strip_prefix(root).map_err(|error| {
         let path = path.display();
         let root = root.display();
-        worktree_error(format!(
-            "worktree path {path} is not inside root {root}: {error}"
+        filesystem_error(format!(
+            "filesystem path {path} is not inside root {root}: {error}"
         ))
     })?;
     let mut segments = Vec::new();
     for component in relative.components() {
         let Component::Normal(segment) = component else {
             let path = path.display();
-            return Err(worktree_error(format!(
-                "worktree path {path} contains an unsupported path component"
+            return Err(filesystem_error(format!(
+                "filesystem path {path} contains an unsupported path component"
             )));
         };
         let segment = segment.to_str().ok_or_else(|| {
             let path = path.display();
-            worktree_error(format!("worktree path {path} is not valid UTF-8"))
+            filesystem_error(format!("filesystem path {path} is not valid UTF-8"))
         })?;
         validate_lix_path_segment(segment, path)?;
         segments.push(segment.to_string());
@@ -660,7 +660,7 @@ fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> 
     }
     let body = path
         .strip_prefix('/')
-        .ok_or_else(|| worktree_error(format!("Lix path {path:?} is not absolute")))?;
+        .ok_or_else(|| filesystem_error(format!("Lix path {path:?} is not absolute")))?;
     let body = body.strip_suffix('/').unwrap_or(body);
     if body.is_empty() {
         return Ok(root.to_path_buf());
@@ -668,7 +668,7 @@ fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> 
     let mut local = root.to_path_buf();
     for segment in body.split('/') {
         if segment.is_empty() {
-            return Err(worktree_error(format!(
+            return Err(filesystem_error(format!(
                 "Lix path {path:?} contains an empty segment"
             )));
         }
@@ -689,8 +689,8 @@ fn validate_lix_path_segment(segment: &str, path: &Path) -> Result<(), LixError>
         || segment.contains('#')
     {
         let path = path.display();
-        return Err(worktree_error(format!(
-            "worktree path {path} contains invalid Lix path segment {segment:?}"
+        return Err(filesystem_error(format!(
+            "filesystem path {path} contains invalid Lix path segment {segment:?}"
         )));
     }
     Ok(())
@@ -728,22 +728,22 @@ fn path_depth(path: &str) -> usize {
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> LixError {
     let path = path.display();
     LixError::new(
-        "LIX_WORKTREE_IO_ERROR",
+        "LIX_FILESYSTEM_IO_ERROR",
         format!("{operation} {path}: {error}"),
     )
 }
 
 fn notify_error(error: notify_debouncer_full::notify::Error) -> LixError {
     LixError::new(
-        "LIX_WORKTREE_NOTIFY_ERROR",
-        format!("worktree watcher error: {error}"),
+        "LIX_FILESYSTEM_NOTIFY_ERROR",
+        format!("filesystem watcher error: {error}"),
     )
 }
 
-fn worktree_sync_backend_error(error: LixError) -> BackendError {
-    BackendError::Io(format!("worktree sync failed: {}", error.format()))
+fn filesystem_sync_backend_error(error: LixError) -> BackendError {
+    BackendError::Io(format!("filesystem sync failed: {}", error.format()))
 }
 
-fn worktree_error(message: impl Into<String>) -> LixError {
-    LixError::new("LIX_WORKTREE_ERROR", message)
+fn filesystem_error(message: impl Into<String>) -> LixError {
+    LixError::new("LIX_FILESYSTEM_ERROR", message)
 }

@@ -1,7 +1,7 @@
 use lix_sdk::{
-    CreateBranchOptions, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, Lix,
-    LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
-    WorktreeBackend, open_lix, open_lix_with_backend,
+    CreateBranchOptions, FilesystemSync, FsMkdirOptions, FsRmOptions, FsWriteOptions,
+    InMemoryBackend, Lix, LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions,
+    SwitchBranchOptions, Value, open_lix, open_lix_with_backend,
 };
 #[cfg(feature = "default_wasm_runtime")]
 use std::io::{Cursor, Write};
@@ -942,13 +942,13 @@ async fn transaction_blocks_session_execute_on_same_handle() {
 }
 
 #[tokio::test]
-async fn worktree_initial_import_uses_local_files_as_source_of_truth() {
+async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tempdir.path().join("docs")).unwrap();
     std::fs::create_dir_all(tempdir.path().join("empty")).unwrap();
     std::fs::write(tempdir.path().join("docs/readme.txt"), b"local").unwrap();
 
-    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
 
     assert_eq!(
         lix.read_file("/docs/readme.txt").await.unwrap().as_deref(),
@@ -962,16 +962,16 @@ async fn worktree_initial_import_uses_local_files_as_source_of_truth() {
     lix.close().await.unwrap();
 }
 
-async fn open_lix_with_worktree(
+async fn open_lix_with_filesystem(
     backend: InMemoryBackend,
     path: &Path,
-) -> Lix<WorktreeBackend<InMemoryBackend>> {
-    let backend = WorktreeBackend::open(backend, path).await.unwrap();
+) -> Lix<FilesystemSync<InMemoryBackend>> {
+    let backend = FilesystemSync::open(backend, path).await.unwrap();
     open_lix_with_backend(backend).await.unwrap()
 }
 
 #[tokio::test]
-async fn worktree_initial_import_deletes_lix_entries_missing_locally() {
+async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let backend = InMemoryBackend::new();
     let seed = open_lix_with_backend(backend.clone()).await.unwrap();
     seed.write_file("/old.txt", b"old".to_vec(), FsWriteOptions::default())
@@ -983,7 +983,7 @@ async fn worktree_initial_import_deletes_lix_entries_missing_locally() {
     seed.close().await.unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_worktree(backend, tempdir.path()).await;
+    let lix = open_lix_with_filesystem(backend, tempdir.path()).await;
 
     assert_eq!(lix.read_file("/old.txt").await.unwrap(), None);
     assert_eq!(lix.readdir("/old-empty/").await.unwrap(), None);
@@ -993,9 +993,9 @@ async fn worktree_initial_import_deletes_lix_entries_missing_locally() {
 }
 
 #[tokio::test]
-async fn worktree_materializes_sdk_sql_and_transaction_writes() {
+async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("pending-local.txt"), b"pending").unwrap();
     lix.write_file("/sdk.txt", b"sdk".to_vec(), FsWriteOptions::default())
@@ -1071,9 +1071,9 @@ async fn worktree_materializes_sdk_sql_and_transaction_writes() {
 }
 
 #[tokio::test]
-async fn worktree_watcher_syncs_disk_changes_to_lix() {
+async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
 
     std::fs::write(tempdir.path().join("disk.txt"), b"disk").unwrap();
     wait_for_lix_file(&lix, "/disk.txt", Some(b"disk")).await;
@@ -1094,9 +1094,9 @@ async fn worktree_watcher_syncs_disk_changes_to_lix() {
 
 #[tokio::test]
 #[cfg(feature = "default_wasm_runtime")]
-async fn worktree_materializes_internal_lix_plugin_paths() {
+async fn filesystem_materializes_internal_lix_plugin_paths() {
     let tempdir = tempfile::tempdir().unwrap();
-    let lix = open_lix_with_worktree(InMemoryBackend::new(), tempdir.path()).await;
+    let lix = open_lix_with_filesystem(InMemoryBackend::new(), tempdir.path()).await;
     let archive = build_csv_plugin_archive();
 
     lix.install_plugin_archive(&archive).await.unwrap();
@@ -1109,31 +1109,31 @@ async fn worktree_materializes_internal_lix_plugin_paths() {
 }
 
 #[tokio::test]
-async fn worktree_rejects_invalid_lix_path_names() {
+async fn filesystem_rejects_invalid_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
 
-    let Err(error) = WorktreeBackend::open(InMemoryBackend::new(), tempdir.path()).await else {
-        panic!("invalid worktree path should fail");
+    let Err(error) = FilesystemSync::open(InMemoryBackend::new(), tempdir.path()).await else {
+        panic!("invalid filesystem path should fail");
     };
 
-    assert_eq!(error.code, "LIX_WORKTREE_ERROR");
+    assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
 }
 
 #[tokio::test]
 #[cfg(unix)]
-async fn worktree_rejects_symlinks() {
+async fn filesystem_rejects_symlinks() {
     use std::os::unix::fs::symlink;
 
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
     symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
 
-    let Err(error) = WorktreeBackend::open(InMemoryBackend::new(), tempdir.path()).await else {
+    let Err(error) = FilesystemSync::open(InMemoryBackend::new(), tempdir.path()).await else {
         panic!("symlink should fail");
     };
 
-    assert_eq!(error.code, "LIX_WORKTREE_ERROR");
+    assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
 }
 
 fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
@@ -1153,7 +1153,7 @@ fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
 }
 
 async fn wait_for_lix_file(
-    lix: &Lix<WorktreeBackend<InMemoryBackend>>,
+    lix: &Lix<FilesystemSync<InMemoryBackend>>,
     path: &str,
     expected: Option<&[u8]>,
 ) {
@@ -1172,7 +1172,7 @@ async fn wait_for_lix_file(
 }
 
 async fn wait_for_lix_directory(
-    lix: &Lix<WorktreeBackend<InMemoryBackend>>,
+    lix: &Lix<FilesystemSync<InMemoryBackend>>,
     path: &str,
     expected: bool,
 ) {
