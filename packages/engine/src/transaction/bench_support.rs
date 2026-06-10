@@ -197,6 +197,45 @@ where
         self.read_one(&self.rows[self.rows.len() / 2]).await
     }
 
+    /// Returns every visible row's identity and snapshot content, sorted by
+    /// identity. Unlike the timed read helpers this materializes contents,
+    /// so equivalence tests can compare logical state across backends.
+    pub async fn read_all_contents(&self) -> Vec<(String, String)> {
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .expect("begin transaction bench read"),
+        );
+        let rows = self
+            .live_state
+            .reader(read)
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["json_pointer".to_string()],
+                    branch_ids: vec![BENCH_BRANCH_ID.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones: false,
+                    ..LiveStateFilter::default()
+                },
+                projection: LiveStateProjection::default(),
+                limit: None,
+            })
+            .await
+            .expect("scan transaction bench rows");
+        let mut contents = rows
+            .into_iter()
+            .map(|row| {
+                let entity_pk = row
+                    .entity_pk
+                    .as_json_array_text()
+                    .expect("bench entity pk should render");
+                (entity_pk, row.snapshot_content.unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+        contents.sort();
+        contents
+    }
+
     async fn read_one(&self, row: &BenchTransactionRow) -> usize {
         let read = SharedStorageRead::new(
             self.storage

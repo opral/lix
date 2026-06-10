@@ -6,6 +6,9 @@ mod redb;
 #[path = "backend/rocksdb.rs"]
 mod rocksdb;
 
+#[path = "backend/scrambled.rs"]
+mod scrambled;
+
 #[path = "backend/sqlite.rs"]
 mod sqlite;
 

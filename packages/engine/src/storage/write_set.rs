@@ -260,7 +260,36 @@ impl StorageWriteSet {
             groups, mut stats, ..
         } = self;
 
-        for group in groups {
+        for mut group in groups {
+            // Lower each space batch in ascending key order. Hash-keyed
+            // spaces such as json_store produce effectively random insertion
+            // order; sorted batches let B-tree backends write with cursor
+            // locality instead of a fresh seek per key. Within a group every
+            // key shares the space prefix, so logical order equals physical
+            // order. Most other spaces already produce key order (BTreeMap
+            // iteration, time-ordered ids), so the common case is a
+            // read-only scan.
+            let puts_sorted = group
+                .puts
+                .is_sorted_by(|left, right| left.key.0 <= right.key.0);
+            let deletes_sorted = group.deletes.is_sorted();
+            #[cfg(feature = "storage-benches")]
+            if order_stats_enabled() && !group.puts.is_empty() {
+                eprintln!(
+                    "write-set-order space={} puts={} puts_sorted={puts_sorted} deletes={} deletes_sorted={deletes_sorted}",
+                    group.space.name,
+                    group.puts.len(),
+                    group.deletes.len(),
+                );
+            }
+            if !puts_sorted {
+                group
+                    .puts
+                    .sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
+            }
+            if !deletes_sorted {
+                group.deletes.sort_unstable();
+            }
             if !group.puts.is_empty() {
                 stats.put_batches += 1;
                 stats.backend_calls += 1;
@@ -383,6 +412,14 @@ impl From<BackendError> for StorageWriteSetError {
     fn from(error: BackendError) -> Self {
         Self::Backend(error)
     }
+}
+
+#[cfg(feature = "storage-benches")]
+fn order_stats_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("LIX_WRITE_SET_ORDER_STATS").is_some());
+    *ENABLED
 }
 
 #[cfg(test)]

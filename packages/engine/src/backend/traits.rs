@@ -203,9 +203,17 @@ pub trait BackendWrite {
     ///
     /// Batches hold at most one mutation per key (the engine's write-set
     /// validation enforces this before lowering), so backends may reorder
-    /// entries freely, e.g. to write in key order.
+    /// entries freely. The engine's write-set lowering additionally produces
+    /// batches sorted by key ascending, so backends that want key order pay
+    /// at most a linear verification pass on engine-produced batches. Other
+    /// callers (e.g. the conformance suite) may pass unsorted batches.
     fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
 
+    /// Deletes the given keys.
+    ///
+    /// Like put batches, key sets hold at most one mutation per key
+    /// (write-set validation rejects duplicates), and the engine's write-set
+    /// lowering produces them sorted ascending.
     fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
 
     fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError>;

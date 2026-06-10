@@ -1052,3 +1052,72 @@ update_one_by_pk each). Eliminating it requires caching scan results keyed on
 storage state, which needs an invalidation story; deferred. The validation
 fast-path (unconsumable fk_target bookkeeping, jsonschema is_valid) remains
 the next bulk-op target.
+
+## Backend Contract: sorted batch lowering and unspecified visit order
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_WRITE_SET_ORDER_STATS=1 LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'kv_layout/lix_redb/smoke/update_all_rows'
+```
+
+Measurement (env-gated `LIX_WRITE_SET_ORDER_STATS` probe in write-set
+lowering):
+
+- Per 1k transaction insert/update commit, the hash-keyed
+  `json_store.json` batch (1,001 puts, ~49% of all puts) arrives unsorted;
+  `changelog.change` (1,000 puts, time-ordered ids) and
+  `tracked_state.tree_chunk` (BTreeMap iteration) arrive sorted.
+- The kv_layout bench writes its 1,000-put batch unsorted.
+- Delete commits lower almost entirely pre-sorted batches.
+
+Changes:
+
+- `StorageWriteSet` lowering now delivers each space batch to the backend
+  sorted by key ascending (skipping the sort when the batch is already
+  sorted, which is the common case for changelog/tree spaces; the
+  sortedness check itself is a read-only scan). Within a group all keys
+  share the space prefix, so logical order equals physical order. The
+  order probe reports natural order before the sort and covers puts and
+  deletes.
+- `BackendWrite::put_many`/`delete_many` document the contract: at most one
+  mutation per key, engine-produced batches sorted ascending.
+- `BackendRead::visit_keys` order is now actively enforced as unspecified: a
+  new order-scrambling backend decorator (`tests/backend/scrambled.rs`)
+  replays point-read visits in a seeded-shuffled order and must pass both
+  the backend conformance suite and a full transaction CRUD equivalence
+  test (identical row contents and identical per-space layout accounting at
+  every stage versus the plain in-memory backend; byte-exact physical
+  comparison is impossible because commit/change ids differ per run). Both
+  pass.
+
+Same-day A/B (single binary where noted):
+
+| Workload                          | Unsorted | Sorted  |  Delta |
+| --------------------------------- | -------: | ------: | -----: |
+| kv_layout redb update_all 1k      |  7.57 ms | 6.19 ms | -18.2% |
+| kv_layout rocksdb insert_all 1k   |   425 us |  349 us | -17.9% |
+| kv_layout sqlite insert_all 1k    |  1.51 ms | 1.42 ms |  -6.0% |
+| transaction redb update_all 1k    | 19.50 ms | 17.38 ms | -10.9% |
+| transaction sqlite delete_all 1k  |  ~12.0 ms | ~12.5 ms | inconclusive |
+
+The sqlite transaction delete_all cell initially measured +5-6% slower with
+sorting in stash-based A/Bs. A single-binary A/B (temporary
+`LIX_LOWER_UNSORTED` env toggle, removed with this change; reproduce by
+reverting the sort block in `write_set.rs`) also showed it, but reversing
+the within-pair run order flipped the sign in one of three pairs and
+widened the unsorted spread to +/-8%; the order probe shows the timed
+delete batches are already sorted, so sorting performs no writes on that
+path (only the read-only sortedness scan runs). Treated as noise. The
+kv_layout rows in the table above are stash-based same-day pairs; the
+delete_all investigation used the single-binary toggle. All engine test
+targets pass; accounting is unchanged (sorting only reorders within a
+batch).
+
+The rs-sdk SQLite backend keeps its internal sort as a cheap verification
+pass; with engine-sorted input it degenerates to a single ascending-run
+detection.

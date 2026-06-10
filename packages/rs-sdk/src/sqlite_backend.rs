@@ -381,6 +381,10 @@ impl BackendWrite for SqliteWrite {
         // Sorting keeps the upsert's conflict probe on a near-neighbor B-tree
         // descent instead of a fresh root-to-leaf seek per row. Batches hold
         // at most one mutation per key, so apply order does not matter.
+        // Engine write-set lowering already produces sorted batches, making
+        // this a linear verification pass; it stays because the sorted
+        // guarantee is scoped to the engine and other callers may pass
+        // unsorted batches.
         entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
         debug_assert!(
             entries.windows(2).all(|pair| pair[0].key != pair[1].key),
