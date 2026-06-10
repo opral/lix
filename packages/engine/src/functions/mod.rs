@@ -13,6 +13,8 @@ mod types;
 pub(crate) use context::FunctionContext;
 pub(crate) use deterministic::DeterministicFunctionProvider;
 pub(crate) use provider::{FunctionProvider, FunctionProviderHandle, SystemFunctionProvider};
+#[cfg(feature = "storage-benches")]
+pub(crate) use state::DETERMINISTIC_MODE_KEY;
 pub(crate) use types::{DeterministicMode, DeterministicSequence};
 
 pub(crate) type DeterministicRuntimeGuard = tokio::sync::OwnedMutexGuard<()>;

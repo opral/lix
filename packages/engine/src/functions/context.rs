@@ -26,16 +26,23 @@ impl FunctionContext {
     #[expect(trivial_casts)]
     pub(crate) async fn prepare(live_state: &dyn LiveStateReader) -> Result<Self, LixError> {
         let mode = state::load_mode(live_state).await?;
-        let mut bookkeeping_functions = SystemFunctionProvider;
-        let bookkeeping_timestamp = bookkeeping_functions.timestamp();
         if !mode.enabled {
+            let mut bookkeeping_functions = SystemFunctionProvider;
             return Ok(Self {
                 functions: FunctionProviderHandle::system(),
-                bookkeeping_timestamp,
+                bookkeeping_timestamp: bookkeeping_functions.timestamp(),
             });
         }
 
         let sequence = state::load_sequence(live_state).await?;
+        // Deterministic mode must produce byte-identical state across runs;
+        // bookkeeping rows (sequence persistence) take a timestamp derived
+        // from the persisted sequence instead of the system clock, without
+        // consuming a sequence tick from user-visible functions. The value
+        // is intentionally un-shuffled: timestamp_shuffle exists to break
+        // ordering assumptions on user-visible timestamps only.
+        let bookkeeping_timestamp =
+            LixTimestamp::from_unix_millis_utc_lossy(sequence.next_sequence());
         Ok(Self {
             functions: FunctionProviderHandle::shared(Box::new(DeterministicFunctionProvider::new(
                 sequence.next_sequence(),
@@ -237,6 +244,27 @@ mod tests {
         );
         let sequence = load_sequence(&reader).await.expect("sequence should load");
         assert_eq!(sequence, DeterministicSequence { highest_seen: 0 });
+
+        // Deterministic mode must stamp the bookkeeping row from the
+        // persisted sequence, never from the system clock; the persisted
+        // sequence was empty, so next_sequence is 0 -> epoch.
+        let row = LiveStateReader::load_row(
+            &reader,
+            &crate::live_state::LiveStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk: crate::entity_pk::EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
+                file_id: crate::NullableKeyFilter::Null,
+            },
+        )
+        .await
+        .expect("sequence row should load")
+        .expect("sequence row should exist");
+        assert_eq!(
+            row.created_at, "1970-01-01T00:00:00.000Z",
+            "bookkeeping timestamp must derive from the sequence, not the system clock"
+        );
+        assert_eq!(row.created_at, row.updated_at);
     }
 
     #[tokio::test]

@@ -1190,3 +1190,72 @@ small against commit totals. The durable claim is the storage table above.
   all targets (three changelog scan tests and two rebuild tests updated:
   resume tokens are typed now, and corruption fixtures plant records at
   binary keys).
+
+## Tree-Chunk Leaf Compaction: front-coded keys
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Change (hard cut):
+
+- Leaf nodes use a new wire format: a kind byte, then per entry a
+  shared-prefix length, key suffix, and verbatim value bytes. Entries within
+  a node are sorted, so consecutive keys share the encoded
+  schema-key/file-id prefix and most of the entity pk; front-coding removes
+  that redundancy. Values are untouched, so value byte-equality and the
+  value codec are unchanged. Internal nodes keep their musli body behind the
+  kind byte.
+- Chunk boundary logic is untouched: boundaries are content-defined on
+  uncompressed key bytes, so the same entries land in the same chunks and
+  history-independence is preserved by construction. There is no
+  estimator/codec coupling to drift.
+- Decode reconstructs keys into a single pre-reserved arena per node; values
+  stay zero-copy. Debug builds verify every encoded leaf round-trips.
+  Property tests cover representative shapes, 512 generated heavy-prefix
+  keys, determinism, and malformed-byte rejection.
+
+### Storage A/B (1k insert footprint, identical across backends)
+
+| Metric                              |  Before |   After |  Delta |
+| ----------------------------------- | ------: | ------: | -----: |
+| `tree_chunk` value bytes (27 chunks) | 162,086 | 125,918 | -22.3% |
+| transaction insert_all written bytes | 642,063 | 606,256 |  -5.6% |
+| transaction update_all written bytes | 728,421 | 692,589 |  -4.9% |
+| transaction delete_all written bytes | 292,912 | 257,080 | -12.2% |
+
+Put counts and chunk counts unchanged.
+
+### Perf A/B (alternating stash triples, RocksDB)
+
+- read_one_by_pk: OLD mean 64.0 us, NEW mean 51.3 us (faster in all three
+  pairs; smaller chunks mean less memory traffic on hot decodes).
+- read_many_by_pk initially regressed +8.3% consistently: the decode arena
+  grew by doubling, costing ~8 re-allocations per leaf. Pre-reserving the
+  arena to the body length erased it (OLD mean 313.3 us, NEW 311.3 us, sign
+  flipping across pairs).
+- 10k spot check: rocksdb transaction insert 77.6 ms, read_all 32.7 ms; no
+  split pathology (boundaries are codec-independent).
+
+### Byte-exact order-independence enforcement
+
+Validating this change hardened the equivalence suite and found an engine
+bug:
+
+- The scrambled-visit equivalence test now runs both fixtures in
+  deterministic-functions mode and asserts byte-identical storage across all
+  ten spaces at every stage, replacing aggregate row/byte-total comparison
+  (which could collide and, with wall-clock content, flaked
+  time-dependently).
+- The exact comparison immediately exposed that `FunctionContext::prepare`
+  stamped the deterministic-sequence bookkeeping row from the system clock
+  even in deterministic mode, violating that mode's byte-determinism
+  contract. Bookkeeping timestamps now derive from the persisted sequence
+  without consuming a sequence tick. Stress: 20 consecutive runs green.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,538 passed.

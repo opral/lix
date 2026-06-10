@@ -70,6 +70,53 @@ where
         .collect()
 }
 
+/// Per-row (key, value bytes) inventory of one space.
+///
+/// Equivalence tests compare these inventories byte-for-byte, so the scan
+/// must be complete; the function asserts it observed every row.
+pub fn space_inventory<R>(read: &R, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)>
+where
+    R: StorageRead,
+{
+    let space = *native_storage_spaces()
+        .iter()
+        .find(|space| space.name == space_name)
+        .expect("space name should exist");
+    let result = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    )
+    .collect(
+        read,
+        StorageScanOptions {
+            projection: StorageCoreProjection::FullValue,
+            limit_rows: 1_000_000,
+            ..StorageScanOptions::default()
+        },
+    )
+    .expect("inventory scan should succeed");
+    assert!(
+        !result.value.has_more,
+        "space inventory scan must observe every row"
+    );
+    result
+        .value
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.key.0.to_vec(),
+                match &entry.value {
+                    StorageProjectedValue::KeyOnly => Vec::new(),
+                    StorageProjectedValue::FullValue(value) => value.to_vec(),
+                },
+            )
+        })
+        .collect()
+}
+
 fn native_storage_spaces() -> &'static [crate::storage::StorageSpace] {
     &[
         crate::untracked_state::storage::UNTRACKED_STATE_ROW_SPACE,

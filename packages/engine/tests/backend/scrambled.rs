@@ -206,10 +206,15 @@ mod engine_paths {
     /// results and byte-identical physical layout.
     #[tokio::test]
     async fn engine_transaction_paths_are_visit_order_independent() {
-        let plain =
-            BenchTransactionFixture::new(StorageContext::new(InMemoryBackend::new()), bench_rows())
-                .await;
-        let scrambled = BenchTransactionFixture::new(
+        // Deterministic functions make ids and timestamps sequence-derived,
+        // so the two fixtures must produce byte-identical storage and the
+        // comparison below can be exact instead of aggregate.
+        let plain = BenchTransactionFixture::new_deterministic(
+            StorageContext::new(InMemoryBackend::new()),
+            bench_rows(),
+        )
+        .await;
+        let scrambled = BenchTransactionFixture::new_deterministic(
             StorageContext::new(ScrambledVisitBackend {
                 inner: InMemoryBackend::new(),
             }),
@@ -275,11 +280,10 @@ mod engine_paths {
         );
     }
 
-    /// Compares full logical row contents (identity + snapshot) plus
-    /// per-space layout accounting. Contents catch value cross-wiring that
-    /// count or byte-sum aggregates would miss; ids and timestamps differ
-    /// between the fixtures, so byte-exact physical comparison is not
-    /// possible without injecting deterministic functions.
+    /// Compares full logical row contents (identity + snapshot) and the
+    /// byte-exact per-space physical inventories. Both fixtures run with
+    /// deterministic functions, so ids and timestamps are identical and any
+    /// divergence is a real visit-order dependence.
     async fn assert_state_matches(
         plain: &BenchTransactionFixture<InMemoryBackend>,
         scrambled: &BenchTransactionFixture<ScrambledVisitBackend>,
@@ -293,40 +297,48 @@ mod engine_paths {
         assert_layouts_match(plain, scrambled, stage);
     }
 
+    const COMPARED_SPACES: [&str; 10] = [
+        "untracked_state.row.v1",
+        "json_store.json",
+        "tracked_state.tree_chunk",
+        "tracked_state.commit_root",
+        "binary_cas.manifest",
+        "binary_cas.manifest_chunk",
+        "binary_cas.chunk",
+        "changelog.commit",
+        "changelog.change",
+        "changelog.commit_change_ref_chunk",
+    ];
+
+    /// Asserts byte-identical storage across every native space. Possible
+    /// because both fixtures run with deterministic functions; any
+    /// visit-order dependence in engine reads shows up as a content diff.
     fn assert_layouts_match(
         plain: &BenchTransactionFixture<InMemoryBackend>,
         scrambled: &BenchTransactionFixture<ScrambledVisitBackend>,
         stage: &str,
     ) {
-        let plain_layout = plain
+        // Guard against the space list rotting: every native space reported
+        // by layout accounting must be in the compared set.
+        let accounted = plain
             .layout_accounting()
             .into_iter()
-            .map(|space| {
-                (
-                    space.space_id,
-                    space.space,
-                    space.rows,
-                    space.key_bytes,
-                    space.value_bytes,
-                )
-            })
-            .collect::<Vec<_>>();
-        let scrambled_layout = scrambled
-            .layout_accounting()
-            .into_iter()
-            .map(|space| {
-                (
-                    space.space_id,
-                    space.space,
-                    space.rows,
-                    space.key_bytes,
-                    space.value_bytes,
-                )
-            })
+            .map(|space| space.space)
             .collect::<Vec<_>>();
         assert_eq!(
-            plain_layout, scrambled_layout,
-            "layout accounting (per-space row counts and key/value byte totals) must match regardless of visit order ({stage})"
+            accounted,
+            COMPARED_SPACES.to_vec(),
+            "COMPARED_SPACES must list every native storage space"
         );
+        for space in COMPARED_SPACES {
+            let mut plain_rows = plain.space_inventory(space);
+            let mut scrambled_rows = scrambled.space_inventory(space);
+            plain_rows.sort();
+            scrambled_rows.sort();
+            assert_eq!(
+                plain_rows, scrambled_rows,
+                "space {space} must be byte-identical regardless of visit order ({stage})"
+            );
+        }
     }
 }

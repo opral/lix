@@ -101,24 +101,42 @@ impl DecodedLeafNode {
     }
 }
 
+/// Decoded view of a leaf node.
+///
+/// Keys are stored front-coded on disk and reconstructed into one arena at
+/// decode time; values stay borrowed from the chunk bytes verbatim.
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedLeafNodeRef<'a> {
-    entries: Vec<EncodedLeafEntryRef<'a>>,
+    key_arena: Vec<u8>,
+    entries: Vec<LeafEntrySpan<'a>>,
 }
 
-impl<'a> DecodedLeafNodeRef<'a> {
+#[derive(Debug, Clone, Copy)]
+struct LeafEntrySpan<'a> {
+    key_start: usize,
+    key_end: usize,
+    value: &'a [u8],
+}
+
+impl DecodedLeafNodeRef<'_> {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     #[expect(clippy::unnecessary_wraps)]
-    pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'a>>, LixError> {
-        Ok(self.entries.get(index).copied())
+    pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'_>>, LixError> {
+        Ok(self.entries.get(index).map(|span| EncodedLeafEntryRef {
+            key: &self.key_arena[span.key_start..span.key_end],
+            value: span.value,
+        }))
     }
 
     #[expect(clippy::unnecessary_wraps)]
-    pub(crate) fn key(&self, index: usize) -> Result<Option<&'a [u8]>, LixError> {
-        Ok(self.entries.get(index).map(|entry| entry.key))
+    pub(crate) fn key(&self, index: usize) -> Result<Option<&[u8]>, LixError> {
+        Ok(self
+            .entries
+            .get(index)
+            .map(|span| &self.key_arena[span.key_start..span.key_end]))
     }
 }
 
@@ -133,10 +151,12 @@ impl DecodedInternalNode {
     }
 }
 
+const NODE_KIND_LEAF_V2: u8 = 1;
+const NODE_KIND_INTERNAL: u8 = 2;
+
 #[derive(Encode, Decode)]
-enum StorageDecodedNode<'a> {
-    Leaf(Vec<EncodedLeafEntryRef<'a>>),
-    Internal(Vec<ChildSummaryRef<'a>>),
+struct StorageInternalNode<'a> {
+    children: Vec<ChildSummaryRef<'a>>,
 }
 
 pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
@@ -264,12 +284,173 @@ pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
     encode_leaf_node_refs(&entries)
 }
 
+/// Leaf node wire format (v2):
+///
+/// ```text
+/// [NODE_KIND_LEAF_V2]
+/// varint entry_count
+/// per entry:
+///   varint shared_key_len   bytes shared with the previous entry's key
+///   varint key_suffix_len ++ key suffix bytes
+///   varint value_len ++ value bytes (verbatim standard value encoding)
+/// ```
+///
+/// Entries within a node are sorted by key, so consecutive keys share the
+/// encoded schema-key/file-id prefix and most of the entity-pk; front-coding
+/// removes that redundancy. Values are untouched: byte equality and the
+/// value codec stay exactly as before. Sortedness is a caller invariant
+/// (the tree builder always produces sorted entries); it is asserted in
+/// debug builds but not enforced in release, where unsorted input would
+/// round-trip faithfully and only confuse downstream binary search.
 pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
-    storage_codec::encode(
-        "tracked-state leaf node",
-        &StorageDecodedNode::Leaf(entries.to_vec()),
-    )
-    .expect("tracked-state leaf node storage encoding should not fail")
+    debug_assert!(
+        entries.windows(2).all(|pair| pair[0].key < pair[1].key),
+        "leaf entries must be strictly sorted by key"
+    );
+    let mut out = Vec::with_capacity(64 + entries.len() * 24);
+    out.push(NODE_KIND_LEAF_V2);
+    write_varint(&mut out, entries.len() as u64);
+    let mut previous_key: &[u8] = &[];
+    for entry in entries {
+        let shared = shared_prefix_len(previous_key, entry.key);
+        write_varint(&mut out, shared as u64);
+        write_varint(&mut out, (entry.key.len() - shared) as u64);
+        out.extend_from_slice(&entry.key[shared..]);
+        write_varint(&mut out, entry.value.len() as u64);
+        out.extend_from_slice(entry.value);
+        previous_key = entry.key;
+    }
+    #[cfg(debug_assertions)]
+    verify_leaf_round_trip(&out, entries);
+    out
+}
+
+#[cfg(debug_assertions)]
+fn verify_leaf_round_trip(encoded: &[u8], entries: &[EncodedLeafEntryRef<'_>]) {
+    let decoded = match decode_node_ref(encoded) {
+        Ok(DecodedNodeRef::Leaf(leaf)) => leaf,
+        other => panic!("leaf round trip decoded unexpectedly: {other:?}"),
+    };
+    assert_eq!(decoded.len(), entries.len(), "leaf round trip entry count");
+    for (index, entry) in entries.iter().enumerate() {
+        let round_tripped = decoded
+            .entry(index)
+            .expect("leaf round trip entry should read")
+            .expect("leaf round trip entry should exist");
+        assert_eq!(round_tripped.key, entry.key, "leaf round trip key {index}");
+        assert_eq!(
+            round_tripped.value, entry.value,
+            "leaf round trip value {index}"
+        );
+    }
+}
+
+fn decode_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef<'_>, LixError> {
+    fn usize_from(value: u64, what: &str) -> Result<usize, LixError> {
+        usize::try_from(value).map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state leaf node {what} does not fit in usize"),
+            )
+        })
+    }
+    fn slice<'b>(body: &'b [u8], offset: &mut usize, len: usize) -> Result<&'b [u8], LixError> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf node length overflow",
+            )
+        })?;
+        let bytes = body.get(*offset..end).ok_or_else(|| {
+            LixError::new("LIX_ERROR_UNKNOWN", "tracked-state leaf node is truncated")
+        })?;
+        *offset = end;
+        Ok(bytes)
+    }
+
+    let mut offset = 0usize;
+    let entry_count = usize_from(read_varint(body, &mut offset)?, "entry count")?;
+    // Reconstructed keys total the suffix bytes plus every re-expanded
+    // shared prefix, so heavy sharing can exceed the body length; the body
+    // length is a cheap reservation that avoids re-allocation for typical
+    // value-dominated chunks.
+    let mut key_arena = Vec::with_capacity(body.len());
+    let mut entries = Vec::with_capacity(entry_count.min(body.len()));
+    let mut previous_key_start = 0usize;
+    for _ in 0..entry_count {
+        let shared = usize_from(read_varint(body, &mut offset)?, "shared key length")?;
+        let suffix_len = usize_from(read_varint(body, &mut offset)?, "key suffix length")?;
+        let previous_key_len = key_arena.len() - previous_key_start;
+        if shared > previous_key_len {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf node shares more key bytes than the previous key holds",
+            ));
+        }
+        let key_start = key_arena.len();
+        key_arena.extend_from_within(previous_key_start..previous_key_start + shared);
+        let suffix = slice(body, &mut offset, suffix_len)?;
+        key_arena.extend_from_slice(suffix);
+        let value_len = usize_from(read_varint(body, &mut offset)?, "value length")?;
+        let value = slice(body, &mut offset, value_len)?;
+        entries.push(LeafEntrySpan {
+            key_start,
+            key_end: key_arena.len(),
+            value,
+        });
+        previous_key_start = key_start;
+    }
+    if offset != body.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf node has trailing bytes",
+        ));
+    }
+    Ok(DecodedLeafNodeRef { key_arena, entries })
+}
+
+fn shared_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_varint(bytes: &[u8], offset: &mut usize) -> Result<u64, LixError> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*offset).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf node varint is truncated",
+            )
+        })?;
+        *offset += 1;
+        if shift >= 64 || (shift == 63 && byte > 1) {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf node varint overflows u64",
+            ));
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
 }
 
 pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
@@ -281,11 +462,17 @@ pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
 }
 
 pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
-    storage_codec::encode(
-        "tracked-state internal node",
-        &StorageDecodedNode::Internal(children.to_vec()),
-    )
-    .expect("tracked-state internal node storage encoding should not fail")
+    let mut out = vec![NODE_KIND_INTERNAL];
+    out.extend_from_slice(
+        &storage_codec::encode(
+            "tracked-state internal node",
+            &StorageInternalNode {
+                children: children.to_vec(),
+            },
+        )
+        .expect("tracked-state internal node storage encoding should not fail"),
+    );
+    out
 }
 
 pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
@@ -311,13 +498,17 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
 }
 
 pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixError> {
-    match storage_codec::decode("tracked-state tree node", bytes)? {
-        StorageDecodedNode::Leaf(entries) => {
-            Ok(DecodedNodeRef::Leaf(DecodedLeafNodeRef { entries }))
-        }
-        StorageDecodedNode::Internal(children) => {
+    let (&kind, body) = bytes
+        .split_first()
+        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree node is empty"))?;
+    match kind {
+        NODE_KIND_LEAF_V2 => Ok(DecodedNodeRef::Leaf(decode_leaf_v2(body)?)),
+        NODE_KIND_INTERNAL => {
+            let node: StorageInternalNode<'_> =
+                storage_codec::decode("tracked-state internal node", body)?;
             Ok(DecodedNodeRef::Internal(DecodedInternalNode {
-                children: children
+                children: node
+                    .children
                     .into_iter()
                     .map(|child| ChildSummary {
                         first_key: child.first_key.to_vec(),
@@ -328,6 +519,10 @@ pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixErr
                     .collect(),
             }))
         }
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree node has unknown kind byte {other}"),
+        )),
     }
 }
 
@@ -393,6 +588,154 @@ fn level_salt(level: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        DecodedNodeRef as NodeRefForLeafTests, decode_node_ref as decode_node_ref_for_leaf_tests,
+        encode_leaf_node_refs as encode_leaf_refs_for_tests,
+    };
+
+    fn leaf_entries_round_trip(entries: &[(Vec<u8>, Vec<u8>)]) {
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef {
+                key: key.as_slice(),
+                value: value.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        let NodeRefForLeafTests::Leaf(decoded) =
+            decode_node_ref_for_leaf_tests(&encoded).expect("leaf should decode")
+        else {
+            panic!("leaf encoded bytes decoded as non-leaf");
+        };
+        assert_eq!(decoded.len(), entries.len());
+        for (index, (key, value)) in entries.iter().enumerate() {
+            let entry = decoded
+                .entry(index)
+                .expect("entry should read")
+                .expect("entry should exist");
+            assert_eq!(entry.key, key.as_slice(), "key {index}");
+            assert_eq!(entry.value, value.as_slice(), "value {index}");
+        }
+    }
+
+    #[test]
+    fn leaf_v2_round_trips_representative_shapes() {
+        leaf_entries_round_trip(&[]);
+        leaf_entries_round_trip(&[(b"only".to_vec(), b"value".to_vec())]);
+        leaf_entries_round_trip(&[
+            (b"a".to_vec(), Vec::new()),
+            (b"ab".to_vec(), vec![0u8; 300]),
+            (b"abc/0001".to_vec(), b"x".to_vec()),
+            (b"abc/0002".to_vec(), b"y".to_vec()),
+            (b"zzz".to_vec(), vec![0xff; 7]),
+        ]);
+        // No shared prefixes at all (front-coding worst case).
+        leaf_entries_round_trip(&[
+            (vec![0x00], b"a".to_vec()),
+            (vec![0x80, 0x01], b"b".to_vec()),
+            (vec![0xff, 0xff, 0xff], b"c".to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn leaf_v2_round_trips_generated_sorted_keys() {
+        // Deterministic pseudo-random keys with heavy shared prefixes,
+        // mimicking encoded (schema_key, file_id, entity_pk) keys.
+        let mut entries = (0..512usize)
+            .map(|index| {
+                let mut state = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+                state ^= state >> 31;
+                let key = format!(
+                    "json_pointer\u{0}/packages/{:04}/{}",
+                    index % 7,
+                    state % 1000
+                )
+                .into_bytes();
+                let value = state.to_be_bytes().repeat(1 + (index % 5));
+                (key, value)
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.dedup_by(|a, b| a.0 == b.0);
+        leaf_entries_round_trip(&entries);
+    }
+
+    #[test]
+    fn leaf_v2_round_trips_multibyte_varint_fields() {
+        // Keys long enough that shared and suffix lengths need two-byte
+        // varints, with >127 entries so the count does too.
+        let mut entries = Vec::new();
+        let prefix = "p".repeat(160);
+        for index in 0..200usize {
+            let key = format!("{prefix}/{index:05}").into_bytes();
+            let value = vec![index.to_le_bytes()[0]; 130];
+            entries.push((key, value));
+        }
+        entries.sort();
+        leaf_entries_round_trip(&entries);
+    }
+
+    /// Pins the exact wire bytes. Tree chunks are content-addressed, so any
+    /// accidental format drift changes chunk hashes; this golden test makes
+    /// such drift fail a unit test instead of only surfacing in storage.
+    #[test]
+    fn leaf_v2_wire_format_is_pinned() {
+        let entries = [
+            (b"shared/aaaa".to_vec(), b"v1".to_vec()),
+            (b"shared/aabb".to_vec(), b"v2".to_vec()),
+            (b"shared/bbbb".to_vec(), b"v3".to_vec()),
+        ];
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef {
+                key: key.as_slice(),
+                value: value.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        let expected: &[u8] = &[
+            1, // NODE_KIND_LEAF_V2
+            3, // entry count
+            0, 11, b's', b'h', b'a', b'r', b'e', b'd', b'/', b'a', b'a', b'a', b'a', 2, b'v',
+            b'1', // entry 0: shared=0, suffix "shared/aaaa", value "v1"
+            9, 2, b'b', b'b', 2, b'v', b'2', // entry 1: shared=9, suffix "bb"
+            7, 4, b'b', b'b', b'b', b'b', 2, b'v', b'3', // entry 2: shared=7, suffix "bbbb"
+        ];
+        assert_eq!(encoded, expected, "leaf v2 wire bytes must stay stable");
+    }
+
+    #[test]
+    fn leaf_v2_rejects_malformed_bytes() {
+        let entries = [(b"key-a".to_vec(), b"value-a".to_vec())];
+        let encoded = encode_leaf_refs_for_tests(
+            &entries
+                .iter()
+                .map(|(key, value)| EncodedLeafEntryRef {
+                    key: key.as_slice(),
+                    value: value.as_slice(),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let mut unknown_kind = encoded.clone();
+        unknown_kind[0] = 0x7f;
+        assert!(decode_node_ref_for_leaf_tests(&unknown_kind).is_err());
+
+        let truncated = &encoded[..encoded.len() - 1];
+        assert!(decode_node_ref_for_leaf_tests(truncated).is_err());
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_node_ref_for_leaf_tests(&trailing).is_err());
+
+        // shared_len larger than the previous key reconstructs nothing valid.
+        let mut bogus_share = vec![NODE_KIND_LEAF_V2];
+        bogus_share.extend_from_slice(&[1, 9, 1, b'k', 1, b'v']);
+        assert!(decode_node_ref_for_leaf_tests(&bogus_share).is_err());
+
+        assert!(decode_node_ref_for_leaf_tests(&[]).is_err());
+    }
+
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
@@ -728,9 +1071,8 @@ mod tests {
         let error = decode_node_ref(&encoded).expect_err("truncated leaf should reject");
 
         assert!(
-            error
-                .to_string()
-                .contains("failed to decode tracked-state tree node")
+            error.to_string().contains("tracked-state leaf node"),
+            "unexpected error: {error}"
         );
     }
 
