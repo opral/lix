@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-#[cfg(test)]
 use crate::changelog::CommitId;
 use crate::storage::{PointReadPlan, StorageRead, StorageSpace, StorageWriteSet};
 use crate::storage::{
@@ -54,55 +53,30 @@ pub(crate) async fn load_root(
         .map(|metadata| metadata.root_id))
 }
 
+/// Commit-root keys are the raw 16 UUID bytes of the commit id; binary
+/// UUIDv7 order matches the former hyphenated-text key order.
+fn commit_root_key(commit_id: CommitId) -> Vec<u8> {
+    commit_id.as_uuid().as_bytes().to_vec()
+}
+
 pub(crate) async fn load_commit_root(
     store: &(impl StorageRead + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateCommitRoot>, LixError> {
+    // parse_lix canonicalizes test labels to the same synthetic UUID the
+    // staging path produces, so label-keyed test fixtures keep matching.
+    let typed_commit_id = CommitId::parse_lix(commit_id, "tracked-state commit root lookup")?;
     let Some(bytes) = get_one(
         store,
         TRACKED_STATE_COMMIT_ROOT_SPACE,
-        commit_id.as_bytes().to_vec(),
-    )
-    .await?
-    else {
-        #[cfg(test)]
-        {
-            let test_commit_id = CommitId::for_test_label(commit_id).to_string();
-            if test_commit_id != commit_id {
-                return load_commit_root_by_storage_key(store, &test_commit_id).await;
-            }
-        }
-        return Ok(None);
-    };
-    let metadata = decode_commit_root(&bytes)?;
-    if metadata.commit_id != commit_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked_state commit_root key for commit '{commit_id}' contains root metadata for commit '{}'",
-                metadata.commit_id
-            ),
-        ));
-    }
-    Ok(Some(metadata))
-}
-
-#[cfg(test)]
-async fn load_commit_root_by_storage_key(
-    store: &(impl StorageRead + ?Sized),
-    commit_id: &str,
-) -> Result<Option<TrackedStateCommitRoot>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_ROOT_SPACE,
-        commit_id.as_bytes().to_vec(),
+        commit_root_key(typed_commit_id),
     )
     .await?
     else {
         return Ok(None);
     };
     let metadata = decode_commit_root(&bytes)?;
-    if metadata.commit_id.to_string() != commit_id {
+    if metadata.commit_id != typed_commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -120,7 +94,7 @@ pub(crate) fn stage_commit_root(
 ) -> Result<(), LixError> {
     writes.put(
         TRACKED_STATE_COMMIT_ROOT_SPACE,
-        key(metadata.commit_id.to_string().into_bytes()),
+        key(commit_root_key(metadata.commit_id)),
         value(encode_commit_root(metadata)?),
     );
     Ok(())

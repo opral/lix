@@ -19,8 +19,8 @@ use super::codec::{
     encode_commit_change_ref_chunk, encode_commit_record,
 };
 use super::store::{
-    CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key,
-    commit_change_ref_chunk_key, commit_change_ref_chunk_prefix, commit_key,
+    CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_id_from_key, change_key,
+    commit_change_ref_chunk_key, commit_change_ref_chunk_prefix, commit_id_from_key, commit_key,
 };
 use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
@@ -489,7 +489,10 @@ where
         &mut self,
         commit_ids: &HashSet<CommitId>,
     ) -> Result<(), LixError> {
-        let keys = commit_ids.iter().map(commit_key).collect::<Vec<_>>();
+        let keys = commit_ids
+            .iter()
+            .map(|id| commit_key(*id))
+            .collect::<Vec<_>>();
         for (commit_id, found) in commit_ids
             .iter()
             .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
@@ -508,7 +511,10 @@ where
         change_ids: impl IntoIterator<Item = ChangeId>,
     ) -> Result<(), LixError> {
         let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-        let keys = change_ids.iter().map(change_key).collect::<Vec<_>>();
+        let keys = change_ids
+            .iter()
+            .map(|id| change_key(*id))
+            .collect::<Vec<_>>();
         for (change_id, found) in change_ids
             .iter()
             .zip(get_many(self.store, CHANGE_SPACE, keys).await?)
@@ -533,7 +539,10 @@ where
             .flat_map(|commit| commit.parent_commit_ids.iter().copied())
             .filter(|parent_id| !append_commit_ids.contains(parent_id))
             .collect::<HashSet<_>>();
-        let keys = parent_ids.iter().map(commit_key).collect::<Vec<_>>();
+        let keys = parent_ids
+            .iter()
+            .map(|id| commit_key(*id))
+            .collect::<Vec<_>>();
         for (parent_id, found) in parent_ids
             .iter()
             .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
@@ -584,7 +593,10 @@ where
         change_ids: impl IntoIterator<Item = ChangeId>,
     ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
         let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-        let keys = change_ids.iter().map(change_key).collect::<Vec<_>>();
+        let keys = change_ids
+            .iter()
+            .map(|id| change_key(*id))
+            .collect::<Vec<_>>();
         let values = get_many(self.store, CHANGE_SPACE, keys).await?;
         let mut out = HashMap::new();
         for (change_id, value) in change_ids.into_iter().zip(values) {
@@ -599,7 +611,7 @@ where
         if self.staged_changes.contains_key(change_id) {
             return Ok(true);
         }
-        Ok(get_one(self.store, CHANGE_SPACE, change_key(change_id))
+        Ok(get_one(self.store, CHANGE_SPACE, change_key(*change_id))
             .await?
             .is_some())
     }
@@ -612,7 +624,7 @@ async fn load_commits_from_store(
     let keys = request
         .commit_ids
         .iter()
-        .map(|commit_id| commit_key(commit_id))
+        .map(|commit_id| commit_key(*commit_id))
         .collect::<Vec<_>>();
     let commit_values = get_many(store, COMMIT_SPACE, keys).await?;
     let mut entries = Vec::with_capacity(request.commit_ids.len());
@@ -661,7 +673,10 @@ async fn scan_commits_from_store(
         .changelog_scan(
             COMMIT_SPACE,
             Vec::new(),
-            request.start_after.map(commit_key),
+            request
+                .start_after
+                .map(|id| CommitId::parse_lix(id, "commit scan start_after").map(commit_key))
+                .transpose()?,
             limit,
             StorageCoreProjection::FullValue,
         )
@@ -682,15 +697,7 @@ async fn scan_commits_from_store(
     }
     let next_start_after = page
         .resume_after
-        .map(|key| {
-            String::from_utf8(key).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("changelog commit scan resume key is not UTF-8: {error}"),
-                )
-            })
-        })
-        .map(|result| result.and_then(|id| CommitId::parse_lix(&id, "commit scan resume key")))
+        .map(|key| commit_id_from_key(&key))
         .transpose()?;
     Ok(CommitScanBatch {
         entries,
@@ -705,7 +712,7 @@ async fn load_changes_from_store(
     let keys = request
         .change_ids
         .iter()
-        .map(|change_id| change_key(change_id))
+        .map(|change_id| change_key(*change_id))
         .collect::<Vec<_>>();
     let entries = get_many(store, CHANGE_SPACE, keys)
         .await?
@@ -733,7 +740,10 @@ async fn scan_changes_from_store(
         .changelog_scan(
             CHANGE_SPACE,
             Vec::new(),
-            request.start_after.map(change_key),
+            request
+                .start_after
+                .map(|id| ChangeId::parse_lix(id, "change scan start_after").map(change_key))
+                .transpose()?,
             limit,
             StorageCoreProjection::FullValue,
         )
@@ -754,15 +764,7 @@ async fn scan_changes_from_store(
     }
     let next_start_after = page
         .resume_after
-        .map(|key| {
-            String::from_utf8(key).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("changelog change scan resume key is not UTF-8: {error}"),
-                )
-            })
-        })
-        .map(|result| result.and_then(|id| ChangeId::parse_lix(&id, "change scan resume key")))
+        .map(|key| change_id_from_key(&key))
         .transpose()?;
     Ok(ChangeScanBatch {
         entries,
@@ -774,8 +776,7 @@ async fn load_commit_change_ref_chunks(
     store: &mut (impl ChangelogStorageRead + ?Sized),
     commit_id: &CommitId,
 ) -> Result<Vec<CommitChangeRefChunk>, LixError> {
-    let commit_id_text = commit_id.to_string();
-    let prefix = commit_change_ref_chunk_prefix(&commit_id_text);
+    let prefix = commit_change_ref_chunk_prefix(*commit_id);
     let mut after = None;
     let mut chunks = Vec::new();
     loop {

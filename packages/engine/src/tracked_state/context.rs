@@ -1150,12 +1150,10 @@ mod tests {
     use crate::storage::StorageContext;
     use crate::storage::{InMemoryStorageBackend, StorageReadOptions, StorageWriteOptions};
 
-    fn commit_id(label: &str) -> String {
-        CommitId::for_test_label(label).to_string()
-    }
-
     fn commit_root_key(label: &str) -> crate::storage::StorageKey {
-        crate::storage::StorageKey(bytes::Bytes::from(commit_id(label).into_bytes()))
+        crate::storage::StorageKey(bytes::Bytes::copy_from_slice(
+            CommitId::for_test_label(label).as_uuid().as_bytes(),
+        ))
     }
 
     fn change_id(label: &str) -> String {
@@ -1666,10 +1664,11 @@ mod tests {
             let mut writes = storage.new_write_set();
             let commit_a = CommitId::for_test_label("commit-a");
             let commit_b = CommitId::for_test_label("commit-b");
-            let commit_a_text = commit_a.to_string();
             writes.put(
                 crate::changelog::COMMIT_SPACE,
-                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(commit_a_text.as_bytes())),
+                crate::storage::StorageKey(bytes::Bytes::copy_from_slice(
+                    commit_a.as_uuid().as_bytes(),
+                )),
                 crate::changelog::encode_commit_record(&CommitRecord {
                     format_version: 1,
                     commit_id: commit_a,

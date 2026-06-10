@@ -1121,3 +1121,72 @@ batch).
 The rs-sdk SQLite backend keeps its internal sort as a cheap verification
 pass; with engine-sorted input it degenerates to a single ascending-run
 detection.
+
+## Binary UUID Keys For Changelog And Commit Roots
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Context:
+
+- `ChangeId`/`CommitId` were already binary in memory (`Uuid` wrappers) and
+  already encode as 16 raw bytes inside musli values. The only remaining
+  text leak was three key codecs routing ids through `Display` into 36-byte
+  hyphenated text: `changelog.change`/`changelog.commit` identity keys, the
+  `commit_change_ref_chunk` key prefix, and `tracked_state.commit_root`
+  keys.
+
+Change (hard cut, no migration):
+
+- Identity keys are now the raw 16 UUID bytes. UUIDv7 big-endian byte order
+  matches hyphenated-text lexicographic order, so range scans, resume
+  tokens, and the sorted-batch lowering contract behave identically.
+- Scan resume tokens decode from the binary key (`commit_id_from_key` /
+  `change_id_from_key`) instead of `String::from_utf8`.
+- `tracked_state.commit_root` staging and lookup share one binary key
+  helper; the test-only text-key fallback in `load_commit_root` is gone
+  (`parse_lix` canonicalizes test labels identically on both paths).
+- Scan `start_after` tokens now parse as UUIDs, so a malformed resume token
+  errors instead of silently scanning from an arbitrary text position.
+
+### Storage A/B (1k insert footprint, identical on all three backends)
+
+| Space                               | Key bytes before | after  |  Delta |
+| ----------------------------------- | ---------------: | -----: | -----: |
+| `changelog.change` (1,016 rows)     |           40,640 | 20,320 | -50.0% |
+| `changelog.commit`                  |               80 |     40 | -50.0% |
+| `tracked_state.commit_root`         |               80 |     40 | -50.0% |
+| `changelog.commit_change_ref_chunk` |              135 |     72 | -46.7% |
+
+Engine key bytes overall: ~78.6 KB -> ~58.2 KB (-26%). Value bytes are
+byte-identical, confirming the value codecs were already binary. Total
+store bytes shrink ~2.8% at this fixture size; the structural win is
+changelog B-tree geometry (half-width keys on the highest-row-count space),
+which compounds as the store grows.
+
+### Perf A/B
+
+Same-day single-run comparison was noisy in both directions; an alternating
+stash-based triple A/B on the contested RocksDB cells pooled to NEW slightly
+faster with overlapping spreads:
+
+| Cell (rocksdb transaction)  | OLD mean (3 runs) | NEW mean (3 runs) |
+| --------------------------- | ----------------: | ----------------: |
+| read_one_by_pk              |           58.0 us |           45.4 us |
+| update_one_by_pk            |            574 us |            490 us |
+
+Treated as perf-neutral-to-positive at 1k smoke scale, as predicted when
+this cut was scoped: the per-commit savings (one fewer String allocation
+plus Display format per id-keyed row, halved key compares) are real but
+small against commit totals. The durable claim is the storage table above.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,534 passed across
+  all targets (three changelog scan tests and two rebuild tests updated:
+  resume tokens are typed now, and corruption fixtures plant records at
+  binary keys).
