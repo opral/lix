@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value as JsonValue;
 
-use crate::catalog::snapshot::{CatalogFingerprint, fingerprint_schema_facts};
+use crate::catalog::snapshot::{
+    CatalogFingerprint, fingerprint_schema_facts, hash_fingerprint_part,
+};
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::{Domain, committed_row_is_exact_branch_scoped};
 use crate::live_state::MaterializedLiveStateRow;
@@ -26,13 +28,72 @@ const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
 /// the engine-wide cache of compiled catalog snapshots, keyed by fact content.
 pub(crate) struct CatalogContext {
     compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
+    compiled_catalogs_by_rows: Mutex<HashMap<CatalogRowsFingerprint, Arc<CatalogSnapshot>>>,
 }
+
+/// Fingerprint of the raw catalog rows visible to a domain, hashed before any
+/// JSON decoding. The raw `snapshot_content` bytes uniquely determine the
+/// decoded facts, so this key is at least as discriminating as the facts
+/// fingerprint: textual or ordering variations can only cause a conservative
+/// cache miss, never a wrong hit.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CatalogRowsFingerprint(String);
 
 impl CatalogContext {
     pub(crate) fn new() -> Self {
         Self {
             compiled_catalogs: Mutex::new(HashMap::new()),
+            compiled_catalogs_by_rows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns the compiled snapshot for the catalog rows visible to `domain`.
+    ///
+    /// This is the transaction hot path. On a hit it costs one live-state scan
+    /// plus a hash of the raw row contents; schema rows are only JSON-decoded
+    /// and canonicalized when the raw fingerprint has not been seen before.
+    pub(crate) async fn compiled_catalog_for_domain<R>(
+        &self,
+        live_state: &R,
+        domain: &Domain,
+    ) -> Result<Arc<CatalogSnapshot>, LixError>
+    where
+        R: LiveStateReader + ?Sized,
+    {
+        let catalog_rows = scan_catalog_rows(live_state, domain).await?;
+        let mut hasher = blake3::Hasher::new();
+        for (schema_domain, row) in &catalog_rows {
+            hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
+            let snapshot_content = row
+                .snapshot_content
+                .as_deref()
+                .expect("catalog rows are filtered to rows with snapshot_content");
+            hash_fingerprint_part(&mut hasher, snapshot_content);
+        }
+        let fingerprint = CatalogRowsFingerprint(hasher.finalize().to_hex().to_string());
+
+        if let Some(snapshot) = self
+            .compiled_catalogs_by_rows
+            .lock()
+            .expect("compiled catalog rows cache lock should not be poisoned")
+            .get(&fingerprint)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+
+        let facts = facts_from_catalog_rows(&catalog_rows)?;
+        let snapshot = self.compiled_catalog_for_facts(&facts)?;
+        let mut cache = self
+            .compiled_catalogs_by_rows
+            .lock()
+            .expect("compiled catalog rows cache lock should not be poisoned");
+        if cache.len() >= COMPILED_CATALOG_CACHE_LIMIT {
+            if let Some(evicted) = cache.keys().find(|key| **key != fingerprint).cloned() {
+                cache.remove(&evicted);
+            }
+        }
+        cache.insert(fingerprint, Arc::clone(&snapshot));
+        Ok(snapshot)
     }
 
     /// Returns the compiled snapshot for `facts`, building it on first use.
@@ -118,33 +179,55 @@ impl CatalogContext {
     where
         R: LiveStateReader + ?Sized,
     {
-        let mut facts = Vec::new();
-        for schema_domain in domain.schema_catalog_domains() {
-            let rows = live_state
-                .scan_rows(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        branch_ids: vec![schema_domain.branch_id().to_string()],
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(schema_domain.untracked()),
-                        include_tombstones: false,
-                        ..LiveStateFilter::default()
-                    },
-                    ..LiveStateScanRequest::default()
-                })
-                .await?;
-            for row in rows
-                .into_iter()
-                .filter(|row| row_belongs_to_schema_catalog_domain(row, &schema_domain))
-            {
-                let Some((key, schema)) = decode_registered_schema_row(&row)? else {
-                    continue;
-                };
-                facts.push(SchemaCatalogFact::new(schema_domain.clone(), key, schema));
-            }
-        }
-        Ok(facts)
+        let catalog_rows = scan_catalog_rows(live_state, domain).await?;
+        facts_from_catalog_rows(&catalog_rows)
     }
+}
+
+/// Scans the raw registered-schema rows reachable from `domain`, without
+/// decoding their snapshots.
+async fn scan_catalog_rows<R>(
+    live_state: &R,
+    domain: &Domain,
+) -> Result<Vec<(Domain, MaterializedLiveStateRow)>, LixError>
+where
+    R: LiveStateReader + ?Sized,
+{
+    let mut catalog_rows = Vec::new();
+    for schema_domain in domain.schema_catalog_domains() {
+        let rows = live_state
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                    branch_ids: vec![schema_domain.branch_id().to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(schema_domain.untracked()),
+                    include_tombstones: false,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await?;
+        catalog_rows.extend(
+            rows.into_iter()
+                .filter(|row| row_belongs_to_schema_catalog_domain(row, &schema_domain))
+                .map(|row| (schema_domain.clone(), row)),
+        );
+    }
+    Ok(catalog_rows)
+}
+
+fn facts_from_catalog_rows(
+    catalog_rows: &[(Domain, MaterializedLiveStateRow)],
+) -> Result<Vec<SchemaCatalogFact>, LixError> {
+    let mut facts = Vec::new();
+    for (schema_domain, row) in catalog_rows {
+        let Some((key, schema)) = decode_registered_schema_row(row)? else {
+            continue;
+        };
+        facts.push(SchemaCatalogFact::new(schema_domain.clone(), key, schema));
+    }
+    Ok(facts)
 }
 
 fn row_belongs_to_schema_catalog_domain(row: &MaterializedLiveStateRow, domain: &Domain) -> bool {
@@ -198,6 +281,44 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
     use crate::live_state::LiveStateRowRequest;
+
+    #[tokio::test]
+    async fn compiled_catalog_for_domain_hits_cache_without_decoding() {
+        let context = CatalogContext::new();
+        let domain = Domain::schema_catalog("global", true);
+        let reader = RowsLiveStateReader::new(vec![
+            registered_schema_row("alpha_schema"),
+            registered_schema_row("beta_schema"),
+        ]);
+
+        let first = context
+            .compiled_catalog_for_domain(&reader, &domain)
+            .await
+            .expect("catalog should compile");
+        let second = context
+            .compiled_catalog_for_domain(&reader, &domain)
+            .await
+            .expect("catalog should hit the raw-rows cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical raw rows must return the cached snapshot"
+        );
+
+        let changed_reader = RowsLiveStateReader::new(vec![
+            registered_schema_row("alpha_schema"),
+            registered_schema_row("gamma_schema"),
+        ]);
+        let changed = context
+            .compiled_catalog_for_domain(&changed_reader, &domain)
+            .await
+            .expect("changed catalog should compile");
+        assert!(
+            !Arc::ptr_eq(&first, &changed),
+            "changed raw rows must compile a different snapshot"
+        );
+        assert!(changed.contains("gamma_schema"));
+        assert!(!first.contains("gamma_schema"));
+    }
 
     #[test]
     fn compiled_catalog_cache_shares_snapshots_for_equal_facts() {

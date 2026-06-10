@@ -947,3 +947,108 @@ smoke sample above landed at 9.00 ms, so the bulk-insert win is real but
 within a few percent of run variance. The dominant, robust win is the removal
 of the fixed per-transaction catalog compile, which was about half of every
 single-row transaction operation.
+
+## Optimization Run: raw-row keyed catalog cache
+
+Date: 2026-06-09
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --lib
+```
+
+Profiling:
+
+- After the compiled-catalog cache, samply showed the schema-facts pipeline as
+  the dominant fixed cost of single-row transaction ops: about 60% of
+  `update_one_by_pk` on RocksDB, paid twice per transaction (once in
+  `open_transaction`'s prefetch, once at row normalization). The pipeline was
+  live-state scan (~15% + ~14%) plus `decode_registered_schema_row` serde
+  parsing of every schema row (~8% + ~9%) plus `fingerprint_schema_facts`
+  canonical-JSON serialization (~11%).
+- The decode and canonicalization existed only to compute the cache key.
+  Decoding is deterministic, so the raw `snapshot_content` bytes already
+  uniquely determine the decoded facts.
+
+Change:
+
+- `CatalogContext::compiled_catalog_for_domain` is the new transaction hot
+  path: it scans the raw registered-schema rows for a domain, fingerprints
+  the raw row contents (blake3, length-prefixed schema-domain component +
+  `snapshot_content`), and returns the cached `Arc<CatalogSnapshot>` on a
+  hit. Rows are only JSON-decoded and canonicalized on a miss, where the
+  result flows through the existing facts-fingerprint cache.
+- A raw-key variation (ordering or textual differences with equal canonical
+  content) can only cause a conservative cache miss, never a wrong hit.
+- `open_transaction` now prefetches the compiled catalog `Arc` instead of a
+  decoded facts `Vec`, and `TransactionSchemaResolver` stores
+  `TransactionCatalog` directly; the intermediate `SchemaFacts` staging
+  variant is gone.
+- Storage accounting is byte-identical to the previous entry.
+- `cargo test -p lix_engine --lib`: 930 passed, 0 failed.
+- Verification profile: `decode_registered_schema_row` and
+  `fingerprint_schema_facts` no longer appear in the `update_one_by_pk`
+  stacks; the remaining facts cost is `scan_catalog_rows` only.
+
+### 1k Smoke Scorecard
+
+Note: this run was taken while the machine was in interactive use, so
+individual cells carry more noise than earlier entries. The kv_layout control
+group stayed within historical variance.
+
+#### Transaction Layer
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   10.79 ms |  2.88 ms |         202 us |          688 us |   13.26 ms |     885 us |   11.83 ms |     947 us |
+| RocksDB |    8.16 ms |  2.65 ms |        41.7 us |          260 us |    8.46 ms |     420 us |    8.08 ms |     493 us |
+| redb    |   19.41 ms |  2.80 ms |        57.3 us |          275 us |   19.50 ms |    5.19 ms |   16.37 ms |    5.08 ms |
+
+#### SQL Session
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| SQLite  |   17.50 ms |  6.33 ms |        1.27 ms |         1.47 ms |   15.80 ms |    6.67 ms |
+| RocksDB |   14.30 ms |  5.49 ms |        1.11 ms |         1.15 ms |   12.14 ms |    5.54 ms |
+| redb    |   30.18 ms |  5.77 ms |        1.19 ms |         1.34 ms |   20.02 ms |   10.15 ms |
+
+#### Direct KV Layout
+
+Control group; untouched by this patch.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.51 ms |   303 us |         158 us |          189 us |    1.57 ms |    74.1 us |     485 us |    43.7 us |
+| RocksDB |     425 us |   156 us |        2.61 us |         7.29 us |     477 us |    8.53 us |    4.64 us |    5.08 us |
+| redb    |    8.12 ms |   241 us |        15.5 us |         31.6 us |    9.86 ms |    4.10 ms |    4.75 ms |    4.03 ms |
+
+### Delta From Previous Entry (compiled schema catalog cache)
+
+| Workload                             | Previous |  Current |  Delta |
+| ------------------------------------ | -------: | -------: | -----: |
+| RocksDB transaction update_one_by_pk |   623 us |   420 us | -32.6% |
+| RocksDB transaction delete_one_by_pk |   613 us |   493 us | -19.6% |
+| SQLite transaction update_one_by_pk  |  1.06 ms |   885 us | -16.2% |
+| SQLite transaction delete_one_by_pk  |  1.25 ms |   947 us | -24.1% |
+| RocksDB transaction insert_all 1k    |  9.00 ms |  8.16 ms |  -9.3% |
+| RocksDB sql_session insert_all 1k    | 15.77 ms | 14.30 ms |  -9.3% |
+| SQLite transaction update_all 1k     | 14.30 ms | 13.26 ms |  -7.3% |
+| redb transaction update_one_by_pk    |  5.14 ms |  5.19 ms |  +1.0% |
+
+redb single-row ops are dominated by redb's fixed per-commit durability cost,
+so the catalog-path savings do not move them; that cost is a backend
+characteristic, not an engine overhead.
+
+Cumulative since the 2026-06-09 baseline (both catalog cache rounds):
+RocksDB transaction update_one_by_pk 1.35 ms -> 420 us (3.2x), delete_one_by_pk
+1.34 ms -> 493 us (2.7x), SQLite update_one_by_pk 1.57 ms -> 885 us (1.8x).
+
+Remaining target from the verification profile: the live-state scan of
+registered-schema rows still runs twice per transaction (~19% of
+update_one_by_pk each). Eliminating it requires caching scan results keyed on
+storage state, which needs an invalidation story; deferred. The validation
+fast-path (unconsumable fk_target bookkeeping, jsonschema is_valid) remains
+the next bulk-op target.

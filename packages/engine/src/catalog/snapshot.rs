@@ -270,7 +270,7 @@ impl CatalogSnapshot {
     }
 }
 
-fn hash_fingerprint_part(hasher: &mut blake3::Hasher, value: &str) {
+pub(super) fn hash_fingerprint_part(hasher: &mut blake3::Hasher, value: &str) {
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
 }
