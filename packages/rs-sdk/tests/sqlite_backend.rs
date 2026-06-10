@@ -370,3 +370,95 @@ const RUNTIME_TEST_PLUGIN_SCHEMA: &str = r#"{
   },
   "additionalProperties": false
 }"#;
+
+#[test]
+fn sqlite_backend_put_many_handles_multi_chunk_batches() {
+    use bytes::Bytes;
+    use lix_engine::backend::PutEntry;
+    use lix_sdk::{
+        Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, PointVisitor,
+        ProjectedValueRef, PutBatch, ReadOptions, StoredValue, WriteOptions,
+    };
+
+    // 300 entries: two full 128-row upsert chunks plus a 44-row remainder.
+    const ROWS: usize = 300;
+    let tempdir = tempfile::tempdir().expect("tempdir should create");
+    let backend =
+        SqliteBackend::open(tempdir.path().join("chunked.lix")).expect("sqlite backend opens");
+
+    let key = |index: usize| Key(Bytes::from(format!("chunked/{:03}", index)));
+    let batch = |tag: u8| PutBatch {
+        entries: (0..ROWS)
+            // Reverse insertion order so put_many's internal key sort is
+            // exercised against out-of-order input.
+            .rev()
+            .map(|index| PutEntry {
+                key: key(index),
+                value: StoredValue {
+                    bytes: Bytes::from(vec![tag, index as u8]),
+                },
+            })
+            .collect(),
+    };
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .expect("begin insert write");
+    write.put_many(batch(1)).expect("insert all rows");
+    let insert_stats = write.commit().expect("commit inserts").stats;
+    assert_eq!(insert_stats.put_entries, ROWS as u64);
+    assert_eq!(insert_stats.written_bytes, (ROWS * 2) as u64);
+
+    // Overwrite every row so both the chunked and remainder paths take the
+    // upsert conflict branch.
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .expect("begin overwrite write");
+    write.put_many(batch(2)).expect("overwrite all rows");
+    write.commit().expect("commit overwrites");
+
+    struct CollectingVisitor {
+        values: Vec<Option<Vec<u8>>>,
+    }
+    impl PointVisitor for CollectingVisitor {
+        fn visit(
+            &mut self,
+            index: usize,
+            _key: &Key,
+            value: Option<ProjectedValueRef<'_>>,
+        ) -> Result<(), lix_sdk::BackendError> {
+            self.values[index] = match value {
+                Some(ProjectedValueRef::FullValue(bytes)) => Some(bytes.to_vec()),
+                Some(ProjectedValueRef::KeyOnly) => Some(Vec::new()),
+                None => None,
+            };
+            Ok(())
+        }
+    }
+
+    let keys = (0..ROWS).map(key).collect::<Vec<_>>();
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    let mut visitor = CollectingVisitor {
+        values: vec![None; ROWS],
+    };
+    read.visit_keys(
+        &keys,
+        GetOptions {
+            projection: CoreProjection::FullValue,
+            _reserved: std::marker::PhantomData,
+        },
+        &mut visitor,
+    )
+    .expect("visit keys");
+    read.close().expect("close read");
+
+    for (index, value) in visitor.values.iter().enumerate() {
+        assert_eq!(
+            value.as_deref(),
+            Some([2u8, index as u8].as_slice()),
+            "row {index} should hold the overwritten value"
+        );
+    }
+}

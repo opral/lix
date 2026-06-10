@@ -30,6 +30,10 @@ pub trait Backend {
 pub trait BackendRead {
     type RangeScan<'cursor>: BackendRangeScan;
 
+    /// Visits the requested keys, calling the visitor with each key's
+    /// position in `keys`. Visit order is unspecified; consumers must
+    /// address results by the visited index, which lets backends return
+    /// rows in whatever order their storage produces them.
     fn visit_keys<V>(
         &self,
         keys: &[Key],
@@ -195,6 +199,11 @@ where
 }
 
 pub trait BackendWrite {
+    /// Stages the batch's entries for the transaction.
+    ///
+    /// Batches hold at most one mutation per key (the engine's write-set
+    /// validation enforces this before lowering), so backends may reorder
+    /// entries freely, e.g. to write in key order.
     fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
 
     fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;

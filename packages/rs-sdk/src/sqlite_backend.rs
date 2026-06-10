@@ -3,11 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
 use lix_engine::backend::{
     Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
     CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
+    ReadOptions, ScanOptions, ScanResult, ScanVisitor, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use rusqlite::types::{Value as SqlValue, ValueRef as SqlValueRef};
@@ -16,7 +15,15 @@ use tempfile::TempDir;
 
 pub const SQLITE_FORMAT_VERSION: u32 = 1;
 const ENTRIES_TABLE: &str = "lix_internal_entries";
+/// Keys per point-read chunk; each key binds 2 parameters (ordinal + key),
+/// so a full chunk uses 800 of SQLite's historical 999-parameter floor.
+/// The specific value is bench-chosen.
 const POINT_READ_CHUNK_KEYS: usize = 400;
+/// Rows per multi-row upsert statement; each row binds 2 parameters
+/// (key + value), so a full chunk uses 256 parameters. Bench-chosen.
+const PUT_CHUNK_ROWS: usize = 128;
+const _: () = assert!(POINT_READ_CHUNK_KEYS * 2 < 999);
+const _: () = assert!(PUT_CHUNK_ROWS * 2 < 999);
 
 #[derive(Debug)]
 pub struct SqliteBackendFactory {
@@ -120,11 +127,16 @@ impl SqliteBackend {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
-        initialize_database(&path)?;
+        // Warm one connection per pool at open so the first read and write
+        // do not pay connection setup (open + busy_timeout + pragmas) inside
+        // their own latency window. The init connection becomes the warm
+        // write connection.
+        let write_conn = initialize_database(&path)?;
+        let read_conn = open_connection(&path)?;
         Ok(Self {
             path,
-            read_pool: Arc::new(Mutex::new(Vec::new())),
-            write_pool: Arc::new(Mutex::new(Vec::new())),
+            read_pool: Arc::new(Mutex::new(vec![read_conn])),
+            write_pool: Arc::new(Mutex::new(vec![write_conn])),
         })
     }
 
@@ -190,8 +202,7 @@ impl Backend for SqliteBackend {
             .pop()
             .map(Ok)
             .unwrap_or_else(|| self.connect())?;
-        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
-            .map_err(sqlite_error)?;
+        execute_cached(&conn, "BEGIN IMMEDIATE TRANSACTION")?;
         Ok(SqliteWrite {
             conn: Some(conn),
             write_pool: Arc::clone(&self.write_pool),
@@ -366,24 +377,52 @@ impl Drop for SqliteRead {
 
 impl BackendWrite for SqliteWrite {
     fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        let mut put_entries = 0;
-        let mut written_bytes = 0;
+        let mut entries = entries.entries;
+        // Sorting keeps the upsert's conflict probe on a near-neighbor B-tree
+        // descent instead of a fresh root-to-leaf seek per row. Batches hold
+        // at most one mutation per key, so apply order does not matter.
+        entries.sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
+        debug_assert!(
+            entries.windows(2).all(|pair| pair[0].key != pair[1].key),
+            "put batches must hold at most one mutation per key"
+        );
+        let put_entries = entries.len() as u64;
+        let written_bytes = entries
+            .iter()
+            .map(|entry| entry.value.bytes.len() as u64)
+            .sum::<u64>();
         {
             let conn = self.conn();
-            let mut stmt = conn
-                .prepare_cached(
-                    "INSERT INTO lix_internal_entries(key, value)
-                     VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                )
-                .map_err(sqlite_error)?;
-
-            for entry in entries.entries {
-                let value = stored_value_bytes(entry.value);
-                put_entries += 1;
-                written_bytes += value.len() as u64;
-                stmt.execute(params![entry.key.0.as_ref(), value.as_ref()])
+            let mut chunks = entries.chunks_exact(PUT_CHUNK_ROWS);
+            if chunks.len() > 0 {
+                let sql = multi_upsert_sql(PUT_CHUNK_ROWS);
+                let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
+                for chunk in chunks.by_ref() {
+                    for (index, entry) in chunk.iter().enumerate() {
+                        stmt.raw_bind_parameter(2 * index + 1, &entry.key.0[..])
+                            .map_err(sqlite_error)?;
+                        stmt.raw_bind_parameter(2 * index + 2, &entry.value.bytes[..])
+                            .map_err(sqlite_error)?;
+                    }
+                    stmt.raw_execute().map_err(sqlite_error)?;
+                }
+            }
+            // The remainder reuses the single-row statement instead of a
+            // sized multi-row one so the prepared-statement cache holds two
+            // upsert shapes total rather than one per remainder length.
+            let remainder = chunks.remainder();
+            if !remainder.is_empty() {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "INSERT INTO lix_internal_entries(key, value)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    )
                     .map_err(sqlite_error)?;
+                for entry in remainder {
+                    stmt.execute(params![entry.key.0.as_ref(), entry.value.bytes.as_ref()])
+                        .map_err(sqlite_error)?;
+                }
             }
         }
         self.stats.put_entries += put_entries;
@@ -464,7 +503,7 @@ impl Drop for SqliteWrite {
     }
 }
 
-fn initialize_database(path: &Path) -> Result<(), BackendError> {
+fn initialize_database(path: &Path) -> Result<Connection, BackendError> {
     let conn = open_connection(path)?;
     let user_version = sqlite_user_version(&conn)?;
     if user_version > SQLITE_FORMAT_VERSION {
@@ -489,7 +528,7 @@ fn initialize_database(path: &Path) -> Result<(), BackendError> {
             .map_err(sqlite_error)?;
     }
 
-    Ok(())
+    Ok(conn)
 }
 
 fn open_connection(path: &Path) -> Result<Connection, BackendError> {
@@ -542,26 +581,25 @@ where
         return Ok(());
     }
 
-    match opts.projection {
-        CoreProjection::KeyOnly => visit_key_only_points(conn, keys, visitor),
-        CoreProjection::FullValue => visit_full_value_points(conn, keys, visitor),
-    }
+    visit_points(conn, keys, opts.projection, visitor)
 }
 
-fn visit_key_only_points<V>(
+fn visit_points<V>(
     conn: &Connection,
     keys: &[Key],
+    projection: CoreProjection,
     visitor: &mut V,
 ) -> Result<(), BackendError>
 where
     V: PointVisitor + ?Sized,
 {
     for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
-        visit_key_only_points_chunk(
+        visit_points_chunk(
             conn,
             keys,
             chunk_index * POINT_READ_CHUNK_KEYS,
             chunk,
+            projection,
             visitor,
         )?;
     }
@@ -569,38 +607,39 @@ where
 }
 
 #[expect(clippy::cast_possible_wrap)]
-fn visit_key_only_points_chunk<V>(
+fn visit_points_chunk<V>(
     conn: &Connection,
     keys: &[Key],
     offset: usize,
     chunk: &[Key],
+    projection: CoreProjection,
     visitor: &mut V,
 ) -> Result<(), BackendError>
 where
     V: PointVisitor + ?Sized,
 {
-    let mut placeholders = String::with_capacity(chunk.len() * 8);
-    let mut values = Vec::with_capacity(chunk.len() * 2);
-    for (index, key) in chunk.iter().enumerate() {
-        if index > 0 {
-            placeholders.push_str(", ");
-        }
-        placeholders.push_str("(?, ?)");
-        values.push(SqlValue::Integer((offset + index) as i64));
-        values.push(SqlValue::Blob(key.0.to_vec()));
-    }
+    // No ORDER BY: callers address results by the returned ordinal, never by
+    // visit order, and binding by reference avoids an owned copy of every key.
+    let projected_column = match projection {
+        CoreProjection::KeyOnly => "e.key",
+        CoreProjection::FullValue => "e.value",
+    };
     let sql = format!(
         "WITH requested(ord, key) AS (VALUES {placeholders})
-         SELECT r.ord, e.key
+         SELECT r.ord, {projected_column}
          FROM requested r
-         LEFT JOIN lix_internal_entries e ON e.key = r.key
-         ORDER BY r.ord ASC"
+         LEFT JOIN lix_internal_entries e ON e.key = r.key",
+        placeholders = point_chunk_placeholders(chunk.len()),
     );
 
     let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(values))
-        .map_err(sqlite_error)?;
+    for (index, key) in chunk.iter().enumerate() {
+        stmt.raw_bind_parameter(2 * index + 1, (offset + index) as i64)
+            .map_err(sqlite_error)?;
+        stmt.raw_bind_parameter(2 * index + 2, &key.0[..])
+            .map_err(sqlite_error)?;
+    }
+    let mut rows = stmt.raw_query();
     while let Some(row) = rows.next().map_err(sqlite_error)? {
         let index: i64 = row.get(0).map_err(sqlite_error)?;
         let index = usize::try_from(index).map_err(|_| {
@@ -611,13 +650,16 @@ where
                 "sqlite requested ordinal out of bounds: {index}"
             )));
         };
-        let key_ref = row.get_ref(1).map_err(sqlite_error)?;
-        let value = match key_ref {
-            SqlValueRef::Null => None,
-            SqlValueRef::Blob(_) => Some(ProjectedValueRef::KeyOnly),
-            other => {
+        let projected = row.get_ref(1).map_err(sqlite_error)?;
+        let value = match (projection, projected) {
+            (_, SqlValueRef::Null) => None,
+            (CoreProjection::KeyOnly, SqlValueRef::Blob(_)) => Some(ProjectedValueRef::KeyOnly),
+            (CoreProjection::FullValue, SqlValueRef::Blob(value)) => {
+                Some(ProjectedValueRef::FullValue(value))
+            }
+            (_, other) => {
                 return Err(BackendError::Corruption(format!(
-                    "sqlite key column was not a blob: {other:?}"
+                    "sqlite projected column was not a blob: {other:?}"
                 )));
             }
         };
@@ -626,82 +668,28 @@ where
     Ok(())
 }
 
-fn visit_full_value_points<V>(
-    conn: &Connection,
-    keys: &[Key],
-    visitor: &mut V,
-) -> Result<(), BackendError>
-where
-    V: PointVisitor + ?Sized,
-{
-    for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
-        visit_full_value_points_chunk(
-            conn,
-            keys,
-            chunk_index * POINT_READ_CHUNK_KEYS,
-            chunk,
-            visitor,
-        )?;
+fn multi_upsert_sql(rows: usize) -> String {
+    let mut sql = String::with_capacity(64 + rows * 8);
+    sql.push_str("INSERT INTO lix_internal_entries(key, value) VALUES ");
+    for index in 0..rows {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?)");
     }
-    Ok(())
+    sql.push_str(" ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    sql
 }
 
-#[expect(clippy::cast_possible_wrap)]
-fn visit_full_value_points_chunk<V>(
-    conn: &Connection,
-    keys: &[Key],
-    offset: usize,
-    chunk: &[Key],
-    visitor: &mut V,
-) -> Result<(), BackendError>
-where
-    V: PointVisitor + ?Sized,
-{
-    let mut placeholders = String::with_capacity(chunk.len() * 8);
-    let mut values = Vec::with_capacity(chunk.len() * 2);
-    for (index, key) in chunk.iter().enumerate() {
+fn point_chunk_placeholders(len: usize) -> String {
+    let mut placeholders = String::with_capacity(len * 8);
+    for index in 0..len {
         if index > 0 {
             placeholders.push_str(", ");
         }
         placeholders.push_str("(?, ?)");
-        values.push(SqlValue::Integer((offset + index) as i64));
-        values.push(SqlValue::Blob(key.0.to_vec()));
     }
-    let sql = format!(
-        "WITH requested(ord, key) AS (VALUES {placeholders})
-         SELECT r.ord, e.value
-         FROM requested r
-         LEFT JOIN lix_internal_entries e ON e.key = r.key
-         ORDER BY r.ord ASC"
-    );
-
-    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(values))
-        .map_err(sqlite_error)?;
-    while let Some(row) = rows.next().map_err(sqlite_error)? {
-        let index: i64 = row.get(0).map_err(sqlite_error)?;
-        let index = usize::try_from(index).map_err(|_| {
-            BackendError::Corruption(format!("sqlite requested ordinal was negative: {index}"))
-        })?;
-        let Some(key) = keys.get(index) else {
-            return Err(BackendError::Corruption(format!(
-                "sqlite requested ordinal out of bounds: {index}"
-            )));
-        };
-        let value_ref = row.get_ref(1).map_err(sqlite_error)?;
-        let value = match value_ref {
-            SqlValueRef::Null => None,
-            SqlValueRef::Blob(value) => Some(ProjectedValueRef::FullValue(value)),
-            other => {
-                return Err(BackendError::Corruption(format!(
-                    "sqlite value column was not a blob: {other:?}"
-                )));
-            }
-        };
-        visitor.visit(index, key, value)?;
-    }
-    Ok(())
+    placeholders
 }
 
 fn scan_sql(range: KeyRange, opts: ScanOptions<'_>) -> (String, Vec<SqlValue>) {
@@ -759,10 +747,6 @@ fn blob_ref<'a>(value: SqlValueRef<'a>, column: &str) -> Result<&'a [u8], Backen
             "sqlite {column} column was not a blob: {other:?}"
         ))),
     }
-}
-
-fn stored_value_bytes(value: StoredValue) -> Bytes {
-    value.bytes
 }
 
 fn sqlite_error(error: rusqlite::Error) -> BackendError {
