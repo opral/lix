@@ -353,13 +353,6 @@ pub(crate) struct CommitChangeRefChunkView<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExpandedCommitChangeRefChunkView<'a> {
-    pub(crate) format_version: u32,
-    pub(crate) commit_id: CommitId,
-    pub(crate) entries: Vec<CommitChangeRefView<'a>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitChangeRef {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -367,12 +360,17 @@ pub(crate) struct CommitChangeRef {
     pub(crate) change_id: ChangeId,
 }
 
+/// Stored ref entry. Entries within a chunk are sorted by
+/// (schema_key, file_id, entity_pk), so consecutive encoded entity pks share
+/// long prefixes; the pk is stored front-coded against the previous entry's
+/// encoded pk bytes.
 #[derive(musli::Encode)]
 #[musli(packed)]
 pub(crate) struct CommitChangeRefEntryRef<'a> {
     pub(crate) schema_index: u16,
     pub(crate) file_index: u16,
-    pub(crate) entity_pk: &'a [String],
+    pub(crate) pk_shared: u32,
+    pub(crate) pk_suffix: &'a [u8],
     pub(crate) change_id: ChangeId,
 }
 
@@ -381,15 +379,8 @@ pub(crate) struct CommitChangeRefEntryRef<'a> {
 pub(crate) struct CommitChangeRefEntryView<'a> {
     pub(crate) schema_index: u16,
     pub(crate) file_index: u16,
-    pub(crate) entity_pk: Vec<&'a str>,
-    pub(crate) change_id: ChangeId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitChangeRefView<'a> {
-    pub(crate) schema_key: &'a str,
-    pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: EntityPkRef<'a>,
+    pub(crate) pk_shared: u32,
+    pub(crate) pk_suffix: &'a [u8],
     pub(crate) change_id: ChangeId,
 }
 

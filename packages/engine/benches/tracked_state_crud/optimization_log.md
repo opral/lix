@@ -1337,3 +1337,78 @@ no consistent regression.
   dict-less and dictionaried golden wire vectors; out-of-bounds, wrapping,
   and adversarial-length dictionary rejection; shared-length-after-
   dictionaried-value rejection; direct change-record round-trips.
+
+## Ref-Chunk Entity-Pk Front-Coding
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Change (hard cut):
+
+- `commit_change_ref_chunk` entries store their entity pk front-coded
+  against the previous entry's encoded pk (`pk_shared` + `pk_suffix` fields
+  in the musli entry struct). The chunker already sorted entries by
+  (schema_key, file_id, entity_pk), so consecutive pks share long heads;
+  correctness does not depend on sortedness (unsorted input only loses
+  compression). The borrowed chunk view (`view_commit_change_ref_chunk`)
+  folded into the owned decode: front-coded parts cannot borrow from chunk
+  bytes, and the view had exactly one caller.
+- Order-semantics audit preceded the cut: rebuild applies refs through
+  keyed tree mutations, merge/graph collect ids into sets, GC is
+  unimplemented, and history output order was already entity-sorted because
+  the chunker sorts. No consumer depends on a different entry order.
+
+The first encoding attempt front-coded the existing musli pk bytes and
+REGRESSED storage (+1.4%): musli's per-part length prefixes sit ahead of
+the content, so same-shaped pks of different lengths share only 1-2 bytes,
+and the per-entry `pk_shared` overhead exceeded the savings. The accounting
+gate caught it immediately. The fix is a length-free pk byte encoding for
+the front-coded form: part bytes with `0x00` escaped as `0x00 0xFF` and
+parts terminated by `0x00 0x01`, making byte-prefix sharing equal
+content-prefix sharing. Lesson recorded: front-coding through a
+length-prefixed encoding is structurally crippled; check the byte layout
+before estimating.
+
+### Storage A/B (1k insert footprint, identical across backends)
+
+| Metric                                 | Before  | After   | Delta  |
+| -------------------------------------- | ------: | ------: | -----: |
+| `commit_change_ref_chunk` value bytes  |  71,882 |  30,881 | -57.0% |
+| transaction insert_all written bytes   | 575,409 | 534,460 |  -7.1% |
+| transaction update_all written bytes   | 661,744 | 620,795 |  -6.2% |
+| transaction delete_all written bytes   | 226,234 | 185,285 | -18.1% |
+
+The insert, update, and delete written-byte deltas are mutually exact at
+-40,949. The ref-chunk footprint delta is -41,001; the 52-byte gap between
+the write-path metric and the end-state footprint metric is accounting
+granularity, not a discrepancy in the cut.
+
+### Perf (vs cached baselines, RocksDB smoke)
+
+Writes got faster with the smaller chunks: insert -13%, update -16%,
+delete -1%. read_one -13%. read_all printed +6.9% then -5.5% on immediate
+re-run: cache noise, and ref chunks are not on the read_all path. Encode
+cost (pk re-encode + prefix compare per entry) is on the commit path and
+is invisible at smoke scale.
+
+- Review additions: a second golden vector pinning the 0x00 0xFF escape
+  bytes; escape edge-case round-trips (lone/trailing/consecutive NULs,
+  0x01 as plain content, shared prefix splitting an escape pair);
+  adversarial decode rejections (empty pk, non-UTF-8 part, out-of-bounds
+  dictionary indices, u32::MAX shared length); an encode-side debug assert
+  on the non-empty-parts invariant.
+- Known follow-up: the chunk-size estimator still charges pre-front-coding
+  pk sizes, so chunks run ~2.3x under-filled at large commit sizes (safe
+  direction; the max-bytes invariant only gets stronger). Fix is to track
+  the previous encoded pk in the builder and charge the suffix length.
+- `cargo test -p lix_engine --features storage-benches`: 1,562 passed.
+  New tests: sorted/multi-part/unicode round-trip, unsorted-input
+  correctness, compression assertion with honest per-entry math, two
+  golden wire vectors, NUL-escape round-trips, truncated-escape rejection,
+  over-shared-pk rejection.
