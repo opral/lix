@@ -101,7 +101,7 @@ pub(crate) fn encode_commit_change_ref_chunk(
     )
 }
 
-fn shared_prefix_len(left: &[u8], right: &[u8]) -> usize {
+pub(crate) fn shared_prefix_len(left: &[u8], right: &[u8]) -> usize {
     left.iter().zip(right).take_while(|(l, r)| l == r).count()
 }
 
@@ -112,7 +112,7 @@ fn shared_prefix_len(left: &[u8], right: &[u8]) -> usize {
 /// lengths. Instead, each part's bytes are emitted with `0x00` escaped as
 /// `0x00 0xFF` and the part terminated by `0x00 0x01`, so byte-prefix
 /// sharing equals content-prefix sharing.
-fn encode_ref_entity_pk(parts: &[String]) -> Vec<u8> {
+pub(crate) fn encode_ref_entity_pk(parts: &[String]) -> Vec<u8> {
     // An empty parts list encodes to zero bytes, which decode rejects via
     // EntityPk validation; all constructors validate, this catches bypasses.
     debug_assert!(!parts.is_empty(), "entity pk parts must not be empty");

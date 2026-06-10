@@ -1412,3 +1412,31 @@ is invisible at smoke scale.
   correctness, compression assertion with honest per-entry math, two
   golden wire vectors, NUL-escape round-trips, truncated-escape rejection,
   over-shared-pk rejection.
+
+## Ref-Chunk Size Estimator: charge front-coded pk cost
+
+Date: 2026-06-10
+
+Follow-up to the front-coding cut. `CommitChangeRefChunkBuilder` still
+charged entity pks at their verbatim size, so chunks closed ~2.3x before
+the 64 KiB target (safe direction, under-filled). The builder now tracks
+the previous entry's encoded pk - the same front-coding base the codec
+uses - and charges `varint(shared) + varint(suffix_len) + suffix` exactly.
+Escape overhead is measured rather than modeled, which also closes the
+NUL-heavy underestimate the codec review flagged. A fresh builder starts
+from an empty base, matching the per-chunk front-coding reset.
+
+At the 1k bench the insert commit packs into one chunk instead of two
+(3 -> 2 chunks total, one fewer put per commit, -58 bytes). The effect
+scales with commit size: a 100k-row commit packs to the 2048-entry cap at
+roughly the byte target instead of producing ~2.2x more, smaller chunks. New tests pin that front-coded entries pack to target, that the
+builder's estimate is a direct upper bound on the real encoding
+(fixture crossing the 128-byte varint boundary plus NUL escapes), the
+varint-size boundaries, and the oversized-single-entry error path; a
+const assertion ties the 2-byte index charge to the entry cap staying
+under musli's 3-byte varint threshold. Review confirmed the upper
+bound term-by-term against the musli wire format, with an empirical
+fuzz across adversarial shapes (margins +22 to +11,737 bytes). The pk
+encode is hoisted to once per entry on the commit path.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,565 passed.

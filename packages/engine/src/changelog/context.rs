@@ -864,7 +864,10 @@ fn chunk_one_commit_change_refs(
     let mut chunks = Vec::new();
     let mut builder = CommitChangeRefChunkBuilder::new(refs.commit_id);
     for entry in refs.entries {
-        let candidate_size = builder.estimated_size_after(&entry);
+        // The encoded pk is entry-intrinsic; encode once per entry and share
+        // it between the close decision and the accepted push.
+        let encoded_pk = super::codec::encode_ref_entity_pk(&entry.entity_pk.parts);
+        let candidate_size = builder.estimated_size_after(&entry, &encoded_pk);
         if !builder.is_empty()
             && (builder.len() >= max_entries
                 || builder.estimated_size() >= target_bytes
@@ -874,7 +877,7 @@ fn chunk_one_commit_change_refs(
             builder = CommitChangeRefChunkBuilder::new(refs.commit_id);
         }
 
-        builder.push(entry);
+        builder.push(entry, encoded_pk);
         validate_commit_change_ref_chunk_size(&builder, max_bytes)?;
     }
 
@@ -918,6 +921,9 @@ struct CommitChangeRefChunkBuilder {
     schema_keys: HashSet<String>,
     file_ids: HashSet<Option<String>>,
     estimated_size: usize,
+    /// The previous entry's encoded entity pk: the front-coding base the
+    /// codec will use, so entry sizes can be charged exactly.
+    previous_encoded_pk: Vec<u8>,
 }
 
 impl CommitChangeRefChunkBuilder {
@@ -928,6 +934,7 @@ impl CommitChangeRefChunkBuilder {
             schema_keys: HashSet::new(),
             file_ids: HashSet::new(),
             estimated_size: commit_change_ref_chunk_fixed_size(),
+            previous_encoded_pk: Vec::new(),
         }
     }
 
@@ -943,18 +950,19 @@ impl CommitChangeRefChunkBuilder {
         self.estimated_size
     }
 
-    fn estimated_size_after(&self, entry: &CommitChangeRef) -> usize {
-        self.estimated_size + self.incremental_size(entry)
+    fn estimated_size_after(&self, entry: &CommitChangeRef, encoded_pk: &[u8]) -> usize {
+        self.estimated_size + self.incremental_size(entry, encoded_pk)
     }
 
-    fn push(&mut self, entry: CommitChangeRef) {
-        self.estimated_size += self.incremental_size(&entry);
+    fn push(&mut self, entry: CommitChangeRef, encoded_pk: Vec<u8>) {
+        self.estimated_size += self.incremental_size(&entry, &encoded_pk);
         self.schema_keys.insert(entry.schema_key.clone());
         self.file_ids.insert(entry.file_id.clone());
+        self.previous_encoded_pk = encoded_pk;
         self.entries.push(entry);
     }
 
-    fn incremental_size(&self, entry: &CommitChangeRef) -> usize {
+    fn incremental_size(&self, entry: &CommitChangeRef, encoded_pk: &[u8]) -> usize {
         let schema_dictionary_bytes = if self.schema_keys.contains(&entry.schema_key) {
             0
         } else {
@@ -965,9 +973,16 @@ impl CommitChangeRefChunkBuilder {
         } else {
             encoded_optional_str_size(entry.file_id.as_deref())
         };
+        // Charge the pk at its front-coded cost against the same base the
+        // codec will use; escape overhead is exact because the real encoded
+        // bytes are measured.
+        let shared = super::codec::shared_prefix_len(&self.previous_encoded_pk, encoded_pk);
+        let suffix_len = encoded_pk.len() - shared;
+        let pk_bytes = varint_size(shared) + varint_size(suffix_len) + suffix_len;
         schema_dictionary_bytes
             + file_dictionary_bytes
-            + encoded_commit_change_ref_entry_size(entry)
+            + encoded_commit_change_ref_entry_fixed_size()
+            + pk_bytes
     }
 
     fn finish(self) -> Result<CommitChangeRefChunk, LixError> {
@@ -975,36 +990,31 @@ impl CommitChangeRefChunkBuilder {
     }
 }
 
+/// Deliberately loose upper bound on the chunk header (the real musli
+/// header is ~4-7 varint bytes); the dictionary and header charges in this
+/// file are conservative bounds, while the pk charge is exact.
 fn commit_change_ref_chunk_fixed_size() -> usize {
-    5 // magic
-        + 4 // format_version
-        + 4 // schema dictionary length
-        + 4 // file dictionary length
-        + 4 // entry count
+    21
 }
 
-fn encoded_commit_change_ref_entry_size(entry: &CommitChangeRef) -> usize {
-    2 // schema index
-        + 2 // file index
-        + encoded_entity_pk_compact_size(&entry.entity_pk)
-        + encoded_change_id_size(&entry.change_id)
+// The 2-byte-per-index charge below is an upper bound only while dictionary
+// indices stay under musli's 3-byte varint threshold (16384); the entry cap
+// keeps them there.
+const _: () = assert!(COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES < 16384);
+
+fn encoded_commit_change_ref_entry_fixed_size() -> usize {
+    2 // schema index upper bound (varint, <= 2 bytes under the entry cap)
+        + 2 // file index upper bound
+        + size_of::<uuid::Bytes>() // change id (16 raw bytes)
 }
 
-fn encoded_change_id_size(_change_id: &ChangeId) -> usize {
-    size_of::<uuid::Bytes>()
-}
-
-fn encoded_entity_pk_compact_size(identity: &crate::entity_pk::EntityPk) -> usize {
-    if identity.parts.len() == 1 {
-        1 + encoded_str_size(&identity.parts[0])
-    } else {
-        1 + 4
-            + identity
-                .parts
-                .iter()
-                .map(|part| encoded_str_size(part))
-                .sum::<usize>()
+fn varint_size(mut value: usize) -> usize {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
     }
+    bytes
 }
 
 fn encoded_optional_str_size(value: Option<&str>) -> usize {
@@ -1214,16 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn encoded_commit_change_ref_entry_size_counts_binary_change_id() {
-        let entry = test_change_ref("entity-1", "change-with-a-long-source-label");
-
-        assert_eq!(
-            encoded_commit_change_ref_entry_size(&entry),
-            2 + 2 + encoded_entity_pk_compact_size(&entry.entity_pk) + 16
-        );
-    }
-
-    #[test]
     fn chunk_one_commit_change_refs_splits_by_encoded_size() {
         let refs = CommitChangeRefSet {
             commit_id: CommitId::for_test_label("commit-1"),
@@ -1263,6 +1263,77 @@ mod tests {
                 "change-0007-yyyyyyyyyyyyyyyyyyyyyyyy",
             ])
         );
+    }
+
+    #[test]
+    fn chunk_one_commit_change_refs_rejects_oversized_single_entry() {
+        let refs = CommitChangeRefSet {
+            commit_id: CommitId::for_test_label("commit-1"),
+            entries: vec![test_change_ref(&"p".repeat(512), "change-big")],
+        };
+        let error = chunk_one_commit_change_refs(refs, 64, 128, 2048)
+            .expect_err("oversized single entry must reject");
+        assert!(error.message.contains("exceeds 128 bytes"));
+    }
+
+    /// Pins that the size estimator charges pks at their front-coded cost:
+    /// prefix-heavy sorted pks whose verbatim sizes blow the target must
+    /// still pack into one chunk when their front-coded sizes fit, and the
+    /// estimate must stay an upper bound on the real encoding.
+    #[test]
+    fn chunk_one_commit_change_refs_packs_to_front_coded_size() {
+        let prefix = "shared-prefix-".repeat(8); // 112 chars shared per pk
+        let refs = CommitChangeRefSet {
+            commit_id: CommitId::for_test_label("commit-1"),
+            entries: (0..30)
+                .map(|index| {
+                    test_change_ref(&format!("{prefix}{index:04}"), &format!("chg-{index:04}"))
+                })
+                .collect(),
+        };
+        // Verbatim pks are 30 x ~120 bytes = ~3.6KB; front-coded they are
+        // one full pk plus 29 short suffixes = well under 1KB.
+        let chunks =
+            chunk_one_commit_change_refs(refs, 1024, 2048, 2048).expect("refs should chunk");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "front-coded entries must pack into one chunk"
+        );
+    }
+
+    /// Directly pins the safety property `validate_commit_change_ref_chunk_size`
+    /// relies on: the builder's estimate is an upper bound on the real
+    /// encoding. The fixture includes a pk whose suffix crosses the 128-byte
+    /// varint boundary and NUL-bearing pks (escape overhead).
+    #[test]
+    fn chunk_builder_estimate_is_an_upper_bound_on_the_encoding() {
+        let entries = vec![
+            test_change_ref("plain-entity", "chg-1"),
+            test_change_ref(&format!("plain-{}", "q".repeat(200)), "chg-2"),
+            test_change_ref("with\u{0}nul\u{0}\u{0}parts", "chg-3"),
+            test_change_ref("with\u{0}nul\u{0}\u{0}partz", "chg-4"),
+        ];
+        let mut builder = CommitChangeRefChunkBuilder::new(CommitId::for_test_label("commit-1"));
+        for entry in entries {
+            let encoded_pk = crate::changelog::codec::encode_ref_entity_pk(&entry.entity_pk.parts);
+            builder.push(entry, encoded_pk);
+        }
+        let estimate = builder.estimated_size();
+        let chunk = builder.finish().expect("chunk should build");
+        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
+        assert!(
+            estimate >= encoded.len(),
+            "estimate {estimate} must be >= encoded {}",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn varint_size_matches_encoding_boundaries() {
+        for (value, expected) in [(0usize, 1usize), (127, 1), (128, 2), (16383, 2), (16384, 3)] {
+            assert_eq!(varint_size(value), expected, "varint_size({value})");
+        }
     }
 
     #[test]
