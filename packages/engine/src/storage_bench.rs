@@ -13,6 +13,7 @@ static TRANSACTION_ROWS_STAGED: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_UNTRACKED_ROWS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_VALIDATION_BRANCHS: AtomicU64 = AtomicU64::new(0);
 static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicU64 = AtomicU64::new(0);
+static TRANSACTION_SCHEMA_CATALOG_COMPILES: AtomicU64 = AtomicU64::new(0);
 static JSON_STORE_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_transaction_rows_staged(count: usize) {
@@ -29,6 +30,10 @@ pub(crate) fn record_transaction_validation_branch() {
 
 pub(crate) fn record_transaction_schema_catalog_load() {
     TRANSACTION_SCHEMA_CATALOG_LOADS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_transaction_schema_catalog_compile() {
+    TRANSACTION_SCHEMA_CATALOG_COMPILES.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {

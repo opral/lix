@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value as JsonValue;
 
-use crate::catalog::SchemaCatalogFact;
+use crate::catalog::snapshot::{CatalogFingerprint, fingerprint_schema_facts};
+use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::{Domain, committed_row_is_exact_branch_scoped};
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
@@ -11,16 +13,65 @@ use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
+/// Compiled catalog snapshots are cached at most this many fact sets deep.
+/// Schema catalogs churn rarely; the bound only guards against pathological
+/// schema-mutation workloads growing the cache without limit.
+const COMPILED_CATALOG_CACHE_LIMIT: usize = 64;
+
 /// Engine schema visibility boundary.
 ///
 /// SQL planning receives a schema snapshot from live state. System schemas are
 /// seeded as ordinary `lix_registered_schema` rows during initialization, so
-/// runtime schema visibility has one source of truth.
-pub(crate) struct CatalogContext;
+/// runtime schema visibility has one source of truth. The context also owns
+/// the engine-wide cache of compiled catalog snapshots, keyed by fact content.
+pub(crate) struct CatalogContext {
+    compiled_catalogs: Mutex<HashMap<CatalogFingerprint, Arc<CatalogSnapshot>>>,
+}
 
 impl CatalogContext {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            compiled_catalogs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the compiled snapshot for `facts`, building it on first use.
+    ///
+    /// The cache key is the content fingerprint of the facts, so a cached
+    /// snapshot can never go stale: changed schema rows produce different
+    /// facts and therefore a different key. The lock is not held while
+    /// compiling, so two racing callers may both compile the same facts; the
+    /// results are identical and the last insert wins.
+    pub(crate) fn compiled_catalog_for_facts(
+        &self,
+        facts: &[SchemaCatalogFact],
+    ) -> Result<Arc<CatalogSnapshot>, LixError> {
+        let fingerprint = fingerprint_schema_facts(facts)?;
+        if let Some(snapshot) = self
+            .compiled_catalogs
+            .lock()
+            .expect("compiled catalog cache lock should not be poisoned")
+            .get(&fingerprint)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(CatalogSnapshot::from_schema_facts(facts)?);
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_transaction_schema_catalog_compile();
+        let mut cache = self
+            .compiled_catalogs
+            .lock()
+            .expect("compiled catalog cache lock should not be poisoned");
+        if cache.len() >= COMPILED_CATALOG_CACHE_LIMIT {
+            // Evict one other entry instead of clearing: identical schema
+            // content on N branches occupies N keys, so a full clear would
+            // recompile every hot catalog whenever the bound is reached.
+            if let Some(evicted) = cache.keys().find(|key| **key != fingerprint).cloned() {
+                cache.remove(&evicted);
+            }
+        }
+        cache.insert(fingerprint, Arc::clone(&snapshot));
+        Ok(snapshot)
     }
 
     /// Loads schema definitions for SQL surface planning at `branch_id`.
@@ -147,6 +198,49 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
     use crate::live_state::LiveStateRowRequest;
+
+    #[test]
+    fn compiled_catalog_cache_shares_snapshots_for_equal_facts() {
+        let context = CatalogContext::new();
+        let parent = catalog_fact("parent_schema");
+        let child = catalog_fact("child_schema");
+
+        let first = context
+            .compiled_catalog_for_facts(&[parent.clone(), child.clone()])
+            .expect("catalog should compile");
+        let reordered = context
+            .compiled_catalog_for_facts(&[child, parent.clone()])
+            .expect("catalog should compile");
+        let different = context
+            .compiled_catalog_for_facts(&[parent])
+            .expect("catalog should compile");
+
+        assert!(
+            Arc::ptr_eq(&first, &reordered),
+            "equal facts in any order must hit the same cached snapshot"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &different),
+            "different facts must compile a different snapshot"
+        );
+    }
+
+    fn catalog_fact(schema_key: &str) -> SchemaCatalogFact {
+        SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            crate::schema::SchemaKey::new(schema_key),
+            json!({
+                "x-lix-key": schema_key,
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        )
+    }
 
     #[tokio::test]
     async fn visible_schemas_are_loaded_from_registered_schema_rows() {

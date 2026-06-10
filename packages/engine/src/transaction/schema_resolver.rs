@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::LixError;
-use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact};
+use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact, TransactionCatalog};
 use crate::domain::Domain;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -19,7 +19,7 @@ pub(crate) struct TransactionSchemaResolver {
 
 enum CatalogEntry {
     SchemaFacts(Vec<SchemaCatalogFact>),
-    Catalog(CatalogSnapshot),
+    Catalog(TransactionCatalog),
 }
 
 impl TransactionSchemaResolver {
@@ -70,9 +70,11 @@ impl TransactionSchemaResolver {
             let CatalogEntry::SchemaFacts(facts) = entry else {
                 unreachable!("catalog entry was checked as schema facts");
             };
-            let catalog = CatalogSnapshot::from_schema_facts(&facts)?;
-            self.catalogs_by_domain
-                .insert(domain, CatalogEntry::Catalog(catalog));
+            let catalog = self.context.compiled_catalog_for_facts(&facts)?;
+            self.catalogs_by_domain.insert(
+                domain,
+                CatalogEntry::Catalog(TransactionCatalog::Shared(catalog)),
+            );
         }
         Ok(())
     }
@@ -82,7 +84,7 @@ impl TransactionSchemaResolver {
         live_state: &dyn LiveStateReader,
         staged: &PreparedStateRowOverlay,
         domain: &Domain,
-    ) -> Result<&mut CatalogSnapshot, LixError> {
+    ) -> Result<&mut TransactionCatalog, LixError> {
         self.load_catalog_for_domain(live_state, Some(staged), domain)
             .await?;
         let domain = domain.schema_catalog_domain();
@@ -111,7 +113,7 @@ impl TransactionSchemaResolver {
             .get(&domain)
             .expect("catalog cache should contain requested branch")
         {
-            CatalogEntry::Catalog(catalog) => Ok(catalog),
+            CatalogEntry::Catalog(catalog) => Ok(catalog.snapshot()),
             CatalogEntry::SchemaFacts(_) => {
                 unreachable!("schema catalog should be materialized before validation access")
             }

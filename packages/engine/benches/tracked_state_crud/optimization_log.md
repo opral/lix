@@ -728,3 +728,222 @@ SQLite transaction insert run immediately before this full smoke measured
 13.18 ms and Criterion reported an 8.8% improvement; the full smoke's SQLite
 transaction insert sample landed at 13.66 ms and Criterion reported no
 significant change.
+
+## Baseline Re-run Before New Optimization Pass: 2026-06-09
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+```
+
+Notes:
+
+- Fresh baseline on branch `fable-5-optimization` (HEAD `e554c557`) before a
+  new round of optimization and bug squashing. No code changes in this entry.
+- The harness has changed since the last log entry: SQL session benches now
+  run on the real `lix_sqlite`, `lix_rocksdb`, and `lix_redb` backends instead
+  of a single in-memory backend, so SQL session numbers are not directly
+  comparable to earlier entries.
+- The accounting report now also emits per-backend rows; logical write counts
+  and layout footprint were identical across SQLite, RocksDB, and redb.
+- Criterion: 10 samples, 250 ms warmup, 1 s measurement. Values are Criterion
+  point estimates.
+
+### 1k Smoke Scorecard
+
+#### Direct KV Layout
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.76 ms |   304 us |         130 us |          192 us |    1.56 ms |    68.0 us |     422 us |    54.0 us |
+| RocksDB |     428 us |   161 us |        2.32 us |         7.98 us |     490 us |    8.60 us |    17.9 us |    4.96 us |
+| redb    |    7.54 ms |   215 us |        13.0 us |         34.9 us |    8.05 ms |    4.07 ms |    4.88 ms |    4.26 ms |
+
+#### Transaction Layer
+
+Direct transaction API, bypassing SQL.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   10.91 ms |  2.84 ms |         189 us |          679 us |   14.01 ms |    1.57 ms |   12.94 ms |    1.62 ms |
+| RocksDB |    9.15 ms |  2.65 ms |        93.0 us |          298 us |    9.82 ms |    1.35 ms |    9.44 ms |    1.34 ms |
+| redb    |   20.34 ms |  2.86 ms |        67.7 us |          278 us |   20.41 ms |    6.37 ms |   17.35 ms |    6.10 ms |
+
+#### SQL Session
+
+Now runs on the real backends; SQL updates remain gated behind
+`LIX_TRACKED_STATE_CRUD_SQL_UPDATE=1` and excluded.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| SQLite  |   17.97 ms |  6.59 ms |        1.29 ms |         1.53 ms |   18.25 ms |    7.85 ms |
+| RocksDB |   16.40 ms |  5.78 ms |        1.05 ms |         1.24 ms |   12.69 ms |    6.37 ms |
+| redb    |   30.27 ms |  6.11 ms |        1.19 ms |         1.46 ms |   21.06 ms |   11.36 ms |
+
+### 1k Smoke Accounting
+
+Logical write counts were identical across SQLite, RocksDB, and redb.
+
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
+| kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
+| kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
+| kv_layout   | update_one_by_pk |            1 |     1 |             0 |             0 |              1 |             1 |         6,693 |   1.00x |      0.00x |
+| kv_layout   | delete_all       |        1,000 |     0 |             0 |             1 |              0 |             1 |             0 |   0.00x |      0.00x |
+| kv_layout   | delete_one_by_pk |            1 |     0 |             1 |             0 |              1 |             1 |             0 |   0.00x |      1.00x |
+| transaction | insert_all       |        1,000 | 2,032 |             0 |             0 |              7 |             7 |       642,063 |   2.03x |      0.00x |
+| transaction | update_all       |        1,000 | 2,032 |             0 |             0 |              7 |             7 |       728,421 |   2.03x |      0.00x |
+| transaction | update_one_by_pk |            1 |    12 |             0 |             0 |              7 |             7 |        18,532 |  12.00x |      0.00x |
+| transaction | delete_all       |        1,000 | 1,032 |             0 |             0 |              7 |             7 |       292,912 |   1.03x |      0.00x |
+| transaction | delete_one_by_pk |            1 |    11 |             0 |             0 |              7 |             7 |        18,229 |  11.00x |      0.00x |
+
+### Layout Footprint After Insert
+
+Identical across SQLite, RocksDB, and redb.
+
+| Layer       | Space id     | Space                               |  Rows | Key bytes | Value bytes |
+| ----------- | ------------ | ----------------------------------- | ----: | --------: | ----------: |
+| kv_layout   | `0x00020001` | `tracked_state.crud.row.v1`         | 1,000 |    87,244 |     396,363 |
+| transaction | `0x00010002` | `untracked_state.row.v1`            |     2 |        83 |         185 |
+| transaction | `0x00020001` | `json_store.json`                   | 1,018 |    36,648 |     299,700 |
+| transaction | `0x00040001` | `tracked_state.tree_chunk`          |    27 |       972 |     162,086 |
+| transaction | `0x00040004` | `tracked_state.commit_root`         |     2 |        80 |         167 |
+| transaction | `0x00050001` | `binary_cas.manifest`               |     0 |         0 |           0 |
+| transaction | `0x00050002` | `binary_cas.manifest_chunk`         |     0 |         0 |           0 |
+| transaction | `0x00050003` | `binary_cas.chunk`                  |     0 |         0 |           0 |
+| transaction | `0x00060001` | `changelog.commit`                  |     2 |        80 |         102 |
+| transaction | `0x00060002` | `changelog.change`                  | 1,016 |    40,640 |     128,857 |
+| transaction | `0x00060003` | `changelog.commit_change_ref_chunk` |     3 |       135 |      71,882 |
+
+### Delta From Previous Full Smoke
+
+The previous full smoke was the fixture-teardown harness entry; the accounting
+reference is the bounded-chunk/codec-cut entries. Intervening mainline commits
+(not part of this log) account for these shifts.
+
+| Workload                               | Previous |  Current |  Delta |
+| -------------------------------------- | -------: | -------: | -----: |
+| SQLite transaction insert 1k           | 13.66 ms | 10.91 ms | -20.1% |
+| RocksDB transaction insert 1k          | 10.22 ms |  9.15 ms | -10.5% |
+| redb transaction insert 1k             | 20.17 ms | 20.34 ms |  +0.8% |
+| SQLite transaction update_all 1k       | 15.39 ms | 14.01 ms |  -9.0% |
+| RocksDB transaction update_all 1k      | 11.58 ms |  9.82 ms | -15.2% |
+| RocksDB transaction delete_all 1k      | 11.18 ms |  9.44 ms | -15.6% |
+| transaction `insert_all` puts          |    2,038 |    2,032 |     -6 |
+| transaction `insert_all` bytes         |  811,483 |  642,063 | -20.9% |
+| transaction `update_all` bytes         |  925,898 |  728,421 | -21.3% |
+| transaction `delete_all` bytes         |  492,389 |  292,912 | -40.5% |
+| `changelog.change` value bytes         |  189,738 |  128,857 | -32.1% |
+| `tracked_state.tree_chunk` value bytes |  243,324 |  162,086 | -33.4% |
+| `commit_change_ref_chunk` value bytes  |  101,325 |   71,882 | -29.1% |
+
+SQL session numbers have no comparable previous entry because the harness moved
+from the in-memory backend to the three real backends.
+
+## Optimization Run: compiled schema catalog cache
+
+Date: 2026-06-09
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine
+```
+
+Profiling:
+
+- samply profiles of the bench binary (built with
+  `CARGO_PROFILE_BENCH_DEBUG=true`, recorded via
+  `samply record --save-only -- <bench-bin> --bench <filter> --profile-time 10`)
+  showed `CatalogSnapshot::from_schema_facts` being rebuilt on every
+  transaction: 6.7% of the timed 1k `insert_all` op and 47.4% of the timed
+  `update_one_by_pk` op on RocksDB, almost all of it in
+  `SchemaPlan::compile`/`compile_lix_schema` (jsonschema validator
+  compilation).
+
+Change:
+
+- `CatalogContext` now caches compiled `CatalogSnapshot`s in an engine-wide
+  map keyed by a blake3 content fingerprint of the schema facts
+  (`fingerprint_schema_facts`). Identical fact sets always hash identically,
+  so cached snapshots cannot go stale and no invalidation protocol exists;
+  changed schema rows produce different facts and therefore a different key.
+- Transactions hold a `TransactionCatalog` copy-on-write handle:
+  `Shared(Arc<CatalogSnapshot>)` from the cache for normal reads, switched to
+  a private `Owned` rebuild only when the transaction registers a schema
+  (`insert_schema_for_domain`). Pending registrations are never visible to
+  the shared cache.
+- Plan ids stay stable across the copy-on-write rebuild because catalog
+  entries keep their insertion order, matching the previous full-rebuild
+  semantics of `insert_schema_for_domain`.
+- The cache holds at most 64 fact sets and clears wholesale at the bound;
+  schema catalogs churn rarely, so this only guards pathological
+  schema-mutation workloads.
+- Storage accounting is unchanged by construction: the accounting tables from
+  this run are byte-identical to the 2026-06-09 baseline.
+- `cargo test -p lix_engine`: 927 passed, 0 failed.
+
+### 1k Smoke Scorecard
+
+#### Transaction Layer
+
+Direct transaction API, bypassing SQL. Criterion point estimates:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   10.57 ms |  3.00 ms |         194 us |          666 us |   14.30 ms |    1.06 ms |   11.86 ms |    1.25 ms |
+| RocksDB |    9.00 ms |  2.77 ms |        41.8 us |          271 us |    8.43 ms |     623 us |    8.08 ms |     613 us |
+| redb    |   19.75 ms |  2.73 ms |        67.0 us |          263 us |   19.24 ms |    5.14 ms |   16.50 ms |    5.13 ms |
+
+#### SQL Session
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| SQLite  |   17.84 ms |  6.60 ms |        1.32 ms |         1.48 ms |   15.52 ms |    6.91 ms |
+| RocksDB |   15.77 ms |  5.69 ms |        1.04 ms |         1.18 ms |   12.54 ms |    5.61 ms |
+| redb    |   31.24 ms |  6.51 ms |        1.26 ms |         1.42 ms |   20.14 ms |   10.33 ms |
+
+#### Direct KV Layout
+
+Control group; this patch does not touch the KV layout path. Movement here is
+run-to-run noise on microsecond-scale benches.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.52 ms |   301 us |         168 us |          175 us |    1.58 ms |    70.4 us |     432 us |    52.6 us |
+| RocksDB |     437 us |   161 us |        2.73 us |         10.0 us |     470 us |    9.10 us |    4.69 us |    4.33 us |
+| redb    |    8.14 ms |   239 us |        12.5 us |         18.5 us |    8.97 ms |    4.23 ms |    4.47 ms |    4.04 ms |
+
+### Delta From 2026-06-09 Baseline
+
+Same machine, same day, same harness. Transaction and SQL session deltas are
+attributable to this change; single-row transaction mutations no longer pay a
+full jsonschema catalog compile per commit.
+
+| Workload                              | Baseline |  Current |  Delta |
+| ------------------------------------- | -------: | -------: | -----: |
+| RocksDB transaction update_one_by_pk  |  1.35 ms |   623 us | -54.0% |
+| RocksDB transaction delete_one_by_pk  |  1.34 ms |   613 us | -54.4% |
+| RocksDB transaction read_one_by_pk    |  93.0 us |  41.8 us | -55.0% |
+| SQLite transaction update_one_by_pk   |  1.57 ms |  1.06 ms | -32.7% |
+| SQLite transaction delete_one_by_pk   |  1.62 ms |  1.25 ms | -22.9% |
+| redb transaction update_one_by_pk     |  6.37 ms |  5.14 ms | -19.3% |
+| redb transaction delete_one_by_pk     |  6.10 ms |  5.13 ms | -15.9% |
+| RocksDB transaction update_all 1k     |  9.82 ms |  8.43 ms | -14.2% |
+| RocksDB transaction delete_all 1k     |  9.44 ms |  8.08 ms | -14.4% |
+| RocksDB transaction insert_all 1k     |  9.15 ms |  9.00 ms |  -1.6% |
+| SQLite transaction delete_all 1k      | 12.94 ms | 11.86 ms |  -8.3% |
+| SQLite sql_session delete_all 1k      | 18.25 ms | 15.52 ms | -15.0% |
+| SQLite sql_session delete_one_by_pk   |  7.85 ms |  6.91 ms | -12.0% |
+| RocksDB sql_session delete_one_by_pk  |  6.37 ms |  5.61 ms | -11.9% |
+
+The focused RocksDB run immediately after the change (against Criterion's
+cached pre-change baseline) measured insert_all at 8.42 ms (-14.3%); the full
+smoke sample above landed at 9.00 ms, so the bulk-insert win is real but
+within a few percent of run variance. The dominant, robust win is the removal
+of the fixed per-transaction catalog compile, which was about half of every
+single-row transaction operation.

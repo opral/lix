@@ -7,4 +7,4 @@ pub(crate) use schema::{
     ForeignKeyPlan, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanId,
     StateForeignKeyPlan,
 };
-pub(crate) use snapshot::{CatalogSnapshot, StateDeleteReferencePlan};
+pub(crate) use snapshot::{CatalogSnapshot, StateDeleteReferencePlan, TransactionCatalog};
