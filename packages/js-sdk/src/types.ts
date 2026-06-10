@@ -2,8 +2,14 @@ export type SqliteBackendOptions = {
 	path: string;
 };
 
+export type FsBackendOptions = {
+	path: string;
+};
+
 export type OpenLixOptions = {
-	backend?: import("./open-lix.js").SqliteBackend;
+	backend?:
+		| import("./open-lix.js").SqliteBackend
+		| import("./open-lix.js").FsBackend;
 };
 
 export type LixValue =
