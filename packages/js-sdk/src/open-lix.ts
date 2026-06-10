@@ -1,4 +1,5 @@
 import { invalidArgument } from "./errors.js";
+import { pluginArchivePathFromArchive } from "./plugin-archive.js";
 import { addon } from "./native.js";
 import { normalizeOptionals, wrapExecuteResult } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
@@ -15,6 +16,7 @@ import type {
 	SqliteBackendOptions,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
+	LixFs,
 } from "./types.js";
 
 type NativeExecuteResult = Parameters<typeof wrapExecuteResult>[0];
@@ -86,7 +88,11 @@ export async function openLix(options: OpenLixOptions = {}): Promise<Lix> {
 }
 
 export class Lix {
-	constructor(private readonly native: NativeLix) {}
+	readonly fs: LixFs;
+
+	constructor(private readonly native: NativeLix) {
+		this.fs = createFsApi("lix", (sql, params) => this.execute(sql, params));
+	}
 
 	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
 		assertExecuteArgs("lix", sql, params);
@@ -102,6 +108,14 @@ export class Lix {
 
 	async beginTransaction(): Promise<LixTransaction> {
 		return new LixTransaction(this.native.beginTransaction());
+	}
+
+	async installPlugin(archiveBytes: Uint8Array): Promise<void> {
+		assertBytesArg("lix", "installPlugin", "archiveBytes", archiveBytes);
+		await this.fs.writeFile(
+			pluginArchivePathFromArchive(archiveBytes),
+			archiveBytes,
+		);
 	}
 
 	async activeBranchId(): Promise<string> {
@@ -138,7 +152,13 @@ export class Lix {
 }
 
 export class LixTransaction {
-	constructor(private readonly native: NativeLixTransaction) {}
+	readonly fs: LixFs;
+
+	constructor(private readonly native: NativeLixTransaction) {
+		this.fs = createFsApi("lixTransaction", (sql, params) =>
+			this.execute(sql, params),
+		);
+	}
 
 	async execute(sql: string, params: SqlParam[] = []): Promise<ExecuteResult> {
 		assertExecuteArgs("lixTransaction", sql, params);
@@ -158,6 +178,77 @@ export class LixTransaction {
 
 	async rollback(): Promise<void> {
 		return this.native.rollback();
+	}
+}
+
+function createFsApi(
+	receiver: string,
+	executeSql: (sql: string, params: SqlParam[]) => Promise<ExecuteResult>,
+): LixFs {
+	return {
+		async readFile(path: string): Promise<Uint8Array | undefined> {
+			assertPathArg(receiver, "fs.readFile", path);
+			const result = await executeSql(
+				"SELECT data FROM lix_file WHERE path = $1",
+				[path],
+			);
+			if (result.rows.length === 0) {
+				return undefined;
+			}
+			return result.rows[0]?.value("data").asBytes() ?? new Uint8Array();
+		},
+		async writeFile(path: string, data: Uint8Array): Promise<void> {
+			assertPathArg(receiver, "fs.writeFile", path);
+			assertBytesArg(receiver, "fs.writeFile", "data", data);
+			const existing = await executeSql(
+				"SELECT id FROM lix_file WHERE path = $1",
+				[path],
+			);
+			if (existing.rows.length === 0) {
+				await executeSql("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
+					path,
+					data,
+				]);
+				return;
+			}
+			await executeSql("UPDATE lix_file SET data = $2 WHERE path = $1", [
+				path,
+				data,
+			]);
+		},
+	};
+}
+
+function assertPathArg(
+	receiver: string,
+	operation: string,
+	path: unknown,
+): void {
+	if (typeof path !== "string" || path.length === 0) {
+		throw invalidArgument(
+			operation,
+			"path",
+			"non-empty string",
+			typeof path,
+			receiver,
+		);
+	}
+}
+
+function assertBytesArg(
+	receiver: string,
+	operation: string,
+	argument: string,
+	value: unknown,
+): asserts value is Uint8Array {
+	if (!(value instanceof Uint8Array)) {
+		throw invalidArgument(
+			operation,
+			argument,
+			"Uint8Array",
+			value === null ? "null" : typeof value,
+			receiver,
+		);
 	}
 }
 

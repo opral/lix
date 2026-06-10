@@ -5,6 +5,10 @@ export {
 	openLix,
 	SqliteBackend,
 } from "./open-lix.js";
+export {
+	bundledPluginArchives,
+	type BundledPluginArchive,
+} from "./bundled-plugins.js";
 export { Row } from "./result.js";
 export { Value } from "./value.js";
 export type {
@@ -14,6 +18,7 @@ export type {
 	FsBackendOptions,
 	JsonValue,
 	LixValue,
+	LixFs,
 	MergeBranchOptions,
 	MergeBranchOutcome,
 	MergeBranchPreview,

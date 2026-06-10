@@ -50,7 +50,8 @@ use crate::live_state::{
 };
 use crate::plugin::{
     InstalledPlugin, PluginRuntimeHost, load_installed_plugins_from_filesystem,
-    plugin_state_live_state_projection, reject_normal_plugin_storage_mutation,
+    plugin_key_from_archive_path, plugin_state_live_state_projection,
+    plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
     render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
 };
 use crate::sql2::branch_scope::{
@@ -1461,12 +1462,34 @@ fn reject_lix_file_update_plugin_storage_paths(
 ) -> Result<()> {
     for row_index in 0..batch.num_rows() {
         if let Some(existing_path) = optional_string_value(batch, row_index, "path")? {
-            normalize_normal_write_file_path(&existing_path, TransactionWriteOperation::Update)?;
+            let normalized =
+                normalize_file_upsert_path(&existing_path, TransactionWriteOperation::Update)?;
+            if normalized.plugin_key.is_some() {
+                if update_columns.path {
+                    return Err(lix_error_to_datafusion_error(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "UPDATE lix_file cannot modify plugin archive paths".to_string(),
+                    )));
+                }
+                if !update_columns.data {
+                    return Err(lix_error_to_datafusion_error(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        "UPDATE lix_file for plugin archive paths requires data".to_string(),
+                    )));
+                }
+            }
         }
         if update_columns.path {
             let assigned_path =
                 update_required_string_value(batch, assignment_values, row_index, "path")?;
-            normalize_normal_write_file_path(&assigned_path, TransactionWriteOperation::Update)?;
+            let normalized =
+                normalize_file_upsert_path(&assigned_path, TransactionWriteOperation::Update)?;
+            if normalized.plugin_key.is_some() {
+                return Err(lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "UPDATE lix_file cannot move files into plugin archive paths".to_string(),
+                )));
+            }
         }
     }
     Ok(())
@@ -1540,7 +1563,8 @@ fn lix_file_path_update_stage_from_batch(
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
         let path = update_required_string_value(batch, assignment_values, row_index, "path")?;
-        let path = normalize_normal_write_file_path(&path, TransactionWriteOperation::Update)?;
+        let NormalizedFileWritePath { path, .. } =
+            normalize_file_upsert_path(&path, TransactionWriteOperation::Update)?;
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
         let assigned_data = if update_columns.data {
@@ -1614,7 +1638,7 @@ fn path_update_plugin_rewrite_file_ids(
         let assigned_path =
             update_required_string_value(batch, assignment_values, row_index, "path")?;
         let assigned_path =
-            normalize_normal_write_file_path(&assigned_path, TransactionWriteOperation::Update)?;
+            normalize_file_upsert_path(&assigned_path, TransactionWriteOperation::Update)?.path;
         if existing_path == assigned_path {
             continue;
         }
@@ -1689,7 +1713,14 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         };
 
         if let Some(path) = path {
-            let path = normalize_normal_write_file_path(&path, TransactionWriteOperation::Insert)?;
+            let NormalizedFileWritePath { path, plugin_key } =
+                normalize_file_upsert_path(&path, TransactionWriteOperation::Insert)?;
+            if plugin_key.is_some() && data.is_none() {
+                return Err(lix_error_to_datafusion_error(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "INSERT into lix_file for plugin archive paths requires data".to_string(),
+                )));
+            }
             reject_read_only_lix_file_insert_field(batch, row_index, "directory_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "name")?;
 
@@ -1706,7 +1737,12 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     "INSERT into lix_file with path requires directory id generator".to_string(),
                 ));
             };
-            let file_id = id.unwrap_or_else(|| generate_directory_id());
+            let file_id = id.unwrap_or_else(|| {
+                plugin_key
+                    .as_deref()
+                    .map(plugin_storage_archive_file_id)
+                    .unwrap_or_else(|| generate_directory_id())
+            });
             let mut plan = crate::filesystem::plan_file_path_write(
                 resolver,
                 FilePathWriteInput {
@@ -2629,6 +2665,40 @@ fn normalize_normal_write_file_path(
     )
     .map_err(lix_error_to_datafusion_error)?;
     Ok(parsed.normalized_path.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedFileWritePath {
+    path: String,
+    plugin_key: Option<String>,
+}
+
+fn normalize_file_upsert_path(
+    path: &str,
+    operation: TransactionWriteOperation,
+) -> Result<NormalizedFileWritePath> {
+    let parsed = ParsedFilePath::try_from_path(path).map_err(lix_error_to_datafusion_error)?;
+    let normalized_path = parsed.normalized_path.to_string();
+    if normalized_path.starts_with(crate::plugin::PLUGIN_STORAGE_ROOT_DIRECTORY_PATH) {
+        let plugin_key = plugin_key_from_archive_path(&normalized_path).ok_or_else(|| {
+            lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "{} cannot modify reserved plugin storage path {:?}",
+                    lix_file_write_operation_label(operation),
+                    normalized_path
+                ),
+            ))
+        })?;
+        return Ok(NormalizedFileWritePath {
+            path: normalized_path,
+            plugin_key: Some(plugin_key),
+        });
+    }
+    Ok(NormalizedFileWritePath {
+        path: normalized_path,
+        plugin_key: None,
+    })
 }
 
 fn lix_file_write_operation_label(operation: TransactionWriteOperation) -> &'static str {
@@ -3902,11 +3972,13 @@ mod tests {
     }
 
     #[test]
-    fn file_path_insert_rejects_plugin_storage_path() {
+    fn file_path_insert_rejects_invalid_plugin_storage_path() {
         let mut resolvers = BTreeMap::new();
 
         let error = lix_file_insert_stage_from_batch_with_path_resolvers(
-            &path_data_insert_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
+            &path_data_insert_batch_with_path(
+                "/.lix_system/plugins/nested/plugin_sentinel.lixplugin",
+            ),
             None,
             "lix_file",
             &mut resolvers,
@@ -3922,11 +3994,11 @@ mod tests {
     }
 
     #[test]
-    fn file_path_update_rejects_plugin_storage_path() {
+    fn file_path_update_rejects_invalid_plugin_storage_path() {
         let mut resolvers = BTreeMap::new();
 
         let error = lix_file_update_stage_from_batch_for_test(
-            &path_update_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
+            &path_update_batch_with_path("/.lix_system/plugins/nested/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
                 path: true,
@@ -3945,9 +4017,32 @@ mod tests {
     }
 
     #[test]
-    fn file_data_update_rejects_existing_plugin_storage_path() {
+    fn file_path_update_rejects_valid_plugin_storage_path() {
+        let mut resolvers = BTreeMap::new();
+
         let error = lix_file_update_stage_from_batch_for_test(
-            &data_update_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
+            &path_update_batch_with_path("/.lix_system/plugins/plugin_sentinel.lixplugin"),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
+        )
+        .expect_err("normal file path update should reject plugin archive path");
+
+        assert!(
+            error.to_string().contains("plugin archive paths"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn file_data_update_rejects_invalid_existing_plugin_storage_path() {
+        let error = lix_file_update_stage_from_batch_for_test(
+            &data_update_batch_with_path("/.lix_system/plugins/nested/plugin_sentinel.lixplugin"),
             None,
             super::LixFileUpdateColumns {
                 path: false,

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import {
+	bundledPluginArchives,
 	FsBackend,
 	openLix,
 	SqliteBackend,
@@ -193,6 +194,94 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 		"generated",
 	);
 	await reopened.close();
+});
+
+test("fs readFile and writeFile wrap SQL file reads and writes", async () => {
+	const lix = await openLix();
+	const data = new TextEncoder().encode("hello from fs wrapper");
+
+	expect(await lix.fs.readFile("/missing.txt")).toBeUndefined();
+	await lix.fs.writeFile("/docs/wrapper.txt", data);
+
+	const stored = await lix.fs.readFile("/docs/wrapper.txt");
+	expect(stored).toEqual(data);
+	const sqlRead = await lix.execute(
+		"SELECT data FROM lix_file WHERE path = $1",
+		["/docs/wrapper.txt"],
+	);
+	expect(get(sqlRead, "data")).toEqual(data);
+
+	const updated = new TextEncoder().encode("updated");
+	await lix.fs.writeFile("/docs/wrapper.txt", updated);
+	expect(await lix.fs.readFile("/docs/wrapper.txt")).toEqual(updated);
+
+	await lix.close();
+});
+
+test("transaction fs wrappers use transaction SQL execution", async () => {
+	const lix = await openLix();
+	const tx = await lix.beginTransaction();
+	const data = new TextEncoder().encode("transactional");
+
+	await tx.fs.writeFile("/tx.txt", data);
+	expect(await tx.fs.readFile("/tx.txt")).toEqual(data);
+	await tx.commit();
+	expect(await lix.fs.readFile("/tx.txt")).toEqual(data);
+
+	await lix.close();
+});
+
+test("writing bundled plugin archives to plugin paths installs schemas", async () => {
+	const lix = await openLix();
+	const plugins = await bundledPluginArchives();
+
+	for (const plugin of plugins) {
+		await lix.fs.writeFile(plugin.path, plugin.archiveBytes);
+		expect(await lix.fs.readFile(plugin.path)).toEqual(plugin.archiveBytes);
+	}
+
+	const schemas = await lix.execute(
+		"SELECT table_name \
+		 FROM information_schema.tables \
+		 WHERE table_name IN ($1, $2, $3, $4) \
+		 ORDER BY table_name",
+		["csv_row", "csv_table", "markdown_block", "markdown_document"],
+	);
+	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
+		"csv_row",
+		"csv_table",
+		"markdown_block",
+		"markdown_document",
+	]);
+
+	await lix.close();
+});
+
+test("installPlugin delegates to the plugin archive writeFile path", async () => {
+	const lix = await openLix();
+	const csvPlugin = (await bundledPluginArchives()).find(
+		(plugin) => plugin.key === "plugin_csv",
+	);
+	if (!csvPlugin) {
+		throw new Error("expected bundled CSV plugin");
+	}
+
+	await lix.installPlugin(csvPlugin.archiveBytes);
+	expect(await lix.fs.readFile(csvPlugin.path)).toEqual(csvPlugin.archiveBytes);
+
+	const schemas = await lix.execute(
+		"SELECT table_name \
+		 FROM information_schema.tables \
+		 WHERE table_name IN ($1, $2) \
+		 ORDER BY table_name",
+		["csv_row", "csv_table"],
+	);
+	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
+		"csv_row",
+		"csv_table",
+	]);
+
+	await lix.close();
 });
 
 test("execute supports UNION ALL without trapping", async () => {

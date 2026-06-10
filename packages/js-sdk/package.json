@@ -18,8 +18,9 @@
 		"dist"
 	],
 	"scripts": {
-		"build": "npm run build:native && npm run build:ts",
+		"build": "npm run build:native && npm run build:ts && npm run build:plugins",
 		"build:native": "node ./scripts/build-native.js",
+		"build:plugins": "node ./scripts/build-bundled-plugins.js",
 		"prepare:native-package": "node ./scripts/prepare-native-package.js",
 		"build:ts": "tsc -p tsconfig.json",
 		"test": "npm run build && vitest run",
@@ -35,5 +36,8 @@
 		"@types/node": "^24.10.2",
 		"typescript": "^5.5.4",
 		"vitest": "^4.0.18"
+	},
+	"dependencies": {
+		"fflate": "^0.8.3"
 	}
 }

@@ -34,7 +34,8 @@ use crate::live_state::{overlay_scan_file_rows, overlay_scan_rows};
 use crate::plugin::{
     InstalledPlugin, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, PluginDetectedChange, PluginRuntimeHost,
     detect_changes_with_plugin, load_installed_plugins_from_filesystem,
-    plugin_state_live_state_projection, retain_plugin_state_rows, select_plugin_for_path,
+    plugin_schema_rows_from_archive_path, plugin_state_live_state_projection,
+    retain_plugin_state_rows, select_plugin_for_path,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::SqlWriteExecutionContext;
@@ -474,6 +475,10 @@ where
     ) -> Result<PluginFileDataReconciliation, LixError> {
         let mut reconciliation = PluginFileDataReconciliation::default();
         for write in file_data {
+            if let Some(rows) = plugin_archive_schema_rows_for_write(write)? {
+                reconciliation.rows.extend(rows);
+                continue;
+            }
             if !is_plugin_reconciliation_candidate_path(&write.path) {
                 continue;
             }
@@ -1329,6 +1334,21 @@ impl From<&TransactionFileData> for PluginFileWriteKey {
 struct PluginFileDataReconciliation {
     file_keys: BTreeSet<PluginFileWriteKey>,
     rows: Vec<TransactionWriteRow>,
+}
+
+fn plugin_archive_schema_rows_for_write(
+    write: &TransactionFileData,
+) -> Result<Option<Vec<TransactionWriteRow>>, LixError> {
+    if !write.path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH) {
+        return Ok(None);
+    }
+    Ok(Some(plugin_schema_rows_from_archive_path(
+        &write.path,
+        &write.data,
+        &write.branch_id,
+        write.global,
+        write.untracked,
+    )?))
 }
 
 fn is_plugin_reconciliation_candidate_path(path: &str) -> bool {
