@@ -7,7 +7,8 @@ use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
-    BoundInsertValues, BoundWriteInput, BoundWriteOp, BoundWriteTarget, EntityWriteSurface,
+    BoundAssignment, BoundInsertConflict, BoundInsertValues, BoundWriteInput, BoundWriteOp,
+    BoundWriteTarget, EntityWriteSurface,
 };
 use crate::sql2::catalog::entity_surface::EntitySurfaceColumn;
 use crate::sql2::catalog::{
@@ -73,7 +74,11 @@ async fn execute_entity_write(
                 entity_insert_rows(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
                 return Ok(0);
             }
-            entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+            if plan.bound.conflict.is_some() {
+                entity_upsert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+            } else {
+                entity_insert(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
+            }
         }
         BoundWriteOp::Update => {
             if no_op {
@@ -115,6 +120,47 @@ async fn entity_insert(
 ) -> Result<u64, LixError> {
     let write_rows = entity_insert_rows(ctx, plan, spec, params, active_branch_commit_id)?;
     stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await
+}
+
+async fn entity_upsert(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<u64, LixError> {
+    let conflict = plan.bound.conflict.as_ref().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "entity upsert requires an INSERT ON CONFLICT clause",
+        )
+    })?;
+    validate_insert_conflict_target(plan, spec, conflict)?;
+
+    let insert_rows = entity_insert_rows(ctx, plan, spec, params, active_branch_commit_id)?;
+    let candidates = scan_entity_conflict_candidates(ctx, spec, insert_rows.as_slice()).await?;
+    let mut write_rows = Vec::with_capacity(insert_rows.len());
+
+    for insert_row in insert_rows {
+        let inserted_entity_pk = insert_row_entity_pk(&insert_row, spec)?;
+        let matching_candidate =
+            find_conflict_candidate(&insert_row, &inserted_entity_pk, candidates.as_slice());
+        if let Some(candidate) = matching_candidate {
+            write_rows.push(entity_conflict_update_row(
+                ctx,
+                spec,
+                candidate,
+                &insert_row,
+                conflict.assignments.as_slice(),
+                params,
+                active_branch_commit_id,
+            )?);
+        } else {
+            write_rows.push(insert_row);
+        }
+    }
+
+    stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
 }
 
 fn entity_insert_rows(
@@ -207,7 +253,7 @@ async fn entity_update(
             spec,
             &candidate,
             Some(updated),
-            plan,
+            plan.bound.assignments.as_slice(),
             params,
             active_branch_commit_id,
         )?);
@@ -243,13 +289,78 @@ async fn entity_delete(
                 spec,
                 &candidate,
                 None,
-                plan,
+                plan.bound.assignments.as_slice(),
                 params,
                 active_branch_commit_id,
             )?);
         }
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
+}
+
+fn entity_conflict_update_row(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &EntitySurfaceSpec,
+    candidate: &crate::live_state::MaterializedLiveStateRow,
+    insert_row: &TransactionWriteRow,
+    assignments: &[BoundAssignment],
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<TransactionWriteRow, LixError> {
+    let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT ON CONFLICT cannot update a tombstone row",
+        )
+    })?;
+    let insert_snapshot = insert_row
+        .snapshot
+        .as_ref()
+        .map(TransactionJson::value)
+        .unwrap_or(&JsonValue::Null);
+    let context =
+        EntityEvalContext::conflict(&snapshot, candidate, insert_snapshot, insert_row, spec);
+    let mut updated = snapshot.clone();
+    let mut visible_assignments = Vec::new();
+    for assignment in assignments {
+        if let Some(column) = spec.visible_column(&assignment.column.name) {
+            reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
+            let value = eval_expr_value(
+                &assignment.value,
+                &context,
+                ctx,
+                params,
+                active_branch_commit_id,
+            )?;
+            visible_assignments.push((
+                column.name.clone(),
+                entity_json_value(value, column.column_type)?,
+            ));
+        } else if assignment.column.name == "lixcol_metadata" {
+            // handled by entity_replace_row_from_live from the assignment list
+        } else {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                format!(
+                    "bound entity INSERT ON CONFLICT does not support assignment to '{}'",
+                    assignment.column.name
+                ),
+            ));
+        }
+    }
+    for (column_name, value) in visible_assignments {
+        updated[&column_name] = value;
+    }
+
+    entity_replace_row_from_live(
+        ctx,
+        spec,
+        candidate,
+        Some(updated),
+        assignments,
+        params,
+        active_branch_commit_id,
+    )
 }
 
 async fn stage_rows(
@@ -264,6 +375,135 @@ async fn stage_rows(
         .stage_write(TransactionWrite::Rows { mode, rows })
         .await?;
     Ok(outcome.count)
+}
+
+fn validate_insert_conflict_target(
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    conflict: &BoundInsertConflict,
+) -> Result<(), LixError> {
+    if spec.primary_key_paths.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT ON CONFLICT requires a schema primary key",
+        ));
+    }
+
+    let mut expected = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| {
+            if path.len() != 1 {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "INSERT ON CONFLICT supports top-level primary-key columns only",
+                ));
+            }
+            Ok(path[0].clone())
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, LixError>>()?;
+    if matches!(
+        plan.bound.target,
+        BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
+    ) {
+        expected.insert("lixcol_branch_id".to_string());
+    }
+
+    let actual = conflict
+        .target_columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != expected {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!(
+                "INSERT ON CONFLICT target must match entity identity columns ({})",
+                expected.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_row_entity_pk(
+    row: &TransactionWriteRow,
+    spec: &EntitySurfaceSpec,
+) -> Result<EntityPk, LixError> {
+    if let Some(entity_pk) = &row.entity_pk {
+        return Ok(entity_pk.clone());
+    }
+    let snapshot = row.snapshot.as_ref().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "INSERT ON CONFLICT for schema '{}' requires snapshot_content",
+                spec.schema_key
+            ),
+        )
+    })?;
+    EntityPk::from_primary_key_paths(snapshot.value(), &spec.primary_key_paths).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "INSERT ON CONFLICT failed to derive entity primary key for schema '{}': {error}",
+                spec.schema_key
+            ),
+        )
+    })
+}
+
+fn find_conflict_candidate<'a>(
+    insert_row: &TransactionWriteRow,
+    inserted_entity_pk: &EntityPk,
+    candidates: &'a [crate::live_state::MaterializedLiveStateRow],
+) -> Option<&'a crate::live_state::MaterializedLiveStateRow> {
+    candidates.iter().find(|candidate| {
+        candidate_matches_insert_identity(candidate, insert_row, inserted_entity_pk)
+    })
+}
+
+fn candidate_matches_insert_identity(
+    candidate: &crate::live_state::MaterializedLiveStateRow,
+    insert_row: &TransactionWriteRow,
+    inserted_entity_pk: &EntityPk,
+) -> bool {
+    candidate.entity_pk == *inserted_entity_pk
+        && candidate.file_id == insert_row.file_id
+        && candidate.branch_id == insert_row.branch_id
+        && candidate.global == insert_row.global
+        && candidate.untracked == insert_row.untracked
+}
+
+async fn scan_entity_conflict_candidates(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &EntitySurfaceSpec,
+    insert_rows: &[TransactionWriteRow],
+) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+    let mut branch_ids = std::collections::BTreeSet::new();
+    let mut untracked_values = std::collections::BTreeSet::new();
+    for row in insert_rows {
+        branch_ids.insert(row.branch_id.clone());
+        untracked_values.insert(row.untracked);
+    }
+
+    let mut candidates = Vec::new();
+    for untracked in untracked_values {
+        let rows = ctx
+            .scan_live_state(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![spec.schema_key.clone()],
+                    branch_ids: branch_ids.iter().cloned().collect(),
+                    untracked: Some(untracked),
+                    include_tombstones: false,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await?;
+        candidates.extend(rows);
+    }
+    Ok(candidates)
 }
 
 async fn scan_entity_candidates(
@@ -469,11 +709,11 @@ fn entity_replace_row_from_live(
     spec: &EntitySurfaceSpec,
     row: &crate::live_state::MaterializedLiveStateRow,
     snapshot: Option<JsonValue>,
-    plan: &LogicalWritePlan,
+    assignments: &[BoundAssignment],
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<TransactionWriteRow, LixError> {
-    let metadata = if let Some(expr) = assignment_value(plan, "lixcol_metadata") {
+    let metadata = if let Some(expr) = assignment_value(assignments, "lixcol_metadata") {
         let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
         let context = EntityEvalContext::live(&snapshot_for_eval, row, spec);
         let value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
@@ -526,6 +766,8 @@ fn inherited_metadata(
 struct EntityEvalContext<'a> {
     snapshot: &'a JsonValue,
     row: Option<&'a crate::live_state::MaterializedLiveStateRow>,
+    excluded_snapshot: Option<&'a JsonValue>,
+    excluded_row: Option<&'a TransactionWriteRow>,
     visible_columns: &'a [EntitySurfaceColumn],
 }
 
@@ -534,6 +776,8 @@ impl<'a> EntityEvalContext<'a> {
         Self {
             snapshot,
             row: None,
+            excluded_snapshot: None,
+            excluded_row: None,
             visible_columns,
         }
     }
@@ -546,6 +790,24 @@ impl<'a> EntityEvalContext<'a> {
         Self {
             snapshot,
             row: Some(row),
+            excluded_snapshot: None,
+            excluded_row: None,
+            visible_columns: &spec.columns,
+        }
+    }
+
+    fn conflict(
+        snapshot: &'a JsonValue,
+        row: &'a crate::live_state::MaterializedLiveStateRow,
+        excluded_snapshot: &'a JsonValue,
+        excluded_row: &'a TransactionWriteRow,
+        spec: &'a EntitySurfaceSpec,
+    ) -> Self {
+        Self {
+            snapshot,
+            row: Some(row),
+            excluded_snapshot: Some(excluded_snapshot),
+            excluded_row: Some(excluded_row),
             visible_columns: &spec.columns,
         }
     }
@@ -618,6 +880,7 @@ fn eval_expr_value(
                 )
             }),
         BoundExpr::Column(column) => column_eval_value(context, &column.name),
+        BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
         BoundExpr::Function { name, args } if name == "lix_json" && args.len() == 1 => {
             let raw = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             let raw = match raw {
@@ -899,6 +1162,11 @@ fn validate_bound_write_supported(
     for assignment in &plan.bound.assignments {
         validate_expr_supported(&assignment.value)?;
     }
+    if let Some(conflict) = &plan.bound.conflict {
+        for assignment in &conflict.assignments {
+            validate_expr_supported(&assignment.value)?;
+        }
+    }
     Ok(())
 }
 
@@ -919,6 +1187,12 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
             .assignments
             .iter()
             .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
+        && plan.bound.conflict.as_ref().is_none_or(|conflict| {
+            conflict
+                .assignments
+                .iter()
+                .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
+        })
 }
 
 fn validate_predicate_supported(
@@ -1029,7 +1303,7 @@ fn require_json_comparison_operand(
 fn is_identity_json_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
-        BoundExpr::Column(column)
+        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
             if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
     )
 }
@@ -1045,7 +1319,7 @@ fn is_parseable_json_text_literal(expr: &BoundExpr) -> bool {
 
 fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
     match expr {
-        BoundExpr::Column(column) => {
+        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => {
             spec.visible_column(&column.name)
                 .is_some_and(|column| column.column_type == EntityColumnType::Json)
                 || matches!(
@@ -1061,7 +1335,10 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &EntitySurfaceSpec) -> bool {
 
 fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
     match expr {
-        BoundExpr::Column(_) | BoundExpr::Param(_) | BoundExpr::Literal(_) => Ok(()),
+        BoundExpr::Column(_)
+        | BoundExpr::ExcludedColumn(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Literal(_) => Ok(()),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
                 "lix_json" if args.len() == 1 => {}
@@ -1369,6 +1646,58 @@ fn column_eval_value(
     }
 }
 
+fn excluded_column_eval_value(
+    context: &EntityEvalContext<'_>,
+    column_name: &str,
+) -> Result<EntityEvalValue, LixError> {
+    let Some(excluded_snapshot) = context.excluded_snapshot else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "excluded columns are only available in INSERT ON CONFLICT assignments",
+        ));
+    };
+    if let Some(value) = excluded_snapshot.get(column_name) {
+        return Ok(visible_column_eval_value(
+            context
+                .visible_columns
+                .iter()
+                .find(|column| column.name == column_name),
+            value,
+        ));
+    }
+    let Some(row) = context.excluded_row else {
+        return Ok(EntityEvalValue::SqlNull);
+    };
+    match column_name {
+        "lixcol_entity_pk" => row
+            .entity_pk
+            .as_ref()
+            .map(|entity_pk| entity_pk.as_json_array_value().map(EntityEvalValue::Json))
+            .transpose()
+            .map(|value| value.unwrap_or(EntityEvalValue::SqlNull)),
+        "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.schema_key.clone(),
+        ))),
+        "lixcol_file_id" => Ok(row
+            .file_id
+            .as_ref()
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .unwrap_or(EntityEvalValue::SqlNull)),
+        "lixcol_metadata" => row
+            .metadata
+            .as_ref()
+            .map(|metadata| Ok(EntityEvalValue::Json(metadata.value().clone())))
+            .transpose()
+            .map(|metadata| metadata.unwrap_or(EntityEvalValue::SqlNull)),
+        "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
+        "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
+        "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
+            row.branch_id.clone(),
+        ))),
+        _ => Ok(EntityEvalValue::SqlNull),
+    }
+}
+
 fn visible_column_eval_value(
     column: Option<&EntitySurfaceColumn>,
     value: &JsonValue,
@@ -1502,9 +1831,11 @@ fn insert_target_branch_ids(scope: &BranchScope) -> Option<Vec<String>> {
     }
 }
 
-fn assignment_value<'a>(plan: &'a LogicalWritePlan, column_name: &str) -> Option<&'a BoundExpr> {
-    plan.bound
-        .assignments
+fn assignment_value<'a>(
+    assignments: &'a [BoundAssignment],
+    column_name: &str,
+) -> Option<&'a BoundExpr> {
+    assignments
         .iter()
         .find(|assignment| assignment.column.name == column_name)
         .map(|assignment| &assignment.value)

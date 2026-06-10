@@ -264,6 +264,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     params: &[Value],
 ) -> Result<u64, LixError> {
     validate_bound_write_input(plan, params)?;
+    reject_datafusion_insert_conflict(plan)?;
     let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
@@ -317,6 +318,7 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
     params: &[Value],
 ) -> Result<(), LixError> {
     validate_bound_write_input(plan, params)?;
+    reject_datafusion_insert_conflict(plan)?;
     let session = build_write_session_with_options(ctx, write_session_options(plan)).await?;
     let table_name = write_target_table_name(plan)?;
     let table = session
@@ -352,6 +354,16 @@ pub(crate) async fn validate_datafusion_write_logical_plan(
         }
     }
 
+    Ok(())
+}
+
+fn reject_datafusion_insert_conflict(plan: &LogicalWritePlan) -> Result<(), LixError> {
+    if plan.bound.conflict.is_some() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "INSERT ON CONFLICT is not supported by the DataFusion write path",
+        ));
+    }
     Ok(())
 }
 
@@ -575,6 +587,7 @@ fn validate_lix_file_data_insert_expr(expr: &BoundExpr, params: &[Value]) -> Res
             _ => Err(lix_file_data_type_lix_error()),
         },
         BoundExpr::Function { .. } => Ok(()),
+        BoundExpr::ExcludedColumn(_) => Err(lix_file_data_type_lix_error()),
         _ => Err(lix_file_data_type_lix_error()),
     }
 }
@@ -841,6 +854,10 @@ fn datafusion_expr_from_bound_expr(
 ) -> Result<Expr, LixError> {
     match expr {
         BoundExpr::Column(column) => Ok(Expr::Column(Column::from_name(column.name.clone()))),
+        BoundExpr::ExcludedColumn(_) => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "excluded columns are only supported in INSERT ON CONFLICT assignments",
+        )),
         BoundExpr::Literal(literal) => Ok(Expr::Literal(
             scalar_from_bound_literal(literal)?,
             bound_literal_metadata(literal),
@@ -886,7 +903,7 @@ fn bound_literal_metadata(literal: &BoundLiteral) -> Option<FieldMetadata> {
 
 fn bound_expr_is_json(expr: &BoundExpr, schema: &Schema) -> bool {
     match expr {
-        BoundExpr::Column(column) => schema
+        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => schema
             .fields()
             .iter()
             .find(|field| field.name() == &column.name)
@@ -900,7 +917,7 @@ fn bound_expr_is_json(expr: &BoundExpr, schema: &Schema) -> bool {
 fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
     matches!(
         expr,
-        BoundExpr::Column(column)
+        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
             if matches!(column.name.as_str(), "entity_pk" | "lixcol_entity_pk")
     )
 }

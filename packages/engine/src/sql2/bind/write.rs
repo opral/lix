@@ -11,6 +11,7 @@ pub(crate) struct BoundWrite {
     pub(crate) input: BoundWriteInput,
     pub(crate) predicate: BoundPredicate,
     pub(crate) assignments: Vec<BoundAssignment>,
+    pub(crate) conflict: Option<BoundInsertConflict>,
     pub(crate) params: BoundParamMap,
     pub(crate) branch_scope: BranchScope,
 }
@@ -78,6 +79,12 @@ impl BoundInsertValues {
 pub(crate) struct BoundAssignment {
     pub(crate) column: BoundColumnRef,
     pub(crate) value: BoundExpr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundInsertConflict {
+    pub(crate) target_columns: Vec<BoundColumnRef>,
+    pub(crate) assignments: Vec<BoundAssignment>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
