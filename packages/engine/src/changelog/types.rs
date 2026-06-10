@@ -439,18 +439,17 @@ pub(crate) enum CommitLoadEntry {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+/// In-memory change record. The stored form (`ChangeRecordRef` /
+/// `ChangeRecordView`) omits `change_id`: it is the storage key and gets
+/// reconstructed on decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChangeRecord {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeId,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
-    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
-    #[musli(with = crate::storage_codec::option)]
     pub(crate) snapshot_ref: Option<JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
     pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: LixTimestamp,
 }
@@ -459,7 +458,6 @@ pub(crate) struct ChangeRecord {
 #[musli(packed)]
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
-    pub(crate) change_id: ChangeId,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a [String],
     #[musli(with = crate::storage_codec::option)]
@@ -475,7 +473,6 @@ pub(crate) struct ChangeRecordRef<'a> {
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
-    pub(crate) change_id: ChangeId,
     pub(crate) schema_key: &'a str,
     #[musli(with = entity_pk_ref_storage)]
     pub(crate) entity_pk: EntityPkRef<'a>,

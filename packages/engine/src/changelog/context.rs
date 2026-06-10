@@ -601,7 +601,7 @@ where
         let mut out = HashMap::new();
         for (change_id, value) in change_ids.into_iter().zip(values) {
             if let Some(value) = value {
-                out.insert(change_id, decode_change_record(&value)?);
+                out.insert(change_id, decode_change_record(&value, change_id)?);
             }
         }
         Ok(out)
@@ -717,7 +717,13 @@ async fn load_changes_from_store(
     let entries = get_many(store, CHANGE_SPACE, keys)
         .await?
         .into_iter()
-        .map(|value| value.as_deref().map(decode_change_record).transpose())
+        .zip(request.change_ids.iter())
+        .map(|(value, change_id)| {
+            value
+                .as_deref()
+                .map(|value| decode_change_record(value, *change_id))
+                .transpose()
+        })
         .collect::<Result<Vec<_>, LixError>>()?;
     Ok(ChangeLoadBatch { entries })
 }
@@ -750,17 +756,9 @@ async fn scan_changes_from_store(
         .await?;
     let mut entries = Vec::with_capacity(page.values.len());
     for (key, value) in page.keys.iter().zip(page.values.iter()) {
-        let record = decode_change_record(value)?;
-        if key.as_slice() != change_key(record.change_id).as_slice() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "changelog change scan key does not match decoded change_id '{}'",
-                    record.change_id
-                ),
-            ));
-        }
-        entries.push(record);
+        // change_id lives in the key; the stored value omits it.
+        let change_id = change_id_from_key(key)?;
+        entries.push(decode_change_record(value, change_id)?);
     }
     let next_start_after = page
         .resume_after

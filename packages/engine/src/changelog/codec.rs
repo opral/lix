@@ -1,8 +1,8 @@
 use super::types::{
-    ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRef, CommitChangeRefChunk,
-    CommitChangeRefChunkRef, CommitChangeRefChunkView, CommitChangeRefEntryRef,
-    CommitChangeRefEntryView, CommitChangeRefView, CommitId, CommitRecord, EntityPkRef,
-    ExpandedCommitChangeRefChunkView,
+    ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRef,
+    CommitChangeRefChunk, CommitChangeRefChunkRef, CommitChangeRefChunkView,
+    CommitChangeRefEntryRef, CommitChangeRefEntryView, CommitChangeRefView, CommitId, CommitRecord,
+    EntityPkRef, ExpandedCommitChangeRefChunkView,
 };
 use crate::common::LixError;
 use crate::entity_pk::EntityPk;
@@ -17,11 +17,36 @@ pub(crate) fn decode_commit_record(bytes: &[u8]) -> Result<CommitRecord, LixErro
 }
 
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
-    storage_codec::encode("change record", record)
+    // change_id is the storage key; the value intentionally omits it.
+    storage_codec::encode(
+        "change record",
+        &ChangeRecordRef {
+            format_version: record.format_version,
+            schema_key: &record.schema_key,
+            entity_pk: &record.entity_pk.parts,
+            file_id: record.file_id.as_deref(),
+            snapshot_ref: record.snapshot_ref.as_ref(),
+            metadata_ref: record.metadata_ref.as_ref(),
+            created_at: record.created_at,
+        },
+    )
 }
 
-pub(crate) fn decode_change_record(bytes: &[u8]) -> Result<ChangeRecord, LixError> {
-    storage_codec::decode("change record", bytes)
+pub(crate) fn decode_change_record(
+    bytes: &[u8],
+    change_id: ChangeId,
+) -> Result<ChangeRecord, LixError> {
+    let view: ChangeRecordView<'_> = storage_codec::decode("change record", bytes)?;
+    Ok(ChangeRecord {
+        format_version: view.format_version,
+        change_id,
+        schema_key: view.schema_key.to_string(),
+        entity_pk: entity_pk_from_ref(view.entity_pk)?,
+        file_id: view.file_id.map(str::to_string),
+        snapshot_ref: view.snapshot_ref,
+        metadata_ref: view.metadata_ref,
+        created_at: view.created_at,
+    })
 }
 
 pub(crate) fn encode_commit_change_ref_chunk(
@@ -192,4 +217,60 @@ fn entity_pk_from_ref(value: EntityPkRef<'_>) -> Result<EntityPk, LixError> {
             )
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changelog::ChangeId;
+    use crate::common::LixTimestamp;
+    use crate::json_store::JsonRef;
+
+    fn full_record() -> ChangeRecord {
+        ChangeRecord {
+            format_version: 1,
+            change_id: ChangeId::for_test_label("roundtrip-change"),
+            schema_key: "schema-\u{00e9}\u{4e2d}".to_string(),
+            entity_pk: EntityPk::from_parts(vec!["part-a".to_string(), "part-b".to_string()])
+                .expect("entity pk should build"),
+            file_id: Some("file-1".to_string()),
+            snapshot_ref: Some(JsonRef::for_content(b"snapshot")),
+            metadata_ref: Some(JsonRef::for_content(b"metadata")),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-06-10T00:00:00.000Z"),
+        }
+    }
+
+    #[test]
+    fn change_record_round_trips_fully_populated() {
+        let record = full_record();
+        let encoded = encode_change_record(&record).expect("record should encode");
+        let decoded =
+            decode_change_record(&encoded, record.change_id).expect("record should decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn change_record_round_trips_with_empty_options() {
+        let record = ChangeRecord {
+            file_id: None,
+            snapshot_ref: None,
+            metadata_ref: None,
+            ..full_record()
+        };
+        let encoded = encode_change_record(&record).expect("record should encode");
+        let decoded =
+            decode_change_record(&encoded, record.change_id).expect("record should decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn change_record_takes_identity_from_the_decode_argument() {
+        // The stored value omits change_id; whatever id the key supplies is
+        // what the decoded record carries.
+        let record = full_record();
+        let encoded = encode_change_record(&record).expect("record should encode");
+        let other_id = ChangeId::for_test_label("other-change");
+        let decoded = decode_change_record(&encoded, other_id).expect("record should decode");
+        assert_eq!(decoded.change_id, other_id);
+    }
 }

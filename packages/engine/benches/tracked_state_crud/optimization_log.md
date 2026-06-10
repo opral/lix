@@ -1259,3 +1259,81 @@ bug:
   without consuming a sequence tick. Stress: 20 consecutive runs green.
 
 - `cargo test -p lix_engine --features storage-benches`: 1,538 passed.
+
+## Value Dedup: keyed change ids and chunk-local commit dictionaries
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Changes (hard cuts):
+
+- `ChangeRecord` values no longer store `change_id`: it is the storage key
+  and is reconstructed on decode, the same pattern
+  `commit_change_ref_chunk` already uses for `commit_id`. The in-memory
+  record keeps the id; only the stored form
+  (`ChangeRecordRef`/`ChangeRecordView`) drops it. The scan-path
+  key-vs-value consistency check became tautological and was removed; a
+  direct codec round-trip suite (fully populated, empty options,
+  id-from-argument) covers the hand-threaded stored form.
+- Leaf nodes dictionary the commit-id slice of their values chunk-locally.
+  The standard value encoding places `change_id` at bytes [0..16) and
+  `commit_id` at [16..32) (pinned by a layout test); bulk commits repeat one
+  commit id across every entry, so the encoder collects first-occurrence
+  commit ids into a per-chunk dictionary and stores values with the slice
+  spliced out. The splice is reversible byte-for-byte regardless of value
+  semantics; values shorter than 32 bytes are stored verbatim (dict ref 0).
+  Dictionaried values are reconstructed into the decode arena; verbatim
+  values stay zero-copy. Both golden wire-format vectors (dict-less and
+  dictionaried) pin the encoding.
+
+Review found two decoder bugs in the initial diff, both fixed with
+regression tests:
+
+- The shared-prefix guard measured the previous key from the arena tail,
+  which holds value bytes after a dictionaried entry; a corrupt chunk with
+  an inflated shared length was accepted and front-coded the next key out
+  of value bytes. The decoder now tracks the previous key end explicitly.
+- `(dict_ref - 1) * 16` was unchecked; a dict_ref near 2^60 wrapped the
+  multiplication in release builds and aliased dictionary slot 0. The
+  decoder validates `dict_ref <= dict_len` before any index arithmetic.
+
+Note on coverage: the byte-exact scrambled equivalence test exercises the
+dictionaried path (its fixture values are full tracked-state encodings) but
+compares the two fixtures against each other, so it catches order-dependent
+bugs only; deterministic codec bugs are the round-trip/golden suites' job.
+
+### Storage A/B (1k insert footprint, identical across backends)
+
+| Metric                                | Before  | After   | Delta  |
+| ------------------------------------- | ------: | ------: | -----: |
+| `changelog.change` value bytes        | 128,857 | 112,601 | -12.6% |
+| `tree_chunk` value bytes              | 125,918 | 110,833 | -12.0% |
+| transaction insert_all written bytes  | 606,256 | 575,409 |  -5.1% |
+| transaction update_all written bytes  | 692,589 | 661,744 |  -4.5% |
+| transaction delete_all written bytes  | 257,080 | 226,234 | -12.0% |
+
+The change-record delta is exactly 16 bytes x 1,016 records. Cumulative
+tree_chunk since before the front-coding cut: 162,086 -> 110,833 (-31.6%).
+
+### Perf A/B (alternating stash triples, RocksDB)
+
+read_all 2.640 -> 2.618 ms means and read_many 266.7 -> 270.2 us means, both
+with sign flips across pairs: parity. read_one initially measured
+42.2 -> 46.2 us means with mixed signs; because dictionaried values lose
+zero-copy on decode (a plausible mechanism for a point-read cost), a second
+alternating triple was run and came back at parity (48.6 -> 49.2 us means,
+sign flipping across pairs). Across all six pairs the sign flips in three:
+no consistent regression.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,549 passed.
+  New tests: value-layout pin; dictionaried round-trip with mixed
+  verbatim/32-byte-boundary/bulk entries plus a compression assertion;
+  dict-less and dictionaried golden wire vectors; out-of-bounds, wrapping,
+  and adversarial-length dictionary rejection; shared-length-after-
+  dictionaried-value rejection; direct change-record round-trips.

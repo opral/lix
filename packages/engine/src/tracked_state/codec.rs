@@ -104,7 +104,8 @@ impl DecodedLeafNode {
 /// Decoded view of a leaf node.
 ///
 /// Keys are stored front-coded on disk and reconstructed into one arena at
-/// decode time; values stay borrowed from the chunk bytes verbatim.
+/// decode time. Values with a dictionaried commit-id slice are reconstructed
+/// into the same arena; verbatim values stay borrowed from the chunk bytes.
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedLeafNodeRef<'a> {
     key_arena: Vec<u8>,
@@ -115,7 +116,15 @@ pub(crate) struct DecodedLeafNodeRef<'a> {
 struct LeafEntrySpan<'a> {
     key_start: usize,
     key_end: usize,
-    value: &'a [u8],
+    value: LeafValueSpan<'a>,
+}
+
+/// Values whose commit-id slice was dictionaried are reconstructed into the
+/// arena; verbatim values stay borrowed from the chunk bytes.
+#[derive(Debug, Clone, Copy)]
+enum LeafValueSpan<'a> {
+    Borrowed(&'a [u8]),
+    Arena { start: usize, end: usize },
 }
 
 impl DecodedLeafNodeRef<'_> {
@@ -127,7 +136,10 @@ impl DecodedLeafNodeRef<'_> {
     pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'_>>, LixError> {
         Ok(self.entries.get(index).map(|span| EncodedLeafEntryRef {
             key: &self.key_arena[span.key_start..span.key_end],
-            value: span.value,
+            value: match span.value {
+                LeafValueSpan::Borrowed(value) => value,
+                LeafValueSpan::Arena { start, end } => &self.key_arena[start..end],
+            },
         }))
     }
 
@@ -284,16 +296,32 @@ pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
     encode_leaf_node_refs(&entries)
 }
 
+/// Offsets of the commit-id slice inside a standard encoded value; pinned by
+/// `encoded_value_layout_places_ids_at_fixed_offsets`.
+const VALUE_COMMIT_ID_START: usize = 16;
+const VALUE_COMMIT_ID_END: usize = 32;
+
 /// Leaf node wire format (v2):
 ///
 /// ```text
 /// [NODE_KIND_LEAF_V2]
 /// varint entry_count
+/// varint commit_dict_len ++ commit_dict_len x 16 commit-id bytes
 /// per entry:
 ///   varint shared_key_len   bytes shared with the previous entry's key
 ///   varint key_suffix_len ++ key suffix bytes
-///   varint value_len ++ value bytes (verbatim standard value encoding)
+///   varint dict_ref         0 = value stored verbatim; n>0 = the value's
+///                           commit-id slice [16..32) is dict entry n-1 and
+///                           is omitted from the stored bytes
+///   varint stored_value_len ++ stored value bytes
 /// ```
+///
+/// Bulk commits repeat one commit id across every entry, so the chunk-local
+/// dictionary collapses the 16-byte slice to a 1-byte ref; the splice is
+/// reversible byte-for-byte regardless of value semantics, and values
+/// shorter than 32 bytes are stored verbatim. The dictionary uses
+/// first-occurrence order, keeping the encoding a deterministic function of
+/// the entries.
 ///
 /// Entries within a node are sorted by key, so consecutive keys share the
 /// encoded schema-key/file-id prefix and most of the entity-pk; front-coding
@@ -307,17 +335,49 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
         entries.windows(2).all(|pair| pair[0].key < pair[1].key),
         "leaf entries must be strictly sorted by key"
     );
+    let mut commit_dictionary: Vec<&[u8]> = Vec::new();
+    let mut dict_refs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.value.len() >= VALUE_COMMIT_ID_END {
+            let commit_id = &entry.value[VALUE_COMMIT_ID_START..VALUE_COMMIT_ID_END];
+            let index = commit_dictionary
+                .iter()
+                .position(|known| *known == commit_id)
+                .unwrap_or_else(|| {
+                    commit_dictionary.push(commit_id);
+                    commit_dictionary.len() - 1
+                });
+            dict_refs.push(index as u64 + 1);
+        } else {
+            dict_refs.push(0);
+        }
+    }
+
     let mut out = Vec::with_capacity(64 + entries.len() * 24);
     out.push(NODE_KIND_LEAF_V2);
     write_varint(&mut out, entries.len() as u64);
+    write_varint(&mut out, commit_dictionary.len() as u64);
+    for commit_id in &commit_dictionary {
+        out.extend_from_slice(commit_id);
+    }
     let mut previous_key: &[u8] = &[];
-    for entry in entries {
+    for (entry, dict_ref) in entries.iter().zip(&dict_refs) {
         let shared = shared_prefix_len(previous_key, entry.key);
         write_varint(&mut out, shared as u64);
         write_varint(&mut out, (entry.key.len() - shared) as u64);
         out.extend_from_slice(&entry.key[shared..]);
-        write_varint(&mut out, entry.value.len() as u64);
-        out.extend_from_slice(entry.value);
+        write_varint(&mut out, *dict_ref);
+        if *dict_ref == 0 {
+            write_varint(&mut out, entry.value.len() as u64);
+            out.extend_from_slice(entry.value);
+        } else {
+            write_varint(
+                &mut out,
+                (entry.value.len() - (VALUE_COMMIT_ID_END - VALUE_COMMIT_ID_START)) as u64,
+            );
+            out.extend_from_slice(&entry.value[..VALUE_COMMIT_ID_START]);
+            out.extend_from_slice(&entry.value[VALUE_COMMIT_ID_END..]);
+        }
         previous_key = entry.key;
     }
     #[cfg(debug_assertions)]
@@ -370,17 +430,29 @@ fn decode_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef<'_>, LixError> {
 
     let mut offset = 0usize;
     let entry_count = usize_from(read_varint(body, &mut offset)?, "entry count")?;
-    // Reconstructed keys total the suffix bytes plus every re-expanded
-    // shared prefix, so heavy sharing can exceed the body length; the body
-    // length is a cheap reservation that avoids re-allocation for typical
-    // value-dominated chunks.
+    let dict_len = usize_from(read_varint(body, &mut offset)?, "commit dictionary length")?;
+    let dict_bytes = dict_len.checked_mul(16).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf node commit dictionary length overflow",
+        )
+    })?;
+    let commit_dictionary = slice(body, &mut offset, dict_bytes)?;
+    // Reconstructed keys (and dictionary-spliced values) total the stored
+    // bytes plus re-expanded prefixes and commit ids, so heavy sharing can
+    // exceed the body length; the body length is a cheap reservation that
+    // avoids re-allocation for typical chunks.
     let mut key_arena = Vec::with_capacity(body.len());
     let mut entries = Vec::with_capacity(entry_count.min(body.len()));
     let mut previous_key_start = 0usize;
+    // Tracked separately from the arena length: dictionaried values are
+    // appended to the same arena after their key, so the arena tail is not
+    // necessarily the previous key.
+    let mut previous_key_end = 0usize;
     for _ in 0..entry_count {
         let shared = usize_from(read_varint(body, &mut offset)?, "shared key length")?;
         let suffix_len = usize_from(read_varint(body, &mut offset)?, "key suffix length")?;
-        let previous_key_len = key_arena.len() - previous_key_start;
+        let previous_key_len = previous_key_end - previous_key_start;
         if shared > previous_key_len {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -391,14 +463,44 @@ fn decode_leaf_v2(body: &[u8]) -> Result<DecodedLeafNodeRef<'_>, LixError> {
         key_arena.extend_from_within(previous_key_start..previous_key_start + shared);
         let suffix = slice(body, &mut offset, suffix_len)?;
         key_arena.extend_from_slice(suffix);
+        let key_end = key_arena.len();
+        let dict_ref = usize_from(read_varint(body, &mut offset)?, "commit dictionary ref")?;
         let value_len = usize_from(read_varint(body, &mut offset)?, "value length")?;
-        let value = slice(body, &mut offset, value_len)?;
+        let stored_value = slice(body, &mut offset, value_len)?;
+        let value = if dict_ref == 0 {
+            LeafValueSpan::Borrowed(stored_value)
+        } else {
+            // Validate before index arithmetic: a huge dict_ref would wrap
+            // the multiplication and alias a valid dictionary slot.
+            if dict_ref > dict_len {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state leaf node commit dictionary ref is out of bounds",
+                ));
+            }
+            let commit_id = &commit_dictionary[(dict_ref - 1) * 16..dict_ref * 16];
+            if stored_value.len() < VALUE_COMMIT_ID_START {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state leaf node dictionaried value is too short",
+                ));
+            }
+            let start = key_arena.len();
+            key_arena.extend_from_slice(&stored_value[..VALUE_COMMIT_ID_START]);
+            key_arena.extend_from_slice(commit_id);
+            key_arena.extend_from_slice(&stored_value[VALUE_COMMIT_ID_START..]);
+            LeafValueSpan::Arena {
+                start,
+                end: key_arena.len(),
+            }
+        };
         entries.push(LeafEntrySpan {
             key_start,
-            key_end: key_arena.len(),
+            key_end,
             value,
         });
         previous_key_start = key_start;
+        previous_key_end = key_end;
     }
     if offset != body.len() {
         return Err(LixError::new(
@@ -675,6 +777,173 @@ mod tests {
         leaf_entries_round_trip(&entries);
     }
 
+    /// Pins the assumption the leaf commit-id dictionary relies on: the
+    /// encoded value places change_id at bytes [0..16) and commit_id at
+    /// bytes [16..32) as raw uuid bytes.
+    #[test]
+    fn encoded_value_layout_places_ids_at_fixed_offsets() {
+        let change_id = ChangeId::for_test_label("layout-change");
+        let commit_id = CommitId::for_test_label("layout-commit");
+        let encoded = encode_value(&TrackedStateIndexValue {
+            change_id,
+            commit_id,
+            deleted: false,
+            snapshot_ref: Some(JsonRef::for_content(b"layout-snapshot")),
+            metadata_ref: None,
+            created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
+            updated_at: timestamp("updated_at", "2026-01-01T00:00:00Z"),
+        });
+        assert_eq!(&encoded[..16], change_id.as_uuid().as_bytes());
+        assert_eq!(&encoded[16..32], commit_id.as_uuid().as_bytes());
+    }
+
+    #[test]
+    fn leaf_v2_round_trips_dictionaried_commit_ids() {
+        // Realistic shape: >=32-byte values where bytes [16..32) repeat
+        // across entries (one commit id per bulk commit, a few stragglers),
+        // including a boundary 32-byte value and a verbatim short value.
+        let mut entries = Vec::new();
+        for index in 0..300usize {
+            let key = format!("rows/{index:05}").into_bytes();
+            let value_len = match index {
+                0 => 32,
+                1 => 8,
+                _ => 90,
+            };
+            let mut value = vec![0u8; value_len];
+            if value_len >= 32 {
+                value[..16].copy_from_slice(&(index as u128).to_be_bytes());
+                let commit = (index % 3).to_le_bytes()[0];
+                value[16..32].copy_from_slice(&[commit; 16]);
+            }
+            entries.push((key, value));
+        }
+        entries.sort();
+        leaf_entries_round_trip(&entries);
+
+        // The dictionary must actually compress: ~300 entries x 16 bytes of
+        // commit id collapse to 3 dictionary rows.
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef {
+                key: key.as_slice(),
+                value: value.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        let verbatim_size: usize = entries
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
+        assert!(
+            encoded.len() + 298 * 14 < verbatim_size,
+            "dictionary must remove ~15 bytes per entry: encoded={} verbatim={}",
+            encoded.len(),
+            verbatim_size
+        );
+    }
+
+    /// Pins the dictionaried wire bytes. The dict-len-0 golden test covers
+    /// verbatim values; this one pins the dictionary section and the
+    /// spliced value layout, so a drift (e.g. sorted instead of
+    /// first-occurrence dictionary order) fails a unit test instead of
+    /// silently changing every chunk hash.
+    #[test]
+    fn leaf_v2_dictionaried_wire_format_is_pinned() {
+        let mut value_a = vec![0xAAu8; 33];
+        value_a[16..32].copy_from_slice(&[0xCC; 16]); // commit id slice
+        let mut value_b = vec![0xBBu8; 32];
+        value_b[16..32].copy_from_slice(&[0xCC; 16]); // same commit id
+        let entries = [(b"k1".to_vec(), value_a), (b"k2".to_vec(), value_b)];
+        let refs = entries
+            .iter()
+            .map(|(key, value)| EncodedLeafEntryRef {
+                key: key.as_slice(),
+                value: value.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_leaf_refs_for_tests(&refs);
+        let mut expected = vec![
+            1, // NODE_KIND_LEAF_V2
+            2, // entry count
+            1, // commit dictionary length
+        ];
+        expected.extend_from_slice(&[0xCC; 16]); // dictionary slot 0
+        // entry 0: shared=0, suffix "k1", dict_ref=1, stored 17 bytes
+        expected.extend_from_slice(&[0, 2, b'k', b'1', 1, 17]);
+        expected.extend_from_slice(&[0xAA; 16]); // value prefix
+        expected.push(0xAA); // value rest (byte 32)
+        // entry 1: shared=1, suffix "2", dict_ref=1, stored 16 bytes
+        expected.extend_from_slice(&[1, 1, b'2', 1, 16]);
+        expected.extend_from_slice(&[0xBB; 16]);
+        assert_eq!(
+            encoded, expected,
+            "dictionaried wire bytes must stay stable"
+        );
+    }
+
+    #[test]
+    fn leaf_v2_rejects_adversarial_dictionary_lengths() {
+        // dict_len claims more 16-byte slots than the body holds.
+        assert!(decode_node_ref_for_leaf_tests(&[1u8, 1, 200, 0, 0]).is_err());
+        // dict_len * 16 overflows usize.
+        let mut huge = vec![1u8, 1];
+        huge.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        assert!(decode_node_ref_for_leaf_tests(&huge).is_err());
+        // dict_ref > 0 with a stored value shorter than the splice prefix.
+        let mut short = vec![1u8, 1, 1];
+        short.extend_from_slice(&[9u8; 16]); // dictionary slot
+        short.extend_from_slice(&[0, 1, b'k', 1, 8]); // stored value only 8 bytes
+        short.extend_from_slice(&[0u8; 8]);
+        assert!(
+            decode_node_ref_for_leaf_tests(&short).is_err(),
+            "dictionaried values shorter than the splice prefix must be rejected"
+        );
+    }
+
+    #[test]
+    fn leaf_v2_rejects_out_of_bounds_dictionary_ref() {
+        // kind, count=1, dict_len=0, shared=0, suffix_len=1, 'k',
+        // dict_ref=1 (out of bounds), stored value 16 bytes.
+        let mut bytes = vec![1u8, 1, 0, 0, 1, b'k', 1, 16];
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert!(decode_node_ref_for_leaf_tests(&bytes).is_err());
+    }
+
+    #[test]
+    fn leaf_v2_rejects_wrapping_dictionary_ref() {
+        // dict_ref = 2^60 + 1 would wrap (dict_ref - 1) * 16 to zero and
+        // alias dictionary slot 0 if validated after the multiplication.
+        let mut bytes = vec![1u8, 1, 1];
+        bytes.extend_from_slice(&[7u8; 16]); // one dictionary slot
+        bytes.extend_from_slice(&[0, 1, b'k']); // shared=0, suffix 'k'
+        bytes.extend_from_slice(&[0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10]);
+        bytes.push(16); // stored value length
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert!(
+            decode_node_ref_for_leaf_tests(&bytes).is_err(),
+            "wrapping dictionary refs must be rejected"
+        );
+    }
+
+    #[test]
+    fn leaf_v2_rejects_shared_len_exceeding_previous_key_after_dictionaried_value() {
+        // Entry A: 1-byte key, dictionaried value (reconstructed value bytes
+        // land in the arena after the key). Entry B claims shared=3, which
+        // exceeds A's key length; a guard computed from the arena tail
+        // instead of the previous key end would accept it and splice value
+        // bytes into B's key.
+        let mut bytes = vec![1u8, 2, 1];
+        bytes.extend_from_slice(&[7u8; 16]); // dictionary slot 0
+        bytes.extend_from_slice(&[0, 1, b'k', 1, 16]); // A: shared=0, 'k', dict_ref=1
+        bytes.extend_from_slice(&[1u8; 16]);
+        bytes.extend_from_slice(&[3, 0, 0, 0]); // B: shared=3, suffix 0, dict_ref=0, value 0
+        assert!(
+            decode_node_ref_for_leaf_tests(&bytes).is_err(),
+            "shared length beyond the previous key must be rejected"
+        );
+    }
+
     /// Pins the exact wire bytes. Tree chunks are content-addressed, so any
     /// accidental format drift changes chunk hashes; this golden test makes
     /// such drift fail a unit test instead of only surfacing in storage.
@@ -696,10 +965,12 @@ mod tests {
         let expected: &[u8] = &[
             1, // NODE_KIND_LEAF_V2
             3, // entry count
-            0, 11, b's', b'h', b'a', b'r', b'e', b'd', b'/', b'a', b'a', b'a', b'a', 2, b'v',
-            b'1', // entry 0: shared=0, suffix "shared/aaaa", value "v1"
-            9, 2, b'b', b'b', 2, b'v', b'2', // entry 1: shared=9, suffix "bb"
-            7, 4, b'b', b'b', b'b', b'b', 2, b'v', b'3', // entry 2: shared=7, suffix "bbbb"
+            0, // commit dictionary length (values too short to dictionary)
+            0, 11, b's', b'h', b'a', b'r', b'e', b'd', b'/', b'a', b'a', b'a', b'a', 0, 2, b'v',
+            b'1', // entry 0: shared=0, suffix "shared/aaaa", dict_ref=0, value "v1"
+            9, 2, b'b', b'b', 0, 2, b'v', b'2', // entry 1: shared=9, suffix "bb"
+            7, 4, b'b', b'b', b'b', b'b', 0, 2, b'v',
+            b'3', // entry 2: shared=7, suffix "bbbb"
         ];
         assert_eq!(encoded, expected, "leaf v2 wire bytes must stay stable");
     }
