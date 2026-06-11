@@ -1,12 +1,24 @@
-export { Lix, LixTransaction, openLix, SqliteBackend } from "./open-lix.js";
+export {
+	FsBackend,
+	Lix,
+	LixTransaction,
+	openLix,
+	SqliteBackend,
+} from "./open-lix.js";
+export {
+	bundledPluginArchives,
+	type BundledPluginArchive,
+} from "./bundled-plugins.js";
 export { Row } from "./result.js";
 export { Value } from "./value.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	ExecuteResult,
+	FsBackendOptions,
 	JsonValue,
 	LixValue,
+	LixFs,
 	MergeBranchOptions,
 	MergeBranchOutcome,
 	MergeBranchPreview,

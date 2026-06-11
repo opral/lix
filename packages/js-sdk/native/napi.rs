@@ -1,6 +1,6 @@
 use lix_sdk::{
     CreateBranchOptions as RsCreateBranchOptions, CreateBranchReceipt,
-    ExecuteResult as RsExecuteResult, InMemoryBackend, Lix as RsLix, LixError,
+    ExecuteResult as RsExecuteResult, FsBackend, InMemoryBackend, Lix as RsLix, LixError,
     LixTransaction as RsLixTransaction, MergeBranchOptions as RsMergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
     MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
@@ -22,11 +22,13 @@ pub struct NativeLix {
 enum NativeLixInner {
     Memory(RsLix<InMemoryBackend>),
     Sqlite(RsLix<SqliteBackend>),
+    Fs(RsLix<FsBackend>),
 }
 
 enum NativeLixTransactionInner {
     Memory(RsLixTransaction<InMemoryBackend>),
     Sqlite(RsLixTransaction<SqliteBackend>),
+    Fs(RsLixTransaction<FsBackend>),
 }
 
 impl NativeLixInner {
@@ -38,6 +40,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.execute(sql, params).await,
             Self::Sqlite(lix) => lix.execute(sql, params).await,
+            Self::Fs(lix) => lix.execute(sql, params).await,
         }
     }
 
@@ -49,6 +52,9 @@ impl NativeLixInner {
             Self::Sqlite(lix) => Ok(NativeLixTransactionInner::Sqlite(
                 lix.begin_transaction().await?,
             )),
+            Self::Fs(lix) => Ok(NativeLixTransactionInner::Fs(
+                lix.begin_transaction().await?,
+            )),
         }
     }
 
@@ -56,6 +62,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.active_branch_id().await,
             Self::Sqlite(lix) => lix.active_branch_id().await,
+            Self::Fs(lix) => lix.active_branch_id().await,
         }
     }
 
@@ -66,6 +73,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.create_branch(options).await,
             Self::Sqlite(lix) => lix.create_branch(options).await,
+            Self::Fs(lix) => lix.create_branch(options).await,
         }
     }
 
@@ -76,6 +84,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.switch_branch(options).await,
             Self::Sqlite(lix) => lix.switch_branch(options).await,
+            Self::Fs(lix) => lix.switch_branch(options).await,
         }
     }
 
@@ -86,6 +95,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.merge_branch_preview(options).await,
             Self::Sqlite(lix) => lix.merge_branch_preview(options).await,
+            Self::Fs(lix) => lix.merge_branch_preview(options).await,
         }
     }
 
@@ -96,6 +106,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.merge_branch(options).await,
             Self::Sqlite(lix) => lix.merge_branch(options).await,
+            Self::Fs(lix) => lix.merge_branch(options).await,
         }
     }
 
@@ -103,6 +114,7 @@ impl NativeLixInner {
         match self {
             Self::Memory(lix) => lix.close().await,
             Self::Sqlite(lix) => lix.close().await,
+            Self::Fs(lix) => lix.close().await,
         }
     }
 }
@@ -116,6 +128,7 @@ impl NativeLixTransactionInner {
         match self {
             Self::Memory(transaction) => transaction.execute(sql, params).await,
             Self::Sqlite(transaction) => transaction.execute(sql, params).await,
+            Self::Fs(transaction) => transaction.execute(sql, params).await,
         }
     }
 
@@ -123,6 +136,7 @@ impl NativeLixTransactionInner {
         match self {
             Self::Memory(transaction) => transaction.commit().await,
             Self::Sqlite(transaction) => transaction.commit().await,
+            Self::Fs(transaction) => transaction.commit().await,
         }
     }
 
@@ -130,6 +144,7 @@ impl NativeLixTransactionInner {
         match self {
             Self::Memory(transaction) => transaction.rollback().await,
             Self::Sqlite(transaction) => transaction.rollback().await,
+            Self::Fs(transaction) => transaction.rollback().await,
         }
     }
 }
@@ -165,6 +180,24 @@ impl NativeLix {
         Ok(Self {
             rt,
             lix: Some(NativeLixInner::Sqlite(lix)),
+        })
+    }
+
+    #[napi(factory, js_name = "openFs")]
+    pub fn open_fs(env: Env, path: String) -> Result<Self> {
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(to_napi_error)?;
+        let backend = rt
+            .block_on(FsBackend::open(path))
+            .map_err(|error| throw_lix_error(&env, error))?;
+        let lix = rt
+            .block_on(open_lix_with_backend(backend))
+            .map_err(|error| throw_lix_error(&env, error))?;
+        Ok(Self {
+            rt,
+            lix: Some(NativeLixInner::Fs(lix)),
         })
     }
 

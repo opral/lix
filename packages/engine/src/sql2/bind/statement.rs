@@ -3,10 +3,10 @@ use std::ops::ControlFlow;
 
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Insert, ObjectName, ObjectNamePart, Query, SetExpr,
-    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
-    Value, Visit, Visitor,
+    AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName, ObjectNamePart,
+    OnConflictAction, OnInsert, Query, SetExpr, Statement as SqlStatement, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Update, Value, Visit, Visitor,
 };
 use serde_json::Value as JsonValue;
 
@@ -22,8 +22,9 @@ use super::table::{
     BoundTable, bind_public_column_ref, bind_public_table, require_writable_column,
 };
 use super::write::{
-    BoundAssignment, BoundInsertValues, BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp,
-    BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface, FileWriteSurface,
+    BoundAssignment, BoundInsertConflict, BoundInsertValues, BoundParamMap, BoundWrite,
+    BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface, EntityWriteSurface,
+    FileWriteSurface,
 };
 
 pub(crate) fn bind_statement(
@@ -97,6 +98,18 @@ pub(super) fn bind_insert_bound(
         insert.source.as_deref(),
         &mut params,
     )?;
+    let conflict = bind_insert_conflict(insert.on.as_ref(), &table, &mut params)?;
+    if conflict.is_some() {
+        if !matches!(
+            table.surface.kind,
+            PublicSurfaceKind::EntityBase { .. } | PublicSurfaceKind::EntityByBranch { .. }
+        ) {
+            return Err(super::error::unsupported(
+                "INSERT ON CONFLICT is supported for entity SQL surfaces only",
+            ));
+        }
+        require_write_capability(&table.surface, BoundWriteOp::Update)?;
+    }
     let branch_scope = bind_write_branch_scope(
         &table.surface.kind,
         &input,
@@ -109,6 +122,7 @@ pub(super) fn bind_insert_bound(
         input,
         predicate: BoundPredicate::True,
         assignments: Vec::new(),
+        conflict,
         params: params.into_map(),
         branch_scope,
     })
@@ -146,6 +160,7 @@ pub(super) fn bind_update_bound(
         input: BoundWriteInput::None,
         predicate,
         assignments,
+        conflict: None,
         params: params.into_map(),
         branch_scope,
     })
@@ -173,6 +188,7 @@ pub(super) fn bind_delete_bound(
         input: BoundWriteInput::None,
         predicate,
         assignments: Vec::new(),
+        conflict: None,
         params: params.into_map(),
         branch_scope,
     })
@@ -210,11 +226,6 @@ fn reject_unsupported_insert_clauses(insert: &Insert) -> Result<(), LixError> {
             "partitioned INSERT is not supported",
         ));
     }
-    if insert.on.is_some() {
-        return Err(super::error::unsupported(
-            "INSERT ON clauses are not supported",
-        ));
-    }
     if insert.returning.is_some() {
         return Err(super::error::unsupported(
             "INSERT RETURNING is not supported",
@@ -239,6 +250,63 @@ fn reject_unsupported_insert_clauses(insert: &Insert) -> Result<(), LixError> {
         ));
     }
     Ok(())
+}
+
+fn bind_insert_conflict(
+    on: Option<&OnInsert>,
+    table: &BoundTable,
+    params: &mut ParamBinder,
+) -> Result<Option<BoundInsertConflict>, LixError> {
+    let Some(on) = on else {
+        return Ok(None);
+    };
+    let OnInsert::OnConflict(conflict) = on else {
+        return Err(super::error::unsupported(
+            "INSERT ON DUPLICATE KEY UPDATE is not supported",
+        ));
+    };
+    let Some(ConflictTarget::Columns(columns)) = &conflict.conflict_target else {
+        return Err(super::error::unsupported(
+            "INSERT ON CONFLICT requires an explicit column target",
+        ));
+    };
+    let mut seen_target_columns = BTreeSet::new();
+    let target_columns = columns
+        .iter()
+        .map(|column| {
+            let column_name = normalize_identifier(column);
+            reject_duplicate_target_column(&mut seen_target_columns, &column_name)?;
+            bind_public_column_ref(table, &column_name)
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let OnConflictAction::DoUpdate(update) = &conflict.action else {
+        return Err(super::error::unsupported(
+            "INSERT ON CONFLICT DO NOTHING is not supported",
+        ));
+    };
+    if update.selection.is_some() {
+        return Err(super::error::unsupported(
+            "INSERT ON CONFLICT DO UPDATE WHERE is not supported",
+        ));
+    }
+    let mut seen_assignments = BTreeSet::new();
+    let assignments = update
+        .assignments
+        .iter()
+        .map(|assignment| {
+            let column = bind_assignment_target(table, &assignment.target)?;
+            reject_duplicate_target_column(&mut seen_assignments, &column.name)?;
+            Ok(BoundAssignment {
+                column,
+                value: bind_conflict_expr(table, &assignment.value, params)?,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+
+    Ok(Some(BoundInsertConflict {
+        target_columns,
+        assignments,
+    }))
 }
 
 fn reject_unsupported_update_clauses(update: &Update) -> Result<(), LixError> {
@@ -613,6 +681,31 @@ fn bind_expr(
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL expression '{expr}'"
         ))),
+    }
+}
+
+fn bind_conflict_expr(
+    table: &BoundTable,
+    expr: &Expr,
+    params: &mut ParamBinder,
+) -> Result<BoundExpr, LixError> {
+    match expr {
+        Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
+            let qualifier = normalize_identifier(&idents[0]);
+            if qualifier == "excluded" {
+                let column_name = normalize_identifier(&idents[1]);
+                return Ok(BoundExpr::ExcludedColumn(bind_public_column_ref(
+                    table,
+                    &column_name,
+                )?));
+            }
+            bind_expr(table, expr, params)
+        }
+        Expr::Nested(expr) => bind_conflict_expr(table, expr, params),
+        Expr::Function(function) => bind_function(function, params, |expr, params| {
+            bind_conflict_expr(table, expr, params)
+        }),
+        _ => bind_expr(table, expr, params),
     }
 }
 

@@ -1,6 +1,7 @@
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundExpr {
     Column(BoundColumnRef),
+    ExcludedColumn(BoundColumnRef),
     Param(BoundParamRef),
     Literal(BoundLiteral),
     Function { name: String, args: Vec<Self> },

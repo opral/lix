@@ -12,8 +12,8 @@ use crate::filesystem::{
     directory_path_resolvers_from_state_rows, filesystem_storage_scope_key, plan_file_path_write,
 };
 use crate::plugin::{
-    ParsedPluginArchive, parse_plugin_archive_for_install, plugin_storage_archive_file_id,
-    plugin_storage_archive_path,
+    ParsedPluginArchive, parse_plugin_archive_for_install, plugin_key_from_archive_path,
+    plugin_storage_archive_file_id, plugin_storage_archive_path,
 };
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, validate_lix_schema_definition,
@@ -37,37 +37,34 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     let parsed = parse_plugin_archive_for_install(archive_bytes)?;
-    stage_plugin_schemas(transaction, &parsed).await?;
     stage_plugin_archive_file(transaction, &parsed, archive_bytes).await?;
     Ok(())
 }
 
-async fn stage_plugin_schemas<B>(
-    transaction: &mut Transaction<B>,
-    parsed: &ParsedPluginArchive,
-) -> Result<(), LixError>
-where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    if parsed.schemas.is_empty() {
-        return Ok(());
+pub(crate) fn plugin_schema_rows_from_archive_path(
+    archive_path: &str,
+    archive_bytes: &[u8],
+    branch_id: &str,
+    global: bool,
+    untracked: bool,
+) -> Result<Vec<TransactionWriteRow>, LixError> {
+    let plugin_key = plugin_key_from_archive_path(archive_path).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!("plugin archive path '{archive_path}' is not a valid plugin storage path"),
+        )
+    })?;
+    let parsed = parse_plugin_archive_for_install(archive_bytes)?;
+    if parsed.manifest.key != plugin_key {
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "plugin archive path key '{}' does not match manifest key '{}'",
+                plugin_key, parsed.manifest.key
+            ),
+        ));
     }
-
-    let branch_id = transaction.active_branch_id().to_string();
-    let rows = parsed
-        .schemas
-        .iter()
-        .map(|schema| registered_schema_row(schema, &branch_id))
-        .collect::<Result<Vec<_>, _>>()?;
-    transaction
-        .stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows,
-        })
-        .await?;
-    Ok(())
+    plugin_schema_rows(&parsed, branch_id, global, untracked)
 }
 
 async fn stage_plugin_archive_file<B>(
@@ -117,9 +114,24 @@ where
     Ok(())
 }
 
+fn plugin_schema_rows(
+    parsed: &ParsedPluginArchive,
+    branch_id: &str,
+    global: bool,
+    untracked: bool,
+) -> Result<Vec<TransactionWriteRow>, LixError> {
+    parsed
+        .schemas
+        .iter()
+        .map(|schema| registered_schema_row(schema, branch_id, global, untracked))
+        .collect()
+}
+
 fn registered_schema_row(
     schema: &JsonValue,
     branch_id: &str,
+    global: bool,
+    untracked: bool,
 ) -> Result<TransactionWriteRow, LixError> {
     validate_lix_schema_definition(schema)?;
     let schema_key = schema_key_from_definition(schema)?;
@@ -136,10 +148,10 @@ fn registered_schema_row(
         origin: None,
         created_at: None,
         updated_at: None,
-        global: false,
+        global,
         change_id: None,
         commit_id: None,
-        untracked: false,
+        untracked,
         branch_id: branch_id.to_string(),
     })
 }

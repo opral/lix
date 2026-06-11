@@ -140,11 +140,11 @@ simulation_test!(
         let insert_error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('plugin-poison', '/.lix_system/plugins/plugin_sentinel.lixplugin', X'626164')",
+                 VALUES ('plugin-poison', '/.lix_system/plugins/nested/plugin_sentinel.lixplugin', X'626164')",
                 &[],
             )
             .await
-            .expect_err("SQL insert should reject plugin storage paths");
+            .expect_err("SQL insert should reject invalid plugin storage paths");
         assert_eq!(insert_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(
             insert_error
@@ -172,9 +172,8 @@ simulation_test!(
             .expect_err("SQL update should reject plugin storage paths");
         assert_eq!(update_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(
-            update_error
-                .message
-                .contains("reserved plugin storage path")
+            update_error.message.contains("plugin archive paths"),
+            "unexpected error: {update_error:?}"
         );
     }
 );

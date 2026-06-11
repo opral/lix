@@ -13,6 +13,7 @@ use lix_engine::wasm::{
 };
 use lix_engine::{
     Engine, FsDirEntryKind, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, LixError,
+    Value,
 };
 
 simulation_test!(fs_write_read_and_readdir_roundtrip, |sim| async move {
@@ -158,7 +159,7 @@ simulation_test!(
             .execute("SELECT id FROM lix_file WHERE path = '/empty-fs.txt'", &[])
             .await
             .expect("file id read should succeed");
-        let [lix_engine::Value::Text(file_id)] = file_result.rows()[0].values() else {
+        let [Value::Text(file_id)] = file_result.rows()[0].values() else {
             panic!(
                 "expected file id row, got {:?}",
                 file_result.rows()[0].values()
@@ -251,10 +252,7 @@ async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
         .await
         .expect("lix_file data read should succeed");
     assert_eq!(files.len(), 1);
-    assert_eq!(
-        files.rows()[0].values(),
-        &[lix_engine::Value::Blob(Vec::new())]
-    );
+    assert_eq!(files.rows()[0].values(), &[Value::Blob(Vec::new())]);
     assert_eq!(runtime.render_calls.load(Ordering::SeqCst), 0);
 
     session.close().await.expect("session should close");
@@ -306,7 +304,7 @@ async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
         )
         .await
         .expect("file id read should succeed");
-    let [lix_engine::Value::Text(file_id)] = file_id_rows.rows()[0].values() else {
+    let [Value::Text(file_id)] = file_id_rows.rows()[0].values() else {
         panic!(
             "expected file id row, got {:?}",
             file_id_rows.rows()[0].values()
@@ -364,7 +362,129 @@ async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
 }
 
 #[tokio::test]
-async fn sql_update_rejects_installed_plugin_storage_archive_data_write() {
+async fn sql_write_file_to_plugin_storage_installs_plugin_archive() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+    let archive = sentinel_plugin_archive();
+
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix_system/plugins/plugin_sentinel.lixplugin".to_string()),
+                Value::Blob(archive.clone()),
+            ],
+        )
+        .await
+        .expect("plugin archive file write should install plugin");
+
+    let plugins = session
+        .list_installed_plugins()
+        .await
+        .expect("installed plugins should list");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].key, "plugin_sentinel");
+    assert_eq!(plugins[0].schema_keys, vec!["plugin_note".to_string()]);
+    assert_eq!(
+        session
+            .fs()
+            .read_file("/.lix_system/plugins/plugin_sentinel.lixplugin")
+            .await
+            .expect("archive read should succeed")
+            .as_deref(),
+        Some(archive.as_slice())
+    );
+
+    let schemas = session
+        .execute(
+            "SELECT value FROM lix_registered_schema WHERE lixcol_entity_pk = lix_json('[\"plugin_note\"]')",
+            &[],
+        )
+        .await
+        .expect("plugin schema should be queryable");
+    assert_eq!(schemas.len(), 1);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn sql_write_file_to_plugin_storage_rejects_path_manifest_key_mismatch() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    let error = session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/.lix_system/plugins/plugin_other.lixplugin".to_string()),
+                Value::Blob(sentinel_plugin_archive()),
+            ],
+        )
+        .await
+        .expect_err("mismatched plugin archive key should fail");
+
+    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    assert!(error.message.contains("does not match manifest key"));
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn sql_update_path_to_plugin_storage_rejects_plugin_archive_rename() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+            &[
+                Value::Text("/normal.txt".to_string()),
+                Value::Blob(b"normal".to_vec()),
+            ],
+        )
+        .await
+        .expect("normal file insert should succeed");
+
+    let error = session
+        .execute(
+            "UPDATE lix_file SET path = $1, data = $2 WHERE path = $3",
+            &[
+                Value::Text("/.lix_system/plugins/plugin_sentinel.lixplugin".to_string()),
+                Value::Blob(sentinel_plugin_archive()),
+                Value::Text("/normal.txt".to_string()),
+            ],
+        )
+        .await
+        .expect_err("path update into plugin storage should fail");
+
+    assert!(error.message.contains("plugin archive paths"));
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
+async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
         .await
@@ -388,10 +508,9 @@ async fn sql_update_rejects_installed_plugin_storage_archive_data_write() {
             &[],
         )
         .await
-        .expect_err("SQL update should reject installed plugin archive data writes");
+        .expect_err("SQL update should reject invalid plugin archive data");
 
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-    assert!(error.message.contains("reserved plugin storage path"));
+    assert!(error.message.contains("valid zip file"));
 
     session.close().await.expect("session should close");
 }
@@ -586,7 +705,7 @@ simulation_test!(fs_write_file_upserts_existing_data, |sim| async move {
         Some(Vec::new())
     );
 
-    let [lix_engine::Value::Text(file_id)] = rows.rows()[0].values() else {
+    let [Value::Text(file_id)] = rows.rows()[0].values() else {
         panic!("expected file id row, got {:?}", rows.rows()[0].values());
     };
     let blob_ref_rows = session
