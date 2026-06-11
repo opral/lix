@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use lix_engine::backend::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, GetOptions, InMemoryBackend, InMemoryRead, InMemoryWrite, Key, KeyRange, KeyRef,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanVisitor,
-    WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
+    InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, SpaceId, WriteOptions,
 };
 use tempfile::TempDir;
 
@@ -149,10 +148,9 @@ impl Backend for ChangelogScoreBackend {
 }
 
 impl BackendRead for ChangelogScoreRead<'_> {
-    type RangeScan<'cursor> = BufferedRangeScan;
-
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -161,99 +159,57 @@ impl BackendRead for ChangelogScoreRead<'_> {
         V: PointVisitor + ?Sized,
     {
         match self {
-            Self::Unit(read) => read.visit_keys(keys, opts, visitor),
-            Self::Sqlite(read) => read.visit_keys(keys, opts, visitor),
-            Self::RocksDb(read) => read.visit_keys(keys, opts, visitor),
-            Self::Redb(read) => read.visit_keys(keys, opts, visitor),
+            Self::Unit(read) => read.visit_keys(space, keys, opts, visitor),
+            Self::Sqlite(read) => read.visit_keys(space, keys, opts, visitor),
+            Self::RocksDb(read) => read.visit_keys(space, keys, opts, visitor),
+            Self::Redb(read) => read.visit_keys(space, keys, opts, visitor),
         }
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
     where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        V: ScanVisitor + ?Sized,
     {
-        fn buffer_scan<C>(
-            cursor: &mut C,
-            limit_rows: usize,
-        ) -> Result<BufferedRangeScan, BackendError>
-        where
-            C: BackendRangeScan,
-        {
-            struct Collector {
-                rows: Vec<ReadEntry>,
-            }
-
-            impl ScanVisitor for Collector {
-                fn visit(
-                    &mut self,
-                    key: KeyRef<'_>,
-                    value: ProjectedValueRef<'_>,
-                ) -> Result<(), BackendError> {
-                    self.rows.push(ReadEntry {
-                        key: key.to_owned_key(),
-                        value: value.to_owned(),
-                    });
-                    Ok(())
-                }
-            }
-
-            let mut visitor = Collector { rows: Vec::new() };
-            let collect_limit = limit_rows.saturating_add(1);
-            cursor.visit_next(collect_limit, &mut visitor)?;
-            Ok(BufferedRangeScan::new(visitor.rows))
-        }
-
         match self {
-            Self::Unit(read) => read.with_range_scan(range, opts, |scan| {
-                let mut buffered = buffer_scan(scan, opts.limit_rows)?;
-                f(&mut buffered)
-            }),
-            Self::Sqlite(read) => read.with_range_scan(range, opts, |scan| {
-                let mut buffered = buffer_scan(scan, opts.limit_rows)?;
-                f(&mut buffered)
-            }),
-            Self::RocksDb(read) => read.with_range_scan(range, opts, |scan| {
-                let mut buffered = buffer_scan(scan, opts.limit_rows)?;
-                f(&mut buffered)
-            }),
-            Self::Redb(read) => read.with_range_scan(range, opts, |scan| {
-                let mut buffered = buffer_scan(scan, opts.limit_rows)?;
-                f(&mut buffered)
-            }),
+            Self::Unit(read) => read.scan(space, range, opts, visitor),
+            Self::Sqlite(read) => read.scan(space, range, opts, visitor),
+            Self::RocksDb(read) => read.scan(space, range, opts, visitor),
+            Self::Redb(read) => read.scan(space, range, opts, visitor),
         }
     }
 }
 
 impl BackendWrite for ChangelogScoreWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.put_many(entries),
-            Self::Sqlite(write) => write.put_many(entries),
-            Self::RocksDb(write) => write.put_many(entries),
-            Self::Redb(write) => write.put_many(entries),
+            Self::Unit(write) => write.put_many(space, entries),
+            Self::Sqlite(write) => write.put_many(space, entries),
+            Self::RocksDb(write) => write.put_many(space, entries),
+            Self::Redb(write) => write.put_many(space, entries),
         }
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.delete_many(keys),
-            Self::Sqlite(write) => write.delete_many(keys),
-            Self::RocksDb(write) => write.delete_many(keys),
-            Self::Redb(write) => write.delete_many(keys),
+            Self::Unit(write) => write.delete_many(space, keys),
+            Self::Sqlite(write) => write.delete_many(space, keys),
+            Self::RocksDb(write) => write.delete_many(space, keys),
+            Self::Redb(write) => write.delete_many(space, keys),
         }
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
         match self {
-            Self::Unit(write) => write.delete_range(range),
-            Self::Sqlite(write) => write.delete_range(range),
-            Self::RocksDb(write) => write.delete_range(range),
-            Self::Redb(write) => write.delete_range(range),
+            Self::Unit(write) => write.delete_range(space, range),
+            Self::Sqlite(write) => write.delete_range(space, range),
+            Self::RocksDb(write) => write.delete_range(space, range),
+            Self::Redb(write) => write.delete_range(space, range),
         }
     }
 

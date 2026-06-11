@@ -15,17 +15,14 @@ pub use error::{
     PreconditionSupportReport,
 };
 pub use in_memory::{
-    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRangeScan,
-    InMemoryRead, InMemoryScanVisitResult, InMemoryWrite,
+    InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRead,
+    InMemoryScanVisitResult, InMemoryWrite,
 };
 pub use predicate::{
     BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
 };
-pub use traits::{
-    Backend, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan, PointVisitor,
-    ScanVisitor, get_many, visit_range,
-};
+pub use traits::{Backend, BackendRead, BackendWrite, PointVisitor, ScanVisitor, get_many};
 pub use types::{
     CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, KeyRef,
     Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry,

@@ -3,10 +3,10 @@ use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_sdk::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef,
-    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions,
-    WriteStats, open_lix_with_backend,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
+    Key, KeyRange, Lix, LixError, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions,
+    ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
+    open_lix_with_backend,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -204,14 +204,7 @@ pub struct FileBackendRead {
     kv: KvMap,
 }
 
-#[expect(missing_debug_implementations)]
-pub struct FileBackendRangeScan {
-    rows: Vec<(Key, Vec<u8>)>,
-    position: usize,
-    projection: CoreProjection,
-}
-
-#[expect(missing_debug_implementations)]
+#[allow(missing_debug_implementations)]
 pub struct FileBackendWrite {
     path: Arc<PathBuf>,
     parent: Arc<Mutex<KvMap>>,
@@ -285,11 +278,39 @@ impl FileBackend {
     }
 }
 
-impl BackendRead for FileBackendRead {
-    type RangeScan<'cursor> = FileBackendRangeScan;
+/// The CLI file backend keeps one flat map; spaces are scoped by prefixing
+/// the 4-byte big-endian space id internally. Visitors observe logical keys.
+fn physical_key(space: SpaceId, key: &Key) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + key.0.len());
+    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&key.0);
+    bytes
+}
 
+fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+    let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
+        Bound::Included(key) => Bound::Included(Key(Bytes::from(physical_key(space, &key)))),
+        Bound::Excluded(key) => Bound::Excluded(Key(Bytes::from(physical_key(space, &key)))),
+        Bound::Unbounded => unbounded,
+    };
+    KeyRange {
+        lower: map(
+            range.lower,
+            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+        ),
+        upper: map(
+            range.upper,
+            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+                Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+            }),
+        ),
+    }
+}
+
+impl BackendRead for FileBackendRead {
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -300,94 +321,85 @@ impl BackendRead for FileBackendRead {
         for (index, key) in keys.iter().enumerate() {
             let value = self
                 .kv
-                .get(key.0.as_ref())
+                .get(physical_key(space, key).as_slice())
                 .map(|value| project_value_ref(value, opts.projection));
             visitor.visit(index, key, value)?;
         }
         Ok(())
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
-    {
-        let mut rows = self
-            .kv
-            .iter()
-            .filter(|(key, _)| key_matches_range(key, &range, opts.resume_after))
-            .map(|(key, value)| (Key(Bytes::copy_from_slice(key)), value.clone()))
-            .collect::<Vec<_>>();
-        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
-
-        let mut scan = FileBackendRangeScan {
-            rows,
-            position: 0,
-            projection: opts.projection,
-        };
-        f(&mut scan)
-    }
-}
-
-impl BackendRangeScan for FileBackendRangeScan {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized,
     {
-        if limit_rows == 0 {
+        if opts.limit_rows == 0 {
             return Ok(ScanResult {
                 emitted: 0,
-                has_more: self.position < self.rows.len(),
+                has_more: false,
             });
         }
-
+        let range = physical_range(space, range);
+        let resume_after = opts
+            .resume_after
+            .map(|key| Key(Bytes::from(physical_key(space, key))));
+        let rows = self
+            .kv
+            .iter()
+            .filter(|(key, _)| key_matches_range(key, &range, resume_after.as_ref()))
+            .collect::<Vec<_>>();
+        // BTreeMap iteration is already key-ascending; no sort needed.
         let mut emitted = 0usize;
-        while emitted < limit_rows {
-            let Some((key, value)) = self.rows.get(self.position) else {
-                break;
-            };
-            visitor.visit(key.as_ref(), project_value_ref(value, self.projection))?;
-            self.position += 1;
+        for (key, value) in &rows {
+            if emitted == opts.limit_rows {
+                return Ok(ScanResult {
+                    emitted,
+                    has_more: true,
+                });
+            }
+            visitor.visit(
+                lix_sdk::BackendKeyRef(&key[4..]),
+                project_value_ref(value, opts.projection),
+            )?;
             emitted += 1;
         }
-
         Ok(ScanResult {
             emitted,
-            has_more: self.position < self.rows.len(),
+            has_more: false,
         })
     }
 }
 
 impl BackendWrite for FileBackendWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
             self.stats.put_entries += 1;
             self.stats.written_bytes += entry.value.bytes.len() as u64;
-            self.kv
-                .insert(entry.key.0.to_vec(), stored_value_bytes(entry.value));
+            self.kv.insert(
+                physical_key(space, &entry.key),
+                stored_value_bytes(entry.value),
+            );
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
-            self.kv.remove(key.0.as_ref());
+            self.kv.remove(physical_key(space, key).as_slice());
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        let range = physical_range(space, range);
         let before = self.kv.len();
         self.kv
             .retain(|key, _| !key_matches_range(key, &range, None));

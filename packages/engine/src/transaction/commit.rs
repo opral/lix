@@ -735,7 +735,9 @@ mod tests {
     use super::*;
     use crate::GLOBAL_BRANCH_ID;
     use crate::NullableKeyFilter;
-    use crate::backend::{Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch};
+    use crate::backend::{
+        Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch, SpaceId,
+    };
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
@@ -1612,16 +1614,16 @@ mod tests {
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-            self.inner.put_many(entries)
+        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+            self.inner.put_many(space, entries)
         }
 
-        fn delete_many(&mut self, keys: &[StorageKey]) -> Result<(), BackendError> {
-            self.inner.delete_many(keys)
+        fn delete_many(&mut self, space: SpaceId, keys: &[StorageKey]) -> Result<(), BackendError> {
+            self.inner.delete_many(space, keys)
         }
 
-        fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
-            self.inner.delete_range(range)
+        fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+            self.inner.delete_range(space, range)
         }
 
         fn commit(self) -> Result<CommitResult, BackendError> {

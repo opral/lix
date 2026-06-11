@@ -6,10 +6,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::backend::{
-        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, CoreProjection, GetOptions,
-        InMemoryBackend, Key, KeyRange, KeyRef, PointVisitor, Prefix, ProjectedValue,
-        ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-        WriteOptions,
+        BackendError, BackendRead, CoreProjection, GetOptions, InMemoryBackend, Key, KeyRange,
+        KeyRef, PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
+        ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
     use crate::storage::{
         PointReadBuffer, PointReadPlan, ScanBuffer, ScanPlan, StorageContext, StorageRead,
@@ -45,10 +44,9 @@ mod tests {
     }
 
     impl BackendRead for SpyRead {
-        type RangeScan<'a> = BufferedRangeScan;
-
         fn visit_keys<V>(
             &self,
+            _space: SpaceId,
             keys: &[Key],
             opts: GetOptions<'_>,
             visitor: &mut V,
@@ -67,19 +65,19 @@ mod tests {
             Ok(())
         }
 
-        fn with_range_scan<T, F>(
+        fn scan<V>(
             &self,
+            _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            f: F,
-        ) -> Result<T, BackendError>
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
         where
-            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+            V: ScanVisitor + ?Sized,
         {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
-            let mut cursor = BufferedRangeScan::default();
-            f(&mut cursor)
+            Ok(ScanResult::default())
         }
     }
 
@@ -89,10 +87,9 @@ mod tests {
     }
 
     impl BackendRead for RequestedOrderRead {
-        type RangeScan<'a> = BufferedRangeScan;
-
         fn visit_keys<V>(
             &self,
+            _space: SpaceId,
             keys: &[Key],
             _opts: GetOptions<'_>,
             visitor: &mut V,
@@ -109,14 +106,15 @@ mod tests {
             Ok(())
         }
 
-        fn with_range_scan<T, F>(
+        fn scan<V>(
             &self,
+            _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-            _f: F,
-        ) -> Result<T, BackendError>
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
         where
-            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+            V: ScanVisitor + ?Sized,
         {
             unreachable!("requested-order point-read test does not scan")
         }
@@ -167,11 +165,7 @@ mod tests {
         read.with_backend(|backend_read| {
             assert_eq!(
                 backend_read.get_many_keys.borrow().as_slice(),
-                [
-                    space(1).encode_key(&key("b")),
-                    space(1).encode_key(&key("a")),
-                    space(1).encode_key(&key("missing"))
-                ]
+                [key("b"), key("a"), key("missing")]
             );
             Ok(())
         })
@@ -179,15 +173,11 @@ mod tests {
         assert_eq!(
             result.value,
             vec![
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
-                Some(ProjectedValue::FullValue(
-                    space(1).encode_key(&key("missing")).0
-                )),
-                Some(ProjectedValue::FullValue(
-                    space(1).encode_key(&key("missing")).0
-                )),
+                Some(ProjectedValue::FullValue(key("b").0)),
+                Some(ProjectedValue::FullValue(key("a").0)),
+                Some(ProjectedValue::FullValue(key("b").0)),
+                Some(ProjectedValue::FullValue(key("missing").0)),
+                Some(ProjectedValue::FullValue(key("missing").0)),
             ]
         );
     }
@@ -398,11 +388,7 @@ mod tests {
         read.with_backend(|backend_read| {
             assert_eq!(
                 backend_read.get_many_keys.borrow().as_slice(),
-                [
-                    space(1).encode_key(&key("b")),
-                    space(1).encode_key(&key("missing")),
-                    space(1).encode_key(&key("a"))
-                ]
+                [key("b"), key("missing"), key("a")]
             );
             Ok(())
         })
@@ -412,16 +398,12 @@ mod tests {
         assert_eq!(result.stats.backend_calls, 1);
         assert_eq!(
             result.value.value_at(0),
-            Some(&ProjectedValue::FullValue(Bytes::from_static(
-                b"\0\0\0\x01b"
-            )))
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"b")))
         );
         assert_eq!(result.value.value_at(1), None);
         assert_eq!(
             result.value.value_at(2),
-            Some(&ProjectedValue::FullValue(Bytes::from_static(
-                b"\0\0\0\x01a"
-            )))
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"a")))
         );
     }
 
@@ -434,14 +416,6 @@ mod tests {
             plan.logical_unique_keys,
             vec![key("b"), key("missing"), key("a")]
         );
-        assert_eq!(
-            plan.physical_unique_keys,
-            vec![
-                space(1).encode_key(&key("b")),
-                space(1).encode_key(&key("missing")),
-                space(1).encode_key(&key("a")),
-            ]
-        );
 
         let result = plan
             .collect(&read, GetOptions::default())
@@ -450,7 +424,7 @@ mod tests {
         read.with_backend(|backend_read| {
             assert_eq!(
                 backend_read.get_many_keys.borrow().as_slice(),
-                plan.physical_unique_keys.as_slice()
+                plan.logical_unique_keys.as_slice()
             );
             Ok(())
         })
@@ -460,9 +434,7 @@ mod tests {
         assert_eq!(result.stats.backend_calls, 1);
         assert_eq!(
             result.value.value_at(0),
-            Some(&ProjectedValue::FullValue(Bytes::from_static(
-                b"\0\0\0\x01b"
-            )))
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"b")))
         );
         assert_eq!(result.value.value_at(1), None);
     }
@@ -749,11 +721,8 @@ mod tests {
             .with_backend(|backend_read| Ok(backend_read.scan_range.borrow().clone()))
             .expect("backend range")
             .expect("range captured");
-        assert_eq!(
-            range.lower,
-            Bound::Included(space(1).encode_key(&key_bytes(b"a\xff")))
-        );
-        assert_eq!(range.upper, Bound::Excluded(space(1).encode_key(&key("b"))));
+        assert_eq!(range.lower, Bound::Included(key_bytes(b"a\xff")));
+        assert_eq!(range.upper, Bound::Excluded(key("b")));
     }
 
     #[test]

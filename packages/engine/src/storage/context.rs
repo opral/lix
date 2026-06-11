@@ -97,8 +97,7 @@ where
         opts: WriteOptions,
     ) -> Result<CommitResult, BackendError> {
         let mut write = self.backend.begin_write(opts)?;
-        let physical_range = space.encode_range(range, None);
-        if let Err(error) = write.delete_range(physical_range) {
+        if let Err(error) = write.delete_range(space.id, range) {
             let _ = write.rollback();
             return Err(error);
         }
@@ -343,10 +342,9 @@ mod shape_tests {
     use bytes::Bytes;
 
     use crate::backend::{
-        Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
-        CommitResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue, ProjectedValueRef,
-        PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-        WriteOptions, WriteStats,
+        Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, Key, KeyRange,
+        PointVisitor, ProjectedValue, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+        ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
     };
     use crate::storage::{PointReadPlan, ScanPlan, StorageContext, StorageReadScope, StorageSpace};
 
@@ -397,20 +395,15 @@ mod shape_tests {
         assert_eq!(
             read.get_many_keys.borrow().clone(),
             vec![key("b"), key("a"), key("missing")]
-                .into_iter()
-                .map(|key| space(1).encode_key(&key))
-                .collect::<Vec<_>>()
         );
         assert_eq!(
             result.value,
             vec![
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("b")).0)),
-                Some(ProjectedValue::FullValue(
-                    space(1).encode_key(&key("missing")).0
-                )),
-                Some(ProjectedValue::FullValue(space(1).encode_key(&key("a")).0)),
+                Some(ProjectedValue::FullValue(key("b").0)),
+                Some(ProjectedValue::FullValue(key("a").0)),
+                Some(ProjectedValue::FullValue(key("b").0)),
+                None,
+                Some(ProjectedValue::FullValue(key("a").0)),
             ]
         );
     }
@@ -433,8 +426,8 @@ mod shape_tests {
         assert_eq!(
             read.scan_range.borrow().clone(),
             Some(KeyRange {
-                lower: Bound::Included(space(1).encode_key(&key("a"))),
-                upper: Bound::Excluded(space(1).encode_key(&key("b"))),
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("b")),
             })
         );
     }
@@ -461,8 +454,8 @@ mod shape_tests {
         assert_eq!(
             backend.state.delete_ranges.borrow().as_slice(),
             &[KeyRange {
-                lower: Bound::Included(space(7).encode_key(&key("a"))),
-                upper: Bound::Excluded(space(7).encode_key(&key("c"))),
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("c")),
             }]
         );
     }
@@ -488,8 +481,8 @@ mod shape_tests {
         assert_eq!(
             backend.state.delete_ranges.borrow().as_slice(),
             &[KeyRange {
-                lower: Bound::Included(space(7).encode_key(&key("ab"))),
-                upper: Bound::Excluded(space(7).encode_key(&key("ac"))),
+                lower: Bound::Included(key("ab")),
+                upper: Bound::Excluded(key("ac")),
             }]
         );
     }
@@ -509,8 +502,8 @@ mod shape_tests {
         assert_eq!(
             backend.state.delete_ranges.borrow().as_slice(),
             &[KeyRange {
-                lower: Bound::Included(Key(Bytes::from_static(b"\0\0\0\x07"))),
-                upper: Bound::Excluded(Key(Bytes::from_static(b"\0\0\0\x08"))),
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
             }]
         );
     }
@@ -562,31 +555,23 @@ mod shape_tests {
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-            let space = entries
-                .entries
-                .first()
-                .map(|entry| physical_space(&entry.key))
-                .unwrap_or(SpaceId(0));
+        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
             self.put_batches.push((
                 space,
-                entries
-                    .entries
-                    .into_iter()
-                    .map(|entry| logical_key(entry.key))
-                    .collect(),
+                entries.entries.into_iter().map(|entry| entry.key).collect(),
             ));
             Ok(())
         }
 
-        fn delete_many(&mut self, _keys: &[Key]) -> Result<(), BackendError> {
+        fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
             self.state
                 .delete_many_calls
                 .set(self.state.delete_many_calls.get() + 1);
             Ok(())
         }
 
-        fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+        fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+            let _ = space;
             self.delete_ranges.push(range);
             Ok(())
         }
@@ -619,10 +604,9 @@ mod shape_tests {
     }
 
     impl BackendRead for SpyRead {
-        type RangeScan<'a> = BufferedRangeScan;
-
         fn visit_keys<V>(
             &self,
+            _space: SpaceId,
             keys: &[Key],
             _opts: GetOptions<'_>,
             visitor: &mut V,
@@ -639,34 +623,24 @@ mod shape_tests {
             Ok(())
         }
 
-        fn with_range_scan<T, F>(
+        fn scan<V>(
             &self,
+            _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            f: F,
-        ) -> Result<T, BackendError>
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
         where
-            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+            V: ScanVisitor + ?Sized,
         {
             self.scan_range_calls.set(self.scan_range_calls.get() + 1);
             self.scan_range.replace(Some(range));
-            let mut cursor = BufferedRangeScan::default();
-            f(&mut cursor)
+            Ok(ScanResult::default())
         }
     }
 
     fn space(id: u32) -> StorageSpace {
         StorageSpace::new(SpaceId(id), "shape.test.space")
-    }
-
-    fn physical_space(key: &Key) -> SpaceId {
-        SpaceId(u32::from_be_bytes(
-            key.0[..4].try_into().expect("space prefix"),
-        ))
-    }
-
-    fn logical_key(key: Key) -> Key {
-        Key(key.0.slice(4..))
     }
 
     fn key(bytes: &'static str) -> Key {

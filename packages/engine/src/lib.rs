@@ -68,14 +68,13 @@ pub use backend::conformance::{
     run_backend_conformance,
 };
 pub use backend::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, InMemoryBackend,
-    InMemoryBackendFactory, InMemoryBackendFixture, InMemoryRangeScan, InMemoryRead,
-    InMemoryScanVisitResult, InMemoryWrite, Key, Key as BackendKey, KeyRange,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, Durability,
+    GetManyResult, GetOptions, InMemoryBackend, InMemoryBackendFactory, InMemoryBackendFixture,
+    InMemoryRead, InMemoryScanVisitResult, InMemoryWrite, Key, Key as BackendKey, KeyRange,
     KeyRef as BackendKeyRef, PointVisitor, Prefix as BackendPrefix, ProjectedValue,
     ProjectedValueRef, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
     ScanOptions, ScanResult, ScanVisitor, SnapshotRef, SpaceId, StoredValue, Value as BackendValue,
-    WriteOptions, WriteStats, get_many as backend_get_many, visit_range as backend_visit_range,
+    WriteOptions, WriteStats, get_many as backend_get_many,
 };
 pub use common::LixError;
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};

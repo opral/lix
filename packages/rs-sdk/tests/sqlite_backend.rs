@@ -372,13 +372,75 @@ const RUNTIME_TEST_PLUGIN_SCHEMA: &str = r#"{
 }"#;
 
 #[test]
+fn sqlite_backend_scans_with_usize_max_limit() {
+    // The engine drives unbounded scans as one visit_next(usize::MAX) call;
+    // a wrapping lookahead limit returned zero rows in release builds.
+    use lix_sdk::{
+        Backend, BackendRead, BackendWrite, CoreProjection, KeyRange, ProjectedValueRef, PutBatch,
+        ReadOptions, ScanOptions, ScanVisitor, SpaceId, WriteOptions,
+    };
+    const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
+    struct Counter(usize);
+    impl ScanVisitor for Counter {
+        fn visit(
+            &mut self,
+            _key: lix_engine::backend::KeyRef<'_>,
+            _value: ProjectedValueRef<'_>,
+        ) -> Result<(), lix_sdk::BackendError> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = SqliteBackend::open(dir.path().join("max.lix")).expect("open");
+    let mut write = backend.begin_write(WriteOptions::default()).expect("write");
+    write
+        .put_many(
+            TEST_SPACE,
+            PutBatch {
+                entries: (0..10u32)
+                    .map(|index| lix_engine::backend::PutEntry {
+                        key: lix_sdk::Key(bytes::Bytes::from(format!("k{index:04}"))),
+                        value: lix_sdk::StoredValue {
+                            bytes: bytes::Bytes::from(vec![index.to_le_bytes()[0]; 8]),
+                        },
+                    })
+                    .collect(),
+            },
+        )
+        .expect("put");
+    write.commit().expect("commit");
+
+    let read = backend.begin_read(ReadOptions::default()).expect("read");
+    let mut counter = Counter(0);
+    let result = read
+        .scan(
+            TEST_SPACE,
+            KeyRange {
+                lower: std::ops::Bound::Unbounded,
+                upper: std::ops::Bound::Unbounded,
+            },
+            ScanOptions {
+                projection: CoreProjection::FullValue,
+                limit_rows: usize::MAX,
+                resume_after: None,
+            },
+            &mut counter,
+        )
+        .expect("scan");
+    assert_eq!(counter.0, 10);
+    assert!(!result.has_more);
+}
+
+#[test]
 fn sqlite_backend_put_many_handles_multi_chunk_batches() {
     use bytes::Bytes;
     use lix_engine::backend::PutEntry;
     use lix_sdk::{
         Backend, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, PointVisitor,
-        ProjectedValueRef, PutBatch, ReadOptions, StoredValue, WriteOptions,
+        ProjectedValueRef, PutBatch, ReadOptions, SpaceId, StoredValue, WriteOptions,
     };
+    const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
 
     // 300 entries: two full 128-row upsert chunks plus a 44-row remainder.
     const ROWS: usize = 300;
@@ -424,7 +486,9 @@ fn sqlite_backend_put_many_handles_multi_chunk_batches() {
     let mut write = backend
         .begin_write(WriteOptions::default())
         .expect("begin insert write");
-    write.put_many(batch(1)).expect("insert all rows");
+    write
+        .put_many(TEST_SPACE, batch(1))
+        .expect("insert all rows");
     let insert_stats = write.commit().expect("commit inserts").stats;
     assert_eq!(insert_stats.put_entries, ROWS as u64);
     assert_eq!(insert_stats.written_bytes, (ROWS * 2) as u64);
@@ -434,7 +498,9 @@ fn sqlite_backend_put_many_handles_multi_chunk_batches() {
     let mut write = backend
         .begin_write(WriteOptions::default())
         .expect("begin overwrite write");
-    write.put_many(batch(2)).expect("overwrite all rows");
+    write
+        .put_many(TEST_SPACE, batch(2))
+        .expect("overwrite all rows");
     write.commit().expect("commit overwrites");
 
     let keys = (0..ROWS).map(key).collect::<Vec<_>>();
@@ -445,6 +511,7 @@ fn sqlite_backend_put_many_handles_multi_chunk_batches() {
         values: vec![None; ROWS],
     };
     read.visit_keys(
+        TEST_SPACE,
         &keys,
         GetOptions {
             projection: CoreProjection::FullValue,

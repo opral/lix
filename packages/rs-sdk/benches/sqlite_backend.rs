@@ -6,13 +6,15 @@ use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lix_engine::backend::{KeyRef, PutEntry};
 use lix_sdk::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions,
-    Key, KeyRange, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult,
-    ScanVisitor, SqliteBackend, StoredValue, WriteOptions,
+    Backend, BackendError, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    SpaceId, SqliteBackend, StoredValue, WriteOptions,
 };
 use tempfile::TempDir;
 
 const ROWS: usize = 50_000;
+/// Space used by the single-space cells.
+const BENCH_SPACE: SpaceId = SpaceId(0x0001_0001);
 const POINT_KEYS: usize = 1_000;
 const VALUE_SIZE: usize = 256;
 const SCAN_CHUNK_ROWS: usize = 1_024;
@@ -75,6 +77,210 @@ fn bench_sqlite_backend(c: &mut Criterion) {
     bench_point_reads(c, &fixture);
     bench_range_scans(c, &fixture);
     bench_write_batches(c);
+    let spaces = multi_space_fixture();
+    bench_space_prefix_scan(c, &spaces);
+    bench_space_truncate(c);
+    report_file_stats();
+}
+
+/// Spaces mirroring the engine's physical layout: a 4-byte big-endian space
+/// id prefixes every key. Row counts approximate the 1k-commit accounting
+/// mix (json store and change records dominate; tree chunks are few but
+/// large).
+const SPACE_MIX: &[(u32, usize, usize)] = &[
+    (0x0001_0001, 20_000, 300), // json_store.json: blake3 keys, json values
+    (0x0006_0002, 20_000, 110), // changelog.change
+    (0x0004_0001, 500, 4_096),  // tracked_state.tree_chunk
+    (0x0006_0001, 1_000, 200),  // changelog.commit
+    (0x0004_0002, 1_000, 20),   // tracked_state.commit_root
+    (0x0002_0001, 200, 150),    // untracked_state.row.v1
+];
+
+fn space_key_for(index: usize) -> Key {
+    // splitmix64 spread within the space, mirroring blake3/uuid key entropy.
+    let mut x = (index as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    Key(Bytes::from(format!("{x:016x}/{index:08x}")))
+}
+
+fn full_range() -> KeyRange {
+    KeyRange {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    }
+}
+
+fn seed_spaces(backend: &SqliteBackend) {
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .expect("begin write");
+    for &(space_id, rows, value_size) in SPACE_MIX {
+        let space = SpaceId(space_id);
+        let mut entries = (0..rows)
+            .map(|index| PutEntry {
+                key: space_key_for(index),
+                value: value_for(index, value_size),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.key.0.cmp(&right.key.0));
+        write
+            .put_many(space, PutBatch { entries })
+            .expect("seed space");
+    }
+    write.commit().expect("seed commit");
+}
+
+fn multi_space_fixture() -> SqliteFixture {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let path = temp_dir.path().join("bench.lix");
+    let backend = SqliteBackend::open(path).expect("open backend");
+    seed_spaces(&backend);
+    SqliteFixture {
+        backend,
+        _temp_dir: temp_dir,
+    }
+}
+
+/// Scans one space by its physical prefix: the cell the per-space-table
+/// format targets (a table scan in v2 vs an interleaved range scan in v1).
+fn bench_space_prefix_scan(c: &mut Criterion, fixture: &SqliteFixture) {
+    let mut group = c.benchmark_group("sqlite_backend/space_prefix_scan");
+    configure_group(&mut group);
+    // The engine drives a scan with ONE visit_next call at the caller's
+    // limit; the chunked cells below exercise the synthetic pagination
+    // pattern, this one the engine pattern.
+    group.throughput(Throughput::Elements(20_000u64));
+    group.bench_function(
+        BenchmarkId::new("json_store_single_call", 20_000usize),
+        |b| {
+            b.iter(|| {
+                let read = fixture
+                    .backend
+                    .begin_read(ReadOptions::default())
+                    .expect("begin read");
+                let mut visitor = CountingScanVisitor::default();
+                let result = read
+                    .scan(
+                        SpaceId(0x0001_0001),
+                        full_range(),
+                        ScanOptions {
+                            projection: CoreProjection::FullValue,
+                            limit_rows: usize::MAX,
+                            resume_after: None,
+                        },
+                        &mut visitor,
+                    )
+                    .expect("space scan");
+                read.close().expect("close read");
+                assert_eq!(visitor.rows, 20_000);
+                black_box((result, visitor));
+            });
+        },
+    );
+    for (label, space_id, rows) in [
+        ("json_store", 0x0001_0001u32, 20_000usize),
+        ("tree_chunk", 0x0004_0001, 500),
+    ] {
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_function(BenchmarkId::new(label, rows), |b| {
+            b.iter(|| {
+                let read = fixture
+                    .backend
+                    .begin_read(ReadOptions::default())
+                    .expect("begin read");
+                let mut visitor = CountingScanVisitor::default();
+                let result =
+                    paged_scan(&read, SpaceId(space_id), &mut visitor).expect("space scan");
+                read.close().expect("close read");
+                assert_eq!(visitor.rows, rows);
+                black_box((result, visitor));
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Deletes one space's full key range: range delete in v1, a candidate for
+/// table truncation in v2.
+fn bench_space_truncate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sqlite_backend/space_truncate");
+    configure_group(&mut group);
+    group.sample_size(10);
+    group.bench_function(BenchmarkId::new("json_store", 20_000usize), |b| {
+        b.iter_batched(
+            multi_space_fixture,
+            |fixture| {
+                let mut write = fixture
+                    .backend
+                    .begin_write(WriteOptions::default())
+                    .expect("begin write");
+                write
+                    .delete_range(SpaceId(0x0001_0001), full_range())
+                    .expect("truncate space");
+                write.commit().expect("commit");
+                fixture
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+/// One-shot physical-layout report, gated by LIX_SQLITE_FILE_STATS=1:
+/// checkpointed file size plus page accounting for the multi-space
+/// workload. The truest storage metric for a file-format change.
+fn report_file_stats() {
+    if std::env::var("LIX_SQLITE_FILE_STATS").map_or(true, |v| v != "1") {
+        return;
+    }
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let path = temp_dir.path().join("stats.lix");
+    let backend = SqliteBackend::open(&path).expect("open backend");
+    seed_spaces(&backend);
+    drop(backend);
+    let conn = rusqlite::Connection::open(&path).expect("open raw");
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .expect("checkpoint");
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("page_size");
+    let page_count: u64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("page_count");
+    let freelist: u64 = conn
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("freelist");
+    let tables: u64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("tables");
+    let file_bytes = std::fs::metadata(&path).expect("metadata").len();
+    println!("| sqlite_file_stats | tables | page_size | pages | freelist | file_bytes |");
+    println!(
+        "| sqlite_file_stats | {tables} | {page_size} | {page_count} | {freelist} | {file_bytes} |"
+    );
+    // Per-table page accounting when the build has dbstat available.
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT name, count(*), sum(pgsize) FROM dbstat GROUP BY name ORDER BY name")
+    {
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                println!("| dbstat | {} | {} pages | {} bytes |", row.0, row.1, row.2);
+            }
+        }
+    }
 }
 
 fn bench_open(c: &mut Criterion) {
@@ -136,6 +342,7 @@ fn bench_point_reads(c: &mut Criterion, fixture: &SqliteFixture) {
                 .expect("begin read");
             let mut visitor = CountingPointVisitor::default();
             read.visit_keys(
+                BENCH_SPACE,
                 black_box(existing_keys.as_slice()),
                 GetOptions {
                     projection: CoreProjection::FullValue,
@@ -158,6 +365,7 @@ fn bench_point_reads(c: &mut Criterion, fixture: &SqliteFixture) {
                 .expect("begin read");
             let mut visitor = CountingPointVisitor::default();
             read.visit_keys(
+                BENCH_SPACE,
                 black_box(missing_keys.as_slice()),
                 GetOptions {
                     projection: CoreProjection::KeyOnly,
@@ -192,17 +400,15 @@ fn bench_range_scans(c: &mut Criterion, fixture: &SqliteFixture) {
                     .expect("begin read");
                 let mut visitor = CountingScanVisitor::default();
                 let result = read
-                    .with_range_scan(
-                        KeyRange {
-                            lower: Bound::Unbounded,
-                            upper: Bound::Unbounded,
-                        },
+                    .scan(
+                        BENCH_SPACE,
+                        full_range(),
                         ScanOptions {
                             projection,
                             limit_rows: usize::MAX,
                             resume_after: None,
                         },
-                        |cursor| visit_all(cursor, &mut visitor),
+                        &mut visitor,
                     )
                     .expect("range scan");
                 read.close().expect("close read");
@@ -232,7 +438,9 @@ fn bench_write_batches(c: &mut Criterion) {
                     let mut write = backend
                         .begin_write(WriteOptions::default())
                         .expect("begin write");
-                    write.put_many(black_box(batch)).expect("put many");
+                    write
+                        .put_many(BENCH_SPACE, black_box(batch))
+                        .expect("put many");
                     let result = write.commit().expect("commit");
                     black_box(result);
                     // Returned so backend teardown (connection close + WAL
@@ -257,7 +465,10 @@ fn bench_write_batches(c: &mut Criterion) {
                         .begin_write(WriteOptions::default())
                         .expect("begin seed write");
                     write
-                        .put_many(random_put_batch(rows, RANDOM_WRITE_SEED_ROWS, VALUE_SIZE))
+                        .put_many(
+                            BENCH_SPACE,
+                            random_put_batch(rows, RANDOM_WRITE_SEED_ROWS, VALUE_SIZE),
+                        )
                         .expect("seed rows");
                     write.commit().expect("seed commit");
                     (backend, temp_dir, random_put_batch(0, rows, VALUE_SIZE))
@@ -266,7 +477,9 @@ fn bench_write_batches(c: &mut Criterion) {
                     let mut write = backend
                         .begin_write(WriteOptions::default())
                         .expect("begin write");
-                    write.put_many(black_box(batch)).expect("put many");
+                    write
+                        .put_many(BENCH_SPACE, black_box(batch))
+                        .expect("put many");
                     let result = write.commit().expect("commit");
                     black_box(result);
                     (backend, temp_dir)
@@ -279,18 +492,37 @@ fn bench_write_batches(c: &mut Criterion) {
     group.finish();
 }
 
-fn visit_all(
-    cursor: &mut impl BackendRangeScan,
+/// Paged scan via resume_after: the pagination pattern the engine uses for
+/// limited scans, one query per page.
+fn paged_scan<R: BackendRead>(
+    read: &R,
+    space: SpaceId,
     visitor: &mut CountingScanVisitor,
 ) -> Result<ScanResult, BackendError> {
     let mut total = ScanResult::default();
+    let mut resume: Option<Key> = None;
     loop {
-        let chunk = cursor.visit_next(SCAN_CHUNK_ROWS, visitor)?;
+        let mut last_key: Option<Key> = None;
+        let mut page = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            last_key = Some(key.to_owned_key());
+            visitor.visit(key, value)
+        };
+        let chunk = read.scan(
+            space,
+            full_range(),
+            ScanOptions {
+                projection: CoreProjection::FullValue,
+                limit_rows: SCAN_CHUNK_ROWS,
+                resume_after: resume.as_ref(),
+            },
+            &mut page,
+        )?;
         total.emitted += chunk.emitted;
         total.has_more = chunk.has_more;
         if !chunk.has_more {
             return Ok(total);
         }
+        resume = last_key;
     }
 }
 
@@ -302,7 +534,7 @@ fn sqlite_fixture(rows: usize, value_size: usize) -> SqliteFixture {
         .begin_write(WriteOptions::default())
         .expect("begin write");
     write
-        .put_many(put_batch(0, rows, value_size))
+        .put_many(BENCH_SPACE, put_batch(0, rows, value_size))
         .expect("seed rows");
     write.commit().expect("seed commit");
     SqliteFixture {

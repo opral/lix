@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
+    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
+use rocksdb::Snapshot;
 use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
-use rocksdb::{DBIteratorWithThreadMode, Snapshot};
 use tempfile::TempDir;
 
 #[derive(Debug)]
@@ -33,14 +33,6 @@ pub struct RocksDbBackend {
 
 pub struct RocksDbRead<'a> {
     snapshot: Snapshot<'a>,
-}
-
-pub struct RocksDbRangeScan<'a> {
-    iter: DBIteratorWithThreadMode<'a, DB>,
-    bounds: EncodedBounds,
-    projection: CoreProjection,
-    pending: Option<(Box<[u8]>, Box<[u8]>)>,
-    done: bool,
 }
 
 pub struct RocksDbWrite {
@@ -133,11 +125,39 @@ impl Backend for RocksDbBackend {
     }
 }
 
-impl<'db> BackendRead for RocksDbRead<'db> {
-    type RangeScan<'cursor> = RocksDbRangeScan<'db>;
+/// RocksDB keeps its single-keyspace layout; spaces are scoped by prefixing
+/// the 4-byte big-endian space id internally. Visitors observe logical keys.
+fn physical_key(space: SpaceId, key: &Key) -> Key {
+    let mut bytes = Vec::with_capacity(4 + key.0.len());
+    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&key.0);
+    Key(Bytes::from(bytes))
+}
 
+fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+    let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
+        Bound::Included(key) => Bound::Included(physical_key(space, &key)),
+        Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)),
+        Bound::Unbounded => unbounded,
+    };
+    KeyRange {
+        lower: map(
+            range.lower,
+            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+        ),
+        upper: map(
+            range.upper,
+            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+                Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+            }),
+        ),
+    }
+}
+
+impl BackendRead for RocksDbRead<'_> {
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -145,11 +165,15 @@ impl<'db> BackendRead for RocksDbRead<'db> {
     where
         V: PointVisitor + ?Sized,
     {
+        let physical_keys = keys
+            .iter()
+            .map(|key| physical_key(space, key))
+            .collect::<Vec<_>>();
         for (index, (key, value)) in keys
             .iter()
             .zip(
                 self.snapshot
-                    .multi_get(keys.iter().map(|key| key.0.as_ref())),
+                    .multi_get(physical_keys.iter().map(|key| key.0.as_ref())),
             )
             .enumerate()
         {
@@ -165,133 +189,86 @@ impl<'db> BackendRead for RocksDbRead<'db> {
         Ok(())
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
-    {
-        let bounds = EncodedBounds::new(range, opts.resume_after);
-        let mut cursor = RocksDbRangeScan {
-            iter: self
-                .snapshot
-                .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward)),
-            bounds,
-            projection: opts.projection,
-            pending: None,
-            done: opts.limit_rows == 0,
-        };
-        f(&mut cursor)
-    }
-}
-
-impl BackendRangeScan for RocksDbRangeScan<'_> {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized,
     {
-        if limit_rows == 0 || self.done {
+        if opts.limit_rows == 0 {
             return Ok(ScanResult {
                 emitted: 0,
-                has_more: !self.done,
+                has_more: false,
             });
         }
-
-        let mut emitted = 0;
-        while emitted < limit_rows {
-            let Some((encoded_key, value)) = self.next_row()? else {
+        let resume_after = opts.resume_after.map(|key| physical_key(space, key));
+        let bounds = EncodedBounds::new(physical_range(space, range), resume_after.as_ref());
+        let mut emitted = 0usize;
+        for item in self
+            .snapshot
+            .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
+        {
+            let (encoded_key, value) = item.map_err(rocksdb_error)?;
+            let encoded_key = encoded_key.as_ref();
+            if !bounds.after_lower(encoded_key) {
+                continue;
+            }
+            if !bounds.before_upper(encoded_key) {
+                break;
+            }
+            if emitted == opts.limit_rows {
                 return Ok(ScanResult {
                     emitted,
-                    has_more: false,
+                    has_more: true,
                 });
-            };
-
-            match self.projection {
+            }
+            match opts.projection {
                 CoreProjection::KeyOnly => {
-                    visitor.visit(KeyRef(encoded_key.as_ref()), ProjectedValueRef::KeyOnly)?;
+                    visitor.visit(KeyRef(&encoded_key[4..]), ProjectedValueRef::KeyOnly)?;
                 }
                 CoreProjection::FullValue => visitor.visit(
-                    KeyRef(encoded_key.as_ref()),
+                    KeyRef(&encoded_key[4..]),
                     ProjectedValueRef::FullValue(value.as_ref()),
                 )?,
             }
             emitted += 1;
         }
-
-        let has_more = self.ensure_pending()?;
-        Ok(ScanResult { emitted, has_more })
-    }
-}
-
-impl RocksDbRangeScan<'_> {
-    fn next_row(&mut self) -> Result<Option<(Box<[u8]>, Box<[u8]>)>, BackendError> {
-        if let Some(pending) = self.pending.take() {
-            return Ok(Some(pending));
-        }
-        self.read_next_row()
-    }
-
-    fn ensure_pending(&mut self) -> Result<bool, BackendError> {
-        if self.pending.is_some() {
-            return Ok(true);
-        }
-        self.pending = self.read_next_row()?;
-        Ok(self.pending.is_some())
-    }
-
-    fn read_next_row(&mut self) -> Result<Option<(Box<[u8]>, Box<[u8]>)>, BackendError> {
-        if self.done {
-            return Ok(None);
-        }
-
-        for item in self.iter.by_ref() {
-            let (encoded_key, value) = item.map_err(rocksdb_error)?;
-            let key = encoded_key.as_ref();
-            if !self.bounds.after_lower(key) {
-                continue;
-            }
-            if !self.bounds.before_upper(key) {
-                self.done = true;
-                return Ok(None);
-            }
-            return Ok(Some((encoded_key, value)));
-        }
-
-        self.done = true;
-        Ok(None)
+        Ok(ScanResult {
+            emitted,
+            has_more: false,
+        })
     }
 }
 
 impl BackendWrite for RocksDbWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
+            let key = physical_key(space, &entry.key);
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            self.staged_put_keys.push(entry.key.clone());
-            self.batch.put(entry.key.0.as_ref(), value.as_ref());
+            self.staged_put_keys.push(key.clone());
+            self.batch.put(key.0.as_ref(), value.as_ref());
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
-            self.batch.delete(key.0.as_ref());
+            self.batch.delete(physical_key(space, key).0.as_ref());
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        let range = physical_range(space, range);
         if let Some((lower, upper)) = rocksdb_delete_range_bounds(&range) {
             self.batch.delete_range(lower.as_slice(), upper.as_slice());
         } else {
@@ -390,7 +367,6 @@ impl EncodedBounds {
         }
     }
 
-    #[allow(dead_code)]
     fn contains(&self, encoded_key: &[u8]) -> bool {
         if !self.after_lower(encoded_key) {
             return false;

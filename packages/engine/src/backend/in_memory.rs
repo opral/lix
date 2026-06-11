@@ -1,6 +1,4 @@
-use std::collections::btree_map;
 use std::collections::{BTreeMap, BTreeSet};
-use std::iter::Peekable;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
@@ -8,13 +6,41 @@ use bytes::Bytes;
 
 use crate::backend::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
-    CommitResult, CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor,
-    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue,
-    WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
+    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
+
+/// The in-memory backend has no native namespaces; it scopes keys to spaces
+/// by prefixing the 4-byte big-endian space id internally. The prefix never
+/// crosses the trait boundary: visitors observe logical keys.
+fn physical_key(space: SpaceId, key: &Key) -> Key {
+    let mut bytes = bytes::BytesMut::with_capacity(4 + key.0.len());
+    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&key.0);
+    Key(bytes.freeze())
+}
+
+fn physical_bound(space: SpaceId, bound: Bound<Key>, unbounded: Bound<Key>) -> Bound<Key> {
+    match bound {
+        Bound::Included(key) => Bound::Included(physical_key(space, &key)),
+        Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)),
+        Bound::Unbounded => unbounded,
+    }
+}
+
+fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+    let lower_unbounded = Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes())));
+    let upper_unbounded = space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+        Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+    });
+    KeyRange {
+        lower: physical_bound(space, range.lower, lower_unbounded),
+        upper: physical_bound(space, range.upper, upper_unbounded),
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 enum EntriesState {
@@ -45,15 +71,6 @@ pub struct InMemoryBackendFixture {
 #[expect(missing_debug_implementations)]
 pub struct InMemoryRead {
     entries: Arc<EntriesState>,
-}
-
-#[expect(missing_debug_implementations)]
-pub enum InMemoryRangeScan<'a> {
-    Flat {
-        iter: Peekable<btree_map::Range<'a, Key, Bytes>>,
-        projection: CoreProjection,
-    },
-    Buffered(BufferedRangeScan),
 }
 
 pub type InMemoryScanVisitResult = ScanResult;
@@ -146,10 +163,9 @@ impl Backend for InMemoryBackend {
 }
 
 impl BackendRead for InMemoryRead {
-    type RangeScan<'a> = InMemoryRangeScan<'a>;
-
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -157,170 +173,71 @@ impl BackendRead for InMemoryRead {
     where
         V: PointVisitor + ?Sized,
     {
-        match self.entries.as_ref() {
-            EntriesState::Flat(entries) => {
-                for (index, key) in keys.iter().enumerate() {
-                    let value = entries
-                        .get(key)
-                        .map(|value| project_value_ref(value, opts.projection));
-                    visitor.visit(index, key, value)?;
-                }
-            }
-            entries => {
-                for (index, key) in keys.iter().enumerate() {
-                    let value = entries
-                        .get(key)
-                        .map(|value| project_value_ref(value, opts.projection));
-                    visitor.visit(index, key, value)?;
-                }
-            }
+        let entries = self.entries.as_ref();
+        for (index, key) in keys.iter().enumerate() {
+            let value = entries
+                .get(&physical_key(space, key))
+                .map(|value| project_value_ref(value, opts.projection));
+            visitor.visit(index, key, value)?;
         }
         Ok(())
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
-    {
-        if opts.limit_rows == 0 {
-            let mut cursor = InMemoryRangeScan::Buffered(BufferedRangeScan::default());
-            return f(&mut cursor);
-        }
-
-        let lower = lower_bound(&range, opts.resume_after);
-        let upper = upper_bound(&range);
-        if bounds_are_empty(&lower, &upper) {
-            let mut cursor = InMemoryRangeScan::Buffered(BufferedRangeScan::default());
-            return f(&mut cursor);
-        }
-
-        match self.entries.as_ref() {
-            EntriesState::Flat(entries) => {
-                let mut cursor = InMemoryRangeScan::Flat {
-                    iter: entries.range((lower, upper)).peekable(),
-                    projection: opts.projection,
-                };
-                f(&mut cursor)
-            }
-            entries => {
-                let mut rows = Vec::new();
-                visit_range(
-                    entries,
-                    range,
-                    ScanOptions {
-                        limit_rows: usize::MAX,
-                        ..opts
-                    },
-                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-                        rows.push(crate::backend::ReadEntry {
-                            key: key.to_owned_key(),
-                            value: value.to_owned(),
-                        });
-                        Ok(())
-                    },
-                )?;
-                let mut cursor = InMemoryRangeScan::Buffered(BufferedRangeScan::new(rows));
-                f(&mut cursor)
-            }
-        }
-    }
-}
-
-impl BackendRangeScan for InMemoryRangeScan<'_> {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized,
     {
-        match self {
-            InMemoryRangeScan::Buffered(cursor) => cursor.visit_next(limit_rows, visitor),
-            InMemoryRangeScan::Flat { iter, projection } => {
-                if limit_rows == 0 {
-                    return Ok(ScanResult {
-                        emitted: 0,
-                        has_more: iter.peek().is_some(),
-                    });
-                }
-
-                let mut emitted = 0;
-                while emitted < limit_rows {
-                    let Some((key, value)) = iter.next() else {
-                        return Ok(ScanResult {
-                            emitted,
-                            has_more: false,
-                        });
-                    };
-                    visitor.visit(key.as_ref(), project_value_ref(value, *projection))?;
-                    emitted += 1;
-                }
-
-                Ok(ScanResult {
-                    emitted,
-                    has_more: iter.peek().is_some(),
-                })
-            }
-        }
-    }
-}
-
-impl InMemoryRead {
-    pub fn visit_scan_range<F>(
-        &self,
-        range: KeyRange,
-        opts: ScanOptions<'_>,
-        mut visitor: F,
-    ) -> Result<InMemoryScanVisitResult, BackendError>
-    where
-        F: FnMut(KeyRef<'_>, Option<&[u8]>),
-    {
-        let mut visitor = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            let value = match value {
-                ProjectedValueRef::KeyOnly => None,
-                ProjectedValueRef::FullValue(value) => Some(value),
-            };
-            visitor(key, value);
-            Ok(())
+        let physical = physical_range(space, range);
+        let resume_after = opts.resume_after.map(|key| physical_key(space, key));
+        let physical_opts = ScanOptions {
+            resume_after: resume_after.as_ref(),
+            ..opts
         };
-        visit_range(&self.entries, range, opts, &mut visitor)
+        // Visitors observe logical keys; strip the internal prefix.
+        let mut strip = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            visitor.visit(KeyRef(&key.0[4..]), value)
+        };
+        visit_range(&self.entries, physical, physical_opts, &mut strip)
     }
 }
 
 impl BackendWrite for InMemoryWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         for entry in entries.entries {
+            let key = physical_key(space, &entry.key);
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
             if !self.overlay.deletes.is_empty() {
-                self.overlay.deletes.remove(&entry.key);
+                self.overlay.deletes.remove(&key);
             }
-            self.overlay.puts.insert(entry.key, value);
+            self.overlay.puts.insert(key, value);
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
+            let key = physical_key(space, key);
             if !self.overlay.puts.is_empty() {
-                self.overlay.puts.remove(key);
+                self.overlay.puts.remove(&key);
             }
-            self.overlay.deletes.insert(key.clone());
+            self.overlay.deletes.insert(key);
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        let range = physical_range(space, range);
         let mut base_keys = Vec::new();
         visit_range(
             &self.base,

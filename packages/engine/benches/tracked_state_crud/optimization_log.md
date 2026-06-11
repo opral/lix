@@ -1440,3 +1440,182 @@ fuzz across adversarial shapes (margins +22 to +11,737 bytes). The pk
 encode is hoisted to once per entry on the commit path.
 
 - `cargo test -p lix_engine --features storage-benches`: 1,565 passed.
+
+## SQLite Format V2 Baseline: per-space bench cells and file stats
+
+Date: 2026-06-10
+
+Command:
+
+```sh
+LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite_backend -- 'space_prefix_scan|space_truncate'
+```
+
+Preparation for the per-space-tables format cut. The rs-sdk bench
+previously used un-prefixed keys, which cannot observe a space-layout
+change; it now has a multi-space fixture mirroring the engine's physical
+layout (4-byte big-endian space id prefix, six spaces in 1k-commit
+accounting proportions, splitmix64 key entropy, sorted batches), plus:
+
+- `space_prefix_scan`: one space scanned by physical prefix (a table scan
+  under v2),
+- `space_truncate`: one space's full range deleted with per-iteration
+  fixture rebuild (a candidate for table truncation under v2),
+- a file-stats report gated by `LIX_SQLITE_FILE_STATS=1`: checkpointed
+  file bytes, page accounting, and per-table dbstat - the physical
+  metric an API-level accounting harness cannot see.
+
+### Format v1 baseline
+
+| Cell                              | v1       |
+| ---------------------------------- | -------- |
+| space_prefix_scan json_store (20k) | 1.034 ms |
+| space_prefix_scan tree_chunk (500) | 132 us   |
+| space_truncate json_store (20k)    | 10.9 ms  |
+
+File: 1 table (`lix_internal_entries`), 3,331 x 4 KiB pages, 13,643,776
+bytes on disk for the multi-space mix.
+
+## SQLite Format V2: per-space bucket tables
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+cargo bench -p lix_sdk --features sqlite --bench sqlite_backend
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke'
+LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite_backend -- 'no_match'
+cargo test -p lix_sdk --features sqlite && cargo test -p lix_engine --features storage-benches
+```
+
+Change (hard cut, `SQLITE_FORMAT_VERSION` 1 -> 2; v1 files rejected with
+a clear no-migration error):
+
+- One table per key bucket instead of a single interleaved
+  `lix_internal_entries` table. The bucket is the key's zero-padded first
+  four bytes read big-endian - an order-preserving partition for arbitrary
+  keys (a unit test pins `bucket(k1) <= bucket(k2)` for sorted keys), so
+  cross-table iteration in bucket order preserves global scan order.
+  Engine keys start with the 4-byte space id, so engine buckets are
+  exactly storage spaces. Full keys stay stored (the 4-byte prefix saving
+  was ~1% of file; locality and truncation are the wins).
+- Tables are created lazily on first write. A positive-only bucket cache
+  is updated from committed state alone (a transaction's created tables
+  merge on commit, vanish on rollback) and never trusted negatively;
+  misses probe sqlite_master inside the caller's snapshot, so tables
+  created by other handles on the same file are always found.
+- `delete_range` issues an unqualified `DELETE FROM` when the range
+  provably covers the bucket; a test pins that the engine's exact
+  `[prefix, next_prefix)` space deletes hit the fast path.
+- Scans prepare one statement per bucket upfront and open every cursor
+  immediately (SQLite executes lazily; an unstepped cursor is free). The
+  statements live in the with_range_scan stack frame and the scan struct
+  owns the open row cursors, so rows stream zero-copy in a single pass
+  with no self-referential borrows, no re-queries, and has_more answered
+  by stepping the already-open cursor one row ahead.
+- The engine test-support copy
+  (`packages/engine/tests/backend/support/sqlite_backend.rs`) is
+  byte-identical (the engine cannot depend on lix_sdk); both files carry a
+  sync note.
+
+Benching found two real bugs and drove one redesign before shipping:
+
+- The first scan implementation used NULL-guarded predicates
+  (`(? IS NULL OR key > ?)`) so one statement shape served every bound
+  combination. That defeats SQLite's index planner; every batch degraded
+  to a table walk (prefix scan 1.03 -> 10.4 ms, 10x). Predicates are now
+  shape-specialized per bound combination, with the prepared-statement
+  cache raised to 256 (shapes multiply per table).
+- An intermediate re-query-per-batch cursor crashed on the engine
+  pattern (one `visit_next(usize::MAX)` call): a `limit + 1` lookahead
+  wrapped to `LIMIT 0` in release. The conformance suite had not covered
+  huge limits; a dedicated regression test now does.
+- The re-query cursor also kept a +10-22% cost on chunked pagination
+  (~11 us re-query + re-seek per visit_next call). The shipped design
+  pre-opens all bucket cursors instead, restoring exact v1 streaming.
+
+### rs-sdk A/B (alternating stash triples)
+
+| Cell                                 | v1       | v2       | Delta  |
+| ------------------------------------ | -------- | -------- | -----: |
+| space_truncate json_store (20k rows) | 10.73 ms | 577 us   | -94.6% |
+| space_prefix_scan 1k-chunked (20k)   | 1.036 ms | 1.029 ms | parity |
+| range_scan full_value 1k-chunked 50k | 2.345 ms | 2.350 ms | parity |
+| point_reads existing 1000            | 270.6 us | 273.7 us | parity |
+| put_many random 10k                  | 20.0 ms  | 20.9 ms  | parity |
+| open existing                        | 127 us   | 127 us   | parity |
+
+Scan parity holds for both the engine pattern (one visit_next call at
+the caller's limit) and chunked pagination, with sign flips across
+pairs; per scan the only added work is one sqlite_master bucket listing
+plus one statement per bucket in range.
+
+### Engine e2e A/B (tracked_state_crud lix_sqlite smoke, triples)
+
+| Cell        | v1       | v2       | Delta  |
+| ----------- | -------- | -------- | -----: |
+| read_one    | 194.7 us | 89.0 us  | -54% (2.2x) |
+| delete_all  | 12.81 ms | 9.17 ms  | -28%   |
+| update_one  | 946 us   | 895 us   | -5%    |
+| insert_all  | 10.87 ms | 11.10 ms | parity |
+| read_all    | 2.978 ms | 3.036 ms | parity |
+
+Point reads descend a small per-space B-tree instead of the 13 MB
+interleaved one; space-wide deletes hit the truncate fast path through
+the whole stack.
+
+### File layout (multi-space mix, checkpointed)
+
+v1: 1 table, 3,331 pages, 13,643,776 bytes. v2: 6 tables, 3,339 pages,
+13,676,544 bytes (+0.24%) with per-space dbstat accounting now available
+(json_store 1,836 pages, change 835, tree_chunk 572, ...).
+
+- `cargo test -p lix_sdk --features sqlite`: 19 passed (conformance,
+  e2e, usize::MAX-limit regression). `cargo test -p lix_engine
+  --features storage-benches`: 1,568 passed. clippy zero across both.
+
+## Space-Aware Backend Interface + Per-Space SQLite Tables
+
+Date: 2026-06-10
+
+Hard cut of the Backend trait and the SQLite file format (v2), replacing
+the prefixed-key keyspace with an explicit, typed interface:
+
+- Every read/write method takes `space: SpaceId`; keys are logical bytes.
+  `scan(space, range, opts, visitor) -> ScanResult` replaces the
+  cursor API (`BackendRangeScan`, `with_range_scan`, `visit_next`) - git
+  archaeology showed every production caller made exactly one visit_next
+  call per cursor, with pagination via resume_after.
+- The engine's physical-key codec (encode/decode of the 4-byte space
+  prefix) is deleted; write-set lowering, point plans, and scans pass the
+  space they already had. `delete_range(space, Unbounded..Unbounded)` is
+  the explicit truncate idiom.
+- SQLite maps each space to its own table. The bucket derivation, key
+  order proofs, sqlite_master listings, and the commit-gated existence
+  cache from the first partitioned design are all deleted: writes run
+  CREATE TABLE IF NOT EXISTS unconditionally (~us of DDL parse), reads
+  probe once per call. redb, RocksDB, the in-memory backend, and the CLI
+  file backend keep single-keyspace layouts and prefix internally in ~30
+  private lines each.
+- Conformance tests the spaces contract; the bench fixtures and the
+  scrambled equivalence decorator are space-aware.
+
+### A/B vs flat v1 (whole working tree stashed, alternating)
+
+| Cell                                | v1 flat   | v2 spaces | Delta  |
+| ----------------------------------- | --------- | --------- | -----: |
+| e2e merge_10k (plugin pipeline)     | 347.8 ms  | 195.3 ms  | -44% (1.78x) |
+| engine read_one_by_pk (sqlite)      | 213.1 us  | 96.2 us   | -55% (2.2x) |
+| engine delete_all (sqlite)          | 12.65 ms  | 9.83 ms   | -22%   |
+| engine insert_all (sqlite)          | 11.59 ms  | 10.57 ms  | -9%    |
+| engine read_all (sqlite)            | ~3.0 ms   | ~3.2 ms   | parity (noisy) |
+| raw space truncate (20k rows)       | 10.7 ms   | ~0.6 ms   | -95%   |
+
+Point reads descend small per-space B-trees instead of one interleaved
+13 MB tree; space deletes truncate tables; the merge pipeline collects
+both.
+
+- Suites: engine 1,565 / sdk 26 / cli 46, all green; workspace clippy
+  zero. SQLITE_FORMAT_VERSION = 2; v1 files rejected with a clear
+  no-migration error.

@@ -10,7 +10,7 @@
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, GetOptions, InMemoryBackend, InMemoryBackendFactory,
     InMemoryBackendFixture, Key, KeyRange, PointVisitor, ProjectedValueRef, ReadOptions,
-    ScanOptions, WriteOptions,
+    ScanOptions, ScanResult, ScanVisitor, SpaceId, WriteOptions,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig, run_backend_conformance};
 
@@ -86,11 +86,9 @@ impl Backend for ScrambledVisitBackend {
 }
 
 impl BackendRead for ScrambledVisitRead {
-    type RangeScan<'a> =
-        <<InMemoryBackend as Backend>::Read<'static> as BackendRead>::RangeScan<'a>;
-
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -99,10 +97,12 @@ impl BackendRead for ScrambledVisitRead {
         V: PointVisitor + ?Sized,
     {
         let mut buffered = Vec::with_capacity(keys.len());
-        self.inner.visit_keys(
-            keys,
-            opts,
-            &mut |index: usize, _key: &Key, value: Option<ProjectedValueRef<'_>>| {
+        self.inner
+            .visit_keys(space, keys, opts, &mut |index: usize,
+                                                 _key: &Key,
+                                                 value: Option<
+                ProjectedValueRef<'_>,
+            >| {
                 let value = value.map(|value| match value {
                     ProjectedValueRef::KeyOnly => OwnedProjected::KeyOnly,
                     ProjectedValueRef::FullValue(bytes) => {
@@ -111,8 +111,7 @@ impl BackendRead for ScrambledVisitRead {
                 });
                 buffered.push((index, value));
                 Ok(())
-            },
-        )?;
+            })?;
         // Replay in a seeded-shuffled order: a consumer that depends on
         // visit order instead of the visited index fails loudly here.
         shuffle(&mut buffered);
@@ -131,17 +130,18 @@ impl BackendRead for ScrambledVisitRead {
         Ok(())
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
     where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        V: ScanVisitor + ?Sized,
     {
         // Range scans stay ordered: ascending key order is contractual.
-        self.inner.with_range_scan(range, opts, f)
+        self.inner.scan(space, range, opts, visitor)
     }
 
     fn close(self) -> Result<(), BackendError> {
