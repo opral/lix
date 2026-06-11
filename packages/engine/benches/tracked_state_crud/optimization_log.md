@@ -1785,3 +1785,28 @@ retention follows commit-graph reachability.
 
 Suites: engine 1,565 / sdk 26 / cli 46, all green; workspace warnings
 zero.
+
+## 2026-06-11 — json_store Compression Floor: 16 KiB → 512 B
+
+One constant. The 16 KiB floor predates inline payloads, when the store
+was dominated by ~127-byte rows that zstd inflates (probed: 200 real
+payloads grew at 1.01×). After single-copy, payloads at or under 256
+bytes never reach the store, so everything in it is mid-size JSON —
+the floor's dead zone had become the entire population. The existing
+`MIN_ZSTD_SAVINGS_BYTES = 128` guard keeps poor compressors raw, and
+the Zstd codec tag has been in the format since the store existed, so
+this is not a format change.
+
+Measured at the 1k bench: json_store values 156.8 → 136.0 KB (−13%),
+insert written bytes 449.4 → 436.5 KB. The modest ratio is honest
+corpus reality: the bench's mid-size payloads are lock-file dependency
+descriptors whose bytes are roughly half sha512 integrity hashes —
+incompressible entropy. Less hash-dense JSON corpora will compress
+better; this is close to the worst case, and the guard makes the
+change strictly non-negative everywhere.
+
+e2e merge_10k (stash-alternating, two pairs): 191.5/197.5 →
+190.0/195.6 ms, ≈ −0.9%, consistent in direction across both pairs.
+
+Cumulative campaign written-bytes: 534.4 → 436.5 KB per 1k-row insert
+commit (−18.3%). Suites: engine 1,569 all green.
