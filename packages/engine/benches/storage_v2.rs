@@ -3168,7 +3168,7 @@ fn put_batches_by_space(mutations: &[WriteMutation]) -> Vec<(StorageSpace, PutBa
     for mutation in mutations {
         if let WriteMutation::Put(space, key, value) = mutation {
             batches.entry(*space).or_default().push(PutEntry {
-                key: space.encode_key(key),
+                key: key.clone(),
                 value: value.clone(),
             });
         }
@@ -3186,15 +3186,12 @@ fn direct_write_batches_from_mutations(mutations: &[WriteMutation]) -> DirectWri
         match mutation {
             WriteMutation::Put(space, key, value) => {
                 puts.entry(*space).or_default().push(PutEntry {
-                    key: space.encode_key(key),
+                    key: key.clone(),
                     value: value.clone(),
                 });
             }
             WriteMutation::Delete(space, key) => {
-                deletes
-                    .entry(*space)
-                    .or_default()
-                    .push(space.encode_key(key));
+                deletes.entry(*space).or_default().push(key.clone());
             }
         }
     }
@@ -3215,11 +3212,11 @@ where
     B: Backend,
 {
     let mut write = backend.begin_write(WriteOptions::default())?;
-    for (_space, batch) in batches.puts {
-        write.put_many(SpaceId(1), batch)?;
+    for (space, batch) in batches.puts {
+        write.put_many(space.id, batch)?;
     }
-    for (_space, keys) in batches.deletes {
-        write.delete_many(SpaceId(1), &keys)?;
+    for (space, keys) in batches.deletes {
+        write.delete_many(space.id, &keys)?;
     }
     write.commit()
 }
@@ -3751,7 +3748,7 @@ fn direct_ordered_put_batch(
     indexes
         .into_iter()
         .map(|index| PutEntry {
-            key: storage_space.encode_key(&key(format!("ordered-put-{index:05}"))),
+            key: key(format!("ordered-put-{index:05}")),
             value: value(index as u32, value_size),
         })
         .collect()
