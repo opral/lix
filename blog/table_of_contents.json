@@ -1,32 +1,51 @@
 [
   {
+    "path": "./007-v0-7-release/index.md",
+    "slug": "lix-v0-7-release",
+    "authors": [
+      "samuelstroschein"
+    ]
+  },
+  {
     "path": "./006-v0-6-release/index.md",
     "slug": "lix-v0-6-release",
-    "authors": ["samuelstroschein"]
+    "authors": [
+      "samuelstroschein"
+    ]
   },
   {
     "path": "./005-april-2026-update/index.md",
     "slug": "april-2026-update",
-    "authors": ["samuelstroschein"]
+    "authors": [
+      "samuelstroschein"
+    ]
   },
   {
     "path": "./004-march-2026-update/index.md",
     "slug": "march-2026-update",
-    "authors": ["samuelstroschein"]
+    "authors": [
+      "samuelstroschein"
+    ]
   },
   {
     "path": "./003-february-2026-update/index.md",
     "slug": "february-2026-update",
-    "authors": ["samuelstroschein"]
+    "authors": [
+      "samuelstroschein"
+    ]
   },
   {
     "path": "./002-modeling-a-company-as-a-repository/index.md",
     "slug": "modeling-a-company-as-a-repository",
-    "authors": ["samuelstroschein"]
+    "authors": [
+      "samuelstroschein"
+    ]
   },
   {
     "path": "./001-introducing-lix/index.md",
     "slug": "introducing-lix",
-    "authors": ["samuelstroschein"]
+    "authors": [
+      "samuelstroschein"
+    ]
   }
 ]
