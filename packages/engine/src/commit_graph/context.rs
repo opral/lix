@@ -293,8 +293,8 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
         entity_pk: change.entity_pk,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        snapshot_ref: change.snapshot_ref,
-        metadata_ref: change.metadata_ref,
+        snapshot: change.snapshot,
+        metadata: change.metadata,
         created_at: change.created_at,
     }
 }
@@ -336,7 +336,7 @@ fn change_matches_history_request(
     change: &CommitGraphChange,
     request: &CommitGraphChangeHistoryRequest,
 ) -> bool {
-    (request.include_tombstones || change.snapshot_ref.is_some())
+    (request.include_tombstones || change.snapshot.is_some())
         && (request.entity_pks.is_empty() || request.entity_pks.contains(&change.entity_pk))
         && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
         && (request.file_ids.is_empty()
@@ -362,19 +362,16 @@ fn commit_graph_commit_from_commit_record(
 }
 
 fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": record.commit_id.to_string(),
-    }))
-    .expect("lix_commit snapshot serialization should not fail");
+    let snapshot_content =
+        crate::changelog::commit_row_snapshot_json(&record.commit_id.to_string())
+            .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
         id: record.change_id,
         entity_pk: EntityPk::single(record.commit_id),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_ref: Some(crate::json_store::JsonRef::for_content(
-            snapshot_content.as_bytes(),
-        )),
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
         created_at: record.created_at,
     }
 }
@@ -730,8 +727,8 @@ mod tests {
                     entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                     schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot_ref: None,
-                    metadata_ref: None,
+                    snapshot: crate::json_store::JsonSlot::None,
+                    metadata: crate::json_store::JsonSlot::None,
                     created_at: ts("2026-01-01T00:00:00Z"),
                 },
                 commit_change_ids: change_ids
@@ -760,10 +757,11 @@ mod tests {
                     entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
                     schema_key: schema_key.to_string(),
                     file_id: file_id.map(str::to_string),
-                    snapshot_ref: snapshot_content.map(|content| {
-                        crate::json_store::JsonRef::from_hash(blake3::hash(content.as_bytes()))
-                    }),
-                    metadata_ref: None,
+                    snapshot: snapshot_content
+                        .map_or(crate::json_store::JsonSlot::None, |content| {
+                            crate::json_store::JsonSlot::from_json(content)
+                        }),
+                    metadata: crate::json_store::JsonSlot::None,
                     created_at: ts(created_at),
                 },
                 commit_change_ids: Vec::new(),
@@ -887,8 +885,8 @@ mod tests {
             entity_pk: change.change.entity_pk.clone(),
             schema_key: change.change.schema_key.clone(),
             file_id: change.change.file_id.clone(),
-            snapshot_ref: change.change.snapshot_ref,
-            metadata_ref: change.change.metadata_ref,
+            snapshot: change.change.snapshot.clone(),
+            metadata: change.change.metadata.clone(),
             created_at: change.change.created_at,
         }
     }

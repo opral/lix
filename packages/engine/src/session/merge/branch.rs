@@ -306,8 +306,6 @@ fn selected_change_from_merge_pick(pick: &TrackedStateMergePick) -> StagedCommit
         file_id: pick.selected_row.file_id.clone(),
         entity_pk: pick.selected_row.entity_pk.clone(),
         change_id: pick.change_id,
-        snapshot_ref: pick.selected_row.snapshot_ref,
-        metadata_ref: pick.selected_row.metadata_ref,
         deleted: pick.selected_row.deleted,
         created_at: pick.selected_row.created_at,
         updated_at: pick.selected_row.updated_at,

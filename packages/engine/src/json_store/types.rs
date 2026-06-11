@@ -278,3 +278,122 @@ mod tests {
         assert!(error.message.contains("failed to decode json ref"));
     }
 }
+
+/// A snapshot or metadata payload slot in tracked-state values and change
+/// records.
+///
+/// Small payloads inline their JSON text directly: measurement on the 10k
+/// merge workload showed 99.8% of payloads at 65-128 bytes with ~0.2%
+/// content dedup, so the json_store indirection (two 32-byte refs, a store
+/// key, a store row, and a point read per materialization) cost more than
+/// the payloads themselves. Large payloads keep the content-addressed ref.
+/// The threshold is applied deterministically at staging time, so identical
+/// content always produces the same variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JsonSlot {
+    None,
+    Ref(JsonRef),
+    Inline(Box<str>),
+}
+
+/// Inline threshold in bytes. Payloads at or under this length skip the
+/// json_store entirely.
+pub(crate) const JSON_INLINE_MAX_BYTES: usize = 256;
+
+impl JsonSlot {
+    pub(crate) fn from_json(json: &str) -> Self {
+        if json.len() <= JSON_INLINE_MAX_BYTES {
+            Self::Inline(json.into())
+        } else {
+            Self::Ref(JsonRef::for_content(json.as_bytes()))
+        }
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(crate) fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub(crate) fn as_ref_slot(&self) -> JsonSlotRef<'_> {
+        match self {
+            Self::None => JsonSlotRef::None,
+            Self::Ref(json_ref) => JsonSlotRef::Ref(json_ref),
+            Self::Inline(json) => JsonSlotRef::Inline(json),
+        }
+    }
+}
+
+/// Borrowed form of [`JsonSlot`] for zero-copy staging paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonSlotRef<'a> {
+    None,
+    Ref(&'a JsonRef),
+    Inline(&'a str),
+}
+
+impl JsonSlotRef<'_> {
+    pub(crate) fn to_owned_slot(self) -> JsonSlot {
+        match self {
+            Self::None => JsonSlot::None,
+            Self::Ref(json_ref) => JsonSlot::Ref(*json_ref),
+            Self::Inline(json) => JsonSlot::Inline(json.into()),
+        }
+    }
+}
+
+/// Musli codec for [`JsonSlot`]: tag byte 0/1/2, then the payload.
+pub(crate) mod json_slot_storage {
+    use musli::Context;
+    use musli::de::SequenceDecoder;
+
+    use super::{JsonRef, JsonSlot};
+
+    pub(crate) fn decode<'de, D>(decoder: D) -> Result<JsonSlot, D::Error>
+    where
+        D: musli::Decoder<'de>,
+    {
+        let cx = decoder.cx();
+        decoder.decode_pack(|pack| {
+            let tag: u8 = pack.next()?;
+            match tag {
+                0 => Ok(JsonSlot::None),
+                1 => Ok(JsonSlot::Ref(pack.next::<JsonRef>()?)),
+                2 => {
+                    let bytes: Vec<u8> = pack.next()?;
+                    String::from_utf8(bytes).map_or_else(
+                        |_| Err(cx.message(format_args!("inline json payload is not UTF-8"))),
+                        |json| Ok(JsonSlot::Inline(json.into_boxed_str())),
+                    )
+                }
+                other => Err(cx.message(format_args!("unknown json slot tag {other}"))),
+            }
+        })
+    }
+}
+
+/// Encode-only musli codec for borrowed [`JsonSlotRef`] fields.
+pub(crate) mod json_slot_storage_ref {
+    use musli::en::SequenceEncoder;
+
+    use super::JsonSlotRef;
+
+    pub(crate) fn encode<E>(value: &JsonSlotRef<'_>, encoder: E) -> Result<(), E::Error>
+    where
+        E: musli::Encoder,
+    {
+        encoder.encode_pack_fn(|pack| match value {
+            JsonSlotRef::None => pack.push(0u8),
+            JsonSlotRef::Ref(json_ref) => {
+                pack.push(1u8)?;
+                pack.push(*json_ref)
+            }
+            JsonSlotRef::Inline(json) => {
+                pack.push(2u8)?;
+                pack.push(json.as_bytes())
+            }
+        })
+    }
+}

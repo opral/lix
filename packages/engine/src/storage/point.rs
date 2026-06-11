@@ -4,6 +4,7 @@ use ahash::RandomState;
 
 use crate::backend::{
     BackendError, BackendRead, GetOptions, Key, PointVisitor, ProjectedValue, ProjectedValueRef,
+    SpaceId,
 };
 use crate::storage::{StorageRead, StorageReadResult, StorageReadStats, StorageSpace};
 
@@ -11,8 +12,8 @@ type FastHashBuilder = RandomState;
 
 #[derive(Clone, Debug)]
 pub struct PointReadPlan {
+    pub space: SpaceId,
     pub logical_unique_keys: Vec<Key>,
-    pub physical_unique_keys: Vec<Key>,
     pub requested_to_unique: RequestedToUnique,
 }
 
@@ -103,7 +104,7 @@ impl PointReadPlan {
         R: StorageRead + ?Sized,
     {
         let unique_values = read.with_backend(|backend_read| {
-            collect_physical_unique_values(backend_read, &self.physical_unique_keys, opts)
+            collect_unique_values(backend_read, self.space, &self.logical_unique_keys, opts)
         })?;
         Ok(StorageReadResult::new(
             PointValues {
@@ -139,9 +140,10 @@ impl PointReadPlan {
         R: StorageRead + ?Sized,
     {
         read.with_backend(|backend_read| {
-            collect_physical_unique_values_into(
+            collect_unique_values_into(
                 backend_read,
-                &self.physical_unique_keys,
+                self.space,
+                &self.logical_unique_keys,
                 opts,
                 buffer,
             )
@@ -166,37 +168,8 @@ impl PointReadPlan {
         R: StorageRead + ?Sized,
         V: PointVisitor + ?Sized,
     {
-        struct LogicalPointVisitor<'a, V: ?Sized> {
-            logical_keys: &'a [Key],
-            inner: &'a mut V,
-        }
-
-        impl<V> PointVisitor for LogicalPointVisitor<'_, V>
-        where
-            V: PointVisitor + ?Sized,
-        {
-            fn visit(
-                &mut self,
-                index: usize,
-                _key: &Key,
-                value: Option<ProjectedValueRef<'_>>,
-            ) -> Result<(), BackendError> {
-                let Some(logical_key) = self.logical_keys.get(index) else {
-                    return Ok(());
-                };
-                self.inner.visit(index, logical_key, value)
-            }
-        }
-
         read.with_backend(|backend_read| {
-            backend_read.visit_keys(
-                &self.physical_unique_keys,
-                opts,
-                &mut LogicalPointVisitor {
-                    logical_keys: &self.logical_unique_keys,
-                    inner: visitor,
-                },
-            )
+            backend_read.visit_keys(self.space, &self.logical_unique_keys, opts, visitor)
         })?;
         Ok(self.stats())
     }
@@ -206,13 +179,9 @@ impl PointReadPlan {
         logical_unique_keys: Vec<Key>,
         requested_to_unique: RequestedToUnique,
     ) -> Self {
-        let physical_unique_keys = logical_unique_keys
-            .iter()
-            .map(|key| space.encode_key(key))
-            .collect();
         Self {
+            space: space.id,
             logical_unique_keys,
-            physical_unique_keys,
             requested_to_unique,
         }
     }
@@ -342,45 +311,44 @@ impl PointValuesRef<'_, '_> {
     }
 }
 
-fn collect_physical_unique_values<R>(
+fn collect_unique_values<R>(
     read: &R,
-    physical_unique_keys: &[Key],
+    space: SpaceId,
+    unique_keys: &[Key],
     opts: GetOptions<'_>,
 ) -> Result<Vec<Option<ProjectedValue>>, BackendError>
 where
     R: BackendRead,
 {
-    let mut values = vec![None; physical_unique_keys.len()];
-    collect_physical_unique_values_into_slice(
-        read,
-        physical_unique_keys,
-        opts,
-        values.as_mut_slice(),
-    )?;
+    let mut values = vec![None; unique_keys.len()];
+    collect_unique_values_into_slice(read, space, unique_keys, opts, values.as_mut_slice())?;
     Ok(values)
 }
 
-fn collect_physical_unique_values_into<R>(
+fn collect_unique_values_into<R>(
     read: &R,
-    physical_unique_keys: &[Key],
+    space: SpaceId,
+    unique_keys: &[Key],
     opts: GetOptions<'_>,
     buffer: &mut PointReadBuffer,
 ) -> Result<(), BackendError>
 where
     R: BackendRead,
 {
-    buffer.reset_for_len(physical_unique_keys.len());
-    collect_physical_unique_values_into_slice(
+    buffer.reset_for_len(unique_keys.len());
+    collect_unique_values_into_slice(
         read,
-        physical_unique_keys,
+        space,
+        unique_keys,
         opts,
         buffer.unique_values.as_mut_slice(),
     )
 }
 
-fn collect_physical_unique_values_into_slice<R>(
+fn collect_unique_values_into_slice<R>(
     read: &R,
-    physical_unique_keys: &[Key],
+    space: SpaceId,
+    unique_keys: &[Key],
     opts: GetOptions<'_>,
     values: &mut [Option<ProjectedValue>],
 ) -> Result<(), BackendError>
@@ -405,7 +373,7 @@ where
         }
     }
 
-    read.visit_keys(physical_unique_keys, opts, &mut Collector { values })
+    read.visit_keys(space, unique_keys, opts, &mut Collector { values })
 }
 
 fn keys_are_unique(keys: &[Key]) -> bool {

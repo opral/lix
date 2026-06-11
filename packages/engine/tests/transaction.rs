@@ -1,4 +1,3 @@
-use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -8,7 +7,7 @@ use lix_engine::Engine;
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, InMemoryBackend,
     InMemoryRead, InMemoryWrite, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
-    WriteOptions,
+    ScanResult, ScanVisitor, SpaceId, WriteOptions,
 };
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -807,16 +806,16 @@ struct BlockingCommitWrite {
 }
 
 impl BackendWrite for BlockingCommitWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        self.inner.put_many(entries)
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(keys)
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(range)
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range)
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
@@ -979,10 +978,9 @@ struct RecordingWrite {
 }
 
 impl BackendRead for RecordingRead {
-    type RangeScan<'cursor> = <InMemoryRead as BackendRead>::RangeScan<'cursor>;
-
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -990,21 +988,22 @@ impl BackendRead for RecordingRead {
     where
         V: PointVisitor + ?Sized,
     {
-        self.fail_if_keys_match(keys)?;
-        self.inner.visit_keys(keys, opts, visitor)
+        self.fail_if_space_matches(space)?;
+        self.inner.visit_keys(space, keys, opts, visitor)
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
     where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        V: ScanVisitor + ?Sized,
     {
-        self.fail_if_range_matches(&range)?;
-        self.inner.with_range_scan(range, opts, f)
+        self.fail_if_space_matches(space)?;
+        self.inner.scan(space, range, opts, visitor)
     }
 
     fn close(self) -> Result<(), BackendError> {
@@ -1014,17 +1013,17 @@ impl BackendRead for RecordingRead {
 }
 
 impl BackendWrite for RecordingWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        self.fail_if_entries_match(&entries)?;
-        self.inner.put_many(entries)
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.fail_if_space_matches(space)?;
+        self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(keys)
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(range)
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range)
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
@@ -1039,14 +1038,10 @@ impl BackendWrite for RecordingWrite {
 }
 
 impl RecordingWrite {
-    fn fail_if_entries_match(&self, entries: &PutBatch) -> Result<(), BackendError> {
+    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), BackendError> {
         if let Some(namespace) = self.fail_write_namespace() {
-            if let Some(prefix) = namespace_prefix(&namespace) {
-                if entries
-                    .entries
-                    .iter()
-                    .any(|entry| key_has_space_prefix(&entry.key, &prefix))
-                {
+            if let Some(failing) = namespace_space(&namespace) {
+                if space == failing {
                     return Err(forced_write_failure(&namespace));
                 }
             }
@@ -1063,21 +1058,10 @@ impl RecordingWrite {
 }
 
 impl RecordingRead {
-    fn fail_if_keys_match(&self, keys: &[Key]) -> Result<(), BackendError> {
+    fn fail_if_space_matches(&self, space: SpaceId) -> Result<(), BackendError> {
         if let Some(namespace) = self.fail_read_namespace() {
-            if let Some(prefix) = namespace_prefix(&namespace) {
-                if keys.iter().any(|key| key_has_space_prefix(key, &prefix)) {
-                    return Err(forced_read_failure(&namespace));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn fail_if_range_matches(&self, range: &KeyRange) -> Result<(), BackendError> {
-        if let Some(namespace) = self.fail_read_namespace() {
-            if let Some(prefix) = namespace_prefix(&namespace) {
-                if range_may_include_space_prefix(range, &prefix) {
+            if let Some(failing) = namespace_space(&namespace) {
+                if space == failing {
                     return Err(forced_read_failure(&namespace));
                 }
             }
@@ -1093,31 +1077,13 @@ impl RecordingRead {
     }
 }
 
-fn namespace_prefix(namespace: &str) -> Option<[u8; 4]> {
+fn namespace_space(namespace: &str) -> Option<SpaceId> {
     match namespace {
-        "changelog.commit" => Some(0x0006_0001_u32.to_be_bytes()),
-        "changelog.change" => Some(0x0006_0002_u32.to_be_bytes()),
-        "changelog.commit_change_ref_chunk" => Some(0x0006_0003_u32.to_be_bytes()),
+        "changelog.commit" => Some(SpaceId(0x0006_0001)),
+        "changelog.change" => Some(SpaceId(0x0006_0002)),
+        "changelog.commit_change_ref_chunk" => Some(SpaceId(0x0006_0003)),
         _ => None,
     }
-}
-
-fn key_has_space_prefix(key: &Key, prefix: &[u8; 4]) -> bool {
-    key.0.starts_with(prefix)
-}
-
-fn range_may_include_space_prefix(range: &KeyRange, prefix: &[u8; 4]) -> bool {
-    let lower_allows = match &range.lower {
-        Bound::Unbounded => true,
-        Bound::Included(key) => key.0.as_ref() <= prefix.as_slice(),
-        Bound::Excluded(key) => key.0.as_ref() < prefix.as_slice(),
-    };
-    let upper_allows = match &range.upper {
-        Bound::Unbounded => true,
-        Bound::Included(key) => key.0.as_ref() >= prefix.as_slice(),
-        Bound::Excluded(key) => key.0.as_ref() > prefix.as_slice(),
-    };
-    lower_allows && upper_allows
 }
 
 fn forced_read_failure(namespace: &str) -> BackendError {

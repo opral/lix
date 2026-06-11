@@ -13,7 +13,12 @@ pub(crate) const JSON_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0002_0001), JSON_NAMESPACE);
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
 const STORED_JSON_HEADER_LEN: usize = STORED_JSON_MAGIC.len() + 1 + 8;
-const ZSTD_MIN_JSON_BYTES: usize = 16 * 1024;
+/// Compression floor. Payloads at or under the inline threshold never
+/// reach the store, so everything here is at least mid-size JSON, which
+/// compresses individually; the savings guard below keeps poor compressors
+/// raw. The historical 16 KiB floor predates inline payloads, when the
+/// store was dominated by ~127-byte rows that zstd inflates.
+const ZSTD_MIN_JSON_BYTES: usize = 512;
 const MIN_ZSTD_SAVINGS_BYTES: usize = 128;
 
 struct StoredJsonPayload<'a> {

@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
+/// Single space used by these fixtures; cross-space isolation is pinned
+/// by the baseline cross-space tests.
+const TEST_SPACE: SpaceId = SpaceId(7);
+
 use bytes::Bytes;
 
 use crate::backend::conformance::{
@@ -11,8 +15,8 @@ use crate::backend::conformance::{
 };
 use crate::backend::{
     Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, WriteOptions,
-    get_many as backend_get_many, visit_range as backend_visit_range,
+    ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, WriteOptions,
+    get_many as backend_get_many,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -58,12 +62,15 @@ where
             if rng.bool() {
                 let value = Bytes::from(format!("v{step}-{mutation_index}"));
                 write
-                    .put_many(put_batch([full_put(target_key.clone(), value.clone())]))
+                    .put_many(
+                        TEST_SPACE,
+                        put_batch([full_put(target_key.clone(), value.clone())]),
+                    )
                     .map_err(|error| format!("step {step}: put_many failed: {error}"))?;
                 staged.put(target_key, value);
             } else {
                 write
-                    .delete_many(std::slice::from_ref(&target_key))
+                    .delete_many(TEST_SPACE, std::slice::from_ref(&target_key))
                     .map_err(|error| format!("step {step}: delete_many failed: {error}"))?;
                 staged.delete(&target_key);
             }
@@ -119,7 +126,7 @@ where
         key("missing"),
         keys[rng.usize(keys.len())].clone(),
     ];
-    let result = backend_get_many(read, &point_keys, GetOptions::default())
+    let result = backend_get_many(read, TEST_SPACE, &point_keys, GetOptions::default())
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
     let actual = entries_to_map(&result.entries_for_requested_keys(&point_keys));
     let expected = point_keys
@@ -172,18 +179,16 @@ where
     R: BackendRead,
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = backend_visit_range(
-        read,
-        range,
-        opts,
-        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            entries.push(ReadEntry {
-                key: key.to_owned_key(),
-                value: value.to_owned(),
-            });
-            Ok(())
-        },
-    )?;
+    let result = read.scan(TEST_SPACE, range, opts, &mut |key: KeyRef<'_>,
+                                                           value: ProjectedValueRef<
+        '_,
+    >| {
+        entries.push(ReadEntry {
+            key: key.to_owned_key(),
+            value: value.to_owned(),
+        });
+        Ok(())
+    })?;
     Ok(ScanChunk {
         entries,
         has_more: result.has_more,

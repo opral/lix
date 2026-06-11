@@ -3,9 +3,13 @@ use crate::backend::conformance::{
     fixtures::{full_put, key, put_batch, space},
 };
 use crate::backend::{
-    Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions, WriteOptions,
+    Backend, BackendWrite, GetOptions, ProjectedValue, ReadOptions, SpaceId, WriteOptions,
     get_many as backend_get_many,
 };
+
+/// Single space used by these fixtures; cross-space isolation is pinned
+/// by the baseline cross-space tests.
+const TEST_SPACE: SpaceId = SpaceId(7);
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
@@ -39,10 +43,13 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(put_batch([
-                full_put(alpha.clone(), "persisted-alpha"),
-                full_put(beta.clone(), "persisted-beta"),
-            ]))
+            .put_many(
+                TEST_SPACE,
+                put_batch([
+                    full_put(alpha.clone(), "persisted-alpha"),
+                    full_put(beta.clone(), "persisted-beta"),
+                ]),
+            )
             .map_err(|error| format!("put_many failed: {error}"))?;
         write
             .commit()
@@ -74,10 +81,10 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(put_batch([full_put(
-                rolled_back.clone(),
-                "should-not-persist",
-            )]))
+            .put_many(
+                TEST_SPACE,
+                put_batch([full_put(rolled_back.clone(), "should-not-persist")]),
+            )
             .map_err(|error| format!("put_many failed: {error}"))?;
         write
             .rollback()
@@ -103,10 +110,13 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(put_batch([
-                full_put(overwritten.clone(), "old"),
-                full_put(deleted.clone(), "delete-me"),
-            ]))
+            .put_many(
+                TEST_SPACE,
+                put_batch([
+                    full_put(overwritten.clone(), "old"),
+                    full_put(deleted.clone(), "delete-me"),
+                ]),
+            )
             .map_err(|error| format!("initial put_many failed: {error}"))?;
         write
             .commit()
@@ -119,10 +129,13 @@ where
             .begin_write(WriteOptions::default())
             .map_err(|error| format!("begin_write failed: {error}"))?;
         write
-            .put_many(put_batch([full_put(overwritten.clone(), "new")]))
+            .put_many(
+                TEST_SPACE,
+                put_batch([full_put(overwritten.clone(), "new")]),
+            )
             .map_err(|error| format!("overwrite put_many failed: {error}"))?;
         write
-            .delete_many(std::slice::from_ref(&deleted))
+            .delete_many(TEST_SPACE, std::slice::from_ref(&deleted))
             .map_err(|error| format!("delete_many failed: {error}"))?;
         write
             .commit()
@@ -139,7 +152,7 @@ where
 
 fn assert_full_values<B>(
     backend: &B,
-    _test_space: crate::backend::SpaceId,
+    _test_space: SpaceId,
     expected: &[(crate::backend::Key, Option<&str>)],
 ) -> ConformanceResult
 where
@@ -152,7 +165,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, &keys, GetOptions::default())
+    let result = backend_get_many(&read, TEST_SPACE, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     for (index, (key, expected_value)) in expected.iter().enumerate() {

@@ -5,14 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use lix_engine::backend::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions, WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
+    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::{BackendFactory, BackendFixture, BackendTestConfig};
 use redb::{
-    Database, Range as RedbRange, ReadTransaction, ReadableDatabase, ReadableTable,
-    TableDefinition, WriteTransaction as RedbWriteTxn,
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+    WriteTransaction as RedbWriteTxn,
 };
 use tempfile::TempDir;
 
@@ -37,18 +37,6 @@ pub struct RedbBackend {
 
 pub struct RedbRead {
     read: ReadTransaction,
-}
-
-pub struct RedbRangeScan<'a> {
-    rows: RedbRange<'a, &'static [u8], &'static [u8]>,
-    projection: CoreProjection,
-    pending: Option<RedbPendingRow>,
-    done: bool,
-}
-
-struct RedbPendingRow {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
 }
 
 pub struct RedbWrite {
@@ -133,11 +121,39 @@ impl Backend for RedbBackend {
     }
 }
 
-impl BackendRead for RedbRead {
-    type RangeScan<'a> = RedbRangeScan<'a>;
+/// redb keeps its single-table layout; spaces are scoped by prefixing the
+/// 4-byte big-endian space id internally. Visitors observe logical keys.
+fn physical_key(space: SpaceId, key: &Key) -> Key {
+    let mut bytes = Vec::with_capacity(4 + key.0.len());
+    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&key.0);
+    Key(Bytes::from(bytes))
+}
 
+fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+    let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
+        Bound::Included(key) => Bound::Included(physical_key(space, &key)),
+        Bound::Excluded(key) => Bound::Excluded(physical_key(space, &key)),
+        Bound::Unbounded => unbounded,
+    };
+    KeyRange {
+        lower: map(
+            range.lower,
+            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+        ),
+        upper: map(
+            range.upper,
+            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+                Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+            }),
+        ),
+    }
+}
+
+impl BackendRead for RedbRead {
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -147,7 +163,9 @@ impl BackendRead for RedbRead {
     {
         let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
         for (index, key) in keys.iter().enumerate() {
-            let value = table.get(key.0.as_ref()).map_err(redb_error)?;
+            let value = table
+                .get(physical_key(space, key).0.as_ref())
+                .map_err(redb_error)?;
             visitor.visit(
                 index,
                 key,
@@ -159,56 +177,31 @@ impl BackendRead for RedbRead {
         Ok(())
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
-    {
-        let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
-        let (lower, upper) = encoded_bounds(range, opts.resume_after);
-        let lower = bound_as_slice(&lower);
-        let upper = bound_as_slice(&upper);
-        let rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
-        let mut cursor = RedbRangeScan {
-            rows,
-            projection: opts.projection,
-            pending: None,
-            done: opts.limit_rows == 0,
-        };
-        f(&mut cursor)
-    }
-}
-
-impl BackendRangeScan for RedbRangeScan<'_> {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
         visitor: &mut V,
     ) -> Result<ScanResult, BackendError>
     where
         V: ScanVisitor + ?Sized,
     {
-        if limit_rows == 0 || self.done {
+        if opts.limit_rows == 0 {
             return Ok(ScanResult {
                 emitted: 0,
-                has_more: !self.done,
+                has_more: false,
             });
         }
-
-        let mut emitted = 0;
-        while emitted < limit_rows {
-            if let Some(pending) = self.pending.take() {
-                visit_redb_pending_row(pending, self.projection, visitor)?;
-                emitted += 1;
-                continue;
-            }
-
-            let Some(row) = self.rows.next() else {
-                self.done = true;
+        let table = self.read.open_table(ENTRIES).map_err(redb_error)?;
+        let resume_after = opts.resume_after.map(|key| physical_key(space, key));
+        let (lower, upper) = encoded_bounds(physical_range(space, range), resume_after.as_ref());
+        let lower = bound_as_slice(&lower);
+        let upper = bound_as_slice(&upper);
+        let mut rows = table.range::<&[u8]>((lower, upper)).map_err(redb_error)?;
+        let mut emitted = 0usize;
+        while emitted < opts.limit_rows {
+            let Some(row) = rows.next() else {
                 return Ok(ScanResult {
                     emitted,
                     has_more: false,
@@ -216,92 +209,47 @@ impl BackendRangeScan for RedbRangeScan<'_> {
             };
             let (key, value) = row.map_err(redb_error)?;
             visitor.visit(
-                KeyRef(key.value()),
-                project_value_ref(value.value(), self.projection),
+                KeyRef(&key.value()[4..]),
+                project_value_ref(value.value(), opts.projection),
             )?;
             emitted += 1;
         }
-
-        let has_more = self.ensure_pending()?;
-        Ok(ScanResult { emitted, has_more })
-    }
-}
-
-impl RedbRangeScan<'_> {
-    fn ensure_pending(&mut self) -> Result<bool, BackendError> {
-        if self.pending.is_some() {
-            return Ok(true);
-        }
-        let Some(row) = self.rows.next() else {
-            self.done = true;
-            return Ok(false);
-        };
-        let (key, value) = row.map_err(redb_error)?;
-        let value = if matches!(self.projection, CoreProjection::FullValue) {
-            Some(value.value().to_vec())
-        } else {
-            None
-        };
-        self.pending = Some(RedbPendingRow {
-            key: key.value().to_vec(),
-            value,
-        });
-        Ok(true)
-    }
-}
-
-fn visit_redb_pending_row<V>(
-    row: RedbPendingRow,
-    projection: CoreProjection,
-    visitor: &mut V,
-) -> Result<(), BackendError>
-where
-    V: ScanVisitor + ?Sized,
-{
-    match projection {
-        CoreProjection::KeyOnly => {
-            visitor.visit(KeyRef(row.key.as_slice()), ProjectedValueRef::KeyOnly)
-        }
-        CoreProjection::FullValue => {
-            let value = row
-                .value
-                .as_deref()
-                .ok_or_else(|| BackendError::Io("redb pending row missing value".to_string()))?;
-            visitor.visit(
-                KeyRef(row.key.as_slice()),
-                ProjectedValueRef::FullValue(value),
-            )
-        }
+        Ok(ScanResult {
+            emitted,
+            has_more: rows.next().is_some(),
+        })
     }
 }
 
 impl BackendWrite for RedbWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         let mut table = self.write.open_table(ENTRIES).map_err(redb_error)?;
         for entry in entries.entries {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
             table
-                .insert(entry.key.0.as_ref(), value.as_ref())
+                .insert(physical_key(space, &entry.key).0.as_ref(), value.as_ref())
                 .map_err(redb_error)?;
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         let mut table = self.write.open_table(ENTRIES).map_err(redb_error)?;
         for key in keys {
-            table.remove(key.0.as_ref()).map_err(redb_error)?;
+            table
+                .remove(physical_key(space, key).0.as_ref())
+                .map_err(redb_error)?;
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
         Ok(())
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
-        let (lower, upper) = encoded_bounds(range, None);
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        let (lower, upper) = encoded_bounds(physical_range(space, range), None);
         let lower = bound_as_slice(&lower);
         let upper = bound_as_slice(&upper);
         let mut table = self.write.open_table(ENTRIES).map_err(redb_error)?;

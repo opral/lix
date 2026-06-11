@@ -1,11 +1,8 @@
 use crate::backend::{
     BackendError, BackendRead, CoreProjection, Key, KeyRange, KeyRef, Prefix, ProjectedValueRef,
     ReadEntry, ScanChunk, ScanOptions, ScanResult, ScanVisitor, SpaceId,
-    visit_range as backend_visit_range,
 };
-use crate::storage::{
-    StorageRead, StorageReadResult, StorageReadStats, StorageSpace, decode_logical_key_ref,
-};
+use crate::storage::{StorageRead, StorageReadResult, StorageReadStats, StorageSpace};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanBuffer {
@@ -40,14 +37,6 @@ impl ScanBuffer {
 pub struct ScanChunkRef<'a> {
     pub entries: &'a [ReadEntry],
     pub has_more: bool,
-}
-
-#[expect(missing_debug_implementations)]
-pub struct ScanCursor<'a, C> {
-    inner: &'a mut C,
-    kind: ScanKind,
-    projection: CoreProjection,
-    chunks_seen: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,83 +150,6 @@ impl ScanPlan {
             }),
         }
     }
-
-    pub fn cursor<R, T, F>(&self, read: &R, opts: ScanOptions<'_>, f: F) -> Result<T, BackendError>
-    where
-        R: StorageRead + ?Sized,
-        F: FnOnce(
-            &mut ScanCursor<'_, <R::BackendRead as BackendRead>::RangeScan<'_>>,
-        ) -> Result<T, BackendError>,
-    {
-        match &self.kind {
-            ScanPlanKind::Range(range) => read.with_backend(|backend_read| {
-                with_range_scan(backend_read, self.space.id, range.clone(), opts, f)
-            }),
-            ScanPlanKind::Prefix(prefix) => read.with_backend(|backend_read| {
-                with_prefix_scan(backend_read, self.space.id, prefix.clone(), opts, f)
-            }),
-        }
-    }
-}
-
-impl<C> ScanCursor<'_, C>
-where
-    C: crate::backend::BackendRangeScan,
-{
-    pub fn visit_next(
-        &mut self,
-        limit_rows: usize,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
-        Ok(self.visit_next_with_stats(limit_rows, visitor)?.value)
-    }
-
-    pub fn visit_next_with_stats<V>(
-        &mut self,
-        limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<StorageReadResult<ScanResult>, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        struct LogicalScanVisitor<'a, V: ?Sized> {
-            inner: &'a mut V,
-        }
-
-        impl<V> ScanVisitor for LogicalScanVisitor<'_, V>
-        where
-            V: ScanVisitor + ?Sized,
-        {
-            fn visit(
-                &mut self,
-                key: KeyRef<'_>,
-                value: ProjectedValueRef<'_>,
-            ) -> Result<(), BackendError> {
-                self.inner.visit(decode_logical_key_ref(key)?, value)
-            }
-        }
-
-        let result = self
-            .inner
-            .visit_next(limit_rows, &mut LogicalScanVisitor { inner: visitor })?;
-        let mut stats = scan_trace_stats(
-            self.kind,
-            ScanOptions {
-                projection: self.projection,
-                limit_rows,
-                resume_after: None,
-            },
-            result.emitted as u64,
-            result.has_more,
-            u64::from(limit_rows != 0),
-        );
-        stats.scan_resume_after = u64::from(self.chunks_seen > 0);
-        if matches!(self.kind, ScanKind::Prefix) {
-            stats.prefix_lowered = u64::from(self.chunks_seen == 0);
-        }
-        self.chunks_seen += u64::from(result.emitted > 0 || result.has_more);
-        Ok(StorageReadResult::new(result, stats))
-    }
 }
 
 pub(crate) fn scan_prefix<R>(
@@ -250,52 +162,6 @@ where
     R: BackendRead,
 {
     Ok(scan_prefix_with_stats(read, space, prefix, opts)?.value)
-}
-
-pub(crate) fn with_range_scan<R, T, F>(
-    read: &R,
-    space: SpaceId,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-    f: F,
-) -> Result<T, BackendError>
-where
-    R: BackendRead,
-    F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
-{
-    let storage_space = StorageSpace::new(space, "storage.scan");
-    let resume_after = opts.resume_after;
-    let physical_range = storage_space.encode_range(range, resume_after);
-    let physical_opts = ScanOptions {
-        resume_after: None,
-        ..opts
-    };
-    read.with_range_scan(physical_range, physical_opts, |backend_cursor| {
-        let mut cursor = ScanCursor {
-            inner: backend_cursor,
-            kind: ScanKind::Range,
-            projection: opts.projection,
-            chunks_seen: 0,
-        };
-        f(&mut cursor)
-    })
-}
-
-pub(crate) fn with_prefix_scan<R, T, F>(
-    read: &R,
-    space: SpaceId,
-    prefix: Prefix,
-    opts: ScanOptions<'_>,
-    f: F,
-) -> Result<T, BackendError>
-where
-    R: BackendRead,
-    F: FnOnce(&mut ScanCursor<'_, R::RangeScan<'_>>) -> Result<T, BackendError>,
-{
-    with_range_scan(read, space, prefix.to_range()?, opts, |cursor| {
-        cursor.kind = ScanKind::Prefix;
-        f(cursor)
-    })
 }
 
 pub(crate) fn scan_range<R>(
@@ -344,20 +210,11 @@ where
             .reserve(opts.limit_rows - buffer.entries.capacity());
     }
 
-    let storage_space = StorageSpace::new(space, "storage.scan");
-    let resume_after = opts.resume_after;
-    let physical_range = storage_space.encode_range(range, resume_after);
-    let physical_opts = ScanOptions {
-        resume_after: None,
-        ..opts
-    };
-
-    let result = backend_visit_range(
-        read,
-        physical_range,
-        physical_opts,
+    let result = read.scan(
+        space,
+        range,
+        opts,
         &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            let key = decode_logical_key_ref(key)?;
             buffer.entries.push(ReadEntry {
                 key: key.to_owned_key(),
                 value: value.to_owned(),
@@ -404,39 +261,7 @@ where
         ));
     }
 
-    let storage_space = StorageSpace::new(space, "storage.scan");
-    let resume_after = opts.resume_after;
-    let physical_range = storage_space.encode_range(range, resume_after);
-    let physical_opts = ScanOptions {
-        resume_after: None,
-        ..opts
-    };
-
-    #[expect(clippy::items_after_statements)]
-    struct LogicalScanVisitor<'a, V: ?Sized> {
-        inner: &'a mut V,
-    }
-
-    #[expect(clippy::items_after_statements)]
-    impl<V> ScanVisitor for LogicalScanVisitor<'_, V>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        fn visit(
-            &mut self,
-            key: KeyRef<'_>,
-            value: ProjectedValueRef<'_>,
-        ) -> Result<(), BackendError> {
-            self.inner.visit(decode_logical_key_ref(key)?, value)
-        }
-    }
-
-    let result = backend_visit_range(
-        read,
-        physical_range,
-        physical_opts,
-        &mut LogicalScanVisitor { inner: visitor },
-    )?;
+    let result = read.scan(space, range, opts, visitor)?;
     let stats = scan_trace_stats(
         ScanKind::Range,
         opts,
@@ -579,9 +404,9 @@ mod tests {
 
     use super::scan_prefix;
     use crate::backend::{
-        BackendError, BackendRangeScan, BackendRead, BufferedRangeScan, GetOptions,
-        InMemoryBackend, Key, KeyRange, PointVisitor, Prefix, ProjectedValueRef, ReadOptions,
-        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
+        BackendError, BackendRead, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor,
+        Prefix, ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+        StoredValue, WriteOptions,
     };
     use crate::storage::{ScanPlan, StorageContext, StorageSpace};
 
@@ -654,8 +479,8 @@ mod tests {
         assert_eq!(
             read.take_range(),
             KeyRange {
-                lower: Bound::Included(space(1).encode_key(&Key(Bytes::new()))),
-                upper: Bound::Excluded(space(2).encode_key(&Key(Bytes::new()))),
+                lower: Bound::Included(Key(Bytes::new())),
+                upper: Bound::Unbounded,
             }
         );
     }
@@ -677,8 +502,8 @@ mod tests {
         assert_eq!(
             read.take_range(),
             KeyRange {
-                lower: Bound::Included(space(1).encode_key(&key_bytes(&[0xff]))),
-                upper: Bound::Excluded(space(2).encode_key(&Key(Bytes::new()))),
+                lower: Bound::Included(key_bytes(&[0xff])),
+                upper: Bound::Unbounded,
             }
         );
     }
@@ -700,8 +525,8 @@ mod tests {
         assert_eq!(
             read.take_range(),
             KeyRange {
-                lower: Bound::Included(space(1).encode_key(&key_bytes(&[0x00, 0xff]))),
-                upper: Bound::Excluded(space(1).encode_key(&key_bytes(&[0x01]))),
+                lower: Bound::Included(key_bytes(&[0x00, 0xff])),
+                upper: Bound::Excluded(key_bytes(&[0x01])),
             }
         );
     }
@@ -721,10 +546,9 @@ mod tests {
     }
 
     impl BackendRead for CapturingRead {
-        type RangeScan<'a> = BufferedRangeScan;
-
         fn visit_keys<V>(
             &self,
+            _space: SpaceId,
             _keys: &[Key],
             _opts: GetOptions<'_>,
             _visitor: &mut V,
@@ -735,18 +559,18 @@ mod tests {
             unimplemented!("not used by prefix lowering tests")
         }
 
-        fn with_range_scan<T, F>(
+        fn scan<V>(
             &self,
+            _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            f: F,
-        ) -> Result<T, BackendError>
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
         where
-            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+            V: ScanVisitor + ?Sized,
         {
             self.range.replace(Some(range));
-            let mut cursor = BufferedRangeScan::default();
-            f(&mut cursor)
+            Ok(ScanResult::default())
         }
     }
 }

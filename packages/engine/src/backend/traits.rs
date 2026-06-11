@@ -1,8 +1,17 @@
 use crate::backend::{
     BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange, KeyRef, ProjectedValue,
-    ProjectedValueRef, PutBatch, ReadEntry, ReadOptions, ScanOptions, ScanResult, WriteOptions,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, SpaceId, WriteOptions,
 };
 
+/// An ordered byte-key entry backend with coherent read views, batched point
+/// access, space-scoped scans, and atomic batched writes.
+///
+/// Storage is organized into spaces: engine-defined namespaces identified by
+/// [`SpaceId`]. Every operation addresses exactly one space, keys are logical
+/// bytes scoped to that space, and spaces are physically independent (a
+/// backend may store them as separate tables, trees, or column families).
+/// Spaces come into existence on first write; reading a space that was never
+/// written behaves as empty.
 pub trait Backend {
     type Read<'a>: BackendRead + 'a
     where
@@ -28,10 +37,13 @@ pub trait Backend {
 }
 
 pub trait BackendRead {
-    type RangeScan<'cursor>: BackendRangeScan;
-
+    /// Visits the requested keys of one space, calling the visitor with each
+    /// key's position in `keys`. Visit order is unspecified; consumers must
+    /// address results by the visited index, which lets backends return
+    /// rows in whatever order their storage produces them.
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -39,14 +51,23 @@ pub trait BackendRead {
     where
         V: PointVisitor + ?Sized;
 
-    fn with_range_scan<T, F>(
+    /// Streams up to `opts.limit_rows` rows of one space in ascending key
+    /// order to the visitor and reports whether more rows remain. The
+    /// visitor observes logical keys.
+    ///
+    /// `opts.resume_after` is exclusive and must not widen the range: the
+    /// effective lower bound is the maximum of `range.lower` and
+    /// `Excluded(resume_after)`. `limit_rows == 0` emits nothing and
+    /// reports `has_more: false`.
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
     where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>;
+        V: ScanVisitor + ?Sized;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -60,56 +81,26 @@ pub trait ScanVisitor {
     fn visit(&mut self, key: KeyRef<'_>, value: ProjectedValueRef<'_>) -> Result<(), BackendError>;
 }
 
-pub trait BackendRangeScan {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized;
-}
+pub trait BackendWrite {
+    /// Applies one batch of upserts to one space.
+    ///
+    /// Batches hold at most one mutation per key. Engine write-set lowering
+    /// produces batches sorted ascending by key; other callers may pass
+    /// unsorted batches.
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError>;
 
-#[derive(Clone, Debug, Default)]
-pub struct BufferedRangeScan {
-    rows: Vec<ReadEntry>,
-    position: usize,
-}
+    /// Deletes the given keys of one space. Batches hold at most one
+    /// mutation per key; engine write-set lowering produces sorted keys.
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError>;
 
-impl BufferedRangeScan {
-    pub fn new(rows: Vec<ReadEntry>) -> Self {
-        Self { rows, position: 0 }
-    }
-}
+    /// Deletes every key of one space within the range. An unbounded range
+    /// clears the whole space; backends may fast-path that case (for
+    /// example by truncating the space's table).
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError>;
 
-impl BackendRangeScan for BufferedRangeScan {
-    fn visit_next<V>(
-        &mut self,
-        limit_rows: usize,
-        visitor: &mut V,
-    ) -> Result<ScanResult, BackendError>
-    where
-        V: ScanVisitor + ?Sized,
-    {
-        if limit_rows == 0 {
-            return Ok(ScanResult::default());
-        }
+    fn commit(self) -> Result<CommitResult, BackendError>;
 
-        let mut emitted = 0usize;
-        while emitted < limit_rows {
-            let Some(entry) = self.rows.get(self.position) else {
-                break;
-            };
-            visitor.visit(entry.key.as_ref(), entry.value.as_ref())?;
-            self.position += 1;
-            emitted += 1;
-        }
-
-        Ok(ScanResult {
-            emitted,
-            has_more: self.position < self.rows.len(),
-        })
-    }
+    fn rollback(self) -> Result<(), BackendError>;
 }
 
 pub trait PointVisitor {
@@ -123,6 +114,7 @@ pub trait PointVisitor {
 
 pub fn get_many<R>(
     read: &R,
+    space: SpaceId,
     keys: &[Key],
     opts: GetOptions<'_>,
 ) -> Result<GetManyResult, BackendError>
@@ -149,6 +141,7 @@ where
 
     let mut values = vec![None::<ProjectedValue>; keys.len()];
     read.visit_keys(
+        space,
         keys,
         opts,
         &mut MaterializingPointVisitor {
@@ -156,19 +149,6 @@ where
         },
     )?;
     Ok(GetManyResult::new(values))
-}
-
-pub fn visit_range<R>(
-    read: &R,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-    visitor: &mut dyn ScanVisitor,
-) -> Result<ScanResult, BackendError>
-where
-    R: BackendRead,
-{
-    let limit_rows = opts.limit_rows;
-    read.with_range_scan(range, opts, |cursor| cursor.visit_next(limit_rows, visitor))
 }
 
 impl<F> ScanVisitor for F
@@ -192,20 +172,4 @@ where
     ) -> Result<(), BackendError> {
         self(index, key, value)
     }
-}
-
-pub trait BackendWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError>;
-
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError>;
-
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError>;
-
-    fn commit(self) -> Result<CommitResult, BackendError>
-    where
-        Self: Sized;
-
-    fn rollback(self) -> Result<(), BackendError>
-    where
-        Self: Sized;
 }

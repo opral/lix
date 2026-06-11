@@ -1,7 +1,7 @@
 use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
+use crate::json_store::{JsonRef, JsonSlot};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -353,13 +353,6 @@ pub(crate) struct CommitChangeRefChunkView<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExpandedCommitChangeRefChunkView<'a> {
-    pub(crate) format_version: u32,
-    pub(crate) commit_id: CommitId,
-    pub(crate) entries: Vec<CommitChangeRefView<'a>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitChangeRef {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -367,12 +360,17 @@ pub(crate) struct CommitChangeRef {
     pub(crate) change_id: ChangeId,
 }
 
+/// Stored ref entry. Entries within a chunk are sorted by
+/// (schema_key, file_id, entity_pk), so consecutive encoded entity pks share
+/// long prefixes; the pk is stored front-coded against the previous entry's
+/// encoded pk bytes.
 #[derive(musli::Encode)]
 #[musli(packed)]
 pub(crate) struct CommitChangeRefEntryRef<'a> {
     pub(crate) schema_index: u16,
     pub(crate) file_index: u16,
-    pub(crate) entity_pk: &'a [String],
+    pub(crate) pk_shared: u32,
+    pub(crate) pk_suffix: &'a [u8],
     pub(crate) change_id: ChangeId,
 }
 
@@ -381,15 +379,8 @@ pub(crate) struct CommitChangeRefEntryRef<'a> {
 pub(crate) struct CommitChangeRefEntryView<'a> {
     pub(crate) schema_index: u16,
     pub(crate) file_index: u16,
-    pub(crate) entity_pk: Vec<&'a str>,
-    pub(crate) change_id: ChangeId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitChangeRefView<'a> {
-    pub(crate) schema_key: &'a str,
-    pub(crate) file_id: Option<&'a str>,
-    pub(crate) entity_pk: EntityPkRef<'a>,
+    pub(crate) pk_shared: u32,
+    pub(crate) pk_suffix: &'a [u8],
     pub(crate) change_id: ChangeId,
 }
 
@@ -439,19 +430,18 @@ pub(crate) enum CommitLoadEntry {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-#[musli(packed)]
+/// In-memory change record. The stored form (`ChangeRecordRef` /
+/// `ChangeRecordView`) omits `change_id`: it is the storage key and gets
+/// reconstructed on decode.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChangeRecord {
     pub(crate) format_version: u32,
     pub(crate) change_id: ChangeId,
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
-    #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<String>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) snapshot: JsonSlot,
+    pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -459,15 +449,14 @@ pub(crate) struct ChangeRecord {
 #[musli(packed)]
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
-    pub(crate) change_id: ChangeId,
     pub(crate) schema_key: &'a str,
     pub(crate) entity_pk: &'a [String],
     #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<&'a JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    #[musli(with = crate::json_store::json_slot_storage_ref)]
+    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = crate::json_store::json_slot_storage_ref)]
+    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -475,16 +464,15 @@ pub(crate) struct ChangeRecordRef<'a> {
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
-    pub(crate) change_id: ChangeId,
     pub(crate) schema_key: &'a str,
     #[musli(with = entity_pk_ref_storage)]
     pub(crate) entity_pk: EntityPkRef<'a>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<JsonRef>,
+    #[musli(with = crate::json_store::json_slot_storage)]
+    pub(crate) snapshot: JsonSlot,
+    #[musli(with = crate::json_store::json_slot_storage)]
+    pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -558,4 +546,17 @@ pub(crate) struct GcPlan {
     pub(crate) live: GcLiveSet,
     pub(crate) sweep: GcSweepSet,
     pub(crate) repair: GcRepairSet,
+}
+
+/// Canonical `lix_commit` row snapshot. Byte-identity across every producer
+/// (staging, rebuild, graph materialization, row materialization) is
+/// load-bearing: content-addressed roots and deterministic inline slots
+/// both depend on it, so all paths must call this one function.
+pub(crate) fn commit_row_snapshot_json(commit_id: &str) -> Result<String, LixError> {
+    serde_json::to_string(&serde_json::json!({ "id": commit_id })).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("commit row snapshot serialization failed: {error}"),
+        )
+    })
 }

@@ -14,7 +14,7 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionContext;
-use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::prepare_branch_ref_row;
@@ -164,6 +164,7 @@ fn json_payloads_from_state_row(
     row.snapshot
         .iter()
         .chain(row.metadata.iter())
+        .filter(|json| !json.is_inline())
         .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized.as_ref(), json.json_ref))
 }
 
@@ -291,7 +292,6 @@ async fn stage_changelog_commits(
 
     let mut writer = ChangelogContext::new().writer(read, writes);
     writer.stage_append(append).await?;
-    stage_commit_row_json_payloads(writes, commit_rows)?;
     Ok(staged)
 }
 
@@ -308,39 +308,19 @@ fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, 
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: row.snapshot.as_ref().map(|snapshot| snapshot.json_ref),
-        metadata_ref: row.metadata.as_ref().map(|metadata| metadata.json_ref),
+        snapshot: row
+            .snapshot
+            .as_ref()
+            .map_or(crate::json_store::JsonSlot::None, |snapshot| {
+                snapshot.slot()
+            }),
+        metadata: row
+            .metadata
+            .as_ref()
+            .map_or(crate::json_store::JsonSlot::None, |metadata| {
+                metadata.slot()
+            }),
         created_at: row.updated_at,
-    })
-}
-
-fn stage_commit_row_json_payloads(
-    writes: &mut StorageWriteSet,
-    commit_rows: &[FinalizedCommitRow],
-) -> Result<(), LixError> {
-    let snapshots = commit_rows
-        .iter()
-        .map(|row| commit_row_snapshot_content(&row.commit_id))
-        .collect::<Result<Vec<_>, _>>()?;
-    JsonStoreContext::new().writer().stage_batch(
-        writes,
-        JsonWritePlacementRef::OutOfBand,
-        snapshots
-            .iter()
-            .map(|snapshot| NormalizedJsonRef::new(snapshot.as_str())),
-    )?;
-    Ok(())
-}
-
-fn commit_row_snapshot_content(commit_id: &CommitId) -> Result<String, LixError> {
-    serde_json::to_string(&serde_json::json!({
-        "id": commit_id.to_string(),
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode lix_commit snapshot: {error}"),
-        )
     })
 }
 
@@ -388,8 +368,6 @@ fn tracked_delta_from_state_row(
         entity_pk: &row.entity_pk,
         change_id,
         commit_id,
-        snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
-        metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
         deleted: row.snapshot.is_none(),
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -406,8 +384,6 @@ fn tracked_delta_from_selected_change_ref(
         entity_pk: &change_ref.entity_pk,
         change_id: change_ref.change_id,
         commit_id,
-        snapshot_ref: change_ref.snapshot_ref.as_ref(),
-        metadata_ref: change_ref.metadata_ref.as_ref(),
         deleted: change_ref.deleted,
         created_at: change_ref.created_at,
         updated_at: change_ref.updated_at,
@@ -449,8 +425,6 @@ async fn stage_tracked_roots(
                 ),
             ));
         }
-        let commit_snapshot = commit_row_snapshot_content(&root.commit_id)?;
-        let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
         let commit_entity_pk = EntityPk::single(root.commit_id.to_string());
         let mut deltas = state_row_indices
             .iter()
@@ -465,8 +439,6 @@ async fn stage_tracked_roots(
             entity_pk: &commit_entity_pk,
             change_id: staged.commit_change_id,
             commit_id: root.commit_id,
-            snapshot_ref: Some(&commit_snapshot_ref),
-            metadata_ref: None,
             deleted: false,
             created_at: staged.commit_created_at,
             updated_at: staged.commit_created_at,
@@ -735,7 +707,9 @@ mod tests {
     use super::*;
     use crate::GLOBAL_BRANCH_ID;
     use crate::NullableKeyFilter;
-    use crate::backend::{Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch};
+    use crate::backend::{
+        Backend, BackendError, BackendWrite, CommitResult, KeyRange, PutBatch, SpaceId,
+    };
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
@@ -1612,16 +1586,16 @@ mod tests {
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-            self.inner.put_many(entries)
+        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+            self.inner.put_many(space, entries)
         }
 
-        fn delete_many(&mut self, keys: &[StorageKey]) -> Result<(), BackendError> {
-            self.inner.delete_many(keys)
+        fn delete_many(&mut self, space: SpaceId, keys: &[StorageKey]) -> Result<(), BackendError> {
+            self.inner.delete_many(space, keys)
         }
 
-        fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
-            self.inner.delete_range(range)
+        fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+            self.inner.delete_range(space, range)
         }
 
         fn commit(self) -> Result<CommitResult, BackendError> {

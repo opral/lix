@@ -70,6 +70,16 @@ impl CatalogSnapshot {
         Self::from_entries(entries)
     }
 
+    /// Rebuilds an owned snapshot with the same entries.
+    ///
+    /// Compiled plans are not clonable, so a transaction that needs a private
+    /// mutable catalog recompiles from the recorded entries. Entry order is
+    /// preserved, so `SchemaPlanId`s issued by the source snapshot remain
+    /// valid against the rebuilt one.
+    pub(crate) fn rebuild_owned(&self) -> Result<Self, LixError> {
+        Self::from_entries(self.entries.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn fingerprint(&self) -> &CatalogFingerprint {
         &self.fingerprint
@@ -208,15 +218,12 @@ impl CatalogSnapshot {
         let mut entries = self.entries.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.identity.cmp(&right.identity));
         for entry in entries {
-            hash_fingerprint_part(&mut hasher, &entry.identity.fingerprint_component());
-            hash_fingerprint_part(&mut hasher, &entry.key.schema_key);
-            let canonical_schema = canonical_json_text(&entry.schema).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!("failed to canonicalize schema for catalog fingerprint: {error}"),
-                )
-            })?;
-            hash_fingerprint_part(&mut hasher, &canonical_schema);
+            hash_catalog_fact(
+                &mut hasher,
+                &entry.identity,
+                &entry.key.schema_key,
+                &entry.schema,
+            )?;
         }
         Ok(CatalogFingerprint(hasher.finalize().to_hex().to_string()))
     }
@@ -263,9 +270,91 @@ impl CatalogSnapshot {
     }
 }
 
-fn hash_fingerprint_part(hasher: &mut blake3::Hasher, value: &str) {
+pub(super) fn hash_fingerprint_part(hasher: &mut blake3::Hasher, value: &str) {
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
+}
+
+/// Hashes one catalog fact as three length-prefixed parts.
+///
+/// `CatalogSnapshot::compute_fingerprint` and `fingerprint_schema_facts` must
+/// hash the identical part stream: the facts fingerprint keys the compiled
+/// snapshot cache, so any drift between the two would silently split or merge
+/// cache entries. The schema key is hashed as its own part even though the
+/// identity component embeds it; the standalone part keeps the stream
+/// injective regardless of separator characters inside identity fields.
+fn hash_catalog_fact(
+    hasher: &mut blake3::Hasher,
+    identity: &DomainSchemaIdentity,
+    schema_key: &str,
+    schema: &JsonValue,
+) -> Result<(), LixError> {
+    hash_fingerprint_part(hasher, &identity.fingerprint_component());
+    hash_fingerprint_part(hasher, schema_key);
+    let canonical_schema = canonical_json_text(schema).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("failed to canonicalize schema for catalog fingerprint: {error}"),
+        )
+    })?;
+    hash_fingerprint_part(hasher, &canonical_schema);
+    Ok(())
+}
+
+/// Content fingerprint of raw schema facts, before any snapshot is built.
+///
+/// Identical fact sets always produce the same fingerprint, so it can key a
+/// cache of compiled snapshots without an invalidation protocol.
+pub(crate) fn fingerprint_schema_facts(
+    facts: &[SchemaCatalogFact],
+) -> Result<CatalogFingerprint, LixError> {
+    let mut hasher = blake3::Hasher::new();
+    let mut facts = facts.iter().collect::<Vec<_>>();
+    facts.sort_by(|left, right| left.identity.cmp(&right.identity));
+    for fact in facts {
+        hash_catalog_fact(
+            &mut hasher,
+            &fact.identity,
+            &fact.catalog_key.schema_key,
+            &fact.schema,
+        )?;
+    }
+    Ok(CatalogFingerprint(hasher.finalize().to_hex().to_string()))
+}
+
+/// Copy-on-write catalog handle for one transaction schema scope.
+///
+/// Transactions normally share an immutable compiled snapshot from the
+/// engine-wide cache. Registering a schema inside the transaction switches the
+/// handle to a private rebuilt snapshot, so pending registrations are never
+/// observable outside the transaction that staged them.
+pub(crate) enum TransactionCatalog {
+    Shared(Arc<CatalogSnapshot>),
+    Owned(CatalogSnapshot),
+}
+
+impl TransactionCatalog {
+    pub(crate) fn snapshot(&self) -> &CatalogSnapshot {
+        match self {
+            Self::Shared(snapshot) => snapshot,
+            Self::Owned(snapshot) => snapshot,
+        }
+    }
+
+    pub(crate) fn insert_schema_for_domain(
+        &mut self,
+        domain: Domain,
+        key: SchemaKey,
+        schema: JsonValue,
+    ) -> Result<SchemaPlanId, LixError> {
+        if let Self::Shared(snapshot) = self {
+            *self = Self::Owned(snapshot.rebuild_owned()?);
+        }
+        let Self::Owned(snapshot) = self else {
+            unreachable!("transaction catalog is owned after copy-on-write");
+        };
+        snapshot.insert_schema_for_domain(domain, key, schema)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -965,6 +1054,71 @@ mod tests {
         assert!(
             !catalog.contains("bad_child_schema"),
             "failed catalog insert must not publish a partially bound schema"
+        );
+    }
+
+    #[test]
+    fn facts_fingerprint_matches_built_snapshot_fingerprint() {
+        let facts = vec![
+            SchemaCatalogFact::new(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("parent_schema"),
+                schema_json("parent_schema"),
+            ),
+            SchemaCatalogFact::new(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("child_schema"),
+                child_schema_json("child_schema", "parent_schema"),
+            ),
+        ];
+
+        let facts_fingerprint =
+            fingerprint_schema_facts(&facts).expect("facts fingerprint should hash");
+        let snapshot = CatalogSnapshot::from_schema_facts(&facts).expect("catalog should bind");
+
+        assert_eq!(
+            &facts_fingerprint,
+            snapshot.fingerprint(),
+            "cache key and snapshot fingerprint must use the same hashing scheme"
+        );
+    }
+
+    #[test]
+    fn transaction_catalog_copy_on_write_isolates_shared_snapshot() {
+        let shared = Arc::new(
+            CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("base_schema"),
+                schema_json("base_schema"),
+            )])
+            .expect("base catalog should bind"),
+        );
+        let (base_plan_id, _) = shared
+            .plan_for_key("base_schema")
+            .expect("base schema plan should exist");
+        let mut handle = TransactionCatalog::Shared(Arc::clone(&shared));
+
+        handle
+            .insert_schema_for_domain(
+                Domain::schema_catalog("main", false),
+                SchemaKey::new("registered_schema"),
+                schema_json("registered_schema"),
+            )
+            .expect("registration should rebuild an owned catalog");
+
+        assert!(matches!(handle, TransactionCatalog::Owned(_)));
+        assert!(handle.snapshot().contains("registered_schema"));
+        assert!(
+            !shared.contains("registered_schema"),
+            "pending registrations must not mutate the shared snapshot"
+        );
+        let (rebuilt_plan_id, _) = handle
+            .snapshot()
+            .plan_for_key("base_schema")
+            .expect("base schema plan should survive the rebuild");
+        assert_eq!(
+            base_plan_id, rebuilt_plan_id,
+            "plan ids issued by the shared snapshot must stay valid after copy-on-write"
         );
     }
 

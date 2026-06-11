@@ -1,6 +1,6 @@
 use crate::changelog::ChangeRecord;
 use crate::entity_pk::EntityPk;
-use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
+use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
 use crate::storage::StorageRead;
 use crate::{LixError, parse_row_metadata};
 
@@ -45,8 +45,8 @@ where
             entity_pk: change.entity_pk,
             schema_key: change.schema_key,
             file_id: change.file_id,
-            snapshot_ref: change.snapshot_ref,
-            metadata_ref: change.metadata_ref,
+            snapshot: change.snapshot,
+            metadata: change.metadata,
             created_at: change.created_at,
         },
     )
@@ -60,18 +60,9 @@ pub(crate) async fn materialize_commit_graph_change<S>(
 where
     S: StorageRead,
 {
-    let snapshot_content = load_optional_changelog_json_text(
-        json_reader,
-        change.snapshot_ref.as_ref(),
-        "snapshot_ref",
-    )
-    .await?;
-    let metadata = match load_optional_changelog_json_text(
-        json_reader,
-        change.metadata_ref.as_ref(),
-        "metadata_ref",
-    )
-    .await?
+    let snapshot_content =
+        load_changelog_json_slot(json_reader, &change.snapshot, "snapshot").await?;
+    let metadata = match load_changelog_json_slot(json_reader, &change.metadata, "metadata").await?
     {
         Some(value) => Some(parse_row_metadata(&value, "changelog change metadata_ref")?),
         None => None,
@@ -87,16 +78,18 @@ where
     })
 }
 
-async fn load_optional_changelog_json_text<S>(
+async fn load_changelog_json_slot<S>(
     json_reader: &mut JsonStoreReader<S>,
-    json_ref: Option<&JsonRef>,
+    slot: &crate::json_store::JsonSlot,
     field: &str,
 ) -> Result<Option<String>, LixError>
 where
     S: StorageRead,
 {
-    let Some(json_ref) = json_ref else {
-        return Ok(None);
+    let json_ref = match slot {
+        crate::json_store::JsonSlot::None => return Ok(None),
+        crate::json_store::JsonSlot::Inline(json) => return Ok(Some(json.to_string())),
+        crate::json_store::JsonSlot::Ref(json_ref) => json_ref,
     };
     let batch = json_reader
         .load_bytes_many(JsonLoadRequestRef {

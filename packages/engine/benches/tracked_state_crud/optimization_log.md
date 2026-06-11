@@ -728,3 +728,1085 @@ SQLite transaction insert run immediately before this full smoke measured
 13.18 ms and Criterion reported an 8.8% improvement; the full smoke's SQLite
 transaction insert sample landed at 13.66 ms and Criterion reported no
 significant change.
+
+## Baseline Re-run Before New Optimization Pass: 2026-06-09
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+```
+
+Notes:
+
+- Fresh baseline on branch `fable-5-optimization` (HEAD `e554c557`) before a
+  new round of optimization and bug squashing. No code changes in this entry.
+- The harness has changed since the last log entry: SQL session benches now
+  run on the real `lix_sqlite`, `lix_rocksdb`, and `lix_redb` backends instead
+  of a single in-memory backend, so SQL session numbers are not directly
+  comparable to earlier entries.
+- The accounting report now also emits per-backend rows; logical write counts
+  and layout footprint were identical across SQLite, RocksDB, and redb.
+- Criterion: 10 samples, 250 ms warmup, 1 s measurement. Values are Criterion
+  point estimates.
+
+### 1k Smoke Scorecard
+
+#### Direct KV Layout
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.76 ms |   304 us |         130 us |          192 us |    1.56 ms |    68.0 us |     422 us |    54.0 us |
+| RocksDB |     428 us |   161 us |        2.32 us |         7.98 us |     490 us |    8.60 us |    17.9 us |    4.96 us |
+| redb    |    7.54 ms |   215 us |        13.0 us |         34.9 us |    8.05 ms |    4.07 ms |    4.88 ms |    4.26 ms |
+
+#### Transaction Layer
+
+Direct transaction API, bypassing SQL.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   10.91 ms |  2.84 ms |         189 us |          679 us |   14.01 ms |    1.57 ms |   12.94 ms |    1.62 ms |
+| RocksDB |    9.15 ms |  2.65 ms |        93.0 us |          298 us |    9.82 ms |    1.35 ms |    9.44 ms |    1.34 ms |
+| redb    |   20.34 ms |  2.86 ms |        67.7 us |          278 us |   20.41 ms |    6.37 ms |   17.35 ms |    6.10 ms |
+
+#### SQL Session
+
+Now runs on the real backends; SQL updates remain gated behind
+`LIX_TRACKED_STATE_CRUD_SQL_UPDATE=1` and excluded.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| SQLite  |   17.97 ms |  6.59 ms |        1.29 ms |         1.53 ms |   18.25 ms |    7.85 ms |
+| RocksDB |   16.40 ms |  5.78 ms |        1.05 ms |         1.24 ms |   12.69 ms |    6.37 ms |
+| redb    |   30.27 ms |  6.11 ms |        1.19 ms |         1.46 ms |   21.06 ms |   11.36 ms |
+
+### 1k Smoke Accounting
+
+Logical write counts were identical across SQLite, RocksDB, and redb.
+
+| Layer       | Operation        | Logical rows |  Puts | Point deletes | Range deletes | Touched spaces | Backend calls | Written bytes | Put amp | Delete amp |
+| ----------- | ---------------- | -----------: | ----: | ------------: | ------------: | -------------: | ------------: | ------------: | ------: | ---------: |
+| kv_layout   | insert_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       396,363 |   1.00x |      0.00x |
+| kv_layout   | update_all       |        1,000 | 1,000 |             0 |             0 |              1 |             1 |       482,607 |   1.00x |      0.00x |
+| kv_layout   | update_one_by_pk |            1 |     1 |             0 |             0 |              1 |             1 |         6,693 |   1.00x |      0.00x |
+| kv_layout   | delete_all       |        1,000 |     0 |             0 |             1 |              0 |             1 |             0 |   0.00x |      0.00x |
+| kv_layout   | delete_one_by_pk |            1 |     0 |             1 |             0 |              1 |             1 |             0 |   0.00x |      1.00x |
+| transaction | insert_all       |        1,000 | 2,032 |             0 |             0 |              7 |             7 |       642,063 |   2.03x |      0.00x |
+| transaction | update_all       |        1,000 | 2,032 |             0 |             0 |              7 |             7 |       728,421 |   2.03x |      0.00x |
+| transaction | update_one_by_pk |            1 |    12 |             0 |             0 |              7 |             7 |        18,532 |  12.00x |      0.00x |
+| transaction | delete_all       |        1,000 | 1,032 |             0 |             0 |              7 |             7 |       292,912 |   1.03x |      0.00x |
+| transaction | delete_one_by_pk |            1 |    11 |             0 |             0 |              7 |             7 |        18,229 |  11.00x |      0.00x |
+
+### Layout Footprint After Insert
+
+Identical across SQLite, RocksDB, and redb.
+
+| Layer       | Space id     | Space                               |  Rows | Key bytes | Value bytes |
+| ----------- | ------------ | ----------------------------------- | ----: | --------: | ----------: |
+| kv_layout   | `0x00020001` | `tracked_state.crud.row.v1`         | 1,000 |    87,244 |     396,363 |
+| transaction | `0x00010002` | `untracked_state.row.v1`            |     2 |        83 |         185 |
+| transaction | `0x00020001` | `json_store.json`                   | 1,018 |    36,648 |     299,700 |
+| transaction | `0x00040001` | `tracked_state.tree_chunk`          |    27 |       972 |     162,086 |
+| transaction | `0x00040004` | `tracked_state.commit_root`         |     2 |        80 |         167 |
+| transaction | `0x00050001` | `binary_cas.manifest`               |     0 |         0 |           0 |
+| transaction | `0x00050002` | `binary_cas.manifest_chunk`         |     0 |         0 |           0 |
+| transaction | `0x00050003` | `binary_cas.chunk`                  |     0 |         0 |           0 |
+| transaction | `0x00060001` | `changelog.commit`                  |     2 |        80 |         102 |
+| transaction | `0x00060002` | `changelog.change`                  | 1,016 |    40,640 |     128,857 |
+| transaction | `0x00060003` | `changelog.commit_change_ref_chunk` |     3 |       135 |      71,882 |
+
+### Delta From Previous Full Smoke
+
+The previous full smoke was the fixture-teardown harness entry; the accounting
+reference is the bounded-chunk/codec-cut entries. Intervening mainline commits
+(not part of this log) account for these shifts.
+
+| Workload                               | Previous |  Current |  Delta |
+| -------------------------------------- | -------: | -------: | -----: |
+| SQLite transaction insert 1k           | 13.66 ms | 10.91 ms | -20.1% |
+| RocksDB transaction insert 1k          | 10.22 ms |  9.15 ms | -10.5% |
+| redb transaction insert 1k             | 20.17 ms | 20.34 ms |  +0.8% |
+| SQLite transaction update_all 1k       | 15.39 ms | 14.01 ms |  -9.0% |
+| RocksDB transaction update_all 1k      | 11.58 ms |  9.82 ms | -15.2% |
+| RocksDB transaction delete_all 1k      | 11.18 ms |  9.44 ms | -15.6% |
+| transaction `insert_all` puts          |    2,038 |    2,032 |     -6 |
+| transaction `insert_all` bytes         |  811,483 |  642,063 | -20.9% |
+| transaction `update_all` bytes         |  925,898 |  728,421 | -21.3% |
+| transaction `delete_all` bytes         |  492,389 |  292,912 | -40.5% |
+| `changelog.change` value bytes         |  189,738 |  128,857 | -32.1% |
+| `tracked_state.tree_chunk` value bytes |  243,324 |  162,086 | -33.4% |
+| `commit_change_ref_chunk` value bytes  |  101,325 |   71,882 | -29.1% |
+
+SQL session numbers have no comparable previous entry because the harness moved
+from the in-memory backend to the three real backends.
+
+## Optimization Run: compiled schema catalog cache
+
+Date: 2026-06-09
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine
+```
+
+Profiling:
+
+- samply profiles of the bench binary (built with
+  `CARGO_PROFILE_BENCH_DEBUG=true`, recorded via
+  `samply record --save-only -- <bench-bin> --bench <filter> --profile-time 10`)
+  showed `CatalogSnapshot::from_schema_facts` being rebuilt on every
+  transaction: 6.7% of the timed 1k `insert_all` op and 47.4% of the timed
+  `update_one_by_pk` op on RocksDB, almost all of it in
+  `SchemaPlan::compile`/`compile_lix_schema` (jsonschema validator
+  compilation).
+
+Change:
+
+- `CatalogContext` now caches compiled `CatalogSnapshot`s in an engine-wide
+  map keyed by a blake3 content fingerprint of the schema facts
+  (`fingerprint_schema_facts`). Identical fact sets always hash identically,
+  so cached snapshots cannot go stale and no invalidation protocol exists;
+  changed schema rows produce different facts and therefore a different key.
+- Transactions hold a `TransactionCatalog` copy-on-write handle:
+  `Shared(Arc<CatalogSnapshot>)` from the cache for normal reads, switched to
+  a private `Owned` rebuild only when the transaction registers a schema
+  (`insert_schema_for_domain`). Pending registrations are never visible to
+  the shared cache.
+- Plan ids stay stable across the copy-on-write rebuild because catalog
+  entries keep their insertion order, matching the previous full-rebuild
+  semantics of `insert_schema_for_domain`.
+- The cache holds at most 64 fact sets and clears wholesale at the bound;
+  schema catalogs churn rarely, so this only guards pathological
+  schema-mutation workloads.
+- Storage accounting is unchanged by construction: the accounting tables from
+  this run are byte-identical to the 2026-06-09 baseline.
+- `cargo test -p lix_engine`: 927 passed, 0 failed.
+
+### 1k Smoke Scorecard
+
+#### Transaction Layer
+
+Direct transaction API, bypassing SQL. Criterion point estimates:
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   10.57 ms |  3.00 ms |         194 us |          666 us |   14.30 ms |    1.06 ms |   11.86 ms |    1.25 ms |
+| RocksDB |    9.00 ms |  2.77 ms |        41.8 us |          271 us |    8.43 ms |     623 us |    8.08 ms |     613 us |
+| redb    |   19.75 ms |  2.73 ms |        67.0 us |          263 us |   19.24 ms |    5.14 ms |   16.50 ms |    5.13 ms |
+
+#### SQL Session
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| SQLite  |   17.84 ms |  6.60 ms |        1.32 ms |         1.48 ms |   15.52 ms |    6.91 ms |
+| RocksDB |   15.77 ms |  5.69 ms |        1.04 ms |         1.18 ms |   12.54 ms |    5.61 ms |
+| redb    |   31.24 ms |  6.51 ms |        1.26 ms |         1.42 ms |   20.14 ms |   10.33 ms |
+
+#### Direct KV Layout
+
+Control group; this patch does not touch the KV layout path. Movement here is
+run-to-run noise on microsecond-scale benches.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.52 ms |   301 us |         168 us |          175 us |    1.58 ms |    70.4 us |     432 us |    52.6 us |
+| RocksDB |     437 us |   161 us |        2.73 us |         10.0 us |     470 us |    9.10 us |    4.69 us |    4.33 us |
+| redb    |    8.14 ms |   239 us |        12.5 us |         18.5 us |    8.97 ms |    4.23 ms |    4.47 ms |    4.04 ms |
+
+### Delta From 2026-06-09 Baseline
+
+Same machine, same day, same harness. Transaction and SQL session deltas are
+attributable to this change; single-row transaction mutations no longer pay a
+full jsonschema catalog compile per commit.
+
+| Workload                              | Baseline |  Current |  Delta |
+| ------------------------------------- | -------: | -------: | -----: |
+| RocksDB transaction update_one_by_pk  |  1.35 ms |   623 us | -54.0% |
+| RocksDB transaction delete_one_by_pk  |  1.34 ms |   613 us | -54.4% |
+| RocksDB transaction read_one_by_pk    |  93.0 us |  41.8 us | -55.0% |
+| SQLite transaction update_one_by_pk   |  1.57 ms |  1.06 ms | -32.7% |
+| SQLite transaction delete_one_by_pk   |  1.62 ms |  1.25 ms | -22.9% |
+| redb transaction update_one_by_pk     |  6.37 ms |  5.14 ms | -19.3% |
+| redb transaction delete_one_by_pk     |  6.10 ms |  5.13 ms | -15.9% |
+| RocksDB transaction update_all 1k     |  9.82 ms |  8.43 ms | -14.2% |
+| RocksDB transaction delete_all 1k     |  9.44 ms |  8.08 ms | -14.4% |
+| RocksDB transaction insert_all 1k     |  9.15 ms |  9.00 ms |  -1.6% |
+| SQLite transaction delete_all 1k      | 12.94 ms | 11.86 ms |  -8.3% |
+| SQLite sql_session delete_all 1k      | 18.25 ms | 15.52 ms | -15.0% |
+| SQLite sql_session delete_one_by_pk   |  7.85 ms |  6.91 ms | -12.0% |
+| RocksDB sql_session delete_one_by_pk  |  6.37 ms |  5.61 ms | -11.9% |
+
+The focused RocksDB run immediately after the change (against Criterion's
+cached pre-change baseline) measured insert_all at 8.42 ms (-14.3%); the full
+smoke sample above landed at 9.00 ms, so the bulk-insert win is real but
+within a few percent of run variance. The dominant, robust win is the removal
+of the fixed per-transaction catalog compile, which was about half of every
+single-row transaction operation.
+
+## Optimization Run: raw-row keyed catalog cache
+
+Date: 2026-06-09
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --lib
+```
+
+Profiling:
+
+- After the compiled-catalog cache, samply showed the schema-facts pipeline as
+  the dominant fixed cost of single-row transaction ops: about 60% of
+  `update_one_by_pk` on RocksDB, paid twice per transaction (once in
+  `open_transaction`'s prefetch, once at row normalization). The pipeline was
+  live-state scan (~15% + ~14%) plus `decode_registered_schema_row` serde
+  parsing of every schema row (~8% + ~9%) plus `fingerprint_schema_facts`
+  canonical-JSON serialization (~11%).
+- The decode and canonicalization existed only to compute the cache key.
+  Decoding is deterministic, so the raw `snapshot_content` bytes already
+  uniquely determine the decoded facts.
+
+Change:
+
+- `CatalogContext::compiled_catalog_for_domain` is the new transaction hot
+  path: it scans the raw registered-schema rows for a domain, fingerprints
+  the raw row contents (blake3, length-prefixed schema-domain component +
+  `snapshot_content`), and returns the cached `Arc<CatalogSnapshot>` on a
+  hit. Rows are only JSON-decoded and canonicalized on a miss, where the
+  result flows through the existing facts-fingerprint cache.
+- A raw-key variation (ordering or textual differences with equal canonical
+  content) can only cause a conservative cache miss, never a wrong hit.
+- `open_transaction` now prefetches the compiled catalog `Arc` instead of a
+  decoded facts `Vec`, and `TransactionSchemaResolver` stores
+  `TransactionCatalog` directly; the intermediate `SchemaFacts` staging
+  variant is gone.
+- Storage accounting is byte-identical to the previous entry.
+- `cargo test -p lix_engine --lib`: 930 passed, 0 failed.
+- Verification profile: `decode_registered_schema_row` and
+  `fingerprint_schema_facts` no longer appear in the `update_one_by_pk`
+  stacks; the remaining facts cost is `scan_catalog_rows` only.
+
+### 1k Smoke Scorecard
+
+Note: this run was taken while the machine was in interactive use, so
+individual cells carry more noise than earlier entries. The kv_layout control
+group stayed within historical variance.
+
+#### Transaction Layer
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |   10.79 ms |  2.88 ms |         202 us |          688 us |   13.26 ms |     885 us |   11.83 ms |     947 us |
+| RocksDB |    8.16 ms |  2.65 ms |        41.7 us |          260 us |    8.46 ms |     420 us |    8.08 ms |     493 us |
+| redb    |   19.41 ms |  2.80 ms |        57.3 us |          275 us |   19.50 ms |    5.19 ms |   16.37 ms |    5.08 ms |
+
+#### SQL Session
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: |
+| SQLite  |   17.50 ms |  6.33 ms |        1.27 ms |         1.47 ms |   15.80 ms |    6.67 ms |
+| RocksDB |   14.30 ms |  5.49 ms |        1.11 ms |         1.15 ms |   12.14 ms |    5.54 ms |
+| redb    |   30.18 ms |  5.77 ms |        1.19 ms |         1.34 ms |   20.02 ms |   10.15 ms |
+
+#### Direct KV Layout
+
+Control group; untouched by this patch.
+
+| Backend | Insert all | Read all | Read one by PK | Read many by PK | Update all | Update one | Delete all | Delete one |
+| ------- | ---------: | -------: | -------------: | --------------: | ---------: | ---------: | ---------: | ---------: |
+| SQLite  |    1.51 ms |   303 us |         158 us |          189 us |    1.57 ms |    74.1 us |     485 us |    43.7 us |
+| RocksDB |     425 us |   156 us |        2.61 us |         7.29 us |     477 us |    8.53 us |    4.64 us |    5.08 us |
+| redb    |    8.12 ms |   241 us |        15.5 us |         31.6 us |    9.86 ms |    4.10 ms |    4.75 ms |    4.03 ms |
+
+### Delta From Previous Entry (compiled schema catalog cache)
+
+| Workload                             | Previous |  Current |  Delta |
+| ------------------------------------ | -------: | -------: | -----: |
+| RocksDB transaction update_one_by_pk |   623 us |   420 us | -32.6% |
+| RocksDB transaction delete_one_by_pk |   613 us |   493 us | -19.6% |
+| SQLite transaction update_one_by_pk  |  1.06 ms |   885 us | -16.2% |
+| SQLite transaction delete_one_by_pk  |  1.25 ms |   947 us | -24.1% |
+| RocksDB transaction insert_all 1k    |  9.00 ms |  8.16 ms |  -9.3% |
+| RocksDB sql_session insert_all 1k    | 15.77 ms | 14.30 ms |  -9.3% |
+| SQLite transaction update_all 1k     | 14.30 ms | 13.26 ms |  -7.3% |
+| redb transaction update_one_by_pk    |  5.14 ms |  5.19 ms |  +1.0% |
+
+redb single-row ops are dominated by redb's fixed per-commit durability cost,
+so the catalog-path savings do not move them; that cost is a backend
+characteristic, not an engine overhead.
+
+Cumulative since the 2026-06-09 baseline (both catalog cache rounds):
+RocksDB transaction update_one_by_pk 1.35 ms -> 420 us (3.2x), delete_one_by_pk
+1.34 ms -> 493 us (2.7x), SQLite update_one_by_pk 1.57 ms -> 885 us (1.8x).
+
+Remaining target from the verification profile: the live-state scan of
+registered-schema rows still runs twice per transaction (~19% of
+update_one_by_pk each). Eliminating it requires caching scan results keyed on
+storage state, which needs an invalidation story; deferred. The validation
+fast-path (unconsumable fk_target bookkeeping, jsonschema is_valid) remains
+the next bulk-op target.
+
+## Backend Contract: sorted batch lowering and unspecified visit order
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_WRITE_SET_ORDER_STATS=1 LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'kv_layout/lix_redb/smoke/update_all_rows'
+```
+
+Measurement (env-gated `LIX_WRITE_SET_ORDER_STATS` probe in write-set
+lowering):
+
+- Per 1k transaction insert/update commit, the hash-keyed
+  `json_store.json` batch (1,001 puts, ~49% of all puts) arrives unsorted;
+  `changelog.change` (1,000 puts, time-ordered ids) and
+  `tracked_state.tree_chunk` (BTreeMap iteration) arrive sorted.
+- The kv_layout bench writes its 1,000-put batch unsorted.
+- Delete commits lower almost entirely pre-sorted batches.
+
+Changes:
+
+- `StorageWriteSet` lowering now delivers each space batch to the backend
+  sorted by key ascending (skipping the sort when the batch is already
+  sorted, which is the common case for changelog/tree spaces; the
+  sortedness check itself is a read-only scan). Within a group all keys
+  share the space prefix, so logical order equals physical order. The
+  order probe reports natural order before the sort and covers puts and
+  deletes.
+- `BackendWrite::put_many`/`delete_many` document the contract: at most one
+  mutation per key, engine-produced batches sorted ascending.
+- `BackendRead::visit_keys` order is now actively enforced as unspecified: a
+  new order-scrambling backend decorator (`tests/backend/scrambled.rs`)
+  replays point-read visits in a seeded-shuffled order and must pass both
+  the backend conformance suite and a full transaction CRUD equivalence
+  test (identical row contents and identical per-space layout accounting at
+  every stage versus the plain in-memory backend; byte-exact physical
+  comparison is impossible because commit/change ids differ per run). Both
+  pass.
+
+Same-day A/B (single binary where noted):
+
+| Workload                          | Unsorted | Sorted  |  Delta |
+| --------------------------------- | -------: | ------: | -----: |
+| kv_layout redb update_all 1k      |  7.57 ms | 6.19 ms | -18.2% |
+| kv_layout rocksdb insert_all 1k   |   425 us |  349 us | -17.9% |
+| kv_layout sqlite insert_all 1k    |  1.51 ms | 1.42 ms |  -6.0% |
+| transaction redb update_all 1k    | 19.50 ms | 17.38 ms | -10.9% |
+| transaction sqlite delete_all 1k  |  ~12.0 ms | ~12.5 ms | inconclusive |
+
+The sqlite transaction delete_all cell initially measured +5-6% slower with
+sorting in stash-based A/Bs. A single-binary A/B (temporary
+`LIX_LOWER_UNSORTED` env toggle, removed with this change; reproduce by
+reverting the sort block in `write_set.rs`) also showed it, but reversing
+the within-pair run order flipped the sign in one of three pairs and
+widened the unsorted spread to +/-8%; the order probe shows the timed
+delete batches are already sorted, so sorting performs no writes on that
+path (only the read-only sortedness scan runs). Treated as noise. The
+kv_layout rows in the table above are stash-based same-day pairs; the
+delete_all investigation used the single-binary toggle. All engine test
+targets pass; accounting is unchanged (sorting only reorders within a
+batch).
+
+The rs-sdk SQLite backend keeps its internal sort as a cheap verification
+pass; with engine-sorted input it degenerates to a single ascending-run
+detection.
+
+## Binary UUID Keys For Changelog And Commit Roots
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Context:
+
+- `ChangeId`/`CommitId` were already binary in memory (`Uuid` wrappers) and
+  already encode as 16 raw bytes inside musli values. The only remaining
+  text leak was three key codecs routing ids through `Display` into 36-byte
+  hyphenated text: `changelog.change`/`changelog.commit` identity keys, the
+  `commit_change_ref_chunk` key prefix, and `tracked_state.commit_root`
+  keys.
+
+Change (hard cut, no migration):
+
+- Identity keys are now the raw 16 UUID bytes. UUIDv7 big-endian byte order
+  matches hyphenated-text lexicographic order, so range scans, resume
+  tokens, and the sorted-batch lowering contract behave identically.
+- Scan resume tokens decode from the binary key (`commit_id_from_key` /
+  `change_id_from_key`) instead of `String::from_utf8`.
+- `tracked_state.commit_root` staging and lookup share one binary key
+  helper; the test-only text-key fallback in `load_commit_root` is gone
+  (`parse_lix` canonicalizes test labels identically on both paths).
+- Scan `start_after` tokens now parse as UUIDs, so a malformed resume token
+  errors instead of silently scanning from an arbitrary text position.
+
+### Storage A/B (1k insert footprint, identical on all three backends)
+
+| Space                               | Key bytes before | after  |  Delta |
+| ----------------------------------- | ---------------: | -----: | -----: |
+| `changelog.change` (1,016 rows)     |           40,640 | 20,320 | -50.0% |
+| `changelog.commit`                  |               80 |     40 | -50.0% |
+| `tracked_state.commit_root`         |               80 |     40 | -50.0% |
+| `changelog.commit_change_ref_chunk` |              135 |     72 | -46.7% |
+
+Engine key bytes overall: ~78.6 KB -> ~58.2 KB (-26%). Value bytes are
+byte-identical, confirming the value codecs were already binary. Total
+store bytes shrink ~2.8% at this fixture size; the structural win is
+changelog B-tree geometry (half-width keys on the highest-row-count space),
+which compounds as the store grows.
+
+### Perf A/B
+
+Same-day single-run comparison was noisy in both directions; an alternating
+stash-based triple A/B on the contested RocksDB cells pooled to NEW slightly
+faster with overlapping spreads:
+
+| Cell (rocksdb transaction)  | OLD mean (3 runs) | NEW mean (3 runs) |
+| --------------------------- | ----------------: | ----------------: |
+| read_one_by_pk              |           58.0 us |           45.4 us |
+| update_one_by_pk            |            574 us |            490 us |
+
+Treated as perf-neutral-to-positive at 1k smoke scale, as predicted when
+this cut was scoped: the per-commit savings (one fewer String allocation
+plus Display format per id-keyed row, halved key compares) are real but
+small against commit totals. The durable claim is the storage table above.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,534 passed across
+  all targets (three changelog scan tests and two rebuild tests updated:
+  resume tokens are typed now, and corruption fixtures plant records at
+  binary keys).
+
+## Tree-Chunk Leaf Compaction: front-coded keys
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Change (hard cut):
+
+- Leaf nodes use a new wire format: a kind byte, then per entry a
+  shared-prefix length, key suffix, and verbatim value bytes. Entries within
+  a node are sorted, so consecutive keys share the encoded
+  schema-key/file-id prefix and most of the entity pk; front-coding removes
+  that redundancy. Values are untouched, so value byte-equality and the
+  value codec are unchanged. Internal nodes keep their musli body behind the
+  kind byte.
+- Chunk boundary logic is untouched: boundaries are content-defined on
+  uncompressed key bytes, so the same entries land in the same chunks and
+  history-independence is preserved by construction. There is no
+  estimator/codec coupling to drift.
+- Decode reconstructs keys into a single pre-reserved arena per node; values
+  stay zero-copy. Debug builds verify every encoded leaf round-trips.
+  Property tests cover representative shapes, 512 generated heavy-prefix
+  keys, determinism, and malformed-byte rejection.
+
+### Storage A/B (1k insert footprint, identical across backends)
+
+| Metric                              |  Before |   After |  Delta |
+| ----------------------------------- | ------: | ------: | -----: |
+| `tree_chunk` value bytes (27 chunks) | 162,086 | 125,918 | -22.3% |
+| transaction insert_all written bytes | 642,063 | 606,256 |  -5.6% |
+| transaction update_all written bytes | 728,421 | 692,589 |  -4.9% |
+| transaction delete_all written bytes | 292,912 | 257,080 | -12.2% |
+
+Put counts and chunk counts unchanged.
+
+### Perf A/B (alternating stash triples, RocksDB)
+
+- read_one_by_pk: OLD mean 64.0 us, NEW mean 51.3 us (faster in all three
+  pairs; smaller chunks mean less memory traffic on hot decodes).
+- read_many_by_pk initially regressed +8.3% consistently: the decode arena
+  grew by doubling, costing ~8 re-allocations per leaf. Pre-reserving the
+  arena to the body length erased it (OLD mean 313.3 us, NEW 311.3 us, sign
+  flipping across pairs).
+- 10k spot check: rocksdb transaction insert 77.6 ms, read_all 32.7 ms; no
+  split pathology (boundaries are codec-independent).
+
+### Byte-exact order-independence enforcement
+
+Validating this change hardened the equivalence suite and found an engine
+bug:
+
+- The scrambled-visit equivalence test now runs both fixtures in
+  deterministic-functions mode and asserts byte-identical storage across all
+  ten spaces at every stage, replacing aggregate row/byte-total comparison
+  (which could collide and, with wall-clock content, flaked
+  time-dependently).
+- The exact comparison immediately exposed that `FunctionContext::prepare`
+  stamped the deterministic-sequence bookkeeping row from the system clock
+  even in deterministic mode, violating that mode's byte-determinism
+  contract. Bookkeeping timestamps now derive from the persisted sequence
+  without consuming a sequence tick. Stress: 20 consecutive runs green.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,538 passed.
+
+## Value Dedup: keyed change ids and chunk-local commit dictionaries
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Changes (hard cuts):
+
+- `ChangeRecord` values no longer store `change_id`: it is the storage key
+  and is reconstructed on decode, the same pattern
+  `commit_change_ref_chunk` already uses for `commit_id`. The in-memory
+  record keeps the id; only the stored form
+  (`ChangeRecordRef`/`ChangeRecordView`) drops it. The scan-path
+  key-vs-value consistency check became tautological and was removed; a
+  direct codec round-trip suite (fully populated, empty options,
+  id-from-argument) covers the hand-threaded stored form.
+- Leaf nodes dictionary the commit-id slice of their values chunk-locally.
+  The standard value encoding places `change_id` at bytes [0..16) and
+  `commit_id` at [16..32) (pinned by a layout test); bulk commits repeat one
+  commit id across every entry, so the encoder collects first-occurrence
+  commit ids into a per-chunk dictionary and stores values with the slice
+  spliced out. The splice is reversible byte-for-byte regardless of value
+  semantics; values shorter than 32 bytes are stored verbatim (dict ref 0).
+  Dictionaried values are reconstructed into the decode arena; verbatim
+  values stay zero-copy. Both golden wire-format vectors (dict-less and
+  dictionaried) pin the encoding.
+
+Review found two decoder bugs in the initial diff, both fixed with
+regression tests:
+
+- The shared-prefix guard measured the previous key from the arena tail,
+  which holds value bytes after a dictionaried entry; a corrupt chunk with
+  an inflated shared length was accepted and front-coded the next key out
+  of value bytes. The decoder now tracks the previous key end explicitly.
+- `(dict_ref - 1) * 16` was unchecked; a dict_ref near 2^60 wrapped the
+  multiplication in release builds and aliased dictionary slot 0. The
+  decoder validates `dict_ref <= dict_len` before any index arithmetic.
+
+Note on coverage: the byte-exact scrambled equivalence test exercises the
+dictionaried path (its fixture values are full tracked-state encodings) but
+compares the two fixtures against each other, so it catches order-dependent
+bugs only; deterministic codec bugs are the round-trip/golden suites' job.
+
+### Storage A/B (1k insert footprint, identical across backends)
+
+| Metric                                | Before  | After   | Delta  |
+| ------------------------------------- | ------: | ------: | -----: |
+| `changelog.change` value bytes        | 128,857 | 112,601 | -12.6% |
+| `tree_chunk` value bytes              | 125,918 | 110,833 | -12.0% |
+| transaction insert_all written bytes  | 606,256 | 575,409 |  -5.1% |
+| transaction update_all written bytes  | 692,589 | 661,744 |  -4.5% |
+| transaction delete_all written bytes  | 257,080 | 226,234 | -12.0% |
+
+The change-record delta is exactly 16 bytes x 1,016 records. Cumulative
+tree_chunk since before the front-coding cut: 162,086 -> 110,833 (-31.6%).
+
+### Perf A/B (alternating stash triples, RocksDB)
+
+read_all 2.640 -> 2.618 ms means and read_many 266.7 -> 270.2 us means, both
+with sign flips across pairs: parity. read_one initially measured
+42.2 -> 46.2 us means with mixed signs; because dictionaried values lose
+zero-copy on decode (a plausible mechanism for a point-read cost), a second
+alternating triple was run and came back at parity (48.6 -> 49.2 us means,
+sign flipping across pairs). Across all six pairs the sign flips in three:
+no consistent regression.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,549 passed.
+  New tests: value-layout pin; dictionaried round-trip with mixed
+  verbatim/32-byte-boundary/bulk entries plus a compression assertion;
+  dict-less and dictionaried golden wire vectors; out-of-bounds, wrapping,
+  and adversarial-length dictionary rejection; shared-length-after-
+  dictionaried-value rejection; direct change-record round-trips.
+
+## Ref-Chunk Entity-Pk Front-Coding
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo test -p lix_engine --features storage-benches
+```
+
+Change (hard cut):
+
+- `commit_change_ref_chunk` entries store their entity pk front-coded
+  against the previous entry's encoded pk (`pk_shared` + `pk_suffix` fields
+  in the musli entry struct). The chunker already sorted entries by
+  (schema_key, file_id, entity_pk), so consecutive pks share long heads;
+  correctness does not depend on sortedness (unsorted input only loses
+  compression). The borrowed chunk view (`view_commit_change_ref_chunk`)
+  folded into the owned decode: front-coded parts cannot borrow from chunk
+  bytes, and the view had exactly one caller.
+- Order-semantics audit preceded the cut: rebuild applies refs through
+  keyed tree mutations, merge/graph collect ids into sets, GC is
+  unimplemented, and history output order was already entity-sorted because
+  the chunker sorts. No consumer depends on a different entry order.
+
+The first encoding attempt front-coded the existing musli pk bytes and
+REGRESSED storage (+1.4%): musli's per-part length prefixes sit ahead of
+the content, so same-shaped pks of different lengths share only 1-2 bytes,
+and the per-entry `pk_shared` overhead exceeded the savings. The accounting
+gate caught it immediately. The fix is a length-free pk byte encoding for
+the front-coded form: part bytes with `0x00` escaped as `0x00 0xFF` and
+parts terminated by `0x00 0x01`, making byte-prefix sharing equal
+content-prefix sharing. Lesson recorded: front-coding through a
+length-prefixed encoding is structurally crippled; check the byte layout
+before estimating.
+
+### Storage A/B (1k insert footprint, identical across backends)
+
+| Metric                                 | Before  | After   | Delta  |
+| -------------------------------------- | ------: | ------: | -----: |
+| `commit_change_ref_chunk` value bytes  |  71,882 |  30,881 | -57.0% |
+| transaction insert_all written bytes   | 575,409 | 534,460 |  -7.1% |
+| transaction update_all written bytes   | 661,744 | 620,795 |  -6.2% |
+| transaction delete_all written bytes   | 226,234 | 185,285 | -18.1% |
+
+The insert, update, and delete written-byte deltas are mutually exact at
+-40,949. The ref-chunk footprint delta is -41,001; the 52-byte gap between
+the write-path metric and the end-state footprint metric is accounting
+granularity, not a discrepancy in the cut.
+
+### Perf (vs cached baselines, RocksDB smoke)
+
+Writes got faster with the smaller chunks: insert -13%, update -16%,
+delete -1%. read_one -13%. read_all printed +6.9% then -5.5% on immediate
+re-run: cache noise, and ref chunks are not on the read_all path. Encode
+cost (pk re-encode + prefix compare per entry) is on the commit path and
+is invisible at smoke scale.
+
+- Review additions: a second golden vector pinning the 0x00 0xFF escape
+  bytes; escape edge-case round-trips (lone/trailing/consecutive NULs,
+  0x01 as plain content, shared prefix splitting an escape pair);
+  adversarial decode rejections (empty pk, non-UTF-8 part, out-of-bounds
+  dictionary indices, u32::MAX shared length); an encode-side debug assert
+  on the non-empty-parts invariant.
+- Known follow-up: the chunk-size estimator still charges pre-front-coding
+  pk sizes, so chunks run ~2.3x under-filled at large commit sizes (safe
+  direction; the max-bytes invariant only gets stronger). Fix is to track
+  the previous encoded pk in the builder and charge the suffix length.
+- `cargo test -p lix_engine --features storage-benches`: 1,562 passed.
+  New tests: sorted/multi-part/unicode round-trip, unsorted-input
+  correctness, compression assertion with honest per-entry math, two
+  golden wire vectors, NUL-escape round-trips, truncated-escape rejection,
+  over-shared-pk rejection.
+
+## Ref-Chunk Size Estimator: charge front-coded pk cost
+
+Date: 2026-06-10
+
+Follow-up to the front-coding cut. `CommitChangeRefChunkBuilder` still
+charged entity pks at their verbatim size, so chunks closed ~2.3x before
+the 64 KiB target (safe direction, under-filled). The builder now tracks
+the previous entry's encoded pk - the same front-coding base the codec
+uses - and charges `varint(shared) + varint(suffix_len) + suffix` exactly.
+Escape overhead is measured rather than modeled, which also closes the
+NUL-heavy underestimate the codec review flagged. A fresh builder starts
+from an empty base, matching the per-chunk front-coding reset.
+
+At the 1k bench the insert commit packs into one chunk instead of two
+(3 -> 2 chunks total, one fewer put per commit, -58 bytes). The effect
+scales with commit size: a 100k-row commit packs to the 2048-entry cap at
+roughly the byte target instead of producing ~2.2x more, smaller chunks. New tests pin that front-coded entries pack to target, that the
+builder's estimate is a direct upper bound on the real encoding
+(fixture crossing the 128-byte varint boundary plus NUL escapes), the
+varint-size boundaries, and the oversized-single-entry error path; a
+const assertion ties the 2-byte index charge to the entry cap staying
+under musli's 3-byte varint threshold. Review confirmed the upper
+bound term-by-term against the musli wire format, with an empirical
+fuzz across adversarial shapes (margins +22 to +11,737 bytes). The pk
+encode is hoisted to once per entry on the commit path.
+
+- `cargo test -p lix_engine --features storage-benches`: 1,565 passed.
+
+## SQLite Format V2 Baseline: per-space bench cells and file stats
+
+Date: 2026-06-10
+
+Command:
+
+```sh
+LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite_backend -- 'space_prefix_scan|space_truncate'
+```
+
+Preparation for the per-space-tables format cut. The rs-sdk bench
+previously used un-prefixed keys, which cannot observe a space-layout
+change; it now has a multi-space fixture mirroring the engine's physical
+layout (4-byte big-endian space id prefix, six spaces in 1k-commit
+accounting proportions, splitmix64 key entropy, sorted batches), plus:
+
+- `space_prefix_scan`: one space scanned by physical prefix (a table scan
+  under v2),
+- `space_truncate`: one space's full range deleted with per-iteration
+  fixture rebuild (a candidate for table truncation under v2),
+- a file-stats report gated by `LIX_SQLITE_FILE_STATS=1`: checkpointed
+  file bytes, page accounting, and per-table dbstat - the physical
+  metric an API-level accounting harness cannot see.
+
+### Format v1 baseline
+
+| Cell                              | v1       |
+| ---------------------------------- | -------- |
+| space_prefix_scan json_store (20k) | 1.034 ms |
+| space_prefix_scan tree_chunk (500) | 132 us   |
+| space_truncate json_store (20k)    | 10.9 ms  |
+
+File: 1 table (`lix_internal_entries`), 3,331 x 4 KiB pages, 13,643,776
+bytes on disk for the multi-space mix.
+
+## SQLite Format V2: per-space bucket tables
+
+Date: 2026-06-10
+
+Commands:
+
+```sh
+cargo bench -p lix_sdk --features sqlite --bench sqlite_backend
+cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke'
+LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite_backend -- 'no_match'
+cargo test -p lix_sdk --features sqlite && cargo test -p lix_engine --features storage-benches
+```
+
+Change (hard cut, `SQLITE_FORMAT_VERSION` 1 -> 2; v1 files rejected with
+a clear no-migration error):
+
+- One table per key bucket instead of a single interleaved
+  `lix_internal_entries` table. The bucket is the key's zero-padded first
+  four bytes read big-endian - an order-preserving partition for arbitrary
+  keys (a unit test pins `bucket(k1) <= bucket(k2)` for sorted keys), so
+  cross-table iteration in bucket order preserves global scan order.
+  Engine keys start with the 4-byte space id, so engine buckets are
+  exactly storage spaces. Full keys stay stored (the 4-byte prefix saving
+  was ~1% of file; locality and truncation are the wins).
+- Tables are created lazily on first write. A positive-only bucket cache
+  is updated from committed state alone (a transaction's created tables
+  merge on commit, vanish on rollback) and never trusted negatively;
+  misses probe sqlite_master inside the caller's snapshot, so tables
+  created by other handles on the same file are always found.
+- `delete_range` issues an unqualified `DELETE FROM` when the range
+  provably covers the bucket; a test pins that the engine's exact
+  `[prefix, next_prefix)` space deletes hit the fast path.
+- Scans prepare one statement per bucket upfront and open every cursor
+  immediately (SQLite executes lazily; an unstepped cursor is free). The
+  statements live in the with_range_scan stack frame and the scan struct
+  owns the open row cursors, so rows stream zero-copy in a single pass
+  with no self-referential borrows, no re-queries, and has_more answered
+  by stepping the already-open cursor one row ahead.
+- The engine test-support copy
+  (`packages/engine/tests/backend/support/sqlite_backend.rs`) is
+  byte-identical (the engine cannot depend on lix_sdk); both files carry a
+  sync note.
+
+Benching found two real bugs and drove one redesign before shipping:
+
+- The first scan implementation used NULL-guarded predicates
+  (`(? IS NULL OR key > ?)`) so one statement shape served every bound
+  combination. That defeats SQLite's index planner; every batch degraded
+  to a table walk (prefix scan 1.03 -> 10.4 ms, 10x). Predicates are now
+  shape-specialized per bound combination, with the prepared-statement
+  cache raised to 256 (shapes multiply per table).
+- An intermediate re-query-per-batch cursor crashed on the engine
+  pattern (one `visit_next(usize::MAX)` call): a `limit + 1` lookahead
+  wrapped to `LIMIT 0` in release. The conformance suite had not covered
+  huge limits; a dedicated regression test now does.
+- The re-query cursor also kept a +10-22% cost on chunked pagination
+  (~11 us re-query + re-seek per visit_next call). The shipped design
+  pre-opens all bucket cursors instead, restoring exact v1 streaming.
+
+### rs-sdk A/B (alternating stash triples)
+
+| Cell                                 | v1       | v2       | Delta  |
+| ------------------------------------ | -------- | -------- | -----: |
+| space_truncate json_store (20k rows) | 10.73 ms | 577 us   | -94.6% |
+| space_prefix_scan 1k-chunked (20k)   | 1.036 ms | 1.029 ms | parity |
+| range_scan full_value 1k-chunked 50k | 2.345 ms | 2.350 ms | parity |
+| point_reads existing 1000            | 270.6 us | 273.7 us | parity |
+| put_many random 10k                  | 20.0 ms  | 20.9 ms  | parity |
+| open existing                        | 127 us   | 127 us   | parity |
+
+Scan parity holds for both the engine pattern (one visit_next call at
+the caller's limit) and chunked pagination, with sign flips across
+pairs; per scan the only added work is one sqlite_master bucket listing
+plus one statement per bucket in range.
+
+### Engine e2e A/B (tracked_state_crud lix_sqlite smoke, triples)
+
+| Cell        | v1       | v2       | Delta  |
+| ----------- | -------- | -------- | -----: |
+| read_one    | 194.7 us | 89.0 us  | -54% (2.2x) |
+| delete_all  | 12.81 ms | 9.17 ms  | -28%   |
+| update_one  | 946 us   | 895 us   | -5%    |
+| insert_all  | 10.87 ms | 11.10 ms | parity |
+| read_all    | 2.978 ms | 3.036 ms | parity |
+
+Point reads descend a small per-space B-tree instead of the 13 MB
+interleaved one; space-wide deletes hit the truncate fast path through
+the whole stack.
+
+### File layout (multi-space mix, checkpointed)
+
+v1: 1 table, 3,331 pages, 13,643,776 bytes. v2: 6 tables, 3,339 pages,
+13,676,544 bytes (+0.24%) with per-space dbstat accounting now available
+(json_store 1,836 pages, change 835, tree_chunk 572, ...).
+
+- `cargo test -p lix_sdk --features sqlite`: 19 passed (conformance,
+  e2e, usize::MAX-limit regression). `cargo test -p lix_engine
+  --features storage-benches`: 1,568 passed. clippy zero across both.
+
+## Space-Aware Backend Interface + Per-Space SQLite Tables
+
+Date: 2026-06-10
+
+Hard cut of the Backend trait and the SQLite file format (v2), replacing
+the prefixed-key keyspace with an explicit, typed interface:
+
+- Every read/write method takes `space: SpaceId`; keys are logical bytes.
+  `scan(space, range, opts, visitor) -> ScanResult` replaces the
+  cursor API (`BackendRangeScan`, `with_range_scan`, `visit_next`) - git
+  archaeology showed every production caller made exactly one visit_next
+  call per cursor, with pagination via resume_after.
+- The engine's physical-key codec (encode/decode of the 4-byte space
+  prefix) is deleted; write-set lowering, point plans, and scans pass the
+  space they already had. `delete_range(space, Unbounded..Unbounded)` is
+  the explicit truncate idiom.
+- SQLite maps each space to its own table. The bucket derivation, key
+  order proofs, sqlite_master listings, and the commit-gated existence
+  cache from the first partitioned design are all deleted: writes run
+  CREATE TABLE IF NOT EXISTS unconditionally (~us of DDL parse), reads
+  probe once per call. redb, RocksDB, the in-memory backend, and the CLI
+  file backend keep single-keyspace layouts and prefix internally in ~30
+  private lines each.
+- Conformance tests the spaces contract; the bench fixtures and the
+  scrambled equivalence decorator are space-aware.
+
+### A/B vs flat v1 (whole working tree stashed, alternating)
+
+| Cell                                | v1 flat   | v2 spaces | Delta  |
+| ----------------------------------- | --------- | --------- | -----: |
+| e2e merge_10k (plugin pipeline)     | 347.8 ms  | 195.3 ms  | -44% (1.78x) |
+| engine read_one_by_pk (sqlite)      | 213.1 us  | 96.2 us   | -55% (2.2x) |
+| engine delete_all (sqlite)          | 12.65 ms  | 9.83 ms   | -22%   |
+| engine insert_all (sqlite)          | 11.59 ms  | 10.57 ms  | -9%    |
+| engine read_all (sqlite)            | ~3.0 ms   | ~3.2 ms   | parity (noisy) |
+| raw space truncate (20k rows)       | 10.7 ms   | ~0.6 ms   | -95%   |
+
+Point reads descend small per-space B-trees instead of one interleaved
+13 MB tree; space deletes truncate tables; the merge pipeline collects
+both.
+
+- Suites: engine 1,565 / sdk 26 / cli 46, all green; workspace clippy
+  zero. SQLITE_FORMAT_VERSION = 2; v1 files rejected with a clear
+  no-migration error.
+
+## 2026-06-10 — Inline Small JSON Payloads + Chunk-Boundary zstd
+
+*Superseded by the 2026-06-11 single-copy entry below; kept as history.
+The tree-chunk codec and neutral compression module described here were
+deleted by that cut.*
+
+Two cuts that only make sense together, shipped together.
+
+Measurement on the 10k-merge workload showed the json_store indirection
+was structure without payoff for the dominant payload class: 99.8% of
+payloads land at 65–128 bytes (420k payloads, 53.3 MB raw across bench
+iterations), content dedup runs ~0.2% marginal (9,981 distinct hashes
+per 10,000 writes), and nothing under the 16 KiB zstd floor was ever
+compressed. Each tiny payload paid a 32-byte ref in the tree value,
+another in the change record, a 32-byte store key, its own store row,
+and a point read on every materialization — ~96 bytes of addressing
+plus an extra lookup to manage ~127 bytes of data. The redundancy
+(repeated JSON keys every ~130 bytes) is cross-payload, which
+per-payload compression structurally cannot reach.
+
+**Cut 1 — inline.** A `JsonSlot` enum (`None` / `Ref(JsonRef)` /
+`Inline(json)`) replaces `Option<JsonRef>` in tracked-state values,
+change records, deltas, staged refs, commit-graph changes, and diff
+rows. Payloads at or under `JSON_INLINE_MAX_BYTES = 256` store their
+JSON text directly in the value (musli tag byte + bytes); larger
+payloads keep the content-addressed ref and the store row. The
+threshold applies deterministically at staging, so identical content
+always produces the same variant — required because content-addressed
+tree chunks demand byte-identical values from staging and rebuild paths
+alike. The slot encodes after the fixed-offset id fields, so the
+chunk-local commit-id dictionary from the value-dedup cut is untouched.
+Inline payloads skip the json_store write at staging and skip the batch
+load at row materialization.
+
+**Cut 2 — chunk-boundary zstd.** Tree chunks gain a storage codec: a
+tag byte, then either the raw chunk or a u32 uncompressed length plus a
+zstd-1 frame (raw fallback when compression does not pay). With inlined
+payloads physically adjacent inside 4–16 KiB leaves, plain zstd
+captures the cross-row redundancy — no trained dictionaries, no
+training lifecycle, no embedded blobs. Chunk hashes and tree identity
+stay over the UNCOMPRESSED bytes, so history independence and content
+addresses are untouched. Generic zstd helpers moved to a neutral
+`crate::compression` module (sealed-owner clean); json_store delegates.
+
+Measured separately, the staging matters: inline alone is byte-sideways
+(+2% store, insert written +8%) and regresses single-row updates +69%
+(a leaf rewrite drags ~30 neighbors' inlined payloads). Compression
+alone has nothing to compress (payloads scattered as store rows). The
+pair, at the 1k bench (lix_sqlite), before → after:
+
+| Metric | before | after | delta |
+| --- | --- | --- | --- |
+| insert_all written bytes | 534.4 KB | 448.5 KB | −16% |
+| update_all written bytes | 620.7 KB | 539.6 KB | −13% |
+| delete_all written bytes | 185.2 KB | 137.9 KB | −26% |
+| update_one_by_pk written bytes | 14.9 KB | 11.4 KB | −23% |
+| delete_one_by_pk written bytes | 14.6 KB | 11.1 KB | −24% |
+| insert_all puts | 2,031 | 1,075 | −47% |
+| json_store rows / commit | 1,018 | 61 | −94% |
+| tracked_state.tree_chunk values | 110.8 KB | 74.6 KB | −33% |
+| changelog.change values | 112.6 KB | 206.5 KB | +83% |
+
+The compressed leaf is smaller than the old uncompressed leaf plus the
+store row it replaced, so even the single-row-update write path
+improves despite carrying neighbors.
+
+e2e merge_10k (stash-alternating, two pairs): 195.9/200.5 ms baseline →
+194.1/188.8 ms, ≈ −3.4% end to end from halved backend puts and the
+deleted per-row point read.
+
+Open cost, recorded deliberately: changelog.change values grow +94 KB
+per 1k commit — each inlined payload is carried twice (tree value +
+change record), and change records are individually-stored ~200 B rows
+that chunk-boundary compression cannot reach. Chunking change records
+the way ref chunks already are is the natural counterpart cut; with it,
+total written bytes would move from −16% to roughly −34%.
+
+Suites: engine all green / sdk 26 / cli 46; workspace clippy zero.
+Validation invariant worth recording: every seed/test path that
+constructs rows independently of live staging must make the same
+inline-vs-ref decision — content-addressed roots fail with "tree chunk
+is missing" the moment a fixture hand-rolls a `Ref` for content under
+the threshold.
+
+## 2026-06-11 — Single-Copy Payloads: the Tree References Changes, Changes Own Content
+
+Supersedes the previous entry's design while keeping its changelog half.
+First-principles question that produced it: the tree leaf has always
+stored the `change_id` of the change that produced the row — a key that
+addresses the payload in changelog, a store deliberately kept
+row-addressable. So why does the tree carry the payload (or a ref to
+it) at all? The historical answer was self-containment against
+changelog pruning; the actual GC contract is liveness-based (a change
+is deletable only when no tracked-state row references its change id),
+which guarantees every live row's payload is resolvable. The
+duplication had no reason to exist.
+
+The design:
+
+- Tree leaf values carry identity only: change id, commit id, deleted,
+  timestamps. No snapshot, no metadata, no refs.
+- Change records own the payload, exactly once: inline JSON text at or
+  under 256 bytes (`JsonSlot`, kept from the previous cut), a
+  content-addressed json_store ref above it.
+- Materialization batch point-reads `changelog.change` by deduplicated
+  change id — plain row hits. Commit rows (`lix_commit`) skip even
+  that: their snapshot is derived from the key.
+- Diff/merge payload equality gets a fast path that is better than
+  byte comparison ever was: unchanged rows inherit the same change id,
+  so equality is an id compare with zero loads; only live/live pairs
+  with differing change ids (cross-branch same-content writes) load
+  payload slots, batched.
+- Chunk-boundary zstd is deleted. The identity-only tree lands at the
+  compressed pair's size raw, so there is nothing left worth
+  compressing — and no decompression on any read path.
+
+Accounting at the 1k bench (lix_sqlite) against the same baseline as
+the previous entry, with the inline+zstd pair for comparison:
+
+| Metric | baseline | inline+zstd pair | single-copy |
+| --- | --- | --- | --- |
+| insert_all written bytes | 534.4 KB | 448.5 KB (−16%) | 449.4 KB (−16%) |
+| update_all written bytes | 620.7 KB | 539.6 KB (−13%) | 553.3 KB (−11%) |
+| update_one_by_pk written bytes | 14.9 KB | 11.4 KB (−23%) | 11.5 KB (−23%) |
+| delete_one_by_pk written bytes | 14.6 KB | 11.1 KB (−24%) | 11.3 KB (−23%) |
+| delete_all written bytes | 185.2 KB | 137.9 KB (−26%) | 182.5 KB (−1.5%) |
+| insert_all puts | 2,031 | 1,075 | 1,074 |
+| json_store rows / commit | 1,018 | 61 | 60 |
+| tracked_state.tree_chunk values | 110.8 KB | 74.6 KB (zstd) | 74.6 KB (raw) |
+| changelog.change values | 112.6 KB | 206.5 KB | 206.5 KB |
+| read_one_by_pk (10k cell) | ~4.9 ms | ~6.1 ms (+24%) | ~4.1–5.1 ms (parity) |
+| read_all_rows (10k cell) | ~47 ms | ~40–41 ms (≈−13%) | ~44–53 ms (parity within noise; mean ~+3%) |
+| e2e merge_10k | ~200.7 ms | −3.4% | ~parity (191.7/204.8) |
+
+Single-copy column refreshed after cleanup removed an orphan per-commit
+json_store snapshot write (−1 put, −1 store row, −65 B per commit);
+tree_chunk and changelog.change are unchanged.
+
+The pivotal line is tree_chunk: dropping payloads from the tree
+reaches the exact size compression reached, with no codec, no
+wasm-zstd parity concerns, and no whole-chunk decompress on point
+reads — which is where the pair paid its +24%. The remaining deltas
+against the pair: delete_all loses the compression of tombstone-heavy
+chunks (−1% vs −26%), and changelog.change grows identically in both
+designs (the payload's single home). Each payload is now stored
+exactly once; the changelog "duplication" cost recorded in the
+previous entry is gone by construction rather than compressed.
+
+Costs, stated plainly: bulk reads and merge resolve payloads through
+batched changelog point reads instead of carrying them in the tree —
+measured at parity on both cells, but it is one more batched read per
+materialization. The GC contract is now load-bearing
+for reads, not just history integrity. It was previously only implied
+by the GC type shapes (`GcRoot::BranchHead`, `GcLiveSet`;
+`collect_garbage` is still a no-op) — this entry and the comment in
+`row_materialization.rs` are its first normative statement. Precisely:
+a future GC may delete a change record only if its change id appears
+in no leaf value of any retained commit root's tree — tombstone leaves
+included, since diff/merge equality keys on change ids. Commit rows
+(`lix_commit`) are exempt from the scan: materialization never loads
+their change records (the snapshot derives from the key), and their
+retention follows commit-graph reachability.
+
+Suites: engine 1,565 / sdk 26 / cli 46, all green; workspace warnings
+zero.
+
+## 2026-06-11 — json_store Compression Floor: 16 KiB → 512 B
+
+One constant. The 16 KiB floor predates inline payloads, when the store
+was dominated by ~127-byte rows that zstd inflates (probed: 200 real
+payloads grew at 1.01×). After single-copy, payloads at or under 256
+bytes never reach the store, so everything in it is mid-size JSON —
+the floor's dead zone had become the entire population. The existing
+`MIN_ZSTD_SAVINGS_BYTES = 128` guard keeps poor compressors raw, and
+the Zstd codec tag has been in the format since the store existed, so
+this is not a format change.
+
+Measured at the 1k bench: json_store values 156.8 → 136.0 KB (−13%),
+insert written bytes 449.4 → 436.5 KB. The modest ratio is honest
+corpus reality: the bench's mid-size payloads are lock-file dependency
+descriptors whose bytes are roughly half sha512 integrity hashes —
+incompressible entropy. Less hash-dense JSON corpora will compress
+better; this is close to the worst case, and the guard makes the
+change strictly non-negative everywhere.
+
+e2e merge_10k (stash-alternating, two pairs): 191.5/197.5 →
+190.0/195.6 ms, ≈ −0.9%, consistent in direction across both pairs.
+
+Cumulative campaign written-bytes: 534.4 → 436.5 KB per 1k-row insert
+commit (−18.3%). Suites: engine 1,569 all green.

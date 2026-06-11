@@ -236,6 +236,23 @@ impl StageJson {
     pub(crate) fn materialize(&self) -> String {
         self.normalized.as_ref().to_string()
     }
+
+    /// Whether this payload inlines into values instead of the json store.
+    pub(crate) fn is_inline(&self) -> bool {
+        self.normalized.len() <= crate::json_store::JSON_INLINE_MAX_BYTES
+    }
+
+    pub(crate) fn slot_ref(&self) -> crate::json_store::JsonSlotRef<'_> {
+        if self.is_inline() {
+            crate::json_store::JsonSlotRef::Inline(&self.normalized)
+        } else {
+            crate::json_store::JsonSlotRef::Ref(&self.json_ref)
+        }
+    }
+
+    pub(crate) fn slot(&self) -> crate::json_store::JsonSlot {
+        self.slot_ref().to_owned_slot()
+    }
 }
 
 #[expect(clippy::unnecessary_wraps)]
@@ -378,8 +395,6 @@ pub(crate) struct StagedCommitChangeRef {
     pub(crate) file_id: Option<String>,
     pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: ChangeId,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,

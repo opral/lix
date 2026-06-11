@@ -307,19 +307,16 @@ impl LixChangeRow {
 fn commit_record_canonical_change(
     commit: &crate::changelog::CommitRecord,
 ) -> crate::commit_graph::CommitGraphChange {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "id": commit.commit_id.to_string(),
-    }))
-    .expect("lix_commit snapshot serialization should not fail");
+    let snapshot_content =
+        crate::changelog::commit_row_snapshot_json(&commit.commit_id.to_string())
+            .expect("lix_commit snapshot serialization should not fail");
     crate::commit_graph::CommitGraphChange {
         id: commit.change_id,
         entity_pk: crate::entity_pk::EntityPk::single(commit.commit_id),
         schema_key: "lix_commit".to_string(),
         file_id: None,
-        snapshot_ref: Some(crate::json_store::JsonRef::for_content(
-            snapshot_content.as_bytes(),
-        )),
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
     }
 }

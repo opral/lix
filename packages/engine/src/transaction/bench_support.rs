@@ -72,6 +72,17 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
+    /// Like [`Self::new`], but enables the engine's deterministic functions
+    /// before any transaction runs, so ids and timestamps are
+    /// sequence-derived and two fixtures produce byte-identical storage.
+    pub async fn new_deterministic(
+        storage: StorageContext<B>,
+        rows: Vec<BenchTransactionRow>,
+    ) -> Self {
+        seed_deterministic_mode(storage.clone());
+        Self::new(storage, rows).await
+    }
+
     pub async fn new(storage: StorageContext<B>, rows: Vec<BenchTransactionRow>) -> Self {
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new(
@@ -197,6 +208,45 @@ where
         self.read_one(&self.rows[self.rows.len() / 2]).await
     }
 
+    /// Returns every visible row's identity and snapshot content, sorted by
+    /// identity. Unlike the timed read helpers this materializes contents,
+    /// so equivalence tests can compare logical state across backends.
+    pub async fn read_all_contents(&self) -> Vec<(String, String)> {
+        let read = SharedStorageRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .expect("begin transaction bench read"),
+        );
+        let rows = self
+            .live_state
+            .reader(read)
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["json_pointer".to_string()],
+                    branch_ids: vec![BENCH_BRANCH_ID.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones: false,
+                    ..LiveStateFilter::default()
+                },
+                projection: LiveStateProjection::default(),
+                limit: None,
+            })
+            .await
+            .expect("scan transaction bench rows");
+        let mut contents = rows
+            .into_iter()
+            .map(|row| {
+                let entity_pk = row
+                    .entity_pk
+                    .as_json_array_text()
+                    .expect("bench entity pk should render");
+                (entity_pk, row.snapshot_content.unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+        contents.sort();
+        contents
+    }
+
     async fn read_one(&self, row: &BenchTransactionRow) -> usize {
         let read = SharedStorageRead::new(
             self.storage
@@ -247,6 +297,15 @@ where
         write_accounting(logical_rows, outcome.storage_stats)
     }
 
+    /// Per-row inventory of one space, for byte-exact layout comparison.
+    pub fn space_inventory(&self, space_name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .expect("begin transaction inventory read");
+        crate::storage_bench::space_inventory(&read, space_name)
+    }
+
     pub fn layout_accounting(&self) -> Vec<BenchLayoutAccounting> {
         let read = self
             .storage
@@ -263,6 +322,41 @@ where
             })
             .collect()
     }
+}
+
+fn seed_deterministic_mode<B>(storage: StorageContext<B>)
+where
+    B: StorageBackend + Clone + Send + Sync + 'static,
+{
+    let snapshot_content = serde_json::to_string(&json!({
+        "key": crate::functions::DETERMINISTIC_MODE_KEY,
+        "value": { "enabled": true },
+    }))
+    .expect("deterministic mode snapshot should serialize");
+    let mut writes = storage.new_write_set();
+    let row = crate::untracked_state::UntrackedStateRow {
+        entity_pk: EntityPk::single(crate::functions::DETERMINISTIC_MODE_KEY),
+        schema_key: "lix_key_value".to_string(),
+        file_id: None,
+        snapshot_content: Some(snapshot_content),
+        metadata: None,
+        created_at: crate::common::LixTimestamp::expect_parse(
+            "created_at",
+            "1970-01-01T00:00:00.000Z",
+        ),
+        updated_at: crate::common::LixTimestamp::expect_parse(
+            "updated_at",
+            "1970-01-01T00:00:00.000Z",
+        ),
+        global: true,
+        branch_id: GLOBAL_BRANCH_ID.to_string(),
+    };
+    UntrackedStateContext::new()
+        .writer(&mut writes)
+        .stage_rows(std::iter::once(row.as_ref()))
+        .expect("deterministic mode row should stage");
+    crate::storage_bench::commit_write_set_for_bench(&storage, writes)
+        .expect("deterministic mode row should commit");
 }
 
 fn write_accounting(logical_rows: usize, stats: StorageWriteSetStats) -> BenchWriteAccounting {

@@ -848,8 +848,8 @@ mod tests {
                 entity_pk: crate::entity_pk::EntityPk::single(commit_id),
                 schema_key: "lix_commit".to_string(),
                 file_id: None,
-                snapshot_ref: None,
-                metadata_ref: None,
+                snapshot: crate::json_store::JsonSlot::None,
+                metadata: crate::json_store::JsonSlot::None,
                 created_at: ts("2026-01-01T00:00:00Z"),
             },
             parent_commit_ids: parent_commit_ids

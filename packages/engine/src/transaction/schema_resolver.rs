@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::LixError;
-use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact};
+use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -14,12 +14,7 @@ use crate::transaction::staging::PreparedStateRowOverlay;
 
 pub(crate) struct TransactionSchemaResolver {
     context: Arc<CatalogContext>,
-    catalogs_by_domain: BTreeMap<Domain, CatalogEntry>,
-}
-
-enum CatalogEntry {
-    SchemaFacts(Vec<SchemaCatalogFact>),
-    Catalog(CatalogSnapshot),
+    catalogs_by_domain: BTreeMap<Domain, TransactionCatalog>,
 }
 
 impl TransactionSchemaResolver {
@@ -37,43 +32,26 @@ impl TransactionSchemaResolver {
         domain: &Domain,
     ) -> Result<(), LixError> {
         let domain = domain.schema_catalog_domain();
-        let needs_load = !self.catalogs_by_domain.contains_key(&domain);
-        if needs_load {
-            let facts = if let Some(staged) = staged {
-                let reader = TransactionSchemaLiveStateReader {
-                    base: live_state,
-                    staged,
-                };
-                self.context
-                    .schema_facts_for_domain(&reader, &domain)
-                    .await?
-            } else {
-                self.context
-                    .schema_facts_for_domain(live_state, &domain)
-                    .await?
-            };
-            self.catalogs_by_domain
-                .insert(domain.clone(), CatalogEntry::SchemaFacts(facts));
+        if self.catalogs_by_domain.contains_key(&domain) {
+            return Ok(());
         }
-
-        let should_materialize = self
-            .catalogs_by_domain
-            .get(&domain)
-            .is_some_and(|entry| matches!(entry, CatalogEntry::SchemaFacts(_)));
-        if should_materialize {
-            #[cfg(feature = "storage-benches")]
-            crate::storage_bench::record_transaction_schema_catalog_load();
-            let entry = self
-                .catalogs_by_domain
-                .remove(&domain)
-                .expect("schema catalog entry should exist after load");
-            let CatalogEntry::SchemaFacts(facts) = entry else {
-                unreachable!("catalog entry was checked as schema facts");
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_transaction_schema_catalog_load();
+        let catalog = if let Some(staged) = staged {
+            let reader = TransactionSchemaLiveStateReader {
+                base: live_state,
+                staged,
             };
-            let catalog = CatalogSnapshot::from_schema_facts(&facts)?;
-            self.catalogs_by_domain
-                .insert(domain, CatalogEntry::Catalog(catalog));
-        }
+            self.context
+                .compiled_catalog_for_domain(&reader, &domain)
+                .await?
+        } else {
+            self.context
+                .compiled_catalog_for_domain(live_state, &domain)
+                .await?
+        };
+        self.catalogs_by_domain
+            .insert(domain, TransactionCatalog::Shared(catalog));
         Ok(())
     }
 
@@ -82,20 +60,14 @@ impl TransactionSchemaResolver {
         live_state: &dyn LiveStateReader,
         staged: &PreparedStateRowOverlay,
         domain: &Domain,
-    ) -> Result<&mut CatalogSnapshot, LixError> {
+    ) -> Result<&mut TransactionCatalog, LixError> {
         self.load_catalog_for_domain(live_state, Some(staged), domain)
             .await?;
         let domain = domain.schema_catalog_domain();
-        match self
+        Ok(self
             .catalogs_by_domain
             .get_mut(&domain)
-            .expect("catalog cache should contain requested branch")
-        {
-            CatalogEntry::Catalog(catalog) => Ok(catalog),
-            CatalogEntry::SchemaFacts(_) => {
-                unreachable!("schema catalog should be materialized before mutable access")
-            }
-        }
+            .expect("catalog cache should contain requested branch"))
     }
 
     pub(crate) async fn catalog_for_validation(
@@ -106,22 +78,21 @@ impl TransactionSchemaResolver {
         self.load_catalog_for_domain(live_state, None, domain)
             .await?;
         let domain = domain.schema_catalog_domain();
-        match self
+        Ok(self
             .catalogs_by_domain
             .get(&domain)
             .expect("catalog cache should contain requested branch")
-        {
-            CatalogEntry::Catalog(catalog) => Ok(catalog),
-            CatalogEntry::SchemaFacts(_) => {
-                unreachable!("schema catalog should be materialized before validation access")
-            }
-        }
+            .snapshot())
     }
 
-    pub(crate) fn remember_schema_facts(&mut self, domain: &Domain, facts: Vec<SchemaCatalogFact>) {
+    pub(crate) fn remember_compiled_catalog(
+        &mut self,
+        domain: &Domain,
+        catalog: Arc<CatalogSnapshot>,
+    ) {
         self.catalogs_by_domain.insert(
             domain.schema_catalog_domain(),
-            CatalogEntry::SchemaFacts(facts),
+            TransactionCatalog::Shared(catalog),
         );
     }
 }

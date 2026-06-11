@@ -42,6 +42,10 @@ mod tests {
         assert_eq!(
             passed,
             vec![
+                "baseline::spaces_do_not_collide",
+                "baseline::scan_is_space_scoped",
+                "baseline::unbounded_delete_range_truncates_only_target_space",
+                "baseline::empty_space_reads_are_empty",
                 "baseline::get_many_returns_requested_slots",
                 "baseline::get_many_empty_key_list",
                 "baseline::delete_many_missing_keys_is_idempotent",

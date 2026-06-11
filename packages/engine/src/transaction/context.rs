@@ -272,19 +272,24 @@ where
                 FunctionContext::prepare(&runtime_live_state).await?
             };
             let functions = runtime_functions.provider();
-            let schema_facts = {
+            let schema_catalog = {
                 let visible_live_state = live_state.reader(&read);
                 catalog_context
-                    .schema_facts_for_domain(
+                    .compiled_catalog_for_domain(
                         &visible_live_state,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
                     )
                     .await?
             };
-            Ok::<_, LixError>((active_branch_id, runtime_functions, functions, schema_facts))
+            Ok::<_, LixError>((
+                active_branch_id,
+                runtime_functions,
+                functions,
+                schema_catalog,
+            ))
         }
         .await;
-        let (active_branch_id, runtime_functions, functions, schema_facts) = match setup_result {
+        let (active_branch_id, runtime_functions, functions, schema_catalog) = match setup_result {
             Ok(result) => result,
             Err(error) => {
                 return Err(error);
@@ -292,9 +297,9 @@ where
         };
         drop(read);
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
-        schema_resolver.remember_schema_facts(
+        schema_resolver.remember_compiled_catalog(
             &Domain::schema_catalog(active_branch_id.clone(), true),
-            schema_facts,
+            schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         Ok(OpenTransaction {

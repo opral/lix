@@ -1,6 +1,11 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
+/// Single space used by most baseline fixtures; the cross-space tests at
+/// the bottom of this file pin space isolation.
+const TEST_SPACE: SpaceId = SpaceId(7);
+const OTHER_SPACE: SpaceId = SpaceId(8);
+
 use bytes::Bytes;
 
 use crate::backend::conformance::{
@@ -9,16 +14,28 @@ use crate::backend::conformance::{
     open_backend,
 };
 use crate::backend::{
-    Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, CoreProjection, GetOptions,
-    Key, KeyRange, KeyRef, ProjectedValue, ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, SpaceId, WriteOptions, get_many as backend_get_many,
-    visit_range as backend_visit_range,
+    Backend, BackendError, BackendRead, BackendWrite, CoreProjection, GetOptions, Key, KeyRange,
+    KeyRef, ProjectedValue, ProjectedValueRef, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
+    SpaceId, WriteOptions, get_many as backend_get_many,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
     F: BackendFactory,
 {
+    report.run("baseline::spaces_do_not_collide", || {
+        spaces_do_not_collide(factory)
+    });
+    report.run("baseline::scan_is_space_scoped", || {
+        scan_is_space_scoped(factory)
+    });
+    report.run(
+        "baseline::unbounded_delete_range_truncates_only_target_space",
+        || unbounded_delete_range_truncates_only_target_space(factory),
+    );
+    report.run("baseline::empty_space_reads_are_empty", || {
+        empty_space_reads_are_empty(factory)
+    });
     report.run("baseline::get_many_returns_requested_slots", || {
         get_many_returns_requested_slots(factory)
     });
@@ -101,7 +118,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, &requested, GetOptions::default())
+    let result = backend_get_many(&read, TEST_SPACE, &requested, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     if result.values.len() != requested.len() {
@@ -142,7 +159,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, &[], GetOptions::default())
+    let result = backend_get_many(&read, TEST_SPACE, &[], GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
     if result.entries_for_requested_keys(&[]).is_empty() {
         Ok(())
@@ -166,7 +183,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .delete_many(&[key("missing")])
+        .delete_many(TEST_SPACE, &[key("missing")])
         .map_err(|error| format!("delete_many missing failed: {error}"))?;
     write
         .commit()
@@ -187,7 +204,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .delete_many(&[key("a")])
+        .delete_many(TEST_SPACE, &[key("a")])
         .map_err(|error| format!("delete_many existing failed: {error}"))?;
     write
         .commit()
@@ -212,10 +229,13 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .delete_range(KeyRange {
-            lower: Bound::Included(key("b")),
-            upper: Bound::Excluded(key("d")),
-        })
+        .delete_range(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Included(key("b")),
+                upper: Bound::Excluded(key("d")),
+            },
+        )
         .map_err(|error| format!("delete_range failed: {error}"))?;
     write
         .commit()
@@ -246,16 +266,19 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(put_batch([
-            full_put(key("b"), "B"),
-            full_put(key("c"), "C2"),
-        ]))
+        .put_many(
+            TEST_SPACE,
+            put_batch([full_put(key("b"), "B"), full_put(key("c"), "C2")]),
+        )
         .map_err(|error| format!("put_many failed: {error}"))?;
     write
-        .delete_range(KeyRange {
-            lower: Bound::Included(key("b")),
-            upper: Bound::Excluded(key("d")),
-        })
+        .delete_range(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Included(key("b")),
+                upper: Bound::Excluded(key("d")),
+            },
+        )
         .map_err(|error| format!("delete_range failed: {error}"))?;
     write
         .commit()
@@ -280,13 +303,16 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .delete_range(KeyRange {
-            lower: Bound::Included(key("b")),
-            upper: Bound::Excluded(key("d")),
-        })
+        .delete_range(
+            TEST_SPACE,
+            KeyRange {
+                lower: Bound::Included(key("b")),
+                upper: Bound::Excluded(key("d")),
+            },
+        )
         .map_err(|error| format!("delete_range failed: {error}"))?;
     write
-        .put_many(put_batch([full_put(key("c"), "C")]))
+        .put_many(TEST_SPACE, put_batch([full_put(key("c"), "C")]))
         .map_err(|error| format!("put_many failed: {error}"))?;
     write
         .commit()
@@ -316,7 +342,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(put_batch([full_put(key("a"), "B")]))
+        .put_many(TEST_SPACE, put_batch([full_put(key("a"), "B")]))
         .map_err(|error| format!("put_many overwrite failed: {error}"))?;
     write
         .commit()
@@ -337,7 +363,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(put_batch([full_put(key("a"), "B")]))
+        .put_many(TEST_SPACE, put_batch([full_put(key("a"), "B")]))
         .map_err(|error| format!("put_many overwrite failed: {error}"))?;
     write
         .commit()
@@ -660,39 +686,37 @@ where
 
     for limit in [1usize, 2, 3] {
         let mut actual = Vec::new();
-        read.with_range_scan(
-            range.clone(),
-            ScanOptions {
-                limit_rows: limit,
-                ..Default::default()
-            },
-            |cursor| {
-                loop {
-                    let mut entries = Vec::new();
-                    let result = cursor.visit_next(limit, &mut |key: KeyRef<'_>,
-                                                                 value: ProjectedValueRef<
-                        '_,
-                    >| {
+        loop {
+            let mut entries = Vec::new();
+            let resume_after = actual.last().map(|(key, _): &(Key, Bytes)| key.clone());
+            let result = read
+                .scan(
+                    TEST_SPACE,
+                    range.clone(),
+                    ScanOptions {
+                        limit_rows: limit,
+                        resume_after: resume_after.as_ref(),
+                        ..Default::default()
+                    },
+                    &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
                         entries.push(ReadEntry {
                             key: key.to_owned_key(),
                             value: value.to_owned(),
                         });
                         Ok(())
-                    })?;
-                    actual.extend(entries_to_key_values(&entries));
-                    if !result.has_more {
-                        break;
-                    }
-                    if actual.len() > expected.len() {
-                        return Err(BackendError::Io(format!(
-                            "cursor limit {limit} emitted too many rows: {actual:?}"
-                        )));
-                    }
-                }
-                Ok(())
-            },
-        )
-        .map_err(|error| format!("with_range_scan limit {limit} failed: {error}"))?;
+                    },
+                )
+                .map_err(|error| format!("paged scan limit {limit} failed: {error}"))?;
+            actual.extend(entries_to_key_values(&entries));
+            if !result.has_more {
+                break;
+            }
+            if actual.len() > expected.len() {
+                return Err(format!(
+                    "paged scan limit {limit} emitted too many rows: {actual:?}"
+                ));
+            }
+        }
         if actual != expected {
             return Err(format!(
                 "cursor drain mismatch for limit {limit}: expected {expected:?}, got {actual:?}"
@@ -742,10 +766,10 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(put_batch([
-            full_put(key_a.clone(), "A"),
-            full_put(key_b.clone(), "B"),
-        ]))
+        .put_many(
+            TEST_SPACE,
+            put_batch([full_put(key_a.clone(), "A"), full_put(key_b.clone(), "B")]),
+        )
         .map_err(|error| format!("put_many failed: {error}"))?;
 
     let read_before_commit = backend
@@ -753,6 +777,7 @@ where
         .map_err(|error| format!("begin_read before commit failed: {error}"))?;
     let before_commit = backend_get_many(
         &read_before_commit,
+        TEST_SPACE,
         &[key_a.clone(), key_b.clone()],
         GetOptions::default(),
     )
@@ -781,7 +806,7 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(put_batch([full_put(key("a"), "A")]))
+        .put_many(TEST_SPACE, put_batch([full_put(key("a"), "A")]))
         .map_err(|error| format!("put_many failed: {error}"))?;
     write
         .rollback()
@@ -802,10 +827,10 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("begin_write failed: {error}"))?;
     write
-        .put_many(put_batch([full_put(key("a"), "A2")]))
+        .put_many(TEST_SPACE, put_batch([full_put(key("a"), "A2")]))
         .map_err(|error| format!("put_many overwrite failed: {error}"))?;
     write
-        .delete_many(&[key("b")])
+        .delete_many(TEST_SPACE, &[key("b")])
         .map_err(|error| format!("delete_many failed: {error}"))?;
     write
         .rollback()
@@ -829,7 +854,7 @@ where
     seed_full_values(&backend, test_space, [("a", "C")])?;
 
     let old_keys = [key("a")];
-    let old_result = backend_get_many(&old_read, &old_keys, GetOptions::default())
+    let old_result = backend_get_many(&old_read, TEST_SPACE, &old_keys, GetOptions::default())
         .map_err(|error| format!("old read get_many failed: {error}"))?;
     assert_read_entries(
         &old_result.entries_for_requested_keys(&old_keys),
@@ -865,6 +890,7 @@ where
     let full_keys = [key("a")];
     let full = backend_get_many(
         &read,
+        TEST_SPACE,
         &full_keys,
         GetOptions {
             projection: CoreProjection::FullValue,
@@ -877,6 +903,7 @@ where
     let key_only_keys = [key("a")];
     let key_only = backend_get_many(
         &read,
+        TEST_SPACE,
         &key_only_keys,
         GetOptions {
             projection: CoreProjection::KeyOnly,
@@ -945,12 +972,272 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, &requested, GetOptions::default())
+    let result = backend_get_many(&read, TEST_SPACE, &requested, GetOptions::default())
         .map_err(|error| format!("opaque get_many failed: {error}"))?;
     assert_read_entries_bytes(
         &result.entries_for_requested_keys(&requested),
         &[(opaque_key.0, opaque_value)],
     )
+}
+
+/// Spaces are physically independent: the same logical key in two spaces
+/// must hold independent values, and deletes must not cross spaces.
+fn spaces_do_not_collide<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin write failed: {error}"))?;
+    write
+        .put_many(
+            TEST_SPACE,
+            put_batch([full_put(key("k"), Bytes::from_static(b"A"))]),
+        )
+        .map_err(|error| format!("put space A failed: {error}"))?;
+    write
+        .put_many(
+            OTHER_SPACE,
+            put_batch([full_put(key("k"), Bytes::from_static(b"B"))]),
+        )
+        .map_err(|error| format!("put space B failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    let a = backend_get_many(&read, TEST_SPACE, &[key("k")], GetOptions::default())
+        .map_err(|error| format!("get space A failed: {error}"))?;
+    let b = backend_get_many(&read, OTHER_SPACE, &[key("k")], GetOptions::default())
+        .map_err(|error| format!("get space B failed: {error}"))?;
+    if a.values[0].as_ref() != Some(&ProjectedValue::FullValue(Bytes::from_static(b"A")))
+        || b.values[0].as_ref() != Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
+    {
+        return Err("same logical key must hold independent values per space".to_string());
+    }
+    drop(read);
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin delete write failed: {error}"))?;
+    write
+        .delete_many(TEST_SPACE, &[key("k")])
+        .map_err(|error| format!("delete failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    let a = backend_get_many(&read, TEST_SPACE, &[key("k")], GetOptions::default())
+        .map_err(|error| format!("get after delete failed: {error}"))?;
+    let b = backend_get_many(&read, OTHER_SPACE, &[key("k")], GetOptions::default())
+        .map_err(|error| format!("get other after delete failed: {error}"))?;
+    if a.values[0].as_ref().is_some() {
+        return Err("delete_many must remove the key in its space".to_string());
+    }
+    if b.values[0].as_ref().is_none() {
+        return Err("delete_many must not cross spaces".to_string());
+    }
+    Ok(())
+}
+
+/// Scans observe only their space, including under resume_after pagination
+/// near the end of the space (an off-by-one upper bound leaks the
+/// neighbouring space here).
+fn scan_is_space_scoped<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin write failed: {error}"))?;
+    for space in [TEST_SPACE, OTHER_SPACE, SpaceId(9)] {
+        write
+            .put_many(
+                space,
+                put_batch([
+                    full_put(key("a"), Bytes::from_static(b"1")),
+                    full_put(key("b"), Bytes::from_static(b"2")),
+                    full_put(key("c"), Bytes::from_static(b"3")),
+                ]),
+            )
+            .map_err(|error| format!("seed failed: {error}"))?;
+    }
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    let mut rows = Vec::new();
+    let result = read
+        .scan(
+            OTHER_SPACE,
+            full_key_range(),
+            ScanOptions::default(),
+            &mut |key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                rows.push(key.to_owned_key());
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("scan failed: {error}"))?;
+    if rows != vec![key("a"), key("b"), key("c")] || result.has_more {
+        return Err(format!("scan must observe only its space, got {rows:?}"));
+    }
+
+    // Resume past the last row: must report exhaustion, never the
+    // neighbouring space's rows.
+    let mut tail = Vec::new();
+    let result = read
+        .scan(
+            OTHER_SPACE,
+            full_key_range(),
+            ScanOptions {
+                resume_after: Some(&key("c")),
+                ..ScanOptions::default()
+            },
+            &mut |key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                tail.push(key.to_owned_key());
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("resume scan failed: {error}"))?;
+    if !tail.is_empty() || result.has_more {
+        return Err(format!(
+            "resume past the space's last key must be empty, got {tail:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The truncate idiom: an unbounded delete_range clears exactly its space,
+/// and the space accepts writes again afterwards.
+fn unbounded_delete_range_truncates_only_target_space<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin write failed: {error}"))?;
+    for space in [TEST_SPACE, OTHER_SPACE, SpaceId(9)] {
+        write
+            .put_many(
+                space,
+                put_batch([
+                    full_put(key("a"), Bytes::from_static(b"1")),
+                    full_put(key("b"), Bytes::from_static(b"2")),
+                ]),
+            )
+            .map_err(|error| format!("seed failed: {error}"))?;
+    }
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin truncate failed: {error}"))?;
+    write
+        .delete_range(OTHER_SPACE, full_key_range())
+        .map_err(|error| format!("truncate failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    for (space, expected) in [(TEST_SPACE, 2usize), (OTHER_SPACE, 0), (SpaceId(9), 2)] {
+        let mut rows = 0usize;
+        read.scan(
+            space,
+            full_key_range(),
+            ScanOptions::default(),
+            &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                rows += 1;
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("scan failed: {error}"))?;
+        if rows != expected {
+            return Err(format!(
+                "truncate must clear only its space: space {space:?} held {rows} rows, expected {expected}"
+            ));
+        }
+    }
+    drop(read);
+
+    // The truncated space must accept writes again.
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin rewrite failed: {error}"))?;
+    write
+        .put_many(
+            OTHER_SPACE,
+            put_batch([full_put(key("z"), Bytes::from_static(b"9"))]),
+        )
+        .map_err(|error| format!("rewrite failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+    Ok(())
+}
+
+/// A never-written space behaves as empty for every read shape.
+fn empty_space_reads_are_empty<F>(factory: &F) -> ConformanceResult
+where
+    F: BackendFactory,
+{
+    let backend = open_backend(factory);
+    let empty = SpaceId(0x7777_7777);
+    let read = backend
+        .begin_read(ReadOptions::default())
+        .map_err(|error| format!("begin read failed: {error}"))?;
+    let result = backend_get_many(&read, empty, &[key("a")], GetOptions::default())
+        .map_err(|error| format!("get failed: {error}"))?;
+    if result.values[0].as_ref().is_some() {
+        return Err("never-written space must miss".to_string());
+    }
+    let mut rows = 0usize;
+    let scan = read
+        .scan(
+            empty,
+            full_key_range(),
+            ScanOptions::default(),
+            &mut |_key: KeyRef<'_>, _value: ProjectedValueRef<'_>| {
+                rows += 1;
+                Ok(())
+            },
+        )
+        .map_err(|error| format!("scan failed: {error}"))?;
+    if rows != 0 || scan.has_more {
+        return Err("never-written space must scan empty".to_string());
+    }
+    drop(read);
+    let mut write = backend
+        .begin_write(WriteOptions::default())
+        .map_err(|error| format!("begin write failed: {error}"))?;
+    write
+        .delete_range(empty, full_key_range())
+        .map_err(|error| format!("delete_range on empty space failed: {error}"))?;
+    write
+        .commit()
+        .map_err(|error| format!("commit failed: {error}"))?;
+    Ok(())
+}
+
+fn full_key_range() -> KeyRange {
+    KeyRange {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+    }
 }
 
 fn seed_full_values<B, I>(backend: &B, _test_space: SpaceId, rows: I) -> ConformanceResult
@@ -962,9 +1249,13 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("seed begin_write failed: {error}"))?;
     write
-        .put_many(put_batch(rows.into_iter().map(
-            |(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes),
-        )))
+        .put_many(
+            TEST_SPACE,
+            put_batch(
+                rows.into_iter()
+                    .map(|(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes)),
+            ),
+        )
         .map_err(|error| format!("seed put_many failed: {error}"))?;
     write
         .commit()
@@ -981,9 +1272,13 @@ where
         .begin_write(WriteOptions::default())
         .map_err(|error| format!("seed begin_write failed: {error}"))?;
     write
-        .put_many(put_batch(rows.into_iter().map(
-            |(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes),
-        )))
+        .put_many(
+            TEST_SPACE,
+            put_batch(
+                rows.into_iter()
+                    .map(|(key_bytes, value_bytes)| full_put(key(key_bytes), value_bytes)),
+            ),
+        )
         .map_err(|error| format!("seed put_many failed: {error}"))?;
     write
         .commit()
@@ -1001,18 +1296,16 @@ where
     R: BackendRead,
 {
     let mut entries = Vec::with_capacity(opts.limit_rows);
-    let result = backend_visit_range(
-        read,
-        range,
-        opts,
-        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            entries.push(ReadEntry {
-                key: key.to_owned_key(),
-                value: value.to_owned(),
-            });
-            Ok(())
-        },
-    )?;
+    let result = read.scan(TEST_SPACE, range, opts, &mut |key: KeyRef<'_>,
+                                                           value: ProjectedValueRef<
+        '_,
+    >| {
+        entries.push(ReadEntry {
+            key: key.to_owned_key(),
+            value: value.to_owned(),
+        });
+        Ok(())
+    })?;
     Ok(ScanChunk {
         entries,
         has_more: result.has_more,
@@ -1034,7 +1327,7 @@ where
     let read = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
-    let result = backend_get_many(&read, &keys, GetOptions::default())
+    let result = backend_get_many(&read, TEST_SPACE, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
     assert_optional_entry_map(&result.entries_for_requested_keys(&keys), expected)
 }

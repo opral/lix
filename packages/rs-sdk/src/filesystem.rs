@@ -8,7 +8,7 @@ use std::time::Duration;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     Backend, BackendError, BackendWrite, CommitResult, Engine, FsMkdirOptions, FsRmOptions,
-    FsWriteOptions, LixError, PutBatch, ReadOptions, SessionContext, WriteOptions,
+    FsWriteOptions, LixError, PutBatch, ReadOptions, SessionContext, SpaceId, WriteOptions,
 };
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
@@ -145,16 +145,24 @@ impl Backend for FsBackend {
 
 #[cfg(feature = "sqlite")]
 impl BackendWrite for FsWrite<'_> {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        self.inner.put_many(entries)
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, keys: &[lix_engine::Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(keys)
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[lix_engine::Key],
+    ) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, range: lix_engine::KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(range)
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: lix_engine::KeyRange,
+    ) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range)
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
@@ -239,16 +247,24 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        self.inner.put_many(entries)
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, keys: &[lix_engine::Key]) -> Result<(), BackendError> {
-        self.inner.delete_many(keys)
+    fn delete_many(
+        &mut self,
+        space: SpaceId,
+        keys: &[lix_engine::Key],
+    ) -> Result<(), BackendError> {
+        self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, range: lix_engine::KeyRange) -> Result<(), BackendError> {
-        self.inner.delete_range(range)
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: lix_engine::KeyRange,
+    ) -> Result<(), BackendError> {
+        self.inner.delete_range(space, range)
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {

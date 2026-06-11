@@ -260,32 +260,52 @@ impl StorageWriteSet {
             groups, mut stats, ..
         } = self;
 
-        for group in groups {
+        for mut group in groups {
+            // Lower each space batch in ascending key order. Hash-keyed
+            // spaces such as json_store produce effectively random insertion
+            // order; sorted batches let B-tree backends write with cursor
+            // locality instead of a fresh seek per key. Most other spaces
+            // already produce key order (BTreeMap
+            // iteration, time-ordered ids), so the common case is a
+            // read-only scan.
+            let puts_sorted = group
+                .puts
+                .is_sorted_by(|left, right| left.key.0 <= right.key.0);
+            let deletes_sorted = group.deletes.is_sorted();
+            #[cfg(feature = "storage-benches")]
+            if order_stats_enabled() && !group.puts.is_empty() {
+                eprintln!(
+                    "write-set-order space={} puts={} puts_sorted={puts_sorted} deletes={} deletes_sorted={deletes_sorted}",
+                    group.space.name,
+                    group.puts.len(),
+                    group.deletes.len(),
+                );
+            }
+            if !puts_sorted {
+                group
+                    .puts
+                    .sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
+            }
+            if !deletes_sorted {
+                group.deletes.sort_unstable();
+            }
             if !group.puts.is_empty() {
                 stats.put_batches += 1;
                 stats.backend_calls += 1;
-                let entries = group
-                    .puts
-                    .into_iter()
-                    .map(|entry| PutEntry {
-                        key: group.space.encode_key(&entry.key),
-                        value: entry.value,
-                    })
-                    .collect();
                 write
-                    .put_many(PutBatch { entries })
+                    .put_many(
+                        group.space.id,
+                        PutBatch {
+                            entries: group.puts,
+                        },
+                    )
                     .map_err(StorageWriteSetError::Backend)?;
             }
             if !group.deletes.is_empty() {
                 stats.delete_batches += 1;
                 stats.backend_calls += 1;
-                let deletes = group
-                    .deletes
-                    .iter()
-                    .map(|key| group.space.encode_key(key))
-                    .collect::<Vec<_>>();
                 write
-                    .delete_many(&deletes)
+                    .delete_many(group.space.id, &group.deletes)
                     .map_err(StorageWriteSetError::Backend)?;
             }
         }
@@ -385,6 +405,14 @@ impl From<BackendError> for StorageWriteSetError {
     }
 }
 
+#[cfg(feature = "storage-benches")]
+fn order_stats_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("LIX_WRITE_SET_ORDER_STATS").is_some());
+    *ENABLED
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -393,10 +421,9 @@ mod tests {
     use std::rc::Rc;
 
     use crate::backend::{
-        Backend, BackendError, BackendRangeScan, BackendRead, BackendWrite, BufferedRangeScan,
-        CommitResult, GetOptions, InMemoryBackend, Key, KeyRange, PointVisitor, PutBatch,
-        ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
-        WriteStats,
+        Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions,
+        InMemoryBackend, Key, KeyRange, PointVisitor, PutBatch, ReadOptions, ScanOptions,
+        ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
     };
     use crate::storage::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -838,10 +865,9 @@ mod tests {
     }
 
     impl BackendRead for CountingRead {
-        type RangeScan<'a> = BufferedRangeScan;
-
         fn visit_keys<V>(
             &self,
+            _space: SpaceId,
             _keys: &[Key],
             _opts: GetOptions<'_>,
             _visitor: &mut V,
@@ -852,50 +878,41 @@ mod tests {
             unimplemented!("not used by write-set tests")
         }
 
-        fn with_range_scan<T, F>(
+        fn scan<V>(
             &self,
+            _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-            _f: F,
-        ) -> Result<T, BackendError>
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
         where
-            F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+            V: ScanVisitor + ?Sized,
         {
             unimplemented!("not used by write-set tests")
         }
     }
 
     impl BackendWrite for CountingWrite {
-        fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
             if self.state.fail_point.get() == Some(FailPoint::PutMany) {
                 return Err(BackendError::Io("put_many failed".to_string()));
             }
-            let space = entries
-                .entries
-                .first()
-                .map(|entry| physical_space(&entry.key))
-                .unwrap_or(SpaceId(0));
-            let keys = entries
-                .entries
-                .into_iter()
-                .map(|entry| logical_key(entry.key))
-                .collect();
+            let keys = entries.entries.into_iter().map(|entry| entry.key).collect();
             self.put_batches.borrow_mut().push((space, keys));
             Ok(())
         }
 
-        fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+        fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
             if self.state.fail_point.get() == Some(FailPoint::DeleteMany) {
                 return Err(BackendError::Io("delete_many failed".to_string()));
             }
-            let space = keys.first().map(physical_space).unwrap_or(SpaceId(0));
             self.delete_batches
                 .borrow_mut()
-                .push((space, keys.iter().cloned().map(logical_key).collect()));
+                .push((space, keys.to_vec()));
             Ok(())
         }
 
-        fn delete_range(&mut self, _range: KeyRange) -> Result<(), BackendError> {
+        fn delete_range(&mut self, _space: SpaceId, _range: KeyRange) -> Result<(), BackendError> {
             Ok(())
         }
 

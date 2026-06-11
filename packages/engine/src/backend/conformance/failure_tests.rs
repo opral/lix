@@ -8,10 +8,9 @@ use super::{
     BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus, run_backend_conformance,
 };
 use crate::backend::{
-    Backend, BackendError, BackendRead, BackendWrite, BufferedRangeScan, CommitResult,
-    CoreProjection, GetOptions, Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch,
-    ReadEntry, ReadOptions, ScanOptions, ScanResult, ScanVisitor, StoredValue, WriteOptions,
-    WriteStats,
+    Backend, BackendError, BackendRead, BackendWrite, CommitResult, CoreProjection, GetOptions,
+    Key, KeyRange, KeyRef, PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions,
+    ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<Key, Bytes>;
@@ -269,11 +268,37 @@ impl Backend for BrokenBackend {
     }
 }
 
-impl BackendRead for BrokenRead {
-    type RangeScan<'a> = BufferedRangeScan;
+fn broken_physical_key(space: SpaceId, key: &Key) -> Key {
+    let mut bytes = Vec::with_capacity(4 + key.0.len());
+    bytes.extend_from_slice(&space.0.to_be_bytes());
+    bytes.extend_from_slice(&key.0);
+    Key(Bytes::from(bytes))
+}
 
+fn broken_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
+    let map = |bound: Bound<Key>, unbounded: Bound<Key>| match bound {
+        Bound::Included(key) => Bound::Included(broken_physical_key(space, &key)),
+        Bound::Excluded(key) => Bound::Excluded(broken_physical_key(space, &key)),
+        Bound::Unbounded => unbounded,
+    };
+    KeyRange {
+        lower: map(
+            range.lower,
+            Bound::Included(Key(Bytes::copy_from_slice(&space.0.to_be_bytes()))),
+        ),
+        upper: map(
+            range.upper,
+            space.0.checked_add(1).map_or(Bound::Unbounded, |next| {
+                Bound::Excluded(Key(Bytes::copy_from_slice(&next.to_be_bytes())))
+            }),
+        ),
+    }
+}
+
+impl BackendRead for BrokenRead {
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -281,6 +306,11 @@ impl BackendRead for BrokenRead {
     where
         V: PointVisitor + ?Sized,
     {
+        let physical_keys = keys
+            .iter()
+            .map(|key| broken_physical_key(space, key))
+            .collect::<Vec<_>>();
+        let keys = &physical_keys[..];
         let live_entries;
         let current_commit_count = *self
             .commit_count
@@ -302,15 +332,22 @@ impl BackendRead for BrokenRead {
         visit_keys_from_map(entries, self.mode, keys, opts, visitor)
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
     where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        V: ScanVisitor + ?Sized,
     {
+        let range = broken_physical_range(space, range);
+        let resume_after = opts.resume_after.map(|key| broken_physical_key(space, key));
+        let opts = ScanOptions {
+            resume_after: resume_after.as_ref(),
+            ..opts
+        };
         let live_entries;
         let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
             live_entries = self
@@ -322,15 +359,19 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        let mut cursor =
-            BufferedRangeScan::new(scan_rows_from_map(entries, self.mode, range, opts));
-        f(&mut cursor)
+        // Stream through the map visitor so has_more survives; strip the
+        // internal space prefix before the caller observes keys.
+        let mut strip = |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
+            visitor.visit(KeyRef(&key.0[4..]), value)
+        };
+        visit_range_from_map(entries, self.mode, range, opts, &mut strip)
     }
 }
 
 impl BackendWrite for BrokenWrite {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
-        for entry in entries.entries {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        for mut entry in entries.entries {
+            entry.key = broken_physical_key(space, &entry.key);
             let mut bytes = stored_value_bytes(entry.value);
             if matches!(self.mode, BrokenMode::CorruptOpaqueBytes) {
                 bytes = Bytes::from(
@@ -346,8 +387,9 @@ impl BackendWrite for BrokenWrite {
         Ok(())
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
+            let key = &broken_physical_key(space, key);
             if matches!(self.mode, BrokenMode::DeleteManyIgnoresExistingKeys)
                 && self.staged.contains_key(key)
             {
@@ -358,7 +400,8 @@ impl BackendWrite for BrokenWrite {
         Ok(())
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
+        let range = broken_physical_range(space, range);
         if matches!(self.mode, BrokenMode::DeleteRangeIgnoresUpperBound) {
             self.staged.retain(|key, _value| match &range.lower {
                 Bound::Included(lower) => key < lower,
@@ -424,9 +467,7 @@ where
 {
     let mut seen = BTreeSet::new();
     for (index, key) in keys.iter().enumerate() {
-        if matches!(mode, BrokenMode::GetManyMissesExistingKey)
-            && key == &Key(Bytes::from_static(b"a"))
-        {
+        if matches!(mode, BrokenMode::GetManyMissesExistingKey) && key.0.ends_with(b"a") {
             visitor.visit(index, key, None)?;
             continue;
         }
@@ -492,29 +533,6 @@ where
     }
 
     Ok(ScanResult { emitted, has_more })
-}
-
-fn scan_rows_from_map(
-    entries: &BrokenMap,
-    mode: BrokenMode,
-    range: KeyRange,
-    opts: ScanOptions<'_>,
-) -> Vec<ReadEntry> {
-    let mut rows = Vec::new();
-    let _ = visit_range_from_map(
-        entries,
-        mode,
-        range,
-        opts,
-        &mut |key: KeyRef<'_>, value: ProjectedValueRef<'_>| {
-            rows.push(ReadEntry {
-                key: key.to_owned_key(),
-                value: value.to_owned(),
-            });
-            Ok(())
-        },
-    );
-    rows
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {

@@ -7,7 +7,8 @@ use bytes::Bytes;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use lix_engine::backend::{
     Backend, BackendError, BackendRead, BackendWrite, CommitResult, GetOptions, Key, KeyRange,
-    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, SpaceId, WriteOptions,
+    PointVisitor, ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
+    SpaceId, WriteOptions,
 };
 use lix_engine::storage::{
     PointReadPlan, ScanPlan, StorageContext, StorageCoreProjection, StorageGetOptions,
@@ -202,10 +203,9 @@ impl<R> BackendRead for CountingRead<R>
 where
     R: BackendRead,
 {
-    type RangeScan<'cursor> = R::RangeScan<'cursor>;
-
     fn visit_keys<V>(
         &self,
+        space: SpaceId,
         keys: &[Key],
         opts: GetOptions<'_>,
         visitor: &mut V,
@@ -223,23 +223,24 @@ where
             inner: visitor,
             stats: Arc::clone(&self.stats),
         };
-        self.inner.visit_keys(keys, opts, &mut counting)
+        self.inner.visit_keys(space, keys, opts, &mut counting)
     }
 
-    fn with_range_scan<T, F>(
+    fn scan<V>(
         &self,
+        space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        f: F,
-    ) -> Result<T, BackendError>
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
     where
-        F: FnOnce(&mut Self::RangeScan<'_>) -> Result<T, BackendError>,
+        V: ScanVisitor + ?Sized,
     {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.scan_entry_calls += 1;
         }
-        self.inner.with_range_scan(range, opts, f)
+        self.inner.scan(space, range, opts, visitor)
     }
 
     fn close(self) -> Result<(), BackendError>
@@ -278,7 +279,7 @@ impl<W> BackendWrite for CountingWrite<W>
 where
     W: BackendWrite,
 {
-    fn put_many(&mut self, entries: PutBatch) -> Result<(), BackendError> {
+    fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
@@ -289,27 +290,27 @@ where
                 .map(|entry| entry.key.0.len() + entry.value.bytes.len())
                 .sum::<usize>();
         }
-        self.inner.put_many(entries)
+        self.inner.put_many(space, entries)
     }
 
-    fn delete_many(&mut self, keys: &[Key]) -> Result<(), BackendError> {
+    fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
             stats.write_deletes += keys.len();
             stats.write_bytes += keys.iter().map(|key| key.0.len()).sum::<usize>();
         }
-        self.inner.delete_many(keys)
+        self.inner.delete_many(space, keys)
     }
 
-    fn delete_range(&mut self, range: KeyRange) -> Result<(), BackendError> {
+    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.write_batches += 1;
             stats.write_delete_ranges += 1;
             stats.write_bytes += range_bound_len(&range.lower) + range_bound_len(&range.upper);
         }
-        self.inner.delete_range(range)
+        self.inner.delete_range(space, range)
     }
 
     fn commit(self) -> Result<CommitResult, BackendError>

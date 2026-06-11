@@ -10,7 +10,6 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
-use crate::json_store::JsonRef;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
@@ -222,9 +221,7 @@ where
                 entity_pk: &change.entity_pk,
                 change_id: change.change_id,
                 commit_id: plan.commit.id,
-                snapshot_ref: change.snapshot_ref.as_ref(),
-                metadata_ref: change.metadata_ref.as_ref(),
-                deleted: change.snapshot_ref.is_none(),
+                deleted: change.snapshot.is_none(),
                 created_at: change.created_at,
                 updated_at: change.created_at,
             })
@@ -235,9 +232,7 @@ where
             entity_pk: &commit_row_change.entity_pk,
             change_id: commit_row_change.change_id,
             commit_id: plan.commit.id,
-            snapshot_ref: commit_row_change.snapshot_ref.as_ref(),
-            metadata_ref: commit_row_change.metadata_ref.as_ref(),
-            deleted: commit_row_change.snapshot_ref.is_none(),
+            deleted: commit_row_change.snapshot.is_none(),
             created_at: commit_row_change.created_at,
             updated_at: commit_row_change.created_at,
         });
@@ -258,8 +253,8 @@ fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {
         entity_pk: change.entity_pk.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(JsonRef::for_content(change.snapshot_content.as_bytes())),
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&change.snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
         created_at: change.created_at,
     }
 }
@@ -272,8 +267,8 @@ fn seed_commit_row_change_record(commit: &InitSeedCommit) -> Result<ChangeRecord
         entity_pk: EntityPk::single(commit.id),
         schema_key: "lix_commit".to_string(),
         file_id: None,
-        snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
     })
 }
@@ -282,16 +277,18 @@ fn stage_init_json_payloads(
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
 ) -> Result<(), LixError> {
-    let commit_snapshot = commit_row_snapshot_content(&plan.commit.id.to_string())?;
+    // Only payloads above the inline threshold need store rows; inline
+    // payloads live in their change records, and the commit-row snapshot
+    // is derived from the key at read time.
     JsonStoreContext::new().writer().stage_batch(
         writes,
         JsonWritePlacementRef::OutOfBand,
         plan.changes
             .iter()
-            .map(|change| NormalizedJsonRef::new(change.snapshot_content.as_str()))
-            .chain(std::iter::once(NormalizedJsonRef::new(
-                commit_snapshot.as_str(),
-            ))),
+            .filter(|change| {
+                change.snapshot_content.len() > crate::json_store::JSON_INLINE_MAX_BYTES
+            })
+            .map(|change| NormalizedJsonRef::new(change.snapshot_content.as_str())),
     )?;
     Ok(())
 }
@@ -329,9 +326,7 @@ async fn stage_init_changelog_commit(
 }
 
 fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-    encode_snapshot(json!({
-        "id": commit_id,
-    }))
+    crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
 fn commit_change_ref_from_seed_change(change: &InitSeedChange) -> CommitChangeRef {
