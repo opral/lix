@@ -28,6 +28,7 @@ use crate::changelog::{
     CommitChangeRefSet, CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest,
     CommitProjection, CommitRecord, CommitScanBatch, CommitScanRequest, GcPlan, GcRoot,
 };
+use crate::json_store::JsonSlot;
 use crate::storage::{
     PointReadPlan, ScanPlan, StorageBackend, StorageContext, StorageCoreProjection,
     StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageRead,
@@ -1484,8 +1485,8 @@ mod tests {
             schema_key: "alpha".to_string(),
             entity_pk: EntityPk::single("entity-0"),
             file_id: None,
-            snapshot_ref: None,
-            metadata_ref: None,
+            snapshot: JsonSlot::None,
+            metadata: JsonSlot::None,
             created_at: ts("2026-05-12T00:00:00Z"),
         });
         append.commit_change_refs[0].entries.insert(
@@ -1667,8 +1668,8 @@ mod tests {
                 schema_key: "message".to_string(),
                 entity_pk: EntityPk::single(format!("entity-{index:04}")),
                 file_id: None,
-                snapshot_ref: None,
-                metadata_ref: None,
+                snapshot: JsonSlot::None,
+                metadata: JsonSlot::None,
                 created_at: ts("2026-05-20T00:00:00Z"),
             })
             .collect::<Vec<_>>();

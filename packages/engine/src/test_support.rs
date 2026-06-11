@@ -118,8 +118,6 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     )
     .await?;
     let typed_commit_id = test_commit_id(&commit_id_text);
-    let commit_snapshot = commit_row_snapshot_content(&commit_id_text)?;
-    let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
     let commit_entity_pk = crate::entity_pk::EntityPk::single(&commit_id_text);
     let mut deltas = staged
         .change_commit_ids
@@ -133,9 +131,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
                 entity_pk: &change.entity_pk,
                 change_id: change.change_id,
                 commit_id: *change_commit_id,
-                snapshot_ref: change.snapshot_ref.as_ref(),
-                metadata_ref: change.metadata_ref.as_ref(),
-                deleted: change.snapshot_ref.is_none(),
+                deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     &row.created_at,
@@ -153,8 +149,6 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         entity_pk: &commit_entity_pk,
         change_id: staged.commit_change_id,
         commit_id: typed_commit_id,
-        snapshot_ref: Some(&commit_snapshot_ref),
-        metadata_ref: None,
         deleted: false,
         created_at: staged.commit_created_at,
         updated_at: staged.commit_created_at,
@@ -198,8 +192,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
     )
     .await?;
     let typed_commit_id = test_commit_id(&commit_id_text);
-    let commit_snapshot = commit_row_snapshot_content(&commit_id_text)?;
-    let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
     let commit_entity_pk = crate::entity_pk::EntityPk::single(&commit_id_text);
     let mut deltas = staged
         .change_commit_ids
@@ -213,9 +205,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 entity_pk: &change.entity_pk,
                 change_id: change.change_id,
                 commit_id: *change_commit_id,
-                snapshot_ref: change.snapshot_ref.as_ref(),
-                metadata_ref: change.metadata_ref.as_ref(),
-                deleted: change.snapshot_ref.is_none(),
+                deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     &row.created_at,
@@ -233,8 +223,6 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         entity_pk: &commit_entity_pk,
         change_id: staged.commit_change_id,
         commit_id: typed_commit_id,
-        snapshot_ref: Some(&commit_snapshot_ref),
-        metadata_ref: None,
         deleted: false,
         created_at: staged.commit_created_at,
         updated_at: staged.commit_created_at,
@@ -341,9 +329,6 @@ async fn stage_test_changelog_commit(
         refs.push(commit_change_ref_from_change(change));
         change_commit_ids.push((row_index, row.commit_id));
     }
-    let commit_snapshot = commit_row_snapshot_content(commit_id)?;
-    let commit_snapshot_ref = JsonRef::for_content(commit_snapshot.as_bytes());
-    json_payloads.push((commit_snapshot_ref, commit_snapshot));
     stage_json_payloads(writes, &json_payloads)?;
     let created_at = rows
         .first()
@@ -368,18 +353,6 @@ async fn stage_test_changelog_commit(
         change_commit_ids,
         commit_change_id: typed_commit_change_id,
         commit_created_at: created_at,
-    })
-}
-
-fn commit_row_snapshot_content(commit_id: &str) -> Result<String, crate::LixError> {
-    serde_json::to_string(&serde_json::json!({
-        "id": commit_id,
-    }))
-    .map_err(|error| {
-        crate::LixError::new(
-            crate::LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode lix_commit snapshot: {error}"),
-        )
     })
 }
 
@@ -434,13 +407,19 @@ fn final_state_row_winner_indices(
 }
 
 fn json_payloads_from_materialized(row: &MaterializedTrackedStateRow) -> Vec<(JsonRef, String)> {
+    // Mirror production staging: only payloads above the inline threshold
+    // get json_store rows.
     let mut payloads = Vec::new();
     if let Some(snapshot) = row.snapshot_content.as_deref() {
-        payloads.push((prepare_json_ref(snapshot), snapshot.to_string()));
+        if snapshot.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
+            payloads.push((prepare_json_ref(snapshot), snapshot.to_string()));
+        }
     }
     if let Some(metadata) = row.metadata.as_ref() {
         let serialized = crate::serialize_row_metadata(metadata);
-        payloads.push((prepare_json_ref(&serialized), serialized));
+        if serialized.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
+            payloads.push((prepare_json_ref(&serialized), serialized));
+        }
     }
     payloads
 }
@@ -480,11 +459,19 @@ pub(crate) fn tracked_change_from_materialized(
         entity_pk: row.entity_pk.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: row.snapshot_content.as_deref().map(prepare_json_ref),
-        metadata_ref: row.metadata.as_ref().map(|value| {
-            let serialized = crate::serialize_row_metadata(value);
-            prepare_json_ref(&serialized)
-        }),
+        snapshot: row
+            .snapshot_content
+            .as_deref()
+            .map_or(crate::json_store::JsonSlot::None, |content| {
+                crate::json_store::JsonSlot::from_json(content)
+            }),
+        metadata: row
+            .metadata
+            .as_ref()
+            .map_or(crate::json_store::JsonSlot::None, |value| {
+                let serialized = crate::serialize_row_metadata(value);
+                crate::json_store::JsonSlot::from_json(&serialized)
+            }),
         created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.updated_at),
     })
 }

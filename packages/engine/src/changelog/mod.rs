@@ -16,7 +16,7 @@ pub(crate) use codec::{
     encode_change_record, encode_commit_change_ref_chunk, encode_commit_record,
 };
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
-pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE};
+pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
@@ -24,4 +24,5 @@ pub(crate) use types::{
     CommitChangeRefChunkView, CommitChangeRefSet, CommitId, CommitLoadBatch, CommitLoadEntry,
     CommitLoadRequest, CommitProjection, CommitRecord, CommitScanBatch, CommitScanRequest,
     EntityPkRef, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
+    commit_row_snapshot_json,
 };

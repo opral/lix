@@ -24,8 +24,8 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
             schema_key: &record.schema_key,
             entity_pk: &record.entity_pk.parts,
             file_id: record.file_id.as_deref(),
-            snapshot_ref: record.snapshot_ref.as_ref(),
-            metadata_ref: record.metadata_ref.as_ref(),
+            snapshot: record.snapshot.as_ref_slot(),
+            metadata: record.metadata.as_ref_slot(),
             created_at: record.created_at,
         },
     )
@@ -42,8 +42,8 @@ pub(crate) fn decode_change_record(
         schema_key: view.schema_key.to_string(),
         entity_pk: entity_pk_from_ref(view.entity_pk)?,
         file_id: view.file_id.map(str::to_string),
-        snapshot_ref: view.snapshot_ref,
-        metadata_ref: view.metadata_ref,
+        snapshot: view.snapshot,
+        metadata: view.metadata,
         created_at: view.created_at,
     })
 }
@@ -312,7 +312,7 @@ mod tests {
     use super::*;
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
-    use crate::json_store::JsonRef;
+    use crate::json_store::{JsonRef, JsonSlot};
 
     fn ref_chunk(entries: Vec<CommitChangeRef>) -> CommitChangeRefChunk {
         CommitChangeRefChunk {
@@ -644,8 +644,8 @@ mod tests {
             entity_pk: EntityPk::from_parts(vec!["part-a".to_string(), "part-b".to_string()])
                 .expect("entity pk should build"),
             file_id: Some("file-1".to_string()),
-            snapshot_ref: Some(JsonRef::for_content(b"snapshot")),
-            metadata_ref: Some(JsonRef::for_content(b"metadata")),
+            snapshot: JsonSlot::Ref(JsonRef::for_content(b"snapshot")),
+            metadata: JsonSlot::Ref(JsonRef::for_content(b"metadata")),
             created_at: LixTimestamp::expect_parse("created_at", "2026-06-10T00:00:00.000Z"),
         }
     }
@@ -660,11 +660,27 @@ mod tests {
     }
 
     #[test]
+    fn change_record_round_trips_inline_payloads() {
+        // The Inline slot variant (tag 2) carries the JSON text itself; it
+        // must survive encode/decode byte-exactly, including non-ASCII.
+        let record = ChangeRecord {
+            snapshot: JsonSlot::from_json("{\"name\":\"libf\u{00f6}\u{4e2d}\"}"),
+            metadata: JsonSlot::from_json("{\"k\":1}"),
+            ..full_record()
+        };
+        assert!(matches!(record.snapshot, JsonSlot::Inline(_)));
+        let encoded = encode_change_record(&record).expect("record should encode");
+        let decoded =
+            decode_change_record(&encoded, record.change_id).expect("record should decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
     fn change_record_round_trips_with_empty_options() {
         let record = ChangeRecord {
             file_id: None,
-            snapshot_ref: None,
-            metadata_ref: None,
+            snapshot: JsonSlot::None,
+            metadata: JsonSlot::None,
             ..full_record()
         };
         let encoded = encode_change_record(&record).expect("record should encode");

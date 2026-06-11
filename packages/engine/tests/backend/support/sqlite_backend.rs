@@ -19,7 +19,7 @@ use tempfile::TempDir;
 
 /// Format v2: one table per storage space instead of a single interleaved
 /// entries table. Hard cut; v1 files are rejected without migration.
-pub const SQLITE_FORMAT_VERSION: u32 = 2;
+pub const SQLITE_FORMAT_VERSION: u32 = 3;
 const LEGACY_ENTRIES_TABLE: &str = "lix_internal_entries";
 /// Keys per point-read chunk; each key binds 2 parameters (ordinal + key),
 /// so a full chunk uses 800 of SQLite's historical 999-parameter floor.
@@ -532,10 +532,12 @@ fn initialize_database(path: &Path) -> Result<Connection, BackendError> {
             "sqlite backend format version {user_version} is newer than supported version {SQLITE_FORMAT_VERSION}"
         )));
     }
-    if user_version == 1 || legacy_table_exists(&conn)? {
+    // v3 changed the engine value layouts (identity-only tree values,
+    // JsonSlot change records); v1 and v2 files cannot be decoded.
+    if (1..SQLITE_FORMAT_VERSION).contains(&user_version) || legacy_table_exists(&conn)? {
         return Err(BackendError::Io(format!(
-            "sqlite backend format version 1 is not supported by version {SQLITE_FORMAT_VERSION}; \
-             there is no migration, recreate the database"
+            "sqlite backend format version {user_version} is not supported by version \
+             {SQLITE_FORMAT_VERSION}; there is no migration, recreate the database"
         )));
     }
 

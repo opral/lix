@@ -1,7 +1,7 @@
 use crate::LixError;
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
+use crate::json_store::{JsonRef, JsonSlot};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -440,8 +440,8 @@ pub(crate) struct ChangeRecord {
     pub(crate) schema_key: String,
     pub(crate) entity_pk: EntityPk,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) snapshot: JsonSlot,
+    pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -453,10 +453,10 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) entity_pk: &'a [String],
     #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<&'a JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    #[musli(with = crate::json_store::json_slot_storage_ref)]
+    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    #[musli(with = crate::json_store::json_slot_storage_ref)]
+    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -469,10 +469,10 @@ pub(crate) struct ChangeRecordView<'a> {
     pub(crate) entity_pk: EntityPkRef<'a>,
     #[musli(with = crate::storage_codec::option)]
     pub(crate) file_id: Option<&'a str>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<JsonRef>,
+    #[musli(with = crate::json_store::json_slot_storage)]
+    pub(crate) snapshot: JsonSlot,
+    #[musli(with = crate::json_store::json_slot_storage)]
+    pub(crate) metadata: JsonSlot,
     pub(crate) created_at: LixTimestamp,
 }
 
@@ -546,4 +546,17 @@ pub(crate) struct GcPlan {
     pub(crate) live: GcLiveSet,
     pub(crate) sweep: GcSweepSet,
     pub(crate) repair: GcRepairSet,
+}
+
+/// Canonical `lix_commit` row snapshot. Byte-identity across every producer
+/// (staging, rebuild, graph materialization, row materialization) is
+/// load-bearing: content-addressed roots and deterministic inline slots
+/// both depend on it, so all paths must call this one function.
+pub(crate) fn commit_row_snapshot_json(commit_id: &str) -> Result<String, LixError> {
+    serde_json::to_string(&serde_json::json!({ "id": commit_id })).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("commit row snapshot serialization failed: {error}"),
+        )
+    })
 }

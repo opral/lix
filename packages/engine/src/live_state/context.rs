@@ -562,7 +562,6 @@ mod tests {
         commit_ids: &[&str],
     ) {
         let mut writes = storage.new_write_set();
-        let mut json_writer = JsonStoreContext::new().writer();
         let mut append = crate::changelog::ChangelogAppend::default();
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
@@ -591,19 +590,7 @@ mod tests {
         drop(writer);
         for commit_id in commit_ids {
             let commit_id_text = CommitId::for_test_label(commit_id).to_string();
-            let snapshot_content = commit_row_snapshot_content(&commit_id_text)
-                .expect("commit snapshot should encode");
-            let snapshot_ref = JsonRef::for_content(snapshot_content.as_bytes());
-            json_writer
-                .stage_batch(
-                    &mut writes,
-                    JsonWritePlacementRef::OutOfBand,
-                    [NormalizedJsonRef::trusted_prehashed(
-                        &snapshot_content,
-                        snapshot_ref.clone(),
-                    )],
-                )
-                .expect("commit snapshot should stage");
+
             let change_id = format!("{commit_id_text}:commit");
             let entity_pk = EntityPk::single(&commit_id_text);
             let deltas = [TrackedStateDeltaRef {
@@ -612,8 +599,6 @@ mod tests {
                 entity_pk: &entity_pk,
                 change_id: ChangeId::for_test_label(&change_id),
                 commit_id: CommitId::for_test_label(&commit_id_text),
-                snapshot_ref: Some(&snapshot_ref),
-                metadata_ref: None,
                 deleted: false,
                 created_at: ts("1970-01-01T00:00:00.000Z"),
                 updated_at: ts("1970-01-01T00:00:00.000Z"),
@@ -730,16 +715,6 @@ mod tests {
                 crate::changelog::ChangelogContext::new().writer(&mut changelog_read, writes);
             crate::changelog::ChangelogWriter::stage_append(&mut writer, append).await?;
             drop(writer);
-            let snapshot_content = commit_row_snapshot_content(&commit_id)?;
-            let snapshot_ref = JsonRef::for_content(snapshot_content.as_bytes());
-            json_writer.stage_batch(
-                writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::trusted_prehashed(
-                    &snapshot_content,
-                    snapshot_ref.clone(),
-                )],
-            )?;
             let commit_entity_pk = EntityPk::single(&commit_id);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
             let mut deltas = rows
@@ -750,9 +725,7 @@ mod tests {
                     entity_pk: &change.entity_pk,
                     change_id: change.change_id,
                     commit_id: typed_commit_id,
-                    snapshot_ref: change.snapshot_ref.as_ref(),
-                    metadata_ref: change.metadata_ref.as_ref(),
-                    deleted: change.snapshot_ref.is_none(),
+                    deleted: change.snapshot.is_none(),
                     created_at: *created_at,
                     updated_at: *updated_at,
                 })
@@ -763,8 +736,6 @@ mod tests {
                 entity_pk: &commit_entity_pk,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 commit_id: typed_commit_id,
-                snapshot_ref: Some(&snapshot_ref),
-                metadata_ref: None,
                 deleted: false,
                 created_at: commit_created_at,
                 updated_at: commit_created_at,
@@ -775,15 +746,6 @@ mod tests {
                 .await?;
         }
         Ok(())
-    }
-
-    fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-        serde_json::to_string(&json!({ "id": commit_id })).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("failed to encode test commit snapshot: {error}"),
-            )
-        })
     }
 
     fn stage_json_payloads_from_materialized(

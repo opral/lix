@@ -2,7 +2,6 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChange {
@@ -10,8 +9,8 @@ pub(crate) struct CommitGraphChange {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) snapshot: crate::json_store::JsonSlot,
+    pub(crate) metadata: crate::json_store::JsonSlot,
     pub(crate) created_at: LixTimestamp,
 }
 

@@ -780,6 +780,25 @@ where
         Ok(())
     }
 
+    /// Batched payload-slot load for diff's cross-change equality fallback.
+    pub(crate) async fn load_change_payloads(
+        &mut self,
+        change_ids: &[ChangeId],
+    ) -> Result<
+        HashMap<ChangeId, (crate::json_store::JsonSlot, crate::json_store::JsonSlot)>,
+        LixError,
+    > {
+        let records = crate::tracked_state::row_materialization::load_change_records(
+            &self.store,
+            change_ids.iter().copied(),
+        )
+        .await?;
+        Ok(records
+            .into_iter()
+            .map(|(change_id, record)| (change_id, (record.snapshot, record.metadata)))
+            .collect())
+    }
+
     pub(crate) async fn diff_tree_entries_at_commits(
         &mut self,
         left_commit_id: &str,
@@ -829,7 +848,9 @@ where
         let source_diff = self
             .diff_commits(base_commit_id, source_commit_id, request)
             .await?;
-        merge::plan_merge(&target_diff, &source_diff)
+        let fallback_ids = merge::merge_payload_fallback_ids(&target_diff, &source_diff);
+        let payloads = self.load_change_payloads(&fallback_ids).await?;
+        merge::plan_merge(&target_diff, &source_diff, &payloads)
     }
 }
 
@@ -923,8 +944,7 @@ where
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
                 deleted: delta.deleted,
-                snapshot_ref: delta.snapshot_ref.copied(),
-                metadata_ref: delta.metadata_ref.copied(),
+
                 created_at,
                 updated_at: delta.updated_at,
             };
@@ -1053,15 +1073,9 @@ fn validate_diff_row_against_changelog(
             row.change_id
         )));
     }
-    if row.deleted != change.snapshot_ref.is_none() {
+    if row.deleted != change.snapshot.is_none() {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{}' deleted flag does not match changelog snapshot",
-            row.change_id
-        )));
-    }
-    if row.snapshot_ref != change.snapshot_ref || row.metadata_ref != change.metadata_ref {
-        return Err(LixError::unknown(format!(
-            "tracked-state diff row for change '{}' payload refs do not match changelog change",
             row.change_id
         )));
     }
@@ -1082,24 +1096,14 @@ fn change_record_from_commit_record(commit: &CommitRecord) -> Result<ChangeRecor
         schema_key: "lix_commit".to_string(),
         entity_pk: EntityPk::single(commit.commit_id),
         file_id: None,
-        snapshot_ref: Some(crate::json_store::JsonRef::for_content(
-            snapshot_content.as_bytes(),
-        )),
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
     })
 }
 
 fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-    serde_json::to_string(&serde_json::json!({
-        "id": commit_id,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode lix_commit snapshot: {error}"),
-        )
-    })
+    crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
 fn tracked_state_identity_from_diff_row(
@@ -2384,7 +2388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_resolve_json_snapshot_refs() {
+    async fn reads_resolve_large_payload_refs_via_change_records() {
         let storage = StorageContext::new(InMemoryStorageBackend::new());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(1536);
@@ -2425,6 +2429,151 @@ mod tests {
 
         assert_eq!(loaded.snapshot_content, row.snapshot_content);
         assert_eq!(scanned[0].snapshot_content, row.snapshot_content);
+    }
+
+    #[tokio::test]
+    async fn missing_change_record_for_live_row_errors_clearly() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let row = row("entity-a", "change-a", "commit-1");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("root should write");
+
+        // Violate the GC contract: delete the change record while a live
+        // tree row still references its change id.
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            crate::changelog::CHANGE_SPACE,
+            crate::storage::StorageKey(bytes::Bytes::from(crate::changelog::change_key(
+                row.change_id,
+            ))),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .expect("delete should commit");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
+        let error = reader
+            .scan_rows_at_commit("commit-1", &test_schema_scan_request())
+            .await
+            .expect_err("materialization must reject a dangling change id");
+        assert!(
+            error.message.contains("missing from the changelog"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rows_materialize_key_derived_snapshots() {
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let row = row("entity-a", "change-a", "commit-1");
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("root should write");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
+        let request = TrackedStateScanRequest {
+            filter: crate::tracked_state::TrackedStateFilter {
+                schema_keys: vec!["lix_commit".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = reader
+            .scan_rows_at_commit("commit-1", &request)
+            .await
+            .expect("commit rows should scan");
+        let commit_row = rows
+            .iter()
+            .find(|row| row.schema_key == "lix_commit")
+            .expect("commit row should exist");
+        // The snapshot is synthesized from the key and must be byte-equal
+        // to the canonical producer.
+        let expected = crate::changelog::commit_row_snapshot_json(
+            &commit_row
+                .entity_pk
+                .parts
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .expect("snapshot should encode");
+        assert_eq!(
+            commit_row.snapshot_content.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_threshold_boundary_routes_payloads_deterministically() {
+        // 256 bytes inlines into the change record; 257 takes the
+        // json_store ref path. Both must read back identically.
+        let storage = StorageContext::new(InMemoryStorageBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        // row_with_value wraps values as {"value":"<v>"} (12 framing bytes);
+        // size the inner strings so the stored payloads land exactly at the
+        // threshold and one byte over.
+        let rows = [
+            row_with_value("entity-at", "change-at", "commit-1", &"a".repeat(256 - 12)),
+            row_with_value(
+                "entity-over",
+                "change-over",
+                "commit-1",
+                &"b".repeat(257 - 12),
+            ),
+        ];
+        let at_threshold = rows[0].snapshot_content.clone().expect("payload");
+        let over_threshold = rows[1].snapshot_content.clone().expect("payload");
+        assert_eq!(at_threshold.len(), 256);
+        assert_eq!(over_threshold.len(), 257);
+        write_root_for_test(&storage, &tracked_state, "commit-1", None, &rows)
+            .await
+            .expect("root should write");
+
+        let mut reader = tracked_state.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .expect("read should open"),
+        );
+        let scanned = reader
+            .scan_rows_at_commit("commit-1", &test_schema_scan_request())
+            .await
+            .expect("rows should scan");
+        let by_pk = |pk: &str| {
+            scanned
+                .iter()
+                .find(|row| row.entity_pk.parts.first().map(String::as_str) == Some(pk))
+                .expect("row should exist")
+                .snapshot_content
+                .clone()
+        };
+        assert_eq!(by_pk("entity-at").as_deref(), Some(at_threshold.as_str()));
+        assert_eq!(
+            by_pk("entity-over").as_deref(),
+            Some(over_threshold.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2728,39 +2877,33 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .expect("read should open");
         let mut writes = storage.new_write_set();
-        let mutations =
-            rows.iter()
-                .map(|row| {
-                    let key = TrackedStateKey {
-                        schema_key: row.schema_key.clone(),
-                        file_id: row.file_id.clone(),
-                        entity_pk: row.entity_pk.clone(),
-                    };
-                    let value = TrackedStateIndexValue {
-                        change_id: row.change_id.clone(),
-                        commit_id: row.commit_id.clone(),
-                        deleted: row.deleted,
-                        snapshot_ref: row.snapshot_content.as_ref().map(|content| {
-                            crate::json_store::JsonRef::for_content(content.as_bytes())
-                        }),
-                        metadata_ref: row.metadata.as_ref().map(|metadata| {
-                            crate::json_store::JsonRef::for_content(metadata.as_bytes())
-                        }),
-                        created_at: crate::common::LixTimestamp::expect_parse(
-                            "created_at",
-                            &row.created_at,
-                        ),
-                        updated_at: crate::common::LixTimestamp::expect_parse(
-                            "updated_at",
-                            &row.updated_at,
-                        ),
-                    };
-                    TrackedStateMutation::put_encoded(
-                        crate::tracked_state::codec::encode_key(&key),
-                        crate::tracked_state::codec::encode_value(&value),
-                    )
-                })
-                .collect::<Vec<_>>();
+        let mutations = rows
+            .iter()
+            .map(|row| {
+                let key = TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                };
+                let value = TrackedStateIndexValue {
+                    change_id: row.change_id.clone(),
+                    commit_id: row.commit_id.clone(),
+                    deleted: row.deleted,
+                    created_at: crate::common::LixTimestamp::expect_parse(
+                        "created_at",
+                        &row.created_at,
+                    ),
+                    updated_at: crate::common::LixTimestamp::expect_parse(
+                        "updated_at",
+                        &row.updated_at,
+                    ),
+                };
+                TrackedStateMutation::put_encoded(
+                    crate::tracked_state::codec::encode_key(&key),
+                    crate::tracked_state::codec::encode_value(&value),
+                )
+            })
+            .collect::<Vec<_>>();
         let result = TrackedStateTree::new()
             .apply_mutations(&read, &mut writes, None, mutations, Some(commit_id))
             .await

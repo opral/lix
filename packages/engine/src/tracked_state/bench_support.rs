@@ -1,6 +1,5 @@
 use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{
     SharedStorageRead, StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions,
     StorageWriteOptions, StorageWriteSetStats,
@@ -299,8 +298,6 @@ struct OwnedDelta {
     entity_pk: EntityPk,
     schema_key: String,
     file_id: Option<String>,
-    snapshot_ref: Option<crate::json_store::JsonRef>,
-    metadata_ref: Option<crate::json_store::JsonRef>,
     deleted: bool,
     created_at: crate::common::LixTimestamp,
     updated_at: crate::common::LixTimestamp,
@@ -312,23 +309,8 @@ impl OwnedDelta {
         commit_id: &str,
         index: usize,
         deleted: bool,
-        writes: &mut crate::storage::StorageWriteSet,
+        _writes: &mut crate::storage::StorageWriteSet,
     ) -> Self {
-        let snapshot_ref = if deleted {
-            None
-        } else {
-            let json = std::str::from_utf8(&row.value)
-                .expect("tracked-state bench row payload should be UTF-8 JSON");
-            let mut json_writer = JsonStoreContext::new().writer();
-            let refs = json_writer
-                .stage_batch(
-                    writes,
-                    JsonWritePlacementRef::OutOfBand,
-                    [NormalizedJsonRef::new(json)],
-                )
-                .expect("stage tracked-state bench JSON payload");
-            Some(refs[0])
-        };
         let change_id = format!("tracked-crud-change-{commit_id}-{index}");
         Self {
             change_id: ChangeId::for_test_label(&change_id),
@@ -336,8 +318,6 @@ impl OwnedDelta {
             entity_pk: EntityPk::single(row.entity_pk),
             schema_key: row.schema_key,
             file_id: row.file_id,
-            snapshot_ref,
-            metadata_ref: None,
             deleted,
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
@@ -357,8 +337,6 @@ impl OwnedDelta {
             entity_pk: &self.entity_pk,
             change_id: self.change_id,
             commit_id: self.commit_id,
-            snapshot_ref: self.snapshot_ref.as_ref(),
-            metadata_ref: self.metadata_ref.as_ref(),
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,

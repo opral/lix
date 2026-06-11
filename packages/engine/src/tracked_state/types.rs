@@ -2,7 +2,6 @@ use crate::NullableKeyFilter;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 
@@ -62,8 +61,6 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) entity_pk: &'a EntityPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
-    pub(crate) snapshot_ref: Option<&'a JsonRef>,
-    pub(crate) metadata_ref: Option<&'a JsonRef>,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
@@ -76,10 +73,6 @@ pub(crate) struct TrackedStateIndexValue {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
 }
@@ -101,10 +94,6 @@ pub(crate) struct TrackedStateIndexValueRef {
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
 }

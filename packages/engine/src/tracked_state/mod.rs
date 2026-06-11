@@ -16,7 +16,8 @@ pub(crate) use diff::{
     TrackedStateDiffRequest, TrackedStateDiffRow,
 };
 pub(crate) use merge::{
-    TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan, plan_merge,
+    TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
+    merge_payload_fallback_ids, plan_merge,
 };
 pub(crate) use row_materialization::{
     TrackedRowMaterialization, materialize_rows_from_index_entries,

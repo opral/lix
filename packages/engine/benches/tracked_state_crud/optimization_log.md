@@ -1619,3 +1619,169 @@ both.
 - Suites: engine 1,565 / sdk 26 / cli 46, all green; workspace clippy
   zero. SQLITE_FORMAT_VERSION = 2; v1 files rejected with a clear
   no-migration error.
+
+## 2026-06-10 — Inline Small JSON Payloads + Chunk-Boundary zstd
+
+*Superseded by the 2026-06-11 single-copy entry below; kept as history.
+The tree-chunk codec and neutral compression module described here were
+deleted by that cut.*
+
+Two cuts that only make sense together, shipped together.
+
+Measurement on the 10k-merge workload showed the json_store indirection
+was structure without payoff for the dominant payload class: 99.8% of
+payloads land at 65–128 bytes (420k payloads, 53.3 MB raw across bench
+iterations), content dedup runs ~0.2% marginal (9,981 distinct hashes
+per 10,000 writes), and nothing under the 16 KiB zstd floor was ever
+compressed. Each tiny payload paid a 32-byte ref in the tree value,
+another in the change record, a 32-byte store key, its own store row,
+and a point read on every materialization — ~96 bytes of addressing
+plus an extra lookup to manage ~127 bytes of data. The redundancy
+(repeated JSON keys every ~130 bytes) is cross-payload, which
+per-payload compression structurally cannot reach.
+
+**Cut 1 — inline.** A `JsonSlot` enum (`None` / `Ref(JsonRef)` /
+`Inline(json)`) replaces `Option<JsonRef>` in tracked-state values,
+change records, deltas, staged refs, commit-graph changes, and diff
+rows. Payloads at or under `JSON_INLINE_MAX_BYTES = 256` store their
+JSON text directly in the value (musli tag byte + bytes); larger
+payloads keep the content-addressed ref and the store row. The
+threshold applies deterministically at staging, so identical content
+always produces the same variant — required because content-addressed
+tree chunks demand byte-identical values from staging and rebuild paths
+alike. The slot encodes after the fixed-offset id fields, so the
+chunk-local commit-id dictionary from the value-dedup cut is untouched.
+Inline payloads skip the json_store write at staging and skip the batch
+load at row materialization.
+
+**Cut 2 — chunk-boundary zstd.** Tree chunks gain a storage codec: a
+tag byte, then either the raw chunk or a u32 uncompressed length plus a
+zstd-1 frame (raw fallback when compression does not pay). With inlined
+payloads physically adjacent inside 4–16 KiB leaves, plain zstd
+captures the cross-row redundancy — no trained dictionaries, no
+training lifecycle, no embedded blobs. Chunk hashes and tree identity
+stay over the UNCOMPRESSED bytes, so history independence and content
+addresses are untouched. Generic zstd helpers moved to a neutral
+`crate::compression` module (sealed-owner clean); json_store delegates.
+
+Measured separately, the staging matters: inline alone is byte-sideways
+(+2% store, insert written +8%) and regresses single-row updates +69%
+(a leaf rewrite drags ~30 neighbors' inlined payloads). Compression
+alone has nothing to compress (payloads scattered as store rows). The
+pair, at the 1k bench (lix_sqlite), before → after:
+
+| Metric | before | after | delta |
+| --- | --- | --- | --- |
+| insert_all written bytes | 534.4 KB | 448.5 KB | −16% |
+| update_all written bytes | 620.7 KB | 539.6 KB | −13% |
+| delete_all written bytes | 185.2 KB | 137.9 KB | −26% |
+| update_one_by_pk written bytes | 14.9 KB | 11.4 KB | −23% |
+| delete_one_by_pk written bytes | 14.6 KB | 11.1 KB | −24% |
+| insert_all puts | 2,031 | 1,075 | −47% |
+| json_store rows / commit | 1,018 | 61 | −94% |
+| tracked_state.tree_chunk values | 110.8 KB | 74.6 KB | −33% |
+| changelog.change values | 112.6 KB | 206.5 KB | +83% |
+
+The compressed leaf is smaller than the old uncompressed leaf plus the
+store row it replaced, so even the single-row-update write path
+improves despite carrying neighbors.
+
+e2e merge_10k (stash-alternating, two pairs): 195.9/200.5 ms baseline →
+194.1/188.8 ms, ≈ −3.4% end to end from halved backend puts and the
+deleted per-row point read.
+
+Open cost, recorded deliberately: changelog.change values grow +94 KB
+per 1k commit — each inlined payload is carried twice (tree value +
+change record), and change records are individually-stored ~200 B rows
+that chunk-boundary compression cannot reach. Chunking change records
+the way ref chunks already are is the natural counterpart cut; with it,
+total written bytes would move from −16% to roughly −34%.
+
+Suites: engine all green / sdk 26 / cli 46; workspace clippy zero.
+Validation invariant worth recording: every seed/test path that
+constructs rows independently of live staging must make the same
+inline-vs-ref decision — content-addressed roots fail with "tree chunk
+is missing" the moment a fixture hand-rolls a `Ref` for content under
+the threshold.
+
+## 2026-06-11 — Single-Copy Payloads: the Tree References Changes, Changes Own Content
+
+Supersedes the previous entry's design while keeping its changelog half.
+First-principles question that produced it: the tree leaf has always
+stored the `change_id` of the change that produced the row — a key that
+addresses the payload in changelog, a store deliberately kept
+row-addressable. So why does the tree carry the payload (or a ref to
+it) at all? The historical answer was self-containment against
+changelog pruning; the actual GC contract is liveness-based (a change
+is deletable only when no tracked-state row references its change id),
+which guarantees every live row's payload is resolvable. The
+duplication had no reason to exist.
+
+The design:
+
+- Tree leaf values carry identity only: change id, commit id, deleted,
+  timestamps. No snapshot, no metadata, no refs.
+- Change records own the payload, exactly once: inline JSON text at or
+  under 256 bytes (`JsonSlot`, kept from the previous cut), a
+  content-addressed json_store ref above it.
+- Materialization batch point-reads `changelog.change` by deduplicated
+  change id — plain row hits. Commit rows (`lix_commit`) skip even
+  that: their snapshot is derived from the key.
+- Diff/merge payload equality gets a fast path that is better than
+  byte comparison ever was: unchanged rows inherit the same change id,
+  so equality is an id compare with zero loads; only live/live pairs
+  with differing change ids (cross-branch same-content writes) load
+  payload slots, batched.
+- Chunk-boundary zstd is deleted. The identity-only tree lands at the
+  compressed pair's size raw, so there is nothing left worth
+  compressing — and no decompression on any read path.
+
+Accounting at the 1k bench (lix_sqlite) against the same baseline as
+the previous entry, with the inline+zstd pair for comparison:
+
+| Metric | baseline | inline+zstd pair | single-copy |
+| --- | --- | --- | --- |
+| insert_all written bytes | 534.4 KB | 448.5 KB (−16%) | 449.4 KB (−16%) |
+| update_all written bytes | 620.7 KB | 539.6 KB (−13%) | 553.3 KB (−11%) |
+| update_one_by_pk written bytes | 14.9 KB | 11.4 KB (−23%) | 11.5 KB (−23%) |
+| delete_one_by_pk written bytes | 14.6 KB | 11.1 KB (−24%) | 11.3 KB (−23%) |
+| delete_all written bytes | 185.2 KB | 137.9 KB (−26%) | 182.5 KB (−1.5%) |
+| insert_all puts | 2,031 | 1,075 | 1,074 |
+| json_store rows / commit | 1,018 | 61 | 60 |
+| tracked_state.tree_chunk values | 110.8 KB | 74.6 KB (zstd) | 74.6 KB (raw) |
+| changelog.change values | 112.6 KB | 206.5 KB | 206.5 KB |
+| read_one_by_pk (10k cell) | ~4.9 ms | ~6.1 ms (+24%) | ~4.1–5.1 ms (parity) |
+| read_all_rows (10k cell) | ~47 ms | ~40–41 ms (≈−13%) | ~44–53 ms (parity within noise; mean ~+3%) |
+| e2e merge_10k | ~200.7 ms | −3.4% | ~parity (191.7/204.8) |
+
+Single-copy column refreshed after cleanup removed an orphan per-commit
+json_store snapshot write (−1 put, −1 store row, −65 B per commit);
+tree_chunk and changelog.change are unchanged.
+
+The pivotal line is tree_chunk: dropping payloads from the tree
+reaches the exact size compression reached, with no codec, no
+wasm-zstd parity concerns, and no whole-chunk decompress on point
+reads — which is where the pair paid its +24%. The remaining deltas
+against the pair: delete_all loses the compression of tombstone-heavy
+chunks (−1% vs −26%), and changelog.change grows identically in both
+designs (the payload's single home). Each payload is now stored
+exactly once; the changelog "duplication" cost recorded in the
+previous entry is gone by construction rather than compressed.
+
+Costs, stated plainly: bulk reads and merge resolve payloads through
+batched changelog point reads instead of carrying them in the tree —
+measured at parity on both cells, but it is one more batched read per
+materialization. The GC contract is now load-bearing
+for reads, not just history integrity. It was previously only implied
+by the GC type shapes (`GcRoot::BranchHead`, `GcLiveSet`;
+`collect_garbage` is still a no-op) — this entry and the comment in
+`row_materialization.rs` are its first normative statement. Precisely:
+a future GC may delete a change record only if its change id appears
+in no leaf value of any retained commit root's tree — tombstone leaves
+included, since diff/merge equality keys on change ids. Commit rows
+(`lix_commit`) are exempt from the scan: materialization never loads
+their change records (the snapshot derives from the key), and their
+retention follows commit-graph reachability.
+
+Suites: engine 1,565 / sdk 26 / cli 46, all green; workspace warnings
+zero.

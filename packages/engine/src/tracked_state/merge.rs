@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LixError;
 use crate::changelog::ChangeId;
+use crate::json_store::JsonSlot;
 use crate::tracked_state::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffRow,
 };
@@ -60,6 +61,23 @@ pub(crate) struct TrackedStateMergeConflict {
     pub(crate) source: TrackedStateDiffEntry,
 }
 
+/// Change ids whose payloads the merge planner needs for cross-change
+/// equality (live/live after-pairs with differing change ids).
+pub(crate) fn merge_payload_fallback_ids(
+    target_diff: &TrackedStateDiff,
+    source_diff: &TrackedStateDiff,
+) -> Vec<ChangeId> {
+    let mut ids = Vec::new();
+    for entry in target_diff.entries.iter().chain(&source_diff.entries) {
+        if let Some(after) = entry.after.as_ref() {
+            if !after.deleted {
+                ids.push(after.change_id);
+            }
+        }
+    }
+    ids
+}
+
 /// Plans a three-way tracked-state merge from two base-relative diffs.
 ///
 /// This follows the same shape as prolly-tree merge systems: compare
@@ -69,6 +87,7 @@ pub(crate) struct TrackedStateMergeConflict {
 pub(crate) fn plan_merge(
     target_diff: &TrackedStateDiff,
     source_diff: &TrackedStateDiff,
+    payloads: &std::collections::HashMap<ChangeId, (JsonSlot, JsonSlot)>,
 ) -> Result<TrackedStateMergePlan, LixError> {
     let target_by_identity = diff_by_identity(target_diff)?;
     let source_by_identity = diff_by_identity(source_diff)?;
@@ -92,7 +111,7 @@ pub(crate) fn plan_merge(
             (None, Some(source)) => {
                 plan.picks.push(source_change_pick(identity, source)?);
             }
-            (Some(target), Some(source)) if same_final_state(target, source) => {
+            (Some(target), Some(source)) if same_final_state(target, source, payloads) => {
                 // Both sides reached the same visible state. Keep target to
                 // avoid writing duplicate source metadata.
             }
@@ -152,12 +171,16 @@ fn source_change_pick(
     })
 }
 
-fn same_final_state(target: &TrackedStateDiffEntry, source: &TrackedStateDiffEntry) -> bool {
+fn same_final_state(
+    target: &TrackedStateDiffEntry,
+    source: &TrackedStateDiffEntry,
+    payloads: &std::collections::HashMap<ChangeId, (JsonSlot, JsonSlot)>,
+) -> bool {
     match (target.after.as_ref(), source.after.as_ref()) {
         (None, None) => true,
         (Some(target), Some(source)) if !row_is_live(target) && !row_is_live(source) => true,
         (Some(target), Some(source)) if row_is_live(target) && row_is_live(source) => {
-            tracked_row_payload_eq(target, source)
+            tracked_row_payload_eq(target, source, payloads)
         }
         _ => false,
     }
@@ -167,8 +190,23 @@ fn row_is_live(row: &TrackedStateDiffRow) -> bool {
     !row.deleted
 }
 
-fn tracked_row_payload_eq(left: &TrackedStateDiffRow, right: &TrackedStateDiffRow) -> bool {
-    left.snapshot_ref == right.snapshot_ref && left.metadata_ref == right.metadata_ref
+fn tracked_row_payload_eq(
+    left: &TrackedStateDiffRow,
+    right: &TrackedStateDiffRow,
+    payloads: &std::collections::HashMap<ChangeId, (JsonSlot, JsonSlot)>,
+) -> bool {
+    if left.change_id == right.change_id {
+        return true;
+    }
+    // A change id missing from the map compares unequal: the conservative
+    // direction (a conflict is surfaced rather than a difference hidden).
+    match (
+        payloads.get(&left.change_id),
+        payloads.get(&right.change_id),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -176,7 +214,6 @@ mod tests {
     use super::*;
     use crate::changelog::CommitId;
     use crate::entity_pk::EntityPk;
-    use crate::json_store::JsonRef;
     use crate::tracked_state::TrackedStateDiffKind;
 
     fn change_id(label: &str) -> String {
@@ -193,6 +230,7 @@ mod tests {
                 None,
                 Some(row("entity-a", "source")),
             )]),
+            &std::collections::HashMap::default(),
         )
         .expect("merge should plan");
 
@@ -207,14 +245,15 @@ mod tests {
             &diff(vec![entry(
                 "entity-a",
                 TrackedStateDiffKind::Modified,
-                Some(row_with_value("entity-a", "base", "base")),
-                Some(row_with_value("entity-a", "source", "source")),
+                Some(row_with_value("entity-a", "base")),
+                Some(row_with_value("entity-a", "source")),
             )]),
+            &std::collections::HashMap::default(),
         )
         .expect("merge should plan");
 
         assert_eq!(pick_ids(&plan), vec!["entity-a"]);
-        assert!(plan.picks[0].source_row().snapshot_ref.is_some());
+        assert!(!plan.picks[0].source_row().deleted);
         assert_eq!(plan.picks[0].source_change_id(), change_id("source"));
     }
 
@@ -228,6 +267,7 @@ mod tests {
                 Some(row("entity-a", "base")),
                 Some(tombstone("entity-a", "source-delete")),
             )]),
+            &std::collections::HashMap::default(),
         )
         .expect("merge should plan");
 
@@ -246,6 +286,7 @@ mod tests {
                 Some(row("entity-a", "target")),
             )]),
             &TrackedStateDiff::default(),
+            &std::collections::HashMap::default(),
         )
         .expect("merge should plan");
 
@@ -258,17 +299,30 @@ mod tests {
         let target = entry(
             "entity-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base", "base")),
-            Some(row_with_value("entity-a", "target", "same")),
+            Some(row_with_value("entity-a", "base")),
+            Some(row_with_value("entity-a", "target")),
         );
         let source = entry(
             "entity-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base", "base")),
-            Some(row_with_value("entity-a", "source", "same")),
+            Some(row_with_value("entity-a", "base")),
+            Some(row_with_value("entity-a", "source")),
         );
 
-        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
+        // Different change ids with identical content: equality needs the
+        // loaded payload slots, exactly as the production caller provides.
+        let same = JsonSlot::from_json("{\"value\":\"same\"}");
+        let payloads = [
+            (
+                ChangeId::for_test_label("target"),
+                (same.clone(), JsonSlot::None),
+            ),
+            (ChangeId::for_test_label("source"), (same, JsonSlot::None)),
+        ]
+        .into_iter()
+        .collect();
+        let plan = plan_merge(&diff(vec![target]), &diff(vec![source]), &payloads)
+            .expect("merge should plan");
 
         assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
@@ -289,7 +343,12 @@ mod tests {
             Some(tombstone("entity-a", "source-delete")),
         );
 
-        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
+        let plan = plan_merge(
+            &diff(vec![target]),
+            &diff(vec![source]),
+            &std::collections::HashMap::default(),
+        )
+        .expect("merge should plan");
 
         assert!(plan.picks.is_empty());
         assert!(plan.conflicts.is_empty());
@@ -300,17 +359,22 @@ mod tests {
         let target = entry(
             "entity-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base", "base")),
-            Some(row_with_value("entity-a", "target", "target")),
+            Some(row_with_value("entity-a", "base")),
+            Some(row_with_value("entity-a", "target")),
         );
         let source = entry(
             "entity-a",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-a", "base", "base")),
-            Some(row_with_value("entity-a", "source", "source")),
+            Some(row_with_value("entity-a", "base")),
+            Some(row_with_value("entity-a", "source")),
         );
 
-        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
+        let plan = plan_merge(
+            &diff(vec![target]),
+            &diff(vec![source]),
+            &std::collections::HashMap::default(),
+        )
+        .expect("merge should plan");
 
         assert!(plan.picks.is_empty());
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
@@ -328,10 +392,15 @@ mod tests {
             "entity-a",
             TrackedStateDiffKind::Modified,
             Some(row("entity-a", "base")),
-            Some(row_with_value("entity-a", "source", "source")),
+            Some(row_with_value("entity-a", "source")),
         );
 
-        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
+        let plan = plan_merge(
+            &diff(vec![target]),
+            &diff(vec![source]),
+            &std::collections::HashMap::default(),
+        )
+        .expect("merge should plan");
 
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
     }
@@ -342,7 +411,7 @@ mod tests {
             "entity-a",
             TrackedStateDiffKind::Modified,
             Some(row("entity-a", "base")),
-            Some(row_with_value("entity-a", "target", "target")),
+            Some(row_with_value("entity-a", "target")),
         );
         let source = entry(
             "entity-a",
@@ -351,7 +420,12 @@ mod tests {
             Some(tombstone("entity-a", "source-delete")),
         );
 
-        let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
+        let plan = plan_merge(
+            &diff(vec![target]),
+            &diff(vec![source]),
+            &std::collections::HashMap::default(),
+        )
+        .expect("merge should plan");
 
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
     }
@@ -366,6 +440,7 @@ mod tests {
                 Some(row("entity-a", "base")),
                 None,
             )]),
+            &std::collections::HashMap::default(),
         )
         .expect_err("merge should reject impossible source removal");
 
@@ -377,8 +452,8 @@ mod tests {
         let target = diff(vec![entry(
             "entity-b",
             TrackedStateDiffKind::Modified,
-            Some(row_with_value("entity-b", "base", "base")),
-            Some(row_with_value("entity-b", "target", "target")),
+            Some(row_with_value("entity-b", "base")),
+            Some(row_with_value("entity-b", "target")),
         )]);
         let source = diff(vec![
             entry(
@@ -396,12 +471,13 @@ mod tests {
             entry(
                 "entity-b",
                 TrackedStateDiffKind::Modified,
-                Some(row_with_value("entity-b", "base", "base")),
-                Some(row_with_value("entity-b", "source", "source")),
+                Some(row_with_value("entity-b", "base")),
+                Some(row_with_value("entity-b", "source")),
             ),
         ]);
 
-        let plan = plan_merge(&target, &source).expect("merge should plan");
+        let plan = plan_merge(&target, &source, &std::collections::HashMap::default())
+            .expect("merge should plan");
 
         assert_eq!(pick_ids(&plan), vec!["entity-a", "entity-c"]);
         assert_eq!(conflict_ids(&plan), vec!["entity-b"]);
@@ -457,24 +533,20 @@ mod tests {
 
     fn tombstone(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
         let mut row = row(entity_pk, change_id);
-        row.snapshot_ref = None;
         row.deleted = true;
         row
     }
 
     fn row(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
-        row_with_value(entity_pk, change_id, "value")
+        row_with_value(entity_pk, change_id)
     }
 
-    fn row_with_value(entity_pk: &str, change_id: &str, value: &str) -> TrackedStateDiffRow {
-        let snapshot = format!("{{\"value\":\"{value}\"}}");
+    fn row_with_value(entity_pk: &str, change_id: &str) -> TrackedStateDiffRow {
         TrackedStateDiffRow {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "test_schema".to_string(),
             file_id: None,
             deleted: false,
-            snapshot_ref: Some(JsonRef::for_content(snapshot.as_bytes())),
-            metadata_ref: None,
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-01-01T00:00:00Z",

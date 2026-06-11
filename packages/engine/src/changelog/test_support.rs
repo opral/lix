@@ -48,8 +48,8 @@ pub(crate) fn test_change_record() -> ChangeRecord {
         schema_key: "message".to_string(),
         entity_pk: EntityPk::single("entity-1"),
         file_id: Some("file-1".to_string()),
-        snapshot_ref: None,
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::None,
+        metadata: crate::json_store::JsonSlot::None,
         created_at: crate::common::LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
     }
 }

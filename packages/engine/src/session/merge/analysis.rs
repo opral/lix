@@ -73,7 +73,10 @@ where
     };
 
     let merge_plan = if outcome == MergeOutcome::MergeCommitted {
-        Some(plan_merge(&target_diff, &source_diff)?)
+        let fallback_ids =
+            crate::tracked_state::merge_payload_fallback_ids(&target_diff, &source_diff);
+        let payloads = reader.load_change_payloads(&fallback_ids).await?;
+        Some(plan_merge(&target_diff, &source_diff, &payloads)?)
     } else {
         None
     };

@@ -3732,7 +3732,7 @@ fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {
 
 #[expect(clippy::cast_possible_truncation)]
 fn direct_ordered_put_batch(
-    storage_space: StorageSpace,
+    _storage_space: StorageSpace,
     writes: usize,
     value_size: usize,
     order: WriteOrder,

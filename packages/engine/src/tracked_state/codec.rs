@@ -8,9 +8,6 @@ use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
 };
 
-#[cfg(test)]
-use crate::json_store::JsonRef;
-
 const WEIBULL_K: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -272,8 +269,6 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
         change_id,
         commit_id,
         deleted,
-        snapshot_ref,
-        metadata_ref,
         created_at,
         updated_at,
     } = value;
@@ -281,8 +276,6 @@ fn tracked_value_from_storage(value: TrackedStateIndexValueRef) -> TrackedStateI
         change_id,
         commit_id,
         deleted,
-        snapshot_ref,
-        metadata_ref,
         created_at,
         updated_at,
     }
@@ -788,8 +781,6 @@ mod tests {
             change_id,
             commit_id,
             deleted: false,
-            snapshot_ref: Some(JsonRef::for_content(b"layout-snapshot")),
-            metadata_ref: None,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-01T00:00:00Z"),
         });
@@ -1021,8 +1012,6 @@ mod tests {
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label(commit_id),
             deleted: false,
-            snapshot_ref: None,
-            metadata_ref: None,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
         }
@@ -1165,8 +1154,6 @@ mod tests {
             change_id: ChangeId::for_test_label("change"),
             commit_id: CommitId::for_test_label("commit"),
             deleted: false,
-            snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
-            metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
         };
@@ -1181,8 +1168,6 @@ mod tests {
             change_id: ChangeId::for_test_label("other-change"),
             commit_id: CommitId::for_test_label("other-commit"),
             deleted: true,
-            snapshot_ref: None,
-            metadata_ref: None,
             created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
             updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
         };
@@ -1251,8 +1236,6 @@ mod tests {
                 change_id: ChangeId::for_test_label("change"),
                 commit_id: CommitId::for_test_label("commit"),
                 deleted: false,
-                snapshot_ref: None,
-                metadata_ref: None,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
@@ -1260,8 +1243,6 @@ mod tests {
                 change_id: ChangeId::for_test_label("change-2"),
                 commit_id: CommitId::for_test_label("commit"),
                 deleted: true,
-                snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
-                metadata_ref: None,
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },
@@ -1269,8 +1250,6 @@ mod tests {
                 change_id: ChangeId::for_test_label("change-3"),
                 commit_id: CommitId::for_test_label("other"),
                 deleted: false,
-                snapshot_ref: None,
-                metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
                 created_at: timestamp("created_at", "2026-01-01T00:00:00Z"),
                 updated_at: timestamp("updated_at", "2026-01-02T00:00:00Z"),
             },

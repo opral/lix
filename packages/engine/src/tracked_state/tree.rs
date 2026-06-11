@@ -3065,9 +3065,6 @@ mod tests {
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label("commit"),
             deleted: snapshot_content.is_none(),
-            snapshot_ref: snapshot_content
-                .map(|content| crate::json_store::JsonRef::for_content(content.as_bytes())),
-            metadata_ref: None,
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-01-01T00:00:00Z",

@@ -11,7 +11,7 @@ use super::types::{
 };
 use crate::LixError;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
+use crate::json_store::{JsonRef, JsonSlot};
 use crate::storage::{
     StorageBackend, StorageBackendReadOf, StorageContext, StorageReadOptions, StorageWriteSetStats,
 };
@@ -629,10 +629,10 @@ fn direct_append_with_shape(
                 schema_key: "message".to_string(),
                 entity_pk: entity_pk.clone(),
                 file_id: None,
-                snapshot_ref: Some(JsonRef::for_content(
-                    format!("{{\"value\":{next_change}}}").as_bytes(),
+                snapshot: crate::json_store::JsonSlot::from_json(&format!(
+                    "{{\"value\":{next_change}}}"
                 )),
-                metadata_ref: None,
+                metadata: crate::json_store::JsonSlot::None,
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
                     "2026-05-20T00:00:00Z",

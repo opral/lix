@@ -68,9 +68,8 @@ mod tests {
         let compressed = compress_json_payload(json.as_bytes()).expect("should compress");
         assert!(compressed.len() < json.len());
 
-        let hash_hex = blake3::hash(json.as_bytes()).to_hex().to_string();
         let decoded =
-            decode_json_zstd_payload(&compressed, json.len(), &hash_hex).expect("should decode");
+            decode_json_zstd_payload(&compressed, json.len(), "test").expect("should decode");
 
         assert_eq!(decoded, json.as_bytes());
     }

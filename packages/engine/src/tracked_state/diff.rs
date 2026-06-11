@@ -4,7 +4,7 @@ use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
+use crate::json_store::JsonSlot;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateTreeScanRequest,
 };
@@ -50,8 +50,6 @@ pub(crate) struct TrackedStateDiffRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) deleted: bool,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) change_id: ChangeId,
@@ -125,6 +123,28 @@ where
         raw_rows.push((before, after));
     }
 
+    // Rows are identity-only; payload equality needs the change records when
+    // a live/live pair carries different change ids (cross-branch writes can
+    // produce identical content under distinct changes, which must classify
+    // as no-diff). Same change id == same change == equal payload, no load.
+    let mut fallback_ids = Vec::new();
+    for (before, after) in &raw_rows {
+        if let (Some(left), Some(right)) =
+            (is_live_row(before.as_ref()), is_live_row(after.as_ref()))
+        {
+            // Commit rows have no change records and are skipped by
+            // classification; loading their ids would always miss.
+            if left.schema_key == "lix_commit" {
+                continue;
+            }
+            if left.change_id != right.change_id {
+                fallback_ids.push(left.change_id);
+                fallback_ids.push(right.change_id);
+            }
+        }
+    }
+    let payloads = reader.load_change_payloads(&fallback_ids).await?;
+
     let mut entries = Vec::with_capacity(raw_rows.len());
     for (before, after) in raw_rows {
         let identity = match before.as_ref().or(after.as_ref()) {
@@ -134,7 +154,7 @@ where
         if identity.schema_key == "lix_commit" {
             continue;
         }
-        let Some(entry) = classify_diff(identity, before, after) else {
+        let Some(entry) = classify_diff(identity, before, after, &payloads) else {
             continue;
         };
         entries.push(entry);
@@ -160,6 +180,7 @@ fn classify_diff(
     identity: TrackedStateDiffIdentity,
     before: Option<TrackedStateDiffRow>,
     after: Option<TrackedStateDiffRow>,
+    payloads: &std::collections::HashMap<ChangeId, (JsonSlot, JsonSlot)>,
 ) -> Option<TrackedStateDiffEntry> {
     match (is_live_row(before.as_ref()), is_live_row(after.as_ref())) {
         (None, None) => None,
@@ -175,7 +196,7 @@ fn classify_diff(
             before,
             after,
         }),
-        (Some(before), Some(after)) if tracked_row_payload_eq(before, after) => None,
+        (Some(before), Some(after)) if tracked_row_payload_eq(before, after, payloads) => None,
         (Some(_), Some(_)) => Some(TrackedStateDiffEntry {
             identity,
             kind: TrackedStateDiffKind::Modified,
@@ -189,8 +210,21 @@ fn is_live_row(row: Option<&TrackedStateDiffRow>) -> Option<&TrackedStateDiffRow
     row.filter(|row| !row.deleted)
 }
 
-fn tracked_row_payload_eq(left: &TrackedStateDiffRow, right: &TrackedStateDiffRow) -> bool {
-    left.snapshot_ref == right.snapshot_ref && left.metadata_ref == right.metadata_ref
+fn tracked_row_payload_eq(
+    left: &TrackedStateDiffRow,
+    right: &TrackedStateDiffRow,
+    payloads: &std::collections::HashMap<ChangeId, (JsonSlot, JsonSlot)>,
+) -> bool {
+    if left.change_id == right.change_id {
+        return true;
+    }
+    match (
+        payloads.get(&left.change_id),
+        payloads.get(&right.change_id),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 impl TrackedStateDiffIdentity {
@@ -210,8 +244,6 @@ impl TrackedStateDiffRow {
             schema_key: key.schema_key,
             file_id: key.file_id,
             deleted: value.deleted,
-            snapshot_ref: value.snapshot_ref,
-            metadata_ref: value.metadata_ref,
             created_at: value.created_at(),
             updated_at: value.updated_at(),
             change_id: value.change_id,
@@ -230,8 +262,6 @@ impl TrackedStateDiffRow {
                 change_id: self.change_id,
                 commit_id: self.commit_id,
                 deleted: self.deleted,
-                snapshot_ref: self.snapshot_ref,
-                metadata_ref: self.metadata_ref,
                 created_at: self.created_at,
                 updated_at: self.updated_at,
             },
@@ -1803,14 +1833,8 @@ mod tests {
             vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
         );
         assert_ne!(
-            diff.entries[0]
-                .before
-                .as_ref()
-                .and_then(|row| row.snapshot_ref.as_ref()),
-            diff.entries[0]
-                .after
-                .as_ref()
-                .and_then(|row| row.snapshot_ref.as_ref())
+            diff.entries[0].before.as_ref().map(|row| row.change_id),
+            diff.entries[0].after.as_ref().map(|row| row.change_id)
         );
     }
 
@@ -1839,14 +1863,8 @@ mod tests {
             vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
         );
         assert_ne!(
-            diff.entries[0]
-                .before
-                .as_ref()
-                .and_then(|row| row.snapshot_ref.as_ref()),
-            diff.entries[0]
-                .after
-                .as_ref()
-                .and_then(|row| row.snapshot_ref.as_ref())
+            diff.entries[0].before.as_ref().map(|row| row.change_id),
+            diff.entries[0].after.as_ref().map(|row| row.change_id)
         );
     }
 
@@ -2089,10 +2107,6 @@ mod tests {
                 change_id: ChangeId::for_test_label(change_id),
                 commit_id,
                 deleted: false,
-                snapshot_ref: Some(JsonRef::for_content(
-                    format!("{{\"id\":\"{commit_id_text}\"}}").as_bytes(),
-                )),
-                metadata_ref: None,
                 created_at: LixTimestamp::expect_parse("created_at", created_at),
                 updated_at: LixTimestamp::expect_parse("updated_at", created_at),
             },

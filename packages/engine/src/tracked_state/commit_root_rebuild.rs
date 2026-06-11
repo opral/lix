@@ -9,7 +9,6 @@ use crate::changelog::{
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::json_store::JsonRef;
 use crate::storage::{StorageRead, StorageWriteSet};
 use crate::tracked_state::TrackedStateDeltaRef;
 use crate::tracked_state::context::{
@@ -29,8 +28,8 @@ pub(crate) struct CommitRootRebuildDelta {
     pub(crate) entity_pk: EntityPk,
     pub(crate) change_id: ChangeId,
     pub(crate) commit_id: CommitId,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) snapshot: crate::json_store::JsonSlot,
+    pub(crate) metadata: crate::json_store::JsonSlot,
     pub(crate) created_at: LixTimestamp,
     pub(crate) updated_at: LixTimestamp,
 }
@@ -279,9 +278,7 @@ where
             entity_pk: &delta.entity_pk,
             change_id: delta.change_id,
             commit_id: delta.commit_id,
-            snapshot_ref: delta.snapshot_ref.as_ref(),
-            metadata_ref: delta.metadata_ref.as_ref(),
-            deleted: delta.snapshot_ref.is_none(),
+            deleted: delta.snapshot.is_none(),
             created_at: delta.created_at,
             updated_at: delta.updated_at,
         })
@@ -307,23 +304,15 @@ fn rebuild_delta_from_commit_record(
         entity_pk: EntityPk::single(commit.commit_id),
         change_id: commit.change_id,
         commit_id: commit.commit_id,
-        snapshot_ref: Some(JsonRef::for_content(snapshot_content.as_bytes())),
-        metadata_ref: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
+        metadata: crate::json_store::JsonSlot::None,
         created_at: commit.created_at,
         updated_at: commit.created_at,
     })
 }
 
 fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
-    serde_json::to_string(&serde_json::json!({
-        "id": commit_id,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode lix_commit snapshot: {error}"),
-        )
-    })
+    crate::changelog::commit_row_snapshot_json(commit_id)
 }
 
 fn rebuild_delta_from_change_ref(
@@ -358,8 +347,8 @@ fn rebuild_delta_from_change_ref(
         entity_pk: change.entity_pk,
         change_id: change.change_id,
         commit_id: CommitId::parse_lix(commit_id, "commit-root rebuild delta commit_id")?,
-        snapshot_ref: change.snapshot_ref,
-        metadata_ref: change.metadata_ref,
+        snapshot: change.snapshot,
+        metadata: change.metadata,
         created_at: change.created_at,
         updated_at: change.created_at,
     })
