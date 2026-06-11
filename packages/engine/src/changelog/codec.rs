@@ -711,8 +711,8 @@ mod tests {
         };
         let text_encoded = encode_change_record(&text_only).expect("record should encode");
         assert!(
-            encoded.len() + 38 <= text_encoded.len(),
-            "uuid arm should save ~19 bytes per id ({} vs {})",
+            encoded.len() + 40 <= text_encoded.len(),
+            "uuid arm should save 20 bytes per id ({} vs {})",
             encoded.len(),
             text_encoded.len()
         );

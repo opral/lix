@@ -5,6 +5,12 @@
 //! the prepared file, warms the plugin outside the measured region, then runs the
 //! merge inside `profile_merge_phase` so samply samples can be filtered to that
 //! frame. The post-merge sqlite file is left on disk for inspection.
+//!
+//! Differences from the merge_10k criterion bench (benches/e2e.rs): the bench's
+//! measured region includes `lix.close()`, which this marker frame excludes, and
+//! the merge here runs in a fresh process against a reopened file, so cold-load
+//! frames appear that the bench's in-process setup absorbs. Profile shapes are
+//! comparable; absolute times are not.
 
 use lix_sdk::{FsWriteOptions, OpenLixOptions, SqliteBackend, Value, open_lix};
 use rand::rngs::SmallRng;

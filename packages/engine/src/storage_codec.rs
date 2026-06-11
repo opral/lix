@@ -87,6 +87,42 @@ pub(crate) mod id_string {
     const TAG_TEXT: u8 = 0;
     const TAG_UUID: u8 = 1;
 
+    /// Raw 16-byte arm. The tag already implies the length, so this encodes
+    /// via `encode_array` (no length prefix), like the uuid id types in
+    /// `changelog::types`.
+    struct UuidArm([u8; 16]);
+
+    impl<M> musli::Encode<M> for UuidArm {
+        type Encode = Self;
+
+        fn encode<E>(&self, encoder: E) -> Result<(), E::Error>
+        where
+            E: musli::Encoder<Mode = M>,
+        {
+            encoder.encode_array(&self.0)
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            Some(16)
+        }
+
+        fn as_encode(&self) -> &Self {
+            self
+        }
+    }
+
+    impl<'de, M, A> musli::Decode<'de, M, A> for UuidArm
+    where
+        A: musli::Allocator,
+    {
+        fn decode<D>(decoder: D) -> Result<Self, D::Error>
+        where
+            D: musli::Decoder<'de, Mode = M, Allocator = A>,
+        {
+            Ok(Self(decoder.decode_array()?))
+        }
+    }
+
     pub(crate) fn uuid_bytes_from_canonical(value: &str) -> Option<[u8; 16]> {
         let bytes = value.as_bytes();
         if bytes.len() != 36 {
@@ -125,7 +161,7 @@ pub(crate) mod id_string {
         match uuid_bytes_from_canonical(value) {
             Some(bytes) => {
                 pack.push(TAG_UUID)?;
-                pack.push(bytes)
+                pack.push(UuidArm(bytes))
             }
             None => {
                 pack.push(TAG_TEXT)?;
@@ -141,7 +177,7 @@ pub(crate) mod id_string {
         let cx = pack.cx();
         let tag: u8 = pack.next()?;
         match tag {
-            TAG_UUID => Ok(uuid_string_from_bytes(pack.next::<[u8; 16]>()?)),
+            TAG_UUID => Ok(uuid_string_from_bytes(pack.next::<UuidArm>()?.0)),
             TAG_TEXT => {
                 let bytes: Vec<u8> = pack.next()?;
                 String::from_utf8(bytes).map_err(|_| cx.message("id string is not UTF-8"))
@@ -312,12 +348,16 @@ mod tests {
         assert_eq!(super::id_string::uuid_string_from_bytes(bytes), canonical);
 
         for rejected in [
-            "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A",     // uppercase
-            "019eb80560d071c0ade3b0f0efab9d9a",         // simple form
-            "{019eb805-60d0-71c0-ade3-b0f0efab9d9a}",   // braced
-            "019eb805-60d0-71c0-ade3-b0f0efab9d9",      // short
-            "019eb805-60d0-71c0-ade3-b0f0efab9d9ax",    // long
-            "019eb805x60d0-71c0-ade3-b0f0efab9d9aa",    // hyphen replaced
+            "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A",   // uppercase
+            "019eb80560d071c0ade3b0f0efab9d9a",       // simple form
+            "{019eb805-60d0-71c0-ade3-b0f0efab9d9a}", // braced
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9",    // short
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9ax",  // long
+            "019eb805x60d0-71c0-ade3-b0f0efab9d9a",   // 36 bytes, hyphen replaced
+            "019eb805-60d0x71c0-ade3-b0f0efab9d9a",   // 36 bytes, hex at hyphen slot
+            "019eb805-60d0-71c0-ade3-b0f0efab9d\u{e9}", // 36 bytes via multi-byte char
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9\0",  // embedded NUL
+            "------------------------------------",   // all hyphens
             "not-a-uuid",
             "",
         ] {
@@ -342,6 +382,72 @@ mod tests {
         assert_eq!(
             decoded.file_id.as_deref(),
             Some("019eb805-5e65-7270-861d-cb341bc904c8")
+        );
+    }
+
+    #[test]
+    fn id_string_wire_format_is_pinned() {
+        // Persisted layout: uuid arm = tag 1 + 16 raw bytes (no length
+        // prefix); text arm = tag 0 + varint length + bytes. Sequences are
+        // count-prefixed; options are bool-prefixed.
+        let parts = vec!["019eb805-60d0-71c0-ade3-b0f0efab9d9a".to_string()];
+        let value = IdStringEncode {
+            parts: &parts,
+            file_id: Some("ab"),
+        };
+        let bytes = super::encode("id string wire pin", &value).expect("encode");
+        let expected: Vec<u8> = [
+            &[1u8][..],     // parts count
+            &[1u8][..],     // TAG_UUID
+            &[
+                0x01, 0x9e, 0xb8, 0x05, 0x60, 0xd0, 0x71, 0xc0, 0xad, 0xe3, 0xb0, 0xf0, 0xef,
+                0xab, 0x9d, 0x9a,
+            ][..],          // raw uuid bytes
+            &[1u8][..],     // file_id Some
+            &[0u8][..],     // TAG_TEXT
+            &[2u8][..],     // text length
+            b"ab",          // text bytes
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn id_string_decode_rejects_unknown_tag_loudly() {
+        let parts = vec!["a".to_string()];
+        let value = IdStringEncode {
+            parts: &parts,
+            file_id: None,
+        };
+        let mut bytes = super::encode("id string tag", &value).expect("encode");
+        // Layout: [count=1][tag][len=1][b'a'][file_id=false]; corrupt the tag.
+        assert_eq!(bytes[1], 0, "expected the text tag at offset 1");
+        bytes[1] = 9;
+        let error = super::decode::<IdStringDecode>("id string tag", &bytes)
+            .expect_err("unknown tag should fail decode");
+        assert!(
+            error.message.contains("unknown id string tag 9"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn id_string_decode_rejects_non_utf8_text_loudly() {
+        let parts = vec!["ab".to_string()];
+        let value = IdStringEncode {
+            parts: &parts,
+            file_id: None,
+        };
+        let mut bytes = super::encode("id string utf8", &value).expect("encode");
+        // Layout: [count=1][tag=0][len=2][b'a'][b'b'][file_id=false].
+        bytes[3] = 0xFF;
+        let error = super::decode::<IdStringDecode>("id string utf8", &bytes)
+            .expect_err("invalid UTF-8 should fail decode");
+        assert!(
+            error.message.contains("id string is not UTF-8"),
+            "{}",
+            error.message
         );
     }
 

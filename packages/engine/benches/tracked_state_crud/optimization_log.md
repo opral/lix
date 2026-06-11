@@ -1826,27 +1826,44 @@ byte for the tag. `CommitRecord.author_account_ids` rides the same
 codec; commit_change_ref chunks already stored raw change-id bytes and
 dictionary-encoded file ids, so they are untouched.
 
+Review follow-up shaved one more byte per packed id: the 16-byte arm
+now encodes via `encode_array` (no length prefix — the tag already
+implies the length, matching how `ChangeId` encodes in ref chunks), so
+a packed id is 17 B, not 18. The wire layout is pinned by test.
+
 Measured on the e2e 10k CSV merge fixture (post-merge sqlite file,
 20,028 change records, UUID entity and file ids):
 
 | | text ids | packed ids |
 |---|---|---|
-| changelog.change avg value | 222.4 B | 184.4 B (−17%) |
-| changelog.change payload | 4,453,469 B | 3,693,359 B (−17%) |
-| changelog.change page bytes | 5,640,192 B | 4,726,784 B (−16%) |
-| whole file | 34,078,720 B | 33,144,832 B (−2.7%) |
+| changelog.change avg value | 222.4 B | 182.4 B (−18%) |
+| changelog.change payload | 4,453,469 B | 3,653,351 B (−18%) |
+| changelog.change page bytes | 5,640,192 B | 4,636,672 B (−18%) |
 
-The whole-file delta is diluted by the 24.7 MB of raw plugin wasm in
-binary_cas.chunk (a separate, pending optimization); against the
-non-bcas remainder this is −10%.
+Measurement correction recorded for honesty: earlier drafts cited a
+34.1 MB whole file dominated by 24.7 MB of raw plugin wasm in
+binary_cas.chunk. That wasm was bloated by the profiling harness's own
+CARGO_PROFILE_RELEASE_DEBUG=true leaking into the bindep-built plugin
+artifact. A normal release build stores the CSV plugin wasm at
+2,073,015 B, and the honest post-merge file is 10,010,624 B, where
+changelog.change is the largest table at 46% (4.64 MB), tree_chunk 26%,
+bcas.chunk 21%, ref chunks 7%. This reorders the remaining
+opportunities: change-record encoding work ranks above bcas chunk
+compression (zstd -3 on the real wasm: 2,073,015 → 652,633 B, ~1.4 MB
+recoverable, not ~18 MB).
 
 The tracked_state_crud 1k bench moves the other way, deliberately:
 insert written bytes 436,472 → 437,472 (+0.23%). Its entity ids are
-synthetic labels ("row-00001"), so every record pays the text tag and
-nothing packs. The empty-length-marker encoding that would make text
+JSON-pointer paths flattened from the pnpm-lock fixture, so every
+record pays the text tag and nothing packs (file_id is None there:
+zero delta). The empty-length-marker encoding that would make text
 free was rejected because empty id strings are currently legal
 (EntityPk validates the parts list, not part contents), making the
 marker ambiguous. Real workloads key on lix_uuid_v7() defaults.
 
-No version gate: shipped inside the current breaking window alongside
-format v3. Suites: engine 972 lib + integration all green, sdk green.
+No version gate: shipped inside the open SQLITE_FORMAT_VERSION = 3
+window (the backend gate in sqlite_backend.rs) on the premise that no
+v3 file with the old record encoding exists outside this branch. A
+pre-packing record read by the new decoder fails loudly ("unknown id
+string tag 36"). Suites: engine 972 lib + integration all green, sdk
+green.
