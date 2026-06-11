@@ -1,7 +1,7 @@
 use super::types::{
     ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRef,
     CommitChangeRefChunk, CommitChangeRefChunkRef, CommitChangeRefChunkView,
-    CommitChangeRefEntryRef, CommitChangeRefEntryView, CommitId, CommitRecord, EntityPkRef,
+    CommitChangeRefEntryRef, CommitChangeRefEntryView, CommitId, CommitRecord,
 };
 use crate::common::LixError;
 use crate::entity_pk::EntityPk;
@@ -40,8 +40,8 @@ pub(crate) fn decode_change_record(
         format_version: view.format_version,
         change_id,
         schema_key: view.schema_key.to_string(),
-        entity_pk: entity_pk_from_ref(view.entity_pk)?,
-        file_id: view.file_id.map(str::to_string),
+        entity_pk: entity_pk_from_parts(view.entity_pk)?,
+        file_id: view.file_id,
         snapshot: view.snapshot,
         metadata: view.metadata,
         created_at: view.created_at,
@@ -296,15 +296,13 @@ fn u16_index(value: usize, context: &str) -> Result<u16, LixError> {
     })
 }
 
-fn entity_pk_from_ref(value: EntityPkRef<'_>) -> Result<EntityPk, LixError> {
-    EntityPk::from_parts(value.parts.iter().map(|part| (*part).to_string()).collect()).map_err(
-        |error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("changelog entity primary key is invalid: {error}"),
-            )
-        },
-    )
+fn entity_pk_from_parts(parts: Vec<String>) -> Result<EntityPk, LixError> {
+    EntityPk::from_parts(parts).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("changelog entity primary key is invalid: {error}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -681,6 +679,59 @@ mod tests {
             file_id: None,
             snapshot: JsonSlot::None,
             metadata: JsonSlot::None,
+            ..full_record()
+        };
+        let encoded = encode_change_record(&record).expect("record should encode");
+        let decoded =
+            decode_change_record(&encoded, record.change_id).expect("record should decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn change_record_packs_canonical_uuid_ids_and_round_trips() {
+        // Canonical lowercase UUID entity pks and file ids take the 16-byte
+        // arm; the record must round-trip to the identical text form and be
+        // smaller than the unpacked text encoding.
+        let record = ChangeRecord {
+            entity_pk: EntityPk::from_parts(vec![
+                "019eb805-60d0-71c0-ade3-b0f0efab9d9a".to_string(),
+            ])
+            .expect("entity pk should build"),
+            file_id: Some("019eb805-5e65-7270-861d-cb341bc904c8".to_string()),
+            ..full_record()
+        };
+        let encoded = encode_change_record(&record).expect("record should encode");
+        let text_only = ChangeRecord {
+            entity_pk: EntityPk::from_parts(vec![
+                "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A".to_string(),
+            ])
+            .expect("entity pk should build"),
+            file_id: Some("019EB805-5E65-7270-861D-CB341BC904C8".to_string()),
+            ..full_record()
+        };
+        let text_encoded = encode_change_record(&text_only).expect("record should encode");
+        assert!(
+            encoded.len() + 38 <= text_encoded.len(),
+            "uuid arm should save ~19 bytes per id ({} vs {})",
+            encoded.len(),
+            text_encoded.len()
+        );
+        let decoded =
+            decode_change_record(&encoded, record.change_id).expect("record should decode");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn change_record_keeps_non_canonical_ids_as_text() {
+        // Uppercase hex re-hyphenates differently, so it must stay text to
+        // round-trip byte-identically; same for arbitrary plugin keys.
+        let record = ChangeRecord {
+            entity_pk: EntityPk::from_parts(vec![
+                "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A".to_string(),
+                "row 5 of sheet 2".to_string(),
+            ])
+            .expect("entity pk should build"),
+            file_id: Some("not-a-uuid".to_string()),
             ..full_record()
         };
         let encoded = encode_change_record(&record).expect("record should encode");

@@ -1810,3 +1810,43 @@ e2e merge_10k (stash-alternating, two pairs): 191.5/197.5 →
 
 Cumulative campaign written-bytes: 534.4 → 436.5 KB per 1k-row insert
 commit (−18.3%). Suites: engine 1,569 all green.
+
+## 2026-06-11 — Opportunistic UUID Packing for Change Record Ids
+
+Change records stored entity_pk parts and file_id as text. Lix-generated
+ids are canonical lowercase hyphenated UUIDs, so each one cost 37 bytes
+(length + 36 chars) where 16 carry the information — and the storage key
+of the same row already stores the change id as raw bytes. Each id string
+is now a 1-byte tag plus either the raw 16 UUID bytes or the original
+text. Only the exact canonical form takes the UUID arm (uppercase, simple,
+braced forms stay text), so decode re-hyphenates byte-identically and
+round-tripping is structural, not probabilistic. Plugin-chosen entity
+keys ("row 5 of sheet 2") and test labels keep their text form at +1
+byte for the tag. `CommitRecord.author_account_ids` rides the same
+codec; commit_change_ref chunks already stored raw change-id bytes and
+dictionary-encoded file ids, so they are untouched.
+
+Measured on the e2e 10k CSV merge fixture (post-merge sqlite file,
+20,028 change records, UUID entity and file ids):
+
+| | text ids | packed ids |
+|---|---|---|
+| changelog.change avg value | 222.4 B | 184.4 B (−17%) |
+| changelog.change payload | 4,453,469 B | 3,693,359 B (−17%) |
+| changelog.change page bytes | 5,640,192 B | 4,726,784 B (−16%) |
+| whole file | 34,078,720 B | 33,144,832 B (−2.7%) |
+
+The whole-file delta is diluted by the 24.7 MB of raw plugin wasm in
+binary_cas.chunk (a separate, pending optimization); against the
+non-bcas remainder this is −10%.
+
+The tracked_state_crud 1k bench moves the other way, deliberately:
+insert written bytes 436,472 → 437,472 (+0.23%). Its entity ids are
+synthetic labels ("row-00001"), so every record pays the text tag and
+nothing packs. The empty-length-marker encoding that would make text
+free was rejected because empty id strings are currently legal
+(EntityPk validates the parts list, not part contents), making the
+marker ambiguous. Real workloads key on lix_uuid_v7() defaults.
+
+No version gate: shipped inside the current breaking window alongside
+format v3. Suites: engine 972 lib + integration all green, sdk green.

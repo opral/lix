@@ -61,6 +61,11 @@ name = "verify_sqlite_key_value"
 path = "tests/fixtures/verify_sqlite_key_value.rs"
 required-features = ["sqlite"]
 
+[[example]]
+name = "profile_merge_10k"
+path = "examples/profile_merge_10k.rs"
+required-features = ["sqlite"]
+
 [[bench]]
 name = "sqlite_backend"
 path = "benches/sqlite_backend.rs"

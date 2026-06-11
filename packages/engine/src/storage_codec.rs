@@ -71,6 +71,155 @@ pub(crate) mod vec_option {
     }
 }
 
+/// Opportunistic UUID packing for stored id strings.
+///
+/// Lix-generated ids are canonical lowercase hyphenated UUIDs; as text they
+/// cost 36 bytes where 16 carry the information. Each id is stored as a
+/// 1-byte tag followed by either the raw 16 UUID bytes or the original text.
+/// Only the exact canonical form takes the UUID arm, so decode re-hyphenates
+/// byte-identically; every other string (plugin-chosen entity keys, test
+/// labels) keeps its text form.
+pub(crate) mod id_string {
+    use musli::Context;
+    use musli::de::SequenceDecoder;
+    use musli::en::SequenceEncoder;
+
+    const TAG_TEXT: u8 = 0;
+    const TAG_UUID: u8 = 1;
+
+    pub(crate) fn uuid_bytes_from_canonical(value: &str) -> Option<[u8; 16]> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 36 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        let mut nibble_index = 0usize;
+        for (position, &byte) in bytes.iter().enumerate() {
+            if matches!(position, 8 | 13 | 18 | 23) {
+                if byte != b'-' {
+                    return None;
+                }
+                continue;
+            }
+            // Lowercase hex only: uppercase input would re-hyphenate
+            // differently and break round-tripping.
+            let nibble = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => return None,
+            };
+            out[nibble_index / 2] |= nibble << (4 * (1 - nibble_index % 2));
+            nibble_index += 1;
+        }
+        Some(out)
+    }
+
+    pub(crate) fn uuid_string_from_bytes(bytes: [u8; 16]) -> String {
+        uuid::Uuid::from_bytes(bytes).as_hyphenated().to_string()
+    }
+
+    pub(crate) fn encode_one<E>(value: &str, pack: &mut E) -> Result<(), E::Error>
+    where
+        E: SequenceEncoder,
+    {
+        match uuid_bytes_from_canonical(value) {
+            Some(bytes) => {
+                pack.push(TAG_UUID)?;
+                pack.push(bytes)
+            }
+            None => {
+                pack.push(TAG_TEXT)?;
+                pack.push(value.as_bytes())
+            }
+        }
+    }
+
+    pub(crate) fn decode_one<'de, D>(pack: &mut D) -> Result<String, D::Error>
+    where
+        D: SequenceDecoder<'de>,
+    {
+        let cx = pack.cx();
+        let tag: u8 = pack.next()?;
+        match tag {
+            TAG_UUID => Ok(uuid_string_from_bytes(pack.next::<[u8; 16]>()?)),
+            TAG_TEXT => {
+                let bytes: Vec<u8> = pack.next()?;
+                String::from_utf8(bytes).map_err(|_| cx.message("id string is not UTF-8"))
+            }
+            other => Err(cx.message(format_args!("unknown id string tag {other}"))),
+        }
+    }
+
+}
+
+/// [`id_string`] values behind the same bool prefix as [`option`].
+pub(crate) mod option_id_string {
+    use musli::de::SequenceDecoder;
+    use musli::en::SequenceEncoder;
+
+    #[expect(clippy::ref_option_ref)]
+    pub(crate) fn encode<E>(value: &Option<&str>, encoder: E) -> Result<(), E::Error>
+    where
+        E: musli::Encoder,
+    {
+        encoder.encode_pack_fn(|pack| {
+            pack.push(value.is_some())?;
+            if let Some(value) = value {
+                super::id_string::encode_one(value, pack)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode<'de, D>(decoder: D) -> Result<Option<String>, D::Error>
+    where
+        D: musli::Decoder<'de>,
+    {
+        decoder.decode_pack(|pack| {
+            if pack.next()? {
+                Ok(Some(super::id_string::decode_one(pack)?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+}
+
+/// A length-prefixed sequence of [`id_string`] values.
+pub(crate) mod id_string_seq {
+    use musli::de::SequenceDecoder;
+    use musli::en::SequenceEncoder;
+
+    pub(crate) fn encode<S, E>(value: &S, encoder: E) -> Result<(), E::Error>
+    where
+        S: AsRef<[String]> + ?Sized,
+        E: musli::Encoder,
+    {
+        let parts = value.as_ref();
+        encoder.encode_pack_fn(|pack| {
+            pack.push(parts.len())?;
+            for part in parts {
+                super::id_string::encode_one(part, pack)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decode<'de, D>(decoder: D) -> Result<Vec<String>, D::Error>
+    where
+        D: musli::Decoder<'de>,
+    {
+        decoder.decode_pack(|pack| {
+            let len: usize = pack.next()?;
+            let mut out = Vec::with_capacity(len.min(4096));
+            for _ in 0..len {
+                out.push(super::id_string::decode_one(pack)?);
+            }
+            Ok(out)
+        })
+    }
+}
+
 pub(crate) fn encode<T>(context: &str, value: &T) -> Result<Vec<u8>, LixError>
 where
     T: ?Sized + musli::Encode<musli::mode::Binary>,
@@ -135,6 +284,79 @@ mod tests {
             super::decode("option roundtrip", &bytes).expect("value should decode cleanly");
 
         assert_eq!(decoded, value);
+    }
+
+    #[derive(Debug, Eq, PartialEq, musli::Encode)]
+    #[musli(packed)]
+    struct IdStringEncode<'a> {
+        #[musli(with = crate::storage_codec::id_string_seq)]
+        parts: &'a [String],
+        #[musli(with = crate::storage_codec::option_id_string)]
+        file_id: Option<&'a str>,
+    }
+
+    #[derive(Debug, Eq, PartialEq, musli::Decode)]
+    #[musli(packed)]
+    struct IdStringDecode {
+        #[musli(with = crate::storage_codec::id_string_seq)]
+        parts: Vec<String>,
+        #[musli(with = crate::storage_codec::option_id_string)]
+        file_id: Option<String>,
+    }
+
+    #[test]
+    fn uuid_bytes_from_canonical_accepts_only_the_exact_canonical_form() {
+        use super::id_string::uuid_bytes_from_canonical;
+        let canonical = "019eb805-60d0-71c0-ade3-b0f0efab9d9a";
+        let bytes = uuid_bytes_from_canonical(canonical).expect("canonical uuid should pack");
+        assert_eq!(super::id_string::uuid_string_from_bytes(bytes), canonical);
+
+        for rejected in [
+            "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A",     // uppercase
+            "019eb80560d071c0ade3b0f0efab9d9a",         // simple form
+            "{019eb805-60d0-71c0-ade3-b0f0efab9d9a}",   // braced
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9",      // short
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9ax",    // long
+            "019eb805x60d0-71c0-ade3-b0f0efab9d9aa",    // hyphen replaced
+            "not-a-uuid",
+            "",
+        ] {
+            assert_eq!(uuid_bytes_from_canonical(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn id_strings_round_trip_through_both_arms() {
+        let parts = vec![
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9a".to_string(),
+            "row 5 of sheet 2".to_string(),
+        ];
+        let value = IdStringEncode {
+            parts: &parts,
+            file_id: Some("019eb805-5e65-7270-861d-cb341bc904c8"),
+        };
+        let bytes = super::encode("id string roundtrip", &value).expect("encode");
+        let decoded: IdStringDecode =
+            super::decode("id string roundtrip", &bytes).expect("decode");
+        assert_eq!(decoded.parts, parts);
+        assert_eq!(
+            decoded.file_id.as_deref(),
+            Some("019eb805-5e65-7270-861d-cb341bc904c8")
+        );
+    }
+
+    #[test]
+    fn id_string_none_file_id_round_trips() {
+        let parts = vec!["plain".to_string()];
+        let value = IdStringEncode {
+            parts: &parts,
+            file_id: None,
+        };
+        let bytes = super::encode("id string roundtrip", &value).expect("encode");
+        let decoded: IdStringDecode =
+            super::decode("id string roundtrip", &bytes).expect("decode");
+        assert_eq!(decoded.parts, parts);
+        assert_eq!(decoded.file_id, None);
     }
 
     #[test]

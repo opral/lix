@@ -6,19 +6,6 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
-mod entity_pk_ref_storage {
-    use super::EntityPkRef;
-
-    pub(crate) fn decode<'de, D>(decoder: D) -> Result<EntityPkRef<'de>, D::Error>
-    where
-        D: musli::Decoder<'de>,
-        Vec<&'de str>: musli::Decode<'de, D::Mode, D::Allocator>,
-    {
-        let parts = musli::Decode::decode(decoder)?;
-        Ok(EntityPkRef { parts })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CommitId {
     uuid: Uuid,
@@ -315,6 +302,7 @@ pub(crate) struct CommitRecord {
     pub(crate) commit_id: CommitId,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) change_id: ChangeId,
+    #[musli(with = crate::storage_codec::id_string_seq)]
     pub(crate) author_account_ids: Vec<String>,
     pub(crate) created_at: LixTimestamp,
 }
@@ -384,11 +372,6 @@ pub(crate) struct CommitChangeRefEntryView<'a> {
     pub(crate) change_id: ChangeId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EntityPkRef<'a> {
-    pub(crate) parts: Vec<&'a str>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitProjection {
     Record,
@@ -450,8 +433,9 @@ pub(crate) struct ChangeRecord {
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
+    #[musli(with = crate::storage_codec::id_string_seq)]
     pub(crate) entity_pk: &'a [String],
-    #[musli(with = crate::storage_codec::option)]
+    #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<&'a str>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
@@ -465,10 +449,10 @@ pub(crate) struct ChangeRecordRef<'a> {
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
-    #[musli(with = entity_pk_ref_storage)]
-    pub(crate) entity_pk: EntityPkRef<'a>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) file_id: Option<&'a str>,
+    #[musli(with = crate::storage_codec::id_string_seq)]
+    pub(crate) entity_pk: Vec<String>,
+    #[musli(with = crate::storage_codec::option_id_string)]
+    pub(crate) file_id: Option<String>,
     #[musli(with = crate::json_store::json_slot_storage)]
     pub(crate) snapshot: JsonSlot,
     #[musli(with = crate::json_store::json_slot_storage)]
