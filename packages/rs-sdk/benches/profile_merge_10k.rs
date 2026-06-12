@@ -13,8 +13,6 @@
 //! comparable; absolute times are not.
 
 use lix_sdk::{FsWriteOptions, OpenLixOptions, SqliteBackend, Value, open_lix};
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
 use std::io::{Cursor, Write as _};
 use std::path::Path;
 use std::time::Instant;
@@ -112,21 +110,43 @@ async fn profile_merge_phase(lix: &lix_sdk::Lix<SqliteBackend>, updated_csv: Vec
         .unwrap();
 }
 
+/// Deterministic splitmix64 generator. The bench (e2e.rs) seeds rand's
+/// SmallRng, a dev-dependency this harness deliberately avoids; the fixture
+/// bytes therefore differ from the bench's, but the harness only needs
+/// setup and merge to agree with each other.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform value in `0..bound` (bound > 0); modulo bias is irrelevant
+    /// for fixture shuffling.
+    fn next_below(&mut self, bound: usize) -> usize {
+        usize::try_from(self.next_u64() % bound as u64).expect("bound fits usize")
+    }
+}
+
 fn random_csv_rows(prefix: &str, count: usize, seed: u64) -> Vec<String> {
-    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut rng = SplitMix64(seed);
     (0..count)
         .map(|offset| {
             format!(
                 "{prefix}-{offset:05},{:016x},{:016x}",
-                rng.random::<u64>(),
-                rng.random::<u64>()
+                rng.next_u64(),
+                rng.next_u64()
             )
         })
         .collect()
 }
 
 fn randomly_merge_csv_rows(initial_rows: &[String], new_rows: &[String], seed: u64) -> Vec<String> {
-    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut rng = SplitMix64(seed);
     let mut merged = Vec::with_capacity(initial_rows.len() + new_rows.len());
     let mut initial_index = 0usize;
     let mut new_index = 0usize;
@@ -139,7 +159,7 @@ fn randomly_merge_csv_rows(initial_rows: &[String], new_rows: &[String], seed: u
         } else {
             let remaining_initial = initial_rows.len() - initial_index;
             let remaining_new = new_rows.len() - new_index;
-            rng.random_range(0..(remaining_initial + remaining_new)) < remaining_initial
+            rng.next_below(remaining_initial + remaining_new) < remaining_initial
         };
 
         if take_initial {
@@ -164,8 +184,17 @@ fn csv_bytes_from_rows(rows: &[String]) -> Vec<u8> {
 }
 
 fn build_csv_plugin() -> Vec<u8> {
-    let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv")))
-        .expect("read bindep-built CSV plugin wasm");
+    // option_env: the bindep artifact env var is absent in some CI target
+    // contexts; this harness is only ever run manually, so resolve at
+    // runtime and fail with instructions instead of failing the compile.
+    let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv") else {
+        eprintln!(
+            "CSV plugin wasm path unavailable; build via `cargo build --bench \
+             profile_merge_10k --features sqlite` so cargo provides the bindep artifact"
+        );
+        std::process::exit(2);
+    };
+    let wasm = std::fs::read(Path::new(wasm_path)).expect("read bindep-built CSV plugin wasm");
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
