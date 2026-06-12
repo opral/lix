@@ -176,7 +176,8 @@ pub(crate) struct LogicalPrimaryKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransactionFileData {
     pub(crate) file_id: String,
-    pub(crate) path: String,
+    pub(crate) path: Option<String>,
+    pub(crate) filename: Option<String>,
     pub(crate) branch_id: String,
     pub(crate) global: bool,
     pub(crate) untracked: bool,

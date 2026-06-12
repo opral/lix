@@ -232,7 +232,10 @@ impl Drop for TimeoutTicker {
 
 impl From<WasmPluginFile> for plugin_bindings::exports::lix::plugin::api::File {
     fn from(file: WasmPluginFile) -> Self {
-        Self { data: file.data }
+        Self {
+            filename: file.filename,
+            data: file.data,
+        }
     }
 }
 

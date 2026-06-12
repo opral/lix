@@ -6,7 +6,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    lix_directory_path_insert_rejects_overlong_paths_and_segments,
+    lix_directory_path_insert_preserves_long_opaque_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -18,58 +18,50 @@ simulation_test!(
         );
 
         let long_segment = "a".repeat(256);
-        let segment_error = session
+        session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES ('dir-long-segment', $1)",
                 &[Value::Text(format!("/{long_segment}/"))],
             )
             .await
-            .expect_err("overlong directory path segment should be rejected");
-        assert_eq!(segment_error.code, LixError::CODE_INVALID_PARAM);
+            .expect("long opaque directory path segment should be accepted");
 
         let long_path = format!("/{}/", ["abcd"; 820].join("/"));
-        let path_error = session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-long-path', $1)",
-                &[Value::Text(long_path)],
-            )
-            .await
-            .expect_err("overlong directory path should be rejected");
-        assert_eq!(path_error.code, LixError::CODE_INVALID_PARAM);
-
-        let encoded_segment_at_limit = "%61".repeat(255);
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-encoded-limit', $1)",
-                &[Value::Text(format!("/{encoded_segment_at_limit}/"))],
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-long-path', $1)",
+                &[Value::Text(long_path.clone())],
             )
             .await
-            .expect("percent-encoded segment should be measured after canonicalization");
+            .expect("long opaque directory path should be accepted");
 
-        let encoded_segment_over_limit = "%61".repeat(256);
-        let encoded_segment_error = session
+        let result = session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-encoded-over-limit', $1)",
-                &[Value::Text(format!("/{encoded_segment_over_limit}/"))],
+                "SELECT id, path FROM lix_directory \
+                 WHERE id IN ('dir-long-segment', 'dir-long-path') \
+                 ORDER BY id",
+                &[],
             )
             .await
-            .expect_err("overlong canonical segment should be rejected");
-        assert_eq!(encoded_segment_error.code, LixError::CODE_INVALID_PARAM);
-
-        let huge_path = format!("/{}/", "a".repeat(1024 * 1024));
-        let huge_error = session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-huge-path', $1)",
-                &[Value::Text(huge_path)],
-            )
-            .await
-            .expect_err("huge path input should be rejected without runtime internals");
-        assert_eq!(huge_error.code, LixError::CODE_INVALID_PARAM);
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("dir-long-path".to_string()),
+                    Value::Text(long_path),
+                ],
+                vec![
+                    Value::Text("dir-long-segment".to_string()),
+                    Value::Text(format!("/{long_segment}/")),
+                ],
+            ],
+        );
     }
 );
 
 simulation_test!(
-    lix_directory_path_insert_rejects_percent_encoded_forbidden_code_points,
+    lix_directory_path_insert_preserves_percent_spelling,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -81,18 +73,48 @@ simulation_test!(
         );
 
         for (id, path) in [
+            ("dir-percent-a", "/docs/%61/"),
             ("dir-percent-nul", "/docs/%00evil/"),
             ("dir-percent-bidi", "/docs/%E2%80%AEevil/"),
         ] {
-            let error = session
+            session
                 .execute(
                     &format!("INSERT INTO lix_directory (id, path) VALUES ('{id}', '{path}')"),
                     &[],
                 )
                 .await
-                .expect_err("percent-encoded forbidden path code point should be rejected");
-            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+                .expect("percent spelling should be stored literally");
         }
+
+        let result = session
+            .execute(
+                "SELECT id, path, name FROM lix_directory \
+                 WHERE id IN ('dir-percent-a', 'dir-percent-bidi', 'dir-percent-nul') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("dir-percent-a".to_string()),
+                    Value::Text("/docs/%61/".to_string()),
+                    Value::Text("%61".to_string()),
+                ],
+                vec![
+                    Value::Text("dir-percent-bidi".to_string()),
+                    Value::Text("/docs/%E2%80%AEevil/".to_string()),
+                    Value::Text("%E2%80%AEevil".to_string()),
+                ],
+                vec![
+                    Value::Text("dir-percent-nul".to_string()),
+                    Value::Text("/docs/%00evil/".to_string()),
+                    Value::Text("%00evil".to_string()),
+                ],
+            ],
+        );
     }
 );
 
@@ -470,7 +492,7 @@ simulation_test!(
             &engine,
         );
 
-        for path in ["/a/../b/", "/a/%2e%2e/b/", "/a/./b/"] {
+        for path in ["/a/../b/", "/a/./b/"] {
             let error = session
                 .execute(
                     "INSERT INTO lix_directory (path) VALUES ($1)",
@@ -487,6 +509,37 @@ simulation_test!(
             .await
             .expect("directory read should succeed");
         assert_eq!(result.len(), 0);
+    }
+);
+
+simulation_test!(
+    lix_directory_descriptor_write_rejects_slash_in_name_at_schema_boundary,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES (lix_json('[\"dir-slash\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
+                &[Value::Json(json!({
+                    "id": "dir-slash",
+                    "parent_id": null,
+                    "name": "nested/name",
+                }))],
+            )
+            .await
+            .expect_err("directory descriptor name must keep '/' as structural separator");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(error.message.contains("lix_directory_descriptor"));
     }
 );
 
@@ -533,7 +586,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_descriptor_writes_use_canonical_path_segment_validation,
+    lix_directory_descriptor_writes_preserve_opaque_names,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -547,37 +600,60 @@ simulation_test!(
         session
             .execute("INSERT INTO lix_directory (path) VALUES ('/Café/')", &[])
             .await
-            .expect("canonical directory insert should succeed");
+            .expect("directory insert should succeed");
 
-        let nfc_collision = session
-			.execute(
-				"INSERT INTO lix_state (\
-	             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-	             ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
-				&[Value::Json(json!({
-					"id": "dir-cafe-decomposed",
-					"parent_id": null,
+        session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
+                &[Value::Json(json!({
+                    "id": "dir-cafe-decomposed",
+                    "parent_id": null,
                     "name": "Cafe\u{301}",
                                     }))],
             )
             .await
-            .expect_err("decomposed descriptor name should normalize before uniqueness");
-        assert_eq!(nfc_collision.code, LixError::CODE_UNIQUE);
+            .expect("decomposed descriptor name should remain distinct");
 
-        let zero_width = session
-			.execute(
-				"INSERT INTO lix_state (\
-	             entity_pk, schema_key, file_id, snapshot_content, global, untracked\
-	             ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
-				&[Value::Json(json!({
-					"id": "dir-zero-width",
-					"parent_id": null,
+        session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_pk, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
+                &[Value::Json(json!({
+                    "id": "dir-zero-width",
+                    "parent_id": null,
                     "name": "zero\u{200D}width",
                                     }))],
             )
             .await
-            .expect_err("descriptor name should reject zero-width characters");
-        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
+            .expect("zero-width descriptor name should be preserved");
+
+        let result = session
+            .execute(
+                "SELECT id, path, name FROM lix_directory \
+                 WHERE id IN ('dir-cafe-decomposed', 'dir-zero-width') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("dir-cafe-decomposed".to_string()),
+                    Value::Text("/Cafe\u{301}/".to_string()),
+                    Value::Text("Cafe\u{301}".to_string()),
+                ],
+                vec![
+                    Value::Text("dir-zero-width".to_string()),
+                    Value::Text("/zero\u{200D}width/".to_string()),
+                    Value::Text("zero\u{200D}width".to_string()),
+                ],
+            ],
+        );
     }
 );
 

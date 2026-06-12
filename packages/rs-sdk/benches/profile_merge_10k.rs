@@ -55,7 +55,7 @@ fn main() {
             ))
             .await
             .unwrap();
-            lix.install_plugin_archive(&plugin).await.unwrap();
+            lix.install_plugin(&plugin).await.unwrap();
             let initial_csv = csv_bytes_from_rows(&initial_rows);
             let start = Instant::now();
             lix.write_file(CSV_PATH, initial_csv, FsWriteOptions::default())

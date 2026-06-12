@@ -2,15 +2,15 @@ use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::binary_cas::BlobDataReader;
-use crate::common::{ParsedFilePath, directory_ancestor_paths, normalize_directory_path};
+use crate::common::LixPath;
 use crate::filesystem::{
     BlobRefRowInput, DirectoryDeleteInput, DirectoryPathResolver, FileDeleteInput,
-    FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemDirEntryKind,
-    FilesystemEntry, FilesystemIndex, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
+    FileDescriptorRowInput, FilesystemDeletePlan, FilesystemDirEntryKind, FilesystemEntry,
+    FilesystemIndex, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
     directory_path_resolvers_from_state_rows, file_descriptor_row, filesystem_conflict_error,
     filesystem_schema_keys, filesystem_storage_scope_key, load_filesystem_index,
-    plan_directory_delete, plan_file_delete, plan_file_path_write, plan_recursive_directory_delete,
-    wrong_kind_error,
+    plan_directory_delete, plan_file_delete, plan_parsed_file_path_write,
+    plan_recursive_directory_delete, wrong_kind_error,
 };
 use crate::live_state::{
     LiveStateFileScanRequest, LiveStateFilter, LiveStateReader, LiveStateScanRequest,
@@ -18,7 +18,8 @@ use crate::live_state::{
 };
 use crate::plugin::{
     InstalledPlugin, is_plugin_storage_path, load_installed_plugins_from_filesystem,
-    plugin_state_live_state_projection, reject_normal_plugin_storage_mutation,
+    plugin_key_from_archive_path, plugin_state_live_state_projection,
+    plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
     render_materialized_plugin_file, retain_plugin_state_rows, select_plugin_for_path,
 };
 use crate::sql2::SqlWriteExecutionContext;
@@ -91,10 +92,8 @@ where
         data: Vec<u8>,
         options: FsWriteOptions,
     ) -> Result<(), LixError> {
-        let path = ParsedFilePath::try_from_path(path)?
-            .normalized_path
-            .to_string();
-        reject_normal_plugin_storage_mutation(&path, "fs.write_file")?;
+        let parsed_path = LixPath::try_from_file_path(path)?;
+        let path = path.to_string();
         self.session.with_write_transaction(|transaction| {
             Box::pin(async move {
                 let branch_id = transaction.active_branch_id().to_string();
@@ -140,7 +139,8 @@ where
                             }
                             file_data.push(TransactionFileData {
                                 file_id: file.id.clone(),
-                                path: path.clone(),
+                                path: Some(path.clone()),
+                                filename: Some(file.name.clone()),
                                 branch_id: context.branch_id.clone(),
                                 global: context.global,
                                 untracked: context.untracked,
@@ -172,8 +172,12 @@ where
                     if options.untracked {
                         filesystem.reject_tracked_path_collision(&path, "fs.write_file")?;
                     }
-                    filesystem.reject_cross_lane_namespace_collision(
-                        namespace_paths_for_file_write(&path),
+                    let path_segments = parsed_path
+                        .segments()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                    filesystem.reject_cross_lane_segments_collision(
+                        &path_segments,
                         options.untracked,
                         "fs.write_file",
                     )?;
@@ -190,14 +194,14 @@ where
                     let resolver = resolvers
                         .entry(key)
                         .or_insert_with(DirectoryPathResolver::default);
-                    let plan = plan_file_path_write(
+                    let file_id =
+                        plugin_key_from_archive_path(&path).map(|key| plugin_storage_archive_file_id(&key));
+                    let plan = plan_parsed_file_path_write(
                         resolver,
-                        FilePathWriteInput {
-                            id: None,
-                            path,
-                            data: Some(data),
-                            context,
-                        },
+                        parsed_path,
+                        file_id,
+                        Some(data),
+                        context,
                         &mut || transaction.functions().call_uuid_v7().to_string(),
                     )?;
                     transaction
@@ -216,9 +220,7 @@ where
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, LixError> {
-        let path = ParsedFilePath::try_from_path(path)?
-            .normalized_path
-            .to_string();
+        let path = LixPath::try_from_file_path(path)?.to_file_path();
         let _operation_guard = self.session.begin_session_operation()?;
         let read = SharedStorageRead::new(
             self.session
@@ -255,7 +257,8 @@ where
     }
 
     pub async fn mkdir(&self, path: &str, options: FsMkdirOptions) -> Result<(), LixError> {
-        let path = normalize_directory_path(path)?;
+        let parsed_path = LixPath::try_from_directory_path(path)?;
+        let path = path.to_string();
         self.session.with_write_transaction(|transaction| {
             Box::pin(async move {
                 if path == "/" {
@@ -282,8 +285,12 @@ where
                 if options.untracked {
                     filesystem.reject_tracked_path_collision(&path, "fs.mkdir")?;
                 }
-                filesystem.reject_cross_lane_namespace_collision(
-                    namespace_paths_for_directory_write(&path),
+                let path_segments = parsed_path
+                    .segments()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                filesystem.reject_cross_lane_segments_collision(
+                    &path_segments,
                     options.untracked,
                     "fs.mkdir",
                 )?;
@@ -300,8 +307,8 @@ where
                 let resolver = resolvers
                     .entry(key)
                     .or_insert_with(DirectoryPathResolver::default);
-                let rows = resolver.create_directory_path_with_leaf_id(
-                    &path,
+                let rows = resolver.create_parsed_directory_path_with_leaf_id(
+                    parsed_path,
                     None,
                     context,
                     &mut || transaction.functions().call_uuid_v7().to_string(),
@@ -321,7 +328,7 @@ where
     }
 
     pub async fn readdir(&self, path: &str) -> Result<Option<Vec<FsDirEntry>>, LixError> {
-        let path = normalize_directory_path(path)?;
+        let path = LixPath::try_from_directory_path(path)?.to_directory_path();
         let _operation_guard = self.session.begin_session_operation()?;
         let read = SharedStorageRead::new(
             self.session
@@ -349,7 +356,7 @@ where
     }
 
     pub async fn rm(&self, path: &str, options: FsRmOptions) -> Result<(), LixError> {
-        let rm_path = normalize_rm_path(path)?;
+        let rm_path = parse_rm_path(path)?;
         if matches!(rm_path, RmPath::Directory(ref path) if path == "/") {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
@@ -361,10 +368,10 @@ where
                 let branch_id = transaction.active_branch_id().to_string();
                 let rows = scan_filesystem_rows(transaction, &branch_id).await?;
                 let filesystem = FilesystemIndex::from_live_rows(rows)?;
-                let Some((normalized_path, entry)) = resolve_rm_entry(&filesystem, &rm_path)? else {
+                let Some((path, entry)) = resolve_rm_entry(&filesystem, &rm_path)? else {
                     return Ok(());
                 };
-                reject_plugin_storage_rm(&normalized_path, entry, &filesystem, options.recursive)?;
+                reject_plugin_storage_rm(&path, entry, &filesystem, options.recursive)?;
                 let metadata = transaction_metadata(options.metadata, "fs.rm metadata")?;
                 let plan = match entry {
                     FilesystemEntry::File(file) => {
@@ -381,7 +388,7 @@ where
                         if has_children && !options.recursive {
                             return Err(LixError::new(
                                 LixError::CODE_CONSTRAINT_VIOLATION,
-                                format!("fs.rm cannot remove non-empty directory {normalized_path:?} without recursive=true"),
+                                format!("fs.rm cannot remove non-empty directory {path:?} without recursive=true"),
                             ));
                         }
                         let mut context = directory.context();
@@ -404,17 +411,18 @@ where
 }
 
 fn reject_plugin_storage_rm(
-    normalized_path: &str,
+    removed_path: &str,
     entry: &FilesystemEntry,
     filesystem: &FilesystemIndex,
     recursive: bool,
 ) -> Result<(), LixError> {
-    reject_normal_plugin_storage_mutation(normalized_path, "fs.rm")?;
+    reject_normal_plugin_storage_mutation(removed_path, "fs.rm")?;
     if !recursive || !matches!(entry, FilesystemEntry::Directory(_)) {
         return Ok(());
     }
-    if filesystem.file_entries().any(|(path, _)| {
-        is_plugin_storage_path(path) && path_is_inside_directory(path, normalized_path)
+    if filesystem.file_entries().any(|(candidate_path, _)| {
+        is_plugin_storage_path(candidate_path)
+            && path_is_inside_directory(candidate_path, removed_path)
     }) {
         return reject_normal_plugin_storage_mutation(
             "/.lix_system/plugins/",
@@ -528,16 +536,16 @@ enum RmPath {
     FileOrDirectory(String),
 }
 
-fn normalize_rm_path(path: &str) -> Result<RmPath, LixError> {
-    if path.ends_with('/') {
-        Ok(RmPath::Directory(normalize_directory_path(path)?))
-    } else {
-        Ok(RmPath::FileOrDirectory(
-            ParsedFilePath::try_from_path(path)?
-                .normalized_path
-                .to_string(),
-        ))
+fn parse_rm_path(path: &str) -> Result<RmPath, LixError> {
+    if let Ok(directory_path) =
+        LixPath::try_from_directory_path(path).map(|path| path.to_directory_path())
+    {
+        return Ok(RmPath::Directory(directory_path));
     }
+
+    Ok(RmPath::FileOrDirectory(
+        LixPath::try_from_file_path(path)?.to_file_path(),
+    ))
 }
 
 fn resolve_rm_entry<'a>(
@@ -549,8 +557,9 @@ fn resolve_rm_entry<'a>(
             if let Some(entry @ FilesystemEntry::Directory(_)) = filesystem.entry(directory_path) {
                 return Ok(Some((directory_path.clone(), entry)));
             }
-            let file_path = directory_path.trim_end_matches('/');
-            if matches!(filesystem.entry(file_path), Some(FilesystemEntry::File(_))) {
+            if let Some(file_path) = directory_path.strip_suffix('/')
+                && matches!(filesystem.entry(file_path), Some(FilesystemEntry::File(_)))
+            {
                 return Err(wrong_kind_error(file_path, "directory", "file"));
             }
             Ok(None)
@@ -559,7 +568,10 @@ fn resolve_rm_entry<'a>(
             if let Some(entry @ FilesystemEntry::File(_)) = filesystem.entry(file_path) {
                 return Ok(Some((file_path.clone(), entry)));
             }
-            let directory_path = format!("{file_path}/");
+            let directory_path = LixPath::try_from_file_path(file_path)
+                .expect("file path should parse before converting to a directory path")
+                .to_file_path()
+                + "/";
             if let Some(entry @ FilesystemEntry::Directory(_)) = filesystem.entry(&directory_path) {
                 return Ok(Some((directory_path, entry)));
             }
@@ -570,16 +582,4 @@ fn resolve_rm_entry<'a>(
 
 fn lane_name(untracked: bool) -> &'static str {
     if untracked { "untracked" } else { "tracked" }
-}
-
-fn namespace_paths_for_file_write(path: &str) -> Vec<String> {
-    let mut paths = directory_ancestor_paths(path);
-    paths.push(path.to_string());
-    paths
-}
-
-fn namespace_paths_for_directory_write(path: &str) -> Vec<String> {
-    let mut paths = directory_ancestor_paths(path);
-    paths.push(path.to_string());
-    paths
 }

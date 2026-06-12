@@ -44,9 +44,6 @@ use crate::sql2::branch_scope::{
     resolve_write_branch_scope,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
-use crate::sql2::filesystem_predicates::{
-    FilesystemPathKind, canonicalize_filesystem_path_filters,
-};
 use crate::sql2::predicate_typecheck::{
     canonicalize_json_identity_text_filters, validate_json_predicate_filters,
 };
@@ -57,10 +54,10 @@ use crate::transaction::types::{
 };
 use crate::{LixError, parse_row_metadata_value, serialize_row_metadata};
 
-use crate::filesystem::VisibleFilesystem;
 use crate::filesystem::{
-    DirectoryDescriptorWriteIntent, DirectoryPathResolver, FilesystemDeletePlan,
-    FilesystemRowContext, directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
+    DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
+    FilesystemDeletePlan, FilesystemRowContext, VisibleFilesystem, derive_directory_paths,
+    directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
     filesystem_storage_scope_key, plan_recursive_directory_delete,
 };
 use crate::sql2::result_metadata::json_field;
@@ -262,7 +259,7 @@ impl TableProvider for LixDirectoryProvider {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
-        let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::Directory)?;
+        let filters = filters.to_vec();
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
@@ -310,8 +307,6 @@ impl TableProvider for LixDirectoryProvider {
         let write_ctx = self
             .write_access
             .require_write("DELETE FROM lix_directory")?;
-        let filters =
-            canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::Directory)?;
         let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
@@ -346,8 +341,6 @@ impl TableProvider for LixDirectoryProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let write_ctx = self.write_access.require_write("UPDATE lix_directory")?;
         validate_lix_directory_update_assignments(&self.schema, &assignments)?;
-        let filters =
-            canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::Directory)?;
         let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
@@ -944,6 +937,20 @@ struct DirectoryDescriptorRecord {
     live: MaterializedLiveStateRow,
 }
 
+impl DirectoryPathRecord for DirectoryDescriptorRecord {
+    type Key = (String, String);
+
+    fn parent_key(&self, key: &Self::Key) -> Option<Self::Key> {
+        self.parent_id
+            .as_ref()
+            .map(|parent_id| (key.0.clone(), parent_id.clone()))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DirectoryDescriptorSnapshot {
     id: String,
@@ -1000,7 +1007,7 @@ fn lix_directory_update_write_rows_from_batch(
                 .entry(directory_path_resolver_key(&context))
                 .or_default();
             resolver
-                .reserve_directory(parent_id.clone(), name.clone(), directory_id.clone())
+                .update_directory(parent_id.clone(), name.clone(), directory_id.clone())
                 .map_err(lix_error_to_datafusion_error)?;
         }
         rows.push(directory_descriptor_write_row(
@@ -1172,6 +1179,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                     context,
                     generate_directory_id,
                 )
+                .map_err(|error| map_lix_directory_insert_error(error, surface_name, &directory_id))
                 .map_err(lix_error_to_datafusion_error)?;
             attach_lix_directory_insert_origin(&mut planned_rows, surface_name, &directory_id);
             rows.extend(planned_rows);
@@ -1187,6 +1195,9 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                     .or_insert_with(DirectoryPathResolver::default);
                 resolver
                     .reserve_directory(parent_id.clone(), name.clone(), directory_id.clone())
+                    .map_err(|error| {
+                        map_lix_directory_insert_error(error, surface_name, directory_id)
+                    })
                     .map_err(lix_error_to_datafusion_error)?;
             }
         }
@@ -1202,6 +1213,24 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         rows.push(row);
     }
     Ok(rows)
+}
+
+fn map_lix_directory_insert_error(
+    error: LixError,
+    surface_name: &str,
+    directory_id: &str,
+) -> LixError {
+    let directory_id_conflict =
+        format!("unique constraint violation on lix_directory.id for value {directory_id:?}");
+    if error.code == LixError::CODE_UNIQUE && error.message == directory_id_conflict {
+        return LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "primary-key constraint violation on table '{surface_name}': INSERT would duplicate id '{directory_id}'"
+            ),
+        );
+    }
+    error
 }
 
 fn attach_lix_directory_insert_origin(
@@ -1355,7 +1384,11 @@ fn lix_directory_record_batch(
         });
     }
 
-    let directory_paths = derive_directory_paths(&directory_rows)?;
+    let directory_paths = derive_directory_paths(
+        directory_rows
+            .iter()
+            .map(|row| ((row.live.branch_id.clone(), row.id.clone()), row)),
+    )?;
     let mut ids = Vec::new();
     let mut paths = Vec::new();
     let mut parent_ids = Vec::new();
@@ -1437,78 +1470,6 @@ fn lix_directory_record_batch(
             format!("sql2 failed to build lix_directory record batch: {error}"),
         )
     })
-}
-
-fn derive_directory_paths(
-    rows: &[DirectoryDescriptorRecord],
-) -> std::result::Result<BTreeMap<(String, String), String>, LixError> {
-    let mut by_branch = BTreeMap::<String, BTreeMap<String, &DirectoryDescriptorRecord>>::new();
-    for row in rows {
-        by_branch
-            .entry(row.live.branch_id.clone())
-            .or_default()
-            .insert(row.id.clone(), row);
-    }
-
-    let mut paths = BTreeMap::<(String, String), String>::new();
-    for (branch_id, records) in by_branch {
-        for directory_id in records.keys() {
-            derive_directory_path_for(
-                &branch_id,
-                directory_id,
-                &records,
-                &mut paths,
-                &mut BTreeSet::new(),
-            )?;
-        }
-    }
-    Ok(paths)
-}
-
-fn derive_directory_path_for(
-    branch_id: &str,
-    directory_id: &str,
-    records: &BTreeMap<String, &DirectoryDescriptorRecord>,
-    paths: &mut BTreeMap<(String, String), String>,
-    visiting: &mut BTreeSet<String>,
-) -> std::result::Result<Option<String>, LixError> {
-    if let Some(path) = paths.get(&(branch_id.to_string(), directory_id.to_string())) {
-        return Ok(Some(path.clone()));
-    }
-    if !visiting.insert(directory_id.to_string()) {
-        return Err(directory_parent_cycle_error(branch_id, directory_id));
-    }
-    let Some(row) = records.get(directory_id) else {
-        visiting.remove(directory_id);
-        return Ok(None);
-    };
-    let path = match row.parent_id.as_deref() {
-        Some(parent_id) => {
-            let Some(parent_path) =
-                derive_directory_path_for(branch_id, parent_id, records, paths, visiting)?
-            else {
-                visiting.remove(directory_id);
-                return Ok(None);
-            };
-            format!("{parent_path}{}/", row.name)
-        }
-        None => format!("/{}/", row.name),
-    };
-    visiting.remove(directory_id);
-    paths.insert(
-        (branch_id.to_string(), directory_id.to_string()),
-        path.clone(),
-    );
-    Ok(Some(path))
-}
-
-fn directory_parent_cycle_error(branch_id: &str, directory_id: &str) -> LixError {
-    LixError::new(
-        LixError::CODE_CONSTRAINT_VIOLATION,
-        format!(
-            "lix_directory_descriptor parent_id cycle in branch '{branch_id}' while resolving directory '{directory_id}'"
-        ),
-    )
 }
 
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
@@ -1874,9 +1835,9 @@ mod tests {
     };
 
     use super::{
-        BranchBinding, DirectoryDescriptorRecord, LixDirectoryInsertSink,
-        derive_directory_path_for, directory_path_resolvers_from_state_rows,
-        lix_directory_by_branch_schema, lix_directory_insert_origin, lix_directory_record_batch,
+        BranchBinding, DirectoryDescriptorRecord, LixDirectoryInsertSink, derive_directory_paths,
+        directory_path_resolvers_from_state_rows, lix_directory_by_branch_schema,
+        lix_directory_insert_origin, lix_directory_record_batch,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
@@ -2116,21 +2077,17 @@ mod tests {
                 "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
             ),
         };
-        let mut records = BTreeMap::new();
-        records.insert(root.id.clone(), &root);
-        records.insert(child.id.clone(), &child);
-        let mut paths = BTreeMap::new();
+        let records = [root, child];
+        let paths = derive_directory_paths(
+            records
+                .iter()
+                .map(|row| ((row.live.branch_id.clone(), row.id.clone()), row)),
+        )
+        .expect("path derivation should succeed");
 
         assert_eq!(
-            derive_directory_path_for(
-                "branch-a",
-                "dir-guides",
-                &records,
-                &mut paths,
-                &mut BTreeSet::new()
-            )
-            .expect("path derivation should succeed"),
-            Some("/docs/guides/".to_string())
+            paths.get(&("branch-a".to_string(), "dir-guides".to_string())),
+            Some(&"/docs/guides/".to_string())
         );
     }
 

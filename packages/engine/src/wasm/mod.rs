@@ -6,6 +6,7 @@ use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPluginFile {
+    pub filename: Option<String>,
     pub data: Vec<u8>,
 }
 

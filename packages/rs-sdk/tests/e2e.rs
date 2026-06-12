@@ -1,10 +1,10 @@
 use lix_sdk::{
-    CreateBranchOptions, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, Lix,
-    LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
-    open_lix, open_lix_with_backend,
+    CreateBranchOptions, FsWriteOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 #[cfg(feature = "sqlite")]
-use lix_sdk::{FsBackend, SqliteBackend};
+use lix_sdk::{FsBackend, FsMkdirOptions, FsRmOptions, SqliteBackend, open_lix_with_backend};
+#[cfg(feature = "sqlite")]
 use std::path::Path;
 #[cfg(feature = "sqlite")]
 use std::time::{Duration, Instant};
@@ -589,15 +589,30 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
-async fn filesystem_rejects_invalid_lix_path_names() {
+async fn filesystem_imports_opaque_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
+    std::fs::write(tempdir.path().join("#hash.txt"), b"hash").unwrap();
 
-    let Err(error) = FsBackend::open(tempdir.path()).await else {
-        panic!("invalid filesystem path should fail");
-    };
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+    assert_eq!(
+        lix.read_file("/bad%name.txt").await.unwrap().as_deref(),
+        Some(b"bad".as_slice())
+    );
+    assert_eq!(
+        lix.read_file("/#hash.txt").await.unwrap().as_deref(),
+        Some(b"hash".as_slice())
+    );
+    lix.write_file(
+        "/written%23.txt",
+        b"written".to_vec(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("written%23.txt"), Some(b"written"));
+    lix.close().await.unwrap();
 }
 
 #[tokio::test]

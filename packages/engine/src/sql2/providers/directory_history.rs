@@ -35,6 +35,9 @@ use crate::sql2::history_route::{
     HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor,
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
 };
+use crate::sql2::providers::filesystem_history_path::{
+    HistoryDirectoryPathRecord, resolve_history_directory_path,
+};
 use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
 
@@ -268,6 +271,24 @@ struct DirectoryHistoryRecord {
     entry: HistoryEntry,
 }
 
+impl HistoryDirectoryPathRecord for DirectoryHistoryRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    fn entry(&self) -> &HistoryEntry {
+        &self.entry
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DirectoryHistoryOutputRow {
     entity_pk: String,
@@ -338,7 +359,7 @@ where
             continue;
         };
         let path = if visible_descriptor.name.is_some() {
-            resolve_directory_history_path(
+            resolve_history_directory_path(
                 &visible_descriptor.id,
                 &event.start_commit_id,
                 event.depth,
@@ -457,55 +478,6 @@ fn nearest_directory_descriptor<'a>(
                 .cmp(&right.entry.depth)
                 .then(left.entry.change.id.cmp(&right.entry.change.id))
         })
-}
-
-fn resolve_directory_history_path(
-    directory_id: &str,
-    start_commit_id: &str,
-    target_depth: u32,
-    directories: &[DirectoryHistoryRecord],
-    cache: &mut BTreeMap<String, Option<String>>,
-    visiting: &mut BTreeSet<String>,
-) -> Option<String> {
-    if let Some(path) = cache.get(directory_id) {
-        return path.clone();
-    }
-    if !visiting.insert(directory_id.to_string()) {
-        cache.insert(directory_id.to_string(), None);
-        return None;
-    }
-    let directory = directories
-        .iter()
-        .filter(|directory| {
-            directory.name.is_some()
-                && directory.id == directory_id
-                && directory.entry.start_commit_id == start_commit_id
-                && directory.entry.depth >= target_depth
-        })
-        .min_by(|left, right| {
-            left.entry
-                .depth
-                .cmp(&right.entry.depth)
-                .then(left.entry.change.id.cmp(&right.entry.change.id))
-        })?;
-    let name = directory.name.as_ref()?;
-    let path = match directory.parent_id.as_deref() {
-        Some(parent_id) => {
-            let parent_path = resolve_directory_history_path(
-                parent_id,
-                start_commit_id,
-                target_depth,
-                directories,
-                cache,
-                visiting,
-            )?;
-            format!("{parent_path}{name}/")
-        }
-        None => format!("/{name}/"),
-    };
-    visiting.remove(directory_id);
-    cache.insert(directory_id.to_string(), Some(path.clone()));
-    Some(path)
 }
 
 fn directory_history_record_batch(

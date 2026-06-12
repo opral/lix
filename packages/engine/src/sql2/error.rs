@@ -33,8 +33,7 @@ fn lix_error_from_datafusion_error(error: &DataFusionError) -> Option<LixError> 
 
 fn normalize_external_sql_error(error: LixError) -> LixError {
     let lower = error.message.to_ascii_lowercase();
-    if (error.code.starts_with("LIX_ERROR_PATH_")
-        && error.code != "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT")
+    if error.code.starts_with("LIX_ERROR_PATH_")
         || error.code == LixError::CODE_INVALID_JSON_PATH
         || (error.code == LixError::CODE_TYPE_MISMATCH
             && lower.contains("cannot store blob values directly"))

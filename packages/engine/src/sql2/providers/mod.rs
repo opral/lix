@@ -14,6 +14,7 @@ mod entity;
 mod entity_history;
 mod file;
 mod file_history;
+mod filesystem_history_path;
 mod history;
 mod lix_state;
 

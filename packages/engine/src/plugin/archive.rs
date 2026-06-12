@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
-use std::path::{Component, Path};
 
 use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
@@ -35,7 +34,7 @@ pub(crate) fn parse_plugin_archive_for_install(
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
 
-    let entry_path = normalize_archive_path_for_install(&validated_manifest.manifest.entry)?;
+    let entry_path = parse_archive_path_for_install(&validated_manifest.manifest.entry)?;
     let wasm_bytes = files
         .get(&entry_path)
         .ok_or_else(|| LixError {
@@ -53,8 +52,8 @@ pub(crate) fn parse_plugin_archive_for_install(
     let mut schemas = Vec::with_capacity(validated_manifest.manifest.schemas.len());
     let mut seen_schema_keys = BTreeSet::<String>::new();
     for schema_path in &validated_manifest.manifest.schemas {
-        let normalized_schema_path = normalize_archive_path_for_install(schema_path)?;
-        let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
+        let schema_entry_path = parse_archive_path_for_install(schema_path)?;
+        let schema_bytes = files.get(&schema_entry_path).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             message: format!("Plugin archive is missing schema file '{schema_path}'"),
             hint: None,
@@ -116,7 +115,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             message: format!(
-                "plugin materialization: archive '{}' key mismatch: path key '{}' vs manifest key '{}'",
+                "plugin materialization: archive '{}' key mismatch: file id key '{}' vs manifest key '{}'",
                 archive_path, plugin_key, validated_manifest.manifest.key
             ),
             hint: None,
@@ -125,7 +124,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     }
 
     let entry_path =
-        normalize_plugin_archive_path_for_materialization(&validated_manifest.manifest.entry)?;
+        parse_plugin_archive_path_for_materialization(&validated_manifest.manifest.entry)?;
     let wasm = files.get(&entry_path).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!(
@@ -141,9 +140,8 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     let content_type = manifest.file_match.content_type;
     let mut schema_keys = Vec::with_capacity(manifest.schemas.len());
     for schema_path in &manifest.schemas {
-        let normalized_schema_path =
-            normalize_plugin_archive_path_for_materialization(schema_path)?;
-        let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
+        let schema_entry_path = parse_plugin_archive_path_for_materialization(schema_path)?;
+        let schema_bytes = files.get(&schema_entry_path).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             message: format!(
                 "plugin materialization: archive '{archive_path}' is missing schema file '{schema_path}'"
@@ -220,7 +218,7 @@ fn read_archive_files_for_install(
             });
         }
 
-        let normalized_path = normalize_archive_path_for_install(&raw_name)?;
+        let entry_path = parse_archive_path_for_install(&raw_name)?;
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -228,10 +226,10 @@ fn read_archive_files_for_install(
             hint: None,
             details: None,
         })?;
-        if files.insert(normalized_path.clone(), bytes).is_some() {
+        if files.insert(entry_path.clone(), bytes).is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                message: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
+                message: format!("Plugin archive contains duplicate entry '{entry_path}'"),
                 hint: None,
                 details: None,
             });
@@ -275,10 +273,10 @@ fn read_plugin_archive_files(
         })?;
 
         let entry_name = entry.name().to_string();
-        let normalized_path = normalize_plugin_archive_path_for_materialization(&entry_name)?;
-        if normalized_path.ends_with('/') {
+        if entry.is_dir() {
             continue;
         }
+        let entry_path = parse_plugin_archive_path_for_materialization(&entry_name)?;
 
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
@@ -289,125 +287,56 @@ fn read_plugin_archive_files(
             hint: None,
             details: None,
         })?;
-        files.insert(normalized_path, bytes);
+        files.insert(entry_path, bytes);
     }
 
     Ok(files)
 }
 
-fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
-    if path.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "Plugin archive path must not be empty".to_string(),
-            hint: None,
-            details: None,
-        });
-    }
-    if path.starts_with('/') || path.starts_with('\\') {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("Plugin archive path '{path}' must be relative"),
-            hint: None,
-            details: None,
-        });
-    }
-    if path.contains('\\') {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("Plugin archive path '{path}' must use forward slash separators"),
-            hint: None,
-            details: None,
-        });
-    }
-
-    let mut segments = Vec::<String>::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::Normal(value) => {
-                let segment = value.to_str().ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    message: format!("Plugin archive path '{path}' contains non-UTF-8 components"),
-                    hint: None,
-                    details: None,
-                })?;
-                if segment.is_empty() {
-                    return Err(LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        message: format!("Plugin archive path '{path}' is invalid"),
-                        hint: None,
-                        details: None,
-                    });
-                }
-                segments.push(segment.to_string());
-            }
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    message: format!(
-                        "Plugin archive path '{path}' must not contain traversal or absolute components"
-                    ),
-                    hint: None,
-                    details: None,
-                });
-            }
-        }
-    }
-
-    if segments.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("Plugin archive path '{path}' is invalid"),
-            hint: None,
-            details: None,
-        });
-    }
-
-    Ok(segments.join("/"))
+fn parse_archive_path_for_install(path: &str) -> Result<String, LixError> {
+    parse_plugin_archive_path(path, "Plugin archive")
 }
 
-fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<String, LixError> {
-    let raw_path = Path::new(path);
-    if raw_path.is_absolute() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("plugin materialization: archive path '{path}' must be relative"),
-            hint: None,
-            details: None,
-        });
+fn parse_plugin_archive_path_for_materialization(path: &str) -> Result<String, LixError> {
+    parse_plugin_archive_path(path, "plugin materialization: archive")
+}
+
+fn parse_plugin_archive_path(path: &str, context: &str) -> Result<String, LixError> {
+    if path.is_empty() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} path must not be empty"),
+        ));
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} path '{path}' must be relative"),
+        ));
+    }
+    if path.contains('\\') {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{context} path '{path}' must use forward slash separators"),
+        ));
     }
 
-    let mut normalized = Vec::new();
-    for component in raw_path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part.to_string_lossy().to_string()),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    message: format!(
-                        "plugin materialization: archive path '{path}' must not escape the archive root"
-                    ),
-                    hint: None,
-                    details: None,
-                });
-            }
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{context} path '{path}' is invalid"),
+            ));
+        }
+        if matches!(segment, "." | "..") {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{context} path '{path}' must not contain traversal or dot components"),
+            ));
         }
     }
 
-    if normalized.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: "plugin materialization: archive path must not be empty".to_string(),
-            hint: None,
-            details: None,
-        });
-    }
-
-    Ok(normalized.join("/"))
+    Ok(path.to_string())
 }
 
 fn ensure_valid_plugin_wasm_for_install(wasm_bytes: &[u8]) -> Result<(), LixError> {
@@ -449,4 +378,67 @@ fn is_symlink_mode(mode: Option<u32>) -> bool {
     const MODE_FILE_TYPE_MASK: u32 = 0o170_000;
     const MODE_SYMLINK: u32 = 0o120_000;
     mode.is_some_and(|value| (value & MODE_FILE_TYPE_MASK) == MODE_SYMLINK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_archive_path_for_install, parse_plugin_archive_path_for_materialization};
+
+    #[test]
+    fn install_archive_path_parsing_is_slash_based() {
+        assert_eq!(
+            parse_archive_path_for_install("schemas/table.json").as_deref(),
+            Ok("schemas/table.json")
+        );
+        assert!(
+            parse_archive_path_for_install("schemas\\table.json")
+                .expect_err("backslash must not be accepted as a portable archive separator")
+                .message
+                .contains("forward slash")
+        );
+        assert!(
+            parse_archive_path_for_install("schemas//table.json")
+                .expect_err("empty slash segments must be rejected")
+                .message
+                .contains("invalid")
+        );
+        assert!(
+            parse_archive_path_for_install("schemas/../table.json")
+                .expect_err("archive paths must not traverse")
+                .message
+                .contains("traversal")
+        );
+    }
+
+    #[test]
+    fn materialization_archive_path_parsing_is_slash_based() {
+        assert_eq!(
+            parse_plugin_archive_path_for_materialization("schemas/table.json").as_deref(),
+            Ok("schemas/table.json")
+        );
+        assert!(
+            parse_plugin_archive_path_for_materialization("schemas\\table.json")
+                .expect_err("backslash must not be accepted as a portable archive separator")
+                .message
+                .contains("forward slash")
+        );
+        assert!(
+            parse_plugin_archive_path_for_materialization("schemas//table.json")
+                .expect_err("empty slash segments must be rejected")
+                .message
+                .contains("invalid")
+        );
+        assert!(
+            parse_plugin_archive_path_for_materialization("schemas/../table.json")
+                .expect_err("archive paths must not traverse")
+                .message
+                .contains("traversal")
+        );
+        assert!(
+            parse_plugin_archive_path_for_materialization("schemas/./table.json")
+                .expect_err("archive paths must not contain dot segments")
+                .message
+                .contains("dot")
+        );
+    }
 }

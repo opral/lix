@@ -487,9 +487,7 @@ where
             .iter()
             .filter(|(path, _)| !is_filesystem_metadata_path(path))
         {
-            if is_plugin_storage_path(path) {
-                self.session.install_plugin_archive(data).await?;
-            } else if lix.files.get(path) != Some(data) {
+            if lix.files.get(path) != Some(data) {
                 self.session
                     .fs()
                     .write_file(path, data.clone(), FsWriteOptions::default())
@@ -761,7 +759,6 @@ fn local_path_to_lix_path(
             let path = path.display();
             filesystem_error(format!("filesystem path {path} is not valid UTF-8"))
         })?;
-        validate_lix_path_segment(segment, path)?;
         segments.push(segment.to_string());
     }
     if segments.is_empty() {
@@ -787,32 +784,30 @@ fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> 
     }
     let mut local = root.to_path_buf();
     for segment in body.split('/') {
-        if segment.is_empty() {
-            return Err(filesystem_error(format!(
-                "Lix path {path:?} contains an empty segment"
-            )));
-        }
-        local.push(segment);
+        push_lix_path_segment(&mut local, segment, path)?;
     }
     Ok(local)
 }
 
-fn validate_lix_path_segment(segment: &str, path: &Path) -> Result<(), LixError> {
-    if segment.is_empty()
-        || segment == "."
-        || segment == ".."
-        || segment.contains('/')
-        || segment.contains('\\')
-        || segment.contains('\0')
-        || segment.contains('%')
-        || segment.contains('?')
-        || segment.contains('#')
-    {
-        let path = path.display();
+fn push_lix_path_segment(local: &mut PathBuf, segment: &str, path: &str) -> Result<(), LixError> {
+    if segment.is_empty() || segment == "." || segment == ".." {
         return Err(filesystem_error(format!(
-            "filesystem path {path} contains invalid Lix path segment {segment:?}"
+            "Lix path {path:?} contains unsupported segment {segment:?}"
         )));
     }
+
+    let mut components = Path::new(segment).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) => {
+            local.push(component);
+        }
+        _ => {
+            return Err(filesystem_error(format!(
+                "Lix path {path:?} contains segment {segment:?} that cannot be mapped to a single host path component"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -822,8 +817,15 @@ fn is_plugin_storage_path(path: &str) -> bool {
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
     matches!(
-        path.trim_end_matches('/'),
-        "/.lix" | "/.lix-wal" | "/.lix-shm" | "/.lix-journal"
+        path,
+        "/.lix"
+            | "/.lix/"
+            | "/.lix-wal"
+            | "/.lix-wal/"
+            | "/.lix-shm"
+            | "/.lix-shm/"
+            | "/.lix-journal"
+            | "/.lix-journal/"
     )
 }
 
@@ -853,8 +855,7 @@ fn sort_directories_shallowest_first(paths: &mut [String]) {
 }
 
 fn path_depth(path: &str) -> usize {
-    path.trim_matches('/')
-        .split('/')
+    path.split('/')
         .filter(|segment| !segment.is_empty())
         .count()
 }
@@ -894,4 +895,66 @@ fn sqlite_backend_error(error: BackendError) -> LixError {
         LixError::CODE_STORAGE_ERROR,
         format!("failed to open filesystem SQLite backend: {error}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_paths_render_opaque_segments() {
+        let root = Path::new("root");
+
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join("bad%name.txt"), false).unwrap(),
+            "/bad%name.txt"
+        );
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join("#hash?.txt"), false).unwrap(),
+            "/#hash?.txt"
+        );
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join("dir%23"), true).unwrap(),
+            "/dir%23/"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_paths_preserve_backslash_segments_on_unix() {
+        let root = Path::new("root");
+
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join(r"a\b.txt"), false).unwrap(),
+            r"/a\b.txt"
+        );
+        assert_eq!(
+            lix_path_to_local_path(root, r"/a\b.txt").unwrap(),
+            root.join(r"a\b.txt")
+        );
+    }
+
+    #[test]
+    fn lix_paths_map_opaque_segments_to_local_paths() {
+        let root = Path::new("root");
+
+        assert_eq!(
+            lix_path_to_local_path(root, "/bad%name.txt").unwrap(),
+            root.join("bad%name.txt")
+        );
+        assert_eq!(
+            lix_path_to_local_path(root, "/#hash?.txt").unwrap(),
+            root.join("#hash?.txt")
+        );
+    }
+
+    #[test]
+    fn lix_paths_reject_structurally_unsafe_segments() {
+        let root = Path::new("root");
+
+        for path in ["relative", "/a//b", "/./b", "/../b"] {
+            let error = lix_path_to_local_path(root, path).expect_err("path should fail");
+            assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+        }
+    }
 }

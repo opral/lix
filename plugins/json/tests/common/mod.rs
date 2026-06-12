@@ -14,6 +14,7 @@ struct SnapshotContent {
 
 pub fn file_from_json(json: &str) -> File {
     File {
+        filename: None,
         data: json.as_bytes().to_vec(),
     }
 }

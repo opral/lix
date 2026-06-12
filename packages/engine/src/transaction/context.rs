@@ -32,8 +32,8 @@ use crate::live_state::{
 };
 use crate::live_state::{overlay_scan_file_rows, overlay_scan_rows};
 use crate::plugin::{
-    InstalledPlugin, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH, PluginDetectedChange, PluginRuntimeHost,
-    detect_changes_with_plugin, load_installed_plugins_from_filesystem,
+    InstalledPlugin, PluginDetectedChange, PluginRuntimeHost, detect_changes_with_plugin,
+    is_plugin_storage_path, load_installed_plugins_from_filesystem,
     plugin_schema_rows_from_archive_path, plugin_state_live_state_projection,
     retain_plugin_state_rows, select_plugin_for_path,
 };
@@ -65,6 +65,7 @@ use crate::transaction::types::{
     TransactionWriteRow, stage_json_from_value,
 };
 use crate::transaction::validation::{TransactionValidationInput, validate_prepared_writes};
+use crate::wasm::WasmPluginFile;
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -484,7 +485,10 @@ where
                 reconciliation.rows.extend(rows);
                 continue;
             }
-            if !is_plugin_reconciliation_candidate_path(&write.path) {
+            let Some(write_path) = write.path.as_deref() else {
+                continue;
+            };
+            if !is_plugin_reconciliation_candidate_path(write_path) {
                 continue;
             }
             let filesystem = self.filesystem_index_for_branch(&write.branch_id).await?;
@@ -496,7 +500,11 @@ where
             });
             let existing_plugin = existing_file
                 .and_then(|(path, _)| select_plugin_for_path(&installed_plugins, path));
-            let selected_plugin = select_plugin_for_path(&installed_plugins, &write.path);
+            let selected_plugin = select_plugin_for_path(&installed_plugins, write_path);
+            let filename = write
+                .filename
+                .clone()
+                .or_else(|| existing_file.map(|(_, file)| file.name.clone()));
             let context = FilesystemRowContext {
                 branch_id: write.branch_id.clone(),
                 global: write.global,
@@ -526,7 +534,10 @@ where
                 &self.plugin_host,
                 plugin,
                 &active_state,
-                write.data.clone(),
+                WasmPluginFile {
+                    filename,
+                    data: write.data.clone(),
+                },
             )
             .await?;
             if existing_file.is_some_and(|(_, file)| file.blob_hash.is_some()) {
@@ -1344,11 +1355,14 @@ struct PluginFileDataReconciliation {
 fn plugin_archive_schema_rows_for_write(
     write: &TransactionFileData,
 ) -> Result<Option<Vec<TransactionWriteRow>>, LixError> {
-    if !write.path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH) {
+    let Some(path) = write.path.as_deref() else {
+        return Ok(None);
+    };
+    if !is_plugin_storage_path(path) {
         return Ok(None);
     }
     Ok(Some(plugin_schema_rows_from_archive_path(
-        &write.path,
+        path,
         &write.data,
         &write.branch_id,
         write.global,
@@ -1357,10 +1371,7 @@ fn plugin_archive_schema_rows_for_write(
 }
 
 fn is_plugin_reconciliation_candidate_path(path: &str) -> bool {
-    if !path.starts_with('/') {
-        return false;
-    }
-    !path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)
+    !is_plugin_storage_path(path)
 }
 
 fn plugin_change_rows(

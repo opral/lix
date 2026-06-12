@@ -5,7 +5,7 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
-    lix_file_read_rejects_public_path_inside_scalar_function,
+    lix_file_read_allows_public_path_inside_scalar_function,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -16,16 +16,23 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('readme-file', '/Readme.md')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let result = session
             .execute(
                 "SELECT id FROM lix_file WHERE lower(path) = '/readme.md'",
                 &[],
             )
             .await
-            .expect_err("public path column should not be hidden inside scalar functions");
+            .expect("path should behave as an opaque text column in predicates");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(error.message.contains("public column 'path'"));
+        assert_rows_eq(result, vec![vec![Value::Text("readme-file".to_string())]]);
     }
 );
 
@@ -55,7 +62,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_path_insert_rejects_overlong_paths_and_segments,
+    lix_file_path_insert_preserves_long_opaque_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -67,61 +74,45 @@ simulation_test!(
         );
 
         let long_segment = "a".repeat(256);
-        let segment_error = session
+        session
             .execute(
                 "INSERT INTO lix_file (id, path) VALUES ('file-long-segment', $1)",
                 &[Value::Text(format!("/{long_segment}"))],
             )
             .await
-            .expect_err("overlong file path segment should be rejected");
-        assert_eq!(segment_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(segment_error.message.contains("path segment is too long"));
+            .expect("long opaque file path segment should be accepted");
 
         let long_path = format!("/{}", ["abcd"; 820].join("/"));
-        let path_error = session
-            .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-long-path', $1)",
-                &[Value::Text(long_path)],
-            )
-            .await
-            .expect_err("overlong file path should be rejected");
-        assert_eq!(path_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(path_error.message.contains("path is too long"));
-
-        let encoded_segment_at_limit = "%61".repeat(255);
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-encoded-limit', $1)",
-                &[Value::Text(format!("/{encoded_segment_at_limit}"))],
+                "INSERT INTO lix_file (id, path) VALUES ('file-long-path', $1)",
+                &[Value::Text(long_path.clone())],
             )
             .await
-            .expect("percent-encoded segment should be measured after canonicalization");
+            .expect("long opaque file path should be accepted");
 
-        let encoded_segment_over_limit = "%61".repeat(256);
-        let encoded_segment_error = session
+        let result = session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-encoded-over-limit', $1)",
-                &[Value::Text(format!("/{encoded_segment_over_limit}"))],
+                "SELECT id, path FROM lix_file \
+                 WHERE id IN ('file-long-segment', 'file-long-path') \
+                 ORDER BY id",
+                &[],
             )
             .await
-            .expect_err("overlong canonical segment should be rejected");
-        assert_eq!(encoded_segment_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(
-            encoded_segment_error
-                .message
-                .contains("path segment is too long")
+            .expect("file read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("file-long-path".to_string()),
+                    Value::Text(long_path),
+                ],
+                vec![
+                    Value::Text("file-long-segment".to_string()),
+                    Value::Text(format!("/{long_segment}")),
+                ],
+            ],
         );
-
-        let huge_path = format!("/{}", "a".repeat(1024 * 1024));
-        let huge_error = session
-            .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-huge-path', $1)",
-                &[Value::Text(huge_path)],
-            )
-            .await
-            .expect_err("huge path input should be rejected without runtime internals");
-        assert_eq!(huge_error.code, LixError::CODE_INVALID_PARAM);
-        assert!(huge_error.message.contains("path input is too long"));
     }
 );
 
@@ -179,7 +170,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_path_insert_rejects_percent_encoded_forbidden_code_points,
+    lix_file_path_insert_preserves_percent_spelling,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -190,28 +181,49 @@ simulation_test!(
             &engine,
         );
 
-        for (id, path, expected_reason) in [
-            (
-                "file-percent-nul",
-                "/docs/%00evil.txt",
-                "path must not contain a NUL byte",
-            ),
-            (
-                "file-percent-bidi",
-                "/docs/%E2%80%AEevil.txt",
-                "path segment contains a character that is not allowed",
-            ),
+        for (id, path) in [
+            ("file-percent-a", "/docs/%61.txt"),
+            ("file-percent-nul", "/docs/%00evil.txt"),
+            ("file-percent-bidi", "/docs/%E2%80%AEevil.txt"),
         ] {
-            let error = session
+            session
                 .execute(
                     &format!("INSERT INTO lix_file (id, path) VALUES ('{id}', '{path}')"),
                     &[],
                 )
                 .await
-                .expect_err("percent-encoded forbidden path code point should be rejected");
-            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-            assert!(error.message.contains(expected_reason), "{error:?}");
+                .expect("percent spelling should be stored literally");
         }
+
+        let result = session
+            .execute(
+                "SELECT id, path, name FROM lix_file \
+                 WHERE id IN ('file-percent-a', 'file-percent-bidi', 'file-percent-nul') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("file-percent-a".to_string()),
+                    Value::Text("/docs/%61.txt".to_string()),
+                    Value::Text("%61.txt".to_string()),
+                ],
+                vec![
+                    Value::Text("file-percent-bidi".to_string()),
+                    Value::Text("/docs/%E2%80%AEevil.txt".to_string()),
+                    Value::Text("%E2%80%AEevil.txt".to_string()),
+                ],
+                vec![
+                    Value::Text("file-percent-nul".to_string()),
+                    Value::Text("/docs/%00evil.txt".to_string()),
+                    Value::Text("%00evil.txt".to_string()),
+                ],
+            ],
+        );
     }
 );
 
@@ -233,7 +245,7 @@ simulation_test!(
             ("file-foo-dot-dot-dot", "/foo..."),
             ("file-archive", "/archive.tar.gz"),
             ("file-dotenv", "/.env"),
-            ("file-percent-dot", "/docs/%2Ehidden"),
+            ("file-hidden-in-docs", "/docs/.hidden"),
         ] {
             session
                 .execute(
@@ -254,7 +266,7 @@ simulation_test!(
                    'file-foo-dot-dot-dot',\
                    'file-archive',\
                    'file-dotenv',\
-                   'file-percent-dot'\
+                   'file-hidden-in-docs'\
                  ) \
                  ORDER BY id",
                 &[],
@@ -291,12 +303,38 @@ simulation_test!(
                     Value::Text("foo...".to_string()),
                 ],
                 vec![
-                    Value::Text("file-percent-dot".to_string()),
+                    Value::Text("file-hidden-in-docs".to_string()),
                     Value::Text("/docs/.hidden".to_string()),
                     Value::Text(".hidden".to_string()),
                 ],
             ],
         );
+    }
+);
+
+simulation_test!(
+    lix_file_descriptor_shape_insert_rejects_slash_in_name_at_renderer_boundary,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('file-slash', NULL, 'nested/name')",
+                &[],
+            )
+            .await
+            .expect_err("file descriptor name must keep '/' as structural separator");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("path segment must not contain '/'"));
     }
 );
 
@@ -1401,7 +1439,7 @@ simulation_test!(
             &engine,
         );
 
-        for path in ["/a/../b/c.txt", "/a/%2e%2e/b/c.txt", "/a/./b/c.txt"] {
+        for path in ["/a/../b/c.txt", "/a/./b/c.txt"] {
             let error = session
                 .execute(
                     "INSERT INTO lix_file (path, data) VALUES ($1, $2)",

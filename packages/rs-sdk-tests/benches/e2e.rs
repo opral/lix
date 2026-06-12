@@ -456,6 +456,7 @@ impl WasmPluginDiffFixture {
             component,
             state,
             file: WasmPluginFile {
+                filename: None,
                 data: file_data.to_vec(),
             },
         }
@@ -499,7 +500,7 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
     .await
     .unwrap();
 
-    lix.install_plugin_archive(plugin).await.unwrap();
+    lix.install_plugin(plugin).await.unwrap();
 
     BenchLix::Sqlite {
         lix,
@@ -510,7 +511,7 @@ async fn open_lix_with_plugin(plugin: &[u8]) -> BenchLix {
 async fn open_lix_with_plugin_inmemory(plugin: &[u8]) -> BenchLix {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin_archive(plugin).await.unwrap();
+    lix.install_plugin(plugin).await.unwrap();
 
     BenchLix::InMemory { lix }
 }
@@ -1038,6 +1039,7 @@ fn native_csv_detected_changes(fixture: NativeCsvDiffFixture) -> Vec<plugin_csv:
         fixture.state,
         CsvFile {
             data: fixture.file_data,
+            filename: None,
         },
     )
     .unwrap()
@@ -1441,7 +1443,10 @@ impl WasmtimePluginComponent {
 
 impl From<WasmPluginFile> for plugin_bindings::exports::lix::plugin::api::File {
     fn from(file: WasmPluginFile) -> Self {
-        Self { data: file.data }
+        Self {
+            filename: file.filename,
+            data: file.data,
+        }
     }
 }
 

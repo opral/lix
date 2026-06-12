@@ -90,6 +90,7 @@ pub fn dataset_large() -> (Vec<u8>, Vec<u8>) {
 
 pub fn file_from_bytes(data: &[u8]) -> File {
     File {
+        filename: None,
         data: data.to_vec(),
     }
 }

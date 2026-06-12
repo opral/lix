@@ -793,6 +793,7 @@ fn file_from_entity_state(state: Vec<EntityState>) -> Result<Option<File>, Plugi
     }
 
     Ok(Some(File {
+        filename: None,
         data: render_entity_state(empty_file(), state)?,
     }))
 }
@@ -813,7 +814,10 @@ fn validate_single_entity_pk(entity_pk: &[String]) -> Result<(), PluginError> {
 }
 
 fn empty_file() -> File {
-    File { data: Vec::new() }
+    File {
+        filename: None,
+        data: Vec::new(),
+    }
 }
 
 pub fn schema_json() -> &'static str {
