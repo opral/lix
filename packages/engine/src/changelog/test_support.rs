@@ -1,6 +1,5 @@
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, CommitChangeRef, CommitChangeRefSet, CommitId,
-    CommitRecord,
+    ChangeId, ChangeRecord, ChangelogAppend, CommitChangeRefSet, CommitId, CommitRecord,
 };
 use crate::entity_pk::EntityPk;
 use crate::storage::{InMemoryStorageBackend, StorageContext};
@@ -20,12 +19,7 @@ pub(crate) fn test_append() -> ChangelogAppend {
         changes: vec![test_change_record()],
         commit_change_refs: vec![CommitChangeRefSet {
             commit_id: CommitId::for_test_label("commit-1"),
-            entries: vec![CommitChangeRef {
-                schema_key: "message".to_string(),
-                file_id: Some("file-1".to_string()),
-                entity_pk: EntityPk::single("entity-1"),
-                change_id: ChangeId::for_test_label("change-1"),
-            }],
+            entries: vec![ChangeId::for_test_label("change-1")],
         }],
     }
 }

@@ -1810,3 +1810,112 @@ e2e merge_10k (stash-alternating, two pairs): 191.5/197.5 →
 
 Cumulative campaign written-bytes: 534.4 → 436.5 KB per 1k-row insert
 commit (−18.3%). Suites: engine 1,569 all green.
+
+## 2026-06-11 — Opportunistic UUID Packing for Change Record Ids
+
+Change records stored entity_pk parts and file_id as text. Lix-generated
+ids are canonical lowercase hyphenated UUIDs, so each one cost 37 bytes
+(length + 36 chars) where 16 carry the information — and the storage key
+of the same row already stores the change id as raw bytes. Each id string
+is now a 1-byte tag plus either the raw 16 UUID bytes or the original
+text. Only the exact canonical form takes the UUID arm (uppercase, simple,
+braced forms stay text), so decode re-hyphenates byte-identically and
+round-tripping is structural, not probabilistic. Plugin-chosen entity
+keys ("row 5 of sheet 2") and test labels keep their text form at +1
+byte for the tag. `CommitRecord.author_account_ids` rides the same
+codec; commit_change_ref chunks already stored raw change-id bytes and
+dictionary-encoded file ids, so they are untouched.
+
+Review follow-up shaved one more byte per packed id: the 16-byte arm
+now encodes via `encode_array` (no length prefix — the tag already
+implies the length, matching how `ChangeId` encodes in ref chunks), so
+a packed id is 17 B, not 18. The wire layout is pinned by test.
+
+Measured on the e2e 10k CSV merge fixture (post-merge sqlite file,
+20,028 change records, UUID entity and file ids):
+
+| | text ids | packed ids |
+|---|---|---|
+| changelog.change avg value | 222.4 B | 182.4 B (−18%) |
+| changelog.change payload | 4,453,469 B | 3,653,351 B (−18%) |
+| changelog.change page bytes | 5,640,192 B | 4,636,672 B (−18%) |
+
+Measurement correction recorded for honesty: earlier drafts cited a
+34.1 MB whole file dominated by 24.7 MB of raw plugin wasm in
+binary_cas.chunk. That wasm was bloated by the profiling harness's own
+CARGO_PROFILE_RELEASE_DEBUG=true leaking into the bindep-built plugin
+artifact. A normal release build stores the CSV plugin wasm at
+2,073,015 B, and the honest post-merge file is 10,010,624 B, where
+changelog.change is the largest table at 46% (4.64 MB), tree_chunk 26%,
+bcas.chunk 21%, ref chunks 7%. This reorders the remaining
+opportunities: change-record encoding work ranks above bcas chunk
+compression (zstd -3 on the real wasm: 2,073,015 → 652,633 B, ~1.4 MB
+recoverable, not ~18 MB).
+
+The tracked_state_crud 1k bench moves the other way, deliberately:
+insert written bytes 436,472 → 437,472 (+0.23%). Its entity ids are
+JSON-pointer paths flattened from the pnpm-lock fixture, so every
+record pays the text tag and nothing packs (file_id is None there:
+zero delta). The empty-length-marker encoding that would make text
+free was rejected because empty id strings are currently legal
+(EntityPk validates the parts list, not part contents), making the
+marker ambiguous. Real workloads key on lix_uuid_v7() defaults.
+
+No version gate: shipped inside the open SQLITE_FORMAT_VERSION = 3
+window (the backend gate in sqlite_backend.rs) on the premise that no
+v3 file with the old record encoding exists outside this branch. A
+pre-packing record read by the new decoder fails loudly ("unknown id
+string tag 36"). Suites: engine 972 lib + integration all green, sdk
+green.
+
+## 2026-06-11 — Commit Change Ref Chunks Carry Ids Only
+
+Ref-chunk entries duplicated each change's schema_key, file_id, and
+entity_pk next to its change id, served by a dictionary-encoding plus
+front-coding plus NUL-escaping codec. Both production readers of those
+fields are covered without them: commit-root rebuild loads the full
+change records anyway and used the chunk copy only as a cross-check,
+and diff validation's commit-ref winners now batch point-reads the
+change records (the standard single-copy pattern). A chunk entry is
+now the raw 16-byte change id, sorted ascending, split at 2048 entries
+per chunk; decode rejects unknown chunk format versions explicitly.
+The front-coding codec, its size-estimating builder, the chunk
+dictionaries, and the now-orphaned vec_option storage codec are
+deleted (-900 lines net in the diff; format_version field kept per
+scope).
+
+Storage, 1k accounting (lix_sqlite, transaction layer):
+
+| | fields in chunks | ids only |
+|---|---|---|
+| insert_all written bytes | 437,472 | 423,200 (−3.3%) |
+| update_all written bytes | 540,284 | 526,013 (−2.6%) |
+| delete_all written bytes | 183,497 | 169,226 (−7.8%) |
+| ref chunk value bytes | 30,823 | 16,261 (−47%) |
+
+e2e 10k merge fixture: ref chunk payload 643,617 → 320,486 B (−50%),
+whole file 10,010,624 → 9,682,944 B. changelog.change unchanged.
+
+Perf A/B (stash-alternating, criterion):
+
+| bench | fields in chunks | ids only |
+|---|---|---|
+| merge_10k | 187.5 ms | 182.5 ms (≈−2.7%, p = 0.11) |
+| insert_all 10k | 87.3 / 80.6 ms | 73.3 / 75.6 / 72.2 ms (−9 to −12%; clean pair −10.4%, p = 0.00) |
+| update_all 10k | 87.3 ms | 84.9 ms (−2.8%, p = 0.00) |
+| delete_all 10k | 79.9 ms | 77.4 ms (−3.2%, p = 0.00) |
+| read_one_by_pk 10k | 141.4 / 177.6 µs | 173.6 / 166.9 µs (inconclusive at this spread, p = 0.28 on rematch; mechanism predicts parity — reads never touch ref chunks) |
+| smoke suite (1k) | — | parity within noise |
+
+The bulk-write speedups come from deleting per-commit work that scaled
+with change count: the identity-tuple sort over (String, Option,
+EntityPk) keys, per-entry front-coding allocations and prefix scans,
+and ref-struct construction (the identity uniqueness check still reads
+the same fields at validation, now via borrowed keys). read_one_by_pk
+initially looked ±20% in both directions across runs; a third run at
+p = 0.28 showed the spread is process-level noise at the ~150 µs
+scale, not an effect.
+
+Read-path cost added: diff/commit-root validation loads change records
+for a commit's ref list instead of reading identities from the chunk —
+batched point reads on a validation path, not on live reads.

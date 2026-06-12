@@ -6,7 +6,7 @@ use crate::branch::BranchContext;
 use crate::changelog::CommitId;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader,
-    ChangelogWriter, CommitChangeRef, CommitChangeRefSet, CommitRecord,
+    ChangelogWriter, CommitChangeRefSet, CommitRecord,
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::StorageContext;
@@ -440,13 +440,8 @@ fn stage_json_payloads(
     Ok(())
 }
 
-fn commit_change_ref_from_change(change: &ChangeRecord) -> CommitChangeRef {
-    CommitChangeRef {
-        schema_key: change.schema_key.clone(),
-        file_id: change.file_id.clone(),
-        entity_pk: change.entity_pk.clone(),
-        change_id: change.change_id,
-    }
+fn commit_change_ref_from_change(change: &ChangeRecord) -> ChangeId {
+    change.change_id
 }
 
 #[expect(clippy::unnecessary_wraps)]

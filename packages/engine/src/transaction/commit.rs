@@ -8,8 +8,8 @@ use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
-    CommitChangeRefSet, CommitId, CommitRecord,
+    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
+    CommitId, CommitRecord,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -253,12 +253,12 @@ async fn stage_changelog_commits(
                     "tracked staged row is missing change_id before changelog append",
                 )
             })?;
-            refs.push(commit_change_ref_from_state_row(row, *change_id));
+            refs.push(*change_id);
             change_ids.push(*change_id);
             changes.push(change_record_from_state_row(row)?);
         }
         for change_ref in &commit_row.selected_change_refs {
-            refs.push(commit_change_ref_from_selected_change_ref(change_ref));
+            refs.push(change_ref.change_id);
             change_ids.push(change_ref.change_id);
         }
         commits.push(CommitRecord {
@@ -322,29 +322,6 @@ fn change_record_from_state_row(row: &PreparedStateRow) -> Result<ChangeRecord, 
             }),
         created_at: row.updated_at,
     })
-}
-
-fn commit_change_ref_from_state_row(
-    row: &PreparedStateRow,
-    change_id: ChangeId,
-) -> CommitChangeRef {
-    CommitChangeRef {
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        entity_pk: row.entity_pk.clone(),
-        change_id,
-    }
-}
-
-fn commit_change_ref_from_selected_change_ref(
-    change_ref: &StagedCommitChangeRef,
-) -> CommitChangeRef {
-    CommitChangeRef {
-        schema_key: change_ref.schema_key.clone(),
-        file_id: change_ref.file_id.clone(),
-        entity_pk: change_ref.entity_pk.clone(),
-        change_id: change_ref.change_id,
-    }
 }
 
 fn tracked_delta_from_state_row(
@@ -794,7 +771,7 @@ mod tests {
             change_ref_chunks
                 .iter()
                 .flat_map(|chunk| chunk.entries.iter())
-                .any(|entry| entry.change_id == change_id("change-1"))
+                .any(|entry| *entry == change_id("change-1"))
         );
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {

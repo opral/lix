@@ -20,9 +20,8 @@ pub(crate) use store::{CHANGE_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
-    ChangeScanRequest, ChangelogAppend, CommitChangeRef, CommitChangeRefChunk,
-    CommitChangeRefChunkView, CommitChangeRefSet, CommitId, CommitLoadBatch, CommitLoadEntry,
-    CommitLoadRequest, CommitProjection, CommitRecord, CommitScanBatch, CommitScanRequest,
-    EntityPkRef, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet, RebuildIndexStats,
-    commit_row_snapshot_json,
+    ChangeScanRequest, ChangelogAppend, CommitChangeRefChunk, CommitChangeRefSet, CommitId,
+    CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
+    CommitScanBatch, CommitScanRequest, GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet,
+    RebuildIndexStats, commit_row_snapshot_json,
 };

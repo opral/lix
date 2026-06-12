@@ -6,19 +6,6 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
-mod entity_pk_ref_storage {
-    use super::EntityPkRef;
-
-    pub(crate) fn decode<'de, D>(decoder: D) -> Result<EntityPkRef<'de>, D::Error>
-    where
-        D: musli::Decoder<'de>,
-        Vec<&'de str>: musli::Decode<'de, D::Mode, D::Allocator>,
-    {
-        let parts = musli::Decode::decode(decoder)?;
-        Ok(EntityPkRef { parts })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct CommitId {
     uuid: Uuid,
@@ -315,6 +302,7 @@ pub(crate) struct CommitRecord {
     pub(crate) commit_id: CommitId,
     pub(crate) parent_commit_ids: Vec<CommitId>,
     pub(crate) change_id: ChangeId,
+    #[musli(with = crate::storage_codec::id_string_seq)]
     pub(crate) author_account_ids: Vec<String>,
     pub(crate) created_at: LixTimestamp,
 }
@@ -322,71 +310,33 @@ pub(crate) struct CommitRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitChangeRefSet {
     pub(crate) commit_id: CommitId,
-    pub(crate) entries: Vec<CommitChangeRef>,
+    pub(crate) entries: Vec<ChangeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitChangeRefChunk {
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
-    pub(crate) entries: Vec<CommitChangeRef>,
+    pub(crate) entries: Vec<ChangeId>,
 }
 
-#[derive(musli::Encode)]
-#[musli(packed)]
-pub(crate) struct CommitChangeRefChunkRef<'a> {
-    pub(crate) format_version: u32,
-    pub(crate) schema_keys: Vec<&'a str>,
-    #[musli(with = crate::storage_codec::vec_option)]
-    pub(crate) file_ids: Vec<Option<&'a str>>,
-    pub(crate) entries: Vec<CommitChangeRefEntryRef<'a>>,
-}
-
+/// Stored ref chunk: the commit id lives in the storage key, the entries are
+/// the referenced change ids sorted ascending. Everything else about a change
+/// (schema key, file id, entity pk, payloads) lives in its change record and
+/// is point-read by change id when needed.
 #[derive(musli::Decode)]
 #[musli(packed)]
-pub(crate) struct CommitChangeRefChunkView<'a> {
+pub(crate) struct CommitChangeRefChunkWire {
     pub(crate) format_version: u32,
-    pub(crate) schema_keys: Vec<&'a str>,
-    #[musli(with = crate::storage_codec::vec_option)]
-    pub(crate) file_ids: Vec<Option<&'a str>>,
-    pub(crate) entries: Vec<CommitChangeRefEntryView<'a>>,
+    pub(crate) entries: Vec<ChangeId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitChangeRef {
-    pub(crate) schema_key: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) entity_pk: EntityPk,
-    pub(crate) change_id: ChangeId,
-}
-
-/// Stored ref entry. Entries within a chunk are sorted by
-/// (schema_key, file_id, entity_pk), so consecutive encoded entity pks share
-/// long prefixes; the pk is stored front-coded against the previous entry's
-/// encoded pk bytes.
+/// Encode-only borrowed twin of [`CommitChangeRefChunkWire`].
 #[derive(musli::Encode)]
 #[musli(packed)]
-pub(crate) struct CommitChangeRefEntryRef<'a> {
-    pub(crate) schema_index: u16,
-    pub(crate) file_index: u16,
-    pub(crate) pk_shared: u32,
-    pub(crate) pk_suffix: &'a [u8],
-    pub(crate) change_id: ChangeId,
-}
-
-#[derive(musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CommitChangeRefEntryView<'a> {
-    pub(crate) schema_index: u16,
-    pub(crate) file_index: u16,
-    pub(crate) pk_shared: u32,
-    pub(crate) pk_suffix: &'a [u8],
-    pub(crate) change_id: ChangeId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EntityPkRef<'a> {
-    pub(crate) parts: Vec<&'a str>,
+pub(crate) struct CommitChangeRefChunkWireRef<'a> {
+    pub(crate) format_version: u32,
+    pub(crate) entries: &'a [ChangeId],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -450,8 +400,9 @@ pub(crate) struct ChangeRecord {
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
+    #[musli(with = crate::storage_codec::id_string_seq)]
     pub(crate) entity_pk: &'a [String],
-    #[musli(with = crate::storage_codec::option)]
+    #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<&'a str>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
@@ -465,10 +416,10 @@ pub(crate) struct ChangeRecordRef<'a> {
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
-    #[musli(with = entity_pk_ref_storage)]
-    pub(crate) entity_pk: EntityPkRef<'a>,
-    #[musli(with = crate::storage_codec::option)]
-    pub(crate) file_id: Option<&'a str>,
+    #[musli(with = crate::storage_codec::id_string_seq)]
+    pub(crate) entity_pk: Vec<String>,
+    #[musli(with = crate::storage_codec::option_id_string)]
+    pub(crate) file_id: Option<String>,
     #[musli(with = crate::json_store::json_slot_storage)]
     pub(crate) snapshot: JsonSlot,
     #[musli(with = crate::json_store::json_slot_storage)]

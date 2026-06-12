@@ -258,7 +258,7 @@ where
             } => {
                 let change_ids = change_ref_chunks
                     .into_iter()
-                    .flat_map(|chunk| chunk.entries.into_iter().map(|entry| entry.change_id))
+                    .flat_map(|chunk| chunk.entries)
                     .collect::<Vec<_>>();
                 Ok(Some(commit_graph_commit_from_commit_record(
                     record, change_ids,
@@ -382,7 +382,7 @@ mod tests {
 
     use crate::changelog::{
         ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
-        CommitChangeRef, CommitChangeRefSet, CommitId, CommitRecord,
+        CommitChangeRefSet, CommitId, CommitRecord,
     };
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
@@ -891,13 +891,8 @@ mod tests {
         }
     }
 
-    fn commit_change_ref_from_test_change(change: &TestChange) -> CommitChangeRef {
-        CommitChangeRef {
-            schema_key: change.change.schema_key.clone(),
-            file_id: change.change.file_id.clone(),
-            entity_pk: change.change.entity_pk.clone(),
-            change_id: change.change.id,
-        }
+    fn commit_change_ref_from_test_change(change: &TestChange) -> ChangeId {
+        change.change.id
     }
 
     fn commit_change(

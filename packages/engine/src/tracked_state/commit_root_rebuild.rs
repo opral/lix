@@ -4,8 +4,8 @@ use std::pin::Pin;
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeId, ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitChangeRef, CommitId,
-    CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
+    ChangeId, ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
+    CommitLoadRequest, CommitProjection, CommitRecord,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -228,29 +228,24 @@ where
             ));
         }
     };
-    let change_ids = change_refs
-        .iter()
-        .map(|entry| entry.change_id)
-        .collect::<Vec<_>>();
     let changes = reader
         .load_changes(ChangeLoadRequest {
-            change_ids: &change_ids,
+            change_ids: &change_refs,
         })
         .await?;
     let mut deltas = change_refs
         .iter()
         .zip(changes.entries)
-        .map(|(change_ref, change)| {
+        .map(|(change_id, change)| {
             let change = change.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "commit '{commit_id}' references missing changelog.change '{}'",
-                        change_ref.change_id
+                        "commit '{commit_id}' references missing changelog.change '{change_id}'"
                     ),
                 )
             })?;
-            rebuild_delta_from_change_ref(commit_id, change_ref, change)
+            rebuild_delta_from_change_ref(commit_id, *change_id, change)
         })
         .collect::<Result<Vec<_>, _>>()?;
     deltas.push(rebuild_delta_from_commit_record(&commit)?);
@@ -317,27 +312,15 @@ fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
 
 fn rebuild_delta_from_change_ref(
     commit_id: &str,
-    change_ref: &CommitChangeRef,
+    ref_change_id: ChangeId,
     change: crate::changelog::ChangeRecord,
 ) -> Result<CommitRootRebuildDelta, LixError> {
-    if change.change_id != change_ref.change_id {
+    if change.change_id != ref_change_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "commit '{commit_id}' change ref '{}' loaded mismatched changelog.change '{}'",
-                change_ref.change_id, change.change_id
-            ),
-        ));
-    }
-    if change.schema_key != change_ref.schema_key
-        || change.file_id != change_ref.file_id
-        || change.entity_pk != change_ref.entity_pk
-    {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit '{commit_id}' change ref '{}' does not match changelog.change identity",
-                change_ref.change_id
+                "commit '{commit_id}' change ref '{ref_change_id}' loaded mismatched changelog.change '{}'",
+                change.change_id
             ),
         ));
     }
