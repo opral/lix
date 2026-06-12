@@ -1867,3 +1867,55 @@ v3 file with the old record encoding exists outside this branch. A
 pre-packing record read by the new decoder fails loudly ("unknown id
 string tag 36"). Suites: engine 972 lib + integration all green, sdk
 green.
+
+## 2026-06-11 — Commit Change Ref Chunks Carry Ids Only
+
+Ref-chunk entries duplicated each change's schema_key, file_id, and
+entity_pk next to its change id, served by a dictionary-encoding plus
+front-coding plus NUL-escaping codec. Both production readers of those
+fields are covered without them: commit-root rebuild loads the full
+change records anyway and used the chunk copy only as a cross-check,
+and diff validation's commit-ref winners now batch point-reads the
+change records (the standard single-copy pattern). A chunk entry is
+now the raw 16-byte change id, sorted ascending, split at 2048 entries
+per chunk; decode rejects unknown chunk format versions explicitly.
+The front-coding codec, its size-estimating builder, the chunk
+dictionaries, and the now-orphaned vec_option storage codec are
+deleted (-900 lines net in the diff; format_version field kept per
+scope).
+
+Storage, 1k accounting (lix_sqlite, transaction layer):
+
+| | fields in chunks | ids only |
+|---|---|---|
+| insert_all written bytes | 437,472 | 423,200 (−3.3%) |
+| update_all written bytes | 540,284 | 526,013 (−2.6%) |
+| delete_all written bytes | 183,497 | 169,226 (−7.8%) |
+| ref chunk value bytes | 30,823 | 16,261 (−47%) |
+
+e2e 10k merge fixture: ref chunk payload 643,617 → 320,486 B (−50%),
+whole file 10,010,624 → 9,682,944 B. changelog.change unchanged.
+
+Perf A/B (stash-alternating, criterion):
+
+| bench | fields in chunks | ids only |
+|---|---|---|
+| merge_10k | 187.5 ms | 182.5 ms (≈−2.7%, p = 0.11) |
+| insert_all 10k | 87.3 / 80.6 ms | 73.3 / 75.6 / 72.2 ms (−9 to −12%; clean pair −10.4%, p = 0.00) |
+| update_all 10k | 87.3 ms | 84.9 ms (−2.8%, p = 0.00) |
+| delete_all 10k | 79.9 ms | 77.4 ms (−3.2%, p = 0.00) |
+| read_one_by_pk 10k | 141.4 / 177.6 µs | 173.6 / 166.9 µs (inconclusive at this spread, p = 0.28 on rematch; mechanism predicts parity — reads never touch ref chunks) |
+| smoke suite (1k) | — | parity within noise |
+
+The bulk-write speedups come from deleting per-commit work that scaled
+with change count: the identity-tuple sort over (String, Option,
+EntityPk) keys, per-entry front-coding allocations and prefix scans,
+and ref-struct construction (the identity uniqueness check still reads
+the same fields at validation, now via borrowed keys). read_one_by_pk
+initially looked ±20% in both directions across runs; a third run at
+p = 0.28 showed the spread is process-level noise at the ~150 µs
+scale, not an effect.
+
+Read-path cost added: diff/commit-root validation loads change records
+for a commit's ref list instead of reading identities from the chunk —
+batched point reads on a validation path, not on live reads.

@@ -485,14 +485,30 @@ where
             },
             record.change_id,
         );
-        for change_ref in chunks.into_iter().flat_map(|chunk| chunk.entries) {
+        // Ref chunks carry change ids only; row identities live in the
+        // change records, batch point-read here.
+        let change_ids = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.entries)
+            .collect::<Vec<_>>();
+        let changes = changelog_reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &change_ids,
+            })
+            .await?;
+        for (change_id, change) in change_ids.iter().zip(changes.entries) {
+            let Some(change) = change else {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{commit_id}' references change '{change_id}' that is missing from the changelog"
+                )));
+            };
             winners.insert(
                 TrackedStateIdentity {
-                    schema_key: change_ref.schema_key,
-                    file_id: change_ref.file_id,
-                    entity_pk: change_ref.entity_pk,
+                    schema_key: change.schema_key,
+                    file_id: change.file_id,
+                    entity_pk: change.entity_pk,
                 },
-                change_ref.change_id,
+                *change_id,
             );
         }
         cache

@@ -24,9 +24,9 @@ use super::store::{
 };
 use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
-    ChangelogAppend, ChangelogReader, ChangelogWriter, CommitChangeRef, CommitChangeRefChunk,
-    CommitChangeRefSet, CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest,
-    CommitProjection, CommitRecord, CommitScanBatch, CommitScanRequest, GcPlan, GcRoot,
+    ChangelogAppend, ChangelogReader, ChangelogWriter, CommitChangeRefChunk, CommitChangeRefSet,
+    CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
+    CommitScanBatch, CommitScanRequest, GcPlan, GcRoot,
 };
 use crate::json_store::JsonSlot;
 use crate::storage::{
@@ -36,9 +36,7 @@ use crate::storage::{
 };
 use crate::{LixError, storage_codec};
 
-const COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION: u32 = 1;
-const COMMIT_CHANGE_REF_CHUNK_TARGET_BYTES: usize = 64 * 1024;
-const COMMIT_CHANGE_REF_CHUNK_MAX_BYTES: usize = 128 * 1024;
+pub(super) const COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION: u32 = 1;
 const COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES: usize = 2048;
 const SCAN_PAGE_LIMIT: usize = 1024;
 
@@ -335,7 +333,7 @@ where
             self.staged_changes.insert(change.change_id, change);
         }
 
-        let chunks = chunk_commit_change_refs(append.commit_change_refs)?;
+        let chunks = chunk_commit_change_refs(append.commit_change_refs);
         for commit in append.commits {
             self.writes.put(
                 COMMIT_SPACE,
@@ -426,7 +424,6 @@ where
                     refs.commit_id
                 )));
             }
-            validate_unique_ref_keys(&refs.entries, &refs.commit_id)?;
             self.validate_change_refs(refs, &append_changes).await?;
         }
 
@@ -557,6 +554,9 @@ where
         Ok(())
     }
 
+    /// Every ref must resolve to a change record (in this append, already
+    /// staged, or stored), and no two refs in one commit may target the same
+    /// (schema_key, file_id, entity_pk) identity.
     async fn validate_change_refs(
         &mut self,
         refs: &CommitChangeRefSet,
@@ -565,26 +565,37 @@ where
         let missing_from_append = refs
             .entries
             .iter()
-            .filter(|entry| !append_changes.contains_key(&entry.change_id))
-            .map(|entry| entry.change_id)
+            .filter(|change_id| !append_changes.contains_key(change_id))
+            .copied()
             .collect::<HashSet<_>>();
         let stored = self
             .load_stored_changes(missing_from_append.iter().copied())
             .await?;
 
-        for entry in &refs.entries {
+        let mut seen_identities = HashSet::new();
+        for change_id in &refs.entries {
             let change = append_changes
-                .get(&entry.change_id)
+                .get(change_id)
                 .copied()
-                .or_else(|| self.staged_changes.get(&entry.change_id))
-                .or_else(|| stored.get(&entry.change_id))
+                .or_else(|| self.staged_changes.get(change_id))
+                .or_else(|| stored.get(change_id))
                 .ok_or_else(|| {
                     LixError::unknown(format!(
                         "changelog commit '{}' references missing change '{}'",
-                        refs.commit_id, entry.change_id
+                        refs.commit_id, change_id
                     ))
                 })?;
-            validate_ref_matches_change(&refs.commit_id, entry, change)?;
+            let identity = (
+                change.schema_key.as_str(),
+                change.file_id.as_deref(),
+                &change.entity_pk,
+            );
+            if !seen_identities.insert(identity) {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{}' has duplicate change ref key",
+                    refs.commit_id
+                )));
+            }
         }
         Ok(())
     }
@@ -824,206 +835,41 @@ fn commit_entry_id(entry: &CommitLoadEntry) -> Option<CommitId> {
 
 fn chunk_commit_change_refs(
     refs: Vec<CommitChangeRefSet>,
-) -> Result<HashMap<CommitId, Vec<CommitChangeRefChunk>>, LixError> {
+) -> HashMap<CommitId, Vec<CommitChangeRefChunk>> {
     refs.into_iter()
         .map(|refs| {
             let commit_id = refs.commit_id;
-            Ok((
+            (
                 commit_id,
-                chunk_one_commit_change_refs(
-                    refs,
-                    COMMIT_CHANGE_REF_CHUNK_TARGET_BYTES,
-                    COMMIT_CHANGE_REF_CHUNK_MAX_BYTES,
-                    COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES,
-                )?,
-            ))
+                chunk_one_commit_change_refs(refs, COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES),
+            )
         })
         .collect()
 }
 
+/// Each entry is a fixed 16 raw bytes on the wire, so chunking is a plain
+/// fixed-capacity split over the change ids, sorted ascending for
+/// deterministic output.
 fn chunk_one_commit_change_refs(
     mut refs: CommitChangeRefSet,
-    target_bytes: usize,
-    max_bytes: usize,
     max_entries: usize,
-) -> Result<Vec<CommitChangeRefChunk>, LixError> {
-    refs.entries.sort_by(|left, right| {
-        (
-            left.schema_key.as_str(),
-            left.file_id.as_deref(),
-            &left.entity_pk,
-            left.change_id,
-        )
-            .cmp(&(
-                right.schema_key.as_str(),
-                right.file_id.as_deref(),
-                &right.entity_pk,
-                right.change_id,
-            ))
-    });
-
-    let mut chunks = Vec::new();
-    let mut builder = CommitChangeRefChunkBuilder::new(refs.commit_id);
-    for entry in refs.entries {
-        // The encoded pk is entry-intrinsic; encode once per entry and share
-        // it between the close decision and the accepted push.
-        let encoded_pk = super::codec::encode_ref_entity_pk(&entry.entity_pk.parts);
-        let candidate_size = builder.estimated_size_after(&entry, &encoded_pk);
-        if !builder.is_empty()
-            && (builder.len() >= max_entries
-                || builder.estimated_size() >= target_bytes
-                || candidate_size > max_bytes)
-        {
-            chunks.push(builder.finish()?);
-            builder = CommitChangeRefChunkBuilder::new(refs.commit_id);
-        }
-
-        builder.push(entry, encoded_pk);
-        validate_commit_change_ref_chunk_size(&builder, max_bytes)?;
+) -> Vec<CommitChangeRefChunk> {
+    refs.entries.sort_unstable();
+    if refs.entries.is_empty() {
+        return vec![commit_change_ref_chunk(refs.commit_id, Vec::new())];
     }
-
-    if !builder.is_empty() {
-        chunks.push(builder.finish()?);
-    }
-    Ok(chunks)
+    refs.entries
+        .chunks(max_entries)
+        .map(|entries| commit_change_ref_chunk(refs.commit_id, entries.to_vec()))
+        .collect()
 }
 
-fn commit_change_ref_chunk(
-    commit_id: CommitId,
-    entries: Vec<CommitChangeRef>,
-) -> CommitChangeRefChunk {
+fn commit_change_ref_chunk(commit_id: CommitId, entries: Vec<ChangeId>) -> CommitChangeRefChunk {
     CommitChangeRefChunk {
         format_version: COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION,
         commit_id,
         entries,
     }
-}
-
-fn validate_commit_change_ref_chunk_size(
-    builder: &CommitChangeRefChunkBuilder,
-    max_bytes: usize,
-) -> Result<(), LixError> {
-    let size = builder.estimated_size();
-    if size > max_bytes {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "single changelog commit_change_ref_chunk entry for commit '{}' exceeds {max_bytes} bytes",
-                builder.commit_id
-            ),
-        ));
-    }
-    Ok(())
-}
-
-struct CommitChangeRefChunkBuilder {
-    commit_id: CommitId,
-    entries: Vec<CommitChangeRef>,
-    schema_keys: HashSet<String>,
-    file_ids: HashSet<Option<String>>,
-    estimated_size: usize,
-    /// The previous entry's encoded entity pk: the front-coding base the
-    /// codec will use, so entry sizes can be charged exactly.
-    previous_encoded_pk: Vec<u8>,
-}
-
-impl CommitChangeRefChunkBuilder {
-    fn new(commit_id: CommitId) -> Self {
-        Self {
-            commit_id,
-            entries: Vec::new(),
-            schema_keys: HashSet::new(),
-            file_ids: HashSet::new(),
-            estimated_size: commit_change_ref_chunk_fixed_size(),
-            previous_encoded_pk: Vec::new(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn estimated_size(&self) -> usize {
-        self.estimated_size
-    }
-
-    fn estimated_size_after(&self, entry: &CommitChangeRef, encoded_pk: &[u8]) -> usize {
-        self.estimated_size + self.incremental_size(entry, encoded_pk)
-    }
-
-    fn push(&mut self, entry: CommitChangeRef, encoded_pk: Vec<u8>) {
-        self.estimated_size += self.incremental_size(&entry, &encoded_pk);
-        self.schema_keys.insert(entry.schema_key.clone());
-        self.file_ids.insert(entry.file_id.clone());
-        self.previous_encoded_pk = encoded_pk;
-        self.entries.push(entry);
-    }
-
-    fn incremental_size(&self, entry: &CommitChangeRef, encoded_pk: &[u8]) -> usize {
-        let schema_dictionary_bytes = if self.schema_keys.contains(&entry.schema_key) {
-            0
-        } else {
-            encoded_str_size(&entry.schema_key)
-        };
-        let file_dictionary_bytes = if self.file_ids.contains(&entry.file_id) {
-            0
-        } else {
-            encoded_optional_str_size(entry.file_id.as_deref())
-        };
-        // Charge the pk at its front-coded cost against the same base the
-        // codec will use; escape overhead is exact because the real encoded
-        // bytes are measured.
-        let shared = super::codec::shared_prefix_len(&self.previous_encoded_pk, encoded_pk);
-        let suffix_len = encoded_pk.len() - shared;
-        let pk_bytes = varint_size(shared) + varint_size(suffix_len) + suffix_len;
-        schema_dictionary_bytes
-            + file_dictionary_bytes
-            + encoded_commit_change_ref_entry_fixed_size()
-            + pk_bytes
-    }
-
-    fn finish(self) -> Result<CommitChangeRefChunk, LixError> {
-        Ok(commit_change_ref_chunk(self.commit_id, self.entries))
-    }
-}
-
-/// Deliberately loose upper bound on the chunk header (the real musli
-/// header is ~4-7 varint bytes); the dictionary and header charges in this
-/// file are conservative bounds, while the pk charge is exact.
-fn commit_change_ref_chunk_fixed_size() -> usize {
-    21
-}
-
-// The 2-byte-per-index charge below is an upper bound only while dictionary
-// indices stay under musli's 3-byte varint threshold (16384); the entry cap
-// keeps them there.
-const _: () = assert!(COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES < 16384);
-
-fn encoded_commit_change_ref_entry_fixed_size() -> usize {
-    2 // schema index upper bound (varint, <= 2 bytes under the entry cap)
-        + 2 // file index upper bound
-        + size_of::<uuid::Bytes>() // change id (16 raw bytes)
-}
-
-fn varint_size(mut value: usize) -> usize {
-    let mut bytes = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        bytes += 1;
-    }
-    bytes
-}
-
-fn encoded_optional_str_size(value: Option<&str>) -> usize {
-    1 + value.map(encoded_str_size).unwrap_or(0)
-}
-
-fn encoded_str_size(value: &str) -> usize {
-    4 + value.len()
 }
 
 fn validate_unique<T>(values: impl IntoIterator<Item = T>, label: &str) -> Result<(), LixError>
@@ -1037,43 +883,6 @@ where
                 "changelog append contains duplicate {label} '{value}'"
             )));
         }
-    }
-    Ok(())
-}
-
-fn validate_unique_ref_keys(
-    entries: &[CommitChangeRef],
-    commit_id: &CommitId,
-) -> Result<(), LixError> {
-    let mut seen = HashSet::new();
-    for entry in entries {
-        let key = (
-            entry.schema_key.as_str(),
-            entry.file_id.as_deref(),
-            &entry.entity_pk,
-        );
-        if !seen.insert(key) {
-            return Err(LixError::unknown(format!(
-                "changelog commit '{commit_id}' has duplicate change ref key"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_ref_matches_change(
-    commit_id: &CommitId,
-    entry: &CommitChangeRef,
-    change: &ChangeRecord,
-) -> Result<(), LixError> {
-    if entry.schema_key != change.schema_key
-        || entry.file_id != change.file_id
-        || entry.entity_pk != change.entity_pk
-    {
-        return Err(LixError::unknown(format!(
-            "changelog commit '{}' change ref '{}' does not match referenced ChangeRecord key",
-            commit_id, entry.change_id
-        )));
     }
     Ok(())
 }
@@ -1177,7 +986,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::changelog::test_support::{changelog_test_context, test_append};
+    use crate::changelog::test_support::{changelog_test_context, test_append, test_change_record};
     use crate::changelog::{
         ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogAppend,
         ChangelogReader, ChangelogWriter, CommitId, CommitLoadEntry, CommitLoadRequest,
@@ -1215,141 +1024,17 @@ mod tests {
         ids
     }
 
-    fn test_change_ref(entity: &str, change_id: &str) -> CommitChangeRef {
-        CommitChangeRef {
-            schema_key: "message".to_string(),
-            file_id: None,
-            entity_pk: EntityPk::single(entity.to_string()),
-            change_id: ChangeId::for_test_label(change_id),
-        }
-    }
-
     #[test]
-    fn chunk_one_commit_change_refs_splits_by_encoded_size() {
-        let refs = CommitChangeRefSet {
-            commit_id: CommitId::for_test_label("commit-1"),
-            entries: (0..8)
-                .map(|index| {
-                    test_change_ref(
-                        &format!("entity-{index:04}-{}", "x".repeat(24)),
-                        &format!("change-{index:04}-{}", "y".repeat(24)),
-                    )
-                })
-                .collect(),
-        };
-
-        let chunks = chunk_one_commit_change_refs(refs, 180, 260, 2048)
-            .expect("refs should chunk under small test limit");
-
-        assert!(chunks.len() > 1);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| encode_commit_change_ref_chunk(chunk).unwrap().len() <= 260)
-        );
-        assert_eq!(
-            chunks
-                .iter()
-                .flat_map(|chunk| chunk.entries.iter())
-                .map(|entry| entry.change_id.to_string())
-                .collect::<Vec<_>>(),
-            change_ids([
-                "change-0000-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0001-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0002-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0003-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0004-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0005-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0006-yyyyyyyyyyyyyyyyyyyyyyyy",
-                "change-0007-yyyyyyyyyyyyyyyyyyyyyyyy",
-            ])
-        );
-    }
-
-    #[test]
-    fn chunk_one_commit_change_refs_rejects_oversized_single_entry() {
-        let refs = CommitChangeRefSet {
-            commit_id: CommitId::for_test_label("commit-1"),
-            entries: vec![test_change_ref(&"p".repeat(512), "change-big")],
-        };
-        let error = chunk_one_commit_change_refs(refs, 64, 128, 2048)
-            .expect_err("oversized single entry must reject");
-        assert!(error.message.contains("exceeds 128 bytes"));
-    }
-
-    /// Pins that the size estimator charges pks at their front-coded cost:
-    /// prefix-heavy sorted pks whose verbatim sizes blow the target must
-    /// still pack into one chunk when their front-coded sizes fit, and the
-    /// estimate must stay an upper bound on the real encoding.
-    #[test]
-    fn chunk_one_commit_change_refs_packs_to_front_coded_size() {
-        let prefix = "shared-prefix-".repeat(8); // 112 chars shared per pk
-        let refs = CommitChangeRefSet {
-            commit_id: CommitId::for_test_label("commit-1"),
-            entries: (0..30)
-                .map(|index| {
-                    test_change_ref(&format!("{prefix}{index:04}"), &format!("chg-{index:04}"))
-                })
-                .collect(),
-        };
-        // Verbatim pks are 30 x ~120 bytes = ~3.6KB; front-coded they are
-        // one full pk plus 29 short suffixes = well under 1KB.
-        let chunks =
-            chunk_one_commit_change_refs(refs, 1024, 2048, 2048).expect("refs should chunk");
-        assert_eq!(
-            chunks.len(),
-            1,
-            "front-coded entries must pack into one chunk"
-        );
-    }
-
-    /// Directly pins the safety property `validate_commit_change_ref_chunk_size`
-    /// relies on: the builder's estimate is an upper bound on the real
-    /// encoding. The fixture includes a pk whose suffix crosses the 128-byte
-    /// varint boundary and NUL-bearing pks (escape overhead).
-    #[test]
-    fn chunk_builder_estimate_is_an_upper_bound_on_the_encoding() {
-        let entries = vec![
-            test_change_ref("plain-entity", "chg-1"),
-            test_change_ref(&format!("plain-{}", "q".repeat(200)), "chg-2"),
-            test_change_ref("with\u{0}nul\u{0}\u{0}parts", "chg-3"),
-            test_change_ref("with\u{0}nul\u{0}\u{0}partz", "chg-4"),
-        ];
-        let mut builder = CommitChangeRefChunkBuilder::new(CommitId::for_test_label("commit-1"));
-        for entry in entries {
-            let encoded_pk = crate::changelog::codec::encode_ref_entity_pk(&entry.entity_pk.parts);
-            builder.push(entry, encoded_pk);
-        }
-        let estimate = builder.estimated_size();
-        let chunk = builder.finish().expect("chunk should build");
-        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
-        assert!(
-            estimate >= encoded.len(),
-            "estimate {estimate} must be >= encoded {}",
-            encoded.len()
-        );
-    }
-
-    #[test]
-    fn varint_size_matches_encoding_boundaries() {
-        for (value, expected) in [(0usize, 1usize), (127, 1), (128, 2), (16383, 2), (16384, 3)] {
-            assert_eq!(varint_size(value), expected, "varint_size({value})");
-        }
-    }
-
-    #[test]
-    fn chunk_one_commit_change_refs_splits_by_entry_count() {
+    fn chunk_one_commit_change_refs_sorts_and_splits_by_entry_count() {
         let refs = CommitChangeRefSet {
             commit_id: CommitId::for_test_label("commit-1"),
             entries: (0..5)
-                .map(|index| {
-                    test_change_ref(&format!("entity-{index}"), &format!("change-{index}"))
-                })
+                .rev()
+                .map(|index| ChangeId::for_test_label(&format!("change-{index}")))
                 .collect(),
         };
 
-        let chunks = chunk_one_commit_change_refs(refs, usize::MAX, usize::MAX, 2)
-            .expect("refs should chunk by entry cap");
+        let chunks = chunk_one_commit_change_refs(refs, 2);
 
         assert_eq!(
             chunks
@@ -1358,6 +1043,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 2, 1]
         );
+        let flattened = chunks
+            .iter()
+            .flat_map(|chunk| chunk.entries.iter().copied())
+            .collect::<Vec<_>>();
+        let mut sorted = flattened.clone();
+        sorted.sort_unstable();
+        assert_eq!(flattened, sorted, "entries must be sorted ascending");
+    }
+
+    #[test]
+    fn chunk_one_commit_change_refs_keeps_empty_commits_addressable() {
+        let refs = CommitChangeRefSet {
+            commit_id: CommitId::for_test_label("commit-1"),
+            entries: Vec::new(),
+        };
+        let chunks = chunk_one_commit_change_refs(refs, 2048);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].entries.is_empty());
     }
 
     #[tokio::test]
@@ -1398,7 +1101,7 @@ mod tests {
             change_ref_chunks[0]
                 .entries
                 .iter()
-                .map(|entry| entry.change_id.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             change_ids(["change-1"])
         );
@@ -1417,10 +1120,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_append_rejects_ref_key_mismatch() {
+    async fn stage_append_rejects_duplicate_ref_identities() {
+        // Two different change records targeting the same
+        // (schema_key, file_id, entity_pk) must not land in one commit.
         let (context, storage) = changelog_test_context();
         let mut append = test_append();
-        append.commit_change_refs[0].entries[0].schema_key = "wrong".to_string();
+        append.changes.push(ChangeRecord {
+            change_id: ChangeId::for_test_label("change-dup"),
+            ..test_change_record()
+        });
+        append.commit_change_refs[0]
+            .entries
+            .push(ChangeId::for_test_label("change-dup"));
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -1429,9 +1140,7 @@ mod tests {
             writer.stage_append(append).await.unwrap_err()
         };
         assert!(
-            error
-                .message
-                .contains("does not match referenced ChangeRecord key"),
+            error.message.contains("duplicate change ref key"),
             "{error:?}"
         );
     }
@@ -1459,7 +1168,7 @@ mod tests {
         let (context, storage) = changelog_test_context();
         let mut append = test_append();
         append.changes[0].change_id = append.commits[0].change_id.clone();
-        append.commit_change_refs[0].entries[0].change_id = append.commits[0].change_id.clone();
+        append.commit_change_refs[0].entries[0] = append.commits[0].change_id.clone();
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -1472,6 +1181,70 @@ mod tests {
                 .message
                 .contains("collides with an existing change id"),
             "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_append_splits_large_ref_sets_at_the_entry_cap() {
+        // Pins COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES end-to-end: one commit
+        // with 2049 refs must persist as chunks of [2048, 1] whose
+        // concatenation is globally sorted and gap-free.
+        let (context, storage) = changelog_test_context();
+        let mut append = test_append();
+        append.changes.clear();
+        append.commit_change_refs[0].entries.clear();
+        for index in 0..=COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES {
+            let change_id = ChangeId::for_test_label(&format!("bulk-change-{index:05}"));
+            append.changes.push(ChangeRecord {
+                change_id,
+                entity_pk: EntityPk::single(format!("bulk-entity-{index:05}")),
+                ..test_change_record()
+            });
+            append.commit_change_refs[0].entries.push(change_id);
+        }
+
+        let mut transaction = storage.begin_write_transaction().await.unwrap();
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut writer = context.writer(&mut *transaction, &mut writes);
+            writer.stage_append(append).await.unwrap();
+        }
+        writes.apply(&mut *transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+
+        let mut read = storage.begin_read_transaction().await.unwrap();
+        let mut reader = context.reader(&mut *read);
+        let commits = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[CommitId::for_test_label("commit-1")],
+                projection: CommitProjection::Full,
+            })
+            .await
+            .unwrap();
+        let Some(CommitLoadEntry::Full {
+            change_ref_chunks, ..
+        }) = commits.entries.into_iter().next().flatten()
+        else {
+            panic!("expected full commit entry");
+        };
+        assert_eq!(
+            change_ref_chunks
+                .iter()
+                .map(|chunk| chunk.entries.len())
+                .collect::<Vec<_>>(),
+            vec![COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES, 1]
+        );
+        let flattened = change_ref_chunks
+            .iter()
+            .flat_map(|chunk| chunk.entries.iter().copied())
+            .collect::<Vec<_>>();
+        let mut sorted = flattened.clone();
+        sorted.sort_unstable();
+        assert_eq!(flattened, sorted, "entries must be globally sorted");
+        assert_eq!(
+            flattened.len(),
+            COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES + 1,
+            "no entry may be lost across the chunk boundary"
         );
     }
 
@@ -1489,15 +1262,9 @@ mod tests {
             metadata: JsonSlot::None,
             created_at: ts("2026-05-12T00:00:00Z"),
         });
-        append.commit_change_refs[0].entries.insert(
-            0,
-            CommitChangeRef {
-                schema_key: "alpha".to_string(),
-                file_id: None,
-                entity_pk: EntityPk::single("entity-0"),
-                change_id: ChangeId::for_test_label("change-0"),
-            },
-        );
+        append.commit_change_refs[0]
+            .entries
+            .insert(0, ChangeId::for_test_label("change-0"));
         append.commit_change_refs[0].entries.swap(0, 1);
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
@@ -1528,7 +1295,7 @@ mod tests {
             change_ref_chunks[0]
                 .entries
                 .iter()
-                .map(|entry| entry.change_id.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             change_ids(["change-0", "change-1"])
         );
@@ -1547,7 +1314,7 @@ mod tests {
         second.commits[0].change_id = ChangeId::for_test_label("commit-a-row-change");
         second.changes[0].change_id = ChangeId::for_test_label("change-a");
         second.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-a");
-        second.commit_change_refs[0].entries[0].change_id = ChangeId::for_test_label("change-a");
+        second.commit_change_refs[0].entries[0] = ChangeId::for_test_label("change-a");
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();
@@ -1608,14 +1375,14 @@ mod tests {
         first.commits[0].change_id = ChangeId::for_test_label("commit-b-row-change");
         first.changes[0].change_id = ChangeId::for_test_label("change-b");
         first.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-b");
-        first.commit_change_refs[0].entries[0].change_id = ChangeId::for_test_label("change-b");
+        first.commit_change_refs[0].entries[0] = ChangeId::for_test_label("change-b");
 
         let mut second = test_append();
         second.commits[0].commit_id = CommitId::for_test_label("commit-a");
         second.commits[0].change_id = ChangeId::for_test_label("commit-a-row-change");
         second.changes[0].change_id = ChangeId::for_test_label("change-a");
         second.commit_change_refs[0].commit_id = CommitId::for_test_label("commit-a");
-        second.commit_change_refs[0].entries[0].change_id = ChangeId::for_test_label("change-a");
+        second.commit_change_refs[0].entries[0] = ChangeId::for_test_label("change-a");
 
         let mut transaction = storage.begin_write_transaction().await.unwrap();
         let mut writes = StorageWriteSet::new();

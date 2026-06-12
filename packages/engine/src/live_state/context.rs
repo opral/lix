@@ -681,12 +681,7 @@ mod tests {
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
             let change_refs = rows
                 .iter()
-                .map(|(change, _, _)| crate::changelog::CommitChangeRef {
-                    schema_key: change.schema_key.clone(),
-                    file_id: change.file_id.clone(),
-                    entity_pk: change.entity_pk.clone(),
-                    change_id: change.change_id.clone(),
-                })
+                .map(|(change, _, _)| change.change_id)
                 .collect::<Vec<_>>();
             let commit_change_id = format!("{commit_id}:commit");
             let mut append = crate::changelog::ChangelogAppend::default();

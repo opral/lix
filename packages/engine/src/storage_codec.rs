@@ -36,41 +36,6 @@ pub(crate) mod option {
     }
 }
 
-pub(crate) mod vec_option {
-    use musli::de::SequenceDecoder;
-    use musli::en::SequenceEncoder;
-
-    pub(crate) fn encode<T, E>(value: &Vec<Option<T>>, encoder: E) -> Result<(), E::Error>
-    where
-        T: musli::Encode<E::Mode>,
-        E: musli::Encoder,
-    {
-        encoder.encode_sequence_fn(value.len(), |sequence| {
-            for item in value {
-                super::option::encode(item, sequence.encode_next()?)?;
-            }
-
-            Ok(())
-        })
-    }
-
-    pub(crate) fn decode<'de, T, D>(decoder: D) -> Result<Vec<Option<T>>, D::Error>
-    where
-        T: musli::Decode<'de, D::Mode, D::Allocator>,
-        D: musli::Decoder<'de>,
-    {
-        decoder.decode_sequence(|sequence| {
-            let mut out = Vec::with_capacity(sequence.size_hint().or_default());
-
-            while let Some(decoder) = sequence.try_decode_next()? {
-                out.push(super::option::decode(decoder)?);
-            }
-
-            Ok(out)
-        })
-    }
-}
-
 /// Opportunistic UUID packing for stored id strings.
 ///
 /// Lix-generated ids are canonical lowercase hyphenated UUIDs; as text they
@@ -185,7 +150,6 @@ pub(crate) mod id_string {
             other => Err(cx.message(format_args!("unknown id string tag {other}"))),
         }
     }
-
 }
 
 /// [`id_string`] values behind the same bool prefix as [`option`].
@@ -301,27 +265,6 @@ mod tests {
         marker: &'a str,
     }
 
-    #[derive(Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
-    #[musli(packed)]
-    struct VecOptionRoundtrip<'a> {
-        #[musli(with = crate::storage_codec::vec_option)]
-        values: Vec<Option<&'a str>>,
-    }
-
-    #[test]
-    fn option_none_does_not_consume_following_packed_field() {
-        let value = OptionRoundtrip {
-            value: None,
-            marker: "after",
-        };
-
-        let bytes = super::encode("option roundtrip", &value).expect("value should encode cleanly");
-        let decoded: OptionRoundtrip<'_> =
-            super::decode("option roundtrip", &bytes).expect("value should decode cleanly");
-
-        assert_eq!(decoded, value);
-    }
-
     #[derive(Debug, Eq, PartialEq, musli::Encode)]
     #[musli(packed)]
     struct IdStringEncode<'a> {
@@ -341,6 +284,20 @@ mod tests {
     }
 
     #[test]
+    fn option_none_does_not_consume_following_packed_field() {
+        let value = OptionRoundtrip {
+            value: None,
+            marker: "after",
+        };
+
+        let bytes = super::encode("option roundtrip", &value).expect("value should encode cleanly");
+        let decoded: OptionRoundtrip<'_> =
+            super::decode("option roundtrip", &bytes).expect("value should decode cleanly");
+
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
     fn uuid_bytes_from_canonical_accepts_only_the_exact_canonical_form() {
         use super::id_string::uuid_bytes_from_canonical;
         let canonical = "019eb805-60d0-71c0-ade3-b0f0efab9d9a";
@@ -348,16 +305,16 @@ mod tests {
         assert_eq!(super::id_string::uuid_string_from_bytes(bytes), canonical);
 
         for rejected in [
-            "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A",   // uppercase
-            "019eb80560d071c0ade3b0f0efab9d9a",       // simple form
-            "{019eb805-60d0-71c0-ade3-b0f0efab9d9a}", // braced
-            "019eb805-60d0-71c0-ade3-b0f0efab9d9",    // short
-            "019eb805-60d0-71c0-ade3-b0f0efab9d9ax",  // long
-            "019eb805x60d0-71c0-ade3-b0f0efab9d9a",   // 36 bytes, hyphen replaced
-            "019eb805-60d0x71c0-ade3-b0f0efab9d9a",   // 36 bytes, hex at hyphen slot
+            "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A",     // uppercase
+            "019eb80560d071c0ade3b0f0efab9d9a",         // simple form
+            "{019eb805-60d0-71c0-ade3-b0f0efab9d9a}",   // braced
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9",      // short
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9ax",    // long
+            "019eb805x60d0-71c0-ade3-b0f0efab9d9a",     // 36 bytes, hyphen replaced
+            "019eb805-60d0x71c0-ade3-b0f0efab9d9a",     // 36 bytes, hex at hyphen slot
             "019eb805-60d0-71c0-ade3-b0f0efab9d\u{e9}", // 36 bytes via multi-byte char
-            "019eb805-60d0-71c0-ade3-b0f0efab9d9\0",  // embedded NUL
-            "------------------------------------",   // all hyphens
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9\0",    // embedded NUL
+            "------------------------------------",     // all hyphens
             "not-a-uuid",
             "",
         ] {
@@ -376,8 +333,7 @@ mod tests {
             file_id: Some("019eb805-5e65-7270-861d-cb341bc904c8"),
         };
         let bytes = super::encode("id string roundtrip", &value).expect("encode");
-        let decoded: IdStringDecode =
-            super::decode("id string roundtrip", &bytes).expect("decode");
+        let decoded: IdStringDecode = super::decode("id string roundtrip", &bytes).expect("decode");
         assert_eq!(decoded.parts, parts);
         assert_eq!(
             decoded.file_id.as_deref(),
@@ -397,16 +353,16 @@ mod tests {
         };
         let bytes = super::encode("id string wire pin", &value).expect("encode");
         let expected: Vec<u8> = [
-            &[1u8][..],     // parts count
-            &[1u8][..],     // TAG_UUID
+            &[1u8][..], // parts count
+            &[1u8][..], // TAG_UUID
             &[
-                0x01, 0x9e, 0xb8, 0x05, 0x60, 0xd0, 0x71, 0xc0, 0xad, 0xe3, 0xb0, 0xf0, 0xef,
-                0xab, 0x9d, 0x9a,
-            ][..],          // raw uuid bytes
-            &[1u8][..],     // file_id Some
-            &[0u8][..],     // TAG_TEXT
-            &[2u8][..],     // text length
-            b"ab",          // text bytes
+                0x01, 0x9e, 0xb8, 0x05, 0x60, 0xd0, 0x71, 0xc0, 0xad, 0xe3, 0xb0, 0xf0, 0xef, 0xab,
+                0x9d, 0x9a,
+            ][..], // raw uuid bytes
+            &[1u8][..], // file_id Some
+            &[0u8][..], // TAG_TEXT
+            &[2u8][..], // text length
+            b"ab",      // text bytes
         ]
         .concat();
         assert_eq!(bytes, expected);
@@ -459,23 +415,8 @@ mod tests {
             file_id: None,
         };
         let bytes = super::encode("id string roundtrip", &value).expect("encode");
-        let decoded: IdStringDecode =
-            super::decode("id string roundtrip", &bytes).expect("decode");
+        let decoded: IdStringDecode = super::decode("id string roundtrip", &bytes).expect("decode");
         assert_eq!(decoded.parts, parts);
         assert_eq!(decoded.file_id, None);
-    }
-
-    #[test]
-    fn vec_option_roundtrips_borrowed_values() {
-        let value = VecOptionRoundtrip {
-            values: vec![Some("first"), None, Some("third")],
-        };
-
-        let bytes =
-            super::encode("vec option roundtrip", &value).expect("value should encode cleanly");
-        let decoded: VecOptionRoundtrip<'_> =
-            super::decode("vec option roundtrip", &bytes).expect("value should decode cleanly");
-
-        assert_eq!(decoded, value);
     }
 }

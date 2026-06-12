@@ -5,9 +5,8 @@
 use super::context::ChangelogContext;
 use super::store::{ChangelogReader, ChangelogWriter};
 use super::types::{
-    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitChangeRef,
-    CommitChangeRefSet, CommitId, CommitLoadRequest, CommitProjection, CommitRecord, GcPlan,
-    GcRoot, RebuildIndexStats,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitChangeRefSet, CommitId,
+    CommitLoadRequest, CommitProjection, CommitRecord, GcPlan, GcRoot, RebuildIndexStats,
 };
 use crate::LixError;
 use crate::entity_pk::EntityPk;
@@ -638,12 +637,7 @@ fn direct_append_with_shape(
                     "2026-05-20T00:00:00Z",
                 ),
             });
-            refs.push(CommitChangeRef {
-                schema_key: "message".to_string(),
-                file_id: None,
-                entity_pk,
-                change_id: typed_change_id,
-            });
+            refs.push(typed_change_id);
             next_change += 1;
         }
         append.commits.push(CommitRecord {

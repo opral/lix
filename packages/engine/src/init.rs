@@ -4,8 +4,8 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRef,
-    CommitChangeRefSet, CommitId, CommitRecord,
+    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
+    CommitId, CommitRecord,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -309,11 +309,7 @@ async fn stage_init_changelog_commit(
     };
     let commit_change_refs = CommitChangeRefSet {
         commit_id: plan.commit.id,
-        entries: plan
-            .changes
-            .iter()
-            .map(commit_change_ref_from_seed_change)
-            .collect(),
+        entries: plan.changes.iter().map(|change| change.id).collect(),
     };
     let mut writer = ChangelogContext::new().writer(read, writes);
     writer
@@ -327,15 +323,6 @@ async fn stage_init_changelog_commit(
 
 fn commit_row_snapshot_content(commit_id: &str) -> Result<String, LixError> {
     crate::changelog::commit_row_snapshot_json(commit_id)
-}
-
-fn commit_change_ref_from_seed_change(change: &InitSeedChange) -> CommitChangeRef {
-    CommitChangeRef {
-        schema_key: change.schema_key.clone(),
-        file_id: None,
-        entity_pk: change.entity_pk.clone(),
-        change_id: change.id,
-    }
 }
 
 fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedStateRow, LixError> {
@@ -601,14 +588,14 @@ mod tests {
         assert!(
             !change_refs
                 .iter()
-                .any(|change_ref| change_ref.change_id == record.change_id),
+                .any(|change_id| **change_id == record.change_id),
             "initial commit row is derived from changelog.commit, not stored in commit refs"
         );
 
-        let sampled_change_id = change_refs
+        let sampled_change_id = *change_refs
             .first()
-            .expect("initial commit should reference at least one change")
-            .change_id;
+            .copied()
+            .expect("initial commit should reference at least one change");
         let changes = reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &[sampled_change_id],
