@@ -1,0 +1,31 @@
+[package]
+name = "lix_sdk_tests"
+version = "0.6.2"
+edition = "2024"
+description = "Integration tests and benchmarks for the Lix Rust SDK."
+license = "LicenseRef-opral"
+homepage = "https://lix.dev"
+repository = "https://github.com/opral/lix"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+lix_sdk = { path = "../rs-sdk", version = "0.6.2", default-features = false, features = ["default_wasm_runtime", "sqlite"] }
+
+[dev-dependencies]
+plugin_csv = { path = "../../plugins/csv", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+
+async-trait = "0.1"
+criterion = { package = "codspeed-criterion-compat", version = "4" }
+rand = { version = "0.9", features = ["small_rng"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "45", default-features = false, features = ["p2"] }
+zip = { version = "8", default-features = false }
+
+[[bench]]
+name = "e2e"
+path = "benches/e2e.rs"
+harness = false
