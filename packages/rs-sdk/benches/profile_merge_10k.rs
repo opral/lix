@@ -27,10 +27,16 @@ const CSV_PLUGIN_WARMUP_PATH: &str = "/.csv-plugin-warmup.csv";
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, dir) = match args.as_slice() {
-        [_, mode, dir] => (mode.as_str(), dir.clone()),
+        [_, mode, dir] if matches!(mode.as_str(), "setup" | "merge") => {
+            (mode.as_str(), dir.clone())
+        }
         _ => {
+            // `cargo bench` invokes every bench target with harness flags
+            // (--bench, filters); this profiling harness only runs when
+            // called explicitly, so a plain usage note and success exit
+            // keeps bench sweeps green.
             eprintln!("usage: profile_merge_10k <setup|merge> <dir>");
-            std::process::exit(2);
+            return;
         }
     };
     let lix_path = Path::new(&dir).join("bench.lix");
