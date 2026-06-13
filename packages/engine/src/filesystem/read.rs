@@ -18,18 +18,12 @@ use super::{DirectoryPathRecord, derive_directory_paths};
 #[derive(Debug, Clone)]
 pub(crate) struct FilesystemIndex {
     entries_by_path: BTreeMap<String, FilesystemEntry>,
-    directories_by_key: BTreeMap<FilesystemDescriptorKey, FilesystemDirectoryEntry>,
-    files_by_key: BTreeMap<FilesystemDescriptorKey, FilesystemFileEntry>,
     directory_paths_by_key: BTreeMap<FilesystemDescriptorKey, String>,
     file_paths_by_key: BTreeMap<FilesystemDescriptorKey, String>,
     directories_by_parent_id:
         BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<FilesystemDescriptorKey>>,
     files_by_directory_id:
         BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<FilesystemDescriptorKey>>,
-    directory_keys_by_parent_and_name:
-        BTreeMap<(Option<FilesystemDescriptorKey>, String), BTreeSet<FilesystemDescriptorKey>>,
-    file_keys_by_directory_and_name:
-        BTreeMap<(Option<FilesystemDescriptorKey>, String), BTreeSet<FilesystemDescriptorKey>>,
 }
 
 impl FilesystemIndex {
@@ -95,22 +89,12 @@ impl FilesystemIndex {
         )?;
 
         let mut entries_by_path = BTreeMap::new();
-        let mut directories_by_key = BTreeMap::new();
-        let mut files_by_key = BTreeMap::new();
         let mut directory_paths_by_key = BTreeMap::new();
         let mut file_paths_by_key = BTreeMap::new();
         let mut directories_by_parent_id =
             BTreeMap::<Option<FilesystemDescriptorKey>, BTreeSet<FilesystemDescriptorKey>>::new();
         let mut files_by_directory_id =
             BTreeMap::<Option<FilesystemDescriptorKey>, BTreeSet<FilesystemDescriptorKey>>::new();
-        let mut directory_keys_by_parent_and_name = BTreeMap::<
-            (Option<FilesystemDescriptorKey>, String),
-            BTreeSet<FilesystemDescriptorKey>,
-        >::new();
-        let mut file_keys_by_directory_and_name = BTreeMap::<
-            (Option<FilesystemDescriptorKey>, String),
-            BTreeSet<FilesystemDescriptorKey>,
-        >::new();
 
         for (directory_id, snapshot) in &directory_rows {
             let path = directory_paths_by_id.get(directory_id).ok_or_else(|| {
@@ -127,17 +111,12 @@ impl FilesystemIndex {
             insert_entry(
                 &mut entries_by_path,
                 path.clone(),
-                FilesystemEntry::Directory(directory.clone()),
+                FilesystemEntry::Directory(directory),
             )?;
-            directories_by_key.insert(directory_id.clone(), directory);
             directory_paths_by_key.insert(directory_id.clone(), path.clone());
             let parent_key = snapshot.parent_key(directory_id);
             directories_by_parent_id
-                .entry(parent_key.clone())
-                .or_default()
-                .insert(directory_id.clone());
-            directory_keys_by_parent_and_name
-                .entry((parent_key, snapshot.name.clone()))
+                .entry(parent_key)
                 .or_default()
                 .insert(directory_id.clone());
         }
@@ -181,31 +160,21 @@ impl FilesystemIndex {
             insert_entry(
                 &mut entries_by_path,
                 path.clone(),
-                FilesystemEntry::File(file.clone()),
+                FilesystemEntry::File(file),
             )?;
-            let file_name = file.name.clone();
-            files_by_key.insert(file_key.clone(), file);
             file_paths_by_key.insert(file_key.clone(), path);
             files_by_directory_id
-                .entry(directory_key.clone())
+                .entry(directory_key)
                 .or_default()
                 .insert(file_key.clone());
-            file_keys_by_directory_and_name
-                .entry((directory_key, file_name))
-                .or_default()
-                .insert(file_key);
         }
 
         Ok(Self {
             entries_by_path,
-            directories_by_key,
-            files_by_key,
             directory_paths_by_key,
             file_paths_by_key,
             directories_by_parent_id,
             files_by_directory_id,
-            directory_keys_by_parent_and_name,
-            file_keys_by_directory_and_name,
         })
     }
 
@@ -359,84 +328,6 @@ impl FilesystemIndex {
         }
         Ok(())
     }
-
-    pub(crate) fn reject_cross_lane_segments_collision(
-        &self,
-        segments: &[String],
-        untracked: bool,
-        operation: &str,
-    ) -> Result<(), LixError> {
-        let mut parent_key = None::<FilesystemDescriptorKey>;
-        let mut namespace_segments = Vec::new();
-
-        for segment in segments {
-            namespace_segments.push(segment.clone());
-            let lookup_parent = parent_key.clone();
-            let mut same_lane_directory = None::<FilesystemDescriptorKey>;
-
-            if let Some(directory_keys) = self
-                .directory_keys_by_parent_and_name
-                .get(&(lookup_parent.clone(), segment.clone()))
-            {
-                for directory_key in directory_keys {
-                    let Some(directory) = self.directories_by_key.get(directory_key) else {
-                        continue;
-                    };
-                    if directory.scope.untracked != untracked {
-                        return Err(cross_lane_namespace_collision_error(
-                            operation,
-                            untracked,
-                            &namespace_segments,
-                            directory.scope.untracked,
-                            "directory",
-                        ));
-                    }
-                    same_lane_directory.get_or_insert_with(|| directory_key.clone());
-                }
-            }
-
-            if let Some(file_keys) = self
-                .file_keys_by_directory_and_name
-                .get(&(lookup_parent, segment.clone()))
-            {
-                for file_key in file_keys {
-                    let Some(file) = self.files_by_key.get(file_key) else {
-                        continue;
-                    };
-                    if file.scope.untracked != untracked {
-                        return Err(cross_lane_namespace_collision_error(
-                            operation,
-                            untracked,
-                            &namespace_segments,
-                            file.scope.untracked,
-                            "file",
-                        ));
-                    }
-                }
-            }
-
-            let Some(directory_key) = same_lane_directory else {
-                break;
-            };
-            parent_key = Some(directory_key);
-        }
-
-        Ok(())
-    }
-}
-
-fn cross_lane_namespace_collision_error(
-    operation: &str,
-    untracked: bool,
-    namespace_segments: &[String],
-    existing_untracked: bool,
-    existing_label: &str,
-) -> LixError {
-    filesystem_conflict_error(format!(
-        "{operation} cannot create {} path in namespace segments {namespace_segments:?} occupied by existing {} {existing_label}",
-        lane_name(untracked),
-        lane_name(existing_untracked),
-    ))
 }
 
 fn descriptor_id_sets_by_parent(
@@ -690,10 +581,6 @@ pub(crate) fn wrong_kind_error(path: &str, expected: &str, actual: &str) -> LixE
 
 pub(crate) fn filesystem_conflict_error(message: String) -> LixError {
     LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message)
-}
-
-fn lane_name(untracked: bool) -> &'static str {
-    if untracked { "untracked" } else { "tracked" }
 }
 
 #[cfg(test)]

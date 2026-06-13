@@ -28,7 +28,7 @@ where
 {
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
         let parsed = parse_plugin_archive_for_install(archive_bytes)?;
-        let archive_path = plugin_storage_archive_path(&parsed.manifest.key)?;
+        let archive_path = plugin_storage_archive_path(&parsed.manifest.key);
         self.fs()
             .write_file(
                 &archive_path,

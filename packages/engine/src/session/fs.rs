@@ -172,15 +172,6 @@ where
                     if options.untracked {
                         filesystem.reject_tracked_path_collision(&path, "fs.write_file")?;
                     }
-                    let path_segments = parsed_path
-                        .segments()
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>();
-                    filesystem.reject_cross_lane_segments_collision(
-                        &path_segments,
-                        options.untracked,
-                        "fs.write_file",
-                    )?;
                     let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
                     let context = FilesystemRowContext {
                         branch_id: branch_id.clone(),
@@ -285,15 +276,6 @@ where
                 if options.untracked {
                     filesystem.reject_tracked_path_collision(&path, "fs.mkdir")?;
                 }
-                let path_segments = parsed_path
-                    .segments()
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                filesystem.reject_cross_lane_segments_collision(
-                    &path_segments,
-                    options.untracked,
-                    "fs.mkdir",
-                )?;
                 let metadata = transaction_metadata(options.metadata, "fs.mkdir metadata")?;
                 let context = FilesystemRowContext {
                     branch_id: branch_id.clone(),

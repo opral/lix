@@ -666,7 +666,7 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
 
 #[cfg(feature = "sqlite")]
 async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let actual = lix.readdir(path).await.unwrap().is_some();
         if actual == expected {

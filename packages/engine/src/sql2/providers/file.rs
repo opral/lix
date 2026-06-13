@@ -80,7 +80,7 @@ use crate::filesystem::{
     FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
     FilesystemBlobRefKey, FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
     blob_ref_row, blob_ref_tombstone_row, derive_directory_paths,
-    directory_path_resolvers_from_state_rows, file_descriptor_row, file_descriptor_write_row,
+    directory_path_resolvers_from_live_state, file_descriptor_row, file_descriptor_write_row,
     filesystem_storage_scope_key, plan_file_delete, plan_file_descriptor_write,
     plan_parsed_file_path_update, plan_parsed_file_path_write,
 };
@@ -538,7 +538,7 @@ impl InsertSink for LixFileInsertSink {
         for batch in batches {
             if path_resolvers.is_none() {
                 path_resolvers = Some(
-                    file_path_resolvers_from_live_state(
+                    directory_path_resolvers_from_live_state(
                         Arc::new(WriteContextLiveStateReader::new(self.write_ctx.clone())),
                         self.branch_binding.active_branch_id(),
                     )
@@ -953,7 +953,7 @@ impl ExecutionPlan for LixFileUpdateExec {
             let mut path_resolvers = None;
             if update_columns.path || update_columns.descriptor {
                 path_resolvers = Some(
-                    file_path_resolvers_from_live_state(
+                    directory_path_resolvers_from_live_state(
                         Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
                         branch_binding.active_branch_id(),
                     )
@@ -1387,7 +1387,6 @@ fn lix_file_existing_update_stage_from_batch(
             file_row_context_from_update(batch, assignment_values, row_index, branch_binding)?;
         let mut data_path = None;
         let mut data_filename = None;
-
         if include_descriptor_writes {
             let directory_id =
                 update_optional_string_value(batch, assignment_values, row_index, "directory_id")?;
@@ -2049,35 +2048,6 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
         context.untracked,
         context.file_id.as_deref(),
     )
-}
-
-async fn file_path_resolvers_from_live_state(
-    live_state: Arc<dyn LiveStateReader>,
-    branch_binding: Option<&str>,
-) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
-    let rows = live_state
-        .scan_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![
-                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                    FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                ],
-                branch_ids: branch_binding
-                    .map(|branch_id| vec![branch_id.to_string()])
-                    .unwrap_or_default(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await?;
-    let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
-    if let Some(branch_id) = branch_binding {
-        let key = filesystem_storage_scope_key(branch_id, false, false, None);
-        resolvers
-            .entry(key)
-            .or_insert_with(DirectoryPathResolver::default);
-    }
-    Ok(resolvers)
 }
 
 async fn lix_file_record_batch(
@@ -4164,7 +4134,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_path_update_seeds_resolver_from_visible_directory_state() {
-        let mut resolvers = super::file_path_resolvers_from_live_state(
+        let mut resolvers = super::directory_path_resolvers_from_live_state(
             Arc::new(RowsLiveStateReader {
                 rows: vec![live_directory_row(
                     "dir-docs",
@@ -4211,7 +4181,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_path_update_stages_only_missing_parent_directories() {
-        let mut resolvers = super::file_path_resolvers_from_live_state(
+        let mut resolvers = super::directory_path_resolvers_from_live_state(
             Arc::new(RowsLiveStateReader::default()) as Arc<dyn LiveStateReader>,
             Some("branch-b"),
         )

@@ -1,5 +1,4 @@
 use crate::LixError;
-use crate::common::compose_file_path;
 
 pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix_system/plugins/";
 const PLUGIN_STORAGE_ROOT_PATH: &str = "/.lix_system/plugins";
@@ -9,26 +8,26 @@ pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
     format!("lix_plugin_archive::{plugin_key}")
 }
 
-pub fn plugin_storage_archive_path(plugin_key: &str) -> Result<String, LixError> {
-    if plugin_key.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "plugin key must be non-empty",
-        ));
-    }
-    compose_file_path(
-        Some(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH),
-        &format!("{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}"),
-    )
+pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
+    format!("{PLUGIN_STORAGE_ROOT_DIRECTORY_PATH}{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}")
 }
 
 pub fn plugin_key_from_archive_path(path: &str) -> Option<String> {
     let file_name = path.strip_prefix(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)?;
     let plugin_key = file_name.strip_suffix(PLUGIN_ARCHIVE_FILE_EXTENSION)?;
-    if plugin_storage_archive_path(plugin_key).ok().as_deref() != Some(path) {
+    if !is_valid_plugin_key(plugin_key) {
         return None;
     }
     Some(plugin_key.to_string())
+}
+
+fn is_valid_plugin_key(plugin_key: &str) -> bool {
+    if plugin_key.is_empty() || plugin_key.len() > 128 {
+        return false;
+    }
+    let mut bytes = plugin_key.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
 pub(crate) fn reject_normal_plugin_storage_mutation(
@@ -61,12 +60,8 @@ mod tests {
     #[test]
     fn computes_storage_archive_paths() {
         assert_eq!(
-            plugin_storage_archive_path("plugin_json").expect("path should build"),
+            plugin_storage_archive_path("plugin_json"),
             "/.lix_system/plugins/plugin_json.lixplugin"
-        );
-        assert_eq!(
-            plugin_storage_archive_path(r"plugin\json").expect("opaque path should build"),
-            r"/.lix_system/plugins/plugin\json.lixplugin"
         );
     }
 
@@ -76,14 +71,14 @@ mod tests {
             plugin_key_from_archive_path("/.lix_system/plugins/plugin_json.lixplugin"),
             Some("plugin_json".to_string())
         );
-        assert_eq!(
-            plugin_key_from_archive_path(r"/.lix_system/plugins/plugin\json.lixplugin"),
-            Some(r"plugin\json".to_string())
-        );
-        assert_eq!(
-            plugin_key_from_archive_path("/.lix_system/plugins/nested/plugin.lixplugin"),
-            None
-        );
+        for path in [
+            "/.lix_system/plugins/plugin\\json.lixplugin",
+            "/.lix_system/plugins/nested/plugin.lixplugin",
+            "/.lix_system/plugins/PluginJson.lixplugin",
+            "/.lix_system/plugins/.lixplugin",
+        ] {
+            assert_eq!(plugin_key_from_archive_path(path), None);
+        }
     }
 
     #[test]

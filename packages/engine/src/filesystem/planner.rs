@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -7,7 +7,9 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::common::{LixPath, compose_file_path, stable_content_fingerprint_hex};
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::{
+    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+};
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -832,7 +834,6 @@ pub(crate) fn plan_file_descriptor_write(
     let file_path = resolver.require_file_path(input.directory_id.as_deref(), &input.name)?;
     let file_id = input.id.unwrap_or_else(&mut *generate_file_id);
     let filename = input.name.clone();
-
     resolver.reserve_file(
         input.directory_id.clone(),
         input.name.clone(),
@@ -1054,6 +1055,33 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
             branch_id,
             DirectoryPathResolver::from_existing_descriptors(std::iter::empty(), files)?,
         );
+    }
+    Ok(resolvers)
+}
+
+pub(crate) async fn directory_path_resolvers_from_live_state(
+    live_state: Arc<dyn LiveStateReader>,
+    branch_binding: Option<&str>,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let rows = live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![
+                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                    FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                ],
+                branch_ids: branch_binding
+                    .map(|branch_id| vec![branch_id.to_string()])
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
+    if let Some(branch_id) = branch_binding {
+        let key = filesystem_storage_scope_key(branch_id, false, false, None);
+        resolvers.entry(key).or_default();
     }
     Ok(resolvers)
 }

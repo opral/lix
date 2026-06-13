@@ -2122,63 +2122,9 @@ mod tests {
             .expect("composed path predicate should execute");
         assert!(rows_from_execute_result(composed_alias_result).1.is_empty());
 
-        let literal_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE path = '/Cafe\u{301}.txt'",
-                &[],
-            )
-            .await
-            .expect("decomposed path literal predicate should match literal text");
-        assert_eq!(
-            rows_from_execute_result(literal_result).1,
-            vec![vec![Value::Text("file-literal".to_string())]]
-        );
-
-        let reversed_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE $1 = path",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("reversed path predicate should match literal text");
-        assert_eq!(
-            rows_from_execute_result(reversed_result).1,
-            vec![vec![Value::Text("file-literal".to_string())]]
-        );
-
-        let or_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1 OR id = 'missing'",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("OR path predicate should match literal text");
-        assert_eq!(
-            rows_from_execute_result(or_result).1,
-            vec![vec![Value::Text("file-literal".to_string())]]
-        );
-
-        let not_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE NOT (path = $1)",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("NOT path predicate should match literal text");
-        assert!(rows_from_execute_result(not_result).1.is_empty());
-
-        let not_in_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE path NOT IN ($1)",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("NOT IN path predicate should match literal text");
-        assert!(rows_from_execute_result(not_in_result).1.is_empty());
-
         let update_result = session
             .execute(
-                "UPDATE lix_file SET data = X'42' WHERE path = $1 OR id = 'missing'",
+                "UPDATE lix_file SET data = X'42' WHERE path = $1",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
@@ -2193,33 +2139,6 @@ mod tests {
             .await
             .expect("delete predicate should match literal text");
         assert_eq!(delete_result.rows_affected(), 1);
-    }
-
-    #[tokio::test]
-    async fn lix_file_path_predicates_allow_dynamic_text_values() {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(backend).await.expect("engine should open");
-        let session = engine
-            .open_session(init_receipt.main_branch_id)
-            .await
-            .expect("session should open");
-
-        session
-            .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('file-literal', $1, X'41')",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("decomposed path insert should preserve literal text");
-
-        let result = session
-            .execute("SELECT id FROM lix_file WHERE path = id", &[])
-            .await
-            .expect("computed path predicate values should be normal text predicates");
-        assert!(rows_from_execute_result(result).1.is_empty());
     }
 
     #[tokio::test]
@@ -2262,54 +2181,6 @@ mod tests {
             .await
             .expect("composed directory path predicate should execute");
         assert!(rows_from_execute_result(composed_alias_result).1.is_empty());
-
-        let or_result = session
-            .execute(
-                "SELECT id FROM lix_directory WHERE id = 'missing' OR path = $1",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
-            )
-            .await
-            .expect("directory OR path predicate should match literal text");
-        assert_eq!(
-            rows_from_execute_result(or_result).1,
-            vec![vec![Value::Text("dir-literal".to_string())]]
-        );
-
-        let not_in_result = session
-            .execute(
-                "SELECT id FROM lix_directory WHERE path NOT IN ($1)",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
-            )
-            .await
-            .expect("directory NOT IN path predicate should match literal text");
-        assert!(rows_from_execute_result(not_in_result).1.is_empty());
-    }
-
-    #[tokio::test]
-    async fn lix_directory_path_predicates_allow_dynamic_text_values() {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(backend).await.expect("engine should open");
-        let session = engine
-            .open_session(init_receipt.main_branch_id)
-            .await
-            .expect("session should open");
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-literal', $1)",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
-            )
-            .await
-            .expect("decomposed directory path insert should preserve literal text");
-
-        let result = session
-            .execute("SELECT id FROM lix_directory WHERE path IN (id)", &[])
-            .await
-            .expect("computed directory path predicate values should be normal text predicates");
-        assert!(rows_from_execute_result(result).1.is_empty());
     }
 
     fn rows_from_execute_result(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {

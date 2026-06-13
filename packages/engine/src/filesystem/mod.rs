@@ -10,10 +10,10 @@ pub(crate) use self::planner::{
     FileDeleteInput, FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
     FilesystemBlobRefKey, FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
     FilesystemWritePlan, blob_ref_row, blob_ref_tombstone_row, directory_descriptor_write_row,
-    directory_path_resolvers_from_state_rows, file_descriptor_row, file_descriptor_write_row,
-    filesystem_storage_scope_key, plan_directory_delete, plan_file_delete,
-    plan_file_descriptor_write, plan_parsed_file_path_update, plan_parsed_file_path_write,
-    plan_recursive_directory_delete,
+    directory_path_resolvers_from_live_state, directory_path_resolvers_from_state_rows,
+    file_descriptor_row, file_descriptor_write_row, filesystem_storage_scope_key,
+    plan_directory_delete, plan_file_delete, plan_file_descriptor_write,
+    plan_parsed_file_path_update, plan_parsed_file_path_write, plan_recursive_directory_delete,
 };
 pub(crate) use self::read::{
     FilesystemDirEntryKind, FilesystemEntry, FilesystemIndex, filesystem_conflict_error,
