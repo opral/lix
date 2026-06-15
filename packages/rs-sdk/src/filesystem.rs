@@ -446,6 +446,12 @@ where
                 && !is_plugin_storage_path(path)
                 && !is_filesystem_metadata_path(path)
             {
+                if previous
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.files.contains_key(path))
+                {
+                    continue;
+                }
                 if lix_path_blocked_by_unmanaged(&self.root, path)?
                     || snapshot_unmanaged_blocks_lix_path(previous, path)
                 {
@@ -460,6 +466,12 @@ where
             if path.as_str() == "/"
                 || is_plugin_storage_path(path)
                 || is_filesystem_metadata_path(path)
+            {
+                continue;
+            }
+            if previous
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.directories.contains(path))
             {
                 continue;
             }
@@ -488,6 +500,11 @@ where
             .directories
             .difference(&lix.directories)
             .filter(|path| path.as_str() != "/")
+            .filter(|path| {
+                previous
+                    .as_ref()
+                    .is_none_or(|snapshot| !snapshot.directories.contains(*path))
+            })
             .cloned()
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
@@ -503,6 +520,12 @@ where
             .iter()
             .filter(|(path, _)| !is_filesystem_metadata_path(path))
         {
+            if previous
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.files.get(path) == Some(data))
+            {
+                continue;
+            }
             if lix.files.get(path) != Some(data) {
                 self.session
                     .fs()
@@ -1076,6 +1099,8 @@ fn sqlite_backend_error(error: BackendError) -> LixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "sqlite")]
+    use lix_engine::Value;
 
     #[test]
     fn local_paths_render_opaque_segments() {
@@ -1132,5 +1157,58 @@ mod tests {
             let error = lix_path_to_local_path(root, path).expect_err("path should fail");
             assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn disk_sync_does_not_reimport_unchanged_materialized_file_deleted_in_lix() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let backend = open_filesystem_sqlite_backend(tempdir.path()).unwrap();
+        let engine = crate::lix::open_or_initialize_engine(backend, None)
+            .await
+            .unwrap();
+        let root = std::fs::canonicalize(tempdir.path()).unwrap();
+        let state = FilesystemState {
+            session: engine.open_workspace_session().await.unwrap(),
+            root,
+            sync_lock: tokio::sync::Mutex::new(()),
+            last_materialized: Mutex::new(None),
+        };
+
+        state.sync_disk_to_lix(false).await.unwrap();
+        state
+            .session
+            .fs()
+            .write_file("/sql.txt", b"updated".to_vec(), FsWriteOptions::default())
+            .await
+            .unwrap();
+        state.sync_from_lix().await.unwrap();
+        assert_eq!(
+            std::fs::read(tempdir.path().join("sql.txt")).unwrap(),
+            b"updated"
+        );
+
+        state
+            .session
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[Value::Text("/sql.txt".to_string())],
+            )
+            .await
+            .unwrap();
+        state.sync_disk_to_lix(true).await.unwrap();
+
+        assert!(!tempdir.path().join("sql.txt").exists());
+        let rows = state
+            .session
+            .execute(
+                "SELECT path FROM lix_file WHERE path = $1",
+                &[Value::Text("/sql.txt".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        state.close().await.unwrap();
     }
 }
