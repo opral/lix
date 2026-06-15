@@ -23,7 +23,6 @@ pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{ExecuteResult, Row, RowRef, TryFromValue};
-pub(crate) use fs::scan_filesystem_rows;
 pub use fs::{FsDirEntry, FsDirEntryKind, FsMkdirOptions, FsRmOptions, FsWriteOptions, SessionFs};
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,

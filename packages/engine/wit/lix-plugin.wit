@@ -6,6 +6,8 @@ interface api {
 
   /// Current materialized file payload supplied to `detect-changes`.
   record file {
+    /// Descriptor filename for the payload, when the engine has one.
+    filename: option<string>,
     data: bytes,
   }
 

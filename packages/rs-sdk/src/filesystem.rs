@@ -85,6 +85,7 @@ where
 struct Snapshot {
     directories: BTreeSet<String>,
     files: BTreeMap<String, Vec<u8>>,
+    unmanaged_paths: BTreeSet<String>,
 }
 
 enum FilesystemEvent {
@@ -285,8 +286,7 @@ where
     for<'backend> B::Write<'backend>: Send,
 {
     async fn open(engine: Engine<B>, root: &Path) -> Result<Self, LixError> {
-        std::fs::create_dir_all(root)
-            .map_err(|error| io_error("create filesystem root", root, error))?;
+        ensure_filesystem_root_directory(root)?;
         let root = std::fs::canonicalize(root)
             .map_err(|error| io_error("canonicalize filesystem root", root, error))?;
         let session = engine.open_workspace_session().await?;
@@ -384,8 +384,8 @@ where
     async fn sync_from_lix(&self) -> Result<(), LixError> {
         let _guard = self.sync_lock.lock().await;
         let snapshot = self.collect_lix_snapshot().await?;
-        self.materialize_snapshot(&snapshot)?;
-        self.remember_materialized(snapshot);
+        let materialized = self.materialize_snapshot(&snapshot)?;
+        self.remember_materialized(materialized);
         Ok(())
     }
 
@@ -395,10 +395,12 @@ where
         if skip_if_last_materialized && self.is_last_materialized(&local) {
             return Ok(());
         }
-        self.apply_local_snapshot_to_lix(&local).await?;
+        let previous = self.last_materialized();
+        self.apply_local_snapshot_to_lix(&local, previous.as_ref())
+            .await?;
         let lix = self.collect_lix_snapshot().await?;
-        self.materialize_snapshot(&lix)?;
-        self.remember_materialized(lix);
+        let materialized = self.materialize_snapshot(&lix)?;
+        self.remember_materialized(materialized);
         Ok(())
     }
 
@@ -432,7 +434,11 @@ where
         Ok(snapshot)
     }
 
-    async fn apply_local_snapshot_to_lix(&self, local: &Snapshot) -> Result<(), LixError> {
+    async fn apply_local_snapshot_to_lix(
+        &self,
+        local: &Snapshot,
+        previous: Option<&Snapshot>,
+    ) -> Result<(), LixError> {
         let lix = self.collect_lix_snapshot().await?;
 
         for path in lix.files.keys() {
@@ -440,20 +446,30 @@ where
                 && !is_plugin_storage_path(path)
                 && !is_filesystem_metadata_path(path)
             {
+                if lix_path_blocked_by_unmanaged(&self.root, path)?
+                    || snapshot_unmanaged_blocks_lix_path(previous, path)
+                {
+                    continue;
+                }
                 self.session.fs().rm(path, FsRmOptions::default()).await?;
             }
         }
 
-        let mut directories_to_remove = lix
-            .directories
-            .difference(&local.directories)
-            .filter(|path| {
-                path.as_str() != "/"
-                    && !is_plugin_storage_path(path)
-                    && !is_filesystem_metadata_path(path)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut directories_to_remove = Vec::new();
+        for path in lix.directories.difference(&local.directories) {
+            if path.as_str() == "/"
+                || is_plugin_storage_path(path)
+                || is_filesystem_metadata_path(path)
+            {
+                continue;
+            }
+            if lix_path_blocked_by_unmanaged(&self.root, path)?
+                || snapshot_unmanaged_blocks_lix_path(previous, path)
+            {
+                continue;
+            }
+            directories_to_remove.push(path.clone());
+        }
         sort_directories_deepest_first(&mut directories_to_remove);
         for path in directories_to_remove {
             self.session
@@ -487,9 +503,7 @@ where
             .iter()
             .filter(|(path, _)| !is_filesystem_metadata_path(path))
         {
-            if is_plugin_storage_path(path) {
-                self.session.install_plugin_archive(data).await?;
-            } else if lix.files.get(path) != Some(data) {
+            if lix.files.get(path) != Some(data) {
                 self.session
                     .fs()
                     .write_file(path, data.clone(), FsWriteOptions::default())
@@ -500,9 +514,8 @@ where
         Ok(())
     }
 
-    fn materialize_snapshot(&self, target: &Snapshot) -> Result<(), LixError> {
-        std::fs::create_dir_all(&self.root)
-            .map_err(|error| io_error("create filesystem root", &self.root, error))?;
+    fn materialize_snapshot(&self, target: &Snapshot) -> Result<Snapshot, LixError> {
+        ensure_filesystem_root_directory(&self.root)?;
         let local = collect_local_snapshot(&self.root)?;
         let previous = self.last_materialized();
 
@@ -513,9 +526,7 @@ where
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.files.contains_key(*path))
         }) {
-            let local_path = lix_path_to_local_path(&self.root, path)?;
-            std::fs::remove_file(&local_path)
-                .map_err(|error| io_error("remove filesystem file", &local_path, error))?;
+            remove_materialized_file(&self.root, path)?;
         }
 
         let mut directories_to_remove = local
@@ -531,9 +542,7 @@ where
             .collect::<Vec<_>>();
         sort_directories_deepest_first(&mut directories_to_remove);
         for path in directories_to_remove {
-            let local_path = lix_path_to_local_path(&self.root, &path)?;
-            std::fs::remove_dir(&local_path)
-                .map_err(|error| io_error("remove filesystem directory", &local_path, error))?;
+            remove_materialized_directory(&self.root, &path)?;
         }
 
         let mut directories_to_create = target
@@ -544,9 +553,7 @@ where
             .collect::<Vec<_>>();
         sort_directories_shallowest_first(&mut directories_to_create);
         for path in directories_to_create {
-            let local_path = lix_path_to_local_path(&self.root, &path)?;
-            std::fs::create_dir_all(&local_path)
-                .map_err(|error| io_error("create filesystem directory", &local_path, error))?;
+            create_materialized_directory(&self.root, &path)?;
         }
 
         for (path, data) in target
@@ -554,18 +561,15 @@ where
             .iter()
             .filter(|(path, _)| !is_filesystem_metadata_path(path))
         {
-            let local_path = lix_path_to_local_path(&self.root, path)?;
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| io_error("create filesystem file parent", parent, error))?;
-            }
             if local.files.get(path) != Some(data) {
-                std::fs::write(&local_path, data)
-                    .map_err(|error| io_error("write filesystem file", &local_path, error))?;
+                write_materialized_file(&self.root, path, data)?;
             }
         }
 
-        Ok(())
+        let materialized = collect_local_snapshot(&self.root)?;
+        let mut remembered = target.clone();
+        remembered.unmanaged_paths = materialized.unmanaged_paths;
+        Ok(remembered)
     }
 
     fn remember_materialized(&self, snapshot: Snapshot) {
@@ -672,20 +676,7 @@ fn sync_from_lix_for_replies<B>(
 }
 
 fn collect_local_snapshot(root: &Path) -> Result<Snapshot, LixError> {
-    let metadata = std::fs::symlink_metadata(root)
-        .map_err(|error| io_error("read filesystem root metadata", root, error))?;
-    if metadata.file_type().is_symlink() {
-        let root = root.display();
-        return Err(filesystem_error(format!(
-            "filesystem root {root} must not be a symlink"
-        )));
-    }
-    if !metadata.is_dir() {
-        let root = root.display();
-        return Err(filesystem_error(format!(
-            "filesystem root {root} must be a directory"
-        )));
-    }
+    validate_filesystem_root_directory(root)?;
 
     let mut snapshot = Snapshot::default();
     snapshot.directories.insert("/".to_string());
@@ -707,34 +698,217 @@ fn collect_local_directory(
             continue;
         }
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| io_error("read filesystem entry type", &path, error))?;
-        if file_type.is_symlink() {
-            let path = path.display();
-            return Err(filesystem_error(format!(
-                "filesystem path {path} must not be a symlink"
-            )));
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("read filesystem entry type", &path, error)),
+        };
+        if is_unmanaged_file_type(&file_type) {
+            remember_unmanaged_local_path(root, directory, &path, snapshot);
+            continue;
         }
         if file_type.is_dir() {
-            snapshot
-                .directories
-                .insert(local_path_to_lix_path(root, &path, true)?);
+            let Ok(lix_path) = local_path_to_lix_path(root, &path, true) else {
+                remember_unmanaged_local_path(root, directory, &path, snapshot);
+                continue;
+            };
+            snapshot.directories.insert(lix_path);
             collect_local_directory(root, &path, snapshot)?;
         } else if file_type.is_file() {
+            let Ok(lix_path) = local_path_to_lix_path(root, &path, false) else {
+                remember_unmanaged_local_path(root, directory, &path, snapshot);
+                continue;
+            };
             let data = std::fs::read(&path)
                 .map_err(|error| io_error("read filesystem file", &path, error))?;
-            snapshot
-                .files
-                .insert(local_path_to_lix_path(root, &path, false)?, data);
-        } else {
-            let path = path.display();
-            return Err(filesystem_error(format!(
-                "filesystem path {path} is not a regular file or directory"
-            )));
+            snapshot.files.insert(lix_path, data);
         }
     }
     Ok(())
+}
+
+fn remember_unmanaged_local_path(
+    root: &Path,
+    directory: &Path,
+    path: &Path,
+    snapshot: &mut Snapshot,
+) {
+    if let Ok(lix_path) = local_path_to_lix_path(root, path, false) {
+        snapshot.unmanaged_paths.insert(lix_path);
+    } else if directory != root {
+        if let Ok(parent_path) = local_path_to_lix_path(root, directory, true) {
+            snapshot.unmanaged_paths.insert(parent_path);
+        }
+    }
+}
+
+fn ensure_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| io_error("create filesystem root", root, error))?;
+    validate_filesystem_root_directory(root)
+}
+
+fn validate_filesystem_root_directory(root: &Path) -> Result<(), LixError> {
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| io_error("read filesystem root metadata", root, error))?;
+    if metadata.file_type().is_symlink() {
+        let root = root.display();
+        return Err(filesystem_error(format!(
+            "filesystem root {root} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let root = root.display();
+        return Err(filesystem_error(format!(
+            "filesystem root {root} must be a directory"
+        )));
+    }
+    Ok(())
+}
+
+fn remove_materialized_file(root: &Path, path: &str) -> Result<(), LixError> {
+    let Some(local_path) = materialization_local_path(root, path) else {
+        return Ok(());
+    };
+    if path_contains_unmanaged_entry(root, &local_path)? {
+        return Ok(());
+    }
+    let metadata = match std::fs::symlink_metadata(&local_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read filesystem file metadata",
+                &local_path,
+                error,
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    std::fs::remove_file(&local_path)
+        .map_err(|error| io_error("remove filesystem file", &local_path, error))
+}
+
+fn remove_materialized_directory(root: &Path, path: &str) -> Result<(), LixError> {
+    let Some(local_path) = materialization_local_path(root, path) else {
+        return Ok(());
+    };
+    if path_contains_unmanaged_entry(root, &local_path)? {
+        return Ok(());
+    }
+    let metadata = match std::fs::symlink_metadata(&local_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "read filesystem directory metadata",
+                &local_path,
+                error,
+            ));
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    match std::fs::remove_dir(&local_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(error) => Err(io_error("remove filesystem directory", &local_path, error)),
+    }
+}
+
+fn create_materialized_directory(root: &Path, path: &str) -> Result<(), LixError> {
+    let Some(local_path) = materialization_local_path(root, path) else {
+        return Ok(());
+    };
+    if path_contains_unmanaged_entry(root, &local_path)? {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&local_path)
+        .map_err(|error| io_error("create filesystem directory", &local_path, error))
+}
+
+fn write_materialized_file(root: &Path, path: &str, data: &[u8]) -> Result<(), LixError> {
+    let Some(local_path) = materialization_local_path(root, path) else {
+        return Ok(());
+    };
+    if path_contains_unmanaged_entry(root, &local_path)? {
+        return Ok(());
+    }
+    if let Some(parent) = local_path.parent() {
+        if path_contains_unmanaged_entry(root, parent)? {
+            return Ok(());
+        }
+        std::fs::create_dir_all(parent)
+            .map_err(|error| io_error("create filesystem file parent", parent, error))?;
+        if path_contains_unmanaged_entry(root, parent)? {
+            return Ok(());
+        }
+    }
+    if path_contains_unmanaged_entry(root, &local_path)? {
+        return Ok(());
+    }
+    std::fs::write(&local_path, data)
+        .map_err(|error| io_error("write filesystem file", &local_path, error))
+}
+
+fn lix_path_blocked_by_unmanaged(root: &Path, path: &str) -> Result<bool, LixError> {
+    let Some(local_path) = materialization_local_path(root, path) else {
+        return Ok(true);
+    };
+    path_contains_unmanaged_entry(root, &local_path)
+}
+
+fn snapshot_unmanaged_blocks_lix_path(snapshot: Option<&Snapshot>, path: &str) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot
+            .unmanaged_paths
+            .iter()
+            .any(|unmanaged_path| unmanaged_path_blocks_lix_path(unmanaged_path, path))
+    })
+}
+
+fn unmanaged_path_blocks_lix_path(unmanaged_path: &str, path: &str) -> bool {
+    let unmanaged_path = unmanaged_path.strip_suffix('/').unwrap_or(unmanaged_path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path == unmanaged_path
+        || path
+            .strip_prefix(unmanaged_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn materialization_local_path(root: &Path, path: &str) -> Option<PathBuf> {
+    lix_path_to_local_path(root, path).ok()
+}
+
+fn path_contains_unmanaged_entry(root: &Path, local_path: &Path) -> Result<bool, LixError> {
+    let Ok(relative) = local_path.strip_prefix(root) else {
+        return Ok(true);
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(segment) = component else {
+            return Ok(true);
+        };
+        current.push(segment);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(io_error("read filesystem path metadata", &current, error));
+            }
+        };
+        if is_unmanaged_file_type(&metadata.file_type()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_unmanaged_file_type(file_type: &std::fs::FileType) -> bool {
+    file_type.is_symlink() || (!file_type.is_file() && !file_type.is_dir())
 }
 
 fn local_path_to_lix_path(
@@ -761,7 +935,6 @@ fn local_path_to_lix_path(
             let path = path.display();
             filesystem_error(format!("filesystem path {path} is not valid UTF-8"))
         })?;
-        validate_lix_path_segment(segment, path)?;
         segments.push(segment.to_string());
     }
     if segments.is_empty() {
@@ -787,32 +960,30 @@ fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> 
     }
     let mut local = root.to_path_buf();
     for segment in body.split('/') {
-        if segment.is_empty() {
-            return Err(filesystem_error(format!(
-                "Lix path {path:?} contains an empty segment"
-            )));
-        }
-        local.push(segment);
+        push_lix_path_segment(&mut local, segment, path)?;
     }
     Ok(local)
 }
 
-fn validate_lix_path_segment(segment: &str, path: &Path) -> Result<(), LixError> {
-    if segment.is_empty()
-        || segment == "."
-        || segment == ".."
-        || segment.contains('/')
-        || segment.contains('\\')
-        || segment.contains('\0')
-        || segment.contains('%')
-        || segment.contains('?')
-        || segment.contains('#')
-    {
-        let path = path.display();
+fn push_lix_path_segment(local: &mut PathBuf, segment: &str, path: &str) -> Result<(), LixError> {
+    if segment.is_empty() || segment == "." || segment == ".." {
         return Err(filesystem_error(format!(
-            "filesystem path {path} contains invalid Lix path segment {segment:?}"
+            "Lix path {path:?} contains unsupported segment {segment:?}"
         )));
     }
+
+    let mut components = Path::new(segment).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) => {
+            local.push(component);
+        }
+        _ => {
+            return Err(filesystem_error(format!(
+                "Lix path {path:?} contains segment {segment:?} that cannot be mapped to a single host path component"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -822,8 +993,15 @@ fn is_plugin_storage_path(path: &str) -> bool {
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
     matches!(
-        path.trim_end_matches('/'),
-        "/.lix" | "/.lix-wal" | "/.lix-shm" | "/.lix-journal"
+        path,
+        "/.lix"
+            | "/.lix/"
+            | "/.lix-wal"
+            | "/.lix-wal/"
+            | "/.lix-shm"
+            | "/.lix-shm/"
+            | "/.lix-journal"
+            | "/.lix-journal/"
     )
 }
 
@@ -853,8 +1031,7 @@ fn sort_directories_shallowest_first(paths: &mut [String]) {
 }
 
 fn path_depth(path: &str) -> usize {
-    path.trim_matches('/')
-        .split('/')
+    path.split('/')
         .filter(|segment| !segment.is_empty())
         .count()
 }
@@ -884,7 +1061,7 @@ fn filesystem_error(message: impl Into<String>) -> LixError {
 
 #[cfg(feature = "sqlite")]
 fn open_filesystem_sqlite_backend(dir: &Path) -> Result<SqliteBackend, LixError> {
-    std::fs::create_dir_all(dir).map_err(|error| io_error("create filesystem root", dir, error))?;
+    ensure_filesystem_root_directory(dir)?;
     SqliteBackend::open(dir.join(".lix")).map_err(sqlite_backend_error)
 }
 
@@ -894,4 +1071,66 @@ fn sqlite_backend_error(error: BackendError) -> LixError {
         LixError::CODE_STORAGE_ERROR,
         format!("failed to open filesystem SQLite backend: {error}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_paths_render_opaque_segments() {
+        let root = Path::new("root");
+
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join("bad%name.txt"), false).unwrap(),
+            "/bad%name.txt"
+        );
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join("#hash?.txt"), false).unwrap(),
+            "/#hash?.txt"
+        );
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join("dir%23"), true).unwrap(),
+            "/dir%23/"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_paths_preserve_backslash_segments_on_unix() {
+        let root = Path::new("root");
+
+        assert_eq!(
+            local_path_to_lix_path(root, &root.join(r"a\b.txt"), false).unwrap(),
+            r"/a\b.txt"
+        );
+        assert_eq!(
+            lix_path_to_local_path(root, r"/a\b.txt").unwrap(),
+            root.join(r"a\b.txt")
+        );
+    }
+
+    #[test]
+    fn lix_paths_map_opaque_segments_to_local_paths() {
+        let root = Path::new("root");
+
+        assert_eq!(
+            lix_path_to_local_path(root, "/bad%name.txt").unwrap(),
+            root.join("bad%name.txt")
+        );
+        assert_eq!(
+            lix_path_to_local_path(root, "/#hash?.txt").unwrap(),
+            root.join("#hash?.txt")
+        );
+    }
+
+    #[test]
+    fn lix_paths_reject_structurally_unsafe_segments() {
+        let root = Path::new("root");
+
+        for path in ["relative", "/a//b", "/./b", "/../b"] {
+            let error = lix_path_to_local_path(root, path).expect_err("path should fail");
+            assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+        }
+    }
 }

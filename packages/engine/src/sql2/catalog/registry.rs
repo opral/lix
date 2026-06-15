@@ -433,7 +433,7 @@ fn filesystem_columns(by_branch: bool) -> Vec<PublicColumn> {
 fn directory_columns(by_branch: bool) -> Vec<PublicColumn> {
     let mut columns = vec![
         PublicColumn::public_insert_only("id"),
-        PublicColumn::public_insert_only("path"),
+        PublicColumn::public("path"),
         PublicColumn::public("parent_id"),
         PublicColumn::public("name"),
     ];

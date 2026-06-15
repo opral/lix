@@ -7,39 +7,15 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
-use crate::filesystem::{
-    DirectoryPathResolver, FilePathWriteInput, FilesystemRowContext,
-    directory_path_resolvers_from_state_rows, filesystem_storage_scope_key, plan_file_path_write,
-};
 use crate::plugin::{
     ParsedPluginArchive, parse_plugin_archive_for_install, plugin_key_from_archive_path,
-    plugin_storage_archive_file_id, plugin_storage_archive_path,
 };
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, validate_lix_schema_definition,
 };
-use crate::session::scan_filesystem_rows;
-use crate::storage::StorageBackend;
-use crate::transaction::Transaction;
-use crate::transaction::types::{
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
-};
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-
-pub(crate) async fn install_plugin_archive_with_transaction<B>(
-    archive_bytes: &[u8],
-    transaction: &mut Transaction<B>,
-) -> Result<(), LixError>
-where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let parsed = parse_plugin_archive_for_install(archive_bytes)?;
-    stage_plugin_archive_file(transaction, &parsed, archive_bytes).await?;
-    Ok(())
-}
 
 pub(crate) fn plugin_schema_rows_from_archive_path(
     archive_path: &str,
@@ -65,53 +41,6 @@ pub(crate) fn plugin_schema_rows_from_archive_path(
         ));
     }
     plugin_schema_rows(&parsed, branch_id, global, untracked)
-}
-
-async fn stage_plugin_archive_file<B>(
-    transaction: &mut Transaction<B>,
-    parsed: &ParsedPluginArchive,
-    archive_bytes: &[u8],
-) -> Result<(), LixError>
-where
-    B: StorageBackend + Clone + Send + Sync + 'static,
-    for<'backend> B::Read<'backend>: Send,
-    for<'backend> B::Write<'backend>: Send,
-{
-    let branch_id = transaction.active_branch_id().to_string();
-    let filesystem_rows = scan_filesystem_rows(transaction, &branch_id).await?;
-    let mut resolvers = directory_path_resolvers_from_state_rows(filesystem_rows)?;
-    let resolver_key = filesystem_storage_scope_key(&branch_id, false, false, None);
-    let resolver = resolvers
-        .entry(resolver_key)
-        .or_insert_with(DirectoryPathResolver::default);
-    let archive_id = plugin_storage_archive_file_id(parsed.manifest.key.as_str());
-    let archive_path = plugin_storage_archive_path(parsed.manifest.key.as_str())?;
-    let plan = plan_file_path_write(
-        resolver,
-        FilePathWriteInput {
-            id: Some(archive_id),
-            path: archive_path,
-            data: Some(archive_bytes.to_vec()),
-            context: FilesystemRowContext {
-                branch_id,
-                global: false,
-                untracked: false,
-                file_id: None,
-                metadata: None,
-            },
-        },
-        &mut || transaction.functions().call_uuid_v7().to_string(),
-    )?;
-
-    transaction
-        .stage_write(TransactionWrite::RowsWithFileData {
-            mode: TransactionWriteMode::Replace,
-            rows: plan.rows,
-            file_data: plan.file_data,
-            count: plan.count,
-        })
-        .await?;
-    Ok(())
 }
 
 fn plugin_schema_rows(

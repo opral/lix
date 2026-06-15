@@ -1,19 +1,22 @@
+mod descriptor_path;
 mod keys;
 mod planner;
 mod read;
 mod visibility;
 
+pub(crate) use self::descriptor_path::{DirectoryPathRecord, derive_directory_paths};
+#[cfg(test)]
+pub(crate) use self::planner::directory_path_resolvers_from_state_rows;
 pub(crate) use self::planner::{
-    BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorWriteIntent, DirectoryPathResolver,
-    FileDeleteInput, FileDescriptorRowInput, FileDescriptorWriteIntent, FilePathWriteInput,
+    BlobRefRowInput, DirectoryDescriptorWriteIntent, DirectoryPathResolver, FileDeleteInput,
+    FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
     FilesystemBlobRefKey, FilesystemDeletePlan, FilesystemDescriptorKey, FilesystemRowContext,
-    FilesystemWritePlan, blob_ref_row, blob_ref_tombstone_row, directory_descriptor_write_row,
-    directory_path_resolvers_from_state_rows, file_descriptor_row, file_descriptor_write_row,
-    filesystem_storage_scope_key, plan_directory_delete, plan_file_delete, plan_file_path_update,
-    plan_file_path_write, plan_recursive_directory_delete,
+    FilesystemWritePlan, blob_ref_row, blob_ref_tombstone_row,
+    create_directory_path_with_leaf_id_with_resolvers, directory_descriptor_write_row,
+    directory_path_resolvers_from_live_state, file_descriptor_row, file_descriptor_write_row,
+    filesystem_storage_scope_key, plan_file_delete, plan_file_descriptor_write,
+    plan_parsed_directory_path_update_with_resolvers, plan_parsed_file_path_update_with_resolvers,
+    plan_parsed_file_path_write_with_resolvers, plan_recursive_directory_delete,
 };
-pub(crate) use self::read::{
-    FilesystemDirEntryKind, FilesystemEntry, FilesystemIndex, filesystem_conflict_error,
-    filesystem_schema_keys, load_filesystem_index, wrong_kind_error,
-};
+pub(crate) use self::read::{FilesystemIndex, filesystem_schema_keys};
 pub(crate) use self::visibility::VisibleFilesystem;

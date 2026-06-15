@@ -135,8 +135,8 @@ where
         self.session.merge_branch_preview(options).await
     }
 
-    pub async fn install_plugin_archive(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.session.install_plugin_archive(archive_bytes).await
+    pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
+        self.session.install_plugin(archive_bytes).await
     }
 
     pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {

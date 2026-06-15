@@ -1139,7 +1139,8 @@ mod tests {
                 rows: vec![state_row("file-readme", "descriptor")],
                 file_data: vec![TransactionFileData {
                     file_id: "file-readme".to_string(),
-                    path: "/readme.md".to_string(),
+                    path: Some("/readme.md".to_string()),
+                    filename: Some("readme.md".to_string()),
                     branch_id: "global".to_string(),
                     global: true,
                     untracked: true,

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 fn file_from_markdown(markdown: &str) -> File {
     File {
+        filename: None,
         data: markdown.as_bytes().to_vec(),
     }
 }

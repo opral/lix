@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use globset::{Glob, GlobBuilder};
+use globset::GlobBuilder;
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -80,8 +80,6 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
             hint: None,
             details: None,
         })?;
-    validate_path_glob(&manifest.file_match.path_glob)?;
-
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Failed to normalize plugin manifest JSON: {error}"),
@@ -136,31 +134,18 @@ pub fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
 }
 
 pub fn glob_matches_path(glob: &str, path: &str) -> bool {
-    let normalized_glob = glob.trim();
-    let normalized_path = path.trim();
-    if normalized_glob.is_empty() || normalized_path.is_empty() {
+    if glob.is_empty() || path.is_empty() {
         return false;
     }
-    if is_catch_all_glob(normalized_glob) {
+    if is_catch_all_glob(glob) {
         return true;
     }
 
-    GlobBuilder::new(normalized_glob)
+    GlobBuilder::new(glob)
         .literal_separator(false)
-        .case_insensitive(true)
         .build()
-        .map(|compiled| compiled.compile_matcher().is_match(normalized_path))
+        .map(|compiled| compiled.compile_matcher().is_match(path))
         .unwrap_or(false)
-}
-
-fn validate_path_glob(glob: &str) -> Result<(), LixError> {
-    Glob::new(glob).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        message: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
-        hint: None,
-        details: None,
-    })?;
-    Ok(())
 }
 
 fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
@@ -178,11 +163,10 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
 }
 
 fn glob_specificity_rank(glob: &str) -> (u8, i32) {
-    let normalized = glob.trim();
-    if is_catch_all_glob(normalized) {
+    if is_catch_all_glob(glob) {
         return (0, i32::MIN);
     }
-    (1, glob_specificity_score(normalized))
+    (1, glob_specificity_score(glob))
 }
 
 fn glob_specificity_score(glob: &str) -> i32 {
@@ -263,7 +247,7 @@ fn format_validation_errors<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginContentType, parse_plugin_manifest_json};
+    use super::{PluginContentType, glob_matches_path, parse_plugin_manifest_json};
 
     #[test]
     fn parses_valid_manifest() {
@@ -302,8 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_path_glob() {
-        let err = parse_plugin_manifest_json(
+    fn preserves_invalid_path_glob_text() {
+        let validated = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
@@ -313,9 +297,17 @@ mod tests {
                 "schemas":["schema/default.json"]
             }"#,
         )
-        .expect_err("invalid glob should fail");
+        .expect("manifest should parse");
 
-        assert!(err.message.contains("match.path_glob"));
+        assert_eq!(validated.manifest.file_match.path_glob, "*.{md,mdx");
+    }
+
+    #[test]
+    fn glob_matching_uses_manifest_and_path_text_verbatim() {
+        assert!(glob_matches_path("*.md", "/docs/readme.md"));
+        assert!(!glob_matches_path(" *.md", "/docs/readme.md"));
+        assert!(!glob_matches_path("/docs/*.md", " /docs/readme.md"));
+        assert!(!glob_matches_path("*.MD", "/docs/readme.md"));
     }
 
     #[test]

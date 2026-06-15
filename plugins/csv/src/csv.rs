@@ -7,7 +7,6 @@ use csv_nose::{Quote, Sniffer};
 use encoding_rs::{CoderResult, Encoding};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::path::Path;
 use std::str;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -221,7 +220,7 @@ fn parse_dialect_byte_string(value: Option<&Value>, field: &str) -> Result<u8, P
 
 pub(crate) fn parse_file(file: &File) -> Result<(Vec<Vec<String>>, CsvDialect), PluginError> {
     let decoded = decode(&file.data)?;
-    let dialect = dialect_for_filename(None, &decoded);
+    let dialect = dialect_for_file(file.filename.as_deref(), &decoded);
     let rows = parse_rows(&decoded, dialect)?;
     Ok((rows, dialect))
 }
@@ -288,7 +287,7 @@ fn buffer_with_encoding(buf: &[u8]) -> (&[u8], &'static Encoding) {
     }
 }
 
-fn dialect_for_filename(filename: Option<&str>, decoded: &str) -> CsvDialect {
+fn dialect_for_file(filename: Option<&str>, decoded: &str) -> CsvDialect {
     let sniffer = Sniffer::new();
     if let Ok(metadata) = sniffer.sniff_bytes(decoded.as_bytes()) {
         return CsvDialect {
@@ -306,17 +305,40 @@ fn dialect_for_filename(filename: Option<&str>, decoded: &str) -> CsvDialect {
 }
 
 fn fallback_delimiter(filename: Option<&str>, decoded: &str) -> u8 {
-    match filename.and_then(|f| Path::new(f).extension().and_then(|ext| ext.to_str())) {
-        Some(extension) if extension.eq_ignore_ascii_case("tsv") => b'\t',
-        Some(extension) if extension.eq_ignore_ascii_case("csv") => b',',
-        _ => {
-            let buf = decoded.as_bytes();
-            let sample = &buf[..buf.len().min(8 * 1024)];
-            let comma_count = bytecount::count(sample, b',');
-            let tab_count = bytecount::count(sample, b'\t');
-            if tab_count > comma_count { b'\t' } else { b',' }
-        }
+    if let Some(delimiter) = filename.and_then(delimiter_from_filename) {
+        return delimiter;
     }
+    delimiter_from_content_sample(decoded)
+}
+
+fn delimiter_from_filename(filename: &str) -> Option<u8> {
+    let extension = filename_extension(filename)?;
+    if extension.eq_ignore_ascii_case("tsv") {
+        return Some(b'\t');
+    }
+    if extension.eq_ignore_ascii_case("csv") {
+        return Some(b',');
+    }
+    None
+}
+
+fn filename_extension(filename: &str) -> Option<&str> {
+    if filename.contains('/') || filename.contains('\\') {
+        return None;
+    }
+    let dot_index = filename.rfind('.')?;
+    if dot_index == 0 || dot_index + 1 == filename.len() {
+        return None;
+    }
+    Some(&filename[dot_index + 1..])
+}
+
+fn delimiter_from_content_sample(decoded: &str) -> u8 {
+    let buf = decoded.as_bytes();
+    let sample = &buf[..buf.len().min(8 * 1024)];
+    let comma_count = bytecount::count(sample, b',');
+    let tab_count = bytecount::count(sample, b'\t');
+    if tab_count > comma_count { b'\t' } else { b',' }
 }
 
 pub(crate) fn render_projection(projection: &Projection) -> Result<Vec<u8>, PluginError> {
@@ -344,4 +366,31 @@ pub(crate) fn render_projection(projection: &Projection) -> Result<Vec<u8>, Plug
     writer.into_inner().map_err(|error| {
         PluginError::Internal(format!("failed to finish rendering CSV: {}", error.error()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fallback_delimiter, filename_extension};
+
+    #[test]
+    fn fallback_delimiter_uses_content_sample() {
+        assert_eq!(fallback_delimiter(None, "a,b\n"), b',');
+        assert_eq!(fallback_delimiter(None, "a\tb\n"), b'\t');
+    }
+
+    #[test]
+    fn fallback_delimiter_uses_filename_extension() {
+        assert_eq!(fallback_delimiter(Some("table.csv"), "a\tb\n"), b',');
+        assert_eq!(fallback_delimiter(Some("table.tsv"), "a,b\n"), b'\t');
+        assert_eq!(fallback_delimiter(Some("table.TSV"), "a,b\n"), b'\t');
+    }
+
+    #[test]
+    fn filename_extension_does_not_parse_paths() {
+        assert_eq!(filename_extension("table.tsv"), Some("tsv"));
+        assert_eq!(filename_extension("dir/table.tsv"), None);
+        assert_eq!(filename_extension("dir\\table.tsv"), None);
+        assert_eq!(filename_extension(".csv"), None);
+        assert_eq!(filename_extension("table."), None);
+    }
 }

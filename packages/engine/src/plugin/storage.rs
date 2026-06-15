@@ -1,31 +1,33 @@
 use crate::LixError;
 
 pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix_system/plugins/";
+const PLUGIN_STORAGE_ROOT_PATH: &str = "/.lix_system/plugins";
 pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
 
 pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
     format!("lix_plugin_archive::{plugin_key}")
 }
 
-pub fn plugin_storage_archive_path(plugin_key: &str) -> Result<String, LixError> {
-    validate_plugin_key_segment(plugin_key)?;
-    Ok(format!(
-        "{PLUGIN_STORAGE_ROOT_DIRECTORY_PATH}{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}"
-    ))
+pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
+    format!("{PLUGIN_STORAGE_ROOT_DIRECTORY_PATH}{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}")
 }
 
 pub fn plugin_key_from_archive_path(path: &str) -> Option<String> {
     let file_name = path.strip_prefix(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)?;
     let plugin_key = file_name.strip_suffix(PLUGIN_ARCHIVE_FILE_EXTENSION)?;
-    if plugin_key.is_empty()
-        || plugin_key == "."
-        || plugin_key == ".."
-        || plugin_key.contains('/')
-        || plugin_key.contains('\\')
-    {
+    if !is_valid_plugin_key(plugin_key) {
         return None;
     }
     Some(plugin_key.to_string())
+}
+
+fn is_valid_plugin_key(plugin_key: &str) -> bool {
+    if plugin_key.is_empty() || plugin_key.len() > 128 {
+        return false;
+    }
+    let mut bytes = plugin_key.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
 pub(crate) fn reject_normal_plugin_storage_mutation(
@@ -39,29 +41,11 @@ pub(crate) fn reject_normal_plugin_storage_mutation(
         LixError::CODE_CONSTRAINT_VIOLATION,
         format!("{operation} cannot modify reserved plugin storage path {path:?}"),
     )
-    .with_hint("Use install_plugin_archive to install plugin archives."))
+    .with_hint("Write a valid plugin archive file to the plugin storage path to install it."))
 }
 
 pub(crate) fn is_plugin_storage_path(path: &str) -> bool {
-    path == PLUGIN_STORAGE_ROOT_DIRECTORY_PATH.trim_end_matches('/')
-        || path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)
-}
-
-fn validate_plugin_key_segment(plugin_key: &str) -> Result<(), LixError> {
-    if plugin_key.is_empty()
-        || plugin_key == "."
-        || plugin_key == ".."
-        || plugin_key.contains('/')
-        || plugin_key.contains('\\')
-    {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            message: format!("plugin key '{plugin_key}' must be a single relative path segment"),
-            hint: None,
-            details: None,
-        });
-    }
-    Ok(())
+    path == PLUGIN_STORAGE_ROOT_PATH || path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)
 }
 
 #[cfg(test)]
@@ -76,7 +60,7 @@ mod tests {
     #[test]
     fn computes_storage_archive_paths() {
         assert_eq!(
-            plugin_storage_archive_path("plugin_json").expect("path should build"),
+            plugin_storage_archive_path("plugin_json"),
             "/.lix_system/plugins/plugin_json.lixplugin"
         );
     }
@@ -87,10 +71,14 @@ mod tests {
             plugin_key_from_archive_path("/.lix_system/plugins/plugin_json.lixplugin"),
             Some("plugin_json".to_string())
         );
-        assert_eq!(
-            plugin_key_from_archive_path("/.lix_system/plugins/nested/plugin.lixplugin"),
-            None
-        );
+        for path in [
+            "/.lix_system/plugins/plugin\\json.lixplugin",
+            "/.lix_system/plugins/nested/plugin.lixplugin",
+            "/.lix_system/plugins/PluginJson.lixplugin",
+            "/.lix_system/plugins/.lixplugin",
+        ] {
+            assert_eq!(plugin_key_from_archive_path(path), None);
+        }
     }
 
     #[test]
@@ -108,7 +96,7 @@ mod tests {
                 error
                     .hint
                     .as_deref()
-                    .is_some_and(|hint| hint.contains("install_plugin_archive"))
+                    .is_some_and(|hint| hint.contains("plugin archive file"))
             );
         }
 

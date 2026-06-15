@@ -2,12 +2,12 @@ use crate::LixError;
 use crate::filesystem::{FilesystemIndex, filesystem_schema_keys};
 use crate::live_state::{LiveStateFilter, LiveStateScanRequest};
 use crate::plugin::{
-    PluginContentType, install_plugin_archive_with_transaction,
-    load_installed_plugins_from_filesystem,
+    PluginContentType, load_installed_plugins_from_filesystem, parse_plugin_archive_for_install,
+    plugin_storage_archive_path,
 };
 use crate::storage::{SharedStorageRead, StorageBackend, StorageReadOptions};
 
-use super::SessionContext;
+use super::{FsWriteOptions, SessionContext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPluginInfo {
@@ -26,14 +26,16 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    pub async fn install_plugin_archive(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        let archive_bytes = archive_bytes.to_vec();
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                install_plugin_archive_with_transaction(&archive_bytes, transaction).await
-            })
-        })
-        .await
+    pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
+        let parsed = parse_plugin_archive_for_install(archive_bytes)?;
+        let archive_path = plugin_storage_archive_path(&parsed.manifest.key);
+        self.fs()
+            .write_file(
+                &archive_path,
+                archive_bytes.to_vec(),
+                FsWriteOptions::default(),
+            )
+            .await
     }
 
     pub async fn list_installed_plugins(&self) -> Result<Vec<InstalledPluginInfo>, LixError> {

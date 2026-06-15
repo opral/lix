@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 fn file_from_bytes(data: &[u8]) -> File {
     File {
+        filename: None,
         data: data.to_vec(),
     }
 }

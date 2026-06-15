@@ -6,7 +6,6 @@ mod context;
 mod dml;
 mod error;
 mod exec;
-mod filesystem_predicates;
 mod history_projection;
 mod history_route;
 mod optimize;

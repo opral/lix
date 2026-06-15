@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 use crate::LixError;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
+use crate::common::compose_file_path;
 use crate::serialize_row_metadata;
 
 use crate::sql2::SqlHistoryQuerySource;
@@ -35,6 +36,9 @@ use crate::sql2::history_route::{
     HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
     HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor,
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
+};
+use crate::sql2::providers::filesystem_history_path::{
+    HistoryDirectoryPathRecord, resolve_history_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage::StorageRead;
@@ -308,6 +312,24 @@ struct FileHistoryDirectoryRecord {
     parent_id: Option<String>,
     name: String,
     entry: HistoryEntry,
+}
+
+impl HistoryDirectoryPathRecord for FileHistoryDirectoryRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
+    fn entry(&self) -> &HistoryEntry {
+        &self.entry
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -721,9 +743,9 @@ fn resolve_file_history_path(
 ) -> Option<String> {
     let name = descriptor.name.as_ref()?;
     let Some(directory_id) = descriptor.directory_id.as_deref() else {
-        return Some(format!("/{name}"));
+        return compose_file_path(None, name).ok();
     };
-    let directory_path = resolve_directory_history_path(
+    let directory_path = resolve_history_directory_path(
         directory_id,
         &descriptor.entry.start_commit_id,
         target_depth,
@@ -731,54 +753,7 @@ fn resolve_file_history_path(
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
     )?;
-    Some(format!("{directory_path}{name}"))
-}
-
-fn resolve_directory_history_path(
-    directory_id: &str,
-    start_commit_id: &str,
-    target_depth: u32,
-    directories: &[FileHistoryDirectoryRecord],
-    cache: &mut BTreeMap<String, Option<String>>,
-    visiting: &mut BTreeSet<String>,
-) -> Option<String> {
-    if let Some(path) = cache.get(directory_id) {
-        return path.clone();
-    }
-    if !visiting.insert(directory_id.to_string()) {
-        cache.insert(directory_id.to_string(), None);
-        return None;
-    }
-    let directory = directories
-        .iter()
-        .filter(|directory| {
-            directory.id == directory_id
-                && directory.entry.start_commit_id == start_commit_id
-                && directory.entry.depth >= target_depth
-        })
-        .min_by(|left, right| {
-            left.entry
-                .depth
-                .cmp(&right.entry.depth)
-                .then(left.entry.change.id.cmp(&right.entry.change.id))
-        })?;
-    let path = match directory.parent_id.as_deref() {
-        Some(parent_id) => {
-            let parent_path = resolve_directory_history_path(
-                parent_id,
-                start_commit_id,
-                target_depth,
-                directories,
-                cache,
-                visiting,
-            )?;
-            format!("{parent_path}{}/", directory.name)
-        }
-        None => format!("/{}/", directory.name),
-    };
-    visiting.remove(directory_id);
-    cache.insert(directory_id.to_string(), Some(path.clone()));
-    Some(path)
+    compose_file_path(Some(&directory_path), name).ok()
 }
 
 fn file_history_record_batch(

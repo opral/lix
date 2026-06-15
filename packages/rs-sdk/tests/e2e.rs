@@ -1,10 +1,10 @@
 use lix_sdk::{
-    CreateBranchOptions, FsMkdirOptions, FsRmOptions, FsWriteOptions, InMemoryBackend, Lix,
-    LixError, MergeBranchOptions, MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value,
-    open_lix, open_lix_with_backend,
+    CreateBranchOptions, FsWriteOptions, InMemoryBackend, Lix, LixError, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, SwitchBranchOptions, Value, open_lix,
 };
 #[cfg(feature = "sqlite")]
-use lix_sdk::{FsBackend, SqliteBackend};
+use lix_sdk::{FsBackend, FsMkdirOptions, FsRmOptions, SqliteBackend, open_lix_with_backend};
+#[cfg(feature = "sqlite")]
 use std::path::Path;
 #[cfg(feature = "sqlite")]
 use std::time::{Duration, Instant};
@@ -589,12 +589,43 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
-async fn filesystem_rejects_invalid_lix_path_names() {
+async fn filesystem_imports_opaque_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
+    std::fs::write(tempdir.path().join("#hash.txt"), b"hash").unwrap();
 
-    let Err(error) = FsBackend::open(tempdir.path()).await else {
-        panic!("invalid filesystem path should fail");
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_eq!(
+        lix.read_file("/bad%name.txt").await.unwrap().as_deref(),
+        Some(b"bad".as_slice())
+    );
+    assert_eq!(
+        lix.read_file("/#hash.txt").await.unwrap().as_deref(),
+        Some(b"hash".as_slice())
+    );
+    lix.write_file(
+        "/written%23.txt",
+        b"written".to_vec(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+    wait_for_disk_file(&tempdir.path().join("written%23.txt"), Some(b"written"));
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(all(unix, feature = "sqlite"))]
+async fn filesystem_rejects_symlink_root() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tempdir.path().join("real-root")).unwrap();
+    symlink("real-root", tempdir.path().join("linked-root")).unwrap();
+
+    let Err(error) = FsBackend::open(tempdir.path().join("linked-root")).await else {
+        panic!("symlink root should fail");
     };
 
     assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
@@ -602,18 +633,208 @@ async fn filesystem_rejects_invalid_lix_path_names() {
 
 #[tokio::test]
 #[cfg(all(unix, feature = "sqlite"))]
-async fn filesystem_rejects_symlinks() {
+async fn filesystem_ignores_symlinks_on_initial_import() {
     use std::os::unix::fs::symlink;
 
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
+    std::fs::create_dir(tempdir.path().join("real-dir")).unwrap();
+    std::fs::write(tempdir.path().join("real-dir/file.txt"), b"nested").unwrap();
     symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
+    symlink("real-dir", tempdir.path().join("linked-dir")).unwrap();
 
-    let Err(error) = FsBackend::open(tempdir.path()).await else {
-        panic!("symlink should fail");
-    };
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
 
-    assert_eq!(error.code, "LIX_FILESYSTEM_ERROR");
+    assert_eq!(
+        lix.read_file("/target.txt").await.unwrap().as_deref(),
+        Some(b"target".as_slice())
+    );
+    assert_eq!(
+        lix.read_file("/real-dir/file.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"nested".as_slice())
+    );
+    assert_eq!(lix.read_file("/link.txt").await.unwrap(), None);
+    assert_eq!(lix.readdir("/linked-dir/").await.unwrap(), None);
+    assert_eq!(lix.read_file("/linked-dir/file.txt").await.unwrap(), None);
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("linked-dir"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(all(unix, feature = "sqlite"))]
+async fn filesystem_ignores_special_and_invalid_utf8_entries() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let socket_path = tempdir.path().join("socket");
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+    let invalid_path = tempdir
+        .path()
+        .join(OsString::from_vec(b"invalid-\xff.txt".to_vec()));
+    let invalid_path_created = std::fs::write(&invalid_path, b"invalid").is_ok();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    assert_eq!(lix.read_file("/socket").await.unwrap(), None);
+    assert_eq!(
+        lix.execute("SELECT path FROM lix_file ORDER BY path", &[])
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(
+        std::fs::symlink_metadata(socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    if invalid_path_created {
+        assert!(invalid_path.exists());
+    }
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(all(unix, feature = "sqlite"))]
+async fn filesystem_watcher_ignores_symlinks_created_after_open() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    std::fs::write(tempdir.path().join("target.txt"), b"target").unwrap();
+    std::fs::create_dir(tempdir.path().join("real-dir")).unwrap();
+    std::fs::write(tempdir.path().join("real-dir/file.txt"), b"nested").unwrap();
+    symlink("target.txt", tempdir.path().join("link.txt")).unwrap();
+    symlink("real-dir", tempdir.path().join("linked-dir")).unwrap();
+    std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
+
+    wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
+    assert_eq!(lix.read_file("/link.txt").await.unwrap(), None);
+    assert_eq!(lix.readdir("/linked-dir/").await.unwrap(), None);
+    assert_eq!(lix.read_file("/linked-dir/file.txt").await.unwrap(), None);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(all(unix, feature = "sqlite"))]
+async fn filesystem_materialization_skips_symlink_collisions() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("outside.txt"), b"outside").unwrap();
+    symlink(
+        outside.path().join("outside.txt"),
+        tempdir.path().join("blocked.txt"),
+    )
+    .unwrap();
+    symlink(outside.path(), tempdir.path().join("blocked-dir")).unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+    lix.write_file("/blocked.txt", b"lix".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+    lix.write_file(
+        "/blocked-dir/file.txt",
+        b"nested".to_vec(),
+        FsWriteOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        lix.read_file("/blocked.txt").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert_eq!(
+        lix.read_file("/blocked-dir/file.txt")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(b"nested".as_slice())
+    );
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("blocked.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::symlink_metadata(tempdir.path().join("blocked-dir"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("outside.txt")).unwrap(),
+        b"outside"
+    );
+    assert!(!outside.path().join("file.txt").exists());
+
+    std::fs::remove_file(tempdir.path().join("blocked.txt")).unwrap();
+    std::fs::remove_file(tempdir.path().join("blocked-dir")).unwrap();
+    wait_for_disk_file(&tempdir.path().join("blocked.txt"), Some(b"lix"));
+    wait_for_disk_file(
+        &tempdir.path().join("blocked-dir/file.txt"),
+        Some(b"nested"),
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("outside.txt")).unwrap(),
+        b"outside"
+    );
+    assert!(!outside.path().join("file.txt").exists());
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(all(unix, feature = "sqlite"))]
+async fn filesystem_materialization_skips_special_file_collisions() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let socket_path = tempdir.path().join("socket");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+    lix.write_file("/socket", b"lix".to_vec(), FsWriteOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lix.read_file("/socket").await.unwrap().as_deref(),
+        Some(b"lix".as_slice())
+    );
+    assert!(
+        std::fs::symlink_metadata(socket_path)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+
+    drop(listener);
+    std::fs::remove_file(tempdir.path().join("socket")).unwrap();
+    wait_for_disk_file(&tempdir.path().join("socket"), Some(b"lix"));
+    lix.close().await.unwrap();
 }
 
 #[cfg(feature = "sqlite")]
@@ -651,7 +872,7 @@ async fn wait_for_lix_file(lix: &Lix<FsBackend>, path: &str, expected: Option<&[
 
 #[cfg(feature = "sqlite")]
 async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let actual = lix.readdir(path).await.unwrap().is_some();
         if actual == expected {

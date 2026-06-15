@@ -15,9 +15,7 @@ pub(crate) use archive::{
     ParsedPluginArchive, load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install,
 };
 pub(crate) use component::{CachedPluginComponent, PluginComponentHost, PluginRuntimeHost};
-pub(crate) use install::{
-    install_plugin_archive_with_transaction, plugin_schema_rows_from_archive_path,
-};
+pub(crate) use install::plugin_schema_rows_from_archive_path;
 #[allow(unused_imports)]
 pub(crate) use manifest::{
     PluginContentType, PluginManifest, PluginMatch, PluginRuntime, ValidatedPluginManifest,

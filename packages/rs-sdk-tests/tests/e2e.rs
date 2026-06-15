@@ -10,7 +10,7 @@ async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin_archive(&archive).await.unwrap();
+    lix.install_plugin(&archive).await.unwrap();
     let plugins = lix.list_installed_plugins().await.unwrap();
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].key, "plugin_csv");
@@ -441,7 +441,7 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    lix.install_plugin_archive(&archive).await.unwrap();
+    lix.install_plugin(&archive).await.unwrap();
     let csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
     lix.write_file("/tx-plugin.csv", csv.clone(), FsWriteOptions::default())
         .await
@@ -479,7 +479,7 @@ async fn filesystem_materializes_internal_lix_plugin_paths() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
     let archive = build_csv_plugin_archive();
 
-    lix.install_plugin_archive(&archive).await.unwrap();
+    lix.install_plugin(&archive).await.unwrap();
 
     wait_for_disk_file(
         &tempdir

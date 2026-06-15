@@ -216,7 +216,7 @@ async fn sqlite_backend_open_lix_options_supplies_plugin_wasm_runtime() {
     .await
     .expect("lix opens on sqlite backend with wasm runtime");
 
-    lix.install_plugin_archive(&build_runtime_test_plugin_archive())
+    lix.install_plugin(&build_runtime_test_plugin_archive())
         .await
         .expect("plugin archive installs");
     lix.write_file(

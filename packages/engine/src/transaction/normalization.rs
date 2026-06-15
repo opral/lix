@@ -7,7 +7,6 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::LixError;
 use crate::catalog::{SchemaPlan, SchemaPlanId, TransactionCatalog};
 use crate::common::format_json_pointer;
-use crate::common::normalize_path_segment;
 use crate::domain::Domain;
 use crate::entity_pk::{EntityPk, EntityPkError};
 use crate::functions::FunctionProviderHandle;
@@ -18,7 +17,9 @@ use crate::schema::{
 use crate::transaction::types::{PreparedRowFacts, TransactionJson, TransactionWriteRow};
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+#[cfg(test)]
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+#[cfg(test)]
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,10 +63,9 @@ pub(crate) fn normalize_transaction_write_row(
     let normalized_snapshot = if let Some(snapshot) = row.snapshot.take() {
         let (mut snapshot, normalized) = snapshot_object_from_transaction_json(snapshot, &row)?;
         let defaults_changed = apply_defaults(&mut snapshot, schema_plan, &row, functions)?;
-        let descriptor_changed = normalize_filesystem_descriptor_snapshot(&row, &mut snapshot)?;
         let snapshot = JsonValue::Object(snapshot);
         row.entity_pk = Some(resolve_entity_pk(&row, schema_plan, &snapshot)?);
-        if defaults_changed || descriptor_changed {
+        if defaults_changed {
             Some(TransactionJson::from_value(
                 snapshot,
                 "normalized transaction snapshot_content",
@@ -152,66 +152,6 @@ fn apply_defaults(
     schema_plan
         .defaults
         .apply(snapshot, functions, &row.schema_key)
-}
-
-fn normalize_filesystem_descriptor_snapshot(
-    row: &TransactionWriteRow,
-    snapshot: &mut JsonMap<String, JsonValue>,
-) -> Result<bool, LixError> {
-    match row.schema_key.as_str() {
-        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => normalize_directory_descriptor_snapshot(row, snapshot),
-        FILE_DESCRIPTOR_SCHEMA_KEY => normalize_file_descriptor_snapshot(row, snapshot),
-        _ => Ok(false),
-    }
-}
-
-fn normalize_directory_descriptor_snapshot(
-    row: &TransactionWriteRow,
-    snapshot: &mut JsonMap<String, JsonValue>,
-) -> Result<bool, LixError> {
-    let Some(name) = optional_string_field(snapshot, "name", row)? else {
-        return Ok(false);
-    };
-    let normalized_name = normalize_path_segment(name)?;
-    if name == normalized_name {
-        return Ok(false);
-    }
-    snapshot.insert("name".to_string(), JsonValue::String(normalized_name));
-    Ok(true)
-}
-
-fn normalize_file_descriptor_snapshot(
-    row: &TransactionWriteRow,
-    snapshot: &mut JsonMap<String, JsonValue>,
-) -> Result<bool, LixError> {
-    let Some(name) = optional_string_field(snapshot, "name", row)? else {
-        return Ok(false);
-    };
-    let normalized_name = normalize_path_segment(name)?;
-    if name == normalized_name {
-        return Ok(false);
-    }
-    snapshot.insert("name".to_string(), JsonValue::String(normalized_name));
-    Ok(true)
-}
-
-fn optional_string_field<'a>(
-    snapshot: &'a JsonMap<String, JsonValue>,
-    field: &str,
-    row: &TransactionWriteRow,
-) -> Result<Option<&'a str>, LixError> {
-    let Some(value) = snapshot.get(field) else {
-        return Ok(None);
-    };
-    value.as_str().map(Some).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!(
-                "snapshot_content for schema '{}' field '{}' must be a string",
-                row.schema_key, field
-            ),
-        )
-    })
 }
 
 fn resolve_entity_pk(
@@ -575,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_canonicalizes_filesystem_descriptor_segments() {
+    fn normalization_preserves_filesystem_descriptor_segments() {
         let mut catalog = catalog_with(vec![
             builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
             builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
@@ -595,7 +535,7 @@ mod tests {
         let file = normalize_transaction_write_row(file, &mut catalog, functions())
             .expect("normalize file");
         let file_snapshot = normalized_snapshot(&file);
-        assert_eq!(file_snapshot["name"], "Café.txt");
+        assert_eq!(file_snapshot["name"], "Cafe\u{301}.txt");
 
         let directory = TransactionWriteRow {
             entity_pk: None,
@@ -611,24 +551,72 @@ mod tests {
         let directory = normalize_transaction_write_row(directory, &mut catalog, functions())
             .expect("normalize directory");
         let directory_snapshot = normalized_snapshot(&directory);
-        assert_eq!(directory_snapshot["name"], "Café");
+        assert_eq!(directory_snapshot["name"], "Cafe\u{301}");
+
+        let bidi = TransactionWriteRow {
+            entity_pk: None,
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            snapshot: Some(transaction_json(json!({
+                "id": "file-bidi",
+                "directory_id": null,
+                "name": "safe\u{202E}txt",
+            }))),
+            global: false,
+            ..base_stage_row()
+        };
+        let bidi = normalize_transaction_write_row(bidi, &mut catalog, functions())
+            .expect("normalize bidi file");
+        let bidi_snapshot = normalized_snapshot(&bidi);
+        assert_eq!(bidi_snapshot["name"], "safe\u{202E}txt");
+
+        let zero_width = TransactionWriteRow {
+            entity_pk: None,
+            schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            snapshot: Some(transaction_json(json!({
+                "id": "dir-zero-width",
+                "parent_id": null,
+                "name": "zero\u{200D}width",
+            }))),
+            global: false,
+            ..base_stage_row()
+        };
+        let zero_width = normalize_transaction_write_row(zero_width, &mut catalog, functions())
+            .expect("normalize zero-width directory");
+        let zero_width_snapshot = normalized_snapshot(&zero_width);
+        assert_eq!(zero_width_snapshot["name"], "zero\u{200D}width");
+
+        let dotdot = TransactionWriteRow {
+            entity_pk: None,
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            snapshot: Some(transaction_json(json!({
+                "id": "file-dotdot",
+                "directory_id": null,
+                "name": "..",
+            }))),
+            global: false,
+            ..base_stage_row()
+        };
+        let dotdot = normalize_transaction_write_row(dotdot, &mut catalog, functions())
+            .expect("normalize dotdot file");
+        let dotdot_snapshot = normalized_snapshot(&dotdot);
+        assert_eq!(dotdot_snapshot["name"], "..");
     }
 
     #[test]
-    fn normalization_rejects_invalid_filesystem_descriptor_segments() {
+    fn normalization_leaves_structural_filesystem_descriptor_validation_to_schema() {
         let mut catalog = catalog_with(vec![
             builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
             builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
         ]);
 
-        let dot_segment = normalize_transaction_write_row(
+        let row = normalize_transaction_write_row(
             TransactionWriteRow {
                 entity_pk: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 snapshot: Some(transaction_json(json!({
-                    "id": "file-dotdot",
+                    "id": "file-slash",
                     "directory_id": null,
-                    "name": "..",
+                    "name": "nested/name",
                 }))),
                 global: false,
                 ..base_stage_row()
@@ -636,44 +624,9 @@ mod tests {
             &mut catalog,
             functions(),
         )
-        .expect_err("file descriptor name should reject dot segments");
-        assert_eq!(dot_segment.code, "LIX_ERROR_PATH_DOT_SEGMENT");
-
-        let bidi = normalize_transaction_write_row(
-            TransactionWriteRow {
-                entity_pk: None,
-                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                snapshot: Some(transaction_json(json!({
-                    "id": "file-bidi",
-                    "directory_id": null,
-                    "name": "safe\u{202E}txt",
-                }))),
-                global: false,
-                ..base_stage_row()
-            },
-            &mut catalog,
-            functions(),
-        )
-        .expect_err("file descriptor name should reject bidi formatting characters");
-        assert_eq!(bidi.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
-
-        let zero_width = normalize_transaction_write_row(
-            TransactionWriteRow {
-                entity_pk: None,
-                schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                snapshot: Some(transaction_json(json!({
-                    "id": "dir-zero-width",
-                    "parent_id": null,
-                    "name": "zero\u{200D}width",
-                }))),
-                global: false,
-                ..base_stage_row()
-            },
-            &mut catalog,
-            functions(),
-        )
-        .expect_err("directory descriptor name should reject zero-width characters");
-        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
+        .expect("normalization should preserve descriptor names without path validation");
+        let snapshot = normalized_snapshot(&row);
+        assert_eq!(snapshot["name"], "nested/name");
     }
 
     #[test]

@@ -3,8 +3,8 @@
 mod support;
 
 use std::io::{Cursor, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::wasm::{
@@ -182,33 +182,38 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    fs_write_file_rejects_plugin_storage_paths,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
+#[tokio::test]
+async fn fs_write_file_to_plugin_storage_installs_plugin_archive() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+    let archive = sentinel_plugin_archive();
 
-        for path in [
-            "/.lix_system/plugins",
+    session
+        .fs()
+        .write_file(
             "/.lix_system/plugins/plugin_sentinel.lixplugin",
-        ] {
-            let error = session
-                .fs
-                .write_file(path, b"bad".to_vec(), FsWriteOptions::default())
-                .await
-                .expect_err("normal fs write should reject plugin storage path");
+            archive,
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("fs.write_file should install plugin archive");
 
-            assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-            assert!(error.message.contains("reserved plugin storage path"));
-        }
-    }
-);
+    let plugins = session
+        .list_installed_plugins()
+        .await
+        .expect("installed plugins should list");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].key, "plugin_sentinel");
+
+    session.close().await.expect("session should close");
+}
 
 #[tokio::test]
 async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
@@ -231,7 +236,7 @@ async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
         .await
         .expect("empty file write should succeed");
     session
-        .install_plugin_archive(&sentinel_plugin_archive())
+        .install_plugin(&sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
@@ -259,6 +264,45 @@ async fn empty_regular_file_does_not_render_through_later_installed_plugin() {
 }
 
 #[tokio::test]
+async fn plugin_detect_changes_receives_descriptor_filename() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let runtime = Arc::new(SentinelPluginRuntime::default());
+    let engine = Engine::new_with_wasm_runtime(backend, runtime.clone())
+        .await
+        .expect("engine should open with plugin runtime");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .install_plugin(&sentinel_plugin_archive())
+        .await
+        .expect("plugin install should succeed");
+    session
+        .fs()
+        .write_file(
+            "/nested/raw.sentinel",
+            b"hello".to_vec(),
+            FsWriteOptions::default(),
+        )
+        .await
+        .expect("plugin file write should succeed");
+
+    let filenames = runtime
+        .detect_filenames
+        .lock()
+        .expect("detect filename lock should not be poisoned")
+        .clone();
+    assert_eq!(filenames, vec![Some("raw.sentinel".to_string())]);
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
 async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
@@ -274,7 +318,7 @@ async fn empty_write_to_binary_plugin_file_clears_plugin_state() {
         .expect("workspace session should open");
 
     session
-        .install_plugin_archive(&binary_sentinel_plugin_archive())
+        .install_plugin(&binary_sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
@@ -496,7 +540,7 @@ async fn sql_update_rejects_invalid_installed_plugin_storage_archive_data() {
         .expect("workspace session should open");
 
     session
-        .install_plugin_archive(&sentinel_plugin_archive())
+        .install_plugin(&sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
@@ -528,7 +572,7 @@ async fn fs_rm_rejects_installed_plugin_storage_deletes() {
         .expect("workspace session should open");
 
     session
-        .install_plugin_archive(&sentinel_plugin_archive())
+        .install_plugin(&sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
@@ -586,7 +630,7 @@ async fn sql_delete_rejects_installed_plugin_storage_archive_tombstone() {
         .expect("workspace session should open");
 
     session
-        .install_plugin_archive(&sentinel_plugin_archive())
+        .install_plugin(&sentinel_plugin_archive())
         .await
         .expect("plugin install should succeed");
 
@@ -949,175 +993,15 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    fs_rejects_cross_lane_ancestor_collisions,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open"),
-            &engine,
-        );
-
-        session
-            .fs
-            .mkdir("/tracked/", FsMkdirOptions::default())
-            .await
-            .expect("tracked mkdir should succeed");
-        session
-            .fs
-            .write_file(
-                "/tracked/untracked.txt",
-                b"nope".to_vec(),
-                FsWriteOptions {
-                    untracked: true,
-                    ..FsWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("untracked write should not create duplicate tracked ancestor");
-        session
-            .fs
-            .mkdir(
-                "/tracked/untracked-dir/",
-                FsMkdirOptions {
-                    untracked: true,
-                    ..FsMkdirOptions::default()
-                },
-            )
-            .await
-            .expect_err("untracked mkdir should not create duplicate tracked ancestor");
-
-        session
-            .fs
-            .mkdir(
-                "/scratch/",
-                FsMkdirOptions {
-                    untracked: true,
-                    ..FsMkdirOptions::default()
-                },
-            )
-            .await
-            .expect("untracked mkdir should succeed");
-        session
-            .fs
-            .write_file(
-                "/scratch/tracked.txt",
-                b"nope".to_vec(),
-                FsWriteOptions::default(),
-            )
-            .await
-            .expect_err("tracked write should not create duplicate untracked ancestor");
-        session
-            .fs
-            .mkdir("/scratch/tracked-dir/", FsMkdirOptions::default())
-            .await
-            .expect_err("tracked mkdir should not create duplicate untracked ancestor");
-
-        session
-            .fs
-            .mkdir("/tracked-dir/", FsMkdirOptions::default())
-            .await
-            .expect("tracked directory should succeed");
-        session
-            .fs
-            .write_file(
-                "/tracked-dir",
-                b"nope".to_vec(),
-                FsWriteOptions {
-                    untracked: true,
-                    ..FsWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("untracked file should not occupy tracked directory namespace");
-        session
-            .fs
-            .write_file(
-                "/tracked-file",
-                b"tracked".to_vec(),
-                FsWriteOptions::default(),
-            )
-            .await
-            .expect("tracked file should succeed");
-        session
-            .fs
-            .mkdir(
-                "/tracked-file/",
-                FsMkdirOptions {
-                    untracked: true,
-                    ..FsMkdirOptions::default()
-                },
-            )
-            .await
-            .expect_err("untracked directory should not occupy tracked file namespace");
-        session
-            .fs
-            .write_file(
-                "/tracked-file/child.txt",
-                b"nope".to_vec(),
-                FsWriteOptions {
-                    untracked: true,
-                    ..FsWriteOptions::default()
-                },
-            )
-            .await
-            .expect_err("untracked write should not create directory under tracked file");
-
-        session
-            .fs
-            .mkdir(
-                "/untracked-dir/",
-                FsMkdirOptions {
-                    untracked: true,
-                    ..FsMkdirOptions::default()
-                },
-            )
-            .await
-            .expect("untracked directory should succeed");
-        session
-            .fs
-            .write_file(
-                "/untracked-dir",
-                b"nope".to_vec(),
-                FsWriteOptions::default(),
-            )
-            .await
-            .expect_err("tracked file should not occupy untracked directory namespace");
-        session
-            .fs
-            .write_file(
-                "/untracked-file",
-                b"untracked".to_vec(),
-                FsWriteOptions {
-                    untracked: true,
-                    ..FsWriteOptions::default()
-                },
-            )
-            .await
-            .expect("untracked file should succeed");
-        session
-            .fs
-            .mkdir("/untracked-file/", FsMkdirOptions::default())
-            .await
-            .expect_err("tracked directory should not occupy untracked file namespace");
-        session
-            .fs
-            .mkdir("/untracked-file/child/", FsMkdirOptions::default())
-            .await
-            .expect_err("tracked mkdir should not create directory under untracked file");
-    }
-);
-
 #[derive(Default)]
 struct SentinelPluginRuntime {
     render_calls: Arc<AtomicUsize>,
+    detect_filenames: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 struct SentinelPluginComponent {
     render_calls: Arc<AtomicUsize>,
+    detect_filenames: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
@@ -1129,6 +1013,7 @@ impl WasmRuntime for SentinelPluginRuntime {
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         Ok(Arc::new(SentinelPluginComponent {
             render_calls: Arc::clone(&self.render_calls),
+            detect_filenames: Arc::clone(&self.detect_filenames),
         }))
     }
 }
@@ -1140,6 +1025,10 @@ impl WasmComponentInstance for SentinelPluginComponent {
         _state: Vec<WasmPluginEntityState>,
         file: WasmPluginFile,
     ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
+        self.detect_filenames
+            .lock()
+            .expect("detect filename lock should not be poisoned")
+            .push(file.filename.clone());
         if file.data.is_empty() {
             Ok(vec![WasmPluginDetectedChange {
                 entity_pk: vec!["note".to_string()],

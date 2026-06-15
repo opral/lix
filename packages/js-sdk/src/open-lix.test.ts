@@ -1,4 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
@@ -170,25 +176,25 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	expect(existsSync(join(dir, ".lix"))).toBe(true);
 
 	const imported = await lix.execute(
-		"SELECT path, data FROM lix_file WHERE path = $1",
-		["/docs/readme.md"],
+		"SELECT path, data FROM lix_file WHERE name = $1",
+		["readme.md"],
 	);
 	expect(get(imported, "path")).toBe("/docs/readme.md");
 	expect(new TextDecoder().decode(get(imported, "data") as Uint8Array)).toBe(
 		"local",
 	);
 
-	await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
-		"/generated.md",
-		new TextEncoder().encode("generated"),
-	]);
+	await lix.execute(
+		"INSERT INTO lix_file (directory_id, name, data) VALUES ($1, $2, $3)",
+		[null, "generated.md", new TextEncoder().encode("generated")],
+	);
 	expect(readFileSync(join(dir, "generated.md"), "utf8")).toBe("generated");
 	await lix.close();
 
 	const reopened = await openLix({ backend: new FsBackend({ path: dir }) });
 	const persisted = await reopened.execute(
-		"SELECT data FROM lix_file WHERE path = $1",
-		["/generated.md"],
+		"SELECT data FROM lix_file WHERE directory_id IS NULL AND name = $1",
+		["generated.md"],
 	);
 	expect(new TextDecoder().decode(get(persisted, "data") as Uint8Array)).toBe(
 		"generated",
@@ -196,11 +202,39 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	await reopened.close();
 });
 
-test("fs readFile and writeFile wrap SQL file reads and writes", async () => {
+test.skipIf(process.platform === "win32")(
+	"fs backend ignores symlinks",
+	async () => {
+		const dir = tempFsDir();
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		writeFileSync(join(dir, "target.txt"), "target");
+		writeFileSync(join(dir, "docs", "readme.md"), "nested");
+		symlinkSync("target.txt", join(dir, "link.txt"));
+		symlinkSync("docs", join(dir, "linked-docs"));
+
+		const lix = await openLix({ backend: new FsBackend({ path: dir }) });
+		const files = await lix.execute(
+			"SELECT path FROM lix_file WHERE path IN ($1, $2, $3) ORDER BY path",
+			["/target.txt", "/link.txt", "/linked-docs/readme.md"],
+		);
+		expect(files.rows.map((row) => row.get("path"))).toEqual(["/target.txt"]);
+
+		const directories = await lix.execute(
+			"SELECT path FROM lix_directory WHERE path IN ($1, $2) ORDER BY path",
+			["/docs/", "/linked-docs/"],
+		);
+		expect(directories.rows.map((row) => row.get("path"))).toEqual([
+			"/docs/",
+		]);
+		await lix.close();
+	},
+);
+
+test("fs readFile and writeFile use paths", async () => {
 	const lix = await openLix();
 	const data = new TextEncoder().encode("hello from fs wrapper");
 
-	expect(await lix.fs.readFile("/missing.txt")).toBeUndefined();
+	expect(await lix.fs.readFile("/docs/missing.txt")).toBeUndefined();
 	await lix.fs.writeFile("/docs/wrapper.txt", data);
 
 	const stored = await lix.fs.readFile("/docs/wrapper.txt");
@@ -231,13 +265,17 @@ test("transaction fs wrappers use transaction SQL execution", async () => {
 	await lix.close();
 });
 
-test("writing bundled plugin archives to plugin paths installs schemas", async () => {
+test("installPlugin installs bundled plugin archive schemas", async () => {
 	const lix = await openLix();
 	const plugins = await bundledPluginArchives();
 
 	for (const plugin of plugins) {
-		await lix.fs.writeFile(plugin.path, plugin.archiveBytes);
-		expect(await lix.fs.readFile(plugin.path)).toEqual(plugin.archiveBytes);
+		await lix.installPlugin(plugin.archiveBytes);
+		const stored = await lix.execute(
+			"SELECT data FROM lix_file WHERE id = $1",
+			[`lix_plugin_archive::${plugin.key}`],
+		);
+		expect(get(stored, "data")).toEqual(plugin.archiveBytes);
 	}
 
 	const schemas = await lix.execute(
@@ -257,7 +295,7 @@ test("writing bundled plugin archives to plugin paths installs schemas", async (
 	await lix.close();
 });
 
-test("installPlugin delegates to the plugin archive writeFile path", async () => {
+test("installPlugin stores the archive and installs schemas", async () => {
 	const lix = await openLix();
 	const csvPlugin = (await bundledPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_csv",
@@ -267,7 +305,12 @@ test("installPlugin delegates to the plugin archive writeFile path", async () =>
 	}
 
 	await lix.installPlugin(csvPlugin.archiveBytes);
-	expect(await lix.fs.readFile(csvPlugin.path)).toEqual(csvPlugin.archiveBytes);
+	const stored = await lix.execute(
+		"SELECT name, data FROM lix_file WHERE id = $1",
+		[`lix_plugin_archive::${csvPlugin.key}`],
+	);
+	expect(get(stored, "name")).toBe(`${csvPlugin.key}.lixplugin`);
+	expect(get(stored, "data")).toEqual(csvPlugin.archiveBytes);
 
 	const schemas = await lix.execute(
 		"SELECT table_name \
@@ -306,7 +349,7 @@ test("INSERT SELECT UNION ALL executes without trapping", async () => {
 	const lix = await openLix();
 
 	const result = await lix.execute(
-		"INSERT INTO lix_directory (path) SELECT '/u1/' UNION ALL SELECT '/u2/'",
+		"INSERT INTO lix_directory (id, name) SELECT 'u1' AS id, 'u1' AS name UNION ALL SELECT 'u2' AS id, 'u2' AS name",
 	);
 
 	expect(result.rowsAffected).toBe(2);
@@ -964,10 +1007,15 @@ test("lix_state_history snapshot_content preserves JSON null for binary file row
 	const lix = await openLix();
 
 	await lix.execute(
-		"INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+		"INSERT INTO lix_directory (id, parent_id, name) VALUES ($1, $2, $3)",
+		["history-binary-dir", null, "history"],
+	);
+	await lix.execute(
+		"INSERT INTO lix_file (id, directory_id, name, data) VALUES ($1, $2, $3, $4)",
 		[
 			"history-binary-native-repro",
-			"/history/native-repro.bin",
+			"history-binary-dir",
+			"native-repro.bin",
 			new Uint8Array([0x80, 0xff, 0x00]),
 		],
 	);

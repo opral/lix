@@ -75,13 +75,13 @@ pub(crate) async fn detect_changes_with_plugin(
     host: &impl PluginComponentHost,
     plugin: &InstalledPlugin,
     active_state: &[MaterializedLiveStateRow],
-    file_data: Vec<u8>,
+    file: WasmPluginFile,
 ) -> Result<Vec<PluginDetectedChange>, LixError> {
     let changes = detect_changes_with_component(
         host,
         plugin,
         plugin_entity_state_from_live_rows(active_state)?,
-        WasmPluginFile { data: file_data },
+        file,
     )
     .await?;
     changes

@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lix_file_path_predicates_canonicalize_bound_values_like_writes() {
+    async fn lix_file_path_predicates_preserve_literal_values_like_writes() {
         let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone())
             .await
@@ -2095,99 +2095,54 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('file-nfc', $1, X'41')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-literal', $1, X'41')",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
-            .expect("NFD path insert should canonicalize");
+            .expect("decomposed path insert should preserve literal text");
 
-        let nfd_result = session
+        let decomposed_result = session
             .execute(
                 "SELECT id FROM lix_file WHERE path = $1",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
-            .expect("NFD path predicate should canonicalize");
+            .expect("decomposed path predicate should match literal text");
         assert_eq!(
-            rows_from_execute_result(nfd_result).1,
-            vec![vec![Value::Text("file-nfc".to_string())]]
+            rows_from_execute_result(decomposed_result).1,
+            vec![vec![Value::Text("file-literal".to_string())]]
         );
 
-        let percent_result = session
+        let composed_alias_result = session
             .execute(
-                "SELECT id FROM lix_file WHERE path = '/%43afe%CC%81.txt'",
-                &[],
+                "SELECT id FROM lix_file WHERE path = $1",
+                &[Value::Text("/Café.txt".to_string())],
             )
             .await
-            .expect("percent-encoded path predicate should canonicalize");
-        assert_eq!(
-            rows_from_execute_result(percent_result).1,
-            vec![vec![Value::Text("file-nfc".to_string())]]
-        );
-
-        let reversed_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE $1 = path",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("reversed path predicate should canonicalize");
-        assert_eq!(
-            rows_from_execute_result(reversed_result).1,
-            vec![vec![Value::Text("file-nfc".to_string())]]
-        );
-
-        let or_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE path = $1 OR id = 'missing'",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("OR path predicate should canonicalize");
-        assert_eq!(
-            rows_from_execute_result(or_result).1,
-            vec![vec![Value::Text("file-nfc".to_string())]]
-        );
-
-        let not_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE NOT (path = $1)",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("NOT path predicate should canonicalize");
-        assert!(rows_from_execute_result(not_result).1.is_empty());
-
-        let not_in_result = session
-            .execute(
-                "SELECT id FROM lix_file WHERE path NOT IN ($1)",
-                &[Value::Text("/%43afe%CC%81.txt".to_string())],
-            )
-            .await
-            .expect("NOT IN path predicate should canonicalize");
-        assert!(rows_from_execute_result(not_in_result).1.is_empty());
+            .expect("composed path predicate should execute");
+        assert!(rows_from_execute_result(composed_alias_result).1.is_empty());
 
         let update_result = session
             .execute(
-                "UPDATE lix_file SET data = X'42' WHERE path = $1 OR id = 'missing'",
+                "UPDATE lix_file SET data = X'42' WHERE path = $1",
                 &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
-            .expect("update predicate should canonicalize");
+            .expect("update predicate should match literal text");
         assert_eq!(update_result.rows_affected(), 1);
 
         let delete_result = session
             .execute(
                 "DELETE FROM lix_file WHERE path = $1",
-                &[Value::Text("/%43afe%CC%81.txt".to_string())],
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
             )
             .await
-            .expect("delete predicate should canonicalize");
+            .expect("delete predicate should match literal text");
         assert_eq!(delete_result.rows_affected(), 1);
     }
 
     #[tokio::test]
-    async fn lix_file_path_predicates_reject_non_literal_path_values() {
+    async fn lix_directory_path_predicates_preserve_literal_values_like_writes() {
         let backend = InMemoryStorageBackend::new();
         let init_receipt = Engine::initialize(backend.clone())
             .await
@@ -2200,110 +2155,32 @@ mod tests {
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('file-nfc', $1, X'41')",
-                &[Value::Text("/Cafe\u{301}.txt".to_string())],
-            )
-            .await
-            .expect("NFD path insert should canonicalize");
-
-        let error = session
-            .execute("SELECT id FROM lix_file WHERE path = id", &[])
-            .await
-            .expect_err("computed path predicate values should be rejected");
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("filesystem path predicates only support literal path values"),
-            "{error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn lix_directory_path_predicates_canonicalize_bound_values_like_writes() {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(backend).await.expect("engine should open");
-        let session = engine
-            .open_session(init_receipt.main_branch_id)
-            .await
-            .expect("session should open");
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-nfc', $1)",
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-literal', $1)",
                 &[Value::Text("/Cafe\u{301}/".to_string())],
             )
             .await
-            .expect("NFD directory path insert should canonicalize");
+            .expect("decomposed directory path insert should preserve literal text");
 
         let result = session
             .execute(
                 "SELECT id FROM lix_directory WHERE path IN ($1)",
-                &[Value::Text("/%43afe%CC%81/".to_string())],
+                &[Value::Text("/Cafe\u{301}/".to_string())],
             )
             .await
-            .expect("directory path predicate should canonicalize");
+            .expect("directory path predicate should match literal text");
         assert_eq!(
             rows_from_execute_result(result).1,
-            vec![vec![Value::Text("dir-nfc".to_string())]]
+            vec![vec![Value::Text("dir-literal".to_string())]]
         );
 
-        let or_result = session
+        let composed_alias_result = session
             .execute(
-                "SELECT id FROM lix_directory WHERE id = 'missing' OR path = $1",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
+                "SELECT id FROM lix_directory WHERE path IN ($1)",
+                &[Value::Text("/Café/".to_string())],
             )
             .await
-            .expect("directory OR path predicate should canonicalize");
-        assert_eq!(
-            rows_from_execute_result(or_result).1,
-            vec![vec![Value::Text("dir-nfc".to_string())]]
-        );
-
-        let not_in_result = session
-            .execute(
-                "SELECT id FROM lix_directory WHERE path NOT IN ($1)",
-                &[Value::Text("/%43afe%CC%81/".to_string())],
-            )
-            .await
-            .expect("directory NOT IN path predicate should canonicalize");
-        assert!(rows_from_execute_result(not_in_result).1.is_empty());
-    }
-
-    #[tokio::test]
-    async fn lix_directory_path_predicates_reject_non_literal_path_values() {
-        let backend = InMemoryStorageBackend::new();
-        let init_receipt = Engine::initialize(backend.clone())
-            .await
-            .expect("engine should initialize");
-        let engine = Engine::new(backend).await.expect("engine should open");
-        let session = engine
-            .open_session(init_receipt.main_branch_id)
-            .await
-            .expect("session should open");
-
-        session
-            .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-nfc', $1)",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
-            )
-            .await
-            .expect("NFD directory path insert should canonicalize");
-
-        let error = session
-            .execute("SELECT id FROM lix_directory WHERE path IN (id)", &[])
-            .await
-            .expect_err("computed directory path predicate values should be rejected");
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("filesystem path predicates only support literal path values"),
-            "{error:?}"
-        );
+            .expect("composed directory path predicate should execute");
+        assert!(rows_from_execute_result(composed_alias_result).1.is_empty());
     }
 
     fn rows_from_execute_result(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {
@@ -3799,7 +3676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_directory_rejects_path_assignment() {
+    async fn execute_sql_update_directory_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_directory_row("dir-docs", "branch-a", None, "docs")],
@@ -3813,25 +3690,29 @@ mod tests {
             schema_definitions: vec![],
         };
 
-        let error = execute_write_sql(
+        let result = execute_write_sql(
             &mut ctx,
             "UPDATE lix_directory SET path = '/renamed/' WHERE id = 'dir-docs'",
             &[],
         )
         .await
-        .expect_err("path should remain read-only");
+        .expect("path update should stage descriptor rewrite");
 
-        assert!(
-            error.message.contains("not writable")
-                || error.message.contains("read-only column 'path'"),
-            "unexpected error: {error:?}"
-        );
-        assert!(
-            staged_writes
-                .lock()
-                .expect("staged writes lock")
-                .deltas
-                .is_empty()
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_pk, "[\"dir-docs\"]");
+        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"id\":\"dir-docs\",\"name\":\"renamed\",\"parent_id\":null}")
         );
     }
 
@@ -3964,7 +3845,9 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![live_directory_row("dir-docs", "branch-b", None, "docs")],
+        });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
             active_branch_id: "branch-a",
