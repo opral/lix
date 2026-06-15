@@ -2,7 +2,7 @@ target-applies-to-host = false
 
 [alias]
 # requires: cargo install cargo-bash
-b = "bash export LIX_OLDPWD=$PWD && while ! [ -d \"$PWD/benchmarks\" -a -d \"$PWD/packages\" ]; do cd .. && [[ \"$PWD\" != \"/\" ]] || { echo \"not in lix repo\" && exit 1; }; done;"
+b = "bash export LIX_OLDPWD=$PWD && while ! [ -d \"$PWD/packages\" -a -d \"$PWD/plugins\" ]; do cd .. && [[ \"$PWD\" != \"/\" ]] || { echo \"not in lix repo\" && exit 1; }; done;"
 lcheck-stable = "b lix_root=$PWD && rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open(\"Cargo.toml\",\"rb\"))[\"workspace\"][\"package\"][\"rust-version\"])') && tmpdir=$(mktemp -d) && trap 'rm -rf \"$tmpdir\"' EXIT && rustup run --install \"$rust_version\" cargo init --bin --vcs none --name lcheck-stable --quiet \"$tmpdir\" && cd \"$tmpdir\" && rustup run --install \"$rust_version\" cargo add --quiet lix_sdk --path \"$lix_root/packages/rs-sdk\" && rustup run --install \"$rust_version\" cargo build"
 lclippy = "b NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo 1); \"$CARGO\" metadata --format-version 1 --no-deps | jq -r '.packages[].manifest_path' | xargs \"-P$NPROC\" -n1 \"$CARGO\" clippy --all-features --all-targets --manifest-path && exit 0"
 
