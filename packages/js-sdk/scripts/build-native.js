@@ -31,26 +31,11 @@ function run(cmd, args, opts = {}) {
 	});
 }
 
-const rustflags = [
-	process.env.RUSTFLAGS ?? "",
-	isRelease ? "-C strip=symbols" : "",
-	process.platform === "darwin"
-		? "-C link-arg=-undefined -C link-arg=dynamic_lookup"
-		: "",
-]
-	.join(" ")
-	.trim();
-
 const args = ["build", "--manifest-path", join(packageDir, "Cargo.toml")];
 if (isRelease) {
 	args.push("--release");
 }
 
-await run("cargo", args, {
-	env: {
-		...process.env,
-		RUSTFLAGS: rustflags,
-	},
-});
+await run("cargo", args);
 await mkdir(packageDir, { recursive: true });
 await cp(source, destination);
