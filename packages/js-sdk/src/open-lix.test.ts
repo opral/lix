@@ -1,4 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
@@ -195,6 +201,34 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	);
 	await reopened.close();
 });
+
+test.skipIf(process.platform === "win32")(
+	"fs backend ignores symlinks",
+	async () => {
+		const dir = tempFsDir();
+		mkdirSync(join(dir, "docs"), { recursive: true });
+		writeFileSync(join(dir, "target.txt"), "target");
+		writeFileSync(join(dir, "docs", "readme.md"), "nested");
+		symlinkSync("target.txt", join(dir, "link.txt"));
+		symlinkSync("docs", join(dir, "linked-docs"));
+
+		const lix = await openLix({ backend: new FsBackend({ path: dir }) });
+		const files = await lix.execute(
+			"SELECT path FROM lix_file WHERE path IN ($1, $2, $3) ORDER BY path",
+			["/target.txt", "/link.txt", "/linked-docs/readme.md"],
+		);
+		expect(files.rows.map((row) => row.get("path"))).toEqual(["/target.txt"]);
+
+		const directories = await lix.execute(
+			"SELECT path FROM lix_directory WHERE path IN ($1, $2) ORDER BY path",
+			["/docs/", "/linked-docs/"],
+		);
+		expect(directories.rows.map((row) => row.get("path"))).toEqual([
+			"/docs/",
+		]);
+		await lix.close();
+	},
+);
 
 test("fs readFile and writeFile use paths", async () => {
 	const lix = await openLix();
