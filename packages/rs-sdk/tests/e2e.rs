@@ -465,7 +465,9 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<FsBackend> {
 #[cfg(feature = "sqlite")]
 async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let tempdir = tempfile::tempdir().unwrap();
-    let seed = open_lix_with_backend(SqliteBackend::open(tempdir.path().join(".lix")).unwrap())
+    let metadata_dir = tempdir.path().join(".lix");
+    std::fs::create_dir(&metadata_dir).unwrap();
+    let seed = open_lix_with_backend(SqliteBackend::open(metadata_dir.join("db.sqlite")).unwrap())
         .await
         .unwrap();
     seed.write_file("/old.txt", b"old".to_vec(), FsWriteOptions::default())

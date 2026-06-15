@@ -1055,24 +1055,11 @@ fn is_plugin_storage_path(path: &str) -> bool {
 }
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/.lix"
-            | "/.lix/"
-            | "/.lix-wal"
-            | "/.lix-wal/"
-            | "/.lix-shm"
-            | "/.lix-shm/"
-            | "/.lix-journal"
-            | "/.lix-journal/"
-    )
+    path == "/.lix" || path.starts_with("/.lix/")
 }
 
 fn is_filesystem_metadata_file_name(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(".lix" | ".lix-wal" | ".lix-shm" | ".lix-journal")
-    )
+    matches!(name.to_str(), Some(".lix"))
 }
 
 fn sort_directories_deepest_first(paths: &mut [String]) {
@@ -1125,7 +1112,46 @@ fn filesystem_error(message: impl Into<String>) -> LixError {
 #[cfg(feature = "sqlite")]
 fn open_filesystem_sqlite_backend(dir: &Path) -> Result<SqliteBackend, LixError> {
     ensure_filesystem_root_directory(dir)?;
-    SqliteBackend::open(dir.join(".lix")).map_err(sqlite_backend_error)
+    let metadata_dir = ensure_filesystem_sqlite_metadata_directory(dir)?;
+    SqliteBackend::open(metadata_dir.join("db.sqlite")).map_err(sqlite_backend_error)
+}
+
+#[cfg(feature = "sqlite")]
+fn ensure_filesystem_sqlite_metadata_directory(dir: &Path) -> Result<PathBuf, LixError> {
+    let metadata_dir = dir.join(".lix");
+    match std::fs::create_dir(&metadata_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(io_error(
+                "create filesystem SQLite metadata directory",
+                &metadata_dir,
+                error,
+            ));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(&metadata_dir).map_err(|error| {
+        io_error(
+            "read filesystem SQLite metadata directory",
+            &metadata_dir,
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        let path = metadata_dir.display();
+        return Err(filesystem_error(format!(
+            "filesystem SQLite metadata path {path} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        let path = metadata_dir.display();
+        return Err(filesystem_error(format!(
+            "filesystem SQLite metadata path {path} must be a directory"
+        )));
+    }
+
+    Ok(metadata_dir)
 }
 
 #[cfg(feature = "sqlite")]

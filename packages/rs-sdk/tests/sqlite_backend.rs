@@ -114,16 +114,29 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
         let lix = open_lix_with_backend(backend)
             .await
             .expect("lix opens on fs backend");
+        let sqlite_dir = filesystem_path.join(".lix");
+        let sqlite_path = sqlite_dir.join("db.sqlite");
         assert!(
-            filesystem_path.join(".lix").is_file(),
-            "fs backend should store SQLite at dir/.lix"
+            sqlite_dir.is_dir(),
+            "fs backend should store SQLite in dir/.lix"
+        );
+        assert!(
+            sqlite_path.is_file(),
+            "fs backend should store SQLite at dir/.lix/db.sqlite"
         );
         assert_eq!(
             lix.read_file("/.lix")
                 .await
                 .expect("reserved backing file path reads"),
             None,
-            "dir/.lix should not be imported into Lix"
+            "dir/.lix should not be imported into Lix as a file"
+        );
+        assert_eq!(
+            lix.readdir("/.lix/")
+                .await
+                .expect("reserved backing directory path reads"),
+            None,
+            "dir/.lix should not be imported into Lix as a directory"
         );
         lix.write_file(
             "/persisted.txt",
@@ -141,7 +154,8 @@ async fn fs_backend_uses_dir_lix_and_materializes_across_reopen() {
 
     {
         let plain = open_lix_with_backend(
-            SqliteBackend::open(filesystem_path.join(".lix")).expect("sqlite backend reopens"),
+            SqliteBackend::open(filesystem_path.join(".lix").join("db.sqlite"))
+                .expect("sqlite backend reopens"),
         )
         .await
         .expect("plain lix opens on sqlite backend");
@@ -191,7 +205,13 @@ async fn fs_backend_ignores_sqlite_sidecar_paths() {
     .await
     .expect("lix opens on fs backend");
 
-    for path in ["/.lix", "/.lix-wal", "/.lix-shm", "/.lix-journal"] {
+    for path in [
+        "/.lix",
+        "/.lix/db.sqlite",
+        "/.lix/db.sqlite-wal",
+        "/.lix/db.sqlite-shm",
+        "/.lix/db.sqlite-journal",
+    ] {
         assert_eq!(
             lix.read_file(path).await.expect("metadata path reads"),
             None,

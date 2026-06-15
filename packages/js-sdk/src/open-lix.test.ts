@@ -1,7 +1,7 @@
 import {
-	existsSync,
 	mkdirSync,
 	readFileSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -173,7 +173,8 @@ test("fs backend imports local files and materializes lix_file writes", async ()
 	writeFileSync(join(dir, "docs", "readme.md"), "local");
 
 	const lix = await openLix({ backend: new FsBackend({ path: dir }) });
-	expect(existsSync(join(dir, ".lix"))).toBe(true);
+	expect(statSync(join(dir, ".lix")).isDirectory()).toBe(true);
+	expect(statSync(join(dir, ".lix", "db.sqlite")).isFile()).toBe(true);
 
 	const imported = await lix.execute(
 		"SELECT path, data FROM lix_file WHERE name = $1",
