@@ -28,6 +28,7 @@ use crate::transaction::types::{
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 pub(crate) async fn install_plugin_archive_with_transaction<B>(
+    parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
     transaction: &mut Transaction<B>,
 ) -> Result<(), LixError>
@@ -36,7 +37,6 @@ where
     for<'backend> B::Read<'backend>: Send,
     for<'backend> B::Write<'backend>: Send,
 {
-    let parsed = parse_plugin_archive_for_install(archive_bytes)?;
     stage_plugin_archive_file(transaction, &parsed, archive_bytes).await?;
     Ok(())
 }

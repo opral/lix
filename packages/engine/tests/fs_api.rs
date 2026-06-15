@@ -415,6 +415,39 @@ async fn sql_write_file_to_plugin_storage_installs_plugin_archive() {
 }
 
 #[tokio::test]
+async fn install_plugin_archive_is_idempotent_for_identical_archive() {
+    let backend = InMemoryBackend::new();
+    Engine::initialize(backend.clone())
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(backend).await.expect("engine should open");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+    let archive = sentinel_plugin_archive();
+
+    session
+        .install_plugin_archive(&archive)
+        .await
+        .expect("first plugin install should succeed");
+    let after_first_install = commit_and_change_counts(&session).await;
+
+    session
+        .install_plugin_archive(&archive)
+        .await
+        .expect("second plugin install should succeed");
+    let after_second_install = commit_and_change_counts(&session).await;
+
+    assert_eq!(
+        after_second_install, after_first_install,
+        "installing identical plugin archive bytes should not create commits or changes"
+    );
+
+    session.close().await.expect("session should close");
+}
+
+#[tokio::test]
 async fn sql_write_file_to_plugin_storage_rejects_path_manifest_key_mismatch() {
     let backend = InMemoryBackend::new();
     Engine::initialize(backend.clone())
@@ -1185,6 +1218,26 @@ fn binary_sentinel_plugin_archive() -> Vec<u8> {
         "schemas": ["schema/plugin_note.json"]
     }"#;
     plugin_archive(MANIFEST_JSON)
+}
+
+async fn commit_and_change_counts(
+    session: &lix_engine::SessionContext<InMemoryBackend>,
+) -> (i64, i64) {
+    let changes = session
+        .execute("SELECT count(*) AS n FROM lix_change", &[])
+        .await
+        .expect("change count should read")
+        .rows()[0]
+        .get::<i64>("n")
+        .expect("change count should be integer");
+    let commits = session
+        .execute("SELECT count(*) AS n FROM lix_commit", &[])
+        .await
+        .expect("commit count should read")
+        .rows()[0]
+        .get::<i64>("n")
+        .expect("commit count should be integer");
+    (commits, changes)
 }
 
 fn plugin_archive(manifest_json: &[u8]) -> Vec<u8> {

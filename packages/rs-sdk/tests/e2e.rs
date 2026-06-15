@@ -5,6 +5,8 @@ use lix_sdk::{
 };
 #[cfg(feature = "sqlite")]
 use lix_sdk::{FsBackend, SqliteBackend};
+#[cfg(feature = "sqlite")]
+use std::io::{Cursor, Write};
 use std::path::Path;
 #[cfg(feature = "sqlite")]
 use std::time::{Duration, Instant};
@@ -589,6 +591,28 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
 
 #[tokio::test]
 #[cfg(feature = "sqlite")]
+async fn filesystem_plugin_archive_install_is_idle_stable() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let lix = open_lix_with_filesystem(tempdir.path()).await;
+
+    lix.install_plugin_archive(&minimal_plugin_archive())
+        .await
+        .unwrap();
+
+    let after_install = commit_and_change_counts(&lix).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after_idle = commit_and_change_counts(&lix).await;
+
+    assert_eq!(
+        after_idle, after_install,
+        "FsBackend should not create commits or changes while idle after materializing an installed plugin archive"
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn filesystem_rejects_invalid_lix_path_names() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(tempdir.path().join("bad%name.txt"), b"bad").unwrap();
@@ -664,6 +688,73 @@ async fn wait_for_lix_directory(lix: &Lix<FsBackend>, path: &str, expected: bool
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(feature = "sqlite")]
+async fn commit_and_change_counts(lix: &Lix<FsBackend>) -> (i64, i64) {
+    let changes = lix
+        .execute("SELECT count(*) AS n FROM lix_change", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("n")
+        .unwrap();
+    let commits = lix
+        .execute("SELECT count(*) AS n FROM lix_commit", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<i64>("n")
+        .unwrap();
+    (commits, changes)
+}
+
+#[cfg(feature = "sqlite")]
+fn minimal_plugin_archive() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        ("manifest.json", MINIMAL_PLUGIN_MANIFEST.as_bytes()),
+        ("schema/p_doc.json", MINIMAL_PLUGIN_SCHEMA.as_bytes()),
+        ("plugin.wasm", b"\0asm\x01\0\0\0".as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[cfg(feature = "sqlite")]
+const MINIMAL_PLUGIN_MANIFEST: &str = r#"{
+  "key": "p",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {
+    "path_glob": "*.p"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/p_doc.json"
+  ]
+}"#;
+
+#[cfg(feature = "sqlite")]
+const MINIMAL_PLUGIN_SCHEMA: &str = r#"{
+  "x-lix-key": "p_doc",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "required": [
+    "id"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}"#;
 
 async fn register_crm_task_schema(lix: &Lix) {
     let schema = r#"{
