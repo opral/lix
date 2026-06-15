@@ -322,6 +322,7 @@ fn fallback_delimiter(filename: Option<&str>, decoded: &str) -> u8 {
 pub(crate) fn render_projection(projection: &Projection) -> Result<Vec<u8>, PluginError> {
     let mut writer_builder = WriterBuilder::new();
     writer_builder
+        .flexible(true)
         .has_headers(false)
         .delimiter(projection.dialect.delimiter)
         .terminator(projection.dialect.terminator.to_csv_terminator());

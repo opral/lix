@@ -249,6 +249,53 @@ fn detects_initial_projection_and_renders_csv() {
 }
 
 #[test]
+fn roundtrips_ragged_csv_rows_with_metadata_preamble() {
+    let expected = b"metadata\nheader,value\n";
+    let after = file_from_bytes(expected);
+
+    let active_state = active_state_from_file(after);
+    let row_widths = active_state
+        .iter()
+        .filter(|row| row.schema_key == ROW_SCHEMA_KEY)
+        .map(|row| {
+            active_state_snapshot_value(row)
+                .get("cells")
+                .and_then(Value::as_array)
+                .expect("row cells should exist")
+                .len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row_widths, [1, 2]);
+
+    let output = render_active_state(active_state).expect("render should support ragged CSV rows");
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn roundtrips_ragged_csv_rows_with_blank_separator() {
+    let input = b"metadata\n\nheader,value\n";
+    let expected = b"metadata\nheader,value\n";
+    let after = file_from_bytes(input);
+
+    let active_state = active_state_from_file(after);
+    let row_widths = active_state
+        .iter()
+        .filter(|row| row.schema_key == ROW_SCHEMA_KEY)
+        .map(|row| {
+            active_state_snapshot_value(row)
+                .get("cells")
+                .and_then(Value::as_array)
+                .expect("row cells should exist")
+                .len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row_widths, [1, 2]);
+
+    let output = render_active_state(active_state).expect("render should support ragged CSV rows");
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn detects_initial_csv_larger_than_fixed_width_order_key_limit() {
     let expected = csv_rows("row", 200);
     let after = file_from_bytes(&expected);
